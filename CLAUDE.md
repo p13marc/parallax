@@ -30,34 +30,22 @@ This file provides guidance to Claude Code when working with code in this reposi
 ## Build Commands
 
 ```bash
-# Build
+# Using just (recommended)
+just test          # Run tests with nextest
+just lint          # Run clippy
+just check         # Format + lint + test
+just bench         # Run benchmarks
+just watch         # Auto-run tests on changes
+
+# Or directly with cargo
 cargo build
-
-# Build release
-cargo build --release
-
-# Run tests
-cargo test
-
-# Run tests with nextest (if installed)
 cargo nextest run
-
-# Run a specific test
-cargo test test_name
-
-# Run benchmarks
-cargo bench
-
-# Check formatting
-cargo fmt --check
-
-# Lint
 cargo clippy -- -D warnings
 ```
 
 ## Architecture
 
-### Crate Organization
+### Current Implementation (Phase 1 & 2 Complete)
 
 ```
 parallax/
@@ -65,43 +53,37 @@ parallax/
 │   ├── lib.rs              # Public API exports
 │   ├── error.rs            # Error types (thiserror)
 │   │
-│   ├── memory/             # Memory management
-│   │   ├── segment.rs      # MemorySegment trait
-│   │   ├── heap.rs         # HeapSegment (default)
-│   │   ├── shared.rs       # PosixSharedMemory (memfd)
-│   │   ├── pool.rs         # MemoryPool, LoanedSlot
-│   │   └── bitmap.rs       # AtomicBitmap for slot tracking
+│   ├── memory/             # Memory management (COMPLETE)
+│   │   ├── mod.rs          # Module exports
+│   │   ├── segment.rs      # MemorySegment trait, MemoryType, IpcHandle
+│   │   ├── heap.rs         # HeapSegment (heap-backed, single process)
+│   │   ├── shared.rs       # SharedMemorySegment (memfd_create, multi-process)
+│   │   ├── pool.rs         # MemoryPool, LoanedSlot (loan semantics)
+│   │   ├── bitmap.rs       # AtomicBitmap (lock-free slot tracking)
+│   │   └── ipc.rs          # send_fds/recv_fds (SCM_RIGHTS fd passing)
 │   │
-│   ├── buffer.rs           # Buffer<T>, MemoryHandle
-│   ├── metadata.rs         # Metadata, BufferFlags
-│   ├── caps.rs             # Caps trait, DynCaps
+│   ├── buffer.rs           # Buffer<T>, MemoryHandle (COMPLETE)
+│   ├── metadata.rs         # Metadata, BufferFlags (COMPLETE)
 │   │
-│   ├── element/            # Element system
-│   │   ├── traits.rs       # Element, Source, Sink, AsyncSource
-│   │   ├── dynamic.rs      # ElementDyn (type-erased)
-│   │   ├── pad.rs          # Pad, PadDirection
-│   │   └── registry.rs     # Element factory registry
+│   ├── element/            # Element system (COMPLETE)
+│   │   ├── mod.rs          # Module exports
+│   │   ├── traits.rs       # Element, Source, Sink, AsyncSource, adapters
+│   │   ├── pad.rs          # Pad, PadDirection, PadTemplate
+│   │   └── context.rs      # ElementContext for runtime info
 │   │
-│   ├── pipeline/           # Pipeline execution
+│   ├── pipeline/           # Pipeline execution (COMPLETE)
+│   │   ├── mod.rs          # Module exports
 │   │   ├── graph.rs        # Pipeline DAG (daggy-based)
-│   │   ├── executor.rs     # Task spawning, channel wiring
-│   │   ├── parser.rs       # String parser (winnow)
-│   │   └── events.rs       # Event enum, event stream
+│   │   └── executor.rs     # PipelineExecutor, task spawning, channel wiring
 │   │
-│   ├── typed/              # Typed pipeline builder
-│   │   └── builder.rs      # TypedPipeline, .then(), .tee()
-│   │
-│   ├── link/               # Inter-element connections
-│   │   ├── local.rs        # In-process Kanal links
-│   │   ├── ipc.rs          # Cross-process (memfd + Unix socket)
-│   │   └── network.rs      # TCP links
-│   │
-│   └── elements/           # Built-in elements
-│       ├── filesrc.rs
-│       ├── tcpsrc.rs
-│       ├── passthrough.rs
-│       ├── tee.rs
-│       └── sinks.rs        # ConsoleSink, NullSink, ZenohSink
+│   └── elements/           # Built-in elements (COMPLETE)
+│       ├── mod.rs          # Module exports
+│       ├── passthrough.rs  # PassThrough - identity element
+│       ├── tee.rs          # Tee - statistics tracking
+│       └── null.rs         # NullSink, NullSource
+│
+├── tests/
+│   └── pipeline_integration.rs  # Integration tests
 ```
 
 ### Key Types
@@ -128,25 +110,39 @@ pub trait MemorySegment: Send + Sync {
 pub struct MemoryPool { /* ... */ }
 pub struct LoanedSlot { /* RAII guard, returns to pool on drop */ }
 
-// Element traits
-pub trait Element: Send {
-    type Input: Caps;
-    type Output: Caps;
-    fn process(&mut self, input: Buffer<Self::Input>) -> Result<Buffer<Self::Output>>;
+// Element traits (Phase 2)
+pub trait Source: Send {
+    fn produce(&mut self) -> Result<Option<Buffer>>;
 }
 
-pub trait ElementDyn: Send {
-    fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>>;
+pub trait Sink: Send {
+    fn consume(&mut self, buffer: Buffer) -> Result<()>;
+}
+
+pub trait Element: Send {
+    fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>>;
 }
 ```
 
 ## Implementation Phases
 
-1. **Phase 1**: Core Types & Memory Foundation (current)
-2. **Phase 2**: Elements & Pipeline Core
-3. **Phase 3**: Sources, Parser & Shared Memory
-4. **Phase 4**: Typed Pipeline Builder & Serialization
-5. **Phase 5**: Events, Observability & Validation
+1. **Phase 1**: Core Types & Memory Foundation - COMPLETE
+   - MemorySegment trait + HeapSegment + SharedMemorySegment
+   - MemoryPool with loan semantics
+   - Buffer<T> with MemoryHandle
+   - IPC fd passing (SCM_RIGHTS)
+
+2. **Phase 2**: Elements & Pipeline Core - COMPLETE
+   - Element traits (Source, Sink, Element, ElementDyn)
+   - Pad abstraction (Pad, PadDirection, PadTemplate)
+   - Pipeline DAG with daggy (cycle detection, validation)
+   - PipelineExecutor with Tokio tasks + Kanal channels
+   - Built-in elements: PassThrough, Tee, NullSink, NullSource
+   - Integration tests
+
+3. **Phase 3**: Sources, Parser & More Elements
+4. **Phase 4**: Typed Pipeline Builder
+5. **Phase 5**: Events & Observability
 6. **Phase 6**: Advanced Memory Backends
 7. **Phase 7**: Plugin System
 8. **Phase 8**: Optimizations & Polish
@@ -161,46 +157,28 @@ pub trait ElementDyn: Send {
 - Document public APIs with examples
 - Write tests for each module
 
-## Testing Strategy
+## Testing
 
 ```bash
-# Unit tests
-cargo test
-
-# Integration tests
-cargo test --test integration
-
-# Benchmarks
-cargo bench
-
-# Property-based tests (with proptest)
-cargo test proptest_
+just test              # Run all tests with nextest
+just test-one NAME     # Run specific test
+just test-verbose      # Run with output capture disabled
+just watch             # Auto-run on changes
 ```
 
 ## Zenoh Integration
 
 Parallax is designed to be compatible with Zenoh for distributed pipelines:
-
-```rust
-// ZenohSink publishes buffers to Zenoh topics
-impl Sink for ZenohSink {
-    fn consume(&mut self, buffer: Buffer) -> Result<()> {
-        self.publisher.put(buffer.as_bytes()).await?;
-        Ok(())
-    }
-}
-```
-
-- Buffers use rkyv format; mark with encoding `"application/rkyv"`
-- Zero-copy possible via Zenoh's SharedMemoryManager
-- Works with all Zenoh topologies (peer, router, client)
+- Buffers provide `as_bytes()` for ZBytes conversion
+- rkyv format is transparent to Zenoh (just bytes)
+- Zero-copy possible via shared memory bridge
+- Works with all Zenoh topologies
 
 ## Performance Notes
 
 - Buffer cloning is O(1) (Arc increment)
 - Pool slot acquire/release is O(1) amortized (atomic bitmap)
 - rkyv validation is cached (validate once, then zero-cost)
-- Use huge pages for large buffer pools (`huge-pages` feature)
 - Cross-process is true zero-copy via shared memory
 
 ## Feature Flags
@@ -217,8 +195,3 @@ rdma = []           # Future: RDMA support
 ## Documentation
 
 - `FINAL_PLAN.md` - Complete implementation plan and architecture
-- `docs/` - Additional design documents (future)
-
-## License
-
-TBD (recommend Apache-2.0 or MIT)

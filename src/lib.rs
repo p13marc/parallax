@@ -36,24 +36,24 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod buffer;
+pub mod element;
+pub mod elements;
 pub mod error;
 pub mod memory;
 pub mod metadata;
+pub mod pipeline;
 
-// Future modules (Phase 2+)
-// pub mod caps;
-// pub mod element;
-// pub mod pipeline;
+// Future modules (Phase 3+)
 // pub mod typed;
-// pub mod link;
-// pub mod elements;
 
 /// Prelude for convenient imports
 pub mod prelude {
     pub use crate::buffer::Buffer;
+    pub use crate::element::{Element, ElementDyn, Sink, Source};
     pub use crate::error::{Error, Result};
     pub use crate::memory::{MemoryPool, MemorySegment, MemoryType};
     pub use crate::metadata::Metadata;
+    pub use crate::pipeline::{Pipeline, PipelineExecutor};
 }
 
 pub use error::{Error, Result};
