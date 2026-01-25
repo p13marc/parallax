@@ -394,3 +394,195 @@ async fn test_parse_file_pipeline() {
     let output_data = std::fs::read(output.path()).unwrap();
     assert_eq!(output_data, data);
 }
+
+// ============================================================================
+// Typed Pipeline Integration Tests
+// ============================================================================
+
+/// Test typed pipeline with map operator.
+#[test]
+fn test_typed_pipeline_map() {
+    use parallax::typed::{collect, from_iter, map, pipeline};
+
+    let source = from_iter(vec![1i32, 2, 3, 4, 5]);
+    let result = pipeline(source)
+        .then(map(|x: i32| x * x))
+        .sink(collect())
+        .run()
+        .unwrap();
+
+    assert_eq!(result.into_inner(), vec![1, 4, 9, 16, 25]);
+}
+
+/// Test typed pipeline with filter operator.
+#[test]
+fn test_typed_pipeline_filter() {
+    use parallax::typed::{collect, filter, from_iter, pipeline};
+
+    let source = from_iter(1..=10);
+    let result = pipeline(source)
+        .then(filter(|x: &i32| x % 3 == 0))
+        .sink(collect())
+        .run()
+        .unwrap();
+
+    assert_eq!(result.into_inner(), vec![3, 6, 9]);
+}
+
+/// Test typed pipeline with chained operators.
+#[test]
+fn test_typed_pipeline_chain() {
+    use parallax::typed::{collect, filter, from_iter, map, pipeline};
+
+    let source = from_iter(1..=20);
+    let result = pipeline(source)
+        .then(filter(|x: &i32| x % 2 == 0)) // Keep even: 2,4,6,...,20
+        .then(map(|x: i32| x / 2)) // Divide by 2: 1,2,3,...,10
+        .then(filter(|x: &i32| *x > 5)) // Keep > 5: 6,7,8,9,10
+        .sink(collect())
+        .run()
+        .unwrap();
+
+    assert_eq!(result.into_inner(), vec![6, 7, 8, 9, 10]);
+}
+
+/// Test typed pipeline with take operator.
+#[test]
+fn test_typed_pipeline_take() {
+    use parallax::typed::{collect, from_iter, pipeline, take};
+
+    let source = from_iter(1..=100);
+    let result = pipeline(source)
+        .then(take(5))
+        .sink(collect())
+        .run()
+        .unwrap();
+
+    assert_eq!(result.into_inner(), vec![1, 2, 3, 4, 5]);
+}
+
+/// Test typed pipeline with skip operator.
+#[test]
+fn test_typed_pipeline_skip() {
+    use parallax::typed::{collect, from_iter, pipeline, skip};
+
+    let source = from_iter(1..=10);
+    let result = pipeline(source)
+        .then(skip(7))
+        .sink(collect())
+        .run()
+        .unwrap();
+
+    assert_eq!(result.into_inner(), vec![8, 9, 10]);
+}
+
+/// Test typed pipeline with filter_map operator.
+#[test]
+fn test_typed_pipeline_filter_map() {
+    use parallax::typed::{collect, filter_map, from_iter, pipeline};
+
+    let source = from_iter(vec!["1", "two", "3", "four", "5"]);
+    let result = pipeline(source)
+        .then(filter_map(|s: &str| s.parse::<i32>().ok()))
+        .sink(collect())
+        .run()
+        .unwrap();
+
+    assert_eq!(result.into_inner(), vec![1, 3, 5]);
+}
+
+/// Test typed pipeline with >> operator.
+#[test]
+fn test_typed_pipeline_shr_operator() {
+    use parallax::typed::{collect, from_iter, map, pipeline};
+
+    let source = from_iter(vec![1, 2, 3]);
+    let result = (pipeline(source) >> map(|x: i32| x + 100))
+        .sink(collect())
+        .run()
+        .unwrap();
+
+    assert_eq!(result.into_inner(), vec![101, 102, 103]);
+}
+
+/// Test typed pipeline with multiple >> operators.
+#[test]
+fn test_typed_pipeline_shr_chain() {
+    use parallax::typed::{collect, filter, from_iter, map, pipeline};
+
+    let source = from_iter(1..=10);
+    let result = (pipeline(source) >> filter(|x: &i32| x % 2 == 0) >> map(|x: i32| x * 10))
+        .sink(collect())
+        .run()
+        .unwrap();
+
+    assert_eq!(result.into_inner(), vec![20, 40, 60, 80, 100]);
+}
+
+/// Test typed pipeline with discard sink.
+#[test]
+fn test_typed_pipeline_discard() {
+    use parallax::typed::{discard, from_iter, map, pipeline};
+
+    let source = from_iter(1..=1000);
+    let _ = pipeline(source)
+        .then(map(|x: i32| x * 2))
+        .sink(discard())
+        .run()
+        .unwrap();
+    // Just verify it completes without error
+}
+
+/// Test typed pipeline with for_each sink.
+#[test]
+fn test_typed_pipeline_for_each() {
+    use parallax::typed::{for_each, from_iter, pipeline};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    let sum = Arc::new(AtomicI32::new(0));
+    let sum_clone = sum.clone();
+
+    let source = from_iter(1..=10);
+    let _ = pipeline(source)
+        .sink(for_each(move |x: i32| {
+            sum_clone.fetch_add(x, Ordering::Relaxed);
+        }))
+        .run()
+        .unwrap();
+
+    // 1+2+3+...+10 = 55
+    assert_eq!(sum.load(Ordering::Relaxed), 55);
+}
+
+/// Test typed pipeline type safety (compile-time check).
+#[test]
+fn test_typed_pipeline_type_conversion() {
+    use parallax::typed::{collect, from_iter, map, pipeline};
+
+    // i32 -> String -> usize pipeline
+    let source = from_iter(vec![1i32, 22, 333]);
+    let result = pipeline(source)
+        .then(map(|x: i32| x.to_string()))
+        .then(map(|s: String| s.len()))
+        .sink(collect())
+        .run()
+        .unwrap();
+
+    assert_eq!(result.into_inner(), vec![1, 2, 3]);
+}
+
+/// Test typed pipeline with once source.
+#[test]
+fn test_typed_pipeline_once() {
+    use parallax::typed::{collect, map, once, pipeline};
+
+    let source = once(42i32);
+    let result = pipeline(source)
+        .then(map(|x: i32| x * 2))
+        .sink(collect())
+        .run()
+        .unwrap();
+
+    assert_eq!(result.into_inner(), vec![84]);
+}

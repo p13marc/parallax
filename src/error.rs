@@ -24,6 +24,10 @@ pub enum Error {
     #[error("buffer validation failed: {0}")]
     ValidationFailed(String),
 
+    /// Invalid caps / type mismatch.
+    #[error("invalid caps: {0}")]
+    InvalidCaps(String),
+
     /// I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

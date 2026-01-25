@@ -42,9 +42,7 @@ pub mod error;
 pub mod memory;
 pub mod metadata;
 pub mod pipeline;
-
-// Future modules (Phase 3+)
-// pub mod typed;
+pub mod typed;
 
 /// Prelude for convenient imports
 pub mod prelude {
