@@ -150,6 +150,27 @@ impl SharedMemorySegment {
         self.fd.as_raw_fd()
     }
 
+    /// Open an existing shared memory segment from a raw file descriptor.
+    ///
+    /// This creates a new mapping from an existing fd without taking ownership.
+    /// The original fd remains open and the segment maintains its own reference.
+    ///
+    /// # Arguments
+    ///
+    /// * `fd` - Raw file descriptor of the memfd.
+    /// * `size` - Expected size of the segment.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `fd` is a valid memfd and that `size`
+    /// matches the actual size of the memfd.
+    pub unsafe fn from_raw_fd(fd: RawFd, size: usize) -> Result<Self> {
+        // Duplicate the fd so we have our own reference
+        use std::os::unix::io::FromRawFd;
+        let dup_fd = rustix::io::fcntl_dupfd_cloexec(unsafe { BorrowedFd::borrow_raw(fd) }, 0)?;
+        unsafe { Self::from_fd(dup_fd, size) }
+    }
+
     /// Get the debug name of this segment.
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()

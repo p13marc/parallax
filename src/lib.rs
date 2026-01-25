@@ -39,6 +39,7 @@ pub mod buffer;
 pub mod element;
 pub mod elements;
 pub mod error;
+pub mod link;
 pub mod memory;
 pub mod metadata;
 pub mod pipeline;

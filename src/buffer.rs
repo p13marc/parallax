@@ -57,6 +57,25 @@ impl MemoryHandle {
         }
     }
 
+    /// Create a memory handle covering a portion of a segment starting at offset 0.
+    ///
+    /// Useful when you have a larger segment but only wrote `len` bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `len > segment.len()`.
+    pub fn from_segment_with_len(segment: Arc<dyn MemorySegment>, len: usize) -> Self {
+        assert!(
+            len <= segment.len(),
+            "requested length exceeds segment size"
+        );
+        Self {
+            segment,
+            offset: 0,
+            len,
+        }
+    }
+
     /// Get a pointer to the start of this handle's memory.
     pub fn as_ptr(&self) -> *const u8 {
         unsafe { self.segment.as_ptr().add(self.offset) }

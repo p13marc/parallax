@@ -28,6 +28,18 @@ pub enum Error {
     #[error("invalid caps: {0}")]
     InvalidCaps(String),
 
+    /// Configuration error.
+    #[error("configuration error: {0}")]
+    Config(String),
+
+    /// Pipeline error.
+    #[error("pipeline error: {0}")]
+    Pipeline(String),
+
+    /// Element error.
+    #[error("element error: {0}")]
+    Element(String),
+
     /// I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
