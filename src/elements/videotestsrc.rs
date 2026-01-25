@@ -301,8 +301,10 @@ impl VideoTestSrc {
         x
     }
 
-    fn apply_framerate_limit(&mut self) {
-        // Only apply framerate limiting in live mode
+    /// Wait until it's time to produce the next frame (for live mode).
+    /// Uses a hybrid approach: sleep for coarse waiting, spin for precision.
+    fn wait_for_next_frame(&mut self) {
+        // Non-live mode produces immediately
         if !self.live {
             return;
         }
@@ -312,18 +314,40 @@ impl VideoTestSrc {
             return;
         }
 
-        let now = Instant::now();
+        let expected_duration = Duration::from_nanos(frame_duration.nanos());
 
-        if let Some(last) = self.last_produce {
-            let expected = Duration::from_nanos(frame_duration.nanos());
-            let elapsed = now.duration_since(last);
-
-            if elapsed < expected {
-                std::thread::sleep(expected - elapsed);
+        let target_time = match self.last_produce {
+            None => {
+                // First frame - start the timer now
+                let now = Instant::now();
+                self.last_produce = Some(now);
+                return; // Produce first frame immediately
             }
+            Some(last) => last + expected_duration,
+        };
+
+        let now = Instant::now();
+        if now >= target_time {
+            // Already past target time, update and produce immediately
+            self.last_produce = Some(target_time);
+            return;
         }
 
-        self.last_produce = Some(Instant::now());
+        let remaining = target_time - now;
+
+        // For waits longer than 2ms, sleep for most of it (leave 1ms for spin)
+        if remaining > Duration::from_millis(2) {
+            let sleep_duration = remaining - Duration::from_millis(1);
+            std::thread::sleep(sleep_duration);
+        }
+
+        // Spin-wait for the remaining time for precision
+        while Instant::now() < target_time {
+            std::hint::spin_loop();
+        }
+
+        // Update last_produce to target to avoid drift
+        self.last_produce = Some(target_time);
     }
 
     fn fill_frame(&mut self, data: &mut [u8]) {
@@ -552,8 +576,8 @@ impl Source for VideoTestSrc {
             }
         }
 
-        // Apply framerate limiting
-        self.apply_framerate_limit();
+        // Wait for next frame time (only in live mode)
+        self.wait_for_next_frame();
 
         // Create frame buffer
         let frame_size = self.frame_size();
