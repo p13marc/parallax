@@ -807,3 +807,124 @@ fn test_dynamic_pipeline_builder_creation() {
     assert_eq!(pipeline.node_count(), 0);
     assert!(pipeline.is_empty());
 }
+
+// ============================================================================
+// Phase 6: Plugin System Tests
+// ============================================================================
+
+/// Test plugin registry creation.
+#[test]
+fn test_plugin_registry_creation() {
+    use parallax::plugin::PluginRegistry;
+
+    let registry = PluginRegistry::new();
+    assert!(registry.list_plugins().is_empty());
+    assert!(registry.list_elements().is_empty());
+}
+
+/// Test plugin registry with custom search paths.
+#[test]
+fn test_plugin_registry_search_paths() {
+    use parallax::plugin::PluginRegistry;
+
+    let registry = PluginRegistry::with_search_paths(["/custom/path", "/another/path"]);
+    assert!(registry.list_plugins().is_empty());
+}
+
+/// Test plugin loader creation.
+#[test]
+fn test_plugin_loader_creation() {
+    use parallax::plugin::PluginLoader;
+
+    let loader = PluginLoader::new();
+    // Loader should be created successfully
+    let _ = loader;
+}
+
+/// Test loading nonexistent plugin fails gracefully.
+#[test]
+fn test_load_nonexistent_plugin() {
+    use parallax::plugin::{PluginError, PluginLoader};
+
+    let loader = PluginLoader::new();
+    let result = unsafe { loader.load_by_name("nonexistent_plugin_that_does_not_exist") };
+    assert!(matches!(result, Err(PluginError::LoadFailed(_))));
+}
+
+/// Test element factory lists built-in elements.
+#[test]
+fn test_element_factory_list_elements() {
+    use parallax::pipeline::ElementFactory;
+
+    let factory = ElementFactory::new();
+    let elements = factory.list_elements();
+
+    assert!(elements.contains(&"nullsource".to_string()));
+    assert!(elements.contains(&"nullsink".to_string()));
+    assert!(elements.contains(&"passthrough".to_string()));
+    assert!(elements.contains(&"tee".to_string()));
+    assert!(elements.contains(&"filesrc".to_string()));
+    assert!(elements.contains(&"filesink".to_string()));
+}
+
+/// Test element factory with plugin registry.
+#[test]
+fn test_element_factory_with_plugin_registry() {
+    use parallax::pipeline::ElementFactory;
+    use parallax::plugin::PluginRegistry;
+    use std::sync::Arc;
+
+    let registry = Arc::new(PluginRegistry::new());
+    let factory = ElementFactory::with_plugin_registry(registry);
+
+    // Built-in elements should still be available
+    assert!(factory.is_registered("nullsource"));
+    assert!(factory.is_registered("nullsink"));
+}
+
+/// Test plugin ABI version constant.
+#[test]
+fn test_plugin_abi_version() {
+    use parallax::plugin::PARALLAX_ABI_VERSION;
+
+    // ABI version should be 1 for this initial implementation
+    assert_eq!(PARALLAX_ABI_VERSION, 1);
+}
+
+/// Test plugin descriptor struct sizes are non-zero.
+#[test]
+fn test_plugin_descriptor_sizes() {
+    use parallax::plugin::{ElementDescriptor, PluginDescriptor};
+
+    assert!(std::mem::size_of::<PluginDescriptor>() > 0);
+    assert!(std::mem::size_of::<ElementDescriptor>() > 0);
+}
+
+/// Test creating element not in registry fails.
+#[test]
+fn test_create_element_not_in_registry() {
+    use parallax::plugin::{PluginError, PluginRegistry};
+
+    let registry = PluginRegistry::new();
+    let result = registry.create_element("nonexistent");
+    assert!(matches!(result, Err(PluginError::ElementNotFound(_))));
+}
+
+/// Test registry has_element returns false for unknown elements.
+#[test]
+fn test_registry_has_element() {
+    use parallax::plugin::PluginRegistry;
+
+    let registry = PluginRegistry::new();
+    assert!(!registry.has_element("nonexistent"));
+    assert!(!registry.has_element("doubler"));
+}
+
+/// Test unloading nonexistent plugin returns false.
+#[test]
+fn test_unload_nonexistent_plugin() {
+    use parallax::plugin::PluginRegistry;
+
+    let registry = PluginRegistry::new();
+    assert!(!registry.unload_plugin("nonexistent"));
+}

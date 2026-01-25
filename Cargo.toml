@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "parallax-macros", "examples/example-plugin"]
+
 [package]
 name = "parallax"
 version = "0.1.0"
@@ -43,6 +46,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Linux system APIs (memfd, mmap, SCM_RIGHTS)
 rustix = { version = "1.0", features = ["mm", "fs", "net", "process"] }
 futures = "0.3.31"
+libloading = "0.8.9"
+paste = "1.0.15"
+
+# Proc macros (optional, for plugin authoring convenience)
+parallax-macros = { path = "parallax-macros", optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
@@ -52,6 +60,7 @@ tempfile = "3.24.0"
 
 [features]
 default = []
+macros = ["parallax-macros"]  # Plugin authoring macros
 huge-pages = []       # MAP_HUGETLB support
 io-uring = []         # Future: io_uring async I/O
 gpu = []              # Future: CUDA/Vulkan pinned memory

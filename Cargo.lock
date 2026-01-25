@@ -263,6 +263,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "example-plugin"
+version = "0.1.0"
+dependencies = [
+ "parallax",
+ "paste",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -480,6 +488,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bcc35a38544a891a5f7c865aca548a982ccb3b8650a5b06d0fd33a10283c56fc"
 
 [[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -596,7 +614,10 @@ dependencies = [
  "daggy",
  "futures",
  "kanal",
+ "libloading",
  "metrics",
+ "parallax-macros",
+ "paste",
  "proptest",
  "rkyv",
  "rustix",
@@ -611,6 +632,21 @@ dependencies = [
  "tracing-subscriber",
  "winnow",
 ]
+
+[[package]]
+name = "parallax-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "paste"
+version = "1.0.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "petgraph"

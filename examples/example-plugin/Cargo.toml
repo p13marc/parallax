@@ -1,0 +1,14 @@
+[package]
+name = "example-plugin"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Example plugin for Parallax"
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+parallax = { path = "../.." }
+paste = "1.0"

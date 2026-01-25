@@ -4,7 +4,9 @@ use crate::element::{ElementAdapter, ElementDyn, SinkAdapter, SourceAdapter};
 use crate::elements::{FileSink, FileSrc, NullSink, NullSource, PassThrough, Tee};
 use crate::error::{Error, Result};
 use crate::pipeline::parser::{ParsedElement, PropertyValue};
+use crate::plugin::PluginRegistry;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Type alias for element constructor functions.
 type ElementConstructor = fn(&HashMap<String, PropertyValue>) -> Result<Box<dyn ElementDyn>>;
@@ -12,6 +14,8 @@ type ElementConstructor = fn(&HashMap<String, PropertyValue>) -> Result<Box<dyn 
 /// Registry of element constructors.
 pub struct ElementFactory {
     constructors: HashMap<String, ElementConstructor>,
+    /// Optional plugin registry for dynamically loaded elements.
+    plugin_registry: Option<Arc<PluginRegistry>>,
 }
 
 impl ElementFactory {
@@ -19,6 +23,7 @@ impl ElementFactory {
     pub fn new() -> Self {
         let mut factory = Self {
             constructors: HashMap::new(),
+            plugin_registry: None,
         };
 
         // Register built-in elements
@@ -32,6 +37,21 @@ impl ElementFactory {
         factory
     }
 
+    /// Create a factory with a plugin registry.
+    ///
+    /// Elements from the plugin registry will be available in addition
+    /// to built-in elements. Built-in elements take precedence.
+    pub fn with_plugin_registry(registry: Arc<PluginRegistry>) -> Self {
+        let mut factory = Self::new();
+        factory.plugin_registry = Some(registry);
+        factory
+    }
+
+    /// Set the plugin registry.
+    pub fn set_plugin_registry(&mut self, registry: Arc<PluginRegistry>) {
+        self.plugin_registry = Some(registry);
+    }
+
     /// Register a custom element constructor.
     pub fn register(&mut self, name: &str, constructor: ElementConstructor) {
         self.constructors.insert(name.to_string(), constructor);
@@ -39,18 +59,50 @@ impl ElementFactory {
 
     /// Create an element from a parsed description.
     pub fn create(&self, parsed: &ParsedElement) -> Result<Box<dyn ElementDyn>> {
-        let constructor = self
-            .constructors
-            .get(&parsed.name)
-            .ok_or_else(|| Error::InvalidSegment(format!("unknown element: {}", parsed.name)))?;
+        // First try built-in constructors
+        if let Some(constructor) = self.constructors.get(&parsed.name) {
+            let props: HashMap<String, PropertyValue> = parsed.properties.iter().cloned().collect();
+            return constructor(&props);
+        }
 
-        let props: HashMap<String, PropertyValue> = parsed.properties.iter().cloned().collect();
-        constructor(&props)
+        // Then try the plugin registry
+        if let Some(ref registry) = self.plugin_registry {
+            if registry.has_element(&parsed.name) {
+                return registry.create_element(&parsed.name).map_err(|e| {
+                    Error::InvalidSegment(format!(
+                        "failed to create element '{}': {}",
+                        parsed.name, e
+                    ))
+                });
+            }
+        }
+
+        Err(Error::InvalidSegment(format!(
+            "unknown element: {}",
+            parsed.name
+        )))
     }
 
     /// Check if an element type is registered.
     pub fn is_registered(&self, name: &str) -> bool {
-        self.constructors.contains_key(name)
+        if self.constructors.contains_key(name) {
+            return true;
+        }
+        if let Some(ref registry) = self.plugin_registry {
+            return registry.has_element(name);
+        }
+        false
+    }
+
+    /// List all available element names.
+    pub fn list_elements(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.constructors.keys().cloned().collect();
+        if let Some(ref registry) = self.plugin_registry {
+            names.extend(registry.list_elements());
+        }
+        names.sort();
+        names.dedup();
+        names
     }
 }
 
