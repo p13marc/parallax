@@ -10,6 +10,7 @@
 //! - [`AppSrc`]: Injects buffers from application code
 //! - [`DataSrc`]: Generates buffers from inline data
 //! - [`TestSrc`]: Generates test pattern buffers
+//! - [`VideoTestSrc`]: Generates video test pattern frames (SMPTE bars, etc.)
 //! - [`MemorySrc`]: Reads from memory buffer/slice
 //! - [`NullSource`]: Produces empty buffers (useful for testing)
 //!
@@ -103,6 +104,10 @@
 //! - [`TsFrame`]: Extracted elementary stream frame
 //! - [`TsStreamType`]: Stream type classification (H.264, AAC, etc.)
 //!
+//! ## Iced Video Sink (requires `iced-sink` feature)
+//! - [`IcedVideoSink`]: Display video frames in an Iced GUI window
+//! - [`IcedVideoSinkHandle`]: Handle to run and control the video window
+//!
 //! ## Data Processing (Tier 5)
 //! - [`FlatMap`]: One-to-many buffer transformation
 //! - [`DuplicateFilter`]: Remove duplicate buffers by content hash
@@ -142,6 +147,7 @@ mod transform;
 mod udp;
 mod unix;
 mod valve;
+mod videotestsrc;
 
 // Tier 3: Network elements
 mod multicast;
@@ -177,6 +183,9 @@ mod rtsp;
 #[cfg(feature = "mpeg-ts")]
 mod mpegts;
 
+#[cfg(feature = "iced-sink")]
+mod iced_sink;
+
 // Sources
 pub use appsrc::{AppSrc, AppSrcHandle, AppSrcStats};
 pub use datasrc::DataSrc;
@@ -187,6 +196,7 @@ pub use null::NullSource;
 pub use tcp::{AsyncTcpSrc, TcpMode, TcpSrc};
 pub use testsrc::{TestPattern, TestSrc};
 pub use udp::{AsyncUdpSrc, UdpSrc};
+pub use videotestsrc::{PixelFormat, VideoPattern, VideoTestSrc};
 
 // Sinks
 pub use appsink::{AppSink, AppSinkHandle, AppSinkStats};
@@ -282,6 +292,12 @@ pub use rtsp::{
 #[cfg(feature = "mpeg-ts")]
 pub use mpegts::{
     TS_PACKET_SIZE, TsDemux, TsDemuxStats, TsElementaryStream, TsFrame, TsProgram, TsStreamType,
+};
+
+// Iced Video Sink (feature-gated)
+#[cfg(feature = "iced-sink")]
+pub use iced_sink::{
+    IcedVideoSink, IcedVideoSinkConfig, IcedVideoSinkHandle, IcedVideoSinkStats, InputPixelFormat,
 };
 
 // Tier 5: Data processing
