@@ -2,7 +2,7 @@
 
 This document outlines the implementation plan for pure Rust media streaming elements equivalent to GStreamer's `udpsrc`, `udpsink`, `rtspsrc`, `rtpsrc`, `rtpsink`, `videoscale`, and MPEG-TS related elements.
 
-> **Status:** Phases 0-4 are **COMPLETE**. Ready for Phase 5 (MPEG-TS).
+> **Status:** Phases 0-5 are **COMPLETE**. Ready for Phase 6 (Video Scaling).
 >
 > **Foundation completed items:**
 > - ✅ `MediaFormat` enum with `VideoFormat`, `AudioFormat`, `RtpFormat`, `MpegTs`, `Bytes`
@@ -316,30 +316,51 @@ while let Some(frame) = session.next_frame().await? {
 }
 ```
 
-### Phase 5: MPEG-TS (2 weeks)
+### Phase 5: MPEG-TS ✅ COMPLETE
 
-**Goal:** Demux/mux MPEG-TS streams
+**Goal:** Demux MPEG-TS streams
 
 ```
-5.1 TsDemux using mpeg2ts-reader traits
-5.2 Elementary stream extraction (PES)
-5.3 PAT/PMT parsing
-5.4 TsMux (basic implementation)
+5.1 ✅ TsDemux using mpeg2ts-reader traits
+5.2 ✅ Elementary stream extraction (PES)
+5.3 ✅ PAT/PMT parsing
+5.4 TsMux (deferred - not commonly needed)
 ```
 
-**Design:**
+**Implemented in `src/elements/mpegts.rs`:**
+
+| Element | Description |
+|---------|-------------|
+| `TsDemux` | MPEG Transport Stream demultiplexer |
+| `TsFrame` | Extracted elementary stream frame with PTS/DTS |
+| `TsStreamType` | Stream type classification (H.264, H.265, AAC, etc.) |
+| `TsDemuxStats` | Demuxer statistics |
+| `TsProgram` | Program information |
+| `TsElementaryStream` | Elementary stream info |
+
+**Features:**
+- Automatic PAT/PMT parsing and stream discovery
+- Elementary stream extraction with PTS/DTS timestamps
+- Support for H.264, H.265, MPEG-2 video
+- Support for AAC (ADTS/LATM), MPEG audio, AC-3 audio
+- Stream type filtering (video-only, audio-only, or specific types)
+- Partial packet handling for non-aligned input
+- Sync byte detection and error recovery
+- Statistics tracking (packets, bytes, frames, errors)
+
+**Example:**
 
 ```rust
-pub struct TsDemux {
-    demuxer: mpeg2ts_reader::demultiplex::Demultiplex<...>,
-    // Output queues per PID
-}
+let mut demux = TsDemux::new(); // or TsDemux::video_only()
 
-impl Element for TsDemux {
-    fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
-        // Feed TS packets to demuxer
-        // Emit PES payloads as buffers with stream_id metadata
+// Feed TS data (any size, handles alignment internally)
+for frame in demux.push(&ts_data)? {
+    match frame.stream_type {
+        TsStreamType::H264 => { /* video frame */ },
+        TsStreamType::AacAdts => { /* audio frame */ },
+        _ => {}
     }
+    // frame.pts and frame.dts contain timestamps
 }
 ```
 

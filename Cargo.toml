@@ -73,6 +73,9 @@ webrtc-util-0_10 = { package = "webrtc-util", version = "0.10", optional = true 
 retina = { version = "0.4", optional = true }
 url = { version = "2", optional = true }
 
+# MPEG-TS demuxer (optional)
+mpeg2ts-reader = { version = "0.18", optional = true }
+
 # Regex (for RegexFilter)
 regex = "1"
 
@@ -94,6 +97,7 @@ websocket = ["tungstenite"]  # WebSocket source/sink elements
 zenoh = ["dep:zenoh"] # Zenoh pub/sub elements
 rtp = ["dep:rtp", "dep:rtcp", "dep:webrtc-util", "dep:webrtc-util-0_10"]  # RTP/RTCP elements
 rtsp = ["rtp", "dep:retina", "dep:url"]  # RTSP client (includes RTP support)
+mpeg-ts = ["dep:mpeg2ts-reader"]  # MPEG-TS demuxer
 
 [[bench]]
 name = "throughput"

@@ -98,6 +98,11 @@
 //! - [`RtspSrc`]: RTSP client source (connects to cameras/servers)
 //! - [`RtspSession`]: Active RTSP session for receiving frames
 //!
+//! ## MPEG-TS (requires `mpeg-ts` feature)
+//! - [`TsDemux`]: MPEG Transport Stream demultiplexer
+//! - [`TsFrame`]: Extracted elementary stream frame
+//! - [`TsStreamType`]: Stream type classification (H.264, AAC, etc.)
+//!
 //! ## Data Processing (Tier 5)
 //! - [`FlatMap`]: One-to-many buffer transformation
 //! - [`DuplicateFilter`]: Remove duplicate buffers by content hash
@@ -168,6 +173,9 @@ mod jitter_buffer;
 
 #[cfg(feature = "rtsp")]
 mod rtsp;
+
+#[cfg(feature = "mpeg-ts")]
+mod mpegts;
 
 // Sources
 pub use appsrc::{AppSrc, AppSrcHandle, AppSrcStats};
@@ -268,6 +276,12 @@ pub use jitter_buffer::{
 pub use rtsp::{
     MediaType, RtspConfig, RtspCredentials, RtspFrame, RtspSession, RtspSrc, RtspStats,
     RtspTransport, StreamInfo, StreamSelection,
+};
+
+// MPEG-TS (feature-gated)
+#[cfg(feature = "mpeg-ts")]
+pub use mpegts::{
+    TS_PACKET_SIZE, TsDemux, TsDemuxStats, TsElementaryStream, TsFrame, TsProgram, TsStreamType,
 };
 
 // Tier 5: Data processing
