@@ -128,6 +128,9 @@ pub struct VideoTestSrc {
     sequence: u64,
     frames_produced: u64,
     last_produce: Option<Instant>,
+    /// Whether to apply framerate limiting (sleep between frames).
+    /// Disable this when using in a pipeline where flow is controlled externally.
+    live: bool,
     // Pattern-specific state
     solid_color: (u8, u8, u8),
     checker_size: u32,
@@ -142,7 +145,7 @@ pub struct VideoTestSrc {
 impl VideoTestSrc {
     /// Create a new video test source with default settings.
     ///
-    /// Defaults to SMPTE color bars at 640x480 @ 30fps.
+    /// Defaults to SMPTE color bars at 640x480 @ 30fps, non-live (no framerate limiting).
     pub fn new() -> Self {
         Self {
             name: "videotestsrc".to_string(),
@@ -156,6 +159,7 @@ impl VideoTestSrc {
             sequence: 0,
             frames_produced: 0,
             last_produce: None,
+            live: false,
             solid_color: (128, 128, 128),
             checker_size: 32,
             ball_x: 100.0,
@@ -245,6 +249,19 @@ impl VideoTestSrc {
         self
     }
 
+    /// Enable live mode (real-time framerate limiting).
+    ///
+    /// When enabled, the source will sleep between frames to maintain the
+    /// configured framerate. This is useful for standalone use but should
+    /// be disabled when using in a pipeline where flow is controlled by
+    /// backpressure or an external clock.
+    ///
+    /// Default: `false` (no framerate limiting)
+    pub fn live(mut self, enabled: bool) -> Self {
+        self.live = enabled;
+        self
+    }
+
     /// Get the number of frames produced.
     pub fn frames_produced(&self) -> u64 {
         self.frames_produced
@@ -285,6 +302,11 @@ impl VideoTestSrc {
     }
 
     fn apply_framerate_limit(&mut self) {
+        // Only apply framerate limiting in live mode
+        if !self.live {
+            return;
+        }
+
         let frame_duration = self.frame_duration();
         if frame_duration.is_none() {
             return;
