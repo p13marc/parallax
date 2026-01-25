@@ -150,7 +150,7 @@ impl crate::element::Source for UdpSrc {
                 self.sequence += 1;
 
                 let handle = crate::buffer::MemoryHandle::from_segment_with_len(segment, n);
-                let metadata = Metadata::with_sequence(seq);
+                let metadata = Metadata::from_sequence(seq);
                 Ok(Some(Buffer::new(handle, metadata)))
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -400,7 +400,7 @@ impl AsyncUdpSrc {
         self.sequence += 1;
 
         let handle = crate::buffer::MemoryHandle::from_segment_with_len(segment, n);
-        let metadata = Metadata::with_sequence(seq);
+        let metadata = Metadata::from_sequence(seq);
         Ok(Some(Buffer::new(handle, metadata)))
     }
 }

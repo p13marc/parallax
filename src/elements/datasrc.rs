@@ -169,7 +169,7 @@ impl Source for DataSrc {
         }
 
         let handle = MemoryHandle::from_segment_with_len(segment, chunk_len);
-        let metadata = Metadata::with_sequence(self.sequence);
+        let metadata = Metadata::from_sequence(self.sequence);
 
         self.position = end;
         self.sequence += 1;

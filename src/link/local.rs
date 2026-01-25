@@ -167,7 +167,7 @@ mod tests {
         let segment = Arc::new(HeapSegment::new(64).unwrap());
         Buffer::new(
             MemoryHandle::from_segment(segment),
-            Metadata::with_sequence(seq),
+            Metadata::from_sequence(seq),
         )
     }
 

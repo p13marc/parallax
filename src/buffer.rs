@@ -177,7 +177,7 @@ impl std::fmt::Debug for MemoryHandle {
 /// // Create a buffer from a heap segment
 /// let segment = Arc::new(HeapSegment::new(1024).unwrap());
 /// let handle = MemoryHandle::from_segment(segment);
-/// let buffer = Buffer::<()>::new(handle, Metadata::with_sequence(0));
+/// let buffer = Buffer::<()>::new(handle, Metadata::from_sequence(0));
 ///
 /// // Clone is O(1) - just Arc increment
 /// let buffer2 = buffer.clone();
@@ -325,7 +325,7 @@ mod tests {
     fn make_test_buffer(size: usize) -> Buffer {
         let segment = Arc::new(HeapSegment::new(size).unwrap());
         let handle = MemoryHandle::from_segment(segment);
-        Buffer::new(handle, Metadata::with_sequence(42))
+        Buffer::new(handle, Metadata::from_sequence(42))
     }
 
     #[test]

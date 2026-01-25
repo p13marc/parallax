@@ -29,7 +29,7 @@ use std::sync::Arc;
 /// // Create a test buffer
 /// # let segment = Arc::new(HeapSegment::new(8).unwrap());
 /// # let handle = MemoryHandle::from_segment(segment);
-/// # let buffer = Buffer::new(handle, Metadata::with_sequence(0));
+/// # let buffer = Buffer::new(handle, Metadata::from_sequence(0));
 ///
 /// // NullSink just discards the buffer
 /// sink.consume(buffer).unwrap();
@@ -158,7 +158,7 @@ impl Source for NullSource {
 
         let segment = Arc::new(HeapSegment::new(self.buffer_size)?);
         let handle = MemoryHandle::from_segment(segment);
-        let buffer = Buffer::new(handle, Metadata::with_sequence(self.current));
+        let buffer = Buffer::new(handle, Metadata::from_sequence(self.current));
 
         self.current += 1;
         Ok(Some(buffer))
@@ -180,7 +180,7 @@ mod tests {
 
         let segment = Arc::new(HeapSegment::new(64).unwrap());
         let handle = MemoryHandle::from_segment(segment);
-        let buffer = Buffer::new(handle, Metadata::with_sequence(0));
+        let buffer = Buffer::new(handle, Metadata::from_sequence(0));
 
         sink.consume(buffer).unwrap();
         assert_eq!(sink.count(), 1);

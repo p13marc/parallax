@@ -121,7 +121,7 @@ impl Source for FileSrc {
 
         // Create a handle that only covers the bytes actually read
         let handle = MemoryHandle::new(segment, 0, bytes_read);
-        let metadata = Metadata::with_sequence(self.sequence);
+        let metadata = Metadata::from_sequence(self.sequence);
         self.sequence += 1;
 
         Ok(Some(Buffer::new(handle, metadata)))
@@ -309,7 +309,7 @@ mod tests {
                 std::ptr::copy_nonoverlapping(b"Hello, World!".as_ptr(), ptr, 13);
             }
             let handle = MemoryHandle::new(segment, 0, 13);
-            let buffer = Buffer::new(handle, Metadata::with_sequence(0));
+            let buffer = Buffer::new(handle, Metadata::from_sequence(0));
 
             sink.consume(buffer).unwrap();
             assert_eq!(sink.bytes_written(), 13);
@@ -350,7 +350,7 @@ mod tests {
                 std::ptr::copy_nonoverlapping(original_data.as_ptr(), ptr, original_data.len());
             }
             let handle = MemoryHandle::from_segment(segment);
-            let buffer = Buffer::new(handle, Metadata::with_sequence(0));
+            let buffer = Buffer::new(handle, Metadata::from_sequence(0));
             sink.consume(buffer).unwrap();
         }
 

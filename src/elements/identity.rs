@@ -129,7 +129,7 @@ mod tests {
     fn create_test_buffer(size: usize, seq: u64) -> Buffer {
         let segment = Arc::new(HeapSegment::new(size).unwrap());
         let handle = MemoryHandle::from_segment(segment);
-        Buffer::new(handle, Metadata::with_sequence(seq))
+        Buffer::new(handle, Metadata::from_sequence(seq))
     }
 
     #[test]

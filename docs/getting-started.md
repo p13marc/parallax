@@ -41,7 +41,7 @@ impl Source for CountingSource {
         
         let segment = Arc::new(HeapSegment::new(64)?);
         let handle = MemoryHandle::from_segment(segment);
-        let buffer = Buffer::new(handle, Metadata::with_sequence(self.current));
+        let buffer = Buffer::new(handle, Metadata::from_sequence(self.current));
         
         self.current += 1;
         Ok(Some(buffer))
@@ -128,7 +128,7 @@ use parallax::metadata::Metadata;
 // Create a buffer
 let segment = Arc::new(HeapSegment::new(1024)?);
 let handle = MemoryHandle::from_segment(segment);
-let buffer = Buffer::<()>::new(handle, Metadata::with_sequence(0));
+let buffer = Buffer::<()>::new(handle, Metadata::from_sequence(0));
 
 // Access buffer properties
 println!("Length: {}", buffer.len());

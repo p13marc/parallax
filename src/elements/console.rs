@@ -221,7 +221,7 @@ mod tests {
             std::ptr::copy_nonoverlapping(data.as_ptr(), segment.as_mut_ptr().unwrap(), data.len());
         }
         let handle = MemoryHandle::from_segment(segment);
-        Buffer::new(handle, Metadata::with_sequence(sequence))
+        Buffer::new(handle, Metadata::from_sequence(sequence))
     }
 
     #[test]

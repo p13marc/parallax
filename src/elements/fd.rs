@@ -154,7 +154,7 @@ impl Source for FdSrc {
                 self.sequence += 1;
 
                 let handle = MemoryHandle::from_segment_with_len(segment, n);
-                let metadata = Metadata::with_sequence(seq);
+                let metadata = Metadata::from_sequence(seq);
 
                 Ok(Some(Buffer::new(handle, metadata)))
             }

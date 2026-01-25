@@ -359,7 +359,7 @@ impl NetworkReceiver {
                 }
 
                 let handle = MemoryHandle::from_segment(segment);
-                let metadata = Metadata::with_sequence(sequence);
+                let metadata = Metadata::from_sequence(sequence);
 
                 Ok(Some(Buffer::new(handle, metadata)))
             }
@@ -394,7 +394,7 @@ mod tests {
         }
         Buffer::new(
             MemoryHandle::from_segment(segment),
-            Metadata::with_sequence(seq),
+            Metadata::from_sequence(seq),
         )
     }
 

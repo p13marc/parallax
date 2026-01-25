@@ -32,7 +32,7 @@ use crate::error::Result;
 /// // Create and process a buffer
 /// # let segment = Arc::new(HeapSegment::new(8).unwrap());
 /// # let handle = MemoryHandle::from_segment(segment);
-/// # let buffer = Buffer::new(handle, Metadata::with_sequence(0));
+/// # let buffer = Buffer::new(handle, Metadata::from_sequence(0));
 ///
 /// let result = tee.process(buffer).unwrap();
 /// assert!(result.is_some());
@@ -114,7 +114,7 @@ mod tests {
 
         let segment = Arc::new(HeapSegment::new(64).unwrap());
         let handle = MemoryHandle::from_segment(segment);
-        let buffer = Buffer::new(handle, Metadata::with_sequence(42));
+        let buffer = Buffer::new(handle, Metadata::from_sequence(42));
 
         let result = tee.process(buffer).unwrap();
         assert!(result.is_some());
@@ -130,7 +130,7 @@ mod tests {
         // Process a 64-byte buffer
         let segment = Arc::new(HeapSegment::new(64).unwrap());
         let handle = MemoryHandle::from_segment(segment);
-        let buffer = Buffer::new(handle, Metadata::with_sequence(0));
+        let buffer = Buffer::new(handle, Metadata::from_sequence(0));
         tee.process(buffer).unwrap();
 
         assert_eq!(tee.count(), 1);
@@ -139,7 +139,7 @@ mod tests {
         // Process another 128-byte buffer
         let segment = Arc::new(HeapSegment::new(128).unwrap());
         let handle = MemoryHandle::from_segment(segment);
-        let buffer = Buffer::new(handle, Metadata::with_sequence(1));
+        let buffer = Buffer::new(handle, Metadata::from_sequence(1));
         tee.process(buffer).unwrap();
 
         assert_eq!(tee.count(), 2);
@@ -152,7 +152,7 @@ mod tests {
 
         let segment = Arc::new(HeapSegment::new(64).unwrap());
         let handle = MemoryHandle::from_segment(segment);
-        let buffer = Buffer::new(handle, Metadata::with_sequence(0));
+        let buffer = Buffer::new(handle, Metadata::from_sequence(0));
         tee.process(buffer).unwrap();
 
         assert_eq!(tee.count(), 1);

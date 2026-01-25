@@ -233,7 +233,7 @@ async fn test_pipeline_abort() {
         fn produce(&mut self) -> Result<Option<Buffer>> {
             let segment = std::sync::Arc::new(HeapSegment::new(64)?);
             let handle = MemoryHandle::from_segment(segment);
-            let buffer = Buffer::new(handle, Metadata::with_sequence(self.seq));
+            let buffer = Buffer::new(handle, Metadata::from_sequence(self.seq));
             self.seq += 1;
             Ok(Some(buffer))
         }

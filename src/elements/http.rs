@@ -174,7 +174,7 @@ impl Source for HttpSrc {
                 self.sequence += 1;
 
                 let handle = MemoryHandle::from_segment_with_len(segment, n);
-                Ok(Some(Buffer::new(handle, Metadata::with_sequence(seq))))
+                Ok(Some(Buffer::new(handle, Metadata::from_sequence(seq))))
             }
             Err(e) => Err(Error::Io(e)),
         }

@@ -100,7 +100,7 @@ fn make_buffer_with_data(data: &[u8], seq: u64) -> Buffer {
         std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
     }
     let handle = MemoryHandle::from_segment_with_len(segment, data.len());
-    Buffer::new(handle, Metadata::with_sequence(seq))
+    Buffer::new(handle, Metadata::from_sequence(seq))
 }
 
 fn make_buffer(seq: u64) -> Buffer {
@@ -225,7 +225,7 @@ fn example_timestamper() -> Result<()> {
 fn example_metadata_inject() -> Result<()> {
     let mut inject = MetadataInject::new()
         .with_stream_id(42)
-        .with_duration(Duration::from_millis(100))
+        .with_duration_from(Duration::from_millis(100))
         .with_offset(1000)
         .with_name("meta_inject");
 

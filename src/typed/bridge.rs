@@ -55,7 +55,7 @@ where
                 }
 
                 let handle = MemoryHandle::from_segment(segment);
-                let metadata = Metadata::with_sequence(self.sequence);
+                let metadata = Metadata::from_sequence(self.sequence);
                 self.sequence += 1;
 
                 Ok(Some(Buffer::new(handle, metadata)))

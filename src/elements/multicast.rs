@@ -135,14 +135,14 @@ impl Source for UdpMulticastSrc {
                 self.sequence += 1;
 
                 let handle = MemoryHandle::from_segment_with_len(segment, n);
-                Ok(Some(Buffer::new(handle, Metadata::with_sequence(seq))))
+                Ok(Some(Buffer::new(handle, Metadata::from_sequence(seq))))
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 // Timeout
                 let segment = Arc::new(HeapSegment::new(1)?);
                 let handle = MemoryHandle::from_segment_with_len(segment, 0);
-                let mut meta = Metadata::with_sequence(self.sequence);
-                meta.flags.timeout = true;
+                let mut meta = Metadata::from_sequence(self.sequence);
+                meta.flags = meta.flags.insert(crate::metadata::BufferFlags::TIMEOUT);
                 self.sequence += 1;
                 Ok(Some(Buffer::new(handle, meta)))
             }
@@ -322,7 +322,7 @@ mod tests {
             }
         }
         let handle = MemoryHandle::from_segment_with_len(segment, data.len());
-        Buffer::new(handle, Metadata::with_sequence(seq))
+        Buffer::new(handle, Metadata::from_sequence(seq))
     }
 
     #[test]
@@ -373,7 +373,7 @@ mod tests {
 
             // Wait for data
             match src.produce()? {
-                Some(buf) if !buf.metadata().flags.timeout => Ok(buf.as_bytes().to_vec()),
+                Some(buf) if !buf.metadata().flags.is_timeout() => Ok(buf.as_bytes().to_vec()),
                 _ => Ok(vec![]),
             }
         });

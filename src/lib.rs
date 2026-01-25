@@ -36,9 +36,11 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod buffer;
+pub mod clock;
 pub mod element;
 pub mod elements;
 pub mod error;
+pub mod format;
 pub mod link;
 pub mod memory;
 pub mod metadata;
@@ -51,10 +53,15 @@ pub mod typed;
 /// Prelude for convenient imports
 pub mod prelude {
     pub use crate::buffer::Buffer;
-    pub use crate::element::{AsyncSink, AsyncSource, Element, ElementDyn, Sink, Source};
+    pub use crate::clock::{Clock, ClockTime, PipelineClock};
+    pub use crate::element::{
+        AsyncSink, AsyncSource, AsyncTransform, Element, ElementDyn, Output, Sink, Source,
+        Transform,
+    };
     pub use crate::error::{Error, Result};
+    pub use crate::format::{AudioFormat, Caps, MediaFormat, RtpFormat, VideoFormat};
     pub use crate::memory::{MemoryPool, MemorySegment, MemoryType};
-    pub use crate::metadata::Metadata;
+    pub use crate::metadata::{BufferFlags, Metadata, RtpMeta};
     pub use crate::pipeline::{Pipeline, PipelineExecutor};
 }
 

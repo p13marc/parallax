@@ -181,8 +181,8 @@ impl Source for ZenohSrc {
                     // Return timeout buffer
                     let segment = Arc::new(HeapSegment::new(1)?);
                     let handle = MemoryHandle::from_segment_with_len(segment, 0);
-                    let mut meta = Metadata::with_sequence(self.sequence);
-                    meta.flags.timeout = true;
+                    let mut meta = Metadata::from_sequence(self.sequence);
+                    meta.flags = meta.flags.insert(crate::metadata::BufferFlags::TIMEOUT);
                     self.sequence += 1;
                     return Ok(Some(Buffer::new(handle, meta)));
                 }
@@ -212,7 +212,7 @@ impl Source for ZenohSrc {
         }
 
         let handle = MemoryHandle::from_segment_with_len(segment, data.len());
-        let mut meta = Metadata::with_sequence(seq);
+        let mut meta = Metadata::from_sequence(seq);
 
         // Store key expression in metadata if different from subscription
         let key = sample.key_expr().as_str();
@@ -616,7 +616,7 @@ impl ZenohQuerier {
                     }
 
                     let handle = MemoryHandle::from_segment_with_len(segment, data.len());
-                    buffers.push(Buffer::new(handle, Metadata::with_sequence(seq)));
+                    buffers.push(Buffer::new(handle, Metadata::from_sequence(seq)));
                     seq += 1;
                     self.replies_received += 1;
                 }
@@ -659,7 +659,7 @@ impl ZenohQuerier {
                     }
 
                     let handle = MemoryHandle::from_segment_with_len(segment, data.len());
-                    buffers.push(Buffer::new(handle, Metadata::with_sequence(seq)));
+                    buffers.push(Buffer::new(handle, Metadata::from_sequence(seq)));
                     seq += 1;
                     self.replies_received += 1;
                 }

@@ -93,7 +93,7 @@ impl Timeout {
 
         let handle = MemoryHandle::from_segment_with_len(segment, len);
         let mut metadata = Metadata::new();
-        metadata.flags.set_timeout(true);
+        metadata.flags = metadata.flags.insert(crate::metadata::BufferFlags::TIMEOUT);
 
         Ok(Some(Buffer::new(handle, metadata)))
     }
@@ -334,7 +334,7 @@ mod tests {
     fn create_test_buffer(seq: u64) -> Buffer {
         let segment = Arc::new(HeapSegment::new(64).unwrap());
         let handle = MemoryHandle::from_segment(segment);
-        Buffer::new(handle, Metadata::with_sequence(seq))
+        Buffer::new(handle, Metadata::from_sequence(seq))
     }
 
     // Timeout tests

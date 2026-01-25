@@ -232,7 +232,7 @@ impl Source for TestSrc {
         self.fill_buffer(data);
 
         let handle = MemoryHandle::from_segment_with_len(segment, self.buffer_size);
-        let metadata = Metadata::with_sequence(self.sequence);
+        let metadata = Metadata::from_sequence(self.sequence);
 
         self.sequence += 1;
         self.bytes_produced += self.buffer_size as u64;

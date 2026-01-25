@@ -42,7 +42,7 @@ fn make_buffer(data: &[u8], seq: u64) -> Buffer {
         }
     }
     let handle = MemoryHandle::from_segment_with_len(segment, data.len());
-    Buffer::new(handle, Metadata::with_sequence(seq))
+    Buffer::new(handle, Metadata::from_sequence(seq))
 }
 
 /// Demonstrates Unix domain socket communication.
@@ -64,7 +64,7 @@ fn example_unix_sockets() -> Result<()> {
         // Read until we have enough data
         while received.len() < 11 {
             if let Some(buf) = src.produce()? {
-                if buf.metadata().flags.eos {
+                if buf.metadata().flags.is_eos() {
                     break;
                 }
                 received.extend_from_slice(buf.as_bytes());
@@ -108,7 +108,7 @@ fn example_udp_multicast() -> Result<()> {
 
         // Wait for one datagram
         match src.produce()? {
-            Some(buf) if !buf.metadata().flags.timeout => {
+            Some(buf) if !buf.metadata().flags.is_timeout() => {
                 println!("   Receiver: got {} bytes", buf.len());
                 Ok(Some(buf.as_bytes().to_vec()))
             }

@@ -359,7 +359,7 @@ mod tests {
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
         }
         let handle = MemoryHandle::from_segment_with_len(segment, data.len());
-        Buffer::new(handle, Metadata::with_sequence(seq))
+        Buffer::new(handle, Metadata::from_sequence(seq))
     }
 
     // BufferTrim tests

@@ -45,7 +45,7 @@ impl Source for BenchSource {
         self.remaining -= 1;
         let segment = Arc::new(HeapSegment::new(self.buffer_size).unwrap());
         let handle = MemoryHandle::from_segment(segment);
-        let buffer = Buffer::<()>::new(handle, Metadata::with_sequence(self.sequence));
+        let buffer = Buffer::<()>::new(handle, Metadata::from_sequence(self.sequence));
         self.sequence += 1;
         Ok(Some(buffer))
     }
@@ -148,7 +148,7 @@ fn bench_channel_throughput(c: &mut Criterion) {
                                 let segment = Arc::new(HeapSegment::new(64).unwrap());
                                 let handle = MemoryHandle::from_segment(segment);
                                 let buffer =
-                                    Buffer::<()>::new(handle, Metadata::with_sequence(i as u64));
+                                    Buffer::<()>::new(handle, Metadata::from_sequence(i as u64));
                                 tx.send(buffer).unwrap();
                             }
                         });

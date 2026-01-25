@@ -3,6 +3,7 @@
 //! Elements for manipulating buffer metadata: timestamps, sequence numbers, etc.
 
 use crate::buffer::Buffer;
+use crate::clock::ClockTime;
 use crate::element::Element;
 use crate::error::Result;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -164,10 +165,13 @@ impl Timestamper {
     }
 
     /// Get current timestamp based on mode.
-    fn get_timestamp(&self) -> Option<Duration> {
+    fn get_timestamp(&self) -> Option<ClockTime> {
         match self.mode {
-            TimestampMode::SystemTime => SystemTime::now().duration_since(UNIX_EPOCH).ok(),
-            TimestampMode::Monotonic => Some(self.start_instant.elapsed()),
+            TimestampMode::SystemTime => SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .map(ClockTime::from),
+            TimestampMode::Monotonic => Some(ClockTime::from(self.start_instant.elapsed())),
             TimestampMode::Preserve | TimestampMode::PtsOnly | TimestampMode::DtsOnly => None,
         }
     }
@@ -181,18 +185,18 @@ impl Element for Timestamper {
             TimestampMode::SystemTime | TimestampMode::Monotonic => {
                 if let Some(ts) = self.get_timestamp() {
                     let meta = buffer.metadata_mut();
-                    meta.pts = Some(ts);
-                    meta.dts = Some(ts);
+                    meta.pts = ts;
+                    meta.dts = ts;
                 }
             }
             TimestampMode::PtsOnly => {
                 if let Some(ts) = self.get_timestamp() {
-                    buffer.metadata_mut().pts = Some(ts);
+                    buffer.metadata_mut().pts = ts;
                 }
             }
             TimestampMode::DtsOnly => {
                 if let Some(ts) = self.get_timestamp() {
-                    buffer.metadata_mut().dts = Some(ts);
+                    buffer.metadata_mut().dts = ts;
                 }
             }
             TimestampMode::Preserve => {
@@ -221,10 +225,9 @@ impl Element for Timestamper {
 /// ```
 pub struct MetadataInject {
     name: String,
-    stream_id: Option<u64>,
-    duration: Option<Duration>,
+    stream_id: Option<u32>,
+    duration: Option<ClockTime>,
     offset: Option<u64>,
-    offset_end: Option<u64>,
     count: AtomicU64,
 }
 
@@ -236,7 +239,6 @@ impl MetadataInject {
             stream_id: None,
             duration: None,
             offset: None,
-            offset_end: None,
             count: AtomicU64::new(0),
         }
     }
@@ -248,26 +250,26 @@ impl MetadataInject {
     }
 
     /// Set the stream ID to inject.
-    pub fn with_stream_id(mut self, id: u64) -> Self {
+    pub fn with_stream_id(mut self, id: u32) -> Self {
         self.stream_id = Some(id);
         self
     }
 
     /// Set the duration to inject.
-    pub fn with_duration(mut self, duration: Duration) -> Self {
+    pub fn with_duration(mut self, duration: ClockTime) -> Self {
         self.duration = Some(duration);
+        self
+    }
+
+    /// Set the duration to inject (from std Duration).
+    pub fn with_duration_from(mut self, duration: Duration) -> Self {
+        self.duration = Some(ClockTime::from(duration));
         self
     }
 
     /// Set the offset to inject.
     pub fn with_offset(mut self, offset: u64) -> Self {
         self.offset = Some(offset);
-        self
-    }
-
-    /// Set the offset end to inject.
-    pub fn with_offset_end(mut self, offset_end: u64) -> Self {
-        self.offset_end = Some(offset_end);
         self
     }
 
@@ -290,16 +292,13 @@ impl Element for MetadataInject {
         let meta = buffer.metadata_mut();
 
         if let Some(id) = self.stream_id {
-            meta.stream_id = Some(id);
+            meta.stream_id = id;
         }
         if let Some(dur) = self.duration {
-            meta.duration = Some(dur);
+            meta.duration = dur;
         }
         if let Some(off) = self.offset {
             meta.offset = Some(off);
-        }
-        if let Some(off_end) = self.offset_end {
-            meta.offset_end = Some(off_end);
         }
 
         Ok(Some(buffer))
@@ -321,7 +320,7 @@ mod tests {
     fn create_test_buffer(seq: u64) -> Buffer {
         let segment = Arc::new(HeapSegment::new(64).unwrap());
         let handle = MemoryHandle::from_segment(segment);
-        Buffer::new(handle, Metadata::with_sequence(seq))
+        Buffer::new(handle, Metadata::from_sequence(seq))
     }
 
     // SequenceNumber tests
@@ -377,11 +376,13 @@ mod tests {
         let mut ts = Timestamper::new(TimestampMode::SystemTime);
 
         let buffer = create_test_buffer(0);
-        assert!(buffer.metadata().pts.is_none());
+        // Default pts is ZERO
+        assert_eq!(buffer.metadata().pts, crate::clock::ClockTime::ZERO);
 
         let result = ts.process(buffer).unwrap().unwrap();
-        assert!(result.metadata().pts.is_some());
-        assert!(result.metadata().dts.is_some());
+        // After timestamping, pts should be non-zero (system time since epoch)
+        assert!(result.metadata().pts.nanos() > 0);
+        assert!(result.metadata().dts.nanos() > 0);
     }
 
     #[test]
@@ -391,10 +392,10 @@ mod tests {
         std::thread::sleep(Duration::from_millis(10));
 
         let result = ts.process(create_test_buffer(0)).unwrap().unwrap();
-        let pts = result.metadata().pts.unwrap();
+        let pts = result.metadata().pts;
 
         // Should be at least 10ms
-        assert!(pts >= Duration::from_millis(10));
+        assert!(pts.millis() >= 10);
     }
 
     #[test]
@@ -404,8 +405,8 @@ mod tests {
         let buffer = create_test_buffer(0);
         let result = ts.process(buffer).unwrap().unwrap();
 
-        // Should remain None
-        assert!(result.metadata().pts.is_none());
+        // Should remain at default (ZERO, which is_none() == false, but value is 0)
+        assert_eq!(result.metadata().pts, crate::clock::ClockTime::default());
     }
 
     #[test]
@@ -425,41 +426,44 @@ mod tests {
         let mut inject = MetadataInject::new().with_stream_id(42);
 
         let buffer = create_test_buffer(0);
-        assert!(buffer.metadata().stream_id.is_none());
+        assert_eq!(buffer.metadata().stream_id, 0); // Default is 0
 
         let result = inject.process(buffer).unwrap().unwrap();
-        assert_eq!(result.metadata().stream_id, Some(42));
+        assert_eq!(result.metadata().stream_id, 42);
     }
 
     #[test]
     fn test_metadata_inject_duration() {
-        let mut inject = MetadataInject::new().with_duration(Duration::from_secs(5));
+        let mut inject = MetadataInject::new().with_duration(crate::clock::ClockTime::from_secs(5));
 
         let result = inject.process(create_test_buffer(0)).unwrap().unwrap();
-        assert_eq!(result.metadata().duration, Some(Duration::from_secs(5)));
+        assert_eq!(
+            result.metadata().duration,
+            crate::clock::ClockTime::from_secs(5)
+        );
     }
 
     #[test]
     fn test_metadata_inject_offset() {
-        let mut inject = MetadataInject::new()
-            .with_offset(1000)
-            .with_offset_end(2000);
+        let mut inject = MetadataInject::new().with_offset(1000);
 
         let result = inject.process(create_test_buffer(0)).unwrap().unwrap();
         assert_eq!(result.metadata().offset, Some(1000));
-        assert_eq!(result.metadata().offset_end, Some(2000));
     }
 
     #[test]
     fn test_metadata_inject_combined() {
         let mut inject = MetadataInject::new()
             .with_stream_id(1)
-            .with_duration(Duration::from_millis(100))
+            .with_duration(crate::clock::ClockTime::from_millis(100))
             .with_offset(0);
 
         let result = inject.process(create_test_buffer(0)).unwrap().unwrap();
-        assert_eq!(result.metadata().stream_id, Some(1));
-        assert_eq!(result.metadata().duration, Some(Duration::from_millis(100)));
+        assert_eq!(result.metadata().stream_id, 1);
+        assert_eq!(
+            result.metadata().duration,
+            crate::clock::ClockTime::from_millis(100)
+        );
         assert_eq!(result.metadata().offset, Some(0));
     }
 

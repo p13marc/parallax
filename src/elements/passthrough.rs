@@ -26,7 +26,7 @@ use crate::error::Result;
 /// // Create a test buffer
 /// # let segment = Arc::new(HeapSegment::new(8).unwrap());
 /// # let handle = MemoryHandle::from_segment(segment);
-/// # let buffer = Buffer::new(handle, Metadata::with_sequence(42));
+/// # let buffer = Buffer::new(handle, Metadata::from_sequence(42));
 ///
 /// // PassThrough returns the buffer unchanged
 /// let result = passthrough.process(buffer).unwrap();
@@ -80,7 +80,7 @@ mod tests {
 
         let segment = Arc::new(HeapSegment::new(64).unwrap());
         let handle = MemoryHandle::from_segment(segment);
-        let buffer = Buffer::new(handle, Metadata::with_sequence(42));
+        let buffer = Buffer::new(handle, Metadata::from_sequence(42));
 
         let result = passthrough.process(buffer).unwrap();
         assert!(result.is_some());

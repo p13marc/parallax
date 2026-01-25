@@ -186,14 +186,14 @@ impl Source for UnixSrc {
                 self.sequence += 1;
 
                 let handle = MemoryHandle::from_segment_with_len(segment, n);
-                Ok(Some(Buffer::new(handle, Metadata::with_sequence(seq))))
+                Ok(Some(Buffer::new(handle, Metadata::from_sequence(seq))))
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 // Timeout - return empty buffer with timeout flag
                 let segment = Arc::new(HeapSegment::new(1)?);
                 let handle = MemoryHandle::from_segment_with_len(segment, 0);
-                let mut meta = Metadata::with_sequence(self.sequence);
-                meta.flags.timeout = true;
+                let mut meta = Metadata::from_sequence(self.sequence);
+                meta.flags = meta.flags.insert(crate::metadata::BufferFlags::TIMEOUT);
                 self.sequence += 1;
                 Ok(Some(Buffer::new(handle, meta)))
             }
@@ -470,7 +470,7 @@ impl AsyncSource for AsyncUnixSrc {
         self.sequence += 1;
 
         let handle = MemoryHandle::from_segment_with_len(segment, result.len());
-        Ok(Some(Buffer::new(handle, Metadata::with_sequence(seq))))
+        Ok(Some(Buffer::new(handle, Metadata::from_sequence(seq))))
     }
 
     fn name(&self) -> &str {
@@ -567,7 +567,7 @@ mod tests {
             }
         }
         let handle = MemoryHandle::from_segment_with_len(segment, data.len());
-        Buffer::new(handle, Metadata::with_sequence(seq))
+        Buffer::new(handle, Metadata::from_sequence(seq))
     }
 
     #[test]
@@ -580,7 +580,7 @@ mod tests {
             let mut src = UnixSrc::listen(&path_clone)?;
             let mut data = Vec::new();
             while let Some(buf) = src.produce()? {
-                if buf.metadata().flags.eos {
+                if buf.metadata().flags.is_eos() {
                     break;
                 }
                 data.extend_from_slice(buf.as_bytes());

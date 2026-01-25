@@ -161,7 +161,7 @@ impl Source for WebSocketSrc {
                     }
 
                     let handle = MemoryHandle::from_segment_with_len(segment, data.len());
-                    return Ok(Some(Buffer::new(handle, Metadata::with_sequence(seq))));
+                    return Ok(Some(Buffer::new(handle, Metadata::from_sequence(seq))));
                 }
                 Ok(Message::Text(text)) => {
                     let data = text.into_bytes();
@@ -179,7 +179,7 @@ impl Source for WebSocketSrc {
                     }
 
                     let handle = MemoryHandle::from_segment_with_len(segment, data.len());
-                    return Ok(Some(Buffer::new(handle, Metadata::with_sequence(seq))));
+                    return Ok(Some(Buffer::new(handle, Metadata::from_sequence(seq))));
                 }
                 Ok(Message::Close(_)) => {
                     self.connected = false;

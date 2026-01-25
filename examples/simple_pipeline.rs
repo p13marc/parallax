@@ -41,7 +41,7 @@ impl Source for CountingSource {
         // Create a buffer
         let segment = Arc::new(HeapSegment::new(self.buffer_size)?);
         let handle = MemoryHandle::from_segment_with_len(segment, self.buffer_size);
-        let buffer = Buffer::new(handle, Metadata::with_sequence(self.current));
+        let buffer = Buffer::new(handle, Metadata::from_sequence(self.current));
 
         self.current += 1;
         Ok(Some(buffer))

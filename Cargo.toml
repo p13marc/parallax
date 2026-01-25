@@ -14,7 +14,7 @@ categories = ["multimedia", "asynchronous", "data-structures"]
 
 [dependencies]
 # Async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "net", "fs", "io-util", "macros", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "fs", "io-util", "macros", "sync", "time"] }
 
 # Channels (fast, MPMC, sync+async)
 kanal = "0.1"

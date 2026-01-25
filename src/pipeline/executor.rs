@@ -515,7 +515,7 @@ mod tests {
             }
             let segment = Arc::new(HeapSegment::new(8).unwrap());
             let handle = MemoryHandle::from_segment(segment);
-            let buffer = Buffer::new(handle, Metadata::with_sequence(self.count));
+            let buffer = Buffer::new(handle, Metadata::from_sequence(self.count));
             self.count += 1;
             Ok(Some(buffer))
         }
@@ -683,7 +683,7 @@ mod tests {
             fn produce(&mut self) -> Result<Option<Buffer>> {
                 let segment = Arc::new(HeapSegment::new(8).unwrap());
                 let handle = MemoryHandle::from_segment(segment);
-                Ok(Some(Buffer::new(handle, Metadata::with_sequence(0))))
+                Ok(Some(Buffer::new(handle, Metadata::from_sequence(0))))
             }
         }
 

@@ -62,7 +62,7 @@ fn main() -> Result<()> {
 fn make_buffer(seq: u64) -> Buffer {
     let segment = Arc::new(HeapSegment::new(64).unwrap());
     let handle = MemoryHandle::from_segment_with_len(segment, 64);
-    Buffer::new(handle, Metadata::with_sequence(seq))
+    Buffer::new(handle, Metadata::from_sequence(seq))
 }
 
 /// Demonstrates AppSrc for injecting data and AppSink for extracting data.

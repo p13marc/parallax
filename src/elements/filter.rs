@@ -248,7 +248,7 @@ impl Element for SampleFilter {
 /// ```
 pub struct MetadataFilter {
     name: String,
-    stream_id: Option<u64>,
+    stream_id: Option<u32>,
     min_sequence: Option<u64>,
     max_sequence: Option<u64>,
     passed: AtomicU64,
@@ -269,12 +269,12 @@ impl MetadataFilter {
     }
 
     /// Filter by stream ID.
-    pub fn by_stream_id(id: u64) -> Self {
+    pub fn by_stream_id(id: u32) -> Self {
         Self::new().with_stream_id(id)
     }
 
     /// Set stream ID filter.
-    pub fn with_stream_id(mut self, id: u64) -> Self {
+    pub fn with_stream_id(mut self, id: u32) -> Self {
         self.stream_id = Some(id);
         self
     }
@@ -325,7 +325,7 @@ impl Element for MetadataFilter {
         let mut pass = true;
 
         if let Some(expected_id) = self.stream_id {
-            if meta.stream_id != Some(expected_id) {
+            if meta.stream_id != expected_id {
                 pass = false;
             }
         }
@@ -367,14 +367,14 @@ mod tests {
     fn create_test_buffer(size: usize, seq: u64) -> Buffer {
         let segment = Arc::new(HeapSegment::new(size).unwrap());
         let handle = MemoryHandle::from_segment(segment);
-        Buffer::new(handle, Metadata::with_sequence(seq))
+        Buffer::new(handle, Metadata::from_sequence(seq))
     }
 
-    fn create_buffer_with_stream(seq: u64, stream_id: u64) -> Buffer {
+    fn create_buffer_with_stream(seq: u64, stream_id: u32) -> Buffer {
         let segment = Arc::new(HeapSegment::new(64).unwrap());
         let handle = MemoryHandle::from_segment(segment);
-        let mut meta = Metadata::with_sequence(seq);
-        meta.stream_id = Some(stream_id);
+        let mut meta = Metadata::from_sequence(seq);
+        meta.stream_id = stream_id;
         Buffer::new(handle, meta)
     }
 

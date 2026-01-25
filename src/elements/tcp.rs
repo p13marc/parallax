@@ -191,7 +191,7 @@ impl crate::element::Source for TcpSrc {
                 self.sequence += 1;
 
                 let handle = crate::buffer::MemoryHandle::from_segment_with_len(segment, n);
-                let metadata = Metadata::with_sequence(seq);
+                let metadata = Metadata::from_sequence(seq);
                 Ok(Some(Buffer::new(handle, metadata)))
             }
             Err(e) => Err(Error::Io(e)),
@@ -326,7 +326,7 @@ impl AsyncSource for AsyncTcpSrc {
                 self.sequence += 1;
 
                 let handle = crate::buffer::MemoryHandle::from_segment_with_len(segment, n);
-                let metadata = Metadata::with_sequence(seq);
+                let metadata = Metadata::from_sequence(seq);
                 Ok(Some(Buffer::new(handle, metadata)))
             }
             Err(e) => Err(Error::Io(e)),

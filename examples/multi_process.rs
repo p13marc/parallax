@@ -46,7 +46,7 @@ fn run_local_channel_example() -> Result<()> {
             let segment =
                 Arc::new(parallax::memory::HeapSegment::new(64).expect("failed to create segment"));
             let handle = MemoryHandle::from_segment(segment);
-            let buffer = Buffer::<()>::new(handle, Metadata::with_sequence(i));
+            let buffer = Buffer::<()>::new(handle, Metadata::from_sequence(i));
 
             println!("   [Producer] Sending buffer {}", i);
             sender.send(buffer).expect("send failed");
@@ -132,8 +132,8 @@ fn run_shared_buffer_example() -> Result<()> {
     let handle1 = MemoryHandle::new(segment.clone(), 0, 1024);
     let handle2 = MemoryHandle::new(segment.clone(), 1024, 1024);
 
-    let buffer1 = Buffer::<()>::new(handle1, Metadata::with_sequence(1));
-    let buffer2 = Buffer::<()>::new(handle2, Metadata::with_sequence(2));
+    let buffer1 = Buffer::<()>::new(handle1, Metadata::from_sequence(1));
+    let buffer2 = Buffer::<()>::new(handle2, Metadata::from_sequence(2));
 
     println!("   Created 2 buffers in shared memory");
 

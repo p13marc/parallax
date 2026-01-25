@@ -381,7 +381,7 @@ impl IpcSubscriber {
                 let len = header.field2 as usize;
 
                 let handle = MemoryHandle::new(segment, offset, len);
-                let metadata = Metadata::with_sequence(header.sequence);
+                let metadata = Metadata::from_sequence(header.sequence);
 
                 Ok(Some(Buffer::new(handle, metadata)))
             }
@@ -427,7 +427,7 @@ mod tests {
                 }
 
                 let handle = MemoryHandle::new(segment.clone(), offset, 8);
-                let buffer = Buffer::new(handle, Metadata::with_sequence(i));
+                let buffer = Buffer::new(handle, Metadata::from_sequence(i));
 
                 publisher.send(buffer).unwrap();
             }
@@ -470,7 +470,7 @@ mod tests {
 
         // Send buffer referencing this segment
         let handle = MemoryHandle::new(segment.clone(), 0, 2);
-        let buffer = Buffer::new(handle, Metadata::with_sequence(0));
+        let buffer = Buffer::new(handle, Metadata::from_sequence(0));
         publisher.send(buffer).unwrap();
         publisher.send_eos().unwrap();
 
@@ -512,10 +512,10 @@ mod tests {
         let handle2 = MemoryHandle::new(segment2.clone(), 0, 1);
 
         publisher
-            .send(Buffer::new(handle1, Metadata::with_sequence(0)))
+            .send(Buffer::new(handle1, Metadata::from_sequence(0)))
             .unwrap();
         publisher
-            .send(Buffer::new(handle2, Metadata::with_sequence(1)))
+            .send(Buffer::new(handle2, Metadata::from_sequence(1)))
             .unwrap();
         publisher.send_eos().unwrap();
 
@@ -546,7 +546,7 @@ mod tests {
 
             let handle = MemoryHandle::new(segment.clone(), offset, 1);
             publisher
-                .send(Buffer::new(handle, Metadata::with_sequence(i as u64)))
+                .send(Buffer::new(handle, Metadata::from_sequence(i as u64)))
                 .unwrap();
         }
         publisher.send_eos().unwrap();
