@@ -51,7 +51,7 @@ pub mod typed;
 /// Prelude for convenient imports
 pub mod prelude {
     pub use crate::buffer::Buffer;
-    pub use crate::element::{Element, ElementDyn, Sink, Source};
+    pub use crate::element::{AsyncSink, AsyncSource, Element, ElementDyn, Sink, Source};
     pub use crate::error::{Error, Result};
     pub use crate::memory::{MemoryPool, MemorySegment, MemoryType};
     pub use crate::metadata::Metadata;

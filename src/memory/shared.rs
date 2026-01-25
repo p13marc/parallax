@@ -166,7 +166,6 @@ impl SharedMemorySegment {
     /// matches the actual size of the memfd.
     pub unsafe fn from_raw_fd(fd: RawFd, size: usize) -> Result<Self> {
         // Duplicate the fd so we have our own reference
-        use std::os::unix::io::FromRawFd;
         let dup_fd = rustix::io::fcntl_dupfd_cloexec(unsafe { BorrowedFd::borrow_raw(fd) }, 0)?;
         unsafe { Self::from_fd(dup_fd, size) }
     }

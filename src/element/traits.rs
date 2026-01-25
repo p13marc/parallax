@@ -112,6 +112,35 @@ pub trait Sink: Send {
     }
 }
 
+/// An async sink element that consumes buffers asynchronously.
+///
+/// Use this for sinks that need to await I/O operations, such as
+/// network writers or async file writers.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// struct TcpSink {
+///     writer: TcpStream,
+/// }
+///
+/// impl AsyncSink for TcpSink {
+///     async fn consume(&mut self, buffer: Buffer) -> Result<()> {
+///         self.writer.write_all(buffer.as_bytes()).await?;
+///         Ok(())
+///     }
+/// }
+/// ```
+pub trait AsyncSink: Send {
+    /// Consume a buffer asynchronously.
+    fn consume(&mut self, buffer: Buffer) -> impl std::future::Future<Output = Result<()>> + Send;
+
+    /// Get the name of this sink (for debugging/logging).
+    fn name(&self) -> &str {
+        std::any::type_name::<Self>()
+    }
+}
+
 /// A transform element that processes buffers.
 ///
 /// Elements sit in the middle of a pipeline, receiving buffers from

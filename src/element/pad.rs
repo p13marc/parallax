@@ -136,10 +136,12 @@ impl Pad {
 
 /// Collection of pads for an element.
 #[derive(Debug, Default)]
+#[allow(dead_code)]
 pub struct PadList {
     pads: Vec<Pad>,
 }
 
+#[allow(dead_code)]
 impl PadList {
     /// Create an empty pad list.
     pub fn new() -> Self {

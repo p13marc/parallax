@@ -125,6 +125,7 @@ pub fn instrument_element(
 
 /// Log a buffer being produced.
 #[inline]
+#[allow(dead_code)]
 pub fn trace_buffer_produced(pipeline: &str, element: &str, size: usize, sequence: u64) {
     tracing::debug!(
         pipeline = %pipeline,
@@ -137,6 +138,7 @@ pub fn trace_buffer_produced(pipeline: &str, element: &str, size: usize, sequenc
 
 /// Log a buffer being consumed.
 #[inline]
+#[allow(dead_code)]
 pub fn trace_buffer_consumed(pipeline: &str, element: &str, size: usize, sequence: u64) {
     tracing::debug!(
         pipeline = %pipeline,
@@ -149,6 +151,7 @@ pub fn trace_buffer_consumed(pipeline: &str, element: &str, size: usize, sequenc
 
 /// Log a buffer being processed.
 #[inline]
+#[allow(dead_code)]
 pub fn trace_buffer_processed(pipeline: &str, element: &str, size: usize, sequence: u64) {
     tracing::trace!(
         pipeline = %pipeline,
@@ -161,6 +164,7 @@ pub fn trace_buffer_processed(pipeline: &str, element: &str, size: usize, sequen
 
 /// Log an error.
 #[inline]
+#[allow(dead_code)]
 pub fn trace_error(pipeline: &str, element: &str, error: &dyn std::error::Error) {
     tracing::error!(
         pipeline = %pipeline,
@@ -172,6 +176,7 @@ pub fn trace_error(pipeline: &str, element: &str, error: &dyn std::error::Error)
 
 /// Log end-of-stream.
 #[inline]
+#[allow(dead_code)]
 pub fn trace_eos(pipeline: &str, element: &str) {
     tracing::info!(
         pipeline = %pipeline,
@@ -182,6 +187,7 @@ pub fn trace_eos(pipeline: &str, element: &str) {
 
 /// Log pipeline state change.
 #[inline]
+#[allow(dead_code)]
 pub fn trace_state_change(pipeline: &str, from: &str, to: &str) {
     tracing::info!(
         pipeline = %pipeline,

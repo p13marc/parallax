@@ -8,9 +8,9 @@
 
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::error::{Error, Result};
-use crate::memory::{MemorySegment, SharedMemorySegment, ipc};
+use crate::memory::{SharedMemorySegment, ipc};
 use crate::metadata::Metadata;
-use rustix::fd::AsFd;
+
 use std::collections::HashMap;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -403,6 +403,7 @@ impl IpcSubscriber {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::MemorySegment;
     use std::thread;
 
     #[test]

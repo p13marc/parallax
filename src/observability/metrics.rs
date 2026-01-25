@@ -1,6 +1,6 @@
 //! Metrics collection using metrics-rs.
 
-use metrics::{Counter, Gauge, Histogram, Unit, counter, gauge, histogram};
+use metrics::{Counter, Histogram, Unit, counter, gauge, histogram};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 

@@ -554,6 +554,12 @@ impl AsyncTcpSink {
 
     /// Write a buffer asynchronously.
     pub async fn write(&mut self, buffer: Buffer) -> Result<()> {
+        <Self as crate::element::AsyncSink>::consume(self, buffer).await
+    }
+}
+
+impl crate::element::AsyncSink for AsyncTcpSink {
+    async fn consume(&mut self, buffer: Buffer) -> Result<()> {
         use tokio::io::AsyncWriteExt;
 
         self.ensure_connected().await?;
@@ -568,6 +574,10 @@ impl AsyncTcpSink {
         self.bytes_written += data.len() as u64;
 
         Ok(())
+    }
+
+    fn name(&self) -> &str {
+        &self.name
     }
 }
 

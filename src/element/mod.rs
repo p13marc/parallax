@@ -38,6 +38,6 @@ mod traits;
 pub use context::ElementContext;
 pub use pad::{Pad, PadDirection, PadTemplate};
 pub use traits::{
-    AsyncSource, Element, ElementAdapter, ElementDyn, ElementType, Sink, SinkAdapter, Source,
-    SourceAdapter,
+    AsyncSink, AsyncSource, Element, ElementAdapter, ElementDyn, ElementType, Sink, SinkAdapter,
+    Source, SourceAdapter,
 };
