@@ -2,7 +2,7 @@
 
 This document outlines the implementation plan for pure Rust media streaming elements equivalent to GStreamer's `udpsrc`, `udpsink`, `rtspsrc`, `rtpsrc`, `rtpsink`, `videoscale`, and MPEG-TS related elements.
 
-> **Status:** Phases 0-3 are **COMPLETE**. Ready for Phase 4 (RTSP Client).
+> **Status:** Phases 0-4 are **COMPLETE**. Ready for Phase 5 (MPEG-TS).
 >
 > **Foundation completed items:**
 > - ✅ `MediaFormat` enum with `VideoFormat`, `AudioFormat`, `RtpFormat`, `MpegTs`, `Bytes`
@@ -261,30 +261,57 @@ All foundation components have been implemented:
 - Flush operation for draining remaining packets
 - Reset operation for stream discontinuities
 
-### Phase 4: RTSP Client (2 weeks)
+### Phase 4: RTSP Client ✅ COMPLETE
 
 **Goal:** Connect to RTSP cameras/servers
 
 ```
-4.1 RtspSrc wrapper around retina
-4.2 TCP interleaved transport (primary)
-4.3 UDP transport (secondary)
-4.4 Authentication (Basic/Digest)
-4.5 Multi-stream handling (video + audio)
+4.1 ✅ RtspSrc wrapper around retina
+4.2 ✅ TCP interleaved transport (primary)
+4.3 ✅ UDP transport (secondary)
+4.4 ✅ Authentication (Basic/Digest)
+4.5 ✅ Multi-stream handling (video + audio)
 ```
 
-**Design:**
+**Implemented in `src/elements/rtsp.rs`:**
+
+| Element | Description |
+|---------|-------------|
+| `RtspSrc` | Builder for configuring RTSP connections |
+| `RtspSession` | Active RTSP session for receiving frames |
+| `RtspFrame` | Video or audio frame received from stream |
+| `RtspTransport` | Transport mode (TcpInterleaved, Udp) |
+| `RtspCredentials` | Authentication credentials |
+| `StreamSelection` | Stream selection policy (All, VideoOnly, AudioOnly, Indices) |
+| `StreamInfo` | Information about available streams |
+| `RtspStats` | Statistics (frames, bytes, keyframes, etc.) |
+
+**Features:**
+- Async RTSP client using retina crate
+- TCP interleaved transport (works through firewalls/NAT)
+- UDP transport (lower latency)
+- Basic/Digest authentication support
+- Multi-stream handling (video + audio simultaneously)
+- Stream selection policies (all, video-only, audio-only, specific indices)
+- Automatic H.264/H.265/AAC depacketization via retina
+- Keyframe detection and flagging
+- RTP timestamp to ClockTime conversion
+- Statistics tracking
+
+**Example:**
 
 ```rust
-pub struct RtspSrc {
-    session: retina::client::Session,
-    // ...
-}
+let src = RtspSrc::new("rtsp://192.168.1.100/stream")
+    .with_transport(RtspTransport::TcpInterleaved)
+    .with_credentials("admin", "password")
+    .video_only();
 
-impl AsyncSource for RtspSrc {
-    async fn produce(&mut self) -> Result<Option<Buffer>> {
-        // Receive frame from retina
-        // Convert to Parallax Buffer with metadata
+let mut session = src.connect().await?;
+
+while let Some(frame) = session.next_frame().await? {
+    match frame {
+        RtspFrame::Video(buf) => { /* H.264/H.265 access unit */ },
+        RtspFrame::Audio(buf) => { /* AAC frame */ },
     }
 }
 ```

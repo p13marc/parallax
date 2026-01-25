@@ -69,6 +69,10 @@ rtcp = { version = "0.12", optional = true }
 webrtc-util = { version = "0.12", optional = true }
 webrtc-util-0_10 = { package = "webrtc-util", version = "0.10", optional = true }
 
+# RTSP client (optional)
+retina = { version = "0.4", optional = true }
+url = { version = "2", optional = true }
+
 # Regex (for RegexFilter)
 regex = "1"
 
@@ -89,6 +93,7 @@ http = ["ureq"]       # HTTP source/sink elements
 websocket = ["tungstenite"]  # WebSocket source/sink elements
 zenoh = ["dep:zenoh"] # Zenoh pub/sub elements
 rtp = ["dep:rtp", "dep:rtcp", "dep:webrtc-util", "dep:webrtc-util-0_10"]  # RTP/RTCP elements
+rtsp = ["rtp", "dep:retina", "dep:url"]  # RTSP client (includes RTP support)
 
 [[bench]]
 name = "throughput"

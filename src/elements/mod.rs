@@ -94,6 +94,10 @@
 //! - [`RtpJitterBuffer`]: Packet reordering and loss detection
 //! - [`AsyncJitterBuffer`]: Async version with timeout-based retrieval
 //!
+//! ## RTSP Client (requires `rtsp` feature)
+//! - [`RtspSrc`]: RTSP client source (connects to cameras/servers)
+//! - [`RtspSession`]: Active RTSP session for receiving frames
+//!
 //! ## Data Processing (Tier 5)
 //! - [`FlatMap`]: One-to-many buffer transformation
 //! - [`DuplicateFilter`]: Remove duplicate buffers by content hash
@@ -161,6 +165,9 @@ mod rtp_codecs;
 
 #[cfg(feature = "rtp")]
 mod jitter_buffer;
+
+#[cfg(feature = "rtsp")]
+mod rtsp;
 
 // Sources
 pub use appsrc::{AppSrc, AppSrcHandle, AppSrcStats};
@@ -254,6 +261,13 @@ pub use rtp_codecs::{
 #[cfg(feature = "rtp")]
 pub use jitter_buffer::{
     AsyncJitterBuffer, JitterBufferConfig, JitterBufferStats, LossInfo, RtpJitterBuffer,
+};
+
+// RTSP (feature-gated)
+#[cfg(feature = "rtsp")]
+pub use rtsp::{
+    MediaType, RtspConfig, RtspCredentials, RtspFrame, RtspSession, RtspSrc, RtspStats,
+    RtspTransport, StreamInfo, StreamSelection,
 };
 
 // Tier 5: Data processing
