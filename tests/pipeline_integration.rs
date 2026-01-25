@@ -296,3 +296,101 @@ async fn test_executor_config() {
     let executor = PipelineExecutor::with_config(config);
     executor.run(&mut pipeline).await.unwrap();
 }
+
+// ============================================================================
+// Parser Integration Tests
+// ============================================================================
+
+/// Test parsing and running a simple pipeline from a string.
+#[tokio::test]
+async fn test_parse_simple_pipeline() {
+    let mut pipeline = Pipeline::parse("nullsource count=10 ! nullsink").unwrap();
+    assert_eq!(pipeline.node_count(), 2);
+
+    let executor = PipelineExecutor::new();
+    executor.run(&mut pipeline).await.unwrap();
+}
+
+/// Test parsing a pipeline with a transform element.
+#[tokio::test]
+async fn test_parse_pipeline_with_transform() {
+    let mut pipeline = Pipeline::parse("nullsource count=5 ! passthrough ! nullsink").unwrap();
+    assert_eq!(pipeline.node_count(), 3);
+
+    let executor = PipelineExecutor::new();
+    executor.run(&mut pipeline).await.unwrap();
+}
+
+/// Test parsing a pipeline with multiple transforms.
+#[tokio::test]
+async fn test_parse_long_pipeline() {
+    let mut pipeline =
+        Pipeline::parse("nullsource count=3 ! passthrough ! tee ! passthrough ! nullsink").unwrap();
+    assert_eq!(pipeline.node_count(), 5);
+
+    let executor = PipelineExecutor::new();
+    executor.run(&mut pipeline).await.unwrap();
+}
+
+/// Test parsing with different property types.
+#[tokio::test]
+async fn test_parse_with_properties() {
+    let mut pipeline = Pipeline::parse("nullsource count=100 buffer-size=1024 ! nullsink").unwrap();
+
+    let executor = PipelineExecutor::new();
+    executor.run(&mut pipeline).await.unwrap();
+}
+
+/// Test that parsing unknown elements fails.
+#[test]
+fn test_parse_unknown_element_fails() {
+    let result = Pipeline::parse("unknown_element ! nullsink");
+    assert!(result.is_err());
+}
+
+/// Test that parsing empty string fails.
+#[test]
+fn test_parse_empty_fails() {
+    let result = Pipeline::parse("");
+    assert!(result.is_err());
+}
+
+/// Test that parsing filesrc without location fails.
+#[test]
+fn test_parse_filesrc_without_location_fails() {
+    let result = Pipeline::parse("filesrc ! nullsink");
+    assert!(result.is_err());
+}
+
+/// Test roundtrip with files using parsed pipeline.
+#[tokio::test]
+async fn test_parse_file_pipeline() {
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    // Create input file
+    let mut input = NamedTempFile::new().unwrap();
+    let data = b"Test data for pipeline";
+    input.write_all(data).unwrap();
+    input.flush().unwrap();
+
+    // Create output file
+    let output = NamedTempFile::new().unwrap();
+
+    // Build pipeline string
+    let pipeline_str = format!(
+        "filesrc location='{}' ! filesink location='{}'",
+        input.path().display(),
+        output.path().display()
+    );
+
+    let mut pipeline = Pipeline::parse(&pipeline_str).unwrap();
+    assert_eq!(pipeline.node_count(), 2);
+
+    let executor = PipelineExecutor::new();
+    executor.run(&mut pipeline).await.unwrap();
+
+    // Verify output
+    let output_data = std::fs::read(output.path()).unwrap();
+    assert_eq!(output_data, data);
+}

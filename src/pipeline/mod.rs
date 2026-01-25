@@ -28,7 +28,11 @@
 //! ```
 
 mod executor;
+pub mod factory;
 mod graph;
+pub mod parser;
 
 pub use executor::{ExecutorConfig, PipelineExecutor, PipelineHandle};
+pub use factory::ElementFactory;
 pub use graph::{Link, Node, NodeId, Pipeline, PipelineState};
+pub use parser::{ParsedElement, ParsedPipeline, PropertyValue, parse_pipeline};

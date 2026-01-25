@@ -405,6 +405,53 @@ impl Default for Pipeline {
     }
 }
 
+impl Pipeline {
+    /// Parse a pipeline description string and build a pipeline.
+    ///
+    /// Uses the default element factory with built-in elements.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use parallax::pipeline::Pipeline;
+    ///
+    /// let pipeline = Pipeline::parse("nullsource count=10 ! passthrough ! nullsink").unwrap();
+    /// assert_eq!(pipeline.node_count(), 3);
+    /// ```
+    pub fn parse(description: &str) -> Result<Self> {
+        Self::parse_with_factory(
+            description,
+            &crate::pipeline::factory::ElementFactory::new(),
+        )
+    }
+
+    /// Parse a pipeline description string using a custom factory.
+    pub fn parse_with_factory(
+        description: &str,
+        factory: &crate::pipeline::factory::ElementFactory,
+    ) -> Result<Self> {
+        let parsed = crate::pipeline::parser::parse_pipeline(description)?;
+
+        let mut pipeline = Pipeline::new();
+        let mut prev_node: Option<NodeId> = None;
+
+        for (i, elem) in parsed.elements.iter().enumerate() {
+            let element = factory.create(elem)?;
+            let name = format!("{}_{}", elem.name, i);
+            let node_id = pipeline.add_node(name, element);
+
+            // Link to previous element
+            if let Some(prev) = prev_node {
+                pipeline.link(prev, node_id)?;
+            }
+
+            prev_node = Some(node_id);
+        }
+
+        Ok(pipeline)
+    }
+}
+
 impl std::fmt::Debug for Pipeline {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Pipeline")
