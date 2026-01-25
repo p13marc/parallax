@@ -142,11 +142,42 @@ pub struct TcpSink { /* ... */ }
 pub struct AsyncTcpSrc { /* ... */ }
 pub struct AsyncTcpSink { /* ... */ }
 
-// Utilities
-pub struct PassThrough;
-pub struct Tee { /* ... */ }
-pub struct NullSink;
+// UDP networking
+pub struct UdpSrc { /* ... */ }
+pub struct UdpSink { /* ... */ }
+pub struct AsyncUdpSrc { /* ... */ }
+pub struct AsyncUdpSink { /* ... */ }
+
+// File descriptor I/O
+pub struct FdSrc { /* ... */ }
+pub struct FdSink { /* ... */ }
+
+// Application integration
+pub struct AppSrc { /* ... */ }
+pub struct AppSink { /* ... */ }
+
+// Test/utility sources
+pub struct DataSrc { /* ... */ }
+pub struct TestSrc { /* ... */ }
 pub struct NullSource { /* ... */ }
+
+// Debug/utility sinks
+pub struct ConsoleSink { /* ... */ }
+pub struct NullSink;
+
+// Transforms
+pub struct PassThrough;
+pub struct RateLimiter { /* ... */ }
+pub struct Valve { /* ... */ }
+pub struct Queue { /* ... */ }
+
+// Routing
+pub struct Tee { /* ... */ }
+pub struct Funnel { /* ... */ }
+pub struct InputSelector { /* ... */ }
+pub struct OutputSelector { /* ... */ }
+pub struct Concat { /* ... */ }
+pub struct StreamIdDemux { /* ... */ }
 ```
 
 #### FileSrc
@@ -169,6 +200,163 @@ pub enum TcpMode {
 impl TcpSrc {
     pub fn new(mode: TcpMode) -> Result<Self>;
     pub fn with_buffer_size(mode: TcpMode, buffer_size: usize) -> Result<Self>;
+}
+```
+
+#### AppSrc
+
+Inject data from application code into a pipeline.
+
+```rust
+impl AppSrc {
+    pub fn new() -> Self;
+    pub fn with_max_buffers(max_buffers: usize) -> Self;
+    pub fn with_name(self, name: impl Into<String>) -> Self;
+    pub fn handle(&self) -> AppSrcHandle;
+}
+
+impl AppSrcHandle {
+    pub fn push_buffer(&self, buffer: Buffer) -> Result<()>;
+    pub fn push_buffer_timeout(&self, buffer: Buffer, timeout: Option<Duration>) -> Result<()>;
+    pub fn end_stream(&self);
+}
+```
+
+#### AppSink
+
+Extract data from a pipeline to application code.
+
+```rust
+impl AppSink {
+    pub fn new() -> Self;
+    pub fn with_max_buffers(max_buffers: usize) -> Self;
+    pub fn with_name(self, name: impl Into<String>) -> Self;
+    pub fn drop_on_full(self, drop: bool) -> Self;
+    pub fn handle(&self) -> AppSinkHandle;
+}
+
+impl AppSinkHandle {
+    pub fn pull_buffer(&self) -> Result<Option<Buffer>>;
+    pub fn pull_buffer_timeout(&self, timeout: Option<Duration>) -> Result<Option<Buffer>>;
+    pub fn try_pull_buffer(&self) -> Option<Buffer>;
+}
+```
+
+#### Queue
+
+Async buffer queue with backpressure and leaky modes.
+
+```rust
+pub enum LeakyMode {
+    None,      // Block until space (default)
+    Upstream,  // Drop new buffers when full
+    Downstream, // Drop old buffers when full
+}
+
+impl Queue {
+    pub fn new(max_buffers: usize) -> Self;
+    pub fn with_limits(max_buffers: usize, max_bytes: usize) -> Self;
+    pub fn leaky(self, mode: LeakyMode) -> Self;
+    pub fn push(&self, buffer: Buffer) -> Result<()>;
+    pub fn pop(&self) -> Result<Option<Buffer>>;
+    pub fn stats(&self) -> QueueStats;
+}
+```
+
+#### Valve
+
+Flow control on/off switch.
+
+```rust
+impl Valve {
+    pub fn new() -> Self;
+    pub fn with_state(open: bool) -> Self;
+    pub fn control(&self) -> ValveControl;
+}
+
+impl ValveControl {
+    pub fn open(&self);
+    pub fn close(&self);
+    pub fn toggle(&self) -> bool;
+    pub fn is_open(&self) -> bool;
+}
+```
+
+#### TestSrc
+
+Generate test pattern buffers for testing and benchmarking.
+
+```rust
+pub enum TestPattern {
+    Zero,        // All zeros
+    Ones,        // All 0xFF
+    Counter,     // Incrementing bytes
+    Random,      // Random data
+    Alternating, // 0x55/0xAA pattern
+    Sequence,    // Sequence number repeated
+}
+
+impl TestSrc {
+    pub fn new() -> Self;
+    pub fn with_pattern(self, pattern: TestPattern) -> Self;
+    pub fn with_buffer_size(self, size: usize) -> Self;
+    pub fn with_num_buffers(self, count: u64) -> Self;
+    pub fn with_rate(self, bytes_per_second: u64) -> Self;
+}
+```
+
+#### Funnel
+
+Merge multiple inputs into a single output (N-to-1).
+
+```rust
+impl Funnel {
+    pub fn new() -> Self;
+    pub fn with_max_buffers(max_buffers: usize) -> Self;
+    pub fn new_input(&self) -> FunnelInput;
+}
+
+impl FunnelInput {
+    pub fn push(&self, buffer: Buffer) -> Result<()>;
+    pub fn end_stream(&self);
+}
+```
+
+#### InputSelector / OutputSelector
+
+Stream routing elements.
+
+```rust
+// N-to-1 selection
+impl InputSelector {
+    pub fn new() -> Self;
+    pub fn new_input(&self) -> SelectorInput;
+    pub fn select(&self, input: usize);
+}
+
+// 1-to-N routing
+impl OutputSelector {
+    pub fn new() -> Self;
+    pub fn new_output(&self) -> SelectorOutput;
+    pub fn select(&self, output: usize);
+}
+```
+
+#### Concat
+
+Concatenate multiple streams sequentially.
+
+```rust
+impl Concat {
+    pub fn new() -> Self;
+    pub fn add_stream(&self) -> ConcatStream;
+    pub fn skip_to(&self, stream_index: usize);
+    pub fn skip_next(&self);
+}
+
+impl ConcatStream {
+    pub fn push(&self, buffer: Buffer) -> Result<()>;
+    pub fn end_stream(&self);
 }
 ```
 

@@ -124,16 +124,50 @@ while let Some(buffer) = subscriber.recv()? {
 
 ## Built-in Elements
 
-| Element | Type | Description |
-|---------|------|-------------|
-| `FileSrc` | Source | Reads from a file |
-| `FileSink` | Sink | Writes to a file |
-| `TcpSrc` / `AsyncTcpSrc` | Source | Reads from TCP connection |
-| `TcpSink` / `AsyncTcpSink` | Sink | Writes to TCP connection |
-| `PassThrough` | Transform | Passes buffers unchanged |
-| `Tee` | Transform | Duplicates to multiple outputs |
-| `NullSink` | Sink | Discards all buffers |
-| `NullSource` | Source | Produces empty buffers |
+### Sources
+
+| Element | Description |
+|---------|-------------|
+| `FileSrc` | Reads buffers from a file |
+| `TcpSrc` / `AsyncTcpSrc` | Reads from TCP connection |
+| `UdpSrc` / `AsyncUdpSrc` | Reads datagrams from UDP socket |
+| `FdSrc` | Reads from a raw file descriptor |
+| `AppSrc` | Injects buffers from application code |
+| `DataSrc` | Generates buffers from inline data |
+| `TestSrc` | Generates test pattern buffers |
+| `NullSource` | Produces empty buffers |
+
+### Sinks
+
+| Element | Description |
+|---------|-------------|
+| `FileSink` | Writes buffers to a file |
+| `TcpSink` / `AsyncTcpSink` | Writes to TCP connection |
+| `UdpSink` / `AsyncUdpSink` | Sends datagrams to UDP socket |
+| `FdSink` | Writes to a raw file descriptor |
+| `AppSink` | Extracts buffers to application code |
+| `ConsoleSink` | Prints buffers to console for debugging |
+| `NullSink` | Discards all buffers |
+
+### Transforms
+
+| Element | Description |
+|---------|-------------|
+| `PassThrough` | Passes buffers unchanged |
+| `RateLimiter` | Limits buffer throughput rate |
+| `Valve` | Drops or passes buffers (on/off switch) |
+| `Queue` | Async buffer queue with backpressure |
+
+### Routing
+
+| Element | Description |
+|---------|-------------|
+| `Tee` | Duplicates buffers to multiple outputs (1-to-N fanout) |
+| `Funnel` | Merges multiple inputs into one output (N-to-1) |
+| `InputSelector` | Selects one of N inputs (N-to-1 switching) |
+| `OutputSelector` | Routes to one of N outputs (1-to-N routing) |
+| `Concat` | Concatenates streams sequentially |
+| `StreamIdDemux` | Demultiplexes by stream ID |
 
 ## Memory Backends
 
@@ -187,6 +221,9 @@ cargo run --example typed_pipeline
 
 # Multi-process shared memory
 cargo run --example multi_process
+
+# New elements (AppSrc/AppSink, Queue, Valve, Funnel, Selectors, etc.)
+cargo run --example new_elements
 ```
 
 ## Benchmarks

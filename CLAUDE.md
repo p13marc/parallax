@@ -76,11 +76,27 @@ parallax/
 │   │   ├── graph.rs        # Pipeline DAG (daggy-based)
 │   │   └── executor.rs     # PipelineExecutor, task spawning, channel wiring
 │   │
-│   └── elements/           # Built-in elements (COMPLETE)
+│   └── elements/           # Built-in elements (COMPLETE - 25+ elements)
 │       ├── mod.rs          # Module exports
 │       ├── passthrough.rs  # PassThrough - identity element
-│       ├── tee.rs          # Tee - statistics tracking
-│       └── null.rs         # NullSink, NullSource
+│       ├── tee.rs          # Tee - fanout (1-to-N)
+│       ├── null.rs         # NullSink, NullSource
+│       ├── file.rs         # FileSrc, FileSink
+│       ├── tcp.rs          # TcpSrc, TcpSink, AsyncTcpSrc, AsyncTcpSink
+│       ├── udp.rs          # UdpSrc, UdpSink, AsyncUdpSrc, AsyncUdpSink
+│       ├── fd.rs           # FdSrc, FdSink (raw file descriptors)
+│       ├── appsrc.rs       # AppSrc - inject from application code
+│       ├── appsink.rs      # AppSink - extract to application code
+│       ├── datasrc.rs      # DataSrc - inline data source
+│       ├── testsrc.rs      # TestSrc - test pattern generator
+│       ├── console.rs      # ConsoleSink - debug output
+│       ├── queue.rs        # Queue - async buffering with backpressure
+│       ├── valve.rs        # Valve - on/off flow control
+│       ├── rate_limiter.rs # RateLimiter - throughput limiting
+│       ├── funnel.rs       # Funnel - merge N-to-1
+│       ├── selector.rs     # InputSelector, OutputSelector
+│       ├── concat.rs       # Concat - sequential stream concatenation
+│       └── streamid_demux.rs # StreamIdDemux - demux by stream ID
 │
 ├── tests/
 │   └── pipeline_integration.rs  # Integration tests
@@ -110,7 +126,7 @@ pub trait MemorySegment: Send + Sync {
 pub struct MemoryPool { /* ... */ }
 pub struct LoanedSlot { /* RAII guard, returns to pool on drop */ }
 
-// Element traits (Phase 2)
+// Element traits
 pub trait Source: Send {
     fn produce(&mut self) -> Result<Option<Buffer>>;
 }
@@ -121,6 +137,14 @@ pub trait Sink: Send {
 
 pub trait Element: Send {
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>>;
+}
+
+pub trait AsyncSource: Send {
+    fn produce(&mut self) -> impl Future<Output = Result<Option<Buffer>>> + Send;
+}
+
+pub trait AsyncSink: Send {
+    fn consume(&mut self, buffer: Buffer) -> impl Future<Output = Result<()>> + Send;
 }
 ```
 
@@ -140,8 +164,17 @@ pub trait Element: Send {
    - Built-in elements: PassThrough, Tee, NullSink, NullSource
    - Integration tests
 
-3. **Phase 3**: Sources, Parser & More Elements
-4. **Phase 4**: Typed Pipeline Builder
+3. **Phase 3**: Sources, Sinks & GStreamer-Equivalent Elements - COMPLETE
+   - File I/O: FileSrc, FileSink
+   - Network: TcpSrc/Sink, UdpSrc/Sink (sync + async variants)
+   - Raw FD: FdSrc, FdSink
+   - Application integration: AppSrc, AppSink (with handles)
+   - Test/utility: DataSrc, TestSrc, ConsoleSink
+   - Transforms: Queue (backpressure/leaky), Valve, RateLimiter
+   - Routing: Funnel (N-to-1), InputSelector, OutputSelector, Concat, StreamIdDemux
+   - AsyncSource and AsyncSink traits
+
+4. **Phase 4**: Typed Pipeline Builder - COMPLETE
 5. **Phase 5**: Events & Observability
 6. **Phase 6**: Advanced Memory Backends
 7. **Phase 7**: Plugin System
