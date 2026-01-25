@@ -30,8 +30,10 @@ mod bitmap;
 mod heap;
 mod pool;
 mod segment;
+mod shared;
 
 pub use bitmap::AtomicBitmap;
 pub use heap::HeapSegment;
 pub use pool::{LoanedSlot, MemoryPool};
 pub use segment::{IpcHandle, MemorySegment, MemoryType};
+pub use shared::SharedMemorySegment;
