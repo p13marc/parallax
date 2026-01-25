@@ -1,24 +1,23 @@
 //! Video display example using VideoTestSrc and IcedVideoSink.
 //!
-//! This example demonstrates displaying video test patterns in a GUI window.
-//! It creates a VideoTestSrc that generates test patterns and pipes them
-//! to an IcedVideoSink for display.
+//! This example demonstrates displaying video test patterns in a GUI window
+//! using a proper pipeline structure.
 //!
 //! Run with: cargo run --example video_display --features iced-sink
 //!
 //! Controls:
 //! - Close the window to exit
 
-use parallax::element::{Sink, Source};
+use parallax::element::{SinkAdapter, SourceAdapter};
 use parallax::elements::{
     IcedVideoSink, IcedVideoSinkConfig, InputPixelFormat, VideoPattern, VideoTestSrc,
 };
+use parallax::pipeline::{Pipeline, PipelineExecutor};
 use std::thread;
-use std::time::Duration;
 
 fn main() -> iced::Result {
     println!("=== Video Display Example ===");
-    println!("Displaying SMPTE color bars at 640x480 @ 30fps");
+    println!("Displaying moving ball pattern at 640x480 @ 30fps");
     println!("Close the window to exit.\n");
 
     // Configuration
@@ -33,70 +32,40 @@ fn main() -> iced::Result {
         .with_framerate(30, 1)
         .with_name("test-pattern");
 
-    // Create the video sink with stats overlay
+    // Create the video sink
     let config = IcedVideoSinkConfig {
         title: format!("Parallax Video - {:?}", pattern),
         width,
         height,
         show_stats: true,
-        pixel_format: InputPixelFormat::Rgb24, // VideoTestSrc outputs RGB24 by default
+        pixel_format: InputPixelFormat::Rgb24,
     };
 
-    let (sink, handle) = IcedVideoSink::with_config(config);
+    let (sink, window_handle) = IcedVideoSink::with_config(config);
 
-    // Spawn a thread to produce frames
-    let producer = thread::spawn(move || {
-        run_producer(src, sink);
+    // Build the pipeline
+    let mut pipeline = Pipeline::new();
+
+    let src_node = pipeline.add_node("videotestsrc", Box::new(SourceAdapter::new(src)));
+
+    let sink_node = pipeline.add_node("iced_sink", Box::new(SinkAdapter::new(sink)));
+
+    pipeline
+        .link(src_node, sink_node)
+        .expect("Failed to link pipeline");
+
+    // Run the pipeline in a background thread
+    thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+        rt.block_on(async {
+            let executor = PipelineExecutor::new();
+            if let Err(e) = executor.run(&mut pipeline).await {
+                eprintln!("Pipeline error: {}", e);
+            }
+        });
+        println!("Pipeline finished");
     });
 
-    // Run the Iced window (blocks until closed)
-    let result = handle.run();
-
-    // Wait for producer to finish
-    let _ = producer.join();
-
-    println!("Window closed. Exiting.");
-    result
-}
-
-fn run_producer(mut src: VideoTestSrc, mut sink: IcedVideoSink) {
-    println!("Producer thread started");
-
-    loop {
-        // Check if window is still open
-        if !sink.is_window_open() {
-            println!("Window closed, stopping producer");
-            break;
-        }
-
-        // Produce a frame
-        match src.produce() {
-            Ok(Some(buffer)) => {
-                // Send to sink
-                if let Err(e) = sink.consume(buffer) {
-                    println!("Sink error: {}", e);
-                    break;
-                }
-            }
-            Ok(None) => {
-                // Source exhausted (shouldn't happen with infinite source)
-                println!("Source exhausted");
-                break;
-            }
-            Err(e) => {
-                println!("Source error: {}", e);
-                break;
-            }
-        }
-
-        // Small sleep to not overwhelm the system
-        // The VideoTestSrc already has framerate limiting, but this adds safety
-        thread::sleep(Duration::from_micros(100));
-    }
-
-    let stats = sink.stats();
-    println!(
-        "Producer finished. Frames: received={}, displayed={}, dropped={}",
-        stats.frames_received, stats.frames_displayed, stats.frames_dropped
-    );
+    // Run the Iced window on the main thread (blocks until closed)
+    window_handle.run()
 }
