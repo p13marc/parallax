@@ -1,335 +1,350 @@
 # Elements Roadmap
 
-This document tracks the implementation status of pipeline elements, organized by category. Elements are inspired by GStreamer core elements and common streaming/media processing patterns.
+This document tracks the implementation status of pipeline elements, **ordered by value and complexity** to guide incremental implementation.
 
 ## Legend
 
 - [x] Implemented
 - [ ] Not yet implemented
 
----
-
-## Core Infrastructure
-
-### Sources
-
-- [x] **NullSource** - Produces empty buffers (testing)
-- [x] **DataSrc** - Generates buffers from inline data
-- [x] **TestSrc** - Test pattern generator (Zero, Ones, Counter, Random, Alternating, Sequence)
-- [x] **AppSrc** - Inject buffers from application code
-- [x] **FileSrc** - Read from file
-- [x] **FdSrc** - Read from raw file descriptor
-- [ ] **MemorySrc** - Read from memory buffer/slice
-- [ ] **MultiFileSrc** - Read from multiple files sequentially
-- [ ] **SplitFileSrc** - Read from split file segments
-
-### Sinks
-
-- [x] **NullSink** - Discards all buffers (benchmarking)
-- [x] **AppSink** - Extract buffers to application code
-- [x] **FileSink** - Write to file
-- [x] **FdSink** - Write to raw file descriptor
-- [x] **ConsoleSink** - Print buffer info to console (debugging)
-- [ ] **MultiFileSink** - Write to multiple files (rotation, splitting)
-- [ ] **SplitFileSink** - Write to split file segments
-- [ ] **MemorySink** - Write to memory buffer
-
-### Transforms
-
-- [x] **PassThrough** - Identity element (no modification)
-- [x] **Queue** - Async buffering with backpressure and leaky modes
-- [x] **Valve** - On/off flow control switch
-- [x] **RateLimiter** - Throughput limiting (buffers/sec, bytes/sec, fixed delay)
-- [ ] **Queue2** - File-backed queue for large buffers
-- [ ] **TypeFind** - Auto-detect buffer content type
-- [ ] **Capsfilter** - Filter by capabilities/metadata
-
-### Routing & Multiplexing
-
-- [x] **Tee** - Duplicate to multiple outputs (1-to-N fanout)
-- [x] **Funnel** - Merge multiple inputs (N-to-1 interleaved)
-- [x] **InputSelector** - Select one of N inputs (N-to-1 switching)
-- [x] **OutputSelector** - Route to one of N outputs (1-to-N routing)
-- [x] **Concat** - Sequential stream concatenation
-- [x] **StreamIdDemux** - Demultiplex by stream ID
-- [ ] **Muxer** - Combine multiple streams with timing
-- [ ] **Demuxer** - Split combined stream
-- [ ] **Interleave** - Interleave multiple streams by timestamp
-- [ ] **Deinterleave** - Split interleaved stream
+**Complexity**: Low (L), Medium (M), High (H)
+**Value**: Essential (E), High (H), Medium (M), Low (L)
 
 ---
 
-## Network Elements
+## Priority Implementation Order
 
-### TCP
-
-- [x] **TcpSrc** - Read from TCP connection (client/server modes)
-- [x] **TcpSink** - Write to TCP connection
-- [x] **AsyncTcpSrc** - Async TCP source
-- [x] **AsyncTcpSink** - Async TCP sink
-- [ ] **TcpServerSrc** - Multi-client TCP server source
-- [ ] **TcpServerSink** - Multi-client TCP server sink
-- [ ] **TcpMux** - Multiplex multiple streams over TCP
-
-### UDP
-
-- [x] **UdpSrc** - Receive UDP datagrams
-- [x] **UdpSink** - Send UDP datagrams
-- [x] **AsyncUdpSrc** - Async UDP source
-- [x] **AsyncUdpSink** - Async UDP sink
-- [ ] **UdpMulticastSrc** - Multicast UDP receiver
-- [ ] **UdpMulticastSink** - Multicast UDP sender
-- [ ] **RtpSrc** - RTP packet receiver
-- [ ] **RtpSink** - RTP packet sender
-- [ ] **RtpJitterBuffer** - RTP jitter buffer for reordering
-
-### Unix Sockets
-
-- [ ] **UnixSrc** - Read from Unix domain socket
-- [ ] **UnixSink** - Write to Unix domain socket
-
-### HTTP/WebSocket
-
-- [ ] **HttpSrc** - HTTP client source (GET)
-- [ ] **HttpSink** - HTTP client sink (POST/PUT)
-- [ ] **HttpServerSrc** - HTTP server source (receive uploads)
-- [ ] **HttpServerSink** - HTTP server sink (serve content)
-- [ ] **WebSocketSrc** - WebSocket client/server source
-- [ ] **WebSocketSink** - WebSocket client/server sink
-
-### Zenoh Integration
-
-- [ ] **ZenohSrc** - Subscribe to Zenoh topic
-- [ ] **ZenohSink** - Publish to Zenoh topic
-- [ ] **ZenohQueryable** - Zenoh queryable element
-- [ ] **ZenohQuerier** - Zenoh query element
+Elements are grouped into implementation tiers, ordered by **highest value first**, then **lowest complexity first** within each tier.
 
 ---
 
-## Data Processing Elements
+## Tier 1: High Value, Low Complexity (Quick Wins)
 
-### Filtering
+These elements provide immediate utility with minimal implementation effort.
 
-- [ ] **Filter** - Generic predicate-based filter
-- [ ] **RangeFilter** - Filter by value range
-- [ ] **RegexFilter** - Filter by regex pattern match
-- [ ] **SampleFilter** - Statistical sampling (every Nth, random %)
-- [ ] **DuplicateFilter** - Remove duplicate buffers
-- [ ] **ThrottleFilter** - Rate-based filtering
-
-### Transformation
-
-- [ ] **Map** - Apply function to buffer contents
-- [ ] **FlatMap** - Map with multiple output buffers
-- [ ] **Batch** - Combine N buffers into one
-- [ ] **Unbatch** - Split one buffer into N
-- [ ] **Chunk** - Split into fixed-size chunks
-- [ ] **Aggregate** - Aggregate buffers over window
-- [ ] **Window** - Windowing (tumbling, sliding, session)
-
-### Buffer Manipulation
-
-- [ ] **BufferSplit** - Split buffer at delimiter
-- [ ] **BufferJoin** - Join buffers with delimiter
-- [ ] **BufferPad** - Pad buffer to fixed size
-- [ ] **BufferTrim** - Trim buffer to max size
-- [ ] **BufferSlice** - Extract slice from buffer
-- [ ] **BufferConcat** - Concatenate buffer contents
-
-### Metadata
-
-- [ ] **MetadataInject** - Add/modify buffer metadata
-- [ ] **MetadataExtract** - Extract metadata to sideband
-- [ ] **MetadataFilter** - Filter by metadata values
-- [ ] **Timestamper** - Add/modify timestamps
-- [ ] **SequenceNumber** - Add sequence numbers
+| Element | Type | Complexity | Description |
+|---------|------|------------|-------------|
+| [x] **PassThrough** | Transform | L | Identity element |
+| [x] **NullSink** | Sink | L | Discard all buffers |
+| [x] **NullSource** | Source | L | Produce empty buffers |
+| [x] **Valve** | Transform | L | On/off flow control |
+| [x] **Tee** | Routing | L | 1-to-N fanout |
+| [x] **DataSrc** | Source | L | Inline data source |
+| [x] **ConsoleSink** | Sink | L | Debug output |
+| [ ] **Identity** | Transform | L | Pass-through with callbacks |
+| [ ] **MemorySrc** | Source | L | Read from memory slice |
+| [ ] **MemorySink** | Sink | L | Write to memory buffer |
+| [ ] **Delay** | Timing | L | Fixed delay element |
+| [ ] **SequenceNumber** | Metadata | L | Add sequence numbers |
+| [ ] **Timestamper** | Metadata | L | Add/modify timestamps |
+| [ ] **MetadataInject** | Metadata | L | Add/modify metadata |
+| [ ] **BufferTrim** | Buffer | L | Trim to max size |
+| [ ] **BufferSlice** | Buffer | L | Extract slice |
 
 ---
 
-## Timing & Synchronization
+## Tier 2: High Value, Low-Medium Complexity (Core Functionality)
 
-### Timing
+Essential elements that form the backbone of most pipelines.
 
-- [ ] **Delay** - Fixed delay element
-- [ ] **Jitter** - Add random jitter (testing)
-- [ ] **Timeout** - Timeout with fallback
-- [ ] **Debounce** - Debounce rapid buffers
-- [ ] **Throttle** - Rate limiting with timing
-- [ ] **Pacer** - Pace output to timestamps
-
-### Synchronization
-
-- [ ] **Sync** - Synchronize to clock
-- [ ] **LatencyTracer** - Measure end-to-end latency
-- [ ] **ClockProvider** - Pipeline clock source
-- [ ] **TimestampSync** - Synchronize multiple streams
-
----
-
-## Compression & Encoding
-
-### Compression
-
-- [ ] **GzipEncode** - Gzip compression
-- [ ] **GzipDecode** - Gzip decompression
-- [ ] **ZstdEncode** - Zstandard compression
-- [ ] **ZstdDecode** - Zstandard decompression
-- [ ] **Lz4Encode** - LZ4 compression
-- [ ] **Lz4Decode** - LZ4 decompression
-- [ ] **SnappyEncode** - Snappy compression
-- [ ] **SnappyDecode** - Snappy decompression
-
-### Serialization
-
-- [ ] **JsonEncode** - Serialize to JSON
-- [ ] **JsonDecode** - Deserialize from JSON
-- [ ] **RkyvEncode** - Serialize to rkyv
-- [ ] **RkyvDecode** - Deserialize from rkyv
-- [ ] **ProtobufEncode** - Serialize to protobuf
-- [ ] **ProtobufDecode** - Deserialize from protobuf
-- [ ] **CborEncode** - Serialize to CBOR
-- [ ] **CborDecode** - Deserialize from CBOR
-- [ ] **MsgPackEncode** - Serialize to MessagePack
-- [ ] **MsgPackDecode** - Deserialize from MessagePack
+| Element | Type | Complexity | Description |
+|---------|------|------------|-------------|
+| [x] **FileSrc** | Source | L | Read from file |
+| [x] **FileSink** | Sink | L | Write to file |
+| [x] **AppSrc** | Source | M | Inject from application |
+| [x] **AppSink** | Sink | M | Extract to application |
+| [x] **Queue** | Transform | M | Async buffering with backpressure |
+| [x] **RateLimiter** | Transform | L | Throughput limiting |
+| [x] **Funnel** | Routing | M | N-to-1 merge |
+| [x] **Concat** | Routing | M | Sequential concatenation |
+| [x] **InputSelector** | Routing | M | N-to-1 switching |
+| [x] **OutputSelector** | Routing | M | 1-to-N routing |
+| [x] **TestSrc** | Source | L | Test pattern generator |
+| [x] **FdSrc** | Source | L | Raw FD source |
+| [x] **FdSink** | Sink | L | Raw FD sink |
+| [ ] **Filter** | Transform | L | Generic predicate filter |
+| [ ] **Map** | Transform | L | Apply function to contents |
+| [ ] **Batch** | Transform | M | Combine N buffers into one |
+| [ ] **Unbatch** | Transform | M | Split one buffer into N |
+| [ ] **Chunk** | Transform | L | Fixed-size chunking |
+| [ ] **SampleFilter** | Filter | L | Every Nth / random % |
+| [ ] **Timeout** | Timing | M | Timeout with fallback |
+| [ ] **Debounce** | Timing | M | Debounce rapid buffers |
 
 ---
 
-## Cryptography & Security
+## Tier 3: High Value, Medium Complexity (Network I/O)
 
-### Hashing
+Network elements are essential for distributed pipelines.
 
-- [ ] **HashCompute** - Compute hash (SHA256, Blake3, etc.)
-- [ ] **HashVerify** - Verify hash
-- [ ] **Checksum** - Add checksum to buffer
-
-### Encryption
-
-- [ ] **AesEncrypt** - AES encryption
-- [ ] **AesDecrypt** - AES decryption
-- [ ] **ChaChaEncrypt** - ChaCha20-Poly1305 encryption
-- [ ] **ChaChaDecrypt** - ChaCha20-Poly1305 decryption
-
-### Authentication
-
-- [ ] **HmacSign** - HMAC signing
-- [ ] **HmacVerify** - HMAC verification
-- [ ] **JwtEncode** - JWT encoding
-- [ ] **JwtDecode** - JWT decoding
-
----
-
-## Debugging & Testing
-
-### Debugging
-
-- [ ] **Identity** - Pass-through with callbacks (debugging)
-- [ ] **FakeSrc** - Generate fake data at specified rate
-- [ ] **FakeSink** - Consume with configurable behavior
-- [ ] **LatencyProbe** - Measure latency at point
-- [ ] **ThroughputProbe** - Measure throughput at point
-- [ ] **BufferProbe** - Inspect buffers (logging/metrics)
-- [ ] **DropProbe** - Randomly drop buffers (chaos testing)
-- [ ] **CorruptProbe** - Randomly corrupt buffers (chaos testing)
-
-### Recording & Replay
-
-- [ ] **Recorder** - Record stream to file with timing
-- [ ] **Replayer** - Replay recorded stream with timing
-- [ ] **Looper** - Loop stream N times or infinitely
+| Element | Type | Complexity | Description |
+|---------|------|------------|-------------|
+| [x] **TcpSrc** | Network | M | TCP client/server source |
+| [x] **TcpSink** | Network | M | TCP sink |
+| [x] **AsyncTcpSrc** | Network | M | Async TCP source |
+| [x] **AsyncTcpSink** | Network | M | Async TCP sink |
+| [x] **UdpSrc** | Network | M | UDP receiver |
+| [x] **UdpSink** | Network | M | UDP sender |
+| [x] **AsyncUdpSrc** | Network | M | Async UDP source |
+| [x] **AsyncUdpSink** | Network | M | Async UDP sink |
+| [ ] **UnixSrc** | Network | L | Unix domain socket source |
+| [ ] **UnixSink** | Network | L | Unix domain socket sink |
+| [ ] **UdpMulticastSrc** | Network | M | Multicast receiver |
+| [ ] **UdpMulticastSink** | Network | M | Multicast sender |
+| [ ] **HttpSrc** | Network | M | HTTP GET source |
+| [ ] **HttpSink** | Network | M | HTTP POST/PUT sink |
+| [ ] **WebSocketSrc** | Network | M | WebSocket source |
+| [ ] **WebSocketSink** | Network | M | WebSocket sink |
 
 ---
 
-## Advanced Routing
+## Tier 4: High Value, Medium-High Complexity (Zenoh Integration)
 
-### Content-Based Routing
+Critical for distributed Zenoh-based pipelines.
 
-- [ ] **Router** - Route based on buffer content
-- [ ] **TopicRouter** - Route based on topic/key
-- [ ] **LoadBalancer** - Load-balanced routing (round-robin, least-loaded)
-- [ ] **Failover** - Failover routing with health checks
-
-### Stream Joining
-
-- [ ] **Zip** - Pair buffers from two streams (1:1)
-- [ ] **ZipLatest** - Pair with latest from each stream
-- [ ] **Join** - Join streams by key
-- [ ] **TemporalJoin** - Join by timestamp proximity
-- [ ] **Merge** - Merge sorted streams
+| Element | Type | Complexity | Description |
+|---------|------|------------|-------------|
+| [ ] **ZenohSrc** | Network | M | Subscribe to Zenoh topic |
+| [ ] **ZenohSink** | Network | M | Publish to Zenoh topic |
+| [ ] **ZenohQueryable** | Network | H | Zenoh queryable element |
+| [ ] **ZenohQuerier** | Network | M | Zenoh query element |
 
 ---
 
-## Media-Specific (Future)
+## Tier 5: Medium Value, Low-Medium Complexity (Data Processing)
 
-### Audio
+Common data manipulation operations.
 
-- [ ] **AudioResample** - Resample audio
-- [ ] **AudioConvert** - Convert audio format
-- [ ] **AudioMixer** - Mix multiple audio streams
-- [ ] **Volume** - Adjust audio volume
-- [ ] **AudioLevel** - Measure audio levels
-
-### Video
-
-- [ ] **VideoScale** - Scale video frames
-- [ ] **VideoConvert** - Convert video format
-- [ ] **VideoRate** - Adjust frame rate
-- [ ] **VideoOverlay** - Overlay graphics on video
-- [ ] **VideoCompositor** - Composite multiple video streams
+| Element | Type | Complexity | Description |
+|---------|------|------------|-------------|
+| [x] **StreamIdDemux** | Routing | M | Demux by stream ID |
+| [ ] **FlatMap** | Transform | M | Map with multiple outputs |
+| [ ] **DuplicateFilter** | Filter | M | Remove duplicates |
+| [ ] **RangeFilter** | Filter | L | Filter by value range |
+| [ ] **RegexFilter** | Filter | M | Filter by regex |
+| [ ] **MetadataFilter** | Filter | L | Filter by metadata |
+| [ ] **MetadataExtract** | Metadata | L | Extract to sideband |
+| [ ] **BufferSplit** | Buffer | M | Split at delimiter |
+| [ ] **BufferJoin** | Buffer | M | Join with delimiter |
+| [ ] **BufferPad** | Buffer | L | Pad to fixed size |
+| [ ] **BufferConcat** | Buffer | L | Concatenate contents |
 
 ---
 
-## Implementation Priority
+## Tier 6: Medium Value, Medium Complexity (Compression)
 
-### Phase 1: Core (DONE)
-Basic infrastructure for pipeline construction.
+Important for bandwidth-constrained scenarios.
 
-### Phase 2: Elements Foundation (DONE)
-Core element traits and basic elements.
+| Element | Type | Complexity | Description |
+|---------|------|------------|-------------|
+| [ ] **Lz4Encode** | Compression | M | LZ4 compression (fastest) |
+| [ ] **Lz4Decode** | Compression | M | LZ4 decompression |
+| [ ] **ZstdEncode** | Compression | M | Zstd compression (best ratio) |
+| [ ] **ZstdDecode** | Compression | M | Zstd decompression |
+| [ ] **GzipEncode** | Compression | M | Gzip compression |
+| [ ] **GzipDecode** | Compression | M | Gzip decompression |
+| [ ] **SnappyEncode** | Compression | M | Snappy compression |
+| [ ] **SnappyDecode** | Compression | M | Snappy decompression |
 
-### Phase 3: GStreamer Equivalents (DONE)
-Essential elements matching GStreamer core.
+---
 
-### Phase 4: Network & IPC (Current)
-1. Unix sockets (UnixSrc, UnixSink)
-2. HTTP elements (HttpSrc, HttpSink)
-3. WebSocket elements
-4. Zenoh integration
+## Tier 7: Medium Value, Medium Complexity (Serialization)
 
-### Phase 5: Data Processing
-1. Filtering elements (Filter, SampleFilter, DuplicateFilter)
-2. Transformation (Map, Batch, Unbatch, Window)
-3. Buffer manipulation
+Format conversion for interoperability.
 
-### Phase 6: Timing & Sync
-1. Delay, Timeout, Debounce
-2. Synchronization elements
-3. Clock integration
+| Element | Type | Complexity | Description |
+|---------|------|------------|-------------|
+| [ ] **JsonEncode** | Serialization | L | Serialize to JSON |
+| [ ] **JsonDecode** | Serialization | M | Deserialize from JSON |
+| [ ] **RkyvEncode** | Serialization | M | Serialize to rkyv |
+| [ ] **RkyvDecode** | Serialization | M | Deserialize from rkyv |
+| [ ] **CborEncode** | Serialization | M | Serialize to CBOR |
+| [ ] **CborDecode** | Serialization | M | Deserialize from CBOR |
+| [ ] **MsgPackEncode** | Serialization | M | Serialize to MessagePack |
+| [ ] **MsgPackDecode** | Serialization | M | Deserialize from MessagePack |
+| [ ] **ProtobufEncode** | Serialization | H | Serialize to protobuf |
+| [ ] **ProtobufDecode** | Serialization | H | Deserialize from protobuf |
 
-### Phase 7: Encoding & Compression
-1. Compression (Gzip, Zstd, Lz4)
-2. Serialization (JSON, rkyv, Protobuf)
+---
 
-### Phase 8: Security
-1. Hashing elements
-2. Encryption/decryption
-3. Authentication
+## Tier 8: Medium Value, Medium-High Complexity (Advanced Routing)
 
-### Phase 9: Debugging & Testing
-1. Probes and identity elements
-2. Recording/replay
-3. Chaos testing elements
+Sophisticated routing patterns.
 
-### Phase 10: Advanced Routing
-1. Content-based routing
-2. Load balancing
-3. Stream joining (Zip, Join, Merge)
+| Element | Type | Complexity | Description |
+|---------|------|------------|-------------|
+| [ ] **Router** | Routing | M | Route by content |
+| [ ] **TopicRouter** | Routing | M | Route by topic/key |
+| [ ] **LoadBalancer** | Routing | M | Round-robin, least-loaded |
+| [ ] **Failover** | Routing | H | Health-checked failover |
+| [ ] **Zip** | Routing | M | Pair from two streams |
+| [ ] **ZipLatest** | Routing | M | Pair with latest |
+| [ ] **Join** | Routing | H | Join by key |
+| [ ] **TemporalJoin** | Routing | H | Join by timestamp |
+| [ ] **Merge** | Routing | M | Merge sorted streams |
+
+---
+
+## Tier 9: Medium Value, High Complexity (Windowing & Aggregation)
+
+Complex stateful processing.
+
+| Element | Type | Complexity | Description |
+|---------|------|------------|-------------|
+| [ ] **Window** | Transform | H | Tumbling/sliding/session windows |
+| [ ] **Aggregate** | Transform | H | Aggregate over window |
+| [ ] **Interleave** | Routing | H | Interleave by timestamp |
+| [ ] **Deinterleave** | Routing | M | Split interleaved stream |
+| [ ] **Muxer** | Routing | H | Combine with timing |
+| [ ] **Demuxer** | Routing | H | Split combined stream |
+
+---
+
+## Tier 10: Medium Value, Medium Complexity (Debugging & Observability)
+
+Essential for development and operations.
+
+| Element | Type | Complexity | Description |
+|---------|------|------------|-------------|
+| [ ] **LatencyProbe** | Debug | M | Measure latency |
+| [ ] **ThroughputProbe** | Debug | M | Measure throughput |
+| [ ] **BufferProbe** | Debug | L | Inspect/log buffers |
+| [ ] **FakeSrc** | Debug | L | Generate fake data |
+| [ ] **FakeSink** | Debug | L | Configurable consumer |
+| [ ] **Recorder** | Debug | M | Record with timing |
+| [ ] **Replayer** | Debug | M | Replay with timing |
+| [ ] **Looper** | Debug | L | Loop N times |
+
+---
+
+## Tier 11: Lower Value, Medium Complexity (Security)
+
+Important for secure pipelines but not always needed.
+
+| Element | Type | Complexity | Description |
+|---------|------|------------|-------------|
+| [ ] **HashCompute** | Security | L | Compute hash (SHA256, Blake3) |
+| [ ] **HashVerify** | Security | M | Verify hash |
+| [ ] **Checksum** | Security | L | Add checksum |
+| [ ] **HmacSign** | Security | M | HMAC signing |
+| [ ] **HmacVerify** | Security | M | HMAC verification |
+| [ ] **AesEncrypt** | Security | M | AES encryption |
+| [ ] **AesDecrypt** | Security | M | AES decryption |
+| [ ] **ChaChaEncrypt** | Security | M | ChaCha20-Poly1305 |
+| [ ] **ChaChaDecrypt** | Security | M | ChaCha20-Poly1305 |
+| [ ] **JwtEncode** | Security | M | JWT encoding |
+| [ ] **JwtDecode** | Security | M | JWT decoding |
+
+---
+
+## Tier 12: Lower Value, Various Complexity (Timing & Sync)
+
+Specialized timing controls.
+
+| Element | Type | Complexity | Description |
+|---------|------|------------|-------------|
+| [ ] **Jitter** | Timing | L | Add random jitter (testing) |
+| [ ] **Throttle** | Timing | M | Rate limiting with timing |
+| [ ] **Pacer** | Timing | M | Pace to timestamps |
+| [ ] **Sync** | Timing | H | Synchronize to clock |
+| [ ] **LatencyTracer** | Timing | M | End-to-end latency |
+| [ ] **ClockProvider** | Timing | H | Pipeline clock source |
+| [ ] **TimestampSync** | Timing | H | Sync multiple streams |
+
+---
+
+## Tier 13: Lower Value, Medium Complexity (Chaos Testing)
+
+Useful for resilience testing.
+
+| Element | Type | Complexity | Description |
+|---------|------|------------|-------------|
+| [ ] **DropProbe** | Debug | L | Randomly drop buffers |
+| [ ] **CorruptProbe** | Debug | M | Randomly corrupt buffers |
+
+---
+
+## Tier 14: Niche, Various Complexity (Advanced Network)
+
+Specialized network scenarios.
+
+| Element | Type | Complexity | Description |
+|---------|------|------------|-------------|
+| [ ] **TcpServerSrc** | Network | H | Multi-client server source |
+| [ ] **TcpServerSink** | Network | H | Multi-client server sink |
+| [ ] **TcpMux** | Network | H | Multiplex over TCP |
+| [ ] **HttpServerSrc** | Network | H | HTTP server source |
+| [ ] **HttpServerSink** | Network | H | HTTP server sink |
+| [ ] **RtpSrc** | Network | H | RTP receiver |
+| [ ] **RtpSink** | Network | H | RTP sender |
+| [ ] **RtpJitterBuffer** | Network | H | RTP jitter buffer |
+
+---
+
+## Tier 15: Niche, Various Complexity (File Handling)
+
+Specialized file operations.
+
+| Element | Type | Complexity | Description |
+|---------|------|------------|-------------|
+| [ ] **MultiFileSrc** | Source | M | Multiple files sequentially |
+| [ ] **MultiFileSink** | Sink | M | File rotation/splitting |
+| [ ] **SplitFileSrc** | Source | M | Split file segments |
+| [ ] **SplitFileSink** | Sink | M | Split file segments |
+| [ ] **Queue2** | Transform | H | File-backed queue |
+| [ ] **TypeFind** | Transform | H | Auto-detect content type |
+| [ ] **Capsfilter** | Transform | M | Filter by capabilities |
+
+---
+
+## Tier 16: Future (Media-Specific)
+
+Reserved for potential media processing expansion.
+
+| Element | Type | Complexity | Description |
+|---------|------|------------|-------------|
+| [ ] **AudioResample** | Audio | H | Resample audio |
+| [ ] **AudioConvert** | Audio | H | Convert audio format |
+| [ ] **AudioMixer** | Audio | H | Mix audio streams |
+| [ ] **Volume** | Audio | M | Adjust volume |
+| [ ] **AudioLevel** | Audio | M | Measure levels |
+| [ ] **VideoScale** | Video | H | Scale video |
+| [ ] **VideoConvert** | Video | H | Convert video format |
+| [ ] **VideoRate** | Video | M | Adjust frame rate |
+| [ ] **VideoOverlay** | Video | H | Overlay graphics |
+| [ ] **VideoCompositor** | Video | H | Composite streams |
+
+---
+
+## Implementation Summary
+
+### Completed: 25+ elements
+- Core infrastructure (sources, sinks, transforms)
+- Basic routing (Tee, Funnel, Selectors, Concat)
+- Network (TCP, UDP - sync and async)
+- Application integration (AppSrc, AppSink)
+
+### Next Priority (Tier order):
+1. **Quick wins** (Tier 1): Identity, MemorySrc/Sink, Delay, Metadata elements
+2. **Data processing** (Tier 2): Filter, Map, Batch, Unbatch, Chunk
+3. **Unix sockets** (Tier 3): UnixSrc, UnixSink
+4. **Zenoh** (Tier 4): ZenohSrc, ZenohSink
+5. **Compression** (Tier 6): Lz4, Zstd (highest value compression)
+
+### Effort Estimates
+
+| Complexity | Typical Effort | Examples |
+|------------|----------------|----------|
+| Low (L) | 1-2 hours | PassThrough, NullSink, Delay |
+| Medium (M) | 2-4 hours | Queue, TcpSrc, Batch |
+| High (H) | 4-8+ hours | Window, RtpJitterBuffer, Join |
 
 ---
 
 ## Notes
 
+- Implement elements in tier order for maximum incremental value
 - Each element should have comprehensive unit tests
-- Elements should support both sync and async where appropriate
-- Consider backpressure and flow control in all elements
-- Document capabilities and limitations clearly
-- Provide examples for complex elements
+- Consider both sync and async variants where applicable
+- Backpressure handling is critical for all elements
+- Document capabilities, limitations, and examples
