@@ -1,0 +1,64 @@
+[package]
+name = "parallax"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A Rust-native streaming pipeline engine with zero-copy multi-process support"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/example/parallax"
+keywords = ["streaming", "pipeline", "zero-copy", "dataflow"]
+categories = ["multimedia", "asynchronous", "data-structures"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "net", "fs", "io-util", "macros", "sync"] }
+
+# Channels (fast, MPMC, sync+async)
+kanal = "0.1"
+
+# Graph structure (enforces DAG)
+daggy = { version = "0.9", features = ["stable_dag"] }
+
+# Parsing
+winnow = "0.7"
+
+# Serialization (zero-copy)
+rkyv = { version = "0.8", features = ["bytecheck"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Buffer utilities
+bytes = "1"
+smallvec = "1"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Metrics & logging
+metrics = "0.24"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Linux system APIs (memfd, mmap, SCM_RIGHTS)
+rustix = { version = "1.0", features = ["mm", "fs", "net", "process"] }
+
+[dev-dependencies]
+tokio-test = "0.4"
+criterion = "0.6"
+proptest = "1"
+
+[features]
+default = []
+huge-pages = []       # MAP_HUGETLB support
+io-uring = []         # Future: io_uring async I/O
+gpu = []              # Future: CUDA/Vulkan pinned memory
+rdma = []             # Future: RDMA support
+
+[[bench]]
+name = "throughput"
+harness = false
+
+[[bench]]
+name = "memory_pool"
+harness = false
