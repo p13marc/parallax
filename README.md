@@ -149,6 +149,19 @@ while let Some(buffer) = subscriber.recv()? {
 | `ConsoleSink` | Prints buffers to console for debugging |
 | `NullSink` | Discards all buffers |
 
+### Sources (Memory/Test)
+
+| Element | Description |
+|---------|-------------|
+| `MemorySrc` | Reads buffers from in-memory data |
+
+### Sinks (Memory)
+
+| Element | Description |
+|---------|-------------|
+| `MemorySink` | Collects buffers into memory |
+| `SharedMemorySink` | Thread-safe memory sink |
+
 ### Transforms
 
 | Element | Description |
@@ -157,6 +170,58 @@ while let Some(buffer) = subscriber.recv()? {
 | `RateLimiter` | Limits buffer throughput rate |
 | `Valve` | Drops or passes buffers (on/off switch) |
 | `Queue` | Async buffer queue with backpressure |
+| `Identity` | Pass-through with callbacks for debugging |
+| `Delay` / `AsyncDelay` | Adds fixed delay between buffers |
+| `Map` | Transforms buffer data with a function |
+| `FilterMap` | Transform and filter in one step |
+| `Chunk` | Splits buffers into fixed-size chunks |
+| `FlatMap` | One-to-many buffer transformation |
+
+### Filtering
+
+| Element | Description |
+|---------|-------------|
+| `Filter` | Filter buffers by predicate |
+| `SampleFilter` | Sample buffers (every Nth, random %, first N) |
+| `MetadataFilter` | Filter by stream ID or sequence range |
+| `DuplicateFilter` | Remove duplicate buffers by content hash |
+| `RangeFilter` | Filter by buffer size or sequence range |
+| `RegexFilter` | Filter by regex pattern match |
+
+### Batching
+
+| Element | Description |
+|---------|-------------|
+| `Batch` | Aggregate multiple buffers into one |
+| `Unbatch` | Split aggregated buffer back into chunks |
+
+### Buffer Operations
+
+| Element | Description |
+|---------|-------------|
+| `BufferTrim` | Trim buffers to maximum size |
+| `BufferSlice` | Extract a slice from each buffer |
+| `BufferPad` | Pad buffers to minimum size |
+| `BufferSplit` | Split buffer at delimiter boundaries |
+| `BufferJoin` | Join buffers with delimiter |
+| `BufferConcat` | Concatenate buffer contents |
+
+### Metadata Operations
+
+| Element | Description |
+|---------|-------------|
+| `SequenceNumber` | Adds sequence numbers to buffers |
+| `Timestamper` | Adds timestamps (system, monotonic) |
+| `MetadataInject` | Injects stream ID, duration, offset |
+| `MetadataExtract` | Extract metadata to sideband channel |
+
+### Timing Control
+
+| Element | Description |
+|---------|-------------|
+| `Timeout` | Generate fallback data on timeout |
+| `Debounce` | Suppress rapid buffer bursts |
+| `Throttle` | Limit buffer rate (drop excess) |
 
 ### Routing
 
@@ -168,6 +233,38 @@ while let Some(buffer) = subscriber.recv()? {
 | `OutputSelector` | Routes to one of N outputs (1-to-N routing) |
 | `Concat` | Concatenates streams sequentially |
 | `StreamIdDemux` | Demultiplexes by stream ID |
+
+### Network (Unix/Multicast)
+
+| Element | Description |
+|---------|-------------|
+| `UnixSrc` / `UnixSink` | Unix domain socket I/O |
+| `AsyncUnixSrc` / `AsyncUnixSink` | Async Unix socket I/O |
+| `UdpMulticastSrc` | Receive from multicast group |
+| `UdpMulticastSink` | Send to multicast group |
+
+### Network (HTTP, requires `http` feature)
+
+| Element | Description |
+|---------|-------------|
+| `HttpSrc` | HTTP GET source (fetch from URL) |
+| `HttpSink` | HTTP POST/PUT sink |
+
+### Network (WebSocket, requires `websocket` feature)
+
+| Element | Description |
+|---------|-------------|
+| `WebSocketSrc` | WebSocket message receiver |
+| `WebSocketSink` | WebSocket message sender |
+
+### Zenoh (requires `zenoh` feature)
+
+| Element | Description |
+|---------|-------------|
+| `ZenohSrc` | Subscribe to Zenoh key expression |
+| `ZenohSink` | Publish to Zenoh key expression |
+| `ZenohQueryable` | Handle Zenoh queries |
+| `ZenohQuerier` | Send Zenoh queries |
 
 ## Memory Backends
 
@@ -224,6 +321,18 @@ cargo run --example multi_process
 
 # New elements (AppSrc/AppSink, Queue, Valve, Funnel, Selectors, etc.)
 cargo run --example new_elements
+
+# Tier 1 & 2 elements (Identity, Memory, Delay, Filters, Batching, etc.)
+cargo run --example tier1_tier2_elements
+
+# Tier 3 network elements (Unix sockets, Multicast)
+cargo run --example tier3_network_elements
+
+# HTTP elements (requires http feature)
+cargo run --example tier3_network_elements --features http
+
+# WebSocket elements (requires websocket feature)
+cargo run --example tier3_network_elements --features websocket
 ```
 
 ## Benchmarks
@@ -245,6 +354,9 @@ cargo bench
 |---------|-------------|
 | `macros` | Plugin authoring convenience macros |
 | `huge-pages` | Enable huge page support |
+| `http` | HTTP source/sink elements (uses ureq) |
+| `websocket` | WebSocket source/sink elements (uses tungstenite) |
+| `zenoh` | Zenoh pub/sub and query elements |
 
 ## License
 

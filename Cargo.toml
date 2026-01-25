@@ -52,6 +52,18 @@ paste = "1.0.15"
 # Proc macros (optional, for plugin authoring convenience)
 parallax-macros = { path = "parallax-macros", optional = true }
 
+# HTTP client (optional)
+ureq = { version = "2", optional = true }
+
+# WebSocket (optional)
+tungstenite = { version = "0.21", optional = true }
+
+# Zenoh pub/sub (optional)
+zenoh = { version = "1.0", optional = true }
+
+# Regex (for RegexFilter)
+regex = "1"
+
 [dev-dependencies]
 tokio-test = "0.4"
 criterion = "0.6"
@@ -65,6 +77,9 @@ huge-pages = []       # MAP_HUGETLB support
 io-uring = []         # Future: io_uring async I/O
 gpu = []              # Future: CUDA/Vulkan pinned memory
 rdma = []             # Future: RDMA support
+http = ["ureq"]       # HTTP source/sink elements
+websocket = ["tungstenite"]  # WebSocket source/sink elements
+zenoh = ["dep:zenoh"] # Zenoh pub/sub elements
 
 [[bench]]
 name = "throughput"

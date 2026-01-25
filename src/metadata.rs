@@ -14,6 +14,32 @@ pub struct BufferFlags {
     pub corrupted: bool,
     /// Buffer should not be displayed/processed (e.g., decode-only).
     pub decode_only: bool,
+    /// Buffer was generated due to a timeout (fallback/heartbeat).
+    pub timeout: bool,
+    /// Buffer is a gap/discontinuity marker.
+    pub gap: bool,
+}
+
+impl BufferFlags {
+    /// Set the timeout flag.
+    pub fn set_timeout(&mut self, value: bool) {
+        self.timeout = value;
+    }
+
+    /// Check if timeout flag is set.
+    pub fn is_timeout(&self) -> bool {
+        self.timeout
+    }
+
+    /// Set the gap flag.
+    pub fn set_gap(&mut self, value: bool) {
+        self.gap = value;
+    }
+
+    /// Check if gap flag is set.
+    pub fn is_gap(&self) -> bool {
+        self.gap
+    }
 }
 
 /// A key-value pair for extra metadata.
@@ -57,6 +83,15 @@ pub struct Metadata {
 
     /// Monotonic sequence number within a stream.
     pub sequence: u64,
+
+    /// Stream identifier for demultiplexing.
+    pub stream_id: Option<u64>,
+
+    /// Byte offset in the original source.
+    pub offset: Option<u64>,
+
+    /// End byte offset in the original source.
+    pub offset_end: Option<u64>,
 
     /// Buffer flags.
     pub flags: BufferFlags,

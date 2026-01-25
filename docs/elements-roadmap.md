@@ -31,15 +31,15 @@ These elements provide immediate utility with minimal implementation effort.
 | [x] **Tee** | Routing | L | 1-to-N fanout |
 | [x] **DataSrc** | Source | L | Inline data source |
 | [x] **ConsoleSink** | Sink | L | Debug output |
-| [ ] **Identity** | Transform | L | Pass-through with callbacks |
-| [ ] **MemorySrc** | Source | L | Read from memory slice |
-| [ ] **MemorySink** | Sink | L | Write to memory buffer |
-| [ ] **Delay** | Timing | L | Fixed delay element |
-| [ ] **SequenceNumber** | Metadata | L | Add sequence numbers |
-| [ ] **Timestamper** | Metadata | L | Add/modify timestamps |
-| [ ] **MetadataInject** | Metadata | L | Add/modify metadata |
-| [ ] **BufferTrim** | Buffer | L | Trim to max size |
-| [ ] **BufferSlice** | Buffer | L | Extract slice |
+| [x] **Identity** | Transform | L | Pass-through with callbacks |
+| [x] **MemorySrc** | Source | L | Read from memory slice |
+| [x] **MemorySink** | Sink | L | Write to memory buffer |
+| [x] **Delay** | Timing | L | Fixed delay element |
+| [x] **SequenceNumber** | Metadata | L | Add sequence numbers |
+| [x] **Timestamper** | Metadata | L | Add/modify timestamps |
+| [x] **MetadataInject** | Metadata | L | Add/modify metadata |
+| [x] **BufferTrim** | Buffer | L | Trim to max size |
+| [x] **BufferSlice** | Buffer | L | Extract slice |
 
 ---
 
@@ -62,14 +62,17 @@ Essential elements that form the backbone of most pipelines.
 | [x] **TestSrc** | Source | L | Test pattern generator |
 | [x] **FdSrc** | Source | L | Raw FD source |
 | [x] **FdSink** | Sink | L | Raw FD sink |
-| [ ] **Filter** | Transform | L | Generic predicate filter |
-| [ ] **Map** | Transform | L | Apply function to contents |
-| [ ] **Batch** | Transform | M | Combine N buffers into one |
-| [ ] **Unbatch** | Transform | M | Split one buffer into N |
-| [ ] **Chunk** | Transform | L | Fixed-size chunking |
-| [ ] **SampleFilter** | Filter | L | Every Nth / random % |
-| [ ] **Timeout** | Timing | M | Timeout with fallback |
-| [ ] **Debounce** | Timing | M | Debounce rapid buffers |
+| [x] **Filter** | Transform | L | Generic predicate filter |
+| [x] **Map** | Transform | L | Apply function to contents |
+| [x] **Batch** | Transform | M | Combine N buffers into one |
+| [x] **Unbatch** | Transform | M | Split one buffer into N |
+| [x] **Chunk** | Transform | L | Fixed-size chunking |
+| [x] **SampleFilter** | Filter | L | Every Nth / random % |
+| [x] **Timeout** | Timing | M | Timeout with fallback |
+| [x] **Debounce** | Timing | M | Debounce rapid buffers |
+| [x] **Throttle** | Timing | M | Rate limiting |
+| [x] **BufferPad** | Buffer | L | Pad to min size |
+| [x] **MetadataFilter** | Filter | L | Filter by metadata |
 
 ---
 
@@ -87,14 +90,14 @@ Network elements are essential for distributed pipelines.
 | [x] **UdpSink** | Network | M | UDP sender |
 | [x] **AsyncUdpSrc** | Network | M | Async UDP source |
 | [x] **AsyncUdpSink** | Network | M | Async UDP sink |
-| [ ] **UnixSrc** | Network | L | Unix domain socket source |
-| [ ] **UnixSink** | Network | L | Unix domain socket sink |
-| [ ] **UdpMulticastSrc** | Network | M | Multicast receiver |
-| [ ] **UdpMulticastSink** | Network | M | Multicast sender |
-| [ ] **HttpSrc** | Network | M | HTTP GET source |
-| [ ] **HttpSink** | Network | M | HTTP POST/PUT sink |
-| [ ] **WebSocketSrc** | Network | M | WebSocket source |
-| [ ] **WebSocketSink** | Network | M | WebSocket sink |
+| [x] **UnixSrc** | Network | L | Unix domain socket source |
+| [x] **UnixSink** | Network | L | Unix domain socket sink |
+| [x] **UdpMulticastSrc** | Network | M | Multicast receiver |
+| [x] **UdpMulticastSink** | Network | M | Multicast sender |
+| [x] **HttpSrc** | Network | M | HTTP GET source (feature: `http`) |
+| [x] **HttpSink** | Network | M | HTTP POST/PUT sink (feature: `http`) |
+| [x] **WebSocketSrc** | Network | M | WebSocket source (feature: `websocket`) |
+| [x] **WebSocketSink** | Network | M | WebSocket sink (feature: `websocket`) |
 
 ---
 
@@ -104,10 +107,10 @@ Critical for distributed Zenoh-based pipelines.
 
 | Element | Type | Complexity | Description |
 |---------|------|------------|-------------|
-| [ ] **ZenohSrc** | Network | M | Subscribe to Zenoh topic |
-| [ ] **ZenohSink** | Network | M | Publish to Zenoh topic |
-| [ ] **ZenohQueryable** | Network | H | Zenoh queryable element |
-| [ ] **ZenohQuerier** | Network | M | Zenoh query element |
+| [x] **ZenohSrc** | Network | M | Subscribe to Zenoh topic (feature: `zenoh`) |
+| [x] **ZenohSink** | Network | M | Publish to Zenoh topic (feature: `zenoh`) |
+| [x] **ZenohQueryable** | Network | H | Zenoh queryable element (feature: `zenoh`) |
+| [x] **ZenohQuerier** | Network | M | Zenoh query element (feature: `zenoh`) |
 
 ---
 
@@ -118,16 +121,14 @@ Common data manipulation operations.
 | Element | Type | Complexity | Description |
 |---------|------|------------|-------------|
 | [x] **StreamIdDemux** | Routing | M | Demux by stream ID |
-| [ ] **FlatMap** | Transform | M | Map with multiple outputs |
-| [ ] **DuplicateFilter** | Filter | M | Remove duplicates |
-| [ ] **RangeFilter** | Filter | L | Filter by value range |
-| [ ] **RegexFilter** | Filter | M | Filter by regex |
-| [ ] **MetadataFilter** | Filter | L | Filter by metadata |
-| [ ] **MetadataExtract** | Metadata | L | Extract to sideband |
-| [ ] **BufferSplit** | Buffer | M | Split at delimiter |
-| [ ] **BufferJoin** | Buffer | M | Join with delimiter |
-| [ ] **BufferPad** | Buffer | L | Pad to fixed size |
-| [ ] **BufferConcat** | Buffer | L | Concatenate contents |
+| [x] **FlatMap** | Transform | M | Map with multiple outputs |
+| [x] **DuplicateFilter** | Filter | M | Remove duplicates |
+| [x] **RangeFilter** | Filter | L | Filter by value range |
+| [x] **RegexFilter** | Filter | M | Filter by regex |
+| [x] **MetadataExtract** | Metadata | L | Extract to sideband |
+| [x] **BufferSplit** | Buffer | M | Split at delimiter |
+| [x] **BufferJoin** | Buffer | M | Join with delimiter |
+| [x] **BufferConcat** | Buffer | L | Concatenate contents |
 
 ---
 
@@ -318,18 +319,24 @@ Reserved for potential media processing expansion.
 
 ## Implementation Summary
 
-### Completed: 25+ elements
+### Completed: 70+ elements (Tiers 1-5)
 - Core infrastructure (sources, sinks, transforms)
-- Basic routing (Tee, Funnel, Selectors, Concat)
+- Basic routing (Tee, Funnel, Selectors, Concat, StreamIdDemux)
 - Network (TCP, UDP - sync and async)
+- Unix domain sockets (UnixSrc, UnixSink)
+- UDP multicast (UdpMulticastSrc, UdpMulticastSink)
+- HTTP (HttpSrc, HttpSink) - feature-gated
+- WebSocket (WebSocketSrc, WebSocketSink) - feature-gated
+- Zenoh (ZenohSrc, ZenohSink, ZenohQueryable, ZenohQuerier) - feature-gated
 - Application integration (AppSrc, AppSink)
+- Data processing (FlatMap, DuplicateFilter, RangeFilter, RegexFilter)
+- Buffer operations (BufferSplit, BufferJoin, BufferConcat)
+- Metadata operations (MetadataExtract)
 
 ### Next Priority (Tier order):
-1. **Quick wins** (Tier 1): Identity, MemorySrc/Sink, Delay, Metadata elements
-2. **Data processing** (Tier 2): Filter, Map, Batch, Unbatch, Chunk
-3. **Unix sockets** (Tier 3): UnixSrc, UnixSink
-4. **Zenoh** (Tier 4): ZenohSrc, ZenohSink
-5. **Compression** (Tier 6): Lz4, Zstd (highest value compression)
+1. **Compression** (Tier 6): Lz4, Zstd (highest value compression)
+2. **Serialization** (Tier 7): JSON, rkyv, CBOR, MessagePack
+3. **Advanced routing** (Tier 8): Router, LoadBalancer, Zip, Join
 
 ### Effort Estimates
 

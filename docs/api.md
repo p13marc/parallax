@@ -178,6 +178,45 @@ pub struct InputSelector { /* ... */ }
 pub struct OutputSelector { /* ... */ }
 pub struct Concat { /* ... */ }
 pub struct StreamIdDemux { /* ... */ }
+
+// Memory-based I/O
+pub struct MemorySrc { /* ... */ }
+pub struct MemorySink { /* ... */ }
+pub struct SharedMemorySink { /* ... */ }
+
+// Identity and delay
+pub struct Identity { /* ... */ }
+pub struct Delay { /* ... */ }
+pub struct AsyncDelay { /* ... */ }
+
+// Metadata operations
+pub struct SequenceNumber { /* ... */ }
+pub struct Timestamper { /* ... */ }
+pub struct MetadataInject { /* ... */ }
+
+// Buffer operations
+pub struct BufferTrim { /* ... */ }
+pub struct BufferSlice { /* ... */ }
+pub struct BufferPad { /* ... */ }
+
+// Filtering
+pub struct Filter<F> { /* ... */ }
+pub struct SampleFilter { /* ... */ }
+pub struct MetadataFilter { /* ... */ }
+
+// Transform
+pub struct Map<F> { /* ... */ }
+pub struct FilterMap<F> { /* ... */ }
+pub struct Chunk { /* ... */ }
+
+// Batching
+pub struct Batch { /* ... */ }
+pub struct Unbatch { /* ... */ }
+
+// Timing control
+pub struct Timeout { /* ... */ }
+pub struct Debounce { /* ... */ }
+pub struct Throttle { /* ... */ }
 ```
 
 #### FileSrc
@@ -357,6 +396,399 @@ impl Concat {
 impl ConcatStream {
     pub fn push(&self, buffer: Buffer) -> Result<()>;
     pub fn end_stream(&self);
+}
+```
+
+#### Identity
+
+Pass-through element with optional callbacks for debugging.
+
+```rust
+impl Identity {
+    pub fn new() -> Self;
+    pub fn with_name(self, name: impl Into<String>) -> Self;
+    pub fn with_callback<F: Fn(&Buffer) + Send + Sync + 'static>(self, f: F) -> Self;
+    pub fn stats(&self) -> (u64, u64);  // (count, bytes)
+    pub fn reset_stats(&self);
+}
+```
+
+#### MemorySrc / MemorySink
+
+Memory-based source and sink for testing and data manipulation.
+
+```rust
+impl MemorySrc {
+    pub fn new(data: Vec<u8>) -> Self;
+    pub fn with_chunk_size(self, chunk_size: usize) -> Self;
+    pub fn with_name(self, name: impl Into<String>) -> Self;
+    pub fn remaining(&self) -> usize;
+    pub fn reset(&mut self);
+}
+
+impl MemorySink {
+    pub fn new() -> Self;
+    pub fn with_max_size(max_size: usize) -> Self;
+    pub fn with_name(self, name: impl Into<String>) -> Self;
+    pub fn data(&self) -> &[u8];
+    pub fn take_data(&mut self) -> Vec<u8>;
+    pub fn clear(&mut self);
+}
+
+// Thread-safe wrapper
+impl SharedMemorySink {
+    pub fn new() -> Self;
+    pub fn with_max_size(max_size: usize) -> Self;
+    pub fn data(&self) -> Vec<u8>;
+    pub fn clear(&self);
+}
+```
+
+#### Delay / AsyncDelay
+
+Add fixed delay between buffer processing.
+
+```rust
+impl Delay {
+    pub fn new(delay: Duration) -> Self;
+    pub fn with_name(self, name: impl Into<String>) -> Self;
+    pub fn set_delay(&self, delay: Duration);
+    pub fn stats(&self) -> (u64, Duration);  // (count, total_delay)
+    pub fn reset_stats(&self);
+}
+
+impl AsyncDelay {
+    pub fn new(delay: Duration) -> Self;
+    pub fn with_name(self, name: impl Into<String>) -> Self;
+    pub fn stats(&self) -> u64;  // count
+}
+```
+
+#### SequenceNumber
+
+Adds sequence numbers to buffer metadata.
+
+```rust
+impl SequenceNumber {
+    pub fn new() -> Self;
+    pub fn starting_at(start: u64) -> Self;
+    pub fn with_increment(self, increment: u64) -> Self;
+    pub fn with_name(self, name: impl Into<String>) -> Self;
+    pub fn current(&self) -> u64;
+    pub fn reset(&self);
+}
+```
+
+#### Timestamper
+
+Adds timestamps to buffer metadata.
+
+```rust
+pub enum TimestampMode {
+    SystemTime,   // System clock time
+    Monotonic,    // Monotonic counter from start
+    Preserve,     // Don't overwrite existing
+    PtsOnly,      // Only set PTS
+    DtsOnly,      // Only set DTS
+}
+
+impl Timestamper {
+    pub fn new(mode: TimestampMode) -> Self;
+    pub fn with_name(self, name: impl Into<String>) -> Self;
+    pub fn buffer_count(&self) -> u64;
+}
+```
+
+#### MetadataInject
+
+Inject metadata fields into buffers.
+
+```rust
+impl MetadataInject {
+    pub fn new() -> Self;
+    pub fn with_stream_id(self, id: u64) -> Self;
+    pub fn with_duration(self, duration: Duration) -> Self;
+    pub fn with_offset(self, offset: u64) -> Self;
+    pub fn with_offset_end(self, offset_end: u64) -> Self;
+    pub fn with_name(self, name: impl Into<String>) -> Self;
+    pub fn count(&self) -> u64;
+}
+```
+
+#### BufferTrim / BufferSlice / BufferPad
+
+Buffer size manipulation operations.
+
+```rust
+impl BufferTrim {
+    pub fn new(max_size: usize) -> Self;
+    pub fn with_name(self, name: impl Into<String>) -> Self;
+    pub fn stats(&self) -> BufferTrimStats;
+}
+
+impl BufferSlice {
+    pub fn new(offset: usize, length: usize) -> Self;
+    pub fn with_name(self, name: impl Into<String>) -> Self;
+}
+
+impl BufferPad {
+    pub fn new(min_size: usize, fill_byte: u8) -> Self;
+    pub fn with_zeros(min_size: usize) -> Self;
+    pub fn with_name(self, name: impl Into<String>) -> Self;
+    pub fn stats(&self) -> BufferPadStats;
+}
+```
+
+#### Filter / SampleFilter / MetadataFilter
+
+Buffer filtering elements.
+
+```rust
+impl<F: FnMut(&Buffer) -> bool + Send> Filter<F> {
+    pub fn new(predicate: F) -> Self;
+    pub fn with_name(self, name: impl Into<String>) -> Self;
+    pub fn stats(&self) -> (u64, u64);  // (passed, dropped)
+}
+
+pub enum SampleMode {
+    EveryNth(u64),       // Pass every Nth buffer
+    RandomPercent(u8),   // Random sampling (0-100%)
+    FirstN(u64),         // Pass first N, then drop
+    SkipFirst(u64),      // Skip first N, then pass
+}
+
+impl SampleFilter {
+    pub fn every_nth(n: u64) -> Self;
+    pub fn random_percent(percent: u8) -> Self;
+    pub fn first_n(n: u64) -> Self;
+    pub fn skip_first(n: u64) -> Self;
+    pub fn with_name(self, name: impl Into<String>) -> Self;
+    pub fn stats(&self) -> (u64, u64);  // (passed, dropped)
+}
+
+impl MetadataFilter {
+    pub fn new() -> Self;
+    pub fn with_stream_id(self, id: u64) -> Self;
+    pub fn with_min_sequence(self, min: u64) -> Self;
+    pub fn with_max_sequence(self, max: u64) -> Self;
+    pub fn with_sequence_range(self, min: u64, max: u64) -> Self;
+    pub fn with_name(self, name: impl Into<String>) -> Self;
+}
+```
+
+#### Map / FilterMap / Chunk
+
+Data transformation elements.
+
+```rust
+impl<F: FnMut(&[u8]) -> Vec<u8> + Send> Map<F> {
+    pub fn new(f: F) -> Self;
+    pub fn with_name(self, name: impl Into<String>) -> Self;
+    pub fn buffer_count(&self) -> u64;
+}
+
+impl<F: FnMut(&[u8]) -> Option<Vec<u8>> + Send> FilterMap<F> {
+    pub fn new(f: F) -> Self;
+    pub fn with_name(self, name: impl Into<String>) -> Self;
+}
+
+impl Chunk {
+    pub fn new(chunk_size: usize) -> Self;
+    pub fn with_name(self, name: impl Into<String>) -> Self;
+    pub fn stats(&self) -> ChunkStats;
+    pub fn flush(&mut self) -> Result<Option<Buffer>>;
+}
+```
+
+#### Batch / Unbatch
+
+Buffer aggregation elements.
+
+```rust
+impl Batch {
+    pub fn by_count(max_count: usize) -> Self;
+    pub fn by_size(max_bytes: usize) -> Self;
+    pub fn with_limits(max_count: usize, max_bytes: usize) -> Self;
+    pub fn with_timeout(self, timeout: Duration) -> Self;
+    pub fn with_name(self, name: impl Into<String>) -> Self;
+    pub fn pending_count(&self) -> usize;
+    pub fn flush(&mut self) -> Result<Option<Buffer>>;
+}
+
+impl Unbatch {
+    pub fn new(chunk_size: usize) -> Self;
+    pub fn with_name(self, name: impl Into<String>) -> Self;
+    pub fn stats(&self) -> UnbatchStats;
+}
+```
+
+#### Timeout / Debounce / Throttle
+
+Timing control elements.
+
+```rust
+impl Timeout {
+    pub fn new(timeout: Duration) -> Self;
+    pub fn with_fallback_data(self, data: Vec<u8>) -> Self;
+    pub fn with_name(self, name: impl Into<String>) -> Self;
+    pub fn check_timeout(&mut self) -> Result<Option<Buffer>>;
+}
+
+impl Debounce {
+    pub fn new(quiet_period: Duration) -> Self;
+    pub fn with_name(self, name: impl Into<String>) -> Self;
+    pub fn flush(&mut self) -> Option<Buffer>;
+}
+
+impl Throttle {
+    pub fn new(min_interval: Duration) -> Self;
+    pub fn with_name(self, name: impl Into<String>) -> Self;
+    pub fn stats(&self) -> ThrottleStats;
+}
+```
+
+#### UnixSrc / UnixSink
+
+Unix domain socket elements for local IPC.
+
+```rust
+impl UnixSrc {
+    pub fn connect<P: AsRef<Path>>(path: P) -> Result<Self>;
+    pub fn listen<P: AsRef<Path>>(path: P) -> Result<Self>;
+    pub fn with_buffer_size(self, size: usize) -> Self;
+    pub fn with_name(self, name: impl Into<String>) -> Self;
+    pub fn with_read_timeout(self, timeout: Duration) -> Self;
+    pub fn bytes_read(&self) -> u64;
+    pub fn path(&self) -> &Path;
+}
+
+impl UnixSink {
+    pub fn connect<P: AsRef<Path>>(path: P) -> Result<Self>;
+    pub fn listen<P: AsRef<Path>>(path: P) -> Result<Self>;
+    pub fn with_name(self, name: impl Into<String>) -> Self;
+    pub fn with_write_timeout(self, timeout: Duration) -> Self;
+    pub fn bytes_written(&self) -> u64;
+}
+```
+
+#### UdpMulticastSrc / UdpMulticastSink
+
+UDP multicast elements for one-to-many distribution.
+
+```rust
+impl UdpMulticastSrc {
+    pub fn new(multicast_addr: &str, port: u16) -> Result<Self>;
+    pub fn with_buffer_size(self, size: usize) -> Self;
+    pub fn with_name(self, name: impl Into<String>) -> Self;
+    pub fn with_timeout(self, timeout: Duration) -> Result<Self>;
+    pub fn multicast_addr(&self) -> Ipv4Addr;
+    pub fn stats(&self) -> UdpMulticastStats;
+}
+
+impl UdpMulticastSink {
+    pub fn new(multicast_addr: &str, port: u16) -> Result<Self>;
+    pub fn with_ttl(self, ttl: u32) -> Result<Self>;
+    pub fn with_loopback(self, enabled: bool) -> Result<Self>;
+    pub fn with_name(self, name: impl Into<String>) -> Self;
+    pub fn stats(&self) -> UdpMulticastStats;
+}
+```
+
+#### HttpSrc / HttpSink (requires `http` feature)
+
+HTTP elements for web-based data transfer.
+
+```rust
+impl HttpSrc {
+    pub fn new(url: impl Into<String>) -> Result<Self>;
+    pub fn with_chunk_size(self, size: usize) -> Self;
+    pub fn with_timeout(self, timeout: Duration) -> Self;
+    pub fn with_header(self, name: impl Into<String>, value: impl Into<String>) -> Self;
+    pub fn with_name(self, name: impl Into<String>) -> Self;
+    pub fn status_code(&self) -> Option<u16>;
+    pub fn bytes_read(&self) -> u64;
+}
+
+impl HttpSink {
+    pub fn new(url: impl Into<String>, method: HttpMethod) -> Result<Self>;
+    pub fn with_timeout(self, timeout: Duration) -> Self;
+    pub fn with_header(self, name: impl Into<String>, value: impl Into<String>) -> Self;
+    pub fn with_content_type(self, content_type: impl Into<String>) -> Self;
+    pub fn with_name(self, name: impl Into<String>) -> Self;
+    pub fn stats(&self) -> HttpSinkStats;
+}
+
+pub enum HttpMethod { Post, Put, Patch }
+```
+
+#### WebSocketSrc / WebSocketSink (requires `websocket` feature)
+
+WebSocket elements for bidirectional communication.
+
+```rust
+impl WebSocketSrc {
+    pub fn new(url: impl Into<String>) -> Result<Self>;
+    pub fn connect(url: impl Into<String>) -> Result<Self>;
+    pub fn with_name(self, name: impl Into<String>) -> Self;
+    pub fn is_connected(&self) -> bool;
+    pub fn stats(&self) -> WebSocketStats;
+    pub fn close(&mut self) -> Result<()>;
+}
+
+impl WebSocketSink {
+    pub fn new(url: impl Into<String>) -> Result<Self>;
+    pub fn connect(url: impl Into<String>) -> Result<Self>;
+    pub fn with_message_type(self, msg_type: WsMessageType) -> Self;
+    pub fn with_name(self, name: impl Into<String>) -> Self;
+    pub fn ping(&mut self) -> Result<()>;
+    pub fn close(&mut self) -> Result<()>;
+    pub fn stats(&self) -> WebSocketStats;
+}
+
+pub enum WsMessageType { Binary, Text }
+```
+
+#### ZenohSrc / ZenohSink (requires `zenoh` feature)
+
+Zenoh pub/sub elements for distributed pipelines.
+
+```rust
+impl ZenohSrc {
+    pub async fn new(key_expr: impl Into<String>) -> Result<Self>;
+    pub async fn with_session(session: Arc<Session>, key_expr: impl Into<String>) -> Result<Self>;
+    pub fn with_name(self, name: impl Into<String>) -> Self;
+    pub fn with_timeout(self, timeout: Duration) -> Self;
+    pub fn key_expr(&self) -> &str;
+    pub fn stats(&self) -> ZenohStats;
+}
+
+impl ZenohSink {
+    pub async fn new(key_expr: impl Into<String>) -> Result<Self>;
+    pub async fn with_session(session: Arc<Session>, key_expr: impl Into<String>) -> Result<Self>;
+    pub fn with_name(self, name: impl Into<String>) -> Self;
+    pub fn with_congestion_control(self, cc: ZenohCongestionControl) -> Self;
+    pub fn with_priority(self, priority: ZenohPriority) -> Self;
+    pub fn stats(&self) -> ZenohStats;
+}
+```
+
+#### ZenohQueryable / ZenohQuerier (requires `zenoh` feature)
+
+Zenoh query elements.
+
+```rust
+impl ZenohQueryable {
+    pub async fn new(key_expr: impl Into<String>) -> Result<Self>;
+    pub fn recv_query(&mut self) -> Result<Option<ZenohQuery>>;
+    pub fn try_recv_query(&mut self) -> Option<ZenohQuery>;
+}
+
+impl ZenohQuerier {
+    pub async fn new() -> Result<Self>;
+    pub fn with_session(session: Arc<Session>) -> Self;
+    pub fn with_timeout(self, timeout: Duration) -> Self;
+    pub async fn get(&mut self, key_expr: &str) -> Result<Vec<Buffer>>;
+    pub async fn get_with_value(&mut self, key_expr: &str, value: &[u8]) -> Result<Vec<Buffer>>;
 }
 ```
 
