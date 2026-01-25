@@ -28,6 +28,7 @@
 
 mod bitmap;
 mod heap;
+pub mod ipc;
 mod pool;
 mod segment;
 mod shared;

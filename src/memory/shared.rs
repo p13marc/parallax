@@ -6,7 +6,7 @@
 
 use super::{IpcHandle, MemorySegment, MemoryType};
 use crate::error::{Error, Result};
-use rustix::fd::OwnedFd;
+use rustix::fd::{AsFd, BorrowedFd, OwnedFd};
 use rustix::mm::{MapFlags, ProtFlags};
 use std::ffi::CString;
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -212,6 +212,12 @@ impl Drop for SharedMemorySegment {
 // - We don't hold any thread-local state
 unsafe impl Send for SharedMemorySegment {}
 unsafe impl Sync for SharedMemorySegment {}
+
+impl AsFd for SharedMemorySegment {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+}
 
 #[cfg(test)]
 mod tests {
