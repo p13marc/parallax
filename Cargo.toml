@@ -61,6 +61,14 @@ tungstenite = { version = "0.21", optional = true }
 # Zenoh pub/sub (optional)
 zenoh = { version = "1.0", optional = true }
 
+# RTP/RTCP (optional, from webrtc-rs)
+# Note: rtp uses webrtc-util 0.12, rtcp uses webrtc-util 0.10
+# We import both versions with different names to avoid diamond dependency issues
+rtp = { version = "0.14", optional = true }
+rtcp = { version = "0.12", optional = true }
+webrtc-util = { version = "0.12", optional = true }
+webrtc-util-0_10 = { package = "webrtc-util", version = "0.10", optional = true }
+
 # Regex (for RegexFilter)
 regex = "1"
 
@@ -80,6 +88,7 @@ rdma = []             # Future: RDMA support
 http = ["ureq"]       # HTTP source/sink elements
 websocket = ["tungstenite"]  # WebSocket source/sink elements
 zenoh = ["dep:zenoh"] # Zenoh pub/sub elements
+rtp = ["dep:rtp", "dep:rtcp", "dep:webrtc-util", "dep:webrtc-util-0_10"]  # RTP/RTCP elements
 
 [[bench]]
 name = "throughput"

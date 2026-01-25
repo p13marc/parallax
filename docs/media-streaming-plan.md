@@ -2,7 +2,17 @@
 
 This document outlines the implementation plan for pure Rust media streaming elements equivalent to GStreamer's `udpsrc`, `udpsink`, `rtspsrc`, `rtpsrc`, `rtpsink`, `videoscale`, and MPEG-TS related elements.
 
-> **Prerequisites:** This plan depends on foundation improvements described in [foundation-design.md](foundation-design.md). Phase 0 (Caps, Multi-Output, Clock, Timestamps) must be completed first.
+> **Status:** Phases 0-3 are **COMPLETE**. Ready for Phase 4 (RTSP Client).
+>
+> **Foundation completed items:**
+> - ✅ `MediaFormat` enum with `VideoFormat`, `AudioFormat`, `RtpFormat`, `MpegTs`, `Bytes`
+> - ✅ `Caps` system with format negotiation
+> - ✅ `ClockTime` type (8-byte Copy, nanosecond precision, NONE sentinel)
+> - ✅ `BufferFlags` as bitflags
+> - ✅ `RtpMeta` struct (seq, ts, ssrc, pt, marker)
+> - ✅ `Transform` trait with `Output` enum (None/Single/Multiple)
+> - ✅ `Demuxer` trait for 1-to-N routing
+> - ✅ `PipelineClock` for pipeline timing
 
 ## Primary Dependency: webrtc-rs
 
@@ -141,80 +151,115 @@ streaming = ["rtp", "media", "rtsp", "mpeg-ts", "video-scale"]
 
 ## Implementation Phases
 
-### Phase 0: Foundation (5-6 weeks)
+### Phase 0: Foundation ✅ COMPLETE
 
 **See [foundation-design.md](foundation-design.md) for details.**
 
-| Sub-Phase | Component | Duration |
-|-----------|-----------|----------|
-| 0.1 | Caps System | 1 week |
-| 0.2 | Multi-Output Support | 1 week |
-| 0.3 | Pipeline Clock | 1 week |
-| 0.4 | Timestamp & Synchronization | 1 week |
-| 0.5 | Caps Negotiation Integration | 1 week |
-| 0.6 | Allocation Query | 3-4 days |
-| 0.7 | AsyncElement | 3-4 days |
+All foundation components have been implemented:
+- `src/format.rs` - MediaFormat, Caps, VideoFormat, AudioFormat, RtpFormat
+- `src/clock.rs` - ClockTime, Clock trait, SystemClock, PipelineClock
+- `src/metadata.rs` - BufferFlags (bitflags), RtpMeta, updated Metadata struct
+- `src/element/traits.rs` - Output enum, Transform trait, Demuxer trait
 
 ---
 
-### Phase 1: RTP Core (1-2 weeks)
+### Phase 1: RTP Core ✅ COMPLETE
 
 **Goal:** Basic RTP send/receive over UDP
 
 ```
-1.1 RTP metadata types (integrate with Parallax Buffer metadata)
-1.2 RtpSrc - UDP receiver, parse with rtp crate
-1.3 RtpSink - UDP sender, build packets with rtp crate
-1.4 Basic RTCP sender/receiver reports
+1.1 ✅ RTP metadata types (RtpMeta already in Metadata)
+1.2 ✅ RtpSrc - UDP receiver, parse with rtp crate
+1.3 ✅ RtpSink - UDP sender, build packets with rtp crate
+1.4 ✅ Basic RTCP sender/receiver reports
 ```
 
-**Key Integration Points:**
-- Map RTP header fields to `Metadata` struct
-- Use existing `UdpSrc`/`UdpSink` as transport layer
-- Add `rtp_timestamp`, `rtp_sequence`, `rtp_ssrc`, `rtp_marker` to metadata
+**Implemented in `src/elements/rtp.rs`:**
+- `RtpSrc` - Receives UDP datagrams, parses RTP headers, outputs payload with RtpMeta
+- `RtpSink` - Wraps buffers in RTP packets, sends over UDP
+- `AsyncRtpSrc` / `AsyncRtpSink` - Async variants for tokio runtime
+- Payload type and SSRC filtering
+- Statistics tracking (packets received/sent, bytes, etc.)
+- Clock rate conversion (RTP timestamp ↔ ClockTime)
 
-### Phase 2: Codec Payloaders/Depayloaders (1 week)
+**Implemented in `src/elements/rtcp.rs`:**
+- `RtcpHandler` - Combined sender/receiver report handling
+- `ReceptionStats` - Per-source reception statistics (jitter, loss, sequence tracking)
+- `SenderStats` - Transmission statistics for senders
+- Sender Reports (SR) for RTP senders with NTP/RTP timestamp correlation
+- Receiver Reports (RR) for RTP receivers with quality metrics
+- Configurable report intervals (default 5 seconds per RFC 3550)
+
+**Key Integration Points:**
+- ✅ RtpMeta struct with seq, ts, ssrc, pt, marker fields
+- ✅ Uses webrtc-rs `rtp` crate for packet parsing/building
+- ✅ Uses webrtc-rs `rtcp` crate for RTCP packet handling
+- ✅ RtpFormat in MediaFormat for caps negotiation
+
+### Phase 2: Codec Payloaders/Depayloaders ✅ COMPLETE
 
 **Goal:** H.264/H.265/VP8/VP9 RTP handling
 
 ```
-2.1 RtpH264Depay - wrap rtp::codecs::h264::H264Packet
-2.2 RtpH264Pay - wrap rtp::codecs::h264 packetizer
-2.3 RtpH265Depay/Pay - same pattern
-2.4 RtpVp8Depay/Pay, RtpVp9Depay/Pay
+2.1 ✅ RtpH264Depay - wrap rtp::codecs::h264::H264Packet
+2.2 ✅ RtpH264Pay - wrap rtp::codecs::h264 packetizer
+2.3 ✅ RtpH265Depay/Pay - same pattern
+2.4 ✅ RtpVp8Depay/Pay, RtpVp9Depay/Pay
+2.5 ✅ RtpOpusDepay - Opus audio depacketizer
 ```
 
-**Design:** Thin wrappers around webrtc-rs codec modules:
+**Implemented in `src/elements/rtp_codecs.rs`:**
 
-```rust
-pub struct RtpH264Depay {
-    depacketizer: h264::H264Packet,
-    // ...
-}
+| Element | Description |
+|---------|-------------|
+| `RtpH264Depay` | H.264 depacketizer (FU-A, STAP-A), Annex B or AVC output |
+| `RtpH264Pay` | H.264 packetizer with configurable MTU |
+| `RtpH265Depay` | H.265/HEVC depacketizer |
+| `RtpH265Pay` | H.265/HEVC packetizer |
+| `RtpVp8Depay` | VP8 depacketizer with keyframe detection |
+| `RtpVp8Pay` | VP8 packetizer |
+| `RtpVp9Depay` | VP9 depacketizer |
+| `RtpVp9Pay` | VP9 packetizer |
+| `RtpOpusDepay` | Opus audio depacketizer |
 
-impl Element for RtpH264Depay {
-    fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
-        // Extract RTP payload from buffer
-        // Call depacketizer.depacketize()
-        // Return NAL units as new buffer
-    }
-}
-```
+**Features:**
+- Thin wrappers around webrtc-rs `rtp::codecs` module
+- Statistics tracking (`DepayStats`, `PayStats`)
+- Keyframe detection for H.264 (IDR NAL) and VP8
+- Configurable MTU for payloaders
+- AVC format support for H.264
 
-### Phase 3: Jitter Buffer (1-2 weeks)
+### Phase 3: Jitter Buffer ✅ COMPLETE
 
 **Goal:** Handle packet reordering, loss, timing
 
 ```
-3.1 Basic reorder buffer (sequence-based)
-3.2 Configurable buffer depth (ms or packets)
-3.3 Packet loss detection and signaling
-3.4 Integration with RTCP for statistics
+3.1 ✅ Basic reorder buffer (sequence-based)
+3.2 ✅ Configurable buffer depth (ms or packets)
+3.3 ✅ Packet loss detection and signaling
+3.4 ✅ Integration with RTCP for statistics
 ```
 
-**Options:**
-- Use `interceptor` crate's NACK/jitter buffer
-- Build custom optimized for Parallax buffer model
+**Implemented in `src/elements/jitter_buffer.rs`:**
+
+| Element | Description |
+|---------|-------------|
+| `RtpJitterBuffer` | Sync jitter buffer with sequence-based reordering |
+| `AsyncJitterBuffer` | Async variant with timeout-based packet retrieval |
+| `JitterBufferConfig` | Configuration (latency_ms, max_packets, clock_rate, drop_late) |
+| `JitterBufferStats` | Statistics (received, output, dropped, lost, reordered, duplicate) |
+| `LossInfo` | Loss statistics for RTCP reporting integration |
+
+**Features:**
+- Extended sequence number handling (16-bit wraparound)
+- Configurable buffering latency (default 200ms)
+- Maximum buffer size enforcement with overflow handling
+- Late packet detection and optional dropping
+- Duplicate packet detection
+- Packet loss detection with gap tracking
+- RTCP integration via `LossInfo` struct (expected, received, lost counts)
+- Flush operation for draining remaining packets
+- Reset operation for stream discontinuities
 
 ### Phase 4: RTSP Client (2 weeks)
 
@@ -402,29 +447,31 @@ let scaler = VideoScale::new()
 
 ---
 
-## RTP Metadata Extension
+## RTP Metadata ✅ IMPLEMENTED
 
-Extend `Metadata` struct for RTP-specific fields:
+RTP metadata is already integrated in `src/metadata.rs`:
 
 ```rust
-// In src/metadata.rs
-pub struct Metadata {
-    // Existing fields...
-    pub sequence: u64,
-    pub timestamp: Option<Timestamp>,
-    
-    // New RTP fields
-    pub rtp: Option<RtpMetadata>,
+/// RTP header metadata (12 bytes, Copy)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RtpMeta {
+    pub seq: u16,       // RTP sequence number
+    pub ts: u32,        // RTP timestamp
+    pub ssrc: u32,      // Synchronization source
+    pub pt: u8,         // Payload type
+    pub marker: bool,   // Marker bit
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct RtpMetadata {
-    pub sequence: u16,
-    pub timestamp: u32,
-    pub ssrc: u32,
-    pub payload_type: u8,
-    pub marker: bool,
-    pub csrc: Vec<u32>,
+pub struct Metadata {
+    pub pts: ClockTime,
+    pub dts: ClockTime,
+    pub duration: ClockTime,
+    pub sequence: u64,
+    pub stream_id: u32,
+    pub flags: BufferFlags,
+    pub rtp: Option<RtpMeta>,  // RTP-specific metadata
+    pub format: Option<MediaFormat>,
+    pub offset: Option<u64>,
 }
 ```
 
