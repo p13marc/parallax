@@ -586,3 +586,224 @@ fn test_typed_pipeline_once() {
 
     assert_eq!(result.into_inner(), vec![84]);
 }
+
+// ============================================================================
+// Phase 5: Graph Export and Event System Tests
+// ============================================================================
+
+/// Test DOT graph export.
+#[test]
+fn test_pipeline_to_dot() {
+    use parallax::pipeline::Pipeline;
+
+    let pipeline = Pipeline::parse("nullsource count=5 ! passthrough ! nullsink").unwrap();
+    let dot = pipeline.to_dot();
+
+    // Check that the DOT output contains expected elements
+    assert!(dot.contains("digraph pipeline"));
+    assert!(dot.contains("rankdir=LR"));
+    assert!(dot.contains("nullsource_0"));
+    assert!(dot.contains("passthrough_1"));
+    assert!(dot.contains("nullsink_2"));
+    assert!(dot.contains("->")); // Edge connections
+}
+
+/// Test DOT graph export with options.
+#[test]
+fn test_pipeline_to_dot_with_options() {
+    use parallax::pipeline::{DotOptions, Pipeline};
+
+    let pipeline = Pipeline::parse("nullsource ! nullsink").unwrap();
+
+    // Test verbose options
+    let dot_verbose = pipeline.to_dot_with_options(&DotOptions::verbose());
+    assert!(dot_verbose.contains("Legend"));
+    assert!(dot_verbose.contains("src -> sink")); // Pad names shown
+
+    // Test minimal options
+    let dot_minimal = pipeline.to_dot_with_options(&DotOptions::minimal());
+    assert!(!dot_minimal.contains("Legend"));
+}
+
+/// Test JSON graph export.
+#[test]
+fn test_pipeline_to_json() {
+    use parallax::pipeline::Pipeline;
+
+    let pipeline = Pipeline::parse("nullsource count=10 ! passthrough ! nullsink").unwrap();
+    let json = pipeline.to_json();
+
+    // Check that the JSON output contains expected elements
+    assert!(json.contains("\"state\": \"Stopped\""));
+    assert!(json.contains("\"node_count\": 3"));
+    assert!(json.contains("\"edge_count\": 2"));
+    assert!(json.contains("\"nodes\": ["));
+    assert!(json.contains("\"edges\": ["));
+    assert!(json.contains("\"name\": \"nullsource_0\""));
+    assert!(json.contains("\"type\": \"Source\""));
+}
+
+/// Test pipeline event system.
+#[tokio::test]
+async fn test_pipeline_events() {
+    use parallax::element::{SinkAdapter, SourceAdapter};
+    use parallax::elements::{NullSink, NullSource};
+    use parallax::pipeline::{Pipeline, PipelineEvent, PipelineExecutor};
+
+    let mut pipeline = Pipeline::new();
+
+    let src = pipeline.add_node("src", Box::new(SourceAdapter::new(NullSource::new(10))));
+    let sink = pipeline.add_node("sink", Box::new(SinkAdapter::new(NullSink::new())));
+    pipeline.link(src, sink).unwrap();
+
+    let executor = PipelineExecutor::new();
+    let handle = executor.start(&mut pipeline).unwrap();
+
+    // Subscribe to events - note that some early events (Started, NodeStarted)
+    // may have already been emitted before we subscribe, since the broadcast
+    // channel drops messages for late subscribers.
+    let mut receiver = handle.subscribe();
+
+    // Wait for the pipeline to complete
+    handle.wait().await.unwrap();
+
+    // Check that we received the events that occur after subscription.
+    // EOS is emitted in wait() after all tasks complete, so it should always be received.
+    // NodeFinished events may or may not be received depending on timing.
+    let mut node_finished_count = 0;
+    let mut eos_count = 0;
+
+    while let Some(event) = receiver.try_recv() {
+        match event {
+            PipelineEvent::NodeFinished { .. } => node_finished_count += 1,
+            PipelineEvent::Eos => eos_count += 1,
+            _ => {}
+        }
+    }
+
+    // EOS should always be received since it's emitted after wait() tasks join
+    assert_eq!(eos_count, 1, "Expected 1 Eos event");
+    // NodeFinished events should be received (emitted before tasks join)
+    assert_eq!(node_finished_count, 2, "Expected 2 NodeFinished events");
+}
+
+/// Test wait_eos on event receiver.
+#[tokio::test]
+async fn test_event_wait_eos() {
+    use parallax::element::{SinkAdapter, SourceAdapter};
+    use parallax::elements::{NullSink, NullSource};
+    use parallax::pipeline::{Pipeline, PipelineExecutor};
+
+    let mut pipeline = Pipeline::new();
+
+    let src = pipeline.add_node("src", Box::new(SourceAdapter::new(NullSource::new(5))));
+    let sink = pipeline.add_node("sink", Box::new(SinkAdapter::new(NullSink::new())));
+    pipeline.link(src, sink).unwrap();
+
+    let executor = PipelineExecutor::new();
+    let handle = executor.start(&mut pipeline).unwrap();
+
+    let mut receiver = handle.subscribe();
+
+    // Wait for EOS using the convenience method
+    let wait_handle = tokio::spawn(async move { receiver.wait_eos().await });
+
+    // Wait for the pipeline
+    handle.wait().await.unwrap();
+
+    // The wait_eos should have completed successfully
+    let result = wait_handle.await.unwrap();
+    assert!(result.is_ok());
+}
+
+/// Test pipeline state transitions.
+#[tokio::test]
+async fn test_pipeline_state_transitions() {
+    use parallax::element::{SinkAdapter, SourceAdapter};
+    use parallax::elements::{NullSink, NullSource};
+    use parallax::pipeline::{Pipeline, PipelineExecutor, PipelineState};
+
+    let mut pipeline = Pipeline::new();
+
+    // Initially stopped
+    assert_eq!(pipeline.state(), PipelineState::Stopped);
+
+    let src = pipeline.add_node("src", Box::new(SourceAdapter::new(NullSource::new(10))));
+    let sink = pipeline.add_node("sink", Box::new(SinkAdapter::new(NullSink::new())));
+    pipeline.link(src, sink).unwrap();
+
+    let executor = PipelineExecutor::new();
+    let handle = executor.start(&mut pipeline).unwrap();
+
+    // Should be running now
+    assert_eq!(pipeline.state(), PipelineState::Running);
+
+    handle.wait().await.unwrap();
+}
+
+/// Test pipeline abort emits stopped event.
+#[tokio::test]
+async fn test_pipeline_abort_event() {
+    use parallax::buffer::{Buffer, MemoryHandle};
+    use parallax::element::{SinkAdapter, Source, SourceAdapter};
+    use parallax::memory::HeapSegment;
+    use parallax::metadata::Metadata;
+    use parallax::pipeline::{Pipeline, PipelineEvent, PipelineExecutor};
+
+    /// A source that produces buffers forever.
+    struct InfiniteSource;
+
+    impl Source for InfiniteSource {
+        fn produce(&mut self) -> parallax::error::Result<Option<Buffer>> {
+            let segment = std::sync::Arc::new(HeapSegment::new(64)?);
+            let handle = MemoryHandle::from_segment(segment);
+            Ok(Some(Buffer::new(handle, Metadata::default())))
+        }
+    }
+
+    struct DiscardSink;
+    impl parallax::element::Sink for DiscardSink {
+        fn consume(&mut self, _buffer: Buffer) -> parallax::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_node("src", Box::new(SourceAdapter::new(InfiniteSource)));
+    let sink = pipeline.add_node("sink", Box::new(SinkAdapter::new(DiscardSink)));
+    pipeline.link(src, sink).unwrap();
+
+    let executor = PipelineExecutor::new();
+    let handle = executor.start(&mut pipeline).unwrap();
+
+    let mut receiver = handle.subscribe();
+
+    // Let it run briefly
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+    // Abort the pipeline
+    handle.abort();
+
+    // Check for Stopped event
+    let mut found_stopped = false;
+    while let Some(event) = receiver.try_recv() {
+        if matches!(event, PipelineEvent::Stopped) {
+            found_stopped = true;
+            break;
+        }
+    }
+
+    assert!(found_stopped, "Expected Stopped event after abort");
+}
+
+/// Test dynamic pipeline builder from typed module.
+#[test]
+fn test_dynamic_pipeline_builder_creation() {
+    use parallax::typed::bridge::DynamicPipelineBuilder;
+
+    let builder = DynamicPipelineBuilder::new();
+    let pipeline = builder.build();
+
+    assert_eq!(pipeline.node_count(), 0);
+    assert!(pipeline.is_empty());
+}

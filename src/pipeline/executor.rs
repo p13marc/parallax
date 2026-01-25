@@ -6,7 +6,7 @@
 use crate::buffer::Buffer;
 use crate::element::{ElementDyn, ElementType};
 use crate::error::{Error, Result};
-use crate::pipeline::{NodeId, Pipeline, PipelineState};
+use crate::pipeline::{EventReceiver, EventSender, NodeId, Pipeline, PipelineEvent, PipelineState};
 use kanal::{AsyncReceiver, AsyncSender, bounded_async};
 use std::collections::HashMap;
 use tokio::task::JoinHandle;
@@ -48,6 +48,8 @@ enum Message {
 pub struct PipelineHandle {
     /// Join handles for all spawned tasks.
     tasks: Vec<JoinHandle<Result<()>>>,
+    /// Event sender for the pipeline.
+    events: EventSender,
 }
 
 impl PipelineHandle {
@@ -55,11 +57,34 @@ impl PipelineHandle {
     ///
     /// Returns `Ok(())` if all elements finished successfully, or the first error encountered.
     pub async fn wait(self) -> Result<()> {
+        let mut first_error = None;
         for task in self.tasks {
-            task.await
-                .map_err(|e| Error::InvalidSegment(format!("task panicked: {e}")))??;
+            match task.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    self.events.send_error(e.to_string(), None);
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
+                Err(e) => {
+                    let err = Error::InvalidSegment(format!("task panicked: {e}"));
+                    self.events.send_error(err.to_string(), None);
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                }
+            }
         }
-        Ok(())
+
+        if first_error.is_none() {
+            self.events.send_eos();
+        }
+
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Abort all pipeline tasks.
@@ -67,6 +92,17 @@ impl PipelineHandle {
         for task in self.tasks {
             task.abort();
         }
+        self.events.send(PipelineEvent::Stopped);
+    }
+
+    /// Subscribe to pipeline events.
+    pub fn subscribe(&self) -> EventReceiver {
+        self.events.subscribe()
+    }
+
+    /// Get the event sender for this pipeline.
+    pub fn event_sender(&self) -> &EventSender {
+        &self.events
     }
 }
 
@@ -104,16 +140,22 @@ impl PipelineExecutor {
         // Validate pipeline structure
         pipeline.validate()?;
 
-        // Set state to running
+        // Create event sender
+        let events = EventSender::new(256);
+
+        // Emit state change event
+        let old_state = pipeline.state();
         pipeline.set_state(PipelineState::Running);
+        events.send_state_changed(old_state, PipelineState::Running);
+        events.send(PipelineEvent::Started);
 
         // Build the channel network
         let channels = self.build_channels(pipeline);
 
         // Spawn tasks for each node
-        let tasks = self.spawn_tasks(pipeline, channels)?;
+        let tasks = self.spawn_tasks(pipeline, channels, &events)?;
 
-        Ok(PipelineHandle { tasks })
+        Ok(PipelineHandle { tasks, events })
     }
 
     /// Build channels between connected nodes.
@@ -154,6 +196,7 @@ impl PipelineExecutor {
         &self,
         pipeline: &mut Pipeline,
         mut channels: ChannelNetwork,
+        events: &EventSender,
     ) -> Result<Vec<JoinHandle<Result<()>>>> {
         let mut tasks = Vec::new();
 
@@ -185,17 +228,19 @@ impl PipelineExecutor {
             let inputs = channels.take_inputs(node_id);
             let outputs = channels.take_outputs(node_id);
 
+            let events_clone = events.clone();
             match element_type {
                 ElementType::Source => {
-                    let task = spawn_source_task(node_name, element, outputs);
+                    let task = spawn_source_task(node_name, element, outputs, events_clone);
                     tasks.push(task);
                 }
                 ElementType::Sink => {
-                    let task = spawn_sink_task(node_name, element, inputs);
+                    let task = spawn_sink_task(node_name, element, inputs, events_clone);
                     tasks.push(task);
                 }
                 ElementType::Transform => {
-                    let task = spawn_transform_task(node_name, element, inputs, outputs);
+                    let task =
+                        spawn_transform_task(node_name, element, inputs, outputs, events_clone);
                     tasks.push(task);
                 }
             }
@@ -289,14 +334,19 @@ fn spawn_source_task(
     name: String,
     mut element: Box<dyn ElementDyn>,
     outputs: Vec<AsyncSender<Message>>,
+    events: EventSender,
 ) -> JoinHandle<Result<()>> {
     tokio::spawn(async move {
         tracing::debug!("source task '{}' started", name);
+        events.send_node_started(&name);
+
+        let mut buffers_processed: u64 = 0;
 
         // Produce buffers until EOS
         loop {
             match element.process(None) {
                 Ok(Some(buffer)) => {
+                    buffers_processed += 1;
                     // Send buffer to all outputs
                     for tx in &outputs {
                         if tx.send(Message::Buffer(buffer.clone())).await.is_err() {
@@ -315,12 +365,14 @@ fn spawn_source_task(
                 }
                 Err(e) => {
                     tracing::error!("source '{}' error: {}", name, e);
+                    events.send_error(e.to_string(), Some(name.clone()));
                     return Err(e);
                 }
             }
         }
 
         tracing::debug!("source task '{}' finished", name);
+        events.send_node_finished(&name, buffers_processed);
         Ok(())
     })
 }
@@ -330,9 +382,13 @@ fn spawn_sink_task(
     name: String,
     mut element: Box<dyn ElementDyn>,
     inputs: Vec<AsyncReceiver<Message>>,
+    events: EventSender,
 ) -> JoinHandle<Result<()>> {
     tokio::spawn(async move {
         tracing::debug!("sink task '{}' started", name);
+        events.send_node_started(&name);
+
+        let mut buffers_processed: u64 = 0;
 
         // For multiple inputs, we'd need to select/merge them
         // For now, assume single input
@@ -340,9 +396,11 @@ fn spawn_sink_task(
             loop {
                 match rx.recv().await {
                     Ok(Message::Buffer(buffer)) => {
+                        buffers_processed += 1;
                         // Process the buffer through the sink element
                         if let Err(e) = element.process(Some(buffer)) {
                             tracing::error!("sink '{}' error: {}", name, e);
+                            events.send_error(e.to_string(), Some(name.clone()));
                             return Err(e);
                         }
                     }
@@ -360,6 +418,7 @@ fn spawn_sink_task(
         }
 
         tracing::debug!("sink task '{}' finished", name);
+        events.send_node_finished(&name, buffers_processed);
         Ok(())
     })
 }
@@ -370,15 +429,20 @@ fn spawn_transform_task(
     mut element: Box<dyn ElementDyn>,
     inputs: Vec<AsyncReceiver<Message>>,
     outputs: Vec<AsyncSender<Message>>,
+    events: EventSender,
 ) -> JoinHandle<Result<()>> {
     tokio::spawn(async move {
         tracing::debug!("transform task '{}' started", name);
+        events.send_node_started(&name);
+
+        let mut buffers_processed: u64 = 0;
 
         // For now, assume single input
         if let Some(rx) = inputs.into_iter().next() {
             loop {
                 match rx.recv().await {
                     Ok(Message::Buffer(buffer)) => {
+                        buffers_processed += 1;
                         // Process the buffer through the transform element
                         match element.process(Some(buffer)) {
                             Ok(Some(out_buffer)) => {
@@ -398,6 +462,7 @@ fn spawn_transform_task(
                             }
                             Err(e) => {
                                 tracing::error!("transform '{}' error: {}", name, e);
+                                events.send_error(e.to_string(), Some(name.clone()));
                                 return Err(e);
                             }
                         }
@@ -423,6 +488,7 @@ fn spawn_transform_task(
         }
 
         tracing::debug!("transform task '{}' finished", name);
+        events.send_node_finished(&name, buffers_processed);
         Ok(())
     })
 }

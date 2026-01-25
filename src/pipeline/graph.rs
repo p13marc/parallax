@@ -462,6 +462,226 @@ impl std::fmt::Debug for Pipeline {
     }
 }
 
+// ============================================================================
+// Graph Export (DOT, JSON)
+// ============================================================================
+
+impl Pipeline {
+    /// Export the pipeline graph to DOT format (Graphviz).
+    ///
+    /// This can be rendered using `dot -Tpng pipeline.dot -o pipeline.png`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use parallax::pipeline::Pipeline;
+    ///
+    /// let mut pipeline = Pipeline::parse("nullsource ! passthrough ! nullsink").unwrap();
+    /// let dot = pipeline.to_dot();
+    /// println!("{}", dot);
+    /// ```
+    pub fn to_dot(&self) -> String {
+        self.to_dot_with_options(&DotOptions::default())
+    }
+
+    /// Export the pipeline graph to DOT format with custom options.
+    pub fn to_dot_with_options(&self, options: &DotOptions) -> String {
+        let mut dot = String::new();
+
+        // Graph header
+        dot.push_str("digraph pipeline {\n");
+        dot.push_str("    rankdir=LR;\n");
+        dot.push_str("    node [shape=box, style=rounded];\n");
+        dot.push_str("\n");
+
+        // Add nodes
+        for idx in self.graph.graph().node_indices() {
+            let node = self.graph.node_weight(idx).unwrap();
+            let (shape, color) = match node.element_type() {
+                ElementType::Source => ("ellipse", "lightgreen"),
+                ElementType::Sink => ("ellipse", "lightcoral"),
+                ElementType::Transform => ("box", "lightblue"),
+            };
+
+            let label = if options.show_element_type {
+                format!("{}\\n({:?})", node.name(), node.element_type())
+            } else {
+                node.name().to_string()
+            };
+
+            dot.push_str(&format!(
+                "    \"{}\" [label=\"{}\", shape={}, fillcolor={}, style=filled];\n",
+                node.name(),
+                label,
+                shape,
+                color
+            ));
+        }
+
+        dot.push_str("\n");
+
+        // Add edges
+        for edge_idx in self.graph.graph().edge_indices() {
+            let (src_idx, sink_idx) = self.graph.graph().edge_endpoints(edge_idx).unwrap();
+            let src_node = self.graph.node_weight(src_idx).unwrap();
+            let sink_node = self.graph.node_weight(sink_idx).unwrap();
+            let link = self.graph.edge_weight(edge_idx).unwrap();
+
+            let edge_label = if options.show_pad_names {
+                format!(" [label=\"{} -> {}\"]", link.src_pad, link.sink_pad)
+            } else {
+                String::new()
+            };
+
+            dot.push_str(&format!(
+                "    \"{}\" -> \"{}\"{};\n",
+                src_node.name(),
+                sink_node.name(),
+                edge_label
+            ));
+        }
+
+        // Legend (optional)
+        if options.show_legend {
+            dot.push_str("\n");
+            dot.push_str("    subgraph cluster_legend {\n");
+            dot.push_str("        label=\"Legend\";\n");
+            dot.push_str("        style=dashed;\n");
+            dot.push_str("        legend_source [label=\"Source\", shape=ellipse, fillcolor=lightgreen, style=filled];\n");
+            dot.push_str("        legend_transform [label=\"Transform\", shape=box, fillcolor=lightblue, style=filled];\n");
+            dot.push_str("        legend_sink [label=\"Sink\", shape=ellipse, fillcolor=lightcoral, style=filled];\n");
+            dot.push_str("    }\n");
+        }
+
+        dot.push_str("}\n");
+        dot
+    }
+
+    /// Export the pipeline graph to JSON format.
+    ///
+    /// The JSON structure includes nodes and edges arrays.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use parallax::pipeline::Pipeline;
+    ///
+    /// let mut pipeline = Pipeline::parse("nullsource ! passthrough ! nullsink").unwrap();
+    /// let json = pipeline.to_json();
+    /// println!("{}", json);
+    /// ```
+    pub fn to_json(&self) -> String {
+        let mut json = String::new();
+
+        json.push_str("{\n");
+
+        // Pipeline metadata
+        json.push_str(&format!("  \"state\": \"{:?}\",\n", self.state));
+        json.push_str(&format!("  \"node_count\": {},\n", self.node_count()));
+        json.push_str(&format!("  \"edge_count\": {},\n", self.edge_count()));
+
+        // Nodes array
+        json.push_str("  \"nodes\": [\n");
+        let node_indices: Vec<_> = self.graph.graph().node_indices().collect();
+        for (i, idx) in node_indices.iter().enumerate() {
+            let node = self.graph.node_weight(*idx).unwrap();
+            json.push_str("    {\n");
+            json.push_str(&format!("      \"id\": {},\n", idx.index()));
+            json.push_str(&format!("      \"name\": \"{}\",\n", node.name()));
+            json.push_str(&format!("      \"type\": \"{:?}\",\n", node.element_type()));
+            json.push_str(&format!(
+                "      \"input_pads\": {},\n",
+                node.input_pads().len()
+            ));
+            json.push_str(&format!(
+                "      \"output_pads\": {}\n",
+                node.output_pads().len()
+            ));
+            if i < node_indices.len() - 1 {
+                json.push_str("    },\n");
+            } else {
+                json.push_str("    }\n");
+            }
+        }
+        json.push_str("  ],\n");
+
+        // Edges array
+        json.push_str("  \"edges\": [\n");
+        let edge_indices: Vec<_> = self.graph.graph().edge_indices().collect();
+        for (i, edge_idx) in edge_indices.iter().enumerate() {
+            let (src_idx, sink_idx) = self.graph.graph().edge_endpoints(*edge_idx).unwrap();
+            let link = self.graph.edge_weight(*edge_idx).unwrap();
+            json.push_str("    {\n");
+            json.push_str(&format!("      \"from\": {},\n", src_idx.index()));
+            json.push_str(&format!("      \"to\": {},\n", sink_idx.index()));
+            json.push_str(&format!("      \"src_pad\": \"{}\",\n", link.src_pad));
+            json.push_str(&format!("      \"sink_pad\": \"{}\"\n", link.sink_pad));
+            if i < edge_indices.len() - 1 {
+                json.push_str("    },\n");
+            } else {
+                json.push_str("    }\n");
+            }
+        }
+        json.push_str("  ]\n");
+
+        json.push_str("}\n");
+        json
+    }
+
+    /// Write the DOT representation to a file.
+    pub fn write_dot(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
+        std::fs::write(path, self.to_dot())?;
+        Ok(())
+    }
+
+    /// Write the JSON representation to a file.
+    pub fn write_json(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
+        std::fs::write(path, self.to_json())?;
+        Ok(())
+    }
+}
+
+/// Options for DOT export.
+#[derive(Debug, Clone)]
+pub struct DotOptions {
+    /// Show element type in node labels.
+    pub show_element_type: bool,
+    /// Show pad names on edges.
+    pub show_pad_names: bool,
+    /// Include a legend subgraph.
+    pub show_legend: bool,
+}
+
+impl Default for DotOptions {
+    fn default() -> Self {
+        Self {
+            show_element_type: true,
+            show_pad_names: false,
+            show_legend: false,
+        }
+    }
+}
+
+impl DotOptions {
+    /// Create options with all details shown.
+    pub fn verbose() -> Self {
+        Self {
+            show_element_type: true,
+            show_pad_names: true,
+            show_legend: true,
+        }
+    }
+
+    /// Create minimal options.
+    pub fn minimal() -> Self {
+        Self {
+            show_element_type: false,
+            show_pad_names: false,
+            show_legend: false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

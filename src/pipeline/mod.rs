@@ -5,6 +5,7 @@
 //! - [`Pipeline`]: The main pipeline container and DAG
 //! - [`Node`]: A node in the pipeline graph (wraps an element)
 //! - [`Link`]: A connection between nodes
+//! - [`PipelineEvent`]: Async events emitted during execution
 //!
 //! # Example
 //!
@@ -27,12 +28,14 @@
 //! pipeline.run().await?;
 //! ```
 
+mod events;
 mod executor;
 pub mod factory;
 mod graph;
 pub mod parser;
 
+pub use events::{EventReceiver, EventSender, EventStream, PipelineEvent};
 pub use executor::{ExecutorConfig, PipelineExecutor, PipelineHandle};
 pub use factory::ElementFactory;
-pub use graph::{Link, Node, NodeId, Pipeline, PipelineState};
+pub use graph::{DotOptions, Link, Node, NodeId, Pipeline, PipelineState};
 pub use parser::{ParsedElement, ParsedPipeline, PropertyValue, parse_pipeline};

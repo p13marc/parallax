@@ -20,6 +20,7 @@
 //! pipeline.run().await?;
 //! ```
 
+pub mod bridge;
 mod element;
 mod operators;
 mod pipeline;

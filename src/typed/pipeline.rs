@@ -3,8 +3,6 @@
 //! The typed pipeline API uses Rust's type system to validate
 //! that element connections are compatible at compile time.
 
-use std::marker::PhantomData;
-
 use crate::error::Result;
 
 use super::element::{TypedSink, TypedSource, TypedTransform};
