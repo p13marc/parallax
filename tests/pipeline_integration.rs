@@ -928,3 +928,309 @@ fn test_unload_nonexistent_plugin() {
     let registry = PluginRegistry::new();
     assert!(!registry.unload_plugin("nonexistent"));
 }
+
+// ============================================================================
+// Phase 7: Multi-source Fusion and Temporal Types Tests
+// ============================================================================
+
+/// Test timestamp creation and arithmetic.
+#[test]
+fn test_timestamp_basics() {
+    use parallax::temporal::Timestamp;
+    use std::time::Duration;
+
+    let ts1 = Timestamp::from_millis(1000);
+    let ts2 = Timestamp::from_millis(1500);
+
+    assert_eq!(ts1.as_millis(), 1000);
+    assert_eq!(ts1.as_secs(), 1);
+
+    // Arithmetic
+    let ts3 = ts1 + Duration::from_millis(500);
+    assert_eq!(ts3.as_millis(), 1500);
+
+    // Difference
+    let diff: Duration = ts2 - ts1;
+    assert_eq!(diff, Duration::from_millis(500));
+}
+
+/// Test timestamp ordering.
+#[test]
+fn test_timestamp_ordering() {
+    use parallax::temporal::Timestamp;
+
+    let t1 = Timestamp::from_millis(100);
+    let t2 = Timestamp::from_millis(200);
+    let t3 = Timestamp::from_millis(100);
+
+    assert!(t1 < t2);
+    assert!(t2 > t1);
+    assert_eq!(t1, t3);
+}
+
+/// Test time range operations.
+#[test]
+fn test_time_range() {
+    use parallax::temporal::{TimeRange, Timestamp};
+
+    let range = TimeRange::new(Timestamp::from_secs(10), Timestamp::from_secs(20));
+
+    assert!(range.contains(Timestamp::from_secs(15)));
+    assert!(!range.contains(Timestamp::from_secs(5)));
+    assert!(!range.contains(Timestamp::from_secs(20))); // exclusive end
+}
+
+/// Test time range overlap detection.
+#[test]
+fn test_time_range_overlap() {
+    use parallax::temporal::{TimeRange, Timestamp};
+
+    let r1 = TimeRange::new(Timestamp::from_secs(10), Timestamp::from_secs(20));
+    let r2 = TimeRange::new(Timestamp::from_secs(15), Timestamp::from_secs(25));
+    let r3 = TimeRange::new(Timestamp::from_secs(25), Timestamp::from_secs(30));
+
+    assert!(r1.overlaps(&r2));
+    assert!(!r1.overlaps(&r3));
+
+    let intersection = r1.intersection(&r2).unwrap();
+    assert_eq!(intersection.start, Timestamp::from_secs(15));
+    assert_eq!(intersection.end, Timestamp::from_secs(20));
+}
+
+/// Test clock source types.
+#[test]
+fn test_clock_source() {
+    use parallax::temporal::{ClockSource, Timestamp};
+
+    let ts = Timestamp::from_nanos_with_source(1000, ClockSource::WallClock);
+    assert_eq!(ts.source(), ClockSource::WallClock);
+
+    let ts2 = ts.with_source(ClockSource::Monotonic);
+    assert_eq!(ts2.source(), ClockSource::Monotonic);
+}
+
+/// Test merge operator combines two sources.
+#[test]
+fn test_typed_merge() {
+    use parallax::typed::{collect, from_iter, merge, pipeline};
+
+    let left = from_iter(vec![1, 3, 5]);
+    let right = from_iter(vec![2, 4, 6]);
+    let merged = merge(left, right);
+
+    let result = pipeline(merged).sink(collect()).run().unwrap();
+    let items = result.into_inner();
+
+    // Should have all items (order depends on alternation)
+    assert_eq!(items.len(), 6);
+    assert!(items.contains(&1));
+    assert!(items.contains(&2));
+    assert!(items.contains(&5));
+    assert!(items.contains(&6));
+}
+
+/// Test zip operator pairs items from two sources.
+#[test]
+fn test_typed_zip() {
+    use parallax::typed::{collect, from_iter, pipeline, zip};
+
+    let left = from_iter(vec!["a", "b", "c"]);
+    let right = from_iter(vec![1, 2, 3]);
+    let zipped = zip(left, right);
+
+    let result = pipeline(zipped).sink(collect()).run().unwrap();
+    let items = result.into_inner();
+
+    assert_eq!(items, vec![("a", 1), ("b", 2), ("c", 3)]);
+}
+
+/// Test zip stops at shorter source.
+#[test]
+fn test_typed_zip_unequal() {
+    use parallax::typed::{collect, from_iter, pipeline, zip};
+
+    let left = from_iter(vec![1, 2, 3, 4, 5]);
+    let right = from_iter(vec![10, 20]);
+    let zipped = zip(left, right);
+
+    let result = pipeline(zipped).sink(collect()).run().unwrap();
+    let items = result.into_inner();
+
+    assert_eq!(items.len(), 2);
+    assert_eq!(items, vec![(1, 10), (2, 20)]);
+}
+
+/// Test join operator joins by key.
+#[test]
+fn test_typed_join() {
+    use parallax::typed::{collect, from_iter, join, pipeline};
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct User {
+        id: i32,
+        name: String,
+    }
+    #[derive(Clone, Debug, PartialEq)]
+    struct Order {
+        user_id: i32,
+        amount: i32,
+    }
+
+    let users = from_iter(vec![
+        User {
+            id: 1,
+            name: "Alice".to_string(),
+        },
+        User {
+            id: 2,
+            name: "Bob".to_string(),
+        },
+    ]);
+    let orders = from_iter(vec![
+        Order {
+            user_id: 2,
+            amount: 100,
+        },
+        Order {
+            user_id: 1,
+            amount: 50,
+        },
+    ]);
+
+    let joined = join(users, orders, |u| u.id, |o| o.user_id);
+    let result = pipeline(joined).sink(collect()).run().unwrap();
+    let items = result.into_inner();
+
+    assert_eq!(items.len(), 2);
+    // Both users should be joined with their orders
+    assert!(
+        items
+            .iter()
+            .any(|(u, o)| u.name == "Alice" && o.amount == 50)
+    );
+    assert!(
+        items
+            .iter()
+            .any(|(u, o)| u.name == "Bob" && o.amount == 100)
+    );
+}
+
+/// Test temporal join with exact matching.
+#[test]
+fn test_typed_temporal_join() {
+    use parallax::typed::{Timestamped, collect, from_iter, pipeline, temporal_join};
+    use std::time::Duration;
+
+    let sensor1 = from_iter(vec![
+        Timestamped::from_millis(100, "A"),
+        Timestamped::from_millis(200, "B"),
+        Timestamped::from_millis(300, "C"),
+    ]);
+    let sensor2 = from_iter(vec![
+        Timestamped::from_millis(100, 1),
+        Timestamped::from_millis(200, 2),
+        Timestamped::from_millis(300, 3),
+    ]);
+
+    let joined = temporal_join(
+        sensor1,
+        sensor2,
+        Duration::from_millis(10),
+        |s| s.timestamp,
+        |s| s.timestamp,
+    );
+
+    let result = pipeline(joined).sink(collect()).run().unwrap();
+    let items = result.into_inner();
+
+    assert_eq!(items.len(), 3);
+    // All should be matched
+    assert!(items.iter().any(|(a, b)| a.value == "A" && b.value == 1));
+    assert!(items.iter().any(|(a, b)| a.value == "B" && b.value == 2));
+    assert!(items.iter().any(|(a, b)| a.value == "C" && b.value == 3));
+}
+
+/// Test temporal join with tolerance.
+#[test]
+fn test_typed_temporal_join_tolerance() {
+    use parallax::typed::{Timestamped, collect, from_iter, pipeline, temporal_join};
+    use std::time::Duration;
+
+    // Timestamps are slightly off but within tolerance
+    let sensor1 = from_iter(vec![
+        Timestamped::from_millis(100, "A"),
+        Timestamped::from_millis(200, "B"),
+    ]);
+    let sensor2 = from_iter(vec![
+        Timestamped::from_millis(95, 1),  // 5ms before A
+        Timestamped::from_millis(210, 2), // 10ms after B
+    ]);
+
+    let joined = temporal_join(
+        sensor1,
+        sensor2,
+        Duration::from_millis(15), // 15ms tolerance
+        |s| s.timestamp,
+        |s| s.timestamp,
+    );
+
+    let result = pipeline(joined).sink(collect()).run().unwrap();
+    let items = result.into_inner();
+
+    assert_eq!(items.len(), 2);
+}
+
+/// Test join window configuration.
+#[test]
+fn test_join_window_config() {
+    use parallax::temporal::{AlignmentStrategy, JoinWindow};
+    use std::time::Duration;
+
+    let window = JoinWindow::with_max_delay(Duration::from_millis(50))
+        .with_strategy(AlignmentStrategy::Exact)
+        .with_max_buffer_size(32);
+
+    assert_eq!(window.max_delay, Duration::from_millis(50));
+    assert_eq!(window.strategy, AlignmentStrategy::Exact);
+    assert_eq!(window.max_buffer_size, 32);
+}
+
+/// Test temporal join operators.
+#[test]
+fn test_temporal_join_direct() {
+    use parallax::temporal::{JoinResult, JoinWindow, TemporalJoin, Timestamp};
+
+    let mut joiner: TemporalJoin<i32, i32> = TemporalJoin::with_config(JoinWindow::default());
+
+    joiner.push_left(Timestamp::from_millis(100), 1);
+    joiner.push_right(Timestamp::from_millis(100), 10);
+
+    match joiner.try_emit() {
+        Some(JoinResult::Matched(a, b)) => {
+            assert_eq!(a, 1);
+            assert_eq!(b, 10);
+        }
+        other => panic!("Expected Matched, got {:?}", other),
+    }
+}
+
+/// Test alignment strategies.
+#[test]
+fn test_alignment_strategies() {
+    use parallax::temporal::AlignmentStrategy;
+    use std::time::Duration;
+
+    let exact = AlignmentStrategy::Exact;
+    let tolerance = AlignmentStrategy::Tolerance(Duration::from_millis(10));
+    let nearest = AlignmentStrategy::Nearest(Duration::from_millis(50));
+
+    assert_eq!(exact, AlignmentStrategy::Exact);
+    assert_eq!(
+        tolerance,
+        AlignmentStrategy::Tolerance(Duration::from_millis(10))
+    );
+    assert_eq!(
+        nearest,
+        AlignmentStrategy::Nearest(Duration::from_millis(50))
+    );
+}

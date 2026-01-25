@@ -43,6 +43,7 @@ pub mod memory;
 pub mod metadata;
 pub mod pipeline;
 pub mod plugin;
+pub mod temporal;
 pub mod typed;
 
 /// Prelude for convenient imports

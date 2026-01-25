@@ -19,12 +19,29 @@
 //!
 //! pipeline.run().await?;
 //! ```
+//!
+//! # Multi-source Operations
+//!
+//! ```rust,ignore
+//! use parallax::typed::*;
+//!
+//! // Merge two sources
+//! let merged = merge(source1, source2);
+//!
+//! // Zip two sources
+//! let zipped = zip(left, right);
+//!
+//! // Temporal join with timestamp alignment
+//! let joined = temporal_join(sensor1, sensor2, tolerance, get_ts1, get_ts2);
+//! ```
 
 pub mod bridge;
 mod element;
+mod multi_source;
 mod operators;
 mod pipeline;
 
 pub use element::*;
+pub use multi_source::*;
 pub use operators::*;
 pub use pipeline::*;
