@@ -42,6 +42,7 @@ pub mod error;
 pub mod link;
 pub mod memory;
 pub mod metadata;
+pub mod observability;
 pub mod pipeline;
 pub mod plugin;
 pub mod temporal;
