@@ -208,6 +208,42 @@ Suspended <──> Idle <──> Running
 
 The key insight from PipeWire: "paused" and "stopped" are the same state (Idle) - the difference is just intent.
 
+### Shared-Memory Reference Counting (SharedArena)
+
+Parallax implements true cross-process reference counting by storing refcounts in shared memory (memfd), not on the heap like `Arc`. This avoids the double-allocation problem and enables zero-copy buffer sharing across processes.
+
+```
+SharedArena Memory Layout:
+┌─────────────────────────────────────────────────────────────────┐
+│ ArenaHeader (64 bytes, cache-aligned)                           │
+│   magic, version, slot_count, slot_size, arena_id               │
+├─────────────────────────────────────────────────────────────────┤
+│ ReleaseQueue (MPSC lock-free queue in shared memory)            │
+│   head: AtomicU32     ← Owner reads here (single consumer)      │
+│   tail: AtomicU32     ← Any process writes here (multi producer)│
+│   slots: [AtomicU32; 1024]  ← Ring buffer of slot indices       │
+├─────────────────────────────────────────────────────────────────┤
+│ SlotHeader[0..N] (8 bytes each)                                 │
+│   refcount: AtomicU32  ← Works across processes!                │
+│   state: AtomicU32     ← Free or Allocated                      │
+├─────────────────────────────────────────────────────────────────┤
+│ SlotData[0..N] (user data)                                      │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Key types:**
+- `SharedArena` - Arena with refcounts in shared memory
+- `SharedSlotRef` - Zero-allocation slot reference (no Arc needed)
+- `SharedIpcSlotRef` - Serializable IPC reference (rkyv-compatible)
+- `SharedArenaCache` - Cache for client processes to map arenas
+
+**Cross-process semantics:**
+- **Clone**: Atomic increment in shared memory (works across processes)
+- **Drop**: Atomic decrement; if 0, push slot index to release queue
+- **Reclaim**: Owner drains queue in O(k) where k = released slots
+
+This improves on PipeWire's approach which uses per-process refcounting with message-based coordination.
+
 ## Build Commands
 
 ```bash
@@ -257,7 +293,9 @@ parallax/
 │   │   ├── segment.rs      # MemorySegment trait, MemoryType
 │   │   ├── heap.rs         # HeapSegment (simple heap allocation)
 │   │   ├── shared.rs       # SharedMemorySegment (memfd_create)
-│   │   ├── cpu.rs          # CpuArena (arena allocator for IPC)
+│   │   ├── cpu.rs          # CpuSegment (unified memfd-backed memory)
+│   │   ├── arena.rs        # CpuArena (arena allocator, 1 fd per pool)
+│   │   ├── shared_refcount.rs # SharedArena (cross-process refcounting)
 │   │   ├── pool.rs         # MemoryPool, LoanedSlot
 │   │   ├── bitmap.rs       # AtomicBitmap (lock-free slot tracking)
 │   │   └── ipc.rs          # send_fds/recv_fds (SCM_RIGHTS)
@@ -488,6 +526,7 @@ Pipeline::parse("zenoh_sub key=factory/camera/1 ! display")?;
 - All CPU memory is memfd-backed (zero overhead vs malloc, always IPC-ready)
 - Cross-process is true zero-copy (same physical pages via mmap)
 - Arena allocation: 1 fd per pool, not per buffer (avoids fd limits)
+- SharedArena: Cross-process refcounting with O(1) release via lock-free MPSC queue
 
 ## Documentation
 

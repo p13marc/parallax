@@ -74,24 +74,31 @@ fn main() -> parallax::Result<()> {
 
 ### Multi-Process Pipeline
 
-Use shared memory for zero-copy IPC:
+Use shared memory for zero-copy IPC with true cross-process reference counting:
 
 ```rust
-use parallax::memory::{SharedMemorySegment, MemoryPool};
-use parallax::link::{IpcPublisher, IpcSubscriber};
+use parallax::memory::{SharedArena, SharedSlotRef, SharedArenaCache};
 
-// Process A: Publisher
-let segment = SharedMemorySegment::new("my-pipeline", 1024 * 1024)?;
-let pool = MemoryPool::new(segment, 4096)?;
-let mut publisher = IpcPublisher::bind("/tmp/pipeline.sock")?;
+// Process A: Owner (creates arena, acquires slots)
+let arena = SharedArena::new(4096, 16)?;  // 16 slots of 4KB each
+let mut slot = arena.acquire()?;
+slot.data_mut()[..5].copy_from_slice(b"hello");
 
-// Process B: Subscriber  
-let mut subscriber = IpcSubscriber::connect("/tmp/pipeline.sock")?;
-while let Some(buffer) = subscriber.recv()? {
-    // Zero-copy access to data in shared memory
-    process(buffer);
-}
+// Send arena fd + IPC reference to Process B
+let ipc_ref = slot.ipc_ref();
+send_fd_and_ref(arena.fd(), ipc_ref)?;
+
+// Process B: Client (maps arena, accesses slots)
+let mut cache = SharedArenaCache::new();
+unsafe { cache.map_arena(received_fd)?; }
+
+let client_slot = cache.get_slot(&ipc_ref)?;
+assert_eq!(client_slot.data(), b"hello");
+// client_slot shares the refcount with Process A's slot!
+// When both drop, slot is released via lock-free queue
 ```
+
+The refcount is stored in the shared memory itself, so atomic operations work across processes. No messages needed for reference counting.
 
 ### Automatic Execution Strategy
 
@@ -352,10 +359,32 @@ pipeline.suspend()?;   // Idle → Suspended (release resources)
 
 | Backend | Use Case | IPC Support |
 |---------|----------|-------------|
-| `HeapSegment` | Default, single-process | No |
-| `SharedMemorySegment` | Multi-process pipelines | Yes |
+| `CpuSegment` | Default, always IPC-ready (memfd-backed) | Yes |
+| `SharedArena` | Cross-process refcounting with lock-free release | Yes |
+| `CpuArena` | Arena allocation (1 fd per pool, not per buffer) | Yes |
 | `HugePageSegment` | High-throughput (reduced TLB misses) | Yes |
 | `MappedFileSegment` | Persistent buffers | Yes |
+
+### SharedArena (Cross-Process Refcounting)
+
+Unlike traditional `Arc` which stores refcount on the heap, `SharedArena` stores refcounts **in the shared memory itself**. This enables true cross-process reference counting:
+
+```rust
+use parallax::memory::{SharedArena, SharedArenaCache};
+
+// Owner process
+let arena = SharedArena::new(4096, 64)?;  // 64 slots of 4KB
+let slot = arena.acquire()?;
+
+// Client process (after receiving arena fd)
+let client_arena = unsafe { SharedArena::from_fd(received_fd)? };
+let client_slot = client_arena.slot_from_ipc(&ipc_ref)?;
+
+// Both slots share the same atomic refcount in shared memory!
+// Drop from any process correctly decrements the shared refcount
+```
+
+**Lock-free release queue**: When refcount hits 0, the slot index is pushed to an MPSC queue in shared memory. The owner drains this queue to reclaim slots in O(k) time.
 
 ## Typed Operators
 
@@ -373,11 +402,14 @@ pipeline.suspend()?;   // Idle → Suspended (release resources)
 | Operation | Cost | Notes |
 |-----------|------|-------|
 | Buffer clone (same process) | O(1) | Arc increment only |
+| Buffer clone (cross-process) | O(1) | Atomic increment in shared memory |
 | Buffer access (typed) | O(1) | Direct pointer |
 | Pool slot acquire | O(1) amortized | Atomic bitmap scan |
+| Slot release (SharedArena) | O(1) | Lock-free queue push |
+| Slot reclaim (SharedArena) | O(k) | k = released slots, not total slots |
 | Tee (N outputs) | O(N) Arc clones | No data copying |
-| Cross-process send | O(data size) | One copy to shared memory |
-| Cross-process receive | O(1) | Validation only, no copy |
+| Cross-process send | O(1) | Just send IPC ref (no copy) |
+| Cross-process receive | O(1) | Map arena once, then direct access |
 
 ## Documentation
 
