@@ -55,8 +55,8 @@ pub mod prelude {
     pub use crate::buffer::Buffer;
     pub use crate::clock::{Clock, ClockTime, PipelineClock};
     pub use crate::element::{
-        AsyncSink, AsyncSource, AsyncTransform, Element, ElementDyn, Output, Sink, Source,
-        Transform,
+        AsyncElementDyn, AsyncSink, AsyncSource, AsyncTransform, DynAsyncElement, Element, Output,
+        Sink, Source, Transform,
     };
     pub use crate::error::{Error, Result};
     pub use crate::format::{AudioFormat, Caps, MediaFormat, RtpFormat, VideoFormat};

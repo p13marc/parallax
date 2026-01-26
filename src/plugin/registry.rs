@@ -1,7 +1,7 @@
 //! Plugin registry for managing loaded plugins and element factories.
 
 use super::loader::{Plugin, PluginError, PluginLoader};
-use crate::element::ElementDyn;
+use crate::element::DynAsyncElement;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
@@ -168,7 +168,7 @@ impl PluginRegistry {
     /// Create an element by name.
     ///
     /// This looks up which plugin provides the element and creates an instance.
-    pub fn create_element(&self, name: &str) -> Result<Box<dyn ElementDyn>, PluginError> {
+    pub fn create_element(&self, name: &str) -> Result<Box<DynAsyncElement<'static>>, PluginError> {
         // Find which plugin has this element
         let plugin_name = {
             let index = self.element_index.read().unwrap();

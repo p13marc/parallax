@@ -7,7 +7,9 @@
 //! Run with: cargo run --example simple_pipeline
 
 use parallax::buffer::{Buffer, MemoryHandle};
-use parallax::element::{Element, ElementAdapter, Sink, SinkAdapter, Source, SourceAdapter};
+use parallax::element::{
+    DynAsyncElement, Element, ElementAdapter, Sink, SinkAdapter, Source, SourceAdapter,
+};
 use parallax::error::Result;
 use parallax::memory::HeapSegment;
 use parallax::metadata::Metadata;
@@ -137,15 +139,18 @@ async fn run_linear_pipeline() -> Result<()> {
     // Create elements
     let source = pipeline.add_node(
         "counter_source",
-        Box::new(SourceAdapter::new(CountingSource::new(10, 64))),
+        DynAsyncElement::new_box(SourceAdapter::new(CountingSource::new(10, 64))),
     );
 
-    let transform = pipeline.add_node("doubler", Box::new(ElementAdapter::new(Doubler)));
+    let transform = pipeline.add_node(
+        "doubler",
+        DynAsyncElement::new_box(ElementAdapter::new(Doubler)),
+    );
 
     let sink_count = Arc::new(AtomicU64::new(0));
     let sink = pipeline.add_node(
         "printing_sink",
-        Box::new(SinkAdapter::new(PrintingSink::new(
+        DynAsyncElement::new_box(SinkAdapter::new(PrintingSink::new(
             "linear",
             sink_count.clone(),
             true,
@@ -173,15 +178,18 @@ async fn run_filtering_pipeline() -> Result<()> {
     // Create elements
     let source = pipeline.add_node(
         "counter_source",
-        Box::new(SourceAdapter::new(CountingSource::new(10, 64))),
+        DynAsyncElement::new_box(SourceAdapter::new(CountingSource::new(10, 64))),
     );
 
-    let filter = pipeline.add_node("even_filter", Box::new(ElementAdapter::new(EvenFilter)));
+    let filter = pipeline.add_node(
+        "even_filter",
+        DynAsyncElement::new_box(ElementAdapter::new(EvenFilter)),
+    );
 
     let sink_count = Arc::new(AtomicU64::new(0));
     let sink = pipeline.add_node(
         "printing_sink",
-        Box::new(SinkAdapter::new(PrintingSink::new(
+        DynAsyncElement::new_box(SinkAdapter::new(PrintingSink::new(
             "filter",
             sink_count.clone(),
             true,
@@ -209,14 +217,14 @@ async fn run_branching_pipeline() -> Result<()> {
     // Create elements
     let source = pipeline.add_node(
         "counter_source",
-        Box::new(SourceAdapter::new(CountingSource::new(5, 64))),
+        DynAsyncElement::new_box(SourceAdapter::new(CountingSource::new(5, 64))),
     );
 
     // Two separate sinks
     let sink1_count = Arc::new(AtomicU64::new(0));
     let sink1 = pipeline.add_node(
         "sink1",
-        Box::new(SinkAdapter::new(PrintingSink::new(
+        DynAsyncElement::new_box(SinkAdapter::new(PrintingSink::new(
             "branch-1",
             sink1_count.clone(),
             true,
@@ -226,7 +234,7 @@ async fn run_branching_pipeline() -> Result<()> {
     let sink2_count = Arc::new(AtomicU64::new(0));
     let sink2 = pipeline.add_node(
         "sink2",
-        Box::new(SinkAdapter::new(PrintingSink::new(
+        DynAsyncElement::new_box(SinkAdapter::new(PrintingSink::new(
             "branch-2",
             sink2_count.clone(),
             true,

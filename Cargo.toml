@@ -82,6 +82,10 @@ iced = { version = "0.14", optional = true, features = ["image", "tokio"] }
 # Regex (for RegexFilter)
 regex = "1"
 
+# Object-safe async traits
+dynosaur = "0.3"
+trait-variant = "0.1"
+
 [dev-dependencies]
 tokio-test = "0.4"
 criterion = "0.6"
@@ -110,3 +114,7 @@ harness = false
 [[bench]]
 name = "memory_pool"
 harness = false
+
+[[example]]
+name = "video_display"
+required-features = ["iced-sink"]

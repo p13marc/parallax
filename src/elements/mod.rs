@@ -11,6 +11,7 @@
 //! - [`DataSrc`]: Generates buffers from inline data
 //! - [`TestSrc`]: Generates test pattern buffers
 //! - [`VideoTestSrc`]: Generates video test pattern frames (SMPTE bars, etc.)
+//! - [`AsyncVideoTestSrc`]: Async video test source with tokio timer for precise framerate
 //! - [`MemorySrc`]: Reads from memory buffer/slice
 //! - [`NullSource`]: Produces empty buffers (useful for testing)
 //!
@@ -196,7 +197,7 @@ pub use null::NullSource;
 pub use tcp::{AsyncTcpSrc, TcpMode, TcpSrc};
 pub use testsrc::{TestPattern, TestSrc};
 pub use udp::{AsyncUdpSrc, UdpSrc};
-pub use videotestsrc::{PixelFormat, VideoPattern, VideoTestSrc};
+pub use videotestsrc::{AsyncVideoTestSrc, PixelFormat, VideoPattern, VideoTestSrc};
 
 // Sinks
 pub use appsink::{AppSink, AppSinkHandle, AppSinkStats};

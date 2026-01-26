@@ -1,6 +1,6 @@
 //! Element factory for creating elements from parsed descriptions.
 
-use crate::element::{ElementAdapter, ElementDyn, SinkAdapter, SourceAdapter};
+use crate::element::{DynAsyncElement, ElementAdapter, SinkAdapter, SourceAdapter};
 use crate::elements::{FileSink, FileSrc, NullSink, NullSource, PassThrough, Tee};
 use crate::error::{Error, Result};
 use crate::pipeline::parser::{ParsedElement, PropertyValue};
@@ -9,7 +9,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Type alias for element constructor functions.
-type ElementConstructor = fn(&HashMap<String, PropertyValue>) -> Result<Box<dyn ElementDyn>>;
+type ElementConstructor =
+    fn(&HashMap<String, PropertyValue>) -> Result<Box<DynAsyncElement<'static>>>;
 
 /// Registry of element constructors.
 pub struct ElementFactory {
@@ -58,7 +59,7 @@ impl ElementFactory {
     }
 
     /// Create an element from a parsed description.
-    pub fn create(&self, parsed: &ParsedElement) -> Result<Box<dyn ElementDyn>> {
+    pub fn create(&self, parsed: &ParsedElement) -> Result<Box<DynAsyncElement<'static>>> {
         // First try built-in constructors
         if let Some(constructor) = self.constructors.get(&parsed.name) {
             let props: HashMap<String, PropertyValue> = parsed.properties.iter().cloned().collect();
@@ -114,7 +115,9 @@ impl Default for ElementFactory {
 
 // Built-in element constructors
 
-fn create_nullsource(props: &HashMap<String, PropertyValue>) -> Result<Box<dyn ElementDyn>> {
+fn create_nullsource(
+    props: &HashMap<String, PropertyValue>,
+) -> Result<Box<DynAsyncElement<'static>>> {
     let count = props.get("count").and_then(|v| v.as_u64()).unwrap_or(100);
 
     let buffer_size = props
@@ -123,22 +126,28 @@ fn create_nullsource(props: &HashMap<String, PropertyValue>) -> Result<Box<dyn E
         .unwrap_or(64) as usize;
 
     let source = NullSource::new(count).with_buffer_size(buffer_size);
-    Ok(Box::new(SourceAdapter::new(source)))
+    Ok(DynAsyncElement::new_box(SourceAdapter::new(source)))
 }
 
-fn create_nullsink(_props: &HashMap<String, PropertyValue>) -> Result<Box<dyn ElementDyn>> {
-    Ok(Box::new(SinkAdapter::new(NullSink::new())))
+fn create_nullsink(
+    _props: &HashMap<String, PropertyValue>,
+) -> Result<Box<DynAsyncElement<'static>>> {
+    Ok(DynAsyncElement::new_box(SinkAdapter::new(NullSink::new())))
 }
 
-fn create_passthrough(_props: &HashMap<String, PropertyValue>) -> Result<Box<dyn ElementDyn>> {
-    Ok(Box::new(ElementAdapter::new(PassThrough::new())))
+fn create_passthrough(
+    _props: &HashMap<String, PropertyValue>,
+) -> Result<Box<DynAsyncElement<'static>>> {
+    Ok(DynAsyncElement::new_box(ElementAdapter::new(
+        PassThrough::new(),
+    )))
 }
 
-fn create_tee(_props: &HashMap<String, PropertyValue>) -> Result<Box<dyn ElementDyn>> {
-    Ok(Box::new(ElementAdapter::new(Tee::new())))
+fn create_tee(_props: &HashMap<String, PropertyValue>) -> Result<Box<DynAsyncElement<'static>>> {
+    Ok(DynAsyncElement::new_box(ElementAdapter::new(Tee::new())))
 }
 
-fn create_filesrc(props: &HashMap<String, PropertyValue>) -> Result<Box<dyn ElementDyn>> {
+fn create_filesrc(props: &HashMap<String, PropertyValue>) -> Result<Box<DynAsyncElement<'static>>> {
     let location = props
         .get("location")
         .map(|v| v.as_string())
@@ -154,10 +163,12 @@ fn create_filesrc(props: &HashMap<String, PropertyValue>) -> Result<Box<dyn Elem
         src = src.with_chunk_size(size);
     }
 
-    Ok(Box::new(SourceAdapter::new(src)))
+    Ok(DynAsyncElement::new_box(SourceAdapter::new(src)))
 }
 
-fn create_filesink(props: &HashMap<String, PropertyValue>) -> Result<Box<dyn ElementDyn>> {
+fn create_filesink(
+    props: &HashMap<String, PropertyValue>,
+) -> Result<Box<DynAsyncElement<'static>>> {
     let location = props
         .get("location")
         .map(|v| v.as_string())
@@ -166,13 +177,13 @@ fn create_filesink(props: &HashMap<String, PropertyValue>) -> Result<Box<dyn Ele
         })?;
 
     let sink = FileSink::new(&location);
-    Ok(Box::new(SinkAdapter::new(sink)))
+    Ok(DynAsyncElement::new_box(SinkAdapter::new(sink)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::element::ElementType;
+    use crate::element::{AsyncElementDyn, ElementType};
 
     #[test]
     fn test_factory_creation() {

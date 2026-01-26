@@ -1,16 +1,16 @@
-//! Video display example using VideoTestSrc and IcedVideoSink.
+//! Video display example using AsyncVideoTestSrc and IcedVideoSink.
 //!
 //! This example demonstrates displaying video test patterns in a GUI window
-//! using a proper pipeline structure.
+//! using a proper pipeline structure with an async video source.
 //!
 //! Run with: cargo run --example video_display --features iced-sink
 //!
 //! Controls:
 //! - Close the window to exit
 
-use parallax::element::{SinkAdapter, SourceAdapter};
+use parallax::element::{AsyncSourceAdapter, DynAsyncElement, SinkAdapter};
 use parallax::elements::{
-    IcedVideoSink, IcedVideoSinkConfig, InputPixelFormat, VideoPattern, VideoTestSrc,
+    AsyncVideoTestSrc, IcedVideoSink, IcedVideoSinkConfig, InputPixelFormat, VideoPattern,
 };
 use parallax::pipeline::{Pipeline, PipelineExecutor};
 use std::thread;
@@ -18,6 +18,7 @@ use std::thread;
 fn main() -> iced::Result {
     println!("=== Video Display Example ===");
     println!("Displaying moving ball pattern at 640x480 @ 30fps");
+    println!("Using AsyncVideoTestSrc with tokio timer for precise framerate");
     println!("Close the window to exit.\n");
 
     // Configuration
@@ -25,12 +26,13 @@ fn main() -> iced::Result {
     let height = 480;
     let pattern = VideoPattern::MovingBall;
 
-    // Create the video source
-    let src = VideoTestSrc::new()
+    // Create the async video source with live mode (tokio timer for framerate)
+    let src = AsyncVideoTestSrc::new()
         .with_pattern(pattern)
         .with_resolution(width, height)
         .with_framerate(30, 1)
-        .with_name("test-pattern");
+        .with_name("test-pattern")
+        .live(true); // Enable tokio timer for precise framerate control
 
     // Create the video sink
     let config = IcedVideoSinkConfig {
@@ -46,17 +48,29 @@ fn main() -> iced::Result {
     // Build the pipeline
     let mut pipeline = Pipeline::new();
 
-    let src_node = pipeline.add_node("videotestsrc", Box::new(SourceAdapter::new(src)));
+    // Use AsyncSourceAdapter to bridge the async source to the pipeline
+    let src_node = pipeline.add_node(
+        "videotestsrc",
+        DynAsyncElement::new_box(AsyncSourceAdapter::new(src)),
+    );
 
-    let sink_node = pipeline.add_node("iced_sink", Box::new(SinkAdapter::new(sink)));
+    let sink_node = pipeline.add_node(
+        "iced_sink",
+        DynAsyncElement::new_box(SinkAdapter::new(sink)),
+    );
 
     pipeline
         .link(src_node, sink_node)
         .expect("Failed to link pipeline");
 
-    // Run the pipeline in a background thread
+    // Run the pipeline in a background thread with a multi-threaded tokio runtime
+    // (required for block_in_place used by AsyncSourceAdapter)
     thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create tokio runtime");
+
         rt.block_on(async {
             let executor = PipelineExecutor::new();
             if let Err(e) = executor.run(&mut pipeline).await {

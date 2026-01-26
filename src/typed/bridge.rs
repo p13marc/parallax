@@ -4,7 +4,7 @@
 //! allowing typed pipelines to be used with the dynamic pipeline executor.
 
 use crate::buffer::{Buffer, MemoryHandle};
-use crate::element::{ElementAdapter, ElementDyn, SinkAdapter, SourceAdapter};
+use crate::element::{DynAsyncElement, ElementAdapter, SinkAdapter, SourceAdapter};
 use crate::error::Result;
 use crate::memory::{HeapSegment, MemorySegment};
 use crate::metadata::Metadata;
@@ -168,34 +168,34 @@ where
 // Convenience Functions
 // ============================================================================
 
-/// Convert a typed source to a boxed dynamic ElementDyn.
-pub fn source_to_dyn<S>(source: S) -> Box<dyn ElementDyn>
+/// Convert a typed source to a boxed dynamic DynAsyncElement.
+pub fn source_to_dyn<S>(source: S) -> Box<DynAsyncElement<'static>>
 where
     S: TypedSource + 'static,
     S::Output: Into<Vec<u8>>,
 {
-    Box::new(SourceAdapter::new(TypedSourceBridge::new(source)))
+    DynAsyncElement::new_box(SourceAdapter::new(TypedSourceBridge::new(source)))
 }
 
-/// Convert a typed sink to a boxed dynamic ElementDyn.
-pub fn sink_to_dyn<K>(sink: K) -> Box<dyn ElementDyn>
+/// Convert a typed sink to a boxed dynamic DynAsyncElement.
+pub fn sink_to_dyn<K>(sink: K) -> Box<DynAsyncElement<'static>>
 where
     K: TypedSink + 'static,
     K::Input: TryFrom<Vec<u8>>,
     <K::Input as TryFrom<Vec<u8>>>::Error: std::fmt::Debug,
 {
-    Box::new(SinkAdapter::new(TypedSinkBridge::new(sink)))
+    DynAsyncElement::new_box(SinkAdapter::new(TypedSinkBridge::new(sink)))
 }
 
-/// Convert a typed transform to a boxed dynamic ElementDyn.
-pub fn transform_to_dyn<T>(transform: T) -> Box<dyn ElementDyn>
+/// Convert a typed transform to a boxed dynamic DynAsyncElement.
+pub fn transform_to_dyn<T>(transform: T) -> Box<DynAsyncElement<'static>>
 where
     T: TypedTransform + 'static,
     T::Input: TryFrom<Vec<u8>>,
     T::Output: Into<Vec<u8>>,
     <T::Input as TryFrom<Vec<u8>>>::Error: std::fmt::Debug,
 {
-    Box::new(ElementAdapter::new(TypedTransformBridge::new(transform)))
+    DynAsyncElement::new_box(ElementAdapter::new(TypedTransformBridge::new(transform)))
 }
 
 /// Build a dynamic pipeline from typed elements.

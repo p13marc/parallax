@@ -1,7 +1,7 @@
 //! Dynamic plugin loading using libloading.
 
 use super::descriptor::{PARALLAX_ABI_VERSION, PluginDescriptor, PluginInfo};
-use crate::element::ElementDyn;
+use crate::element::DynAsyncElement;
 use libloading::{Library, Symbol};
 use std::ffi::OsStr;
 use std::path::Path;
@@ -93,7 +93,7 @@ impl Plugin {
     }
 
     /// Create an instance of an element by name.
-    pub fn create_element(&self, name: &str) -> Result<Box<dyn ElementDyn>, PluginError> {
+    pub fn create_element(&self, name: &str) -> Result<Box<DynAsyncElement<'static>>, PluginError> {
         // SAFETY: The descriptor was validated at load time and the library is kept alive.
         let desc = unsafe { &*self.descriptor };
         let elements = unsafe { desc.elements() };

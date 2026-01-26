@@ -4,7 +4,7 @@
 //! connects them using Kanal channels for zero-copy buffer passing.
 
 use crate::buffer::Buffer;
-use crate::element::{ElementDyn, ElementType};
+use crate::element::{AsyncElementDyn, DynAsyncElement, ElementType};
 use crate::error::{Error, Result};
 use crate::pipeline::{EventReceiver, EventSender, NodeId, Pipeline, PipelineEvent, PipelineState};
 use kanal::{AsyncReceiver, AsyncSender, bounded_async};
@@ -332,7 +332,7 @@ impl ChannelNetwork {
 /// Spawn a task for a source element.
 fn spawn_source_task(
     name: String,
-    mut element: Box<dyn ElementDyn>,
+    mut element: Box<DynAsyncElement<'static>>,
     outputs: Vec<AsyncSender<Message>>,
     events: EventSender,
 ) -> JoinHandle<Result<()>> {
@@ -344,7 +344,7 @@ fn spawn_source_task(
 
         // Produce buffers until EOS
         loop {
-            match element.process(None) {
+            match element.process(None).await {
                 Ok(Some(buffer)) => {
                     buffers_processed += 1;
                     // Send buffer to all outputs
@@ -380,7 +380,7 @@ fn spawn_source_task(
 /// Spawn a task for a sink element.
 fn spawn_sink_task(
     name: String,
-    mut element: Box<dyn ElementDyn>,
+    mut element: Box<DynAsyncElement<'static>>,
     inputs: Vec<AsyncReceiver<Message>>,
     events: EventSender,
 ) -> JoinHandle<Result<()>> {
@@ -398,7 +398,7 @@ fn spawn_sink_task(
                     Ok(Message::Buffer(buffer)) => {
                         buffers_processed += 1;
                         // Process the buffer through the sink element
-                        if let Err(e) = element.process(Some(buffer)) {
+                        if let Err(e) = element.process(Some(buffer)).await {
                             tracing::error!("sink '{}' error: {}", name, e);
                             events.send_error(e.to_string(), Some(name.clone()));
                             return Err(e);
@@ -426,7 +426,7 @@ fn spawn_sink_task(
 /// Spawn a task for a transform element.
 fn spawn_transform_task(
     name: String,
-    mut element: Box<dyn ElementDyn>,
+    mut element: Box<DynAsyncElement<'static>>,
     inputs: Vec<AsyncReceiver<Message>>,
     outputs: Vec<AsyncSender<Message>>,
     events: EventSender,
@@ -444,7 +444,7 @@ fn spawn_transform_task(
                     Ok(Message::Buffer(buffer)) => {
                         buffers_processed += 1;
                         // Process the buffer through the transform element
-                        match element.process(Some(buffer)) {
+                        match element.process(Some(buffer)).await {
                             Ok(Some(out_buffer)) => {
                                 // Send transformed buffer to all outputs
                                 for tx in &outputs {
@@ -497,7 +497,9 @@ fn spawn_transform_task(
 mod tests {
     use super::*;
     use crate::buffer::MemoryHandle;
-    use crate::element::{Element, ElementAdapter, Sink, SinkAdapter, Source, SourceAdapter};
+    use crate::element::{
+        DynAsyncElement, Element, ElementAdapter, Sink, SinkAdapter, Source, SourceAdapter,
+    };
     use crate::memory::HeapSegment;
     use crate::metadata::Metadata;
     use std::sync::Arc;
@@ -568,12 +570,12 @@ mod tests {
 
         let src = pipeline.add_node(
             "src",
-            Box::new(SourceAdapter::new(CountingSource { count: 0, max: 5 })),
+            DynAsyncElement::new_box(SourceAdapter::new(CountingSource { count: 0, max: 5 })),
         );
         let sink_received = Arc::new(AtomicU64::new(0));
         let sink = pipeline.add_node(
             "sink",
-            Box::new(SinkAdapter::new(CountingSink {
+            DynAsyncElement::new_box(SinkAdapter::new(CountingSink {
                 received: sink_received.clone(),
             })),
         );
@@ -594,13 +596,16 @@ mod tests {
 
         let src = pipeline.add_node(
             "src",
-            Box::new(SourceAdapter::new(CountingSource { count: 0, max: 10 })),
+            DynAsyncElement::new_box(SourceAdapter::new(CountingSource { count: 0, max: 10 })),
         );
-        let transform = pipeline.add_node("transform", Box::new(ElementAdapter::new(PassThrough)));
+        let transform = pipeline.add_node(
+            "transform",
+            DynAsyncElement::new_box(ElementAdapter::new(PassThrough)),
+        );
         let sink_received = Arc::new(AtomicU64::new(0));
         let sink = pipeline.add_node(
             "sink",
-            Box::new(SinkAdapter::new(CountingSink {
+            DynAsyncElement::new_box(SinkAdapter::new(CountingSink {
                 received: sink_received.clone(),
             })),
         );
@@ -621,13 +626,16 @@ mod tests {
 
         let src = pipeline.add_node(
             "src",
-            Box::new(SourceAdapter::new(CountingSource { count: 0, max: 10 })),
+            DynAsyncElement::new_box(SourceAdapter::new(CountingSource { count: 0, max: 10 })),
         );
-        let filter = pipeline.add_node("filter", Box::new(ElementAdapter::new(FilterEven)));
+        let filter = pipeline.add_node(
+            "filter",
+            DynAsyncElement::new_box(ElementAdapter::new(FilterEven)),
+        );
         let sink_received = Arc::new(AtomicU64::new(0));
         let sink = pipeline.add_node(
             "sink",
-            Box::new(SinkAdapter::new(CountingSink {
+            DynAsyncElement::new_box(SinkAdapter::new(CountingSink {
                 received: sink_received.clone(),
             })),
         );
@@ -687,11 +695,14 @@ mod tests {
             }
         }
 
-        let src = pipeline.add_node("src", Box::new(SourceAdapter::new(InfiniteSource)));
+        let src = pipeline.add_node(
+            "src",
+            DynAsyncElement::new_box(SourceAdapter::new(InfiniteSource)),
+        );
         let sink_received = Arc::new(AtomicU64::new(0));
         let sink = pipeline.add_node(
             "sink",
-            Box::new(SinkAdapter::new(CountingSink {
+            DynAsyncElement::new_box(SinkAdapter::new(CountingSink {
                 received: sink_received.clone(),
             })),
         );

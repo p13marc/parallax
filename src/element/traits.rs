@@ -3,6 +3,7 @@
 use crate::buffer::Buffer;
 use crate::error::Result;
 use crate::format::Caps;
+use dynosaur::dynosaur;
 use smallvec::SmallVec;
 
 // ============================================================================
@@ -664,46 +665,8 @@ pub trait Demuxer: Send {
 }
 
 // ============================================================================
-// Dynamic Element (Type-Erased)
+// Dynamic Async Element (Type-Erased)
 // ============================================================================
-
-/// Dynamic (type-erased) element trait.
-///
-/// This trait is used internally by the pipeline executor to handle
-/// elements uniformly, regardless of their concrete type.
-///
-/// Most users should implement [`Source`], [`Sink`], or [`Element`] instead.
-pub trait ElementDyn: Send {
-    /// Get the element's name.
-    fn name(&self) -> &str;
-
-    /// Get the element's type (source, sink, or transform).
-    fn element_type(&self) -> ElementType;
-
-    /// Process or produce a buffer.
-    ///
-    /// - For sources: `input` is `None`, returns produced buffer
-    /// - For sinks: `input` is `Some`, returns `None`
-    /// - For transforms: `input` is `Some`, returns transformed buffer
-    fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>>;
-
-    /// Process and return all outputs (for transforms that produce multiple).
-    ///
-    /// Default implementation wraps `process` in a single-element output.
-    fn process_all(&mut self, input: Option<Buffer>) -> Result<Output> {
-        self.process(input).map(Output::from)
-    }
-
-    /// Get the input caps (for validation).
-    fn input_caps(&self) -> Caps {
-        Caps::any()
-    }
-
-    /// Get the output caps (for validation).
-    fn output_caps(&self) -> Caps {
-        Caps::any()
-    }
-}
 
 /// The type of an element in the pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -716,11 +679,59 @@ pub enum ElementType {
     Transform,
 }
 
+/// Async dynamic (type-erased) element trait for pipeline execution.
+///
+/// This trait is used internally by the pipeline executor to handle
+/// elements uniformly with native async support.
+///
+/// The `#[dynosaur]` macro generates `DynAsyncElement` which provides
+/// object-safe async dispatch. The `SendAsyncElementDyn` variant ensures
+/// the futures are `Send` for use with multi-threaded executors.
+///
+/// # Usage
+///
+/// Most users should implement [`Source`], [`Sink`], [`AsyncSource`],
+/// [`AsyncSink`], or [`Transform`] and use the corresponding adapter.
+#[trait_variant::make(SendAsyncElementDyn: Send)]
+#[dynosaur(pub DynAsyncElement = dyn(box) SendAsyncElementDyn, bridge(dyn))]
+pub trait AsyncElementDyn {
+    /// Get the element's name.
+    fn name(&self) -> &str;
+
+    /// Get the element's type (source, sink, or transform).
+    fn element_type(&self) -> ElementType;
+
+    /// Process or produce a buffer asynchronously.
+    ///
+    /// - For sources: `input` is `None`, returns produced buffer
+    /// - For sinks: `input` is `Some`, returns `None`
+    /// - For transforms: `input` is `Some`, returns transformed buffer
+    async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>>;
+
+    /// Process and return all outputs (for transforms that produce multiple).
+    ///
+    /// Default implementation wraps `process` in a single-element output.
+    async fn process_all(&mut self, input: Option<Buffer>) -> Result<Output>;
+
+    /// Get the input caps (for validation).
+    fn input_caps(&self) -> Caps {
+        Caps::any()
+    }
+
+    /// Get the output caps (for validation).
+    fn output_caps(&self) -> Caps {
+        Caps::any()
+    }
+}
+
 // ============================================================================
-// Adapters
+// Adapters for Sync Elements -> AsyncElementDyn
 // ============================================================================
 
-/// Wrapper to adapt a [`Source`] to [`ElementDyn`].
+/// Wrapper to adapt a sync [`Source`] to [`AsyncElementDyn`].
+///
+/// Sync sources run directly in the async context without blocking,
+/// as they are typically fast CPU operations.
 pub struct SourceAdapter<S: Source> {
     inner: S,
 }
@@ -732,7 +743,7 @@ impl<S: Source> SourceAdapter<S> {
     }
 }
 
-impl<S: Source + 'static> ElementDyn for SourceAdapter<S> {
+impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
     fn name(&self) -> &str {
         self.inner.name()
     }
@@ -741,8 +752,14 @@ impl<S: Source + 'static> ElementDyn for SourceAdapter<S> {
         ElementType::Source
     }
 
-    fn process(&mut self, _input: Option<Buffer>) -> Result<Option<Buffer>> {
+    async fn process(&mut self, _input: Option<Buffer>) -> Result<Option<Buffer>> {
         self.inner.produce()
+    }
+
+    async fn process_all(&mut self, input: Option<Buffer>) -> Result<Output> {
+        AsyncElementDyn::process(self, input)
+            .await
+            .map(Output::from)
     }
 
     fn output_caps(&self) -> Caps {
@@ -750,7 +767,7 @@ impl<S: Source + 'static> ElementDyn for SourceAdapter<S> {
     }
 }
 
-/// Wrapper to adapt a [`Sink`] to [`ElementDyn`].
+/// Wrapper to adapt a sync [`Sink`] to [`AsyncElementDyn`].
 pub struct SinkAdapter<S: Sink> {
     inner: S,
 }
@@ -762,7 +779,7 @@ impl<S: Sink> SinkAdapter<S> {
     }
 }
 
-impl<S: Sink + 'static> ElementDyn for SinkAdapter<S> {
+impl<S: Sink + Send + 'static> SendAsyncElementDyn for SinkAdapter<S> {
     fn name(&self) -> &str {
         self.inner.name()
     }
@@ -771,11 +788,17 @@ impl<S: Sink + 'static> ElementDyn for SinkAdapter<S> {
         ElementType::Sink
     }
 
-    fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
+    async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
         if let Some(buffer) = input {
             self.inner.consume(buffer)?;
         }
         Ok(None)
+    }
+
+    async fn process_all(&mut self, input: Option<Buffer>) -> Result<Output> {
+        AsyncElementDyn::process(self, input)
+            .await
+            .map(Output::from)
     }
 
     fn input_caps(&self) -> Caps {
@@ -783,7 +806,7 @@ impl<S: Sink + 'static> ElementDyn for SinkAdapter<S> {
     }
 }
 
-/// Wrapper to adapt an [`Element`] to [`ElementDyn`].
+/// Wrapper to adapt a sync [`Element`] to [`AsyncElementDyn`].
 pub struct ElementAdapter<E: Element> {
     inner: E,
 }
@@ -795,7 +818,7 @@ impl<E: Element> ElementAdapter<E> {
     }
 }
 
-impl<E: Element + 'static> ElementDyn for ElementAdapter<E> {
+impl<E: Element + Send + 'static> SendAsyncElementDyn for ElementAdapter<E> {
     fn name(&self) -> &str {
         self.inner.name()
     }
@@ -804,11 +827,17 @@ impl<E: Element + 'static> ElementDyn for ElementAdapter<E> {
         ElementType::Transform
     }
 
-    fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
+    async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
         match input {
             Some(buffer) => self.inner.process(buffer),
             None => Ok(None),
         }
+    }
+
+    async fn process_all(&mut self, input: Option<Buffer>) -> Result<Output> {
+        AsyncElementDyn::process(self, input)
+            .await
+            .map(Output::from)
     }
 
     fn input_caps(&self) -> Caps {
@@ -820,7 +849,7 @@ impl<E: Element + 'static> ElementDyn for ElementAdapter<E> {
     }
 }
 
-/// Wrapper to adapt a [`Transform`] to [`ElementDyn`].
+/// Wrapper to adapt a sync [`Transform`] to [`AsyncElementDyn`].
 ///
 /// This adapter supports transforms that produce multiple outputs.
 pub struct TransformAdapter<T: Transform> {
@@ -838,7 +867,7 @@ impl<T: Transform> TransformAdapter<T> {
     }
 }
 
-impl<T: Transform + 'static> ElementDyn for TransformAdapter<T> {
+impl<T: Transform + Send + 'static> SendAsyncElementDyn for TransformAdapter<T> {
     fn name(&self) -> &str {
         self.inner.name()
     }
@@ -847,7 +876,7 @@ impl<T: Transform + 'static> ElementDyn for TransformAdapter<T> {
         ElementType::Transform
     }
 
-    fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
+    async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
         // First, return any pending buffers from previous multi-output
         if !self.pending.is_empty() {
             return Ok(Some(self.pending.remove(0)));
@@ -874,7 +903,7 @@ impl<T: Transform + 'static> ElementDyn for TransformAdapter<T> {
         }
     }
 
-    fn process_all(&mut self, input: Option<Buffer>) -> Result<Output> {
+    async fn process_all(&mut self, input: Option<Buffer>) -> Result<Output> {
         // Return pending first
         if !self.pending.is_empty() {
             let pending = std::mem::take(&mut self.pending);
@@ -883,6 +912,175 @@ impl<T: Transform + 'static> ElementDyn for TransformAdapter<T> {
 
         match input {
             Some(buffer) => self.inner.transform(buffer),
+            None => Ok(Output::None),
+        }
+    }
+
+    fn input_caps(&self) -> Caps {
+        self.inner.input_caps()
+    }
+
+    fn output_caps(&self) -> Caps {
+        self.inner.output_caps()
+    }
+}
+
+// ============================================================================
+// Adapters for Async Elements -> AsyncElementDyn
+// ============================================================================
+
+/// Wrapper to adapt an [`AsyncSource`] to [`AsyncElementDyn`].
+///
+/// This is the native async adapter - no blocking required.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use parallax::element::AsyncSourceAdapter;
+/// use parallax::elements::AsyncVideoTestSrc;
+///
+/// let src = AsyncVideoTestSrc::new()
+///     .with_pattern(VideoPattern::MovingBall)
+///     .with_framerate(30, 1)
+///     .live(true);
+///
+/// let adapter = AsyncSourceAdapter::new(src);
+/// ```
+pub struct AsyncSourceAdapter<S: AsyncSource> {
+    inner: S,
+}
+
+impl<S: AsyncSource> AsyncSourceAdapter<S> {
+    /// Create a new async source adapter.
+    pub fn new(source: S) -> Self {
+        Self { inner: source }
+    }
+}
+
+impl<S: AsyncSource + Send + 'static> SendAsyncElementDyn for AsyncSourceAdapter<S> {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn element_type(&self) -> ElementType {
+        ElementType::Source
+    }
+
+    async fn process(&mut self, _input: Option<Buffer>) -> Result<Option<Buffer>> {
+        self.inner.produce().await
+    }
+
+    async fn process_all(&mut self, input: Option<Buffer>) -> Result<Output> {
+        AsyncElementDyn::process(self, input)
+            .await
+            .map(Output::from)
+    }
+
+    fn output_caps(&self) -> Caps {
+        self.inner.output_caps()
+    }
+}
+
+/// Wrapper to adapt an [`AsyncSink`] to [`AsyncElementDyn`].
+pub struct AsyncSinkAdapter<S: AsyncSink> {
+    inner: S,
+}
+
+impl<S: AsyncSink> AsyncSinkAdapter<S> {
+    /// Create a new async sink adapter.
+    pub fn new(sink: S) -> Self {
+        Self { inner: sink }
+    }
+}
+
+impl<S: AsyncSink + Send + 'static> SendAsyncElementDyn for AsyncSinkAdapter<S> {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn element_type(&self) -> ElementType {
+        ElementType::Sink
+    }
+
+    async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
+        if let Some(buffer) = input {
+            self.inner.consume(buffer).await?;
+        }
+        Ok(None)
+    }
+
+    async fn process_all(&mut self, input: Option<Buffer>) -> Result<Output> {
+        AsyncElementDyn::process(self, input)
+            .await
+            .map(Output::from)
+    }
+
+    fn input_caps(&self) -> Caps {
+        self.inner.input_caps()
+    }
+}
+
+/// Wrapper to adapt an [`AsyncTransform`] to [`AsyncElementDyn`].
+pub struct AsyncTransformAdapter<T: AsyncTransform> {
+    inner: T,
+    pending: Vec<Buffer>,
+}
+
+impl<T: AsyncTransform> AsyncTransformAdapter<T> {
+    /// Create a new async transform adapter.
+    pub fn new(transform: T) -> Self {
+        Self {
+            inner: transform,
+            pending: Vec::new(),
+        }
+    }
+}
+
+impl<T: AsyncTransform + Send + 'static> SendAsyncElementDyn for AsyncTransformAdapter<T> {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn element_type(&self) -> ElementType {
+        ElementType::Transform
+    }
+
+    async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
+        // First, return any pending buffers from previous multi-output
+        if !self.pending.is_empty() {
+            return Ok(Some(self.pending.remove(0)));
+        }
+
+        match input {
+            Some(buffer) => {
+                let output = self.inner.transform(buffer).await?;
+                match output {
+                    Output::None => Ok(None),
+                    Output::Single(b) => Ok(Some(b)),
+                    Output::Multiple(mut v) => {
+                        if v.is_empty() {
+                            Ok(None)
+                        } else {
+                            let first = v.remove(0);
+                            self.pending = v;
+                            Ok(Some(first))
+                        }
+                    }
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn process_all(&mut self, input: Option<Buffer>) -> Result<Output> {
+        // Return pending first
+        if !self.pending.is_empty() {
+            let pending = std::mem::take(&mut self.pending);
+            return Ok(Output::from(pending));
+        }
+
+        match input {
+            Some(buffer) => self.inner.transform(buffer).await,
             None => Ok(Output::None),
         }
     }
@@ -1005,48 +1203,75 @@ mod tests {
         assert_eq!(seqs, vec![1, 2]);
     }
 
-    #[test]
-    fn test_source_adapter() {
+    #[tokio::test]
+    async fn test_source_adapter() {
         let source = TestSource { count: 0, max: 3 };
         let mut adapter = SourceAdapter::new(source);
 
-        assert_eq!(adapter.element_type(), ElementType::Source);
+        assert_eq!(AsyncElementDyn::element_type(&adapter), ElementType::Source);
 
         // Should produce 3 buffers then None
-        assert!(adapter.process(None).unwrap().is_some());
-        assert!(adapter.process(None).unwrap().is_some());
-        assert!(adapter.process(None).unwrap().is_some());
-        assert!(adapter.process(None).unwrap().is_none());
+        assert!(
+            AsyncElementDyn::process(&mut adapter, None)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            AsyncElementDyn::process(&mut adapter, None)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            AsyncElementDyn::process(&mut adapter, None)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            AsyncElementDyn::process(&mut adapter, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
-    #[test]
-    fn test_sink_adapter() {
+    #[tokio::test]
+    async fn test_sink_adapter() {
         let sink = TestSink { received: vec![] };
         let mut adapter = SinkAdapter::new(sink);
 
-        assert_eq!(adapter.element_type(), ElementType::Sink);
+        assert_eq!(AsyncElementDyn::element_type(&adapter), ElementType::Sink);
 
         // Create and consume some buffers
         for i in 0..3 {
             let segment = Arc::new(HeapSegment::new(8).unwrap());
             let handle = MemoryHandle::from_segment(segment);
             let buffer = Buffer::new(handle, Metadata::from_sequence(i));
-            adapter.process(Some(buffer)).unwrap();
+            AsyncElementDyn::process(&mut adapter, Some(buffer))
+                .await
+                .unwrap();
         }
     }
 
-    #[test]
-    fn test_element_adapter() {
+    #[tokio::test]
+    async fn test_element_adapter() {
         let element = PassThrough;
         let mut adapter = ElementAdapter::new(element);
 
-        assert_eq!(adapter.element_type(), ElementType::Transform);
+        assert_eq!(
+            AsyncElementDyn::element_type(&adapter),
+            ElementType::Transform
+        );
 
         let segment = Arc::new(HeapSegment::new(8).unwrap());
         let handle = MemoryHandle::from_segment(segment);
         let buffer = Buffer::new(handle, Metadata::from_sequence(42));
 
-        let result = adapter.process(Some(buffer)).unwrap();
+        let result = AsyncElementDyn::process(&mut adapter, Some(buffer))
+            .await
+            .unwrap();
         assert!(result.is_some());
         assert_eq!(result.unwrap().metadata().sequence, 42);
     }

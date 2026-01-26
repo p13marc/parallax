@@ -1,6 +1,6 @@
 //! Pipeline graph structure using daggy.
 
-use crate::element::{ElementDyn, ElementType, Pad};
+use crate::element::{AsyncElementDyn, DynAsyncElement, ElementType, Pad};
 use crate::error::{Error, Result};
 use daggy::{Dag, NodeIndex, Walker};
 use std::collections::HashMap;
@@ -38,7 +38,7 @@ pub struct Node {
     name: String,
     /// The element wrapped by this node.
     /// This is an Option so that elements can be taken out for execution.
-    element: Option<Box<dyn ElementDyn>>,
+    element: Option<Box<DynAsyncElement<'static>>>,
     /// Cached element type (so we don't need the element to query it).
     element_type: ElementType,
     /// Input pads.
@@ -49,7 +49,7 @@ pub struct Node {
 
 impl Node {
     /// Create a new node.
-    pub fn new(name: impl Into<String>, element: Box<dyn ElementDyn>) -> Self {
+    pub fn new(name: impl Into<String>, element: Box<DynAsyncElement<'static>>) -> Self {
         let name = name.into();
         let element_type = element.element_type();
 
@@ -77,21 +77,21 @@ impl Node {
     /// Get a reference to the element.
     ///
     /// Returns `None` if the element has been taken for execution.
-    pub fn element(&self) -> Option<&dyn ElementDyn> {
+    pub fn element(&self) -> Option<&DynAsyncElement<'static>> {
         self.element.as_ref().map(|e| e.as_ref())
     }
 
     /// Get a mutable reference to the element.
     ///
     /// Returns `None` if the element has been taken for execution.
-    pub fn element_mut(&mut self) -> Option<&mut Box<dyn ElementDyn>> {
+    pub fn element_mut(&mut self) -> Option<&mut Box<DynAsyncElement<'static>>> {
         self.element.as_mut()
     }
 
     /// Take the element out of this node for execution.
     ///
     /// Returns `None` if the element has already been taken.
-    pub fn take_element(&mut self) -> Option<Box<dyn ElementDyn>> {
+    pub fn take_element(&mut self) -> Option<Box<DynAsyncElement<'static>>> {
         self.element.take()
     }
 
@@ -197,7 +197,11 @@ impl Pipeline {
     /// Add a node to the pipeline.
     ///
     /// Returns the node's ID for linking.
-    pub fn add_node(&mut self, name: impl Into<String>, element: Box<dyn ElementDyn>) -> NodeId {
+    pub fn add_node(
+        &mut self,
+        name: impl Into<String>,
+        element: Box<DynAsyncElement<'static>>,
+    ) -> NodeId {
         let name = name.into();
         let node = Node::new(name.clone(), element);
         let idx = self.graph.add_node(node);
@@ -207,7 +211,7 @@ impl Pipeline {
     }
 
     /// Add a node with an auto-generated name.
-    pub fn add_node_auto(&mut self, element: Box<dyn ElementDyn>) -> NodeId {
+    pub fn add_node_auto(&mut self, element: Box<DynAsyncElement<'static>>) -> NodeId {
         let name = format!("node_{}", self.name_counter);
         self.name_counter += 1;
         self.add_node(name, element)
@@ -686,7 +690,9 @@ impl DotOptions {
 mod tests {
     use super::*;
     use crate::buffer::Buffer;
-    use crate::element::{Element, ElementAdapter, Sink, SinkAdapter, Source, SourceAdapter};
+    use crate::element::{
+        DynAsyncElement, Element, ElementAdapter, Sink, SinkAdapter, Source, SourceAdapter,
+    };
 
     struct TestSource;
     impl Source for TestSource {
@@ -720,9 +726,15 @@ mod tests {
     fn test_add_nodes() {
         let mut pipeline = Pipeline::new();
 
-        let src = pipeline.add_node("src", Box::new(SourceAdapter::new(TestSource)));
-        let filter = pipeline.add_node("filter", Box::new(ElementAdapter::new(TestElement)));
-        let sink = pipeline.add_node("sink", Box::new(SinkAdapter::new(TestSink)));
+        let src = pipeline.add_node(
+            "src",
+            DynAsyncElement::new_box(SourceAdapter::new(TestSource)),
+        );
+        let filter = pipeline.add_node(
+            "filter",
+            DynAsyncElement::new_box(ElementAdapter::new(TestElement)),
+        );
+        let sink = pipeline.add_node("sink", DynAsyncElement::new_box(SinkAdapter::new(TestSink)));
 
         assert_eq!(pipeline.node_count(), 3);
         assert_eq!(pipeline.get_node_id("src"), Some(src));
@@ -734,9 +746,15 @@ mod tests {
     fn test_link_nodes() {
         let mut pipeline = Pipeline::new();
 
-        let src = pipeline.add_node("src", Box::new(SourceAdapter::new(TestSource)));
-        let filter = pipeline.add_node("filter", Box::new(ElementAdapter::new(TestElement)));
-        let sink = pipeline.add_node("sink", Box::new(SinkAdapter::new(TestSink)));
+        let src = pipeline.add_node(
+            "src",
+            DynAsyncElement::new_box(SourceAdapter::new(TestSource)),
+        );
+        let filter = pipeline.add_node(
+            "filter",
+            DynAsyncElement::new_box(ElementAdapter::new(TestElement)),
+        );
+        let sink = pipeline.add_node("sink", DynAsyncElement::new_box(SinkAdapter::new(TestSink)));
 
         pipeline.link(src, filter).unwrap();
         pipeline.link(filter, sink).unwrap();
@@ -757,9 +775,15 @@ mod tests {
     fn test_sources_and_sinks() {
         let mut pipeline = Pipeline::new();
 
-        let src = pipeline.add_node("src", Box::new(SourceAdapter::new(TestSource)));
-        let filter = pipeline.add_node("filter", Box::new(ElementAdapter::new(TestElement)));
-        let sink = pipeline.add_node("sink", Box::new(SinkAdapter::new(TestSink)));
+        let src = pipeline.add_node(
+            "src",
+            DynAsyncElement::new_box(SourceAdapter::new(TestSource)),
+        );
+        let filter = pipeline.add_node(
+            "filter",
+            DynAsyncElement::new_box(ElementAdapter::new(TestElement)),
+        );
+        let sink = pipeline.add_node("sink", DynAsyncElement::new_box(SinkAdapter::new(TestSink)));
 
         pipeline.link(src, filter).unwrap();
         pipeline.link(filter, sink).unwrap();
@@ -777,8 +801,14 @@ mod tests {
     fn test_cycle_detection() {
         let mut pipeline = Pipeline::new();
 
-        let a = pipeline.add_node("a", Box::new(ElementAdapter::new(TestElement)));
-        let b = pipeline.add_node("b", Box::new(ElementAdapter::new(TestElement)));
+        let a = pipeline.add_node(
+            "a",
+            DynAsyncElement::new_box(ElementAdapter::new(TestElement)),
+        );
+        let b = pipeline.add_node(
+            "b",
+            DynAsyncElement::new_box(ElementAdapter::new(TestElement)),
+        );
 
         pipeline.link(a, b).unwrap();
 
@@ -797,8 +827,11 @@ mod tests {
     fn test_validate_valid_pipeline() {
         let mut pipeline = Pipeline::new();
 
-        let src = pipeline.add_node("src", Box::new(SourceAdapter::new(TestSource)));
-        let sink = pipeline.add_node("sink", Box::new(SinkAdapter::new(TestSink)));
+        let src = pipeline.add_node(
+            "src",
+            DynAsyncElement::new_box(SourceAdapter::new(TestSource)),
+        );
+        let sink = pipeline.add_node("sink", DynAsyncElement::new_box(SinkAdapter::new(TestSink)));
 
         pipeline.link(src, sink).unwrap();
 
@@ -809,8 +842,8 @@ mod tests {
     fn test_auto_naming() {
         let mut pipeline = Pipeline::new();
 
-        let n1 = pipeline.add_node_auto(Box::new(SourceAdapter::new(TestSource)));
-        let n2 = pipeline.add_node_auto(Box::new(SinkAdapter::new(TestSink)));
+        let n1 = pipeline.add_node_auto(DynAsyncElement::new_box(SourceAdapter::new(TestSource)));
+        let n2 = pipeline.add_node_auto(DynAsyncElement::new_box(SinkAdapter::new(TestSink)));
 
         assert_eq!(pipeline.get_node(n1).unwrap().name(), "node_0");
         assert_eq!(pipeline.get_node(n2).unwrap().name(), "node_1");

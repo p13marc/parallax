@@ -3,7 +3,7 @@
 //! These types define the minimal ABI surface that plugins must implement.
 //! The design prioritizes safety and simplicity over flexibility.
 
-use crate::element::ElementDyn;
+use crate::element::DynAsyncElement;
 use std::ffi::{CStr, c_char, c_int, c_void};
 
 /// Current ABI version. Plugins must match this version to be loaded.
@@ -13,8 +13,8 @@ pub const PARALLAX_ABI_VERSION: u32 = 1;
 ///
 /// # Safety
 ///
-/// The returned pointer must be a valid `Box<dyn ElementDyn>` that was
-/// created using `Box::into_raw(Box::new(...) as Box<dyn ElementDyn>)`.
+/// The returned pointer must be a valid `Box<DynAsyncElement<'static>>` that was
+/// created using `Box::into_raw(Box::new(...))` via `element_to_raw`.
 pub type CreateElementFn = unsafe extern "C" fn() -> *mut c_void;
 
 /// Function pointer type for destroying element instances.
@@ -73,7 +73,7 @@ impl ElementDescriptor {
     ///
     /// The `create` function must return a valid pointer that was created
     /// using the `element_to_raw` helper function or equivalent.
-    pub unsafe fn create_element(&self) -> Option<Box<dyn ElementDyn>> {
+    pub unsafe fn create_element(&self) -> Option<Box<DynAsyncElement<'static>>> {
         // SAFETY: Caller guarantees the create function returns a valid pointer.
         let ptr = unsafe { (self.create)() };
         if ptr.is_null() {
@@ -86,24 +86,25 @@ impl ElementDescriptor {
     }
 }
 
-/// Convert an ElementDyn box to a raw pointer for C ABI.
+/// Convert a DynAsyncElement box to a raw pointer for C ABI.
 ///
 /// This is used by plugins to return elements from their create functions.
-pub fn element_to_raw(element: Box<dyn ElementDyn>) -> *mut c_void {
+pub fn element_to_raw(element: Box<DynAsyncElement<'static>>) -> *mut c_void {
     // Convert the fat pointer to a raw pointer
     // We store both the data pointer and vtable by boxing the trait object
-    let boxed: Box<Box<dyn ElementDyn>> = Box::new(element);
+    let boxed: Box<Box<DynAsyncElement<'static>>> = Box::new(element);
     Box::into_raw(boxed) as *mut c_void
 }
 
-/// Convert a raw pointer back to an ElementDyn box.
+/// Convert a raw pointer back to a DynAsyncElement box.
 ///
 /// # Safety
 ///
 /// The pointer must have been created by `element_to_raw`.
-pub unsafe fn element_from_raw(ptr: *mut c_void) -> Box<dyn ElementDyn> {
+pub unsafe fn element_from_raw(ptr: *mut c_void) -> Box<DynAsyncElement<'static>> {
     // SAFETY: Caller guarantees ptr was created by element_to_raw.
-    let boxed: Box<Box<dyn ElementDyn>> = unsafe { Box::from_raw(ptr as *mut Box<dyn ElementDyn>) };
+    let boxed: Box<Box<DynAsyncElement<'static>>> =
+        unsafe { Box::from_raw(ptr as *mut Box<DynAsyncElement<'static>>) };
     *boxed
 }
 
@@ -324,7 +325,7 @@ macro_rules! define_plugin {
 
                 #[unsafe(no_mangle)]
                 extern "C" fn [<create_ $elem_name>]() -> *mut std::ffi::c_void {
-                    let creator: fn() -> Box<dyn $crate::element::ElementDyn> = $create;
+                    let creator: fn() -> Box<$crate::element::DynAsyncElement<'static>> = $create;
                     let element = creator();
                     $crate::plugin::element_to_raw(element)
                 }
