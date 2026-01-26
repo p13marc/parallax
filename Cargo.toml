@@ -129,49 +129,53 @@ harness = false
 name = "memory_pool"
 harness = false
 
-# Basic examples
-[[example]]
-name = "simple_pipeline"
-path = "examples/basics/simple_pipeline.rs"
+# Examples - one concept per file, numbered for learning order
 
 [[example]]
-name = "typed_pipeline"
-path = "examples/basics/typed_pipeline.rs"
+name = "01_hello_pipeline"
 
-# Video examples
 [[example]]
-name = "video_display"
-path = "examples/video/video_display.rs"
+name = "02_counting_source"
+
+[[example]]
+name = "03_transform_element"
+
+[[example]]
+name = "04_tee_fanout"
+
+[[example]]
+name = "05_funnel_merge"
+
+[[example]]
+name = "06_typed_pipeline"
+
+[[example]]
+name = "07_appsrc_appsink"
+
+[[example]]
+name = "08_queue_backpressure"
+
+[[example]]
+name = "09_valve_control"
+
+[[example]]
+name = "10_file_io"
+
+[[example]]
+name = "11_isolate_in_process"
+
+[[example]]
+name = "12_isolate_by_pattern"
+
+[[example]]
+name = "13_isolate_all"
+
+[[example]]
+name = "14_ipc_manual"
+
+[[example]]
+name = "15_video_testsrc"
+
+[[example]]
+name = "16_video_display"
 required-features = ["iced-sink"]
-
-# Network examples
-[[example]]
-name = "tier3_network_elements"
-path = "examples/network/tier3_network_elements.rs"
-
-# IPC examples
-[[example]]
-name = "multi_process"
-path = "examples/ipc/multi_process.rs"
-
-# Element showcase examples
-[[example]]
-name = "new_elements"
-path = "examples/elements/new_elements.rs"
-
-[[example]]
-name = "tier1_tier2_elements"
-path = "examples/elements/tier1_tier2_elements.rs"
-
-# Process isolation examples
-[[example]]
-name = "easy_isolation"
-path = "examples/isolation/easy_isolation.rs"
-
-[[example]]
-name = "process_isolation"
-path = "examples/isolation/process_isolation.rs"
-
-[[example]]
-name = "cross_process_pipeline"
-path = "examples/isolation/cross_process_pipeline.rs"
