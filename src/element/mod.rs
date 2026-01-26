@@ -67,7 +67,10 @@ mod context;
 mod pad;
 mod traits;
 
-pub use context::{ElementContext, MemoryView, MemoryViewMut, ProcessContext};
+pub use context::{
+    ConsumeContext, ElementContext, MemoryView, MemoryViewMut, ProcessContext, ProduceContext,
+    ProduceResult,
+};
 pub use pad::{Pad, PadDirection, PadTemplate};
 pub use traits::{
     // Scheduling affinity

@@ -3,7 +3,7 @@
 //! Concatenates multiple streams one after another.
 
 use crate::buffer::Buffer;
-use crate::element::Source;
+use crate::element::{ProduceContext, ProduceResult, Source};
 use crate::error::Result;
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
@@ -208,8 +208,11 @@ impl Default for Concat {
 }
 
 impl Source for Concat {
-    fn produce(&mut self) -> Result<Option<Buffer>> {
-        self.pull_timeout(None)
+    fn produce(&mut self, _ctx: &mut ProduceContext) -> Result<ProduceResult> {
+        match self.pull_timeout(None)? {
+            Some(buffer) => Ok(ProduceResult::OwnBuffer(buffer)),
+            None => Ok(ProduceResult::Eos),
+        }
     }
 
     fn name(&self) -> &str {
@@ -427,8 +430,15 @@ mod tests {
         });
 
         let mut received = Vec::new();
-        while let Ok(Some(buf)) = concat.produce() {
-            received.push(buf.metadata().sequence);
+        let mut ctx = ProduceContext::without_buffer();
+        loop {
+            match concat.produce(&mut ctx).unwrap() {
+                ProduceResult::OwnBuffer(buf) => {
+                    received.push(buf.metadata().sequence);
+                }
+                ProduceResult::Eos => break,
+                _ => {}
+            }
         }
 
         producer0.join().unwrap();

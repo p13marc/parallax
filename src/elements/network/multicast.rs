@@ -5,13 +5,9 @@
 //! - [`UdpMulticastSrc`]: Receives data from a multicast group
 //! - [`UdpMulticastSink`]: Sends data to a multicast group
 
-use crate::buffer::{Buffer, MemoryHandle};
-use crate::element::{Sink, Source};
+use crate::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
 use crate::error::{Error, Result};
-use crate::memory::{HeapSegment, MemorySegment};
-use crate::metadata::Metadata;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
-use std::sync::Arc;
 use std::time::Duration;
 
 /// A UDP multicast source that receives data from a multicast group.
@@ -122,29 +118,22 @@ impl UdpMulticastSrc {
 }
 
 impl Source for UdpMulticastSrc {
-    fn produce(&mut self) -> Result<Option<Buffer>> {
-        let segment = Arc::new(HeapSegment::new(self.buffer_size)?);
-        let ptr = segment.as_mut_ptr().unwrap();
-        let slice = unsafe { std::slice::from_raw_parts_mut(ptr, self.buffer_size) };
+    fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
+        let output = ctx.output();
+        let recv_len = output.len().min(self.buffer_size);
 
-        match self.socket.recv_from(slice) {
+        match self.socket.recv_from(&mut output[..recv_len]) {
             Ok((n, _addr)) => {
                 self.bytes_read += n as u64;
                 self.datagrams_received += 1;
-                let seq = self.sequence;
+                ctx.set_sequence(self.sequence);
                 self.sequence += 1;
 
-                let handle = MemoryHandle::from_segment_with_len(segment, n);
-                Ok(Some(Buffer::new(handle, Metadata::from_sequence(seq))))
+                Ok(ProduceResult::Produced(n))
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // Timeout
-                let segment = Arc::new(HeapSegment::new(1)?);
-                let handle = MemoryHandle::from_segment_with_len(segment, 0);
-                let mut meta = Metadata::from_sequence(self.sequence);
-                meta.flags = meta.flags.insert(crate::metadata::BufferFlags::TIMEOUT);
-                self.sequence += 1;
-                Ok(Some(Buffer::new(handle, meta)))
+                // Timeout - signal would block
+                Ok(ProduceResult::WouldBlock)
             }
             Err(e) => Err(e.into()),
         }
@@ -152,6 +141,10 @@ impl Source for UdpMulticastSrc {
 
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn preferred_buffer_size(&self) -> Option<usize> {
+        Some(self.buffer_size)
     }
 }
 
@@ -279,8 +272,8 @@ impl UdpMulticastSink {
 }
 
 impl Sink for UdpMulticastSink {
-    fn consume(&mut self, buffer: Buffer) -> Result<()> {
-        let data = buffer.as_bytes();
+    fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
+        let data = ctx.input();
 
         // UDP datagrams have a max size
         if data.len() > 65535 {
@@ -311,6 +304,10 @@ pub struct UdpMulticastStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::{Buffer, MemoryHandle};
+    use crate::memory::{CpuArena, HeapSegment, MemorySegment};
+    use crate::metadata::Metadata;
+    use std::sync::Arc;
     use std::thread;
 
     fn make_buffer(data: &[u8], seq: u64) -> Buffer {
@@ -371,9 +368,17 @@ mod tests {
             let mut src = UdpMulticastSrc::new(multicast_addr, port)?
                 .with_timeout(Duration::from_millis(500))?;
 
+            // Create arena for buffer allocation
+            let arena = CpuArena::new(65535, 4).unwrap();
+            let slot = arena.acquire().unwrap();
+            let mut ctx = ProduceContext::new(slot);
+
             // Wait for data
-            match src.produce()? {
-                Some(buf) if !buf.metadata().flags.is_timeout() => Ok(buf.as_bytes().to_vec()),
+            match src.produce(&mut ctx)? {
+                ProduceResult::Produced(n) => {
+                    let buffer = ctx.finalize(n);
+                    Ok(buffer.as_bytes().to_vec())
+                }
                 _ => Ok(vec![]),
             }
         });
@@ -383,7 +388,9 @@ mod tests {
 
         // Send data
         let mut sink = UdpMulticastSink::new(multicast_addr, port)?.with_loopback(true)?;
-        sink.consume(make_buffer(b"Hello Multicast", 0))?;
+        let buffer = make_buffer(b"Hello Multicast", 0);
+        let ctx = ConsumeContext::new(&buffer);
+        sink.consume(&ctx)?;
 
         let received = receiver.join().unwrap()?;
         // Note: multicast delivery is not guaranteed, so we check if we got data
@@ -397,8 +404,14 @@ mod tests {
     #[test]
     fn test_multicast_stats() -> Result<()> {
         let mut sink = UdpMulticastSink::new("239.255.0.1", 5005)?;
-        sink.consume(make_buffer(b"test", 0))?;
-        sink.consume(make_buffer(b"data", 1))?;
+
+        let buffer1 = make_buffer(b"test", 0);
+        let ctx1 = ConsumeContext::new(&buffer1);
+        sink.consume(&ctx1)?;
+
+        let buffer2 = make_buffer(b"data", 1);
+        let ctx2 = ConsumeContext::new(&buffer2);
+        sink.consume(&ctx2)?;
 
         let stats = sink.stats();
         assert_eq!(stats.datagrams, 2);

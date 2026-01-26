@@ -1,14 +1,10 @@
 //! File-based source and sink elements.
 
-use crate::buffer::{Buffer, MemoryHandle};
-use crate::element::{Sink, Source};
+use crate::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
 use crate::error::Result;
-use crate::memory::{HeapSegment, MemorySegment};
-use crate::metadata::Metadata;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 /// A source element that reads from a file.
 ///
@@ -18,12 +14,23 @@ use std::sync::Arc;
 ///
 /// ```rust,ignore
 /// use parallax::elements::FileSrc;
-/// use parallax::element::Source;
+/// use parallax::element::{Source, ProduceContext, ProduceResult};
+/// use parallax::memory::CpuArena;
 ///
 /// let mut src = FileSrc::open("input.bin")?;
+/// let arena = CpuArena::new(64 * 1024, 4)?;
 ///
-/// while let Some(buffer) = src.produce()? {
-///     println!("Read {} bytes", buffer.len());
+/// loop {
+///     let slot = arena.acquire().unwrap();
+///     let mut ctx = ProduceContext::new(slot);
+///     match src.produce(&mut ctx)? {
+///         ProduceResult::Produced(n) => {
+///             let buffer = ctx.finalize(n);
+///             println!("Read {} bytes", buffer.len());
+///         }
+///         ProduceResult::Eos => break,
+///         _ => {}
+///     }
 /// }
 /// ```
 pub struct FileSrc {
@@ -98,37 +105,36 @@ impl FileSrc {
 }
 
 impl Source for FileSrc {
-    fn produce(&mut self) -> Result<Option<Buffer>> {
+    fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
         // Copy chunk_size before borrowing self mutably
         let chunk_size = self.chunk_size;
         let file = self.ensure_open()?;
 
-        // Allocate a buffer for reading
-        let segment = Arc::new(HeapSegment::new(chunk_size)?);
-
-        // Read into the segment
-        let ptr = segment.as_mut_ptr().unwrap();
-        let slice = unsafe { std::slice::from_raw_parts_mut(ptr, chunk_size) };
-
-        let bytes_read = file.read(slice)?;
+        // Read into the provided buffer
+        let output = ctx.output();
+        let read_len = output.len().min(chunk_size);
+        let bytes_read = file.read(&mut output[..read_len])?;
 
         if bytes_read == 0 {
             // EOF
-            return Ok(None);
+            return Ok(ProduceResult::Eos);
         }
 
         self.bytes_read += bytes_read as u64;
 
-        // Create a handle that only covers the bytes actually read
-        let handle = MemoryHandle::new(segment, 0, bytes_read);
-        let metadata = Metadata::from_sequence(self.sequence);
+        // Set metadata
+        ctx.set_sequence(self.sequence);
         self.sequence += 1;
 
-        Ok(Some(Buffer::new(handle, metadata)))
+        Ok(ProduceResult::Produced(bytes_read))
     }
 
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn preferred_buffer_size(&self) -> Option<usize> {
+        Some(self.chunk_size)
     }
 }
 
@@ -138,12 +144,13 @@ impl Source for FileSrc {
 ///
 /// ```rust,ignore
 /// use parallax::elements::FileSink;
-/// use parallax::element::Sink;
+/// use parallax::element::{Sink, ConsumeContext};
 ///
 /// let mut sink = FileSink::create("output.bin")?;
 ///
-/// // Write buffers
-/// sink.consume(buffer)?;
+/// // Write buffers using ConsumeContext
+/// let ctx = ConsumeContext::new(&buffer);
+/// sink.consume(&ctx)?;
 ///
 /// // Flush and close
 /// sink.flush()?;
@@ -221,9 +228,9 @@ impl FileSink {
 }
 
 impl Sink for FileSink {
-    fn consume(&mut self, buffer: Buffer) -> Result<()> {
+    fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
         let file = self.ensure_open()?;
-        let data = buffer.as_bytes();
+        let data = ctx.input();
         file.write_all(data)?;
         self.bytes_written += data.len() as u64;
         self.buffers_written += 1;
@@ -245,9 +252,38 @@ impl Drop for FileSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::MemorySegment;
+    use crate::buffer::{Buffer, MemoryHandle};
+    use crate::element::{ConsumeContext, ProduceContext, ProduceResult};
+    use crate::memory::{CpuArena, HeapSegment, MemorySegment};
+    use crate::metadata::Metadata;
     use std::io::Write;
+    use std::sync::Arc;
     use tempfile::NamedTempFile;
+
+    // Helper to produce a buffer using CpuArena
+    fn produce_buffer(src: &mut FileSrc, arena: &Arc<CpuArena>) -> Option<Vec<u8>> {
+        let slot = arena.acquire().unwrap();
+        let mut ctx = ProduceContext::new(slot);
+        match src.produce(&mut ctx).unwrap() {
+            ProduceResult::Produced(n) => {
+                let buffer = ctx.finalize(n);
+                Some(buffer.as_bytes().to_vec())
+            }
+            ProduceResult::Eos => None,
+            _ => None,
+        }
+    }
+
+    // Helper to produce and get the buffer with metadata
+    fn produce_buffer_with_meta(src: &mut FileSrc, arena: &Arc<CpuArena>) -> Option<Buffer> {
+        let slot = arena.acquire().unwrap();
+        let mut ctx = ProduceContext::new(slot);
+        match src.produce(&mut ctx).unwrap() {
+            ProduceResult::Produced(n) => Some(ctx.finalize(n)),
+            ProduceResult::Eos => None,
+            _ => None,
+        }
+    }
 
     #[test]
     fn test_filesrc_reads_file() {
@@ -257,16 +293,19 @@ mod tests {
         temp.write_all(content).unwrap();
         temp.flush().unwrap();
 
+        // Create arena with enough space
+        let arena = CpuArena::new(1024, 4).unwrap();
+
         // Read it back
         let mut src = FileSrc::open(temp.path()).unwrap();
-        let buffer = src.produce().unwrap().unwrap();
+        let buffer = produce_buffer_with_meta(&mut src, &arena).unwrap();
 
         assert_eq!(buffer.as_bytes(), content);
         assert_eq!(buffer.metadata().sequence, 0);
         assert_eq!(src.bytes_read(), content.len() as u64);
 
         // Next read should return None (EOF)
-        let buffer = src.produce().unwrap();
+        let buffer = produce_buffer(&mut src, &arena);
         assert!(buffer.is_none());
     }
 
@@ -278,16 +317,19 @@ mod tests {
         temp.write_all(&content).unwrap();
         temp.flush().unwrap();
 
+        // Create arena with enough slots for all chunks
+        let arena = CpuArena::new(128, 16).unwrap();
+
         // Read with small chunks
         let mut src = FileSrc::open(temp.path()).unwrap().with_chunk_size(100);
 
         let mut total_read = 0;
         let mut chunk_count = 0;
 
-        while let Some(buffer) = src.produce().unwrap() {
-            total_read += buffer.len();
+        while let Some(bytes) = produce_buffer(&mut src, &arena) {
+            total_read += bytes.len();
             chunk_count += 1;
-            assert!(buffer.len() <= 100);
+            assert!(bytes.len() <= 100);
         }
 
         assert_eq!(total_read, 1000);
@@ -311,7 +353,9 @@ mod tests {
             let handle = MemoryHandle::new(segment, 0, 13);
             let buffer = Buffer::new(handle, Metadata::from_sequence(0));
 
-            sink.consume(buffer).unwrap();
+            // Use ConsumeContext
+            let ctx = ConsumeContext::new(&buffer);
+            sink.consume(&ctx).unwrap();
             assert_eq!(sink.bytes_written(), 13);
             assert_eq!(sink.buffers_written(), 1);
         }
@@ -351,12 +395,18 @@ mod tests {
             }
             let handle = MemoryHandle::from_segment(segment);
             let buffer = Buffer::new(handle, Metadata::from_sequence(0));
-            sink.consume(buffer).unwrap();
+
+            // Use ConsumeContext
+            let ctx = ConsumeContext::new(&buffer);
+            sink.consume(&ctx).unwrap();
         }
+
+        // Create arena for reading
+        let arena = CpuArena::new(1024, 4).unwrap();
 
         // Read it back
         let mut src = FileSrc::open(&path).unwrap();
-        let buffer = src.produce().unwrap().unwrap();
+        let buffer = produce_buffer_with_meta(&mut src, &arena).unwrap();
         assert_eq!(buffer.as_bytes(), original_data);
     }
 }

@@ -12,6 +12,10 @@ pub enum Error {
     #[error("memory pool exhausted: no slots available")]
     PoolExhausted,
 
+    /// Buffer pool error (no pool configured or pool unavailable).
+    #[error("buffer pool error: {0}")]
+    BufferPool(String),
+
     /// Memory allocation failed.
     #[error("memory allocation failed: {0}")]
     AllocationFailed(String),

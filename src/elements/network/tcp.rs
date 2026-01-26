@@ -6,7 +6,7 @@
 //! - [`TcpSink`]: Writes data to a TCP connection
 
 use crate::buffer::Buffer;
-use crate::element::AsyncSource;
+use crate::element::{AsyncSource, ConsumeContext, ProduceContext, ProduceResult};
 use crate::error::{Error, Result};
 use crate::memory::{HeapSegment, MemorySegment};
 use crate::metadata::Metadata;
@@ -164,7 +164,7 @@ impl TcpSrc {
 }
 
 impl crate::element::Source for TcpSrc {
-    fn produce(&mut self) -> Result<Option<Buffer>> {
+    fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
         self.ensure_connected()?;
 
         let stream = self
@@ -172,29 +172,47 @@ impl crate::element::Source for TcpSrc {
             .as_mut()
             .ok_or_else(|| Error::Pipeline("TCP stream not connected".into()))?;
 
-        // Allocate buffer
-        let segment = Arc::new(HeapSegment::new(self.buffer_size)?);
-        let ptr = segment
-            .as_mut_ptr()
-            .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
-        let slice = unsafe { std::slice::from_raw_parts_mut(ptr, self.buffer_size) };
-
-        // Read data
-        match stream.read(slice) {
-            Ok(0) => {
-                // Connection closed
-                Ok(None)
+        // Check if context has a buffer
+        if ctx.has_buffer() {
+            // Use the provided buffer from the context
+            let output = ctx.output();
+            match stream.read(output) {
+                Ok(0) => {
+                    // Connection closed
+                    Ok(ProduceResult::Eos)
+                }
+                Ok(n) => {
+                    self.bytes_read += n as u64;
+                    ctx.set_sequence(self.sequence);
+                    self.sequence += 1;
+                    Ok(ProduceResult::Produced(n))
+                }
+                Err(e) => Err(Error::Io(e)),
             }
-            Ok(n) => {
-                self.bytes_read += n as u64;
-                let seq = self.sequence;
-                self.sequence += 1;
+        } else {
+            // No buffer provided, allocate our own
+            let segment = Arc::new(HeapSegment::new(self.buffer_size)?);
+            let ptr = segment
+                .as_mut_ptr()
+                .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
+            let slice = unsafe { std::slice::from_raw_parts_mut(ptr, self.buffer_size) };
 
-                let handle = crate::buffer::MemoryHandle::from_segment_with_len(segment, n);
-                let metadata = Metadata::from_sequence(seq);
-                Ok(Some(Buffer::new(handle, metadata)))
+            match stream.read(slice) {
+                Ok(0) => {
+                    // Connection closed
+                    Ok(ProduceResult::Eos)
+                }
+                Ok(n) => {
+                    self.bytes_read += n as u64;
+                    let seq = self.sequence;
+                    self.sequence += 1;
+
+                    let handle = crate::buffer::MemoryHandle::from_segment_with_len(segment, n);
+                    let metadata = Metadata::from_sequence(seq);
+                    Ok(ProduceResult::OwnBuffer(Buffer::new(handle, metadata)))
+                }
+                Err(e) => Err(Error::Io(e)),
             }
-            Err(e) => Err(Error::Io(e)),
         }
     }
 
@@ -297,7 +315,7 @@ impl AsyncTcpSrc {
 }
 
 impl AsyncSource for AsyncTcpSrc {
-    async fn produce(&mut self) -> Result<Option<Buffer>> {
+    async fn produce(&mut self, ctx: &mut ProduceContext<'_>) -> Result<ProduceResult> {
         use tokio::io::AsyncReadExt;
 
         self.ensure_connected().await?;
@@ -307,29 +325,47 @@ impl AsyncSource for AsyncTcpSrc {
             .as_mut()
             .ok_or_else(|| Error::Pipeline("TCP stream not connected".into()))?;
 
-        // Allocate buffer
-        let segment = Arc::new(HeapSegment::new(self.buffer_size)?);
-        let ptr = segment
-            .as_mut_ptr()
-            .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
-        let slice = unsafe { std::slice::from_raw_parts_mut(ptr, self.buffer_size) };
-
-        // Read data asynchronously
-        match stream.read(slice).await {
-            Ok(0) => {
-                // Connection closed
-                Ok(None)
+        // Check if context has a buffer
+        if ctx.has_buffer() {
+            // Use the provided buffer from the context
+            let output = ctx.output();
+            match stream.read(output).await {
+                Ok(0) => {
+                    // Connection closed
+                    Ok(ProduceResult::Eos)
+                }
+                Ok(n) => {
+                    self.bytes_read += n as u64;
+                    ctx.set_sequence(self.sequence);
+                    self.sequence += 1;
+                    Ok(ProduceResult::Produced(n))
+                }
+                Err(e) => Err(Error::Io(e)),
             }
-            Ok(n) => {
-                self.bytes_read += n as u64;
-                let seq = self.sequence;
-                self.sequence += 1;
+        } else {
+            // No buffer provided, allocate our own
+            let segment = Arc::new(HeapSegment::new(self.buffer_size)?);
+            let ptr = segment
+                .as_mut_ptr()
+                .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
+            let slice = unsafe { std::slice::from_raw_parts_mut(ptr, self.buffer_size) };
 
-                let handle = crate::buffer::MemoryHandle::from_segment_with_len(segment, n);
-                let metadata = Metadata::from_sequence(seq);
-                Ok(Some(Buffer::new(handle, metadata)))
+            match stream.read(slice).await {
+                Ok(0) => {
+                    // Connection closed
+                    Ok(ProduceResult::Eos)
+                }
+                Ok(n) => {
+                    self.bytes_read += n as u64;
+                    let seq = self.sequence;
+                    self.sequence += 1;
+
+                    let handle = crate::buffer::MemoryHandle::from_segment_with_len(segment, n);
+                    let metadata = Metadata::from_sequence(seq);
+                    Ok(ProduceResult::OwnBuffer(Buffer::new(handle, metadata)))
+                }
+                Err(e) => Err(Error::Io(e)),
             }
-            Err(e) => Err(Error::Io(e)),
         }
     }
 
@@ -452,7 +488,7 @@ impl TcpSink {
 }
 
 impl crate::element::Sink for TcpSink {
-    fn consume(&mut self, buffer: Buffer) -> Result<()> {
+    fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
         self.ensure_connected()?;
 
         let stream = self
@@ -460,7 +496,7 @@ impl crate::element::Sink for TcpSink {
             .as_mut()
             .ok_or_else(|| Error::Pipeline("TCP stream not connected".into()))?;
 
-        let data = buffer.as_bytes();
+        let data = ctx.input();
         stream.write_all(data)?;
         self.bytes_written += data.len() as u64;
 
@@ -553,13 +589,14 @@ impl AsyncTcpSink {
     }
 
     /// Write a buffer asynchronously.
-    pub async fn write(&mut self, buffer: Buffer) -> Result<()> {
-        <Self as crate::element::AsyncSink>::consume(self, buffer).await
+    pub async fn write(&mut self, buffer: &Buffer) -> Result<()> {
+        let ctx = ConsumeContext::new(buffer);
+        <Self as crate::element::AsyncSink>::consume(self, &ctx).await
     }
 }
 
 impl crate::element::AsyncSink for AsyncTcpSink {
-    async fn consume(&mut self, buffer: Buffer) -> Result<()> {
+    async fn consume(&mut self, ctx: &ConsumeContext<'_>) -> Result<()> {
         use tokio::io::AsyncWriteExt;
 
         self.ensure_connected().await?;
@@ -569,7 +606,7 @@ impl crate::element::AsyncSink for AsyncTcpSink {
             .as_mut()
             .ok_or_else(|| Error::Pipeline("TCP stream not connected".into()))?;
 
-        let data = buffer.as_bytes();
+        let data = ctx.input();
         stream.write_all(data).await?;
         self.bytes_written += data.len() as u64;
 
@@ -612,6 +649,8 @@ mod tests {
 
     #[test]
     fn test_tcp_roundtrip() {
+        use crate::memory::CpuArena;
+
         // Create a server source
         let mut src = TcpSrc::listen("127.0.0.1:0").unwrap();
         let addr = src.local_addr().unwrap();
@@ -624,13 +663,25 @@ mod tests {
             drop(stream);
         });
 
-        // Read from the source
-        let buffer = src.produce().unwrap().unwrap();
-        assert_eq!(buffer.as_bytes(), b"hello world");
+        // Read from the source using the new context-based API
+        let arena = CpuArena::new(1024, 4).unwrap();
+        let slot = arena.acquire().unwrap();
+        let mut ctx = ProduceContext::new(slot);
+        let result = src.produce(&mut ctx).unwrap();
 
-        // Next read should return None (connection closed)
-        let next = src.produce().unwrap();
-        assert!(next.is_none());
+        match result {
+            ProduceResult::Produced(n) => {
+                let buffer = ctx.finalize(n);
+                assert_eq!(buffer.as_bytes(), b"hello world");
+            }
+            _ => panic!("expected Produced result"),
+        }
+
+        // Next read should return Eos (connection closed)
+        let slot2 = arena.acquire().unwrap();
+        let mut ctx2 = ProduceContext::new(slot2);
+        let next = src.produce(&mut ctx2).unwrap();
+        assert!(matches!(next, ProduceResult::Eos));
 
         handle.join().unwrap();
     }
@@ -661,7 +712,8 @@ mod tests {
         }
         let handle_mem = crate::buffer::MemoryHandle::from_segment_with_len(segment, 11);
         let buffer = Buffer::new(handle_mem, Metadata::default());
-        sink.consume(buffer).unwrap();
+        let ctx = ConsumeContext::new(&buffer);
+        sink.consume(&ctx).unwrap();
 
         // Close connection
         drop(sink);
@@ -689,6 +741,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_async_tcp_roundtrip() {
+        use crate::memory::CpuArena;
         use tokio::io::AsyncWriteExt;
 
         // Create async server source
@@ -707,9 +760,19 @@ mod tests {
             stream.shutdown().await.unwrap();
         });
 
-        // Read from async source
-        let buffer = src.produce().await.unwrap().unwrap();
-        assert_eq!(buffer.as_bytes(), b"async hello");
+        // Read from async source using the new context-based API
+        let arena = CpuArena::new(1024, 4).unwrap();
+        let slot = arena.acquire().unwrap();
+        let mut ctx = ProduceContext::new(slot);
+        let result = src.produce(&mut ctx).await.unwrap();
+
+        match result {
+            ProduceResult::Produced(n) => {
+                let buffer = ctx.finalize(n);
+                assert_eq!(buffer.as_bytes(), b"async hello");
+            }
+            _ => panic!("expected Produced result"),
+        }
 
         client.await.unwrap();
     }

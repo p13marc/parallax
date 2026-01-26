@@ -2,14 +2,10 @@
 //!
 //! Read from and write to raw file descriptors.
 
-use crate::buffer::{Buffer, MemoryHandle};
-use crate::element::{Sink, Source};
+use crate::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
 use crate::error::{Error, Result};
-use crate::memory::{HeapSegment, MemorySegment};
-use crate::metadata::Metadata;
 use rustix::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-use std::sync::Arc;
 
 /// A source that reads from a file descriptor.
 ///
@@ -28,7 +24,6 @@ use std::sync::Arc;
 pub struct FdSrc {
     name: String,
     fd: FdHolder,
-    buffer_size: usize,
     bytes_read: u64,
     sequence: u64,
 }
@@ -81,7 +76,6 @@ impl FdSrc {
         Self {
             name: format!("fdsrc-{}", fd),
             fd: FdHolder::Borrowed(fd),
-            buffer_size: 64 * 1024,
             bytes_read: 0,
             sequence: 0,
         }
@@ -93,7 +87,6 @@ impl FdSrc {
         Self {
             name: format!("fdsrc-{}", raw),
             fd: FdHolder::Owned(fd),
-            buffer_size: 64 * 1024,
             bytes_read: 0,
             sequence: 0,
         }
@@ -110,12 +103,6 @@ impl FdSrc {
     /// Set a custom name.
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
-        self
-    }
-
-    /// Set the buffer size for reads.
-    pub fn with_buffer_size(mut self, size: usize) -> Self {
-        self.buffer_size = size;
         self
     }
 
@@ -136,27 +123,20 @@ impl FdSrc {
 }
 
 impl Source for FdSrc {
-    fn produce(&mut self) -> Result<Option<Buffer>> {
-        let segment = Arc::new(HeapSegment::new(self.buffer_size)?);
-        let ptr = segment
-            .as_mut_ptr()
-            .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
-        let slice = unsafe { std::slice::from_raw_parts_mut(ptr, self.buffer_size) };
+    fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
+        let output = ctx.output();
 
-        match rustix::io::read(&self.fd, slice) {
+        match rustix::io::read(&self.fd, output) {
             Ok(0) => {
                 // EOF
-                Ok(None)
+                Ok(ProduceResult::Eos)
             }
             Ok(n) => {
                 self.bytes_read += n as u64;
-                let seq = self.sequence;
+                ctx.set_sequence(self.sequence);
                 self.sequence += 1;
 
-                let handle = MemoryHandle::from_segment_with_len(segment, n);
-                let metadata = Metadata::from_sequence(seq);
-
-                Ok(Some(Buffer::new(handle, metadata)))
+                Ok(ProduceResult::Produced(n))
             }
             Err(e) => Err(Error::Io(e.into())),
         }
@@ -215,8 +195,8 @@ impl FdSink {
 }
 
 impl Sink for FdSink {
-    fn consume(&mut self, buffer: Buffer) -> Result<()> {
-        let data = buffer.as_bytes();
+    fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
+        let data = ctx.input();
         let mut written = 0;
 
         while written < data.len() {
@@ -242,6 +222,7 @@ impl Sink for FdSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::CpuArena;
 
     #[test]
     fn test_fdsrc_from_pipe() {
@@ -252,15 +233,30 @@ mod tests {
         rustix::io::write(&write_fd, b"hello from pipe").unwrap();
         drop(write_fd);
 
-        // Read using FdSrc
-        let mut src = FdSrc::from_owned(read_fd).with_buffer_size(1024);
+        // Create arena and source
+        let arena = CpuArena::new(1024, 4).unwrap();
+        let mut src = FdSrc::from_owned(read_fd);
 
-        let buf = src.produce().unwrap().unwrap();
-        assert_eq!(buf.as_bytes(), b"hello from pipe");
+        // Acquire slot and create context
+        let slot = arena.acquire().unwrap();
+        let mut ctx = ProduceContext::new(slot);
 
-        // Should be EOF
-        let buf = src.produce().unwrap();
-        assert!(buf.is_none());
+        // Produce buffer
+        let result = src.produce(&mut ctx).unwrap();
+        match result {
+            ProduceResult::Produced(n) => {
+                assert_eq!(n, 15);
+                let buf = ctx.finalize(n);
+                assert_eq!(buf.as_bytes(), b"hello from pipe");
+            }
+            _ => panic!("Expected Produced result"),
+        }
+
+        // Should be EOF on next read
+        let slot = arena.acquire().unwrap();
+        let mut ctx = ProduceContext::new(slot);
+        let result = src.produce(&mut ctx).unwrap();
+        assert!(matches!(result, ProduceResult::Eos));
 
         assert_eq!(src.bytes_read(), 15);
     }
@@ -270,18 +266,20 @@ mod tests {
         // Create a pipe using rustix
         let (read_fd, write_fd) = rustix::pipe::pipe().unwrap();
 
-        // Write using FdSink
+        // Create arena and sink
+        let arena = CpuArena::new(1024, 4).unwrap();
         let mut sink = FdSink::from_owned(write_fd);
 
-        let segment = Arc::new(HeapSegment::new(11).unwrap());
-        let ptr = segment.as_mut_ptr().unwrap();
-        unsafe {
-            std::ptr::copy_nonoverlapping(b"hello world".as_ptr(), ptr, 11);
-        }
-        let handle = MemoryHandle::from_segment_with_len(segment, 11);
-        let buffer = Buffer::new(handle, Metadata::default());
+        // Create buffer using arena
+        let slot = arena.acquire().unwrap();
+        let mut ctx = ProduceContext::new(slot);
+        let output = ctx.output();
+        output[..11].copy_from_slice(b"hello world");
+        let buffer = ctx.finalize(11);
 
-        sink.consume(buffer).unwrap();
+        // Consume buffer
+        let consume_ctx = ConsumeContext::new(&buffer);
+        sink.consume(&consume_ctx).unwrap();
         drop(sink);
 
         // Read and verify using rustix
@@ -305,9 +303,60 @@ mod tests {
     }
 
     #[test]
-    fn test_fdsrc_buffer_size() {
-        let (read_fd, _write_fd) = rustix::pipe::pipe().unwrap();
-        let src = FdSrc::from_owned(read_fd).with_buffer_size(256);
-        assert_eq!(src.buffer_size, 256);
+    fn test_fdsrc_multiple_reads() {
+        // Create a pipe using rustix
+        let (read_fd, write_fd) = rustix::pipe::pipe().unwrap();
+
+        // Write multiple chunks
+        rustix::io::write(&write_fd, b"chunk1").unwrap();
+        rustix::io::write(&write_fd, b"chunk2").unwrap();
+        drop(write_fd);
+
+        // Create arena and source
+        let arena = CpuArena::new(1024, 4).unwrap();
+        let mut src = FdSrc::from_owned(read_fd);
+
+        // Read first chunk
+        let slot = arena.acquire().unwrap();
+        let mut ctx = ProduceContext::new(slot);
+        let result = src.produce(&mut ctx).unwrap();
+        match result {
+            ProduceResult::Produced(n) => {
+                let buf = ctx.finalize(n);
+                // Might read both chunks at once or separately
+                assert!(buf.len() > 0);
+            }
+            _ => panic!("Expected Produced result"),
+        }
+
+        assert_eq!(src.buffers_produced(), 1);
+    }
+
+    #[test]
+    fn test_fdsink_bytes_written() {
+        let (_read_fd, write_fd) = rustix::pipe::pipe().unwrap();
+
+        let arena = CpuArena::new(1024, 4).unwrap();
+        let mut sink = FdSink::from_owned(write_fd);
+
+        // Write first buffer
+        let slot = arena.acquire().unwrap();
+        let mut ctx = ProduceContext::new(slot);
+        ctx.output()[..5].copy_from_slice(b"hello");
+        let buffer = ctx.finalize(5);
+        let consume_ctx = ConsumeContext::new(&buffer);
+        sink.consume(&consume_ctx).unwrap();
+
+        assert_eq!(sink.bytes_written(), 5);
+
+        // Write second buffer
+        let slot = arena.acquire().unwrap();
+        let mut ctx = ProduceContext::new(slot);
+        ctx.output()[..5].copy_from_slice(b"world");
+        let buffer = ctx.finalize(5);
+        let consume_ctx = ConsumeContext::new(&buffer);
+        sink.consume(&consume_ctx).unwrap();
+
+        assert_eq!(sink.bytes_written(), 10);
     }
 }

@@ -792,7 +792,8 @@ mod tests {
     use super::*;
     use crate::buffer::MemoryHandle;
     use crate::element::{
-        DynAsyncElement, Element, ElementAdapter, Sink, SinkAdapter, Source, SourceAdapter,
+        ConsumeContext, DynAsyncElement, Element, ElementAdapter, ProduceContext, ProduceResult,
+        Sink, SinkAdapter, Source, SourceAdapter,
     };
     use crate::memory::HeapSegment;
     use crate::metadata::Metadata;
@@ -805,15 +806,15 @@ mod tests {
     }
 
     impl Source for CountingSource {
-        fn produce(&mut self) -> Result<Option<Buffer>> {
+        fn produce(&mut self, _ctx: &mut ProduceContext) -> Result<ProduceResult> {
             if self.count >= self.max {
-                return Ok(None);
+                return Ok(ProduceResult::Eos);
             }
             let segment = Arc::new(HeapSegment::new(8).unwrap());
             let handle = MemoryHandle::from_segment(segment);
             let buffer = Buffer::new(handle, Metadata::from_sequence(self.count));
             self.count += 1;
-            Ok(Some(buffer))
+            Ok(ProduceResult::OwnBuffer(buffer))
         }
     }
 
@@ -822,7 +823,7 @@ mod tests {
     }
 
     impl Sink for CountingSink {
-        fn consume(&mut self, _buffer: Buffer) -> Result<()> {
+        fn consume(&mut self, _ctx: &ConsumeContext) -> Result<()> {
             self.received.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
@@ -1038,10 +1039,13 @@ mod tests {
         // Create a source that never ends
         struct InfiniteSource;
         impl Source for InfiniteSource {
-            fn produce(&mut self) -> Result<Option<Buffer>> {
+            fn produce(&mut self, _ctx: &mut ProduceContext) -> Result<ProduceResult> {
                 let segment = Arc::new(HeapSegment::new(8).unwrap());
                 let handle = MemoryHandle::from_segment(segment);
-                Ok(Some(Buffer::new(handle, Metadata::from_sequence(0))))
+                Ok(ProduceResult::OwnBuffer(Buffer::new(
+                    handle,
+                    Metadata::from_sequence(0),
+                )))
             }
         }
 

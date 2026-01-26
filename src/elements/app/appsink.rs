@@ -3,7 +3,7 @@
 //! Allows applications to pull buffers from a pipeline programmatically.
 
 use crate::buffer::Buffer;
-use crate::element::Sink;
+use crate::element::{ConsumeContext, Sink};
 use crate::error::{Error, Result};
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
@@ -144,7 +144,7 @@ impl Default for AppSink {
 }
 
 impl Sink for AppSink {
-    fn consume(&mut self, buffer: Buffer) -> Result<()> {
+    fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
         let mut state = self.inner.state.lock().unwrap();
 
         if state.flushing {
@@ -164,7 +164,8 @@ impl Sink for AppSink {
             return Err(Error::Element("appsink is flushing".into()));
         }
 
-        state.queue.push_back(buffer);
+        // Clone the buffer from the context to store it
+        state.queue.push_back(ctx.buffer().clone());
         state.total_received += 1;
 
         self.inner.data_available.notify_one();
@@ -304,8 +305,13 @@ mod tests {
         let mut sink = AppSink::new();
         let handle = sink.handle();
 
-        sink.consume(create_test_buffer(0)).unwrap();
-        sink.consume(create_test_buffer(1)).unwrap();
+        let buf0 = create_test_buffer(0);
+        let ctx0 = ConsumeContext::new(&buf0);
+        sink.consume(&ctx0).unwrap();
+
+        let buf1 = create_test_buffer(1);
+        let ctx1 = ConsumeContext::new(&buf1);
+        sink.consume(&ctx1).unwrap();
 
         assert_eq!(handle.queue_len(), 2);
 
@@ -327,7 +333,9 @@ mod tests {
         let mut sink = AppSink::new();
         let handle = sink.handle();
 
-        sink.consume(create_test_buffer(0)).unwrap();
+        let buf0 = create_test_buffer(0);
+        let ctx0 = ConsumeContext::new(&buf0);
+        sink.consume(&ctx0).unwrap();
         sink.send_eos();
 
         assert!(sink.is_eos());
@@ -349,7 +357,9 @@ mod tests {
         // No data - should return None immediately
         assert!(handle.try_pull_buffer().is_none());
 
-        sink.consume(create_test_buffer(0)).unwrap();
+        let buf0 = create_test_buffer(0);
+        let ctx0 = ConsumeContext::new(&buf0);
+        sink.consume(&ctx0).unwrap();
 
         // Now should get data
         let buf = handle.try_pull_buffer();
@@ -360,9 +370,17 @@ mod tests {
     fn test_appsink_drop_on_full() {
         let mut sink = AppSink::with_max_buffers(2).drop_on_full(true);
 
-        sink.consume(create_test_buffer(0)).unwrap();
-        sink.consume(create_test_buffer(1)).unwrap();
-        sink.consume(create_test_buffer(2)).unwrap(); // Should be dropped
+        let buf0 = create_test_buffer(0);
+        let ctx0 = ConsumeContext::new(&buf0);
+        sink.consume(&ctx0).unwrap();
+
+        let buf1 = create_test_buffer(1);
+        let ctx1 = ConsumeContext::new(&buf1);
+        sink.consume(&ctx1).unwrap();
+
+        let buf2 = create_test_buffer(2);
+        let ctx2 = ConsumeContext::new(&buf2);
+        sink.consume(&ctx2).unwrap(); // Should be dropped
 
         assert_eq!(sink.queue_len(), 2);
         assert_eq!(sink.stats().total_dropped, 1);
@@ -375,7 +393,9 @@ mod tests {
 
         let producer = thread::spawn(move || {
             for i in 0..10 {
-                sink.consume(create_test_buffer(i)).unwrap();
+                let buf = create_test_buffer(i);
+                let ctx = ConsumeContext::new(&buf);
+                sink.consume(&ctx).unwrap();
             }
             sink.send_eos();
         });
@@ -394,8 +414,13 @@ mod tests {
         let mut sink = AppSink::new();
         let handle = sink.handle();
 
-        sink.consume(create_test_buffer(0)).unwrap();
-        sink.consume(create_test_buffer(1)).unwrap();
+        let buf0 = create_test_buffer(0);
+        let ctx0 = ConsumeContext::new(&buf0);
+        sink.consume(&ctx0).unwrap();
+
+        let buf1 = create_test_buffer(1);
+        let ctx1 = ConsumeContext::new(&buf1);
+        sink.consume(&ctx1).unwrap();
 
         handle.clear();
 
@@ -407,8 +432,14 @@ mod tests {
         let mut sink = AppSink::new();
         let handle = sink.handle();
 
-        sink.consume(create_test_buffer(0)).unwrap();
-        sink.consume(create_test_buffer(1)).unwrap();
+        let buf0 = create_test_buffer(0);
+        let ctx0 = ConsumeContext::new(&buf0);
+        sink.consume(&ctx0).unwrap();
+
+        let buf1 = create_test_buffer(1);
+        let ctx1 = ConsumeContext::new(&buf1);
+        sink.consume(&ctx1).unwrap();
+
         handle.try_pull_buffer();
 
         let stats = sink.stats();

@@ -3,7 +3,7 @@
 //! Read from and write to in-memory buffers.
 
 use crate::buffer::{Buffer, MemoryHandle};
-use crate::element::{Sink, Source};
+use crate::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
 use crate::error::Result;
 use crate::memory::{HeapSegment, MemorySegment};
 use crate::metadata::Metadata;
@@ -90,14 +90,15 @@ impl MemorySrc {
 }
 
 impl Source for MemorySrc {
-    fn produce(&mut self) -> Result<Option<Buffer>> {
+    fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
         if self.position >= self.data.len() {
-            return Ok(None);
+            return Ok(ProduceResult::Eos);
         }
 
         let remaining = self.data.len() - self.position;
         let chunk_len = remaining.min(self.chunk_size);
 
+        // Create our own buffer since MemorySrc manages its own memory
         let segment = Arc::new(HeapSegment::new(chunk_len)?);
         let ptr = segment.as_mut_ptr().unwrap();
 
@@ -107,12 +108,18 @@ impl Source for MemorySrc {
         }
 
         let handle = MemoryHandle::from_segment_with_len(segment, chunk_len);
-        let metadata = Metadata::from_sequence(self.sequence);
+        let mut metadata = Metadata::from_sequence(self.sequence);
+
+        // Copy any metadata set on the context
+        metadata.pts = ctx.metadata().pts;
+        metadata.dts = ctx.metadata().dts;
+        metadata.duration = ctx.metadata().duration;
+        metadata.flags = ctx.metadata().flags;
 
         self.position += chunk_len;
         self.sequence += 1;
 
-        Ok(Some(Buffer::new(handle, metadata)))
+        Ok(ProduceResult::OwnBuffer(Buffer::new(handle, metadata)))
     }
 
     fn name(&self) -> &str {
@@ -222,8 +229,8 @@ impl Default for MemorySink {
 }
 
 impl Sink for MemorySink {
-    fn consume(&mut self, buffer: Buffer) -> Result<()> {
-        let bytes = buffer.as_bytes();
+    fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
+        let bytes = ctx.input();
 
         // Check max size limit
         if let Some(max) = self.max_size {
@@ -293,8 +300,8 @@ impl Default for SharedMemorySink {
 }
 
 impl Sink for SharedMemorySink {
-    fn consume(&mut self, buffer: Buffer) -> Result<()> {
-        self.inner.lock().unwrap().consume(buffer)
+    fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
+        self.inner.lock().unwrap().consume(ctx)
     }
 
     fn name(&self) -> &str {
@@ -306,13 +313,30 @@ impl Sink for SharedMemorySink {
 mod tests {
     use super::*;
 
+    /// Helper to produce from a source using the context-based API.
+    fn produce_buffer(src: &mut MemorySrc) -> Result<Option<Buffer>> {
+        let mut ctx = ProduceContext::without_buffer();
+        match src.produce(&mut ctx)? {
+            ProduceResult::OwnBuffer(buf) => Ok(Some(buf)),
+            ProduceResult::Eos => Ok(None),
+            ProduceResult::Produced(_) => panic!("MemorySrc should return OwnBuffer"),
+            ProduceResult::WouldBlock => Ok(None),
+        }
+    }
+
+    /// Helper to consume a buffer using the context-based API.
+    fn consume_buffer(sink: &mut MemorySink, buffer: &Buffer) -> Result<()> {
+        let ctx = ConsumeContext::new(buffer);
+        sink.consume(&ctx)
+    }
+
     #[test]
     fn test_memorysrc_basic() {
         let data = vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10];
         let mut src = MemorySrc::new(data.clone()).with_chunk_size(4);
 
         let mut collected = Vec::new();
-        while let Some(buf) = src.produce().unwrap() {
+        while let Some(buf) = produce_buffer(&mut src).unwrap() {
             collected.extend_from_slice(buf.as_bytes());
         }
 
@@ -324,11 +348,11 @@ mod tests {
         let data = vec![0u8; 100];
         let mut src = MemorySrc::new(data).with_chunk_size(25);
 
-        let buf1 = src.produce().unwrap().unwrap();
-        let buf2 = src.produce().unwrap().unwrap();
-        let buf3 = src.produce().unwrap().unwrap();
-        let buf4 = src.produce().unwrap().unwrap();
-        let eos = src.produce().unwrap();
+        let buf1 = produce_buffer(&mut src).unwrap().unwrap();
+        let buf2 = produce_buffer(&mut src).unwrap().unwrap();
+        let buf3 = produce_buffer(&mut src).unwrap().unwrap();
+        let buf4 = produce_buffer(&mut src).unwrap().unwrap();
+        let eos = produce_buffer(&mut src).unwrap();
 
         assert_eq!(buf1.metadata().sequence, 0);
         assert_eq!(buf2.metadata().sequence, 1);
@@ -342,13 +366,13 @@ mod tests {
         let data = vec![1u8, 2, 3, 4];
         let mut src = MemorySrc::new(data).with_chunk_size(2);
 
-        src.produce().unwrap();
-        src.produce().unwrap();
-        assert!(src.produce().unwrap().is_none());
+        produce_buffer(&mut src).unwrap();
+        produce_buffer(&mut src).unwrap();
+        assert!(produce_buffer(&mut src).unwrap().is_none());
 
         src.reset();
         assert_eq!(src.position(), 0);
-        assert!(src.produce().unwrap().is_some());
+        assert!(produce_buffer(&mut src).unwrap().is_some());
     }
 
     #[test]
@@ -357,7 +381,7 @@ mod tests {
         let mut src = MemorySrc::new(data).with_chunk_size(30);
 
         assert_eq!(src.remaining(), 100);
-        src.produce().unwrap();
+        produce_buffer(&mut src).unwrap();
         assert_eq!(src.remaining(), 70);
     }
 
@@ -373,7 +397,7 @@ mod tests {
         let handle = MemoryHandle::from_segment(segment);
         let buffer = Buffer::new(handle, Metadata::new());
 
-        sink.consume(buffer).unwrap();
+        consume_buffer(&mut sink, &buffer).unwrap();
 
         assert_eq!(sink.data(), &[1, 2, 3, 4]);
         assert_eq!(sink.buffer_count(), 1);
@@ -391,7 +415,7 @@ mod tests {
             }
             let handle = MemoryHandle::from_segment(segment);
             let buffer = Buffer::new(handle, Metadata::new());
-            sink.consume(buffer).unwrap();
+            consume_buffer(&mut sink, &buffer).unwrap();
         }
 
         // Only first 5 bytes should be stored
@@ -405,7 +429,7 @@ mod tests {
         let segment = Arc::new(HeapSegment::new(4).unwrap());
         let handle = MemoryHandle::from_segment(segment);
         let buffer = Buffer::new(handle, Metadata::new());
-        sink.consume(buffer).unwrap();
+        consume_buffer(&mut sink, &buffer).unwrap();
 
         let data = sink.take_data();
         assert_eq!(data.len(), 4);
@@ -420,7 +444,7 @@ mod tests {
         let segment = Arc::new(HeapSegment::new(4).unwrap());
         let handle = MemoryHandle::from_segment(segment);
         let buffer = Buffer::new(handle, Metadata::new());
-        sink.consume(buffer).unwrap();
+        consume_buffer(&mut sink, &buffer).unwrap();
 
         sink.clear();
         assert!(sink.is_empty());
@@ -433,7 +457,8 @@ mod tests {
         let segment = Arc::new(HeapSegment::new(4).unwrap());
         let handle = MemoryHandle::from_segment(segment);
         let buffer = Buffer::new(handle, Metadata::new());
-        sink.consume(buffer).unwrap();
+        let ctx = ConsumeContext::new(&buffer);
+        sink.consume(&ctx).unwrap();
 
         let stats = sink.stats();
         assert_eq!(stats.buffer_count, 1);
@@ -445,8 +470,8 @@ mod tests {
         let mut src = MemorySrc::new(original.clone()).with_chunk_size(3);
         let mut sink = MemorySink::new();
 
-        while let Some(buf) = src.produce().unwrap() {
-            sink.consume(buf).unwrap();
+        while let Some(buf) = produce_buffer(&mut src).unwrap() {
+            consume_buffer(&mut sink, &buf).unwrap();
         }
 
         assert_eq!(sink.data(), &original);

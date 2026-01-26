@@ -1,32 +1,383 @@
 //! Element runtime context.
 //!
-//! This module provides:
+//! This module provides context types for pool-aware buffer processing:
 //!
+//! - [`ProduceContext`]: Context for sources to write into pre-allocated buffers
+//! - [`ConsumeContext`]: Context for sinks to read from buffers
+//! - [`ProcessContext`]: Context for transforms with input and output buffers
 //! - [`ElementContext`]: Runtime context for element initialization
-//! - [`ProcessContext`]: Processing context with pre-allocated buffers
 //!
-//! # ProcessContext Design
+//! # PipeWire-Style Buffer Management
 //!
-//! The [`ProcessContext`] API enables zero-copy processing by providing elements
-//! with pre-allocated input and output memory views. Elements don't allocate;
-//! the pipeline provides memory from arenas.
+//! Parallax uses a PipeWire-inspired pattern where the framework provides
+//! pre-allocated buffers to elements, enabling true zero-allocation processing:
 //!
 //! ```rust,ignore
-//! fn process_ctx(&mut self, ctx: &mut ProcessContext) -> Result<()> {
+//! // Source: framework provides output buffer
+//! fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
+//!     let output = ctx.output();
+//!     let n = self.reader.read(output)?;
+//!     Ok(ProduceResult::Produced(n))
+//! }
+//!
+//! // Sink: framework provides input buffer
+//! fn consume(&mut self, ctx: &mut ConsumeContext) -> Result<()> {
+//!     let input = ctx.input();
+//!     self.writer.write_all(input)?;
+//!     Ok(())
+//! }
+//!
+//! // Transform: framework provides both input and output
+//! fn process(&mut self, ctx: &mut ProcessContext) -> Result<()> {
 //!     let input = ctx.input();
 //!     let output = ctx.output();
-//!
-//!     // Process input -> output
 //!     output[..input.len()].copy_from_slice(input);
-//!
-//!     // Commit how much we wrote
 //!     ctx.commit(input.len());
 //!     Ok(())
 //! }
 //! ```
 
-use crate::memory::MemoryPool;
+use crate::buffer::{Buffer, MemoryHandle};
+use crate::memory::{ArenaSlot, MemoryPool};
+use crate::metadata::Metadata;
 use std::sync::Arc;
+
+// ============================================================================
+// ProduceResult - return type for source produce()
+// ============================================================================
+
+/// Result of a source's produce operation.
+///
+/// Sources return this to indicate:
+/// - How many bytes were written to the provided buffer
+/// - End-of-stream
+/// - Or that they need to provide their own buffer
+#[derive(Debug)]
+pub enum ProduceResult {
+    /// Produced `n` bytes into the provided buffer.
+    ///
+    /// The framework will create a buffer with the first `n` bytes
+    /// of the output buffer and the metadata from the context.
+    Produced(usize),
+
+    /// End of stream - no more data will be produced.
+    Eos,
+
+    /// Source provides its own buffer.
+    ///
+    /// Use this when:
+    /// - The source has its own memory management (e.g., mmap)
+    /// - The source receives buffers from external systems
+    /// - Integration with legacy APIs that provide their own buffers
+    OwnBuffer(Buffer),
+
+    /// No data available yet (for non-blocking sources).
+    ///
+    /// The framework should retry later.
+    WouldBlock,
+}
+
+impl ProduceResult {
+    /// Check if this is end-of-stream.
+    #[inline]
+    pub fn is_eos(&self) -> bool {
+        matches!(self, Self::Eos)
+    }
+
+    /// Check if data was produced.
+    #[inline]
+    pub fn is_produced(&self) -> bool {
+        matches!(self, Self::Produced(_) | Self::OwnBuffer(_))
+    }
+
+    /// Check if the source would block.
+    #[inline]
+    pub fn is_would_block(&self) -> bool {
+        matches!(self, Self::WouldBlock)
+    }
+}
+
+// ============================================================================
+// ProduceContext - context for sources
+// ============================================================================
+
+/// Context provided to sources for producing data.
+///
+/// The framework provides a pre-allocated output buffer where sources
+/// write their data. This enables zero-allocation production.
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
+///     // Get the output buffer to write into
+///     let output = ctx.output();
+///
+///     // Write data (e.g., read from file, receive from network)
+///     let n = self.reader.read(output)?;
+///     if n == 0 {
+///         return Ok(ProduceResult::Eos);
+///     }
+///
+///     // Set metadata
+///     ctx.metadata_mut().sequence = self.seq;
+///     self.seq += 1;
+///
+///     Ok(ProduceResult::Produced(n))
+/// }
+/// ```
+///
+/// # Own Buffer Fallback
+///
+/// Some sources need to provide their own buffers (e.g., memory-mapped files,
+/// external APIs). Use `ProduceResult::OwnBuffer` for these cases:
+///
+/// ```rust,ignore
+/// fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
+///     // Source manages its own memory
+///     let buffer = self.external_api.get_buffer()?;
+///     Ok(ProduceResult::OwnBuffer(buffer))
+/// }
+/// ```
+pub struct ProduceContext<'a> {
+    /// Pre-allocated output buffer from the pool.
+    slot: Option<ArenaSlot>,
+    /// Mutable slice view into the slot (if slot is Some).
+    output: Option<&'a mut [u8]>,
+    /// Metadata for the produced buffer.
+    metadata: Metadata,
+    /// Capacity of the output buffer.
+    capacity: usize,
+}
+
+impl<'a> ProduceContext<'a> {
+    /// Create a new produce context with a pre-allocated slot.
+    ///
+    /// # Safety
+    ///
+    /// The slot must remain valid for the lifetime `'a`.
+    pub fn new(slot: ArenaSlot) -> Self {
+        let capacity = slot.len();
+        // SAFETY: We own the slot and it's valid for the duration of this context.
+        // The pointer is valid because ArenaSlot guarantees valid memory.
+        let output = unsafe {
+            let ptr = slot.as_ptr() as *mut u8;
+            Some(std::slice::from_raw_parts_mut(ptr, capacity))
+        };
+        Self {
+            slot: Some(slot),
+            output,
+            metadata: Metadata::new(),
+            capacity,
+        }
+    }
+
+    /// Create a produce context without a pre-allocated buffer.
+    ///
+    /// Sources using this context must return `ProduceResult::OwnBuffer`.
+    pub fn without_buffer() -> Self {
+        Self {
+            slot: None,
+            output: None,
+            metadata: Metadata::new(),
+            capacity: 0,
+        }
+    }
+
+    /// Get the output buffer to write into.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no buffer was provided (use `has_buffer()` to check).
+    #[inline]
+    pub fn output(&mut self) -> &mut [u8] {
+        self.output
+            .as_mut()
+            .map(|s| &mut **s)
+            .expect("ProduceContext has no buffer - use ProduceResult::OwnBuffer")
+    }
+
+    /// Check if a buffer was provided.
+    #[inline]
+    pub fn has_buffer(&self) -> bool {
+        self.slot.is_some()
+    }
+
+    /// Get the capacity of the output buffer.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Get a reference to the metadata.
+    #[inline]
+    pub fn metadata(&self) -> &Metadata {
+        &self.metadata
+    }
+
+    /// Get a mutable reference to the metadata.
+    #[inline]
+    pub fn metadata_mut(&mut self) -> &mut Metadata {
+        &mut self.metadata
+    }
+
+    /// Set the presentation timestamp.
+    #[inline]
+    pub fn set_pts(&mut self, pts: crate::clock::ClockTime) {
+        self.metadata.pts = pts;
+    }
+
+    /// Set the sequence number.
+    #[inline]
+    pub fn set_sequence(&mut self, seq: u64) {
+        self.metadata.sequence = seq;
+    }
+
+    /// Mark as keyframe.
+    #[inline]
+    pub fn set_keyframe(&mut self) {
+        self.metadata.flags = self
+            .metadata
+            .flags
+            .insert(crate::metadata::BufferFlags::SYNC_POINT);
+    }
+
+    /// Mark as end of stream.
+    #[inline]
+    pub fn set_eos(&mut self) {
+        self.metadata.flags = self
+            .metadata
+            .flags
+            .insert(crate::metadata::BufferFlags::EOS);
+    }
+
+    /// Finalize and create a buffer with the produced data.
+    ///
+    /// This consumes the context and creates a buffer with the first `len` bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `len > capacity()` or if no buffer was provided.
+    pub fn finalize(self, len: usize) -> Buffer {
+        assert!(len <= self.capacity, "produced length exceeds capacity");
+        let slot = self.slot.expect("cannot finalize without buffer");
+        let handle = MemoryHandle::from_arena_slot_with_len(slot, len);
+        Buffer::new(handle, self.metadata)
+    }
+
+    /// Take the metadata (for use when source provides own buffer).
+    pub fn take_metadata(self) -> Metadata {
+        self.metadata
+    }
+}
+
+impl std::fmt::Debug for ProduceContext<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProduceContext")
+            .field("has_buffer", &self.has_buffer())
+            .field("capacity", &self.capacity)
+            .field("metadata", &self.metadata)
+            .finish()
+    }
+}
+
+// ============================================================================
+// ConsumeContext - context for sinks
+// ============================================================================
+
+/// Context provided to sinks for consuming data.
+///
+/// Provides read-only access to the buffer data and metadata.
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
+///     let data = ctx.input();
+///     let meta = ctx.metadata();
+///
+///     // Write to destination
+///     self.writer.write_all(data)?;
+///
+///     // Log timestamp
+///     if meta.pts.is_some() {
+///         tracing::debug!(pts = %meta.pts, "wrote buffer");
+///     }
+///
+///     Ok(())
+/// }
+/// ```
+pub struct ConsumeContext<'a> {
+    /// The buffer being consumed.
+    buffer: &'a Buffer,
+}
+
+impl<'a> ConsumeContext<'a> {
+    /// Create a new consume context.
+    pub fn new(buffer: &'a Buffer) -> Self {
+        Self { buffer }
+    }
+
+    /// Get the input data.
+    #[inline]
+    pub fn input(&self) -> &[u8] {
+        self.buffer.as_bytes()
+    }
+
+    /// Get the buffer length.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Check if the buffer is empty.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
+    /// Get a reference to the metadata.
+    #[inline]
+    pub fn metadata(&self) -> &Metadata {
+        self.buffer.metadata()
+    }
+
+    /// Get the sequence number.
+    #[inline]
+    pub fn sequence(&self) -> u64 {
+        self.buffer.metadata().sequence
+    }
+
+    /// Check if this is end of stream.
+    #[inline]
+    pub fn is_eos(&self) -> bool {
+        self.buffer.metadata().is_eos()
+    }
+
+    /// Check if this is a keyframe.
+    #[inline]
+    pub fn is_keyframe(&self) -> bool {
+        self.buffer.metadata().is_keyframe()
+    }
+
+    /// Get the underlying buffer reference.
+    ///
+    /// Use this when you need full buffer access (e.g., for cloning).
+    #[inline]
+    pub fn buffer(&self) -> &Buffer {
+        self.buffer
+    }
+}
+
+impl std::fmt::Debug for ConsumeContext<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConsumeContext")
+            .field("len", &self.len())
+            .field("sequence", &self.sequence())
+            .field("is_eos", &self.is_eos())
+            .finish()
+    }
+}
 
 // ============================================================================
 // ProcessContext - zero-copy processing context
@@ -446,7 +797,7 @@ impl std::fmt::Debug for ElementContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::HeapSegment;
+    use crate::memory::{HeapSegment, MemorySegment};
 
     #[test]
     fn test_context_creation() {
@@ -615,5 +966,124 @@ mod tests {
         let slice_mut: &mut [u8] = view.as_mut();
         slice_mut[0] = b'T';
         assert_eq!(&data, b"Test");
+    }
+
+    // ProduceContext tests
+
+    use crate::memory::CpuArena;
+    use std::sync::Arc;
+
+    #[test]
+    fn test_produce_context_with_buffer() {
+        let arena = Arc::new(CpuArena::new(1024, 4).unwrap());
+        let slot = arena.acquire().unwrap();
+
+        let mut ctx = ProduceContext::new(slot);
+
+        assert!(ctx.has_buffer());
+        assert_eq!(ctx.capacity(), 1024);
+
+        // Write some data
+        let output = ctx.output();
+        output[..5].copy_from_slice(b"hello");
+
+        // Set metadata
+        ctx.set_sequence(42);
+        ctx.set_keyframe();
+
+        // Finalize
+        let buffer = ctx.finalize(5);
+        assert_eq!(buffer.len(), 5);
+        assert_eq!(buffer.as_bytes(), b"hello");
+        assert_eq!(buffer.metadata().sequence, 42);
+        assert!(buffer.metadata().is_keyframe());
+    }
+
+    #[test]
+    fn test_produce_context_without_buffer() {
+        let ctx = ProduceContext::without_buffer();
+
+        assert!(!ctx.has_buffer());
+        assert_eq!(ctx.capacity(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "ProduceContext has no buffer")]
+    fn test_produce_context_no_buffer_panic() {
+        let mut ctx = ProduceContext::without_buffer();
+        let _ = ctx.output(); // Should panic
+    }
+
+    #[test]
+    #[should_panic(expected = "produced length exceeds capacity")]
+    fn test_produce_context_finalize_overflow() {
+        let arena = Arc::new(CpuArena::new(1024, 4).unwrap());
+        let slot = arena.acquire().unwrap();
+
+        let ctx = ProduceContext::new(slot);
+        let _ = ctx.finalize(2048); // Should panic
+    }
+
+    #[test]
+    fn test_produce_context_take_metadata() {
+        let ctx = ProduceContext::without_buffer();
+        let meta = ctx.take_metadata();
+        assert_eq!(meta.sequence, 0);
+    }
+
+    #[test]
+    fn test_produce_result_variants() {
+        let result = ProduceResult::Produced(100);
+        assert!(result.is_produced());
+        assert!(!result.is_eos());
+        assert!(!result.is_would_block());
+
+        let result = ProduceResult::Eos;
+        assert!(!result.is_produced());
+        assert!(result.is_eos());
+        assert!(!result.is_would_block());
+
+        let result = ProduceResult::WouldBlock;
+        assert!(!result.is_produced());
+        assert!(!result.is_eos());
+        assert!(result.is_would_block());
+    }
+
+    // ConsumeContext tests
+
+    #[test]
+    fn test_consume_context() {
+        let segment = Arc::new(HeapSegment::new(1024).unwrap());
+        // Write some data
+        unsafe {
+            let ptr = segment.as_ptr() as *mut u8;
+            std::ptr::copy_nonoverlapping(b"hello world".as_ptr(), ptr, 11);
+        }
+        let handle = MemoryHandle::new(segment, 0, 11);
+        let meta = Metadata::from_sequence(42).keyframe();
+        let buffer = Buffer::new(handle, meta);
+
+        let ctx = ConsumeContext::new(&buffer);
+
+        assert_eq!(ctx.len(), 11);
+        assert!(!ctx.is_empty());
+        assert_eq!(ctx.input(), b"hello world");
+        assert_eq!(ctx.sequence(), 42);
+        assert!(ctx.is_keyframe());
+        assert!(!ctx.is_eos());
+
+        // Access underlying buffer
+        assert_eq!(ctx.buffer().len(), 11);
+    }
+
+    #[test]
+    fn test_consume_context_eos() {
+        let segment = Arc::new(HeapSegment::new(8).unwrap());
+        let handle = MemoryHandle::from_segment(segment);
+        let meta = Metadata::new().eos();
+        let buffer = Buffer::new(handle, meta);
+
+        let ctx = ConsumeContext::new(&buffer);
+        assert!(ctx.is_eos());
     }
 }

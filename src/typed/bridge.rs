@@ -4,7 +4,10 @@
 //! allowing typed pipelines to be used with the dynamic pipeline executor.
 
 use crate::buffer::{Buffer, MemoryHandle};
-use crate::element::{DynAsyncElement, ElementAdapter, SinkAdapter, SourceAdapter};
+use crate::element::{
+    ConsumeContext, DynAsyncElement, ElementAdapter, ProduceContext, ProduceResult, SinkAdapter,
+    SourceAdapter,
+};
 use crate::error::Result;
 use crate::memory::{HeapSegment, MemorySegment};
 use crate::metadata::Metadata;
@@ -40,27 +43,39 @@ where
     S: TypedSource,
     S::Output: Into<Vec<u8>>,
 {
-    fn produce(&mut self) -> Result<Option<Buffer>> {
+    fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
         match self.inner.produce()? {
             Some(output) => {
                 let bytes: Vec<u8> = output.into();
-                let segment = Arc::new(HeapSegment::new(bytes.len())?);
 
-                // Copy data to segment (using unsafe as required by the trait)
-                // SAFETY: HeapSegment is mutable and we have exclusive access via Arc
-                unsafe {
-                    if let Some(slice) = segment.as_mut_slice() {
-                        slice.copy_from_slice(&bytes);
+                // Check if we have a pre-allocated buffer from the context
+                if ctx.has_buffer() && ctx.capacity() >= bytes.len() {
+                    // Use the pre-allocated buffer
+                    let output_buf = ctx.output();
+                    output_buf[..bytes.len()].copy_from_slice(&bytes);
+                    ctx.set_sequence(self.sequence);
+                    self.sequence += 1;
+                    Ok(ProduceResult::Produced(bytes.len()))
+                } else {
+                    // Fall back to creating our own buffer
+                    let segment = Arc::new(HeapSegment::new(bytes.len())?);
+
+                    // Copy data to segment (using unsafe as required by the trait)
+                    // SAFETY: HeapSegment is mutable and we have exclusive access via Arc
+                    unsafe {
+                        if let Some(slice) = segment.as_mut_slice() {
+                            slice.copy_from_slice(&bytes);
+                        }
                     }
+
+                    let handle = MemoryHandle::from_segment(segment);
+                    let metadata = Metadata::from_sequence(self.sequence);
+                    self.sequence += 1;
+
+                    Ok(ProduceResult::OwnBuffer(Buffer::new(handle, metadata)))
                 }
-
-                let handle = MemoryHandle::from_segment(segment);
-                let metadata = Metadata::from_sequence(self.sequence);
-                self.sequence += 1;
-
-                Ok(Some(Buffer::new(handle, metadata)))
             }
-            None => Ok(None),
+            None => Ok(ProduceResult::Eos),
         }
     }
 
@@ -98,8 +113,8 @@ where
     K::Input: TryFrom<Vec<u8>>,
     <K::Input as TryFrom<Vec<u8>>>::Error: std::fmt::Debug,
 {
-    fn consume(&mut self, buffer: Buffer) -> Result<()> {
-        let bytes = buffer.as_bytes().to_vec();
+    fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
+        let bytes = ctx.input().to_vec();
         let item = K::Input::try_from(bytes)
             .map_err(|e| crate::error::Error::InvalidCaps(format!("{:?}", e)))?;
         self.inner.consume(item)

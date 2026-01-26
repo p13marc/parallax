@@ -1,6 +1,7 @@
 //! Core element traits.
 
 use crate::buffer::Buffer;
+use crate::element::context::{ConsumeContext, ProduceContext, ProduceResult};
 use crate::error::Result;
 use crate::format::Caps;
 use dynosaur::dynosaur;
@@ -252,8 +253,7 @@ pub enum MemoryHint {
 /// // Multiple outputs (e.g., from Chunk or FlatMap)
 /// // let out = Output::from(vec![buf1, buf2, buf3]);
 /// ```
-#[derive(Debug)]
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub enum Output {
     /// No output (buffer was filtered/consumed).
     #[default]
@@ -336,7 +336,6 @@ impl Output {
         }
     }
 }
-
 
 // Ergonomic conversions
 impl From<Buffer> for Output {
@@ -427,11 +426,20 @@ impl ExactSizeIterator for OutputIter {}
 /// Sources are the entry points of a pipeline. They generate data from
 /// external sources like files, network connections, or hardware devices.
 ///
+/// # Pool-Aware Buffer Production (PipeWire-style)
+///
+/// The framework provides a [`ProduceContext`] with a pre-allocated buffer
+/// from the pool. Sources write data into this buffer and return how many
+/// bytes were produced. This enables true zero-allocation operation.
+///
 /// # Lifecycle
 ///
 /// - `produce()` is called repeatedly by the executor
-/// - Return `Ok(Some(buffer))` to emit a buffer
-/// - Return `Ok(None)` to signal end-of-stream (EOS)
+/// - The executor provides a `ProduceContext` with a pre-allocated buffer
+/// - Write to `ctx.output()`, set metadata via `ctx.metadata_mut()`
+/// - Return `ProduceResult::Produced(n)` to emit n bytes
+/// - Return `ProduceResult::Eos` to signal end-of-stream
+/// - Return `ProduceResult::OwnBuffer(buffer)` for sources with their own memory
 /// - Return `Err(...)` to signal an error
 ///
 /// # Example
@@ -443,24 +451,49 @@ impl ExactSizeIterator for OutputIter {}
 /// }
 ///
 /// impl Source for CounterSource {
-///     fn produce(&mut self) -> Result<Option<Buffer>> {
+///     fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
 ///         if self.count >= self.max {
-///             return Ok(None); // EOS
+///             return Ok(ProduceResult::Eos);
 ///         }
-///         let buffer = Buffer::from_bytes(
-///             self.count.to_le_bytes().to_vec(),
-///             Metadata::from_sequence(self.count),
-///         );
+///
+///         // Write to the provided buffer
+///         let output = ctx.output();
+///         let bytes = self.count.to_le_bytes();
+///         output[..8].copy_from_slice(&bytes);
+///
+///         // Set metadata
+///         ctx.set_sequence(self.count);
 ///         self.count += 1;
-///         Ok(Some(buffer))
+///
+///         Ok(ProduceResult::Produced(8))
+///     }
+/// }
+/// ```
+///
+/// # Own Buffer Fallback
+///
+/// Sources that manage their own memory (e.g., mmap, external APIs) can
+/// return `ProduceResult::OwnBuffer`:
+///
+/// ```rust,ignore
+/// impl Source for MmapSource {
+///     fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
+///         // Source has its own buffer management
+///         let buffer = self.mmap_next_region()?;
+///         Ok(ProduceResult::OwnBuffer(buffer))
 ///     }
 /// }
 /// ```
 pub trait Source: Send {
     /// Produce the next buffer.
     ///
-    /// Returns `Ok(None)` when the source is exhausted (end of stream).
-    fn produce(&mut self) -> Result<Option<Buffer>>;
+    /// The framework provides a `ProduceContext` with a pre-allocated output buffer.
+    /// Write data to `ctx.output()`, set metadata via `ctx.metadata_mut()`, and
+    /// return `ProduceResult::Produced(n)` to indicate how many bytes were written.
+    ///
+    /// Return `ProduceResult::Eos` when the source is exhausted.
+    /// Return `ProduceResult::OwnBuffer(buffer)` if the source manages its own memory.
+    fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult>;
 
     /// Get the name of this source (for debugging/logging).
     fn name(&self) -> &str {
@@ -470,6 +503,14 @@ pub trait Source: Send {
     /// Get the output caps (what formats this source produces).
     fn output_caps(&self) -> Caps {
         Caps::any()
+    }
+
+    /// Get the preferred buffer size for this source.
+    ///
+    /// The executor uses this hint when allocating pool buffers.
+    /// Return `None` to use the default pool buffer size.
+    fn preferred_buffer_size(&self) -> Option<usize> {
+        None
     }
 
     /// Get the scheduling affinity for this source.
@@ -516,20 +557,24 @@ pub trait Source: Send {
 /// }
 ///
 /// impl AsyncSource for TcpSource {
-///     async fn produce(&mut self) -> Result<Option<Buffer>> {
-///         let mut buf = vec![0u8; 4096];
-///         let n = self.reader.read(&mut buf).await?;
+///     async fn produce(&mut self, ctx: &mut ProduceContext<'_>) -> Result<ProduceResult> {
+///         let output = ctx.output();
+///         let n = self.reader.read(output).await?;
 ///         if n == 0 {
-///             return Ok(None); // Connection closed
+///             return Ok(ProduceResult::Eos); // Connection closed
 ///         }
-///         buf.truncate(n);
-///         Ok(Some(Buffer::from_bytes(buf, Metadata::default())))
+///         Ok(ProduceResult::Produced(n))
 ///     }
 /// }
 /// ```
 pub trait AsyncSource: Send {
     /// Produce the next buffer asynchronously.
-    fn produce(&mut self) -> impl std::future::Future<Output = Result<Option<Buffer>>> + Send;
+    ///
+    /// The framework provides a `ProduceContext` with a pre-allocated output buffer.
+    fn produce(
+        &mut self,
+        ctx: &mut ProduceContext<'_>,
+    ) -> impl std::future::Future<Output = Result<ProduceResult>> + Send;
 
     /// Get the name of this source (for debugging/logging).
     fn name(&self) -> &str {
@@ -539,6 +584,11 @@ pub trait AsyncSource: Send {
     /// Get the output caps (what formats this source produces).
     fn output_caps(&self) -> Caps {
         Caps::any()
+    }
+
+    /// Get the preferred buffer size for this source.
+    fn preferred_buffer_size(&self) -> Option<usize> {
+        None
     }
 
     /// Get the scheduling affinity for this source.
@@ -573,6 +623,12 @@ pub trait AsyncSource: Send {
 /// Sinks are the exit points of a pipeline. They write data to external
 /// destinations like files, network connections, or displays.
 ///
+/// # ConsumeContext
+///
+/// The framework provides a [`ConsumeContext`] that gives read-only access
+/// to the buffer data and metadata. This ensures the sink cannot accidentally
+/// modify buffers that may be shared with other elements.
+///
 /// # Example
 ///
 /// ```rust,ignore
@@ -581,15 +637,18 @@ pub trait AsyncSource: Send {
 /// }
 ///
 /// impl Sink for FileSink {
-///     fn consume(&mut self, buffer: Buffer) -> Result<()> {
-///         self.file.write_all(buffer.as_bytes())?;
+///     fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
+///         self.file.write_all(ctx.input())?;
 ///         Ok(())
 ///     }
 /// }
 /// ```
 pub trait Sink: Send {
     /// Consume a buffer.
-    fn consume(&mut self, buffer: Buffer) -> Result<()>;
+    ///
+    /// The `ConsumeContext` provides read-only access to the buffer data
+    /// and metadata.
+    fn consume(&mut self, ctx: &ConsumeContext) -> Result<()>;
 
     /// Get the name of this sink (for debugging/logging).
     fn name(&self) -> &str {
@@ -638,15 +697,20 @@ pub trait Sink: Send {
 /// }
 ///
 /// impl AsyncSink for TcpSink {
-///     async fn consume(&mut self, buffer: Buffer) -> Result<()> {
-///         self.writer.write_all(buffer.as_bytes()).await?;
+///     async fn consume(&mut self, ctx: &ConsumeContext<'_>) -> Result<()> {
+///         self.writer.write_all(ctx.input()).await?;
 ///         Ok(())
 ///     }
 /// }
 /// ```
 pub trait AsyncSink: Send {
     /// Consume a buffer asynchronously.
-    fn consume(&mut self, buffer: Buffer) -> impl std::future::Future<Output = Result<()>> + Send;
+    ///
+    /// The `ConsumeContext` provides read-only access to the buffer data.
+    fn consume(
+        &mut self,
+        ctx: &ConsumeContext<'_>,
+    ) -> impl std::future::Future<Output = Result<()>> + Send;
 
     /// Get the name of this sink (for debugging/logging).
     fn name(&self) -> &str {
@@ -1272,14 +1336,47 @@ pub trait AsyncElementDyn {
 ///
 /// Sync sources run directly in the async context without blocking,
 /// as they are typically fast CPU operations.
+///
+/// # Pool-Aware Execution
+///
+/// The adapter holds an optional arena for providing pre-allocated buffers
+/// to the source via `ProduceContext`. Set the arena with [`set_arena()`](Self::set_arena).
 pub struct SourceAdapter<S: Source> {
     inner: S,
+    /// Arena for pre-allocated buffers.
+    arena: Option<std::sync::Arc<crate::memory::CpuArena>>,
 }
 
 impl<S: Source> SourceAdapter<S> {
     /// Create a new source adapter.
     pub fn new(source: S) -> Self {
-        Self { inner: source }
+        Self {
+            inner: source,
+            arena: None,
+        }
+    }
+
+    /// Create a source adapter with an arena for buffer allocation.
+    pub fn with_arena(source: S, arena: std::sync::Arc<crate::memory::CpuArena>) -> Self {
+        Self {
+            inner: source,
+            arena: Some(arena),
+        }
+    }
+
+    /// Set the arena for buffer allocation.
+    pub fn set_arena(&mut self, arena: std::sync::Arc<crate::memory::CpuArena>) {
+        self.arena = Some(arena);
+    }
+
+    /// Get a reference to the inner source.
+    pub fn inner(&self) -> &S {
+        &self.inner
+    }
+
+    /// Get a mutable reference to the inner source.
+    pub fn inner_mut(&mut self) -> &mut S {
+        &mut self.inner
     }
 }
 
@@ -1293,7 +1390,40 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
     }
 
     async fn process(&mut self, _input: Option<Buffer>) -> Result<Option<Buffer>> {
-        self.inner.produce()
+        // Try to acquire a slot from the arena for the ProduceContext
+        if let Some(arena) = &self.arena {
+            if let Some(slot) = arena.acquire() {
+                let mut ctx = ProduceContext::new(slot);
+                match self.inner.produce(&mut ctx)? {
+                    ProduceResult::Produced(n) => Ok(Some(ctx.finalize(n))),
+                    ProduceResult::Eos => Ok(None),
+                    ProduceResult::OwnBuffer(buffer) => Ok(Some(buffer)),
+                    ProduceResult::WouldBlock => Ok(None), // Treat as no data for now
+                }
+            } else {
+                // Arena exhausted, try without buffer
+                let mut ctx = ProduceContext::without_buffer();
+                match self.inner.produce(&mut ctx)? {
+                    ProduceResult::OwnBuffer(buffer) => Ok(Some(buffer)),
+                    ProduceResult::Eos => Ok(None),
+                    ProduceResult::WouldBlock => Ok(None),
+                    ProduceResult::Produced(_) => Err(crate::error::Error::BufferPool(
+                        "arena exhausted and source doesn't provide own buffer".into(),
+                    )),
+                }
+            }
+        } else {
+            // No arena, source must provide its own buffer
+            let mut ctx = ProduceContext::without_buffer();
+            match self.inner.produce(&mut ctx)? {
+                ProduceResult::OwnBuffer(buffer) => Ok(Some(buffer)),
+                ProduceResult::Eos => Ok(None),
+                ProduceResult::WouldBlock => Ok(None),
+                ProduceResult::Produced(_) => Err(crate::error::Error::BufferPool(
+                    "no arena configured and source doesn't provide own buffer".into(),
+                )),
+            }
+        }
     }
 
     async fn process_all(&mut self, input: Option<Buffer>) -> Result<Output> {
@@ -1329,6 +1459,16 @@ impl<S: Sink> SinkAdapter<S> {
     pub fn new(sink: S) -> Self {
         Self { inner: sink }
     }
+
+    /// Get a reference to the inner sink.
+    pub fn inner(&self) -> &S {
+        &self.inner
+    }
+
+    /// Get a mutable reference to the inner sink.
+    pub fn inner_mut(&mut self) -> &mut S {
+        &mut self.inner
+    }
 }
 
 impl<S: Sink + Send + 'static> SendAsyncElementDyn for SinkAdapter<S> {
@@ -1341,8 +1481,9 @@ impl<S: Sink + Send + 'static> SendAsyncElementDyn for SinkAdapter<S> {
     }
 
     async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
-        if let Some(buffer) = input {
-            self.inner.consume(buffer)?;
+        if let Some(ref buffer) = input {
+            let ctx = ConsumeContext::new(buffer);
+            self.inner.consume(&ctx)?;
         }
         Ok(None)
     }
@@ -1536,12 +1677,40 @@ impl<T: Transform + Send + 'static> SendAsyncElementDyn for TransformAdapter<T> 
 /// ```
 pub struct AsyncSourceAdapter<S: AsyncSource> {
     inner: S,
+    /// Arena for pre-allocated buffers.
+    arena: Option<std::sync::Arc<crate::memory::CpuArena>>,
 }
 
 impl<S: AsyncSource> AsyncSourceAdapter<S> {
     /// Create a new async source adapter.
     pub fn new(source: S) -> Self {
-        Self { inner: source }
+        Self {
+            inner: source,
+            arena: None,
+        }
+    }
+
+    /// Create an async source adapter with an arena for buffer allocation.
+    pub fn with_arena(source: S, arena: std::sync::Arc<crate::memory::CpuArena>) -> Self {
+        Self {
+            inner: source,
+            arena: Some(arena),
+        }
+    }
+
+    /// Set the arena for buffer allocation.
+    pub fn set_arena(&mut self, arena: std::sync::Arc<crate::memory::CpuArena>) {
+        self.arena = Some(arena);
+    }
+
+    /// Get a reference to the inner source.
+    pub fn inner(&self) -> &S {
+        &self.inner
+    }
+
+    /// Get a mutable reference to the inner source.
+    pub fn inner_mut(&mut self) -> &mut S {
+        &mut self.inner
     }
 }
 
@@ -1555,7 +1724,40 @@ impl<S: AsyncSource + Send + 'static> SendAsyncElementDyn for AsyncSourceAdapter
     }
 
     async fn process(&mut self, _input: Option<Buffer>) -> Result<Option<Buffer>> {
-        self.inner.produce().await
+        // Try to acquire a slot from the arena for the ProduceContext
+        if let Some(arena) = &self.arena {
+            if let Some(slot) = arena.acquire() {
+                let mut ctx = ProduceContext::new(slot);
+                match self.inner.produce(&mut ctx).await? {
+                    ProduceResult::Produced(n) => Ok(Some(ctx.finalize(n))),
+                    ProduceResult::Eos => Ok(None),
+                    ProduceResult::OwnBuffer(buffer) => Ok(Some(buffer)),
+                    ProduceResult::WouldBlock => Ok(None),
+                }
+            } else {
+                // Arena exhausted, try without buffer
+                let mut ctx = ProduceContext::without_buffer();
+                match self.inner.produce(&mut ctx).await? {
+                    ProduceResult::OwnBuffer(buffer) => Ok(Some(buffer)),
+                    ProduceResult::Eos => Ok(None),
+                    ProduceResult::WouldBlock => Ok(None),
+                    ProduceResult::Produced(_) => Err(crate::error::Error::BufferPool(
+                        "arena exhausted and source doesn't provide own buffer".into(),
+                    )),
+                }
+            }
+        } else {
+            // No arena, source must provide its own buffer
+            let mut ctx = ProduceContext::without_buffer();
+            match self.inner.produce(&mut ctx).await? {
+                ProduceResult::OwnBuffer(buffer) => Ok(Some(buffer)),
+                ProduceResult::Eos => Ok(None),
+                ProduceResult::WouldBlock => Ok(None),
+                ProduceResult::Produced(_) => Err(crate::error::Error::BufferPool(
+                    "no arena configured and source doesn't provide own buffer".into(),
+                )),
+            }
+        }
     }
 
     async fn process_all(&mut self, input: Option<Buffer>) -> Result<Output> {
@@ -1591,6 +1793,16 @@ impl<S: AsyncSink> AsyncSinkAdapter<S> {
     pub fn new(sink: S) -> Self {
         Self { inner: sink }
     }
+
+    /// Get a reference to the inner sink.
+    pub fn inner(&self) -> &S {
+        &self.inner
+    }
+
+    /// Get a mutable reference to the inner sink.
+    pub fn inner_mut(&mut self) -> &mut S {
+        &mut self.inner
+    }
 }
 
 impl<S: AsyncSink + Send + 'static> SendAsyncElementDyn for AsyncSinkAdapter<S> {
@@ -1603,8 +1815,9 @@ impl<S: AsyncSink + Send + 'static> SendAsyncElementDyn for AsyncSinkAdapter<S> 
     }
 
     async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
-        if let Some(buffer) = input {
-            self.inner.consume(buffer).await?;
+        if let Some(ref buffer) = input {
+            let ctx = ConsumeContext::new(buffer);
+            self.inner.consume(&ctx).await?;
         }
         Ok(None)
     }
@@ -1947,7 +2160,7 @@ impl<M: Muxer + Send + 'static> SendAsyncElementDyn for MuxerAdapter<M> {
 mod tests {
     use super::*;
     use crate::buffer::MemoryHandle;
-    use crate::memory::HeapSegment;
+    use crate::memory::{CpuArena, HeapSegment};
     use crate::metadata::Metadata;
     use std::sync::Arc;
 
@@ -1957,15 +2170,21 @@ mod tests {
     }
 
     impl Source for TestSource {
-        fn produce(&mut self) -> Result<Option<Buffer>> {
+        fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
             if self.count >= self.max {
-                return Ok(None);
+                return Ok(ProduceResult::Eos);
             }
-            let segment = Arc::new(HeapSegment::new(8).unwrap());
-            let handle = MemoryHandle::from_segment(segment);
-            let buffer = Buffer::new(handle, Metadata::from_sequence(self.count));
+
+            // Write sequence number to the provided buffer
+            let output = ctx.output();
+            let bytes = self.count.to_le_bytes();
+            output[..8].copy_from_slice(&bytes);
+
+            // Set metadata
+            ctx.set_sequence(self.count);
             self.count += 1;
-            Ok(Some(buffer))
+
+            Ok(ProduceResult::Produced(8))
         }
     }
 
@@ -1974,8 +2193,8 @@ mod tests {
     }
 
     impl Sink for TestSink {
-        fn consume(&mut self, buffer: Buffer) -> Result<()> {
-            self.received.push(buffer.metadata().sequence);
+        fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
+            self.received.push(ctx.sequence());
             Ok(())
         }
     }
@@ -2055,7 +2274,8 @@ mod tests {
     #[tokio::test]
     async fn test_source_adapter() {
         let source = TestSource { count: 0, max: 3 };
-        let mut adapter = SourceAdapter::new(source);
+        let arena = CpuArena::new(1024, 8).unwrap();
+        let mut adapter = SourceAdapter::with_arena(source, arena);
 
         assert_eq!(AsyncElementDyn::element_type(&adapter), ElementType::Source);
 
@@ -2363,8 +2583,8 @@ mod tests {
     struct TestAsyncSource;
 
     impl AsyncSource for TestAsyncSource {
-        async fn produce(&mut self) -> Result<Option<Buffer>> {
-            Ok(None)
+        async fn produce(&mut self, _ctx: &mut ProduceContext<'_>) -> Result<ProduceResult> {
+            Ok(ProduceResult::Eos)
         }
     }
 
@@ -2389,7 +2609,7 @@ mod tests {
     struct TestAsyncSink;
 
     impl AsyncSink for TestAsyncSink {
-        async fn consume(&mut self, _buffer: Buffer) -> Result<()> {
+        async fn consume(&mut self, _ctx: &ConsumeContext<'_>) -> Result<()> {
             Ok(())
         }
     }

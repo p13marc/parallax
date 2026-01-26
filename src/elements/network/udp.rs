@@ -6,6 +6,7 @@
 //! - [`UdpSink`]: Writes datagrams to a UDP socket
 
 use crate::buffer::Buffer;
+use crate::element::{ConsumeContext, ProduceContext, ProduceResult};
 use crate::error::{Error, Result};
 use crate::memory::{HeapSegment, MemorySegment};
 use crate::metadata::Metadata;
@@ -133,36 +134,64 @@ impl UdpSrc {
 }
 
 impl crate::element::Source for UdpSrc {
-    fn produce(&mut self) -> Result<Option<Buffer>> {
-        // Allocate buffer
-        let segment = Arc::new(HeapSegment::new(self.buffer_size)?);
-        let ptr = segment
-            .as_mut_ptr()
-            .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
-        let slice = unsafe { std::slice::from_raw_parts_mut(ptr, self.buffer_size) };
+    fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
+        if ctx.has_buffer() {
+            // Use the provided buffer
+            let output = ctx.output();
+            let max_len = output.len().min(self.buffer_size);
 
-        // Receive datagram
-        match self.socket.recv_from(slice) {
-            Ok((n, sender)) => {
-                self.bytes_read += n as u64;
-                self.last_sender = Some(sender);
-                let seq = self.sequence;
-                self.sequence += 1;
+            // Receive datagram into the provided buffer
+            match self.socket.recv_from(&mut output[..max_len]) {
+                Ok((n, sender)) => {
+                    self.bytes_read += n as u64;
+                    self.last_sender = Some(sender);
 
-                let handle = crate::buffer::MemoryHandle::from_segment_with_len(segment, n);
-                let metadata = Metadata::from_sequence(seq);
-                Ok(Some(Buffer::new(handle, metadata)))
+                    ctx.set_sequence(self.sequence);
+                    self.sequence += 1;
+
+                    Ok(ProduceResult::Produced(n))
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // Non-blocking mode, no data available
+                    Ok(ProduceResult::WouldBlock)
+                }
+                Err(e) => Err(Error::Io(e)),
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // Non-blocking mode, no data available
-                Ok(None)
+        } else {
+            // No buffer provided, allocate our own
+            let segment = Arc::new(HeapSegment::new(self.buffer_size)?);
+            let ptr = segment
+                .as_mut_ptr()
+                .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
+            let slice = unsafe { std::slice::from_raw_parts_mut(ptr, self.buffer_size) };
+
+            // Receive datagram
+            match self.socket.recv_from(slice) {
+                Ok((n, sender)) => {
+                    self.bytes_read += n as u64;
+                    self.last_sender = Some(sender);
+                    let seq = self.sequence;
+                    self.sequence += 1;
+
+                    let handle = crate::buffer::MemoryHandle::from_segment_with_len(segment, n);
+                    let metadata = Metadata::from_sequence(seq);
+                    Ok(ProduceResult::OwnBuffer(Buffer::new(handle, metadata)))
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // Non-blocking mode, no data available
+                    Ok(ProduceResult::WouldBlock)
+                }
+                Err(e) => Err(Error::Io(e)),
             }
-            Err(e) => Err(Error::Io(e)),
         }
     }
 
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn preferred_buffer_size(&self) -> Option<usize> {
+        Some(self.buffer_size)
     }
 }
 
@@ -292,8 +321,8 @@ impl UdpSink {
 }
 
 impl crate::element::Sink for UdpSink {
-    fn consume(&mut self, buffer: Buffer) -> Result<()> {
-        let data = buffer.as_bytes();
+    fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
+        let data = ctx.input();
 
         if self.connected {
             // Connected mode - use send()
@@ -383,7 +412,12 @@ impl AsyncUdpSrc {
         self.last_sender
     }
 
-    /// Receive a datagram asynchronously.
+    /// Get the preferred buffer size for this source.
+    pub fn preferred_buffer_size(&self) -> Option<usize> {
+        Some(self.buffer_size)
+    }
+
+    /// Receive a datagram asynchronously (convenience method).
     pub async fn recv(&mut self) -> Result<Option<Buffer>> {
         // Allocate buffer
         let segment = Arc::new(HeapSegment::new(self.buffer_size)?);
@@ -402,6 +436,52 @@ impl AsyncUdpSrc {
         let handle = crate::buffer::MemoryHandle::from_segment_with_len(segment, n);
         let metadata = Metadata::from_sequence(seq);
         Ok(Some(Buffer::new(handle, metadata)))
+    }
+}
+
+impl crate::element::AsyncSource for AsyncUdpSrc {
+    async fn produce(&mut self, ctx: &mut ProduceContext<'_>) -> Result<ProduceResult> {
+        if ctx.has_buffer() {
+            // Use the provided buffer
+            let output = ctx.output();
+            let max_len = output.len().min(self.buffer_size);
+
+            // Receive datagram into the provided buffer
+            let (n, sender) = self.socket.recv_from(&mut output[..max_len]).await?;
+            self.bytes_read += n as u64;
+            self.last_sender = Some(sender);
+
+            ctx.set_sequence(self.sequence);
+            self.sequence += 1;
+
+            Ok(ProduceResult::Produced(n))
+        } else {
+            // No buffer provided, allocate our own
+            let segment = Arc::new(HeapSegment::new(self.buffer_size)?);
+            let ptr = segment
+                .as_mut_ptr()
+                .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
+            let slice = unsafe { std::slice::from_raw_parts_mut(ptr, self.buffer_size) };
+
+            // Receive datagram
+            let (n, sender) = self.socket.recv_from(slice).await?;
+            self.bytes_read += n as u64;
+            self.last_sender = Some(sender);
+            let seq = self.sequence;
+            self.sequence += 1;
+
+            let handle = crate::buffer::MemoryHandle::from_segment_with_len(segment, n);
+            let metadata = Metadata::from_sequence(seq);
+            Ok(ProduceResult::OwnBuffer(Buffer::new(handle, metadata)))
+        }
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn preferred_buffer_size(&self) -> Option<usize> {
+        Some(self.buffer_size)
     }
 }
 
@@ -482,13 +562,14 @@ impl AsyncUdpSink {
 
     /// Send a buffer asynchronously.
     pub async fn send(&mut self, buffer: Buffer) -> Result<()> {
-        <Self as crate::element::AsyncSink>::consume(self, buffer).await
+        let ctx = ConsumeContext::new(&buffer);
+        <Self as crate::element::AsyncSink>::consume(self, &ctx).await
     }
 }
 
 impl crate::element::AsyncSink for AsyncUdpSink {
-    async fn consume(&mut self, buffer: Buffer) -> Result<()> {
-        let data = buffer.as_bytes();
+    async fn consume(&mut self, ctx: &ConsumeContext<'_>) -> Result<()> {
+        let data = ctx.input();
 
         if self.connected {
             self.socket.send(data).await?;
@@ -511,6 +592,7 @@ impl crate::element::AsyncSink for AsyncUdpSink {
 mod tests {
     use super::*;
     use crate::element::{Sink, Source};
+    use crate::memory::CpuArena;
     use std::thread;
 
     #[test]
@@ -546,9 +628,20 @@ mod tests {
             socket.send_to(b"hello udp", recv_addr).unwrap();
         });
 
+        // Create arena for receiving
+        let arena = Arc::new(CpuArena::new(65535, 4).unwrap());
+        let slot = arena.acquire().unwrap();
+        let mut ctx = ProduceContext::new(slot);
+
         // Receive the datagram
-        let buffer = src.produce().unwrap().unwrap();
-        assert_eq!(buffer.as_bytes(), b"hello udp");
+        let result = src.produce(&mut ctx).unwrap();
+        match result {
+            ProduceResult::Produced(n) => {
+                let buffer = ctx.finalize(n);
+                assert_eq!(buffer.as_bytes(), b"hello udp");
+            }
+            _ => panic!("expected Produced result"),
+        }
         assert!(src.last_sender().is_some());
 
         handle.join().unwrap();
@@ -571,7 +664,8 @@ mod tests {
         let handle = crate::buffer::MemoryHandle::from_segment_with_len(segment, 9);
         let buffer = Buffer::new(handle, Metadata::default());
 
-        sink.consume(buffer).unwrap();
+        let ctx = ConsumeContext::new(&buffer);
+        sink.consume(&ctx).unwrap();
 
         // Receive and verify
         let mut buf = [0u8; 64];
@@ -588,7 +682,8 @@ mod tests {
         let buffer = Buffer::new(handle, Metadata::default());
 
         // Should fail without destination
-        let result = sink.consume(buffer);
+        let ctx = ConsumeContext::new(&buffer);
+        let result = sink.consume(&ctx);
         assert!(result.is_err());
     }
 
@@ -618,7 +713,7 @@ mod tests {
             socket.send_to(b"async hello", recv_addr).await.unwrap();
         });
 
-        // Receive
+        // Receive using the convenience method
         let buffer = src.recv().await.unwrap().unwrap();
         assert_eq!(buffer.as_bytes(), b"async hello");
 

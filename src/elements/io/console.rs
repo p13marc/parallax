@@ -1,8 +1,8 @@
 //! Console sink element for debugging output.
 
-use crate::buffer::Buffer;
-use crate::element::Sink;
+use crate::element::{ConsumeContext, Sink};
 use crate::error::Result;
+use crate::metadata::Metadata;
 use std::io::{self, Write};
 
 /// Output format for ConsoleSink.
@@ -114,9 +114,8 @@ impl ConsoleSink {
         self.total_bytes
     }
 
-    fn format_buffer(&self, buffer: &Buffer) -> String {
+    fn format_output(&self, data: &[u8], metadata: &Metadata) -> String {
         let prefix = self.prefix.as_deref().unwrap_or("");
-        let metadata = buffer.metadata();
 
         match self.format {
             ConsoleFormat::Metadata => {
@@ -125,41 +124,38 @@ impl ConsoleSink {
                     prefix,
                     self.count,
                     metadata.sequence,
-                    buffer.len(),
+                    data.len(),
                     metadata.pts,
                     metadata.flags
                 )
             }
             ConsoleFormat::Hex => {
-                let bytes = buffer.as_bytes();
-                let display_len = bytes.len().min(self.max_hex_bytes);
-                let hex: String = bytes[..display_len]
+                let display_len = data.len().min(self.max_hex_bytes);
+                let hex: String = data[..display_len]
                     .iter()
                     .map(|b| format!("{:02x}", b))
                     .collect::<Vec<_>>()
                     .join(" ");
-                let truncated = if bytes.len() > self.max_hex_bytes {
-                    format!("... ({} more bytes)", bytes.len() - self.max_hex_bytes)
+                let truncated = if data.len() > self.max_hex_bytes {
+                    format!("... ({} more bytes)", data.len() - self.max_hex_bytes)
                 } else {
                     String::new()
                 };
                 format!("{}[{}]{}", prefix, hex, truncated)
             }
             ConsoleFormat::Text => {
-                let bytes = buffer.as_bytes();
-                let text = String::from_utf8_lossy(bytes);
+                let text = String::from_utf8_lossy(data);
                 format!("{}{}", prefix, text)
             }
             ConsoleFormat::Full => {
-                let bytes = buffer.as_bytes();
-                let display_len = bytes.len().min(self.max_hex_bytes);
-                let hex: String = bytes[..display_len]
+                let display_len = data.len().min(self.max_hex_bytes);
+                let hex: String = data[..display_len]
                     .iter()
                     .map(|b| format!("{:02x}", b))
                     .collect::<Vec<_>>()
                     .join(" ");
-                let truncated = if bytes.len() > self.max_hex_bytes {
-                    format!("... ({} more)", bytes.len() - self.max_hex_bytes)
+                let truncated = if data.len() > self.max_hex_bytes {
+                    format!("... ({} more)", data.len() - self.max_hex_bytes)
                 } else {
                     String::new()
                 };
@@ -168,7 +164,7 @@ impl ConsoleSink {
                     prefix,
                     self.count,
                     metadata.sequence,
-                    buffer.len(),
+                    data.len(),
                     metadata.pts,
                     prefix,
                     hex,
@@ -186,11 +182,11 @@ impl Default for ConsoleSink {
 }
 
 impl Sink for ConsoleSink {
-    fn consume(&mut self, buffer: Buffer) -> Result<()> {
+    fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
         self.count += 1;
-        self.total_bytes += buffer.len() as u64;
+        self.total_bytes += ctx.len() as u64;
 
-        let output = self.format_buffer(&buffer);
+        let output = self.format_output(ctx.input(), ctx.metadata());
 
         // Use writeln to stdout with proper error handling
         let stdout = io::stdout();
@@ -208,9 +204,8 @@ impl Sink for ConsoleSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::MemoryHandle;
+    use crate::buffer::{Buffer, MemoryHandle};
     use crate::memory::HeapSegment;
-    use crate::metadata::Metadata;
     use std::sync::Arc;
 
     fn create_test_buffer(data: &[u8], sequence: u64) -> Buffer {
@@ -247,8 +242,9 @@ mod tests {
     fn test_console_sink_consume() {
         let mut sink = ConsoleSink::new();
         let buffer = create_test_buffer(b"hello", 0);
+        let ctx = ConsumeContext::new(&buffer);
 
-        sink.consume(buffer).unwrap();
+        sink.consume(&ctx).unwrap();
 
         assert_eq!(sink.count(), 1);
         assert_eq!(sink.total_bytes(), 5);
@@ -257,9 +253,10 @@ mod tests {
     #[test]
     fn test_console_sink_format_metadata() {
         let sink = ConsoleSink::with_format(ConsoleFormat::Metadata);
-        let buffer = create_test_buffer(b"test", 42);
+        let data = b"test";
+        let metadata = Metadata::from_sequence(42);
 
-        let output = sink.format_buffer(&buffer);
+        let output = sink.format_output(data, &metadata);
         assert!(output.contains("seq=42"));
         assert!(output.contains("len=4"));
     }
@@ -267,18 +264,20 @@ mod tests {
     #[test]
     fn test_console_sink_format_hex() {
         let sink = ConsoleSink::with_format(ConsoleFormat::Hex);
-        let buffer = create_test_buffer(&[0x00, 0x01, 0xff], 0);
+        let data: &[u8] = &[0x00, 0x01, 0xff];
+        let metadata = Metadata::from_sequence(0);
 
-        let output = sink.format_buffer(&buffer);
+        let output = sink.format_output(data, &metadata);
         assert!(output.contains("00 01 ff"));
     }
 
     #[test]
     fn test_console_sink_format_text() {
         let sink = ConsoleSink::with_format(ConsoleFormat::Text);
-        let buffer = create_test_buffer(b"Hello, World!", 0);
+        let data = b"Hello, World!";
+        let metadata = Metadata::from_sequence(0);
 
-        let output = sink.format_buffer(&buffer);
+        let output = sink.format_output(data, &metadata);
         assert!(output.contains("Hello, World!"));
     }
 

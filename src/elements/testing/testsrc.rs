@@ -2,12 +2,8 @@
 //!
 //! Generates various test patterns for pipeline testing and benchmarking.
 
-use crate::buffer::{Buffer, MemoryHandle};
-use crate::element::Source;
+use crate::element::{ProduceContext, ProduceResult, Source};
 use crate::error::Result;
-use crate::memory::{HeapSegment, MemorySegment};
-use crate::metadata::Metadata;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Test pattern types.
@@ -213,41 +209,66 @@ impl Default for TestSrc {
 }
 
 impl Source for TestSrc {
-    fn produce(&mut self) -> Result<Option<Buffer>> {
+    fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
         // Check buffer limit
         if let Some(max) = self.num_buffers {
             if self.sequence >= max {
-                return Ok(None);
+                return Ok(ProduceResult::Eos);
             }
         }
 
         // Apply rate limiting
         self.apply_rate_limit();
 
-        // Create buffer
-        let segment = Arc::new(HeapSegment::new(self.buffer_size)?);
-        let ptr = segment.as_mut_ptr().unwrap();
-        let data = unsafe { std::slice::from_raw_parts_mut(ptr, self.buffer_size) };
+        // Fill the provided buffer
+        let output = ctx.output();
+        let len = output.len().min(self.buffer_size);
+        self.fill_buffer(&mut output[..len]);
 
-        self.fill_buffer(data);
-
-        let handle = MemoryHandle::from_segment_with_len(segment, self.buffer_size);
-        let metadata = Metadata::from_sequence(self.sequence);
+        // Set metadata
+        ctx.set_sequence(self.sequence);
 
         self.sequence += 1;
-        self.bytes_produced += self.buffer_size as u64;
+        self.bytes_produced += len as u64;
 
-        Ok(Some(Buffer::new(handle, metadata)))
+        Ok(ProduceResult::Produced(len))
     }
 
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn preferred_buffer_size(&self) -> Option<usize> {
+        Some(self.buffer_size)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::CpuArena;
+    use std::sync::Arc;
+
+    // Helper to create a ProduceContext with an arena
+    fn produce_with_arena(src: &mut TestSrc, arena: &Arc<CpuArena>) -> Result<ProduceResult> {
+        let slot = arena.acquire().unwrap();
+        let mut ctx = ProduceContext::new(slot);
+        src.produce(&mut ctx)
+    }
+
+    // Helper to produce and get buffer data
+    fn produce_buffer(src: &mut TestSrc, arena: &Arc<CpuArena>) -> Option<Vec<u8>> {
+        let slot = arena.acquire().unwrap();
+        let mut ctx = ProduceContext::new(slot);
+        match src.produce(&mut ctx).unwrap() {
+            ProduceResult::Produced(n) => {
+                let buffer = ctx.finalize(n);
+                Some(buffer.as_bytes().to_vec())
+            }
+            ProduceResult::Eos => None,
+            _ => None,
+        }
+    }
 
     #[test]
     fn test_testsrc_zero_pattern() {
@@ -256,8 +277,9 @@ mod tests {
             .with_buffer_size(100)
             .with_num_buffers(1);
 
-        let buf = src.produce().unwrap().unwrap();
-        assert!(buf.as_bytes().iter().all(|&b| b == 0));
+        let arena = Arc::new(CpuArena::new(1024, 4).unwrap());
+        let bytes = produce_buffer(&mut src, &arena).unwrap();
+        assert!(bytes.iter().all(|&b| b == 0));
     }
 
     #[test]
@@ -267,8 +289,9 @@ mod tests {
             .with_buffer_size(100)
             .with_num_buffers(1);
 
-        let buf = src.produce().unwrap().unwrap();
-        assert!(buf.as_bytes().iter().all(|&b| b == 0xFF));
+        let arena = Arc::new(CpuArena::new(1024, 4).unwrap());
+        let bytes = produce_buffer(&mut src, &arena).unwrap();
+        assert!(bytes.iter().all(|&b| b == 0xFF));
     }
 
     #[test]
@@ -278,8 +301,8 @@ mod tests {
             .with_buffer_size(256)
             .with_num_buffers(1);
 
-        let buf = src.produce().unwrap().unwrap();
-        let bytes = buf.as_bytes();
+        let arena = Arc::new(CpuArena::new(1024, 4).unwrap());
+        let bytes = produce_buffer(&mut src, &arena).unwrap();
 
         for (i, &byte) in bytes.iter().enumerate() {
             assert_eq!(byte, i as u8);
@@ -293,8 +316,8 @@ mod tests {
             .with_buffer_size(10)
             .with_num_buffers(1);
 
-        let buf = src.produce().unwrap().unwrap();
-        let bytes = buf.as_bytes();
+        let arena = Arc::new(CpuArena::new(1024, 4).unwrap());
+        let bytes = produce_buffer(&mut src, &arena).unwrap();
 
         assert_eq!(bytes[0], 0x55);
         assert_eq!(bytes[1], 0xAA);
@@ -316,20 +339,22 @@ mod tests {
             .with_seed(12345)
             .with_num_buffers(1);
 
-        let buf1 = src1.produce().unwrap().unwrap();
-        let buf2 = src2.produce().unwrap().unwrap();
+        let arena = Arc::new(CpuArena::new(1024, 4).unwrap());
+        let bytes1 = produce_buffer(&mut src1, &arena).unwrap();
+        let bytes2 = produce_buffer(&mut src2, &arena).unwrap();
 
-        assert_eq!(buf1.as_bytes(), buf2.as_bytes());
+        assert_eq!(bytes1, bytes2);
     }
 
     #[test]
     fn test_testsrc_num_buffers() {
         let mut src = TestSrc::new().with_buffer_size(10).with_num_buffers(3);
+        let arena = Arc::new(CpuArena::new(1024, 8).unwrap());
 
-        assert!(src.produce().unwrap().is_some());
-        assert!(src.produce().unwrap().is_some());
-        assert!(src.produce().unwrap().is_some());
-        assert!(src.produce().unwrap().is_none());
+        assert!(produce_buffer(&mut src, &arena).is_some());
+        assert!(produce_buffer(&mut src, &arena).is_some());
+        assert!(produce_buffer(&mut src, &arena).is_some());
+        assert!(produce_buffer(&mut src, &arena).is_none());
 
         assert_eq!(src.buffers_produced(), 3);
     }
@@ -337,23 +362,32 @@ mod tests {
     #[test]
     fn test_testsrc_sequence() {
         let mut src = TestSrc::new().with_buffer_size(10).with_num_buffers(3);
+        let arena = Arc::new(CpuArena::new(1024, 8).unwrap());
 
-        let buf = src.produce().unwrap().unwrap();
-        assert_eq!(buf.metadata().sequence, 0);
+        // Check sequence via metadata in context
+        let slot = arena.acquire().unwrap();
+        let mut ctx = ProduceContext::new(slot);
+        src.produce(&mut ctx).unwrap();
+        assert_eq!(ctx.metadata().sequence, 0);
 
-        let buf = src.produce().unwrap().unwrap();
-        assert_eq!(buf.metadata().sequence, 1);
+        let slot = arena.acquire().unwrap();
+        let mut ctx = ProduceContext::new(slot);
+        src.produce(&mut ctx).unwrap();
+        assert_eq!(ctx.metadata().sequence, 1);
 
-        let buf = src.produce().unwrap().unwrap();
-        assert_eq!(buf.metadata().sequence, 2);
+        let slot = arena.acquire().unwrap();
+        let mut ctx = ProduceContext::new(slot);
+        src.produce(&mut ctx).unwrap();
+        assert_eq!(ctx.metadata().sequence, 2);
     }
 
     #[test]
     fn test_testsrc_bytes_produced() {
         let mut src = TestSrc::new().with_buffer_size(100).with_num_buffers(5);
+        let arena = Arc::new(CpuArena::new(1024, 8).unwrap());
 
         for _ in 0..5 {
-            src.produce().unwrap();
+            produce_buffer(&mut src, &arena);
         }
 
         assert_eq!(src.bytes_produced(), 500);
@@ -362,14 +396,15 @@ mod tests {
     #[test]
     fn test_testsrc_reset() {
         let mut src = TestSrc::new().with_buffer_size(10).with_num_buffers(2);
+        let arena = Arc::new(CpuArena::new(1024, 8).unwrap());
 
-        src.produce().unwrap();
-        src.produce().unwrap();
-        assert!(src.produce().unwrap().is_none());
+        produce_buffer(&mut src, &arena);
+        produce_buffer(&mut src, &arena);
+        assert!(produce_buffer(&mut src, &arena).is_none());
 
         src.reset();
 
-        assert!(src.produce().unwrap().is_some());
+        assert!(produce_buffer(&mut src, &arena).is_some());
         assert_eq!(src.buffers_produced(), 1);
     }
 

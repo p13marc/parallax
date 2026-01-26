@@ -4,7 +4,7 @@
 //! - `OutputSelector`: 1-to-N stream routing
 
 use crate::buffer::Buffer;
-use crate::element::{Element, Source};
+use crate::element::{Element, ProduceContext, ProduceResult, Source};
 use crate::error::Result;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -182,8 +182,11 @@ impl Default for InputSelector {
 }
 
 impl Source for InputSelector {
-    fn produce(&mut self) -> Result<Option<Buffer>> {
-        self.pull_timeout(None)
+    fn produce(&mut self, _ctx: &mut ProduceContext) -> Result<ProduceResult> {
+        match self.pull_timeout(None)? {
+            Some(buffer) => Ok(ProduceResult::OwnBuffer(buffer)),
+            None => Ok(ProduceResult::Eos),
+        }
     }
 
     fn name(&self) -> &str {

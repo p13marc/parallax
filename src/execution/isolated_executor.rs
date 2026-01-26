@@ -395,6 +395,7 @@ impl IsolatedPipelineHandle {
 mod tests {
     use super::*;
     use crate::buffer::{Buffer, MemoryHandle};
+    use crate::element::{ConsumeContext, ProduceContext, ProduceResult};
     use crate::element::{DynAsyncElement, Sink, SinkAdapter, Source, SourceAdapter};
     use crate::memory::HeapSegment;
     use crate::metadata::Metadata;
@@ -407,15 +408,16 @@ mod tests {
     }
 
     impl Source for TestSource {
-        fn produce(&mut self) -> Result<Option<Buffer>> {
+        fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
             if self.count >= self.max {
-                return Ok(None);
+                return Ok(ProduceResult::Eos);
             }
+            // Create our own buffer since we're in tests without an arena
             let segment = Arc::new(HeapSegment::new(8).unwrap());
             let handle = MemoryHandle::from_segment(segment);
             let buffer = Buffer::new(handle, Metadata::from_sequence(self.count));
             self.count += 1;
-            Ok(Some(buffer))
+            Ok(ProduceResult::OwnBuffer(buffer))
         }
     }
 
@@ -424,7 +426,7 @@ mod tests {
     }
 
     impl Sink for TestSink {
-        fn consume(&mut self, _buffer: Buffer) -> Result<()> {
+        fn consume(&mut self, _ctx: &ConsumeContext) -> Result<()> {
             self.received.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }

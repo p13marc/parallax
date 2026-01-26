@@ -29,7 +29,7 @@
 //! ```
 
 use crate::buffer::{Buffer, MemoryHandle};
-use crate::element::{Sink, Source};
+use crate::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
 use crate::error::{Error, Result};
 use crate::execution::{ControlMessage, SerializableMetadata, frame_message, unframe_message};
 use crate::format::Caps;
@@ -253,7 +253,7 @@ impl IpcSink {
 }
 
 impl Sink for IpcSink {
-    fn consume(&mut self, buffer: Buffer) -> Result<()> {
+    fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
         self.ensure_connected()?;
         self.process_acks()?;
 
@@ -263,6 +263,9 @@ impl Sink for IpcSink {
             std::thread::sleep(std::time::Duration::from_micros(100));
             self.process_acks()?;
         }
+
+        // Get the buffer from context
+        let buffer = ctx.buffer();
 
         // Get or create slot reference
         let slot = if let Some(ipc_ref) = buffer.memory().ipc_ref() {
@@ -278,8 +281,8 @@ impl Sink for IpcSink {
                 .acquire()
                 .ok_or_else(|| Error::Element("Arena full".into()))?;
 
-            // Copy data
-            let data = buffer.as_bytes();
+            // Copy data using ctx.input() which gives buffer data as bytes
+            let data = ctx.input();
             if data.len() > arena_slot.len() {
                 return Err(Error::Element("Buffer too large for arena slot".into()));
             }
@@ -474,7 +477,7 @@ impl IpcSrc {
 }
 
 impl Source for IpcSrc {
-    fn produce(&mut self) -> Result<Option<Buffer>> {
+    fn produce(&mut self, _ctx: &mut ProduceContext) -> Result<ProduceResult> {
         self.ensure_connected()?;
 
         loop {
@@ -507,15 +510,16 @@ impl Source for IpcSrc {
                     let handle = MemoryHandle::from_segment(segment);
                     let buffer = Buffer::new(handle, meta);
 
-                    return Ok(Some(buffer));
+                    // IpcSrc receives buffers via IPC, so return OwnBuffer
+                    return Ok(ProduceResult::OwnBuffer(buffer));
                 }
 
                 ControlMessage::Eos => {
-                    return Ok(None);
+                    return Ok(ProduceResult::Eos);
                 }
 
                 ControlMessage::Shutdown => {
-                    return Ok(None);
+                    return Ok(ProduceResult::Eos);
                 }
 
                 _ => {

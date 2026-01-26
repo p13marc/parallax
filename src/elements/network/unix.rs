@@ -8,7 +8,7 @@
 //! - [`AsyncUnixSink`]: Async version of UnixSink
 
 use crate::buffer::{Buffer, MemoryHandle};
-use crate::element::{AsyncSource, Sink, Source};
+use crate::element::{AsyncSource, ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
 use crate::error::{Error, Result};
 use crate::memory::{HeapSegment, MemorySegment};
 use crate::metadata::Metadata;
@@ -166,7 +166,7 @@ impl UnixSrc {
 }
 
 impl Source for UnixSrc {
-    fn produce(&mut self) -> Result<Option<Buffer>> {
+    fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
         self.ensure_connected()?;
 
         let stream = self
@@ -174,28 +174,26 @@ impl Source for UnixSrc {
             .as_mut()
             .ok_or_else(|| Error::Element("not connected".into()))?;
 
-        let segment = Arc::new(HeapSegment::new(self.buffer_size)?);
-        let ptr = segment.as_mut_ptr().unwrap();
-        let slice = unsafe { std::slice::from_raw_parts_mut(ptr, self.buffer_size) };
+        let output = ctx.output();
 
-        match stream.read(slice) {
-            Ok(0) => Ok(None), // EOF
+        match stream.read(output) {
+            Ok(0) => Ok(ProduceResult::Eos), // EOF
             Ok(n) => {
                 self.bytes_read += n as u64;
-                let seq = self.sequence;
+                ctx.set_sequence(self.sequence);
                 self.sequence += 1;
 
-                let handle = MemoryHandle::from_segment_with_len(segment, n);
-                Ok(Some(Buffer::new(handle, Metadata::from_sequence(seq))))
+                Ok(ProduceResult::Produced(n))
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 // Timeout - return empty buffer with timeout flag
-                let segment = Arc::new(HeapSegment::new(1)?);
-                let handle = MemoryHandle::from_segment_with_len(segment, 0);
-                let mut meta = Metadata::from_sequence(self.sequence);
-                meta.flags = meta.flags.insert(crate::metadata::BufferFlags::TIMEOUT);
+                ctx.set_sequence(self.sequence);
+                ctx.metadata_mut().flags = ctx
+                    .metadata()
+                    .flags
+                    .insert(crate::metadata::BufferFlags::TIMEOUT);
                 self.sequence += 1;
-                Ok(Some(Buffer::new(handle, meta)))
+                Ok(ProduceResult::Produced(0))
             }
             Err(e) => Err(e.into()),
         }
@@ -338,7 +336,7 @@ impl UnixSink {
 }
 
 impl Sink for UnixSink {
-    fn consume(&mut self, buffer: Buffer) -> Result<()> {
+    fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
         self.ensure_connected()?;
 
         let stream = self
@@ -346,7 +344,7 @@ impl Sink for UnixSink {
             .as_mut()
             .ok_or_else(|| Error::Element("not connected".into()))?;
 
-        let data = buffer.as_bytes();
+        let data = ctx.input();
         stream.write_all(data)?;
         self.bytes_written += data.len() as u64;
 
@@ -430,7 +428,7 @@ impl AsyncUnixSrc {
 }
 
 impl AsyncSource for AsyncUnixSrc {
-    async fn produce(&mut self) -> Result<Option<Buffer>> {
+    async fn produce(&mut self, ctx: &mut ProduceContext<'_>) -> Result<ProduceResult> {
         // For async, we use std blocking I/O wrapped in spawn_blocking
         // A full async implementation would use tokio::net::UnixStream
         let path = self.path.clone();
@@ -456,21 +454,33 @@ impl AsyncSource for AsyncUnixSrc {
         .map_err(|e| Error::Element(format!("task join error: {}", e)))??;
 
         if result.is_empty() {
-            return Ok(None);
-        }
-
-        let segment = Arc::new(HeapSegment::new(result.len())?);
-        unsafe {
-            let ptr = segment.as_mut_ptr().unwrap();
-            std::ptr::copy_nonoverlapping(result.as_ptr(), ptr, result.len());
+            return Ok(ProduceResult::Eos);
         }
 
         self.bytes_read += result.len() as u64;
         let seq = self.sequence;
         self.sequence += 1;
 
-        let handle = MemoryHandle::from_segment_with_len(segment, result.len());
-        Ok(Some(Buffer::new(handle, Metadata::from_sequence(seq))))
+        // Check if we can use the pre-allocated buffer
+        if ctx.has_buffer() && ctx.capacity() >= result.len() {
+            let output = ctx.output();
+            output[..result.len()].copy_from_slice(&result);
+            ctx.set_sequence(seq);
+            Ok(ProduceResult::Produced(result.len()))
+        } else {
+            // Fall back to creating our own buffer
+            let segment = Arc::new(HeapSegment::new(result.len())?);
+            unsafe {
+                let ptr = segment.as_mut_ptr().unwrap();
+                std::ptr::copy_nonoverlapping(result.as_ptr(), ptr, result.len());
+            }
+
+            let handle = MemoryHandle::from_segment_with_len(segment, result.len());
+            Ok(ProduceResult::OwnBuffer(Buffer::new(
+                handle,
+                Metadata::from_sequence(seq),
+            )))
+        }
     }
 
     fn name(&self) -> &str {
@@ -555,6 +565,7 @@ impl AsyncUnixSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::CpuArena;
     use std::thread;
     use tempfile::tempdir;
 
@@ -577,15 +588,25 @@ mod tests {
 
         let path_clone = socket_path.clone();
         let server = thread::spawn(move || -> Result<Vec<u8>> {
+            let arena = Arc::new(CpuArena::new(4096, 8).unwrap());
             let mut src = UnixSrc::listen(&path_clone)?;
             let mut data = Vec::new();
-            while let Some(buf) = src.produce()? {
-                if buf.metadata().flags.is_eos() {
-                    break;
-                }
-                data.extend_from_slice(buf.as_bytes());
-                if data.len() >= 11 {
-                    break;
+            loop {
+                let slot = arena.acquire().unwrap();
+                let mut ctx = ProduceContext::new(slot);
+                match src.produce(&mut ctx)? {
+                    ProduceResult::Produced(n) => {
+                        let buf = ctx.finalize(n);
+                        if buf.metadata().flags.is_eos() {
+                            break;
+                        }
+                        data.extend_from_slice(buf.as_bytes());
+                        if data.len() >= 11 {
+                            break;
+                        }
+                    }
+                    ProduceResult::Eos => break,
+                    _ => break,
                 }
             }
             Ok(data)
@@ -595,8 +616,12 @@ mod tests {
         thread::sleep(Duration::from_millis(50));
 
         let mut sink = UnixSink::connect(&socket_path)?;
-        sink.consume(make_buffer(b"Hello", 0))?;
-        sink.consume(make_buffer(b" World", 1))?;
+        let buf1 = make_buffer(b"Hello", 0);
+        let ctx1 = ConsumeContext::new(&buf1);
+        sink.consume(&ctx1)?;
+        let buf2 = make_buffer(b" World", 1);
+        let ctx2 = ConsumeContext::new(&buf2);
+        sink.consume(&ctx2)?;
 
         let received = server.join().unwrap()?;
         assert_eq!(received, b"Hello World");

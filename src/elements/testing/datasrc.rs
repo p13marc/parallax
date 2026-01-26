@@ -2,12 +2,8 @@
 //!
 //! Similar to GStreamer's dataurisrc, but accepts raw bytes directly.
 
-use crate::buffer::{Buffer, MemoryHandle};
-use crate::element::Source;
+use crate::element::{ProduceContext, ProduceResult, Source};
 use crate::error::Result;
-use crate::memory::HeapSegment;
-use crate::metadata::Metadata;
-use std::sync::Arc;
 
 /// A source that produces buffers from inline data.
 ///
@@ -129,9 +125,9 @@ impl DataSrc {
 }
 
 impl Source for DataSrc {
-    fn produce(&mut self) -> Result<Option<Buffer>> {
+    fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
         if self.data.is_empty() {
-            return Ok(None);
+            return Ok(ProduceResult::Eos);
         }
 
         // Check if we've finished
@@ -140,13 +136,13 @@ impl Source for DataSrc {
             if self.repeat {
                 if let Some(max_repeats) = self.repeat_count {
                     if self.repeats_done >= max_repeats {
-                        return Ok(None);
+                        return Ok(ProduceResult::Eos);
                     }
                 }
                 self.position = 0;
                 self.repeats_done += 1;
             } else {
-                return Ok(None);
+                return Ok(ProduceResult::Eos);
             }
         }
 
@@ -159,124 +155,150 @@ impl Source for DataSrc {
         let chunk = &self.data[self.position..end];
         let chunk_len = chunk.len();
 
-        // Create buffer
-        let segment = Arc::new(HeapSegment::new(chunk_len)?);
-        unsafe {
-            use crate::memory::MemorySegment;
-            if let Some(ptr) = segment.as_mut_ptr() {
-                std::ptr::copy_nonoverlapping(chunk.as_ptr(), ptr, chunk_len);
-            }
-        }
+        // Write to the provided buffer
+        let output = ctx.output();
+        output[..chunk_len].copy_from_slice(chunk);
 
-        let handle = MemoryHandle::from_segment_with_len(segment, chunk_len);
-        let metadata = Metadata::from_sequence(self.sequence);
+        // Set metadata
+        ctx.set_sequence(self.sequence);
 
         self.position = end;
         self.sequence += 1;
 
-        Ok(Some(Buffer::new(handle, metadata)))
+        Ok(ProduceResult::Produced(chunk_len))
     }
 
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn preferred_buffer_size(&self) -> Option<usize> {
+        // Return the chunk size if set, otherwise the full data size
+        Some(match self.chunk_size {
+            Some(size) => size,
+            None => self.data.len().max(1), // At least 1 byte
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::CpuArena;
+    use std::sync::Arc;
+
+    fn produce_with_arena(
+        src: &mut DataSrc,
+        arena: &Arc<CpuArena>,
+    ) -> Result<Option<crate::buffer::Buffer>> {
+        let slot = arena.acquire().expect("arena slot available");
+        let mut ctx = ProduceContext::new(slot);
+        match src.produce(&mut ctx)? {
+            ProduceResult::Produced(n) => Ok(Some(ctx.finalize(n))),
+            ProduceResult::Eos => Ok(None),
+            ProduceResult::OwnBuffer(buf) => Ok(Some(buf)),
+            ProduceResult::WouldBlock => Ok(None),
+        }
+    }
 
     #[test]
     fn test_datasrc_from_bytes() {
         let mut src = DataSrc::from_bytes(b"hello");
+        let arena = Arc::new(CpuArena::new(1024, 4).unwrap());
 
-        let buf = src.produce().unwrap().unwrap();
+        let buf = produce_with_arena(&mut src, &arena).unwrap().unwrap();
         assert_eq!(buf.as_bytes(), b"hello");
 
         // Should be EOS
-        let buf = src.produce().unwrap();
+        let buf = produce_with_arena(&mut src, &arena).unwrap();
         assert!(buf.is_none());
     }
 
     #[test]
     fn test_datasrc_from_string() {
         let mut src = DataSrc::from_string("hello world");
+        let arena = Arc::new(CpuArena::new(1024, 4).unwrap());
 
-        let buf = src.produce().unwrap().unwrap();
+        let buf = produce_with_arena(&mut src, &arena).unwrap().unwrap();
         assert_eq!(buf.as_bytes(), b"hello world");
     }
 
     #[test]
     fn test_datasrc_chunked() {
         let mut src = DataSrc::from_bytes(b"hello world").with_chunk_size(5);
+        let arena = Arc::new(CpuArena::new(1024, 4).unwrap());
 
-        let buf = src.produce().unwrap().unwrap();
+        let buf = produce_with_arena(&mut src, &arena).unwrap().unwrap();
         assert_eq!(buf.as_bytes(), b"hello");
 
-        let buf = src.produce().unwrap().unwrap();
+        let buf = produce_with_arena(&mut src, &arena).unwrap().unwrap();
         assert_eq!(buf.as_bytes(), b" worl");
 
-        let buf = src.produce().unwrap().unwrap();
+        let buf = produce_with_arena(&mut src, &arena).unwrap().unwrap();
         assert_eq!(buf.as_bytes(), b"d");
 
         // Should be EOS
-        let buf = src.produce().unwrap();
+        let buf = produce_with_arena(&mut src, &arena).unwrap();
         assert!(buf.is_none());
     }
 
     #[test]
     fn test_datasrc_repeat() {
         let mut src = DataSrc::from_bytes(b"ab").repeat_n(2);
+        let arena = Arc::new(CpuArena::new(1024, 4).unwrap());
 
         // First iteration
-        let buf = src.produce().unwrap().unwrap();
+        let buf = produce_with_arena(&mut src, &arena).unwrap().unwrap();
         assert_eq!(buf.as_bytes(), b"ab");
 
         // Second iteration (repeat 1)
-        let buf = src.produce().unwrap().unwrap();
+        let buf = produce_with_arena(&mut src, &arena).unwrap().unwrap();
         assert_eq!(buf.as_bytes(), b"ab");
 
         // Third iteration (repeat 2)
-        let buf = src.produce().unwrap().unwrap();
+        let buf = produce_with_arena(&mut src, &arena).unwrap().unwrap();
         assert_eq!(buf.as_bytes(), b"ab");
 
         // Should be EOS (repeated 2 times = 3 total)
-        let buf = src.produce().unwrap();
+        let buf = produce_with_arena(&mut src, &arena).unwrap();
         assert!(buf.is_none());
     }
 
     #[test]
     fn test_datasrc_empty() {
         let mut src = DataSrc::from_bytes(b"");
+        let arena = CpuArena::new(1024, 4).unwrap();
 
-        let buf = src.produce().unwrap();
+        let buf = produce_with_arena(&mut src, &arena).unwrap();
         assert!(buf.is_none());
     }
 
     #[test]
     fn test_datasrc_reset() {
         let mut src = DataSrc::from_bytes(b"hello");
+        let arena = CpuArena::new(1024, 4).unwrap();
 
-        let _ = src.produce().unwrap();
-        assert!(src.produce().unwrap().is_none());
+        let _ = produce_with_arena(&mut src, &arena).unwrap();
+        assert!(produce_with_arena(&mut src, &arena).unwrap().is_none());
 
         src.reset();
 
-        let buf = src.produce().unwrap().unwrap();
+        let buf = produce_with_arena(&mut src, &arena).unwrap().unwrap();
         assert_eq!(buf.as_bytes(), b"hello");
     }
 
     #[test]
     fn test_datasrc_sequence() {
         let mut src = DataSrc::from_bytes(b"hello world").with_chunk_size(5);
+        let arena = CpuArena::new(1024, 4).unwrap();
 
-        let buf = src.produce().unwrap().unwrap();
+        let buf = produce_with_arena(&mut src, &arena).unwrap().unwrap();
         assert_eq!(buf.metadata().sequence, 0);
 
-        let buf = src.produce().unwrap().unwrap();
+        let buf = produce_with_arena(&mut src, &arena).unwrap().unwrap();
         assert_eq!(buf.metadata().sequence, 1);
 
-        let buf = src.produce().unwrap().unwrap();
+        let buf = produce_with_arena(&mut src, &arena).unwrap().unwrap();
         assert_eq!(buf.metadata().sequence, 2);
     }
 
@@ -284,5 +306,20 @@ mod tests {
     fn test_datasrc_with_name() {
         let src = DataSrc::from_bytes(b"test").with_name("my-data");
         assert_eq!(src.name(), "my-data");
+    }
+
+    #[test]
+    fn test_datasrc_preferred_buffer_size() {
+        // Without chunk size - uses full data length
+        let src = DataSrc::from_bytes(b"hello world");
+        assert_eq!(src.preferred_buffer_size(), Some(11));
+
+        // With chunk size - uses chunk size
+        let src = DataSrc::from_bytes(b"hello world").with_chunk_size(5);
+        assert_eq!(src.preferred_buffer_size(), Some(5));
+
+        // Empty data - returns at least 1
+        let src = DataSrc::from_bytes(b"");
+        assert_eq!(src.preferred_buffer_size(), Some(1));
     }
 }

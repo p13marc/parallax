@@ -1,11 +1,7 @@
 //! Null elements - NullSink and NullSource.
 
-use crate::buffer::{Buffer, MemoryHandle};
-use crate::element::{Sink, Source};
+use crate::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
 use crate::error::Result;
-use crate::memory::HeapSegment;
-use crate::metadata::Metadata;
-use std::sync::Arc;
 
 /// A sink that discards all buffers.
 ///
@@ -18,7 +14,7 @@ use std::sync::Arc;
 ///
 /// ```rust
 /// use parallax::elements::NullSink;
-/// use parallax::element::Sink;
+/// use parallax::element::{ConsumeContext, Sink};
 /// # use parallax::buffer::{Buffer, MemoryHandle};
 /// # use parallax::memory::HeapSegment;
 /// # use parallax::metadata::Metadata;
@@ -30,9 +26,10 @@ use std::sync::Arc;
 /// # let segment = Arc::new(HeapSegment::new(8).unwrap());
 /// # let handle = MemoryHandle::from_segment(segment);
 /// # let buffer = Buffer::new(handle, Metadata::from_sequence(0));
+/// # let ctx = ConsumeContext::new(&buffer);
 ///
 /// // NullSink just discards the buffer
-/// sink.consume(buffer).unwrap();
+/// sink.consume(&ctx).unwrap();
 ///
 /// // Check how many buffers were consumed
 /// assert_eq!(sink.count(), 1);
@@ -72,7 +69,7 @@ impl Default for NullSink {
 }
 
 impl Sink for NullSink {
-    fn consume(&mut self, _buffer: Buffer) -> Result<()> {
+    fn consume(&mut self, _ctx: &ConsumeContext) -> Result<()> {
         self.count += 1;
         Ok(())
     }
@@ -151,27 +148,37 @@ impl NullSource {
 }
 
 impl Source for NullSource {
-    fn produce(&mut self) -> Result<Option<Buffer>> {
+    fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
         if self.current >= self.count {
-            return Ok(None);
+            return Ok(ProduceResult::Eos);
         }
 
-        let segment = Arc::new(HeapSegment::new(self.buffer_size)?);
-        let handle = MemoryHandle::from_segment(segment);
-        let buffer = Buffer::new(handle, Metadata::from_sequence(self.current));
+        // Write zeros to the provided buffer
+        let output = ctx.output();
+        let len = output.len().min(self.buffer_size);
+        output[..len].fill(0);
+        ctx.set_sequence(self.current);
 
         self.current += 1;
-        Ok(Some(buffer))
+        Ok(ProduceResult::Produced(len))
     }
 
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn preferred_buffer_size(&self) -> Option<usize> {
+        Some(self.buffer_size)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::{Buffer, MemoryHandle};
+    use crate::memory::HeapSegment;
+    use crate::metadata::Metadata;
+    use std::sync::Arc;
 
     #[test]
     fn test_null_sink_consumes() {
@@ -181,8 +188,9 @@ mod tests {
         let segment = Arc::new(HeapSegment::new(64).unwrap());
         let handle = MemoryHandle::from_segment(segment);
         let buffer = Buffer::new(handle, Metadata::from_sequence(0));
+        let ctx = ConsumeContext::new(&buffer);
 
-        sink.consume(buffer).unwrap();
+        sink.consume(&ctx).unwrap();
         assert_eq!(sink.count(), 1);
     }
 
@@ -194,36 +202,62 @@ mod tests {
 
     #[test]
     fn test_null_source_produces_count() {
+        use crate::memory::CpuArena;
+
+        let arena = Arc::new(CpuArena::new(1024, 8).unwrap());
         let mut source = NullSource::new(5);
         assert_eq!(source.remaining(), 5);
 
         for i in 0..5 {
-            let buffer = source.produce().unwrap();
-            assert!(buffer.is_some());
-            assert_eq!(buffer.unwrap().metadata().sequence, i);
+            let slot = arena.acquire().unwrap();
+            let mut ctx = ProduceContext::new(slot);
+            let result = source.produce(&mut ctx).unwrap();
+            match result {
+                ProduceResult::Produced(n) => {
+                    assert!(n > 0);
+                    let buf = ctx.finalize(n);
+                    assert_eq!(buf.metadata().sequence, i);
+                }
+                _ => panic!("Expected Produced result"),
+            }
         }
 
         assert_eq!(source.remaining(), 0);
 
-        // Should return None (EOS)
-        let buffer = source.produce().unwrap();
-        assert!(buffer.is_none());
+        // Should return Eos
+        let slot = arena.acquire().unwrap();
+        let mut ctx = ProduceContext::new(slot);
+        let result = source.produce(&mut ctx).unwrap();
+        assert!(matches!(result, ProduceResult::Eos));
     }
 
     #[test]
     fn test_null_source_buffer_size() {
+        use crate::memory::CpuArena;
+
+        let arena = Arc::new(CpuArena::new(2048, 4).unwrap());
         let mut source = NullSource::new(1).with_buffer_size(1024);
 
-        let buffer = source.produce().unwrap().unwrap();
-        assert_eq!(buffer.len(), 1024);
+        let slot = arena.acquire().unwrap();
+        let mut ctx = ProduceContext::new(slot);
+        let result = source.produce(&mut ctx).unwrap();
+        match result {
+            ProduceResult::Produced(n) => {
+                assert_eq!(n, 1024);
+                let buf = ctx.finalize(n);
+                assert_eq!(buf.len(), 1024);
+            }
+            _ => panic!("Expected Produced result"),
+        }
     }
 
     #[test]
     fn test_null_source_zero_count() {
         let mut source = NullSource::new(0);
 
-        // Should immediately return None
-        let buffer = source.produce().unwrap();
-        assert!(buffer.is_none());
+        // Should immediately return Eos
+        let mut ctx = ProduceContext::without_buffer();
+        let result = source.produce(&mut ctx).unwrap();
+        assert!(matches!(result, ProduceResult::Eos));
     }
 }

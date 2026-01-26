@@ -5,8 +5,8 @@ use crate::error::{Error, Result};
 use crate::format::{Caps, MediaFormat};
 use crate::memory::MemoryType;
 use crate::negotiation::{
-    ConverterInsertion, ConverterRegistry, ElementCaps, LinkInfo as NegLinkInfo,
-    NegotiationResult, NegotiationSolver,
+    ConverterInsertion, ConverterRegistry, ElementCaps, LinkInfo as NegLinkInfo, NegotiationResult,
+    NegotiationSolver,
 };
 use daggy::petgraph::visit::EdgeRef;
 use daggy::{Dag, EdgeIndex, NodeIndex, Walker};
@@ -612,11 +612,7 @@ impl Pipeline {
 
     /// Get all node IDs in the pipeline.
     pub fn node_ids(&self) -> Vec<NodeId> {
-        self.graph
-            .graph()
-            .node_indices()
-            .map(NodeId)
-            .collect()
+        self.graph.graph().node_indices().map(NodeId).collect()
     }
 
     /// Get the parents (upstream nodes) of a node.
@@ -1656,20 +1652,20 @@ mod tests {
     use super::*;
     use crate::buffer::Buffer;
     use crate::element::{
-        DynAsyncElement, Element, ElementAdapter, PadDirection, Sink, SinkAdapter, Source,
-        SourceAdapter,
+        ConsumeContext, DynAsyncElement, Element, ElementAdapter, PadDirection, ProduceContext,
+        ProduceResult, Sink, SinkAdapter, Source, SourceAdapter,
     };
 
     struct TestSource;
     impl Source for TestSource {
-        fn produce(&mut self) -> Result<Option<Buffer>> {
-            Ok(None)
+        fn produce(&mut self, _ctx: &mut ProduceContext) -> Result<ProduceResult> {
+            Ok(ProduceResult::Eos)
         }
     }
 
     struct TestSink;
     impl Sink for TestSink {
-        fn consume(&mut self, _buffer: Buffer) -> Result<()> {
+        fn consume(&mut self, _ctx: &ConsumeContext) -> Result<()> {
             Ok(())
         }
     }

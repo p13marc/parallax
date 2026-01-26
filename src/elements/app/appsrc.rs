@@ -3,7 +3,7 @@
 //! Allows applications to push buffers into a pipeline programmatically.
 
 use crate::buffer::Buffer;
-use crate::element::Source;
+use crate::element::{ProduceContext, ProduceResult, Source};
 use crate::error::{Error, Result};
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
@@ -123,7 +123,7 @@ impl Default for AppSrc {
 }
 
 impl Source for AppSrc {
-    fn produce(&mut self) -> Result<Option<Buffer>> {
+    fn produce(&mut self, _ctx: &mut ProduceContext) -> Result<ProduceResult> {
         let mut state = self.inner.state.lock().unwrap();
 
         // Wait for data or EOS
@@ -137,9 +137,11 @@ impl Source for AppSrc {
 
         if let Some(buffer) = state.queue.pop_front() {
             state.total_produced += 1;
-            Ok(Some(buffer))
+            Ok(ProduceResult::OwnBuffer(buffer))
+        } else if state.eos {
+            Ok(ProduceResult::Eos)
         } else {
-            Ok(None) // Either EOS or no data yet
+            Ok(ProduceResult::WouldBlock)
         }
     }
 
@@ -258,6 +260,12 @@ mod tests {
         Buffer::new(handle, Metadata::from_sequence(seq))
     }
 
+    /// Helper to call produce with a dummy context (AppSrc provides its own buffer)
+    fn produce_buffer(src: &mut AppSrc) -> Result<ProduceResult> {
+        let mut ctx = ProduceContext::without_buffer();
+        src.produce(&mut ctx)
+    }
+
     #[test]
     fn test_appsrc_creation() {
         let src = AppSrc::new();
@@ -275,10 +283,18 @@ mod tests {
 
         assert_eq!(src.queue_len(), 2);
 
-        let buf = src.produce().unwrap().unwrap();
+        let result = produce_buffer(&mut src).unwrap();
+        let buf = match result {
+            ProduceResult::OwnBuffer(b) => b,
+            _ => panic!("Expected OwnBuffer"),
+        };
         assert_eq!(buf.metadata().sequence, 0);
 
-        let buf = src.produce().unwrap().unwrap();
+        let result = produce_buffer(&mut src).unwrap();
+        let buf = match result {
+            ProduceResult::OwnBuffer(b) => b,
+            _ => panic!("Expected OwnBuffer"),
+        };
         assert_eq!(buf.metadata().sequence, 1);
     }
 
@@ -293,12 +309,12 @@ mod tests {
         assert!(src.is_eos());
 
         // Should still get the buffered data
-        let buf = src.produce().unwrap();
-        assert!(buf.is_some());
+        let result = produce_buffer(&mut src).unwrap();
+        assert!(matches!(result, ProduceResult::OwnBuffer(_)));
 
-        // Now should get None for EOS
-        let buf = src.produce().unwrap();
-        assert!(buf.is_none());
+        // Now should get Eos
+        let result = produce_buffer(&mut src).unwrap();
+        assert!(result.is_eos());
     }
 
     #[test]
@@ -325,8 +341,16 @@ mod tests {
         });
 
         let mut received = Vec::new();
-        while let Ok(Some(buf)) = src.produce() {
-            received.push(buf.metadata().sequence);
+        loop {
+            match produce_buffer(&mut src).unwrap() {
+                ProduceResult::OwnBuffer(buf) => {
+                    received.push(buf.metadata().sequence);
+                }
+                ProduceResult::Eos => break,
+                ProduceResult::WouldBlock | ProduceResult::Produced(_) => {
+                    // Shouldn't happen in this test, but handle gracefully
+                }
+            }
         }
 
         producer.join().unwrap();
@@ -357,7 +381,7 @@ mod tests {
 
         handle.push_buffer(create_test_buffer(0)).unwrap();
         handle.push_buffer(create_test_buffer(1)).unwrap();
-        src.produce().unwrap();
+        let _ = produce_buffer(&mut src).unwrap();
 
         let stats = src.stats();
         assert_eq!(stats.total_pushed, 2);
