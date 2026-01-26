@@ -217,6 +217,26 @@ impl Node {
     pub fn get_input_pad(&self, name: &str) -> Option<&Pad> {
         self.input_pads.iter().find(|p| p.name() == name)
     }
+
+    /// Get the scheduling affinity for this node's element.
+    ///
+    /// Returns `Affinity::Auto` if the element has been taken.
+    pub fn affinity(&self) -> crate::element::Affinity {
+        self.element
+            .as_ref()
+            .map(|e| e.affinity())
+            .unwrap_or(crate::element::Affinity::Auto)
+    }
+
+    /// Check if this node's element is safe to run in a real-time context.
+    ///
+    /// Returns `false` if the element has been taken.
+    pub fn is_rt_safe(&self) -> bool {
+        self.element
+            .as_ref()
+            .map(|e| e.is_rt_safe())
+            .unwrap_or(false)
+    }
 }
 
 impl std::fmt::Debug for Node {
@@ -433,6 +453,15 @@ impl Pipeline {
                 let link = self.graph.edge_weight(edge_idx).unwrap();
                 (NodeId(node_idx), link)
             })
+            .collect()
+    }
+
+    /// Get all node IDs in the pipeline.
+    pub fn node_ids(&self) -> Vec<NodeId> {
+        self.graph
+            .graph()
+            .node_indices()
+            .map(|idx| NodeId(idx))
             .collect()
     }
 

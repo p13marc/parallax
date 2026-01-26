@@ -37,7 +37,7 @@ use crate::buffer::Buffer;
 use crate::error::{Error, Result};
 use std::cell::UnsafeCell;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(target_os = "linux")]
 use rustix::event::{EventfdFlags, eventfd};
@@ -126,7 +126,7 @@ impl EventFd {
         match rustix::io::read(&self.fd, &mut buf) {
             Ok(8) => Ok(true),
             Ok(_) => Ok(false),
-            Err(rustix::io::Errno::WOULDBLOCK | rustix::io::Errno::AGAIN) => Ok(false),
+            Err(rustix::io::Errno::WOULDBLOCK) => Ok(false),
             Err(e) => Err(Error::Io(std::io::Error::other(format!(
                 "eventfd read: {}",
                 e

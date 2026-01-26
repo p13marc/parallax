@@ -34,6 +34,7 @@ pub mod factory;
 mod graph;
 pub mod parser;
 pub mod rt_bridge;
+pub mod rt_scheduler;
 
 pub use events::{EventReceiver, EventSender, EventStream, PipelineEvent};
 pub use executor::{ExecutorConfig, PipelineExecutor, PipelineHandle};
@@ -41,3 +42,7 @@ pub use factory::ElementFactory;
 pub use graph::{DotOptions, Link, LinkId, LinkInfo, Node, NodeId, Pipeline, PipelineState};
 pub use parser::{ParsedElement, ParsedPipeline, PropertyValue, parse_pipeline};
 pub use rt_bridge::{AsyncRtBridge, BridgeConfig, EventFd, SharedBridge, shared_bridge};
+pub use rt_scheduler::{
+    ActivationRecord, BoundaryDirection, BoundaryEdge, DataThreadHandle, GraphPartition,
+    NodeStatus, RtConfig, RtScheduler, SchedulingMode,
+};

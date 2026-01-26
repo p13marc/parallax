@@ -4082,6 +4082,7 @@ dependencies = [
  "h264-reader 0.7.0",
  "iced",
  "kanal",
+ "libc",
  "libloading",
  "metrics",
  "mpeg2ts-reader",
