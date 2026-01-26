@@ -56,6 +56,91 @@ pub enum ExecutionMode {
 | Isolated | All untrusted | 21 | 21 |
 | Grouped | 2 codecs untrusted | 2-3 | 2-3 |
 
+### Hybrid Scheduling (PipeWire-inspired)
+
+Parallax uses a hybrid scheduling model inspired by PipeWire that combines:
+- **Tokio async tasks** for I/O-bound elements (network, file I/O)
+- **Dedicated RT threads** for CPU-bound, real-time-safe elements (audio/video processing)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Tokio Runtime                            │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
+│  │  TcpSrc      │  │  FileSrc     │  │  HttpSrc     │          │
+│  │  (async I/O) │  │  (async I/O) │  │  (async I/O) │          │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘          │
+│         │                 │                 │                   │
+│         ▼                 ▼                 ▼                   │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │              AsyncRtBridge (lock-free ring buffer)      │   │
+│  └─────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    RT Data Thread(s)                            │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
+│  │  Decoder     │──│  Mixer       │──│  AudioSink   │          │
+│  │  (RT-safe)   │  │  (RT-safe)   │  │  (RT-safe)   │          │
+│  └──────────────┘  └──────────────┘  └──────────────┘          │
+│                                                                 │
+│  Driver-based scheduling, deterministic latency                │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Key concepts:**
+
+- **Element Affinity**: Each element declares its scheduling affinity (`Async`, `RealTime`, or `Auto`)
+- **RT-Safety**: Elements declare `is_rt_safe()` - no allocations, no blocking in hot path
+- **Graph Partitioning**: The scheduler automatically partitions the graph and inserts bridges
+- **Driver-based Scheduling**: A driver node (timer or hardware) initiates each processing cycle
+
+```rust
+// Scheduling modes
+pub enum SchedulingMode {
+    Async,    // All in Tokio (default)
+    Hybrid,   // RT-safe nodes in RT threads, rest in Tokio
+    RealTime, // All RT-safe nodes in RT threads
+}
+
+// Configure hybrid execution
+let config = RtConfig {
+    mode: SchedulingMode::Hybrid,
+    quantum: 256,        // samples per cycle (audio)
+    rt_priority: Some(50), // SCHED_FIFO priority (requires CAP_SYS_NICE)
+    data_threads: 1,
+    bridge_capacity: 16,
+};
+
+let executor = HybridExecutor::new(config);
+executor.run(&mut pipeline).await?;
+```
+
+### Pipeline State Model (PipeWire-inspired)
+
+Parallax uses a 3-state model inspired by PipeWire:
+
+```
+Suspended <──> Idle <──> Running
+    │                        │
+    └────── Error ◄──────────┘
+```
+
+| State | Description | Resources |
+|-------|-------------|-----------|
+| **Suspended** | Minimal memory footprint | Deallocated |
+| **Idle** | Ready to process (paused) | Allocated |
+| **Running** | Actively processing data | Allocated |
+| **Error** | Unrecoverable error | Varies |
+
+**State transitions:**
+- `prepare()`: Suspended → Idle (validate, negotiate caps, allocate)
+- `activate()`: Idle → Running (start processing)
+- `pause()`: Running → Idle (stop processing, keep resources)
+- `suspend()`: Idle → Suspended (release resources)
+
+The key insight from PipeWire: "paused" and "stopped" are the same state (Idle) - the difference is just intent.
+
 ## Build Commands
 
 ```bash
@@ -121,6 +206,10 @@ parallax/
 │   ├── pipeline/           # Pipeline execution
 │   │   ├── graph.rs        # Pipeline DAG (daggy-based)
 │   │   ├── executor.rs     # PipelineExecutor (Tokio tasks + Kanal channels)
+│   │   ├── hybrid_executor.rs # HybridExecutor (async + RT threads)
+│   │   ├── rt_scheduler.rs # RT scheduler (graph partitioning, activation records)
+│   │   ├── rt_bridge.rs    # AsyncRtBridge (lock-free SPSC ring buffer + eventfd)
+│   │   ├── driver.rs       # TimerDriver, ManualDriver (PipeWire-style drivers)
 │   │   ├── parser.rs       # Pipeline string parser (winnow)
 │   │   └── factory.rs      # ElementFactory + PluginRegistry
 │   │
@@ -180,26 +269,43 @@ parallax/
 ### Key Types
 
 ```rust
+// Element affinity (for hybrid scheduling)
+pub enum Affinity {
+    Async,     // Always run in Tokio
+    RealTime,  // Always run in RT thread
+    Auto,      // Let scheduler decide based on is_rt_safe()
+}
+
 // Element traits (sync)
 pub trait Source: Send {
     fn produce(&mut self) -> Result<Option<Buffer>>;
+    fn affinity(&self) -> Affinity { Affinity::Auto }
+    fn is_rt_safe(&self) -> bool { false }
 }
 
 pub trait Sink: Send {
     fn consume(&mut self, buffer: Buffer) -> Result<()>;
+    fn affinity(&self) -> Affinity { Affinity::Auto }
+    fn is_rt_safe(&self) -> bool { false }
 }
 
 pub trait Element: Send {
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>>;
+    fn affinity(&self) -> Affinity { Affinity::Auto }
+    fn is_rt_safe(&self) -> bool { false }
 }
 
 // Element traits (async - for I/O bound operations)
 pub trait AsyncSource: Send {
     fn produce(&mut self) -> impl Future<Output = Result<Option<Buffer>>> + Send;
+    fn affinity(&self) -> Affinity { Affinity::Async }  // Default to async
+    fn is_rt_safe(&self) -> bool { false }
 }
 
 pub trait AsyncSink: Send {
     fn consume(&mut self, buffer: Buffer) -> impl Future<Output = Result<()>> + Send;
+    fn affinity(&self) -> Affinity { Affinity::Async }
+    fn is_rt_safe(&self) -> bool { false }
 }
 
 // Pipeline usage
@@ -221,6 +327,7 @@ See `docs/FINAL_DESIGN_PARALLAX.md` for full details.
 | 6 | Process Isolation (transparent auto-IPC) | ✅ Complete |
 | 7 | Plugin System (C-compatible ABI) | ✅ Complete |
 | 8 | Distribution (Zenoh) | ✅ Complete |
+| 9 | Hybrid Scheduling (PipeWire-inspired) | ✅ Complete |
 
 ### Transparent Process Isolation
 
