@@ -40,6 +40,7 @@ pub mod clock;
 pub mod element;
 pub mod elements;
 pub mod error;
+pub mod execution;
 pub mod format;
 pub mod link;
 pub mod memory;

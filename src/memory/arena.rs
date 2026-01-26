@@ -456,11 +456,10 @@ unsafe impl Sync for ArenaSlot {}
 /// │     (8 bytes)    │     (8 bytes)    │     (8 bytes)    │
 /// └──────────────────┴──────────────────┴──────────────────┘
 /// ```
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
+#[rkyv(derive(Debug))]
 pub struct IpcSlotRef {
     /// Unique ID of the arena.
     pub arena_id: u64,
