@@ -184,11 +184,18 @@ impl PipelineExecutor {
     ) {
         let children = pipeline.children(node_id);
 
-        for (child_id, _link) in children {
+        for (child_id, link) in children {
             // Create channel if not already exists
-            if !network.has_channel(node_id, child_id) {
+            if !network.has_channel(node_id, &link.src_pad, child_id, &link.sink_pad) {
                 let (tx, rx) = bounded_async::<Message>(self.config.channel_capacity);
-                network.add_channel(node_id, child_id, tx, rx);
+                network.add_channel(
+                    node_id,
+                    link.src_pad.clone(),
+                    child_id,
+                    link.sink_pad.clone(),
+                    tx,
+                    rx,
+                );
             }
 
             // Recurse to children
@@ -248,6 +255,25 @@ impl PipelineExecutor {
                         spawn_transform_task(node_name, element, inputs, outputs, events_clone);
                     tasks.push(task);
                 }
+                ElementType::Demuxer => {
+                    // Demuxers use per-pad output channels
+                    let outputs_by_pad = channels.take_outputs_by_pad(node_id);
+                    let task = spawn_demuxer_task(
+                        node_name,
+                        element,
+                        inputs,
+                        outputs_by_pad,
+                        events_clone,
+                    );
+                    tasks.push(task);
+                }
+                ElementType::Muxer => {
+                    // Muxers use per-pad input channels
+                    let inputs_by_pad = channels.take_inputs_by_pad(node_id);
+                    let task =
+                        spawn_muxer_task(node_name, element, inputs_by_pad, outputs, events_clone);
+                    tasks.push(task);
+                }
             }
         }
 
@@ -290,14 +316,17 @@ impl Default for PipelineExecutor {
     }
 }
 
+/// Key for a channel: (source_node, source_pad, sink_node, sink_pad).
+type ChannelKey = (NodeId, String, NodeId, String);
+
 /// Network of channels connecting pipeline nodes.
 struct ChannelNetwork {
-    /// Channels indexed by (src_node, sink_node).
-    channels: HashMap<(NodeId, NodeId), (AsyncSender<Message>, AsyncReceiver<Message>)>,
-    /// Output channels per node (node -> list of senders).
-    outputs: HashMap<NodeId, Vec<AsyncSender<Message>>>,
-    /// Input channels per node (node -> list of receivers).
-    inputs: HashMap<NodeId, Vec<AsyncReceiver<Message>>>,
+    /// Channels indexed by (src_node, src_pad, sink_node, sink_pad).
+    channels: HashMap<ChannelKey, (AsyncSender<Message>, AsyncReceiver<Message>)>,
+    /// Output channels per node+pad: (node, pad_name) -> list of senders.
+    outputs: HashMap<(NodeId, String), Vec<AsyncSender<Message>>>,
+    /// Input channels per node+pad: (node, pad_name) -> list of receivers.
+    inputs: HashMap<(NodeId, String), Vec<AsyncReceiver<Message>>>,
 }
 
 impl ChannelNetwork {
@@ -309,28 +338,76 @@ impl ChannelNetwork {
         }
     }
 
-    fn has_channel(&self, src: NodeId, sink: NodeId) -> bool {
-        self.channels.contains_key(&(src, sink))
+    fn has_channel(&self, src: NodeId, src_pad: &str, sink: NodeId, sink_pad: &str) -> bool {
+        self.channels
+            .contains_key(&(src, src_pad.to_string(), sink, sink_pad.to_string()))
     }
 
     fn add_channel(
         &mut self,
         src: NodeId,
+        src_pad: String,
         sink: NodeId,
+        sink_pad: String,
         tx: AsyncSender<Message>,
         rx: AsyncReceiver<Message>,
     ) {
-        self.channels.insert((src, sink), (tx.clone(), rx.clone()));
-        self.outputs.entry(src).or_default().push(tx);
-        self.inputs.entry(sink).or_default().push(rx);
+        self.channels.insert(
+            (src, src_pad.clone(), sink, sink_pad.clone()),
+            (tx.clone(), rx.clone()),
+        );
+        self.outputs.entry((src, src_pad)).or_default().push(tx);
+        self.inputs.entry((sink, sink_pad)).or_default().push(rx);
     }
 
+    /// Take all outputs for a node, grouped by pad name.
+    fn take_outputs_by_pad(&mut self, node: NodeId) -> HashMap<String, Vec<AsyncSender<Message>>> {
+        let mut result = HashMap::new();
+        let keys: Vec<_> = self
+            .outputs
+            .keys()
+            .filter(|(n, _)| *n == node)
+            .cloned()
+            .collect();
+        for (n, pad) in keys {
+            if let Some(senders) = self.outputs.remove(&(n, pad.clone())) {
+                result.insert(pad, senders);
+            }
+        }
+        result
+    }
+
+    /// Take all inputs for a node, grouped by pad name.
+    fn take_inputs_by_pad(&mut self, node: NodeId) -> HashMap<String, Vec<AsyncReceiver<Message>>> {
+        let mut result = HashMap::new();
+        let keys: Vec<_> = self
+            .inputs
+            .keys()
+            .filter(|(n, _)| *n == node)
+            .cloned()
+            .collect();
+        for (n, pad) in keys {
+            if let Some(receivers) = self.inputs.remove(&(n, pad.clone())) {
+                result.insert(pad, receivers);
+            }
+        }
+        result
+    }
+
+    /// Take all outputs for a node (flattened, for backwards compatibility).
     fn take_outputs(&mut self, node: NodeId) -> Vec<AsyncSender<Message>> {
-        self.outputs.remove(&node).unwrap_or_default()
+        self.take_outputs_by_pad(node)
+            .into_values()
+            .flatten()
+            .collect()
     }
 
+    /// Take all inputs for a node (flattened, for backwards compatibility).
     fn take_inputs(&mut self, node: NodeId) -> Vec<AsyncReceiver<Message>> {
-        self.inputs.remove(&node).unwrap_or_default()
+        self.take_inputs_by_pad(node)
+            .into_values()
+            .flatten()
+            .collect()
     }
 }
 
@@ -493,6 +570,213 @@ fn spawn_transform_task(
         }
 
         tracing::debug!("transform task '{}' finished", name);
+        events.send_node_finished(&name, buffers_processed);
+        Ok(())
+    })
+}
+
+/// Spawn a task for a demuxer element.
+///
+/// Demuxers have a single input and multiple outputs routed by pad name.
+/// The demuxer element is responsible for routing buffers to the correct output pads
+/// via `process_all()` which returns routed output.
+fn spawn_demuxer_task(
+    name: String,
+    mut element: Box<DynAsyncElement<'static>>,
+    inputs: Vec<AsyncReceiver<Message>>,
+    outputs_by_pad: HashMap<String, Vec<AsyncSender<Message>>>,
+    events: EventSender,
+) -> JoinHandle<Result<()>> {
+    tokio::spawn(async move {
+        tracing::debug!("demuxer task '{}' started", name);
+        events.send_node_started(&name);
+
+        let mut buffers_processed: u64 = 0;
+
+        // Demuxers have a single input
+        if let Some(rx) = inputs.into_iter().next() {
+            loop {
+                match rx.recv().await {
+                    Ok(Message::Buffer(buffer)) => {
+                        buffers_processed += 1;
+
+                        // Process the buffer through the demuxer
+                        // For now, use process() which returns buffers one at a time
+                        // The DemuxerAdapter handles routing internally
+                        match element.process(Some(buffer)).await {
+                            Ok(Some(out_buffer)) => {
+                                // Send to all connected pads (default "src" pad)
+                                // In future, DemuxerAdapter could carry pad info in buffer metadata
+                                for senders in outputs_by_pad.values() {
+                                    for tx in senders {
+                                        if tx
+                                            .send(Message::Buffer(out_buffer.clone()))
+                                            .await
+                                            .is_err()
+                                        {
+                                            tracing::warn!(
+                                                "demuxer '{}': downstream receiver dropped",
+                                                name
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(None) => {
+                                // Buffer was filtered/dropped
+                                tracing::trace!("demuxer '{}' filtered out buffer", name);
+                            }
+                            Err(e) => {
+                                tracing::error!("demuxer '{}' error: {}", name, e);
+                                events.send_error(e.to_string(), Some(name.clone()));
+                                return Err(e);
+                            }
+                        }
+                    }
+                    Ok(Message::Eos) => {
+                        // Forward EOS to all output pads
+                        tracing::debug!("demuxer '{}' received EOS", name);
+                        for senders in outputs_by_pad.values() {
+                            for tx in senders {
+                                let _ = tx.send(Message::Eos).await;
+                            }
+                        }
+                        break;
+                    }
+                    Err(_) => {
+                        // Channel closed, forward EOS
+                        tracing::debug!("demuxer '{}': channel closed", name);
+                        for senders in outputs_by_pad.values() {
+                            for tx in senders {
+                                let _ = tx.send(Message::Eos).await;
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        tracing::debug!("demuxer task '{}' finished", name);
+        events.send_node_finished(&name, buffers_processed);
+        Ok(())
+    })
+}
+
+/// Spawn a task for a muxer element.
+///
+/// Muxers have multiple inputs (by pad name) and a single output.
+/// Buffers are received from all input pads and combined by the muxer element.
+fn spawn_muxer_task(
+    name: String,
+    mut element: Box<DynAsyncElement<'static>>,
+    inputs_by_pad: HashMap<String, Vec<AsyncReceiver<Message>>>,
+    outputs: Vec<AsyncSender<Message>>,
+    events: EventSender,
+) -> JoinHandle<Result<()>> {
+    use futures::stream::{FuturesUnordered, StreamExt};
+
+    tokio::spawn(async move {
+        tracing::debug!("muxer task '{}' started", name);
+        events.send_node_started(&name);
+
+        let mut buffers_processed: u64 = 0;
+
+        // Flatten all receivers from all pads into a stream
+        let mut receivers: FuturesUnordered<_> = inputs_by_pad
+            .into_iter()
+            .flat_map(|(pad_name, rxs)| {
+                rxs.into_iter().map(move |rx| {
+                    let pad = pad_name.clone();
+                    async move { (pad, rx.recv().await) }
+                })
+            })
+            .collect();
+
+        let total_inputs = receivers.len();
+        let mut eos_count = 0;
+
+        while let Some((pad_name, msg)) = receivers.next().await {
+            match msg {
+                Ok(Message::Buffer(buffer)) => {
+                    buffers_processed += 1;
+                    tracing::trace!("muxer '{}' received buffer on pad '{}'", name, pad_name);
+
+                    // Process the buffer through the muxer
+                    match element.process(Some(buffer)).await {
+                        Ok(Some(out_buffer)) => {
+                            // Send output to all downstream elements
+                            for tx in &outputs {
+                                if tx.send(Message::Buffer(out_buffer.clone())).await.is_err() {
+                                    tracing::warn!("muxer '{}': downstream receiver dropped", name);
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            // Muxer is buffering, no output yet
+                            tracing::trace!("muxer '{}' buffering (no output)", name);
+                        }
+                        Err(e) => {
+                            tracing::error!("muxer '{}' error: {}", name, e);
+                            events.send_error(e.to_string(), Some(name.clone()));
+                            return Err(e);
+                        }
+                    }
+                }
+                Ok(Message::Eos) => {
+                    eos_count += 1;
+                    tracing::debug!(
+                        "muxer '{}' received EOS on pad '{}' ({}/{})",
+                        name,
+                        pad_name,
+                        eos_count,
+                        total_inputs
+                    );
+
+                    // When all inputs have sent EOS, flush and forward EOS
+                    if eos_count >= total_inputs {
+                        // Flush the muxer (send None to signal EOS)
+                        if let Ok(Some(out_buffer)) = element.process(None).await {
+                            for tx in &outputs {
+                                let _ = tx.send(Message::Buffer(out_buffer.clone())).await;
+                            }
+                        }
+
+                        // Send EOS downstream
+                        for tx in &outputs {
+                            let _ = tx.send(Message::Eos).await;
+                        }
+                        break;
+                    }
+                }
+                Err(_) => {
+                    // Channel closed for this pad
+                    eos_count += 1;
+                    tracing::debug!(
+                        "muxer '{}': channel closed on pad '{}' ({}/{})",
+                        name,
+                        pad_name,
+                        eos_count,
+                        total_inputs
+                    );
+
+                    if eos_count >= total_inputs {
+                        // Flush and forward EOS
+                        if let Ok(Some(out_buffer)) = element.process(None).await {
+                            for tx in &outputs {
+                                let _ = tx.send(Message::Buffer(out_buffer.clone())).await;
+                            }
+                        }
+                        for tx in &outputs {
+                            let _ = tx.send(Message::Eos).await;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        tracing::debug!("muxer task '{}' finished", name);
         events.send_node_finished(&name, buffers_processed);
         Ok(())
     })
@@ -672,18 +956,74 @@ mod tests {
         let node_a = NodeId(daggy::NodeIndex::new(0));
         let node_b = NodeId(daggy::NodeIndex::new(1));
 
-        assert!(!network.has_channel(node_a, node_b));
+        assert!(!network.has_channel(node_a, "src", node_b, "sink"));
 
         let (tx, rx) = bounded_async::<Message>(16);
-        network.add_channel(node_a, node_b, tx, rx);
+        network.add_channel(
+            node_a,
+            "src".to_string(),
+            node_b,
+            "sink".to_string(),
+            tx,
+            rx,
+        );
 
-        assert!(network.has_channel(node_a, node_b));
+        assert!(network.has_channel(node_a, "src", node_b, "sink"));
 
         let outputs = network.take_outputs(node_a);
         assert_eq!(outputs.len(), 1);
 
         let inputs = network.take_inputs(node_b);
         assert_eq!(inputs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_channel_network_multi_pad() {
+        let mut network = ChannelNetwork::new();
+
+        let node_a = NodeId(daggy::NodeIndex::new(0));
+        let node_b = NodeId(daggy::NodeIndex::new(1));
+        let node_c = NodeId(daggy::NodeIndex::new(2));
+
+        // Connect node_a.src_0 -> node_b.sink
+        let (tx1, rx1) = bounded_async::<Message>(16);
+        network.add_channel(
+            node_a,
+            "src_0".to_string(),
+            node_b,
+            "sink".to_string(),
+            tx1,
+            rx1,
+        );
+
+        // Connect node_a.src_1 -> node_c.sink
+        let (tx2, rx2) = bounded_async::<Message>(16);
+        network.add_channel(
+            node_a,
+            "src_1".to_string(),
+            node_c,
+            "sink".to_string(),
+            tx2,
+            rx2,
+        );
+
+        // Verify channels exist
+        assert!(network.has_channel(node_a, "src_0", node_b, "sink"));
+        assert!(network.has_channel(node_a, "src_1", node_c, "sink"));
+        assert!(!network.has_channel(node_a, "src_0", node_c, "sink"));
+
+        // Take outputs by pad
+        let outputs_by_pad = network.take_outputs_by_pad(node_a);
+        assert_eq!(outputs_by_pad.len(), 2);
+        assert!(outputs_by_pad.contains_key("src_0"));
+        assert!(outputs_by_pad.contains_key("src_1"));
+
+        // Inputs should have one each
+        let inputs_b = network.take_inputs(node_b);
+        assert_eq!(inputs_b.len(), 1);
+
+        let inputs_c = network.take_inputs(node_c);
+        assert_eq!(inputs_c.len(), 1);
     }
 
     #[tokio::test]

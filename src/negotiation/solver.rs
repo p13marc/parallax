@@ -53,10 +53,31 @@ impl std::fmt::Debug for ConverterInsertion {
 pub struct ElementCaps {
     /// Element name.
     pub name: String,
-    /// Caps for each sink (input) pad.
-    pub sink_caps: Vec<MediaCaps>,
-    /// Caps for each source (output) pad.
-    pub source_caps: Vec<MediaCaps>,
+    /// Caps for each sink (input) pad, keyed by pad name.
+    pub sink_caps: HashMap<String, MediaCaps>,
+    /// Caps for each source (output) pad, keyed by pad name.
+    pub source_caps: HashMap<String, MediaCaps>,
+}
+
+impl ElementCaps {
+    /// Create new element caps with the given name.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            sink_caps: HashMap::new(),
+            source_caps: HashMap::new(),
+        }
+    }
+
+    /// Add caps for a sink (input) pad.
+    pub fn add_sink_pad(&mut self, pad_name: impl Into<String>, caps: MediaCaps) {
+        self.sink_caps.insert(pad_name.into(), caps);
+    }
+
+    /// Add caps for a source (output) pad.
+    pub fn add_source_pad(&mut self, pad_name: impl Into<String>, caps: MediaCaps) {
+        self.source_caps.insert(pad_name.into(), caps);
+    }
 }
 
 /// Link in the pipeline graph.
@@ -66,12 +87,12 @@ pub struct LinkInfo {
     pub id: usize,
     /// Source element name.
     pub source_element: String,
-    /// Source pad index.
-    pub source_pad: usize,
+    /// Source pad name.
+    pub source_pad: String,
     /// Sink element name.
     pub sink_element: String,
-    /// Sink pad index.
-    pub sink_pad: usize,
+    /// Sink pad name.
+    pub sink_pad: String,
 }
 
 /// Solver for caps negotiation.
@@ -218,11 +239,11 @@ impl NegotiationSolver {
 
         element
             .source_caps
-            .get(link.source_pad)
+            .get(&link.source_pad)
             .cloned()
             .ok_or_else(|| {
                 NegotiationError::Internal(format!(
-                    "Source pad {} not found on element {}",
+                    "Source pad '{}' not found on element '{}'",
                     link.source_pad, link.source_element
                 ))
             })
@@ -238,11 +259,11 @@ impl NegotiationSolver {
 
         element
             .sink_caps
-            .get(link.sink_pad)
+            .get(&link.sink_pad)
             .cloned()
             .ok_or_else(|| {
                 NegotiationError::Internal(format!(
-                    "Sink pad {} not found on element {}",
+                    "Sink pad '{}' not found on element '{}'",
                     link.sink_pad, link.sink_element
                 ))
             })
@@ -285,27 +306,24 @@ mod tests {
         let mut solver = NegotiationSolver::new();
 
         // Source produces 1080p video
-        solver.add_element(ElementCaps {
-            name: "source".into(),
-            sink_caps: vec![],
-            source_caps: vec![MediaCaps::from(video_1080p())],
-        });
+        let mut source_caps = ElementCaps::new("source");
+        source_caps.add_source_pad("src", MediaCaps::from(video_1080p()));
+        solver.add_element(source_caps);
 
         // Sink accepts any video
-        solver.add_element(ElementCaps {
-            name: "sink".into(),
-            sink_caps: vec![MediaCaps::from_format(FormatCaps::VideoRaw(
-                VideoFormatCaps::any(),
-            ))],
-            source_caps: vec![],
-        });
+        let mut sink_caps = ElementCaps::new("sink");
+        sink_caps.add_sink_pad(
+            "sink",
+            MediaCaps::from_format(FormatCaps::VideoRaw(VideoFormatCaps::any())),
+        );
+        solver.add_element(sink_caps);
 
         solver.add_link(LinkInfo {
             id: 0,
             source_element: "source".into(),
-            source_pad: 0,
+            source_pad: "src".into(),
             sink_element: "sink".into(),
-            sink_pad: 0,
+            sink_pad: "sink".into(),
         });
 
         let result = solver.solve().unwrap();
@@ -322,27 +340,27 @@ mod tests {
         let mut solver = NegotiationSolver::new();
 
         // Source produces raw video
-        solver.add_element(ElementCaps {
-            name: "source".into(),
-            sink_caps: vec![],
-            source_caps: vec![MediaCaps::from_format(FormatCaps::VideoRaw(
-                VideoFormatCaps::any(),
-            ))],
-        });
+        let mut source_caps = ElementCaps::new("source");
+        source_caps.add_source_pad(
+            "src",
+            MediaCaps::from_format(FormatCaps::VideoRaw(VideoFormatCaps::any())),
+        );
+        solver.add_element(source_caps);
 
         // Sink only accepts H.264
-        solver.add_element(ElementCaps {
-            name: "sink".into(),
-            sink_caps: vec![MediaCaps::from_format(FormatCaps::Video(VideoCodec::H264))],
-            source_caps: vec![],
-        });
+        let mut sink_caps = ElementCaps::new("sink");
+        sink_caps.add_sink_pad(
+            "sink",
+            MediaCaps::from_format(FormatCaps::Video(VideoCodec::H264)),
+        );
+        solver.add_element(sink_caps);
 
         solver.add_link(LinkInfo {
             id: 0,
             source_element: "source".into(),
-            source_pad: 0,
+            source_pad: "src".into(),
             sink_element: "sink".into(),
-            sink_pad: 0,
+            sink_pad: "sink".into(),
         });
 
         let result = solver.solve();
@@ -358,31 +376,33 @@ mod tests {
         let mut solver = NegotiationSolver::new();
 
         // Source produces CPU memory
-        solver.add_element(ElementCaps {
-            name: "source".into(),
-            sink_caps: vec![],
-            source_caps: vec![MediaCaps::new(
+        let mut source_caps = ElementCaps::new("source");
+        source_caps.add_source_pad(
+            "src",
+            MediaCaps::new(
                 FormatCaps::VideoRaw(VideoFormatCaps::any()),
                 MemoryCaps::cpu_only(),
-            )],
-        });
+            ),
+        );
+        solver.add_element(source_caps);
 
         // Sink accepts CPU memory
-        solver.add_element(ElementCaps {
-            name: "sink".into(),
-            sink_caps: vec![MediaCaps::new(
+        let mut sink_caps = ElementCaps::new("sink");
+        sink_caps.add_sink_pad(
+            "sink",
+            MediaCaps::new(
                 FormatCaps::VideoRaw(VideoFormatCaps::any()),
                 MemoryCaps::cpu_only(),
-            )],
-            source_caps: vec![],
-        });
+            ),
+        );
+        solver.add_element(sink_caps);
 
         solver.add_link(LinkInfo {
             id: 0,
             source_element: "source".into(),
-            source_pad: 0,
+            source_pad: "src".into(),
             sink_element: "sink".into(),
-            sink_pad: 0,
+            sink_pad: "sink".into(),
         });
 
         let result = solver.solve().unwrap();
@@ -397,44 +417,42 @@ mod tests {
         let format = video_1080p();
 
         // source -> filter -> sink
-        solver.add_element(ElementCaps {
-            name: "source".into(),
-            sink_caps: vec![],
-            source_caps: vec![MediaCaps::from(format.clone())],
-        });
+        let mut source_caps = ElementCaps::new("source");
+        source_caps.add_source_pad("src", MediaCaps::from(format.clone()));
+        solver.add_element(source_caps);
 
-        solver.add_element(ElementCaps {
-            name: "filter".into(),
-            sink_caps: vec![MediaCaps::from_format(FormatCaps::VideoRaw(
-                VideoFormatCaps::any(),
-            ))],
-            source_caps: vec![MediaCaps::from_format(FormatCaps::VideoRaw(
-                VideoFormatCaps::any(),
-            ))],
-        });
+        let mut filter_caps = ElementCaps::new("filter");
+        filter_caps.add_sink_pad(
+            "sink",
+            MediaCaps::from_format(FormatCaps::VideoRaw(VideoFormatCaps::any())),
+        );
+        filter_caps.add_source_pad(
+            "src",
+            MediaCaps::from_format(FormatCaps::VideoRaw(VideoFormatCaps::any())),
+        );
+        solver.add_element(filter_caps);
 
-        solver.add_element(ElementCaps {
-            name: "sink".into(),
-            sink_caps: vec![MediaCaps::from_format(FormatCaps::VideoRaw(
-                VideoFormatCaps::any(),
-            ))],
-            source_caps: vec![],
-        });
+        let mut sink_caps = ElementCaps::new("sink");
+        sink_caps.add_sink_pad(
+            "sink",
+            MediaCaps::from_format(FormatCaps::VideoRaw(VideoFormatCaps::any())),
+        );
+        solver.add_element(sink_caps);
 
         solver.add_link(LinkInfo {
             id: 0,
             source_element: "source".into(),
-            source_pad: 0,
+            source_pad: "src".into(),
             sink_element: "filter".into(),
-            sink_pad: 0,
+            sink_pad: "sink".into(),
         });
 
         solver.add_link(LinkInfo {
             id: 1,
             source_element: "filter".into(),
-            source_pad: 0,
+            source_pad: "src".into(),
             sink_element: "sink".into(),
-            sink_pad: 0,
+            sink_pad: "sink".into(),
         });
 
         let result = solver.solve().unwrap();
@@ -449,9 +467,9 @@ mod tests {
         solver.add_link(LinkInfo {
             id: 0,
             source_element: "nonexistent".into(),
-            source_pad: 0,
+            source_pad: "src".into(),
             sink_element: "sink".into(),
-            sink_pad: 0,
+            sink_pad: "sink".into(),
         });
 
         let result = solver.solve();
@@ -459,5 +477,68 @@ mod tests {
             result.unwrap_err(),
             NegotiationError::ElementNotFound { .. }
         ));
+    }
+
+    #[test]
+    fn test_solver_multi_output_element() {
+        let mut solver = NegotiationSolver::new();
+
+        // Source with multiple outputs (like a demuxer)
+        let mut demux_caps = ElementCaps::new("demux");
+        demux_caps.add_sink_pad("sink", MediaCaps::any());
+        demux_caps.add_source_pad(
+            "video",
+            MediaCaps::from_format(FormatCaps::VideoRaw(VideoFormatCaps::any())),
+        );
+        demux_caps.add_source_pad(
+            "audio",
+            MediaCaps::from_format(FormatCaps::Audio(crate::format::AudioCodec::Aac)),
+        );
+        solver.add_element(demux_caps);
+
+        // Video sink
+        let mut video_sink = ElementCaps::new("video_sink");
+        video_sink.add_sink_pad(
+            "sink",
+            MediaCaps::from_format(FormatCaps::VideoRaw(VideoFormatCaps::any())),
+        );
+        solver.add_element(video_sink);
+
+        // Audio sink
+        let mut audio_sink = ElementCaps::new("audio_sink");
+        audio_sink.add_sink_pad(
+            "sink",
+            MediaCaps::from_format(FormatCaps::Audio(crate::format::AudioCodec::Aac)),
+        );
+        solver.add_element(audio_sink);
+
+        // Link video output
+        solver.add_link(LinkInfo {
+            id: 0,
+            source_element: "demux".into(),
+            source_pad: "video".into(),
+            sink_element: "video_sink".into(),
+            sink_pad: "sink".into(),
+        });
+
+        // Link audio output
+        solver.add_link(LinkInfo {
+            id: 1,
+            source_element: "demux".into(),
+            source_pad: "audio".into(),
+            sink_element: "audio_sink".into(),
+            sink_pad: "sink".into(),
+        });
+
+        let result = solver.solve().unwrap();
+        assert_eq!(result.link_caps.len(), 2);
+
+        // Check video link negotiated correctly
+        let video_link = result.link_caps.get(&0).unwrap();
+        assert!(matches!(video_link.format, MediaFormat::VideoRaw(_)));
+
+        // Check audio link negotiated correctly
+        let audio_link = result.link_caps.get(&1).unwrap();
+        assert!(matches!(audio_link.format, MediaFormat::Audio(_)));
     }
 }

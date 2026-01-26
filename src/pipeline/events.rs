@@ -3,6 +3,8 @@
 //! Events are emitted by the pipeline during execution and can be
 //! received asynchronously by the caller.
 
+use crate::element::PadDirection;
+use crate::format::Caps;
 use std::fmt;
 use tokio::sync::broadcast;
 
@@ -71,6 +73,72 @@ pub enum PipelineEvent {
         /// Event payload (opaque bytes).
         payload: Vec<u8>,
     },
+
+    /// A new pad was added to an element.
+    ///
+    /// This event is emitted when a demuxer or other dynamic element
+    /// creates a new output pad at runtime.
+    PadAdded {
+        /// The node that has the new pad.
+        node: String,
+        /// The name of the new pad.
+        pad_name: String,
+        /// The direction of the pad (Input or Output).
+        direction: PadDirection,
+        /// The caps (format) of the new pad.
+        caps: Caps,
+    },
+
+    /// A pad was removed from an element.
+    ///
+    /// This event is emitted when a dynamic pad is removed from an element.
+    PadRemoved {
+        /// The node that had the pad removed.
+        node: String,
+        /// The name of the removed pad.
+        pad_name: String,
+        /// The direction of the pad (Input or Output).
+        direction: PadDirection,
+    },
+
+    /// A link was dynamically created between pads.
+    ///
+    /// This event is emitted when pads are connected at runtime.
+    LinkCreated {
+        /// Source node name.
+        source_node: String,
+        /// Source pad name.
+        source_pad: String,
+        /// Sink node name.
+        sink_node: String,
+        /// Sink pad name.
+        sink_pad: String,
+    },
+
+    /// A link was dynamically removed.
+    ///
+    /// This event is emitted when a connection is removed at runtime.
+    LinkRemoved {
+        /// Source node name.
+        source_node: String,
+        /// Source pad name.
+        source_pad: String,
+        /// Sink node name.
+        sink_node: String,
+        /// Sink pad name.
+        sink_pad: String,
+    },
+
+    /// Re-negotiation is required.
+    ///
+    /// This event is emitted when the pipeline needs to re-negotiate
+    /// caps due to dynamic changes (e.g., new pads added).
+    NegotiationRequired {
+        /// The node that triggered the re-negotiation.
+        node: String,
+        /// Reason for re-negotiation.
+        reason: String,
+    },
 }
 
 impl fmt::Display for PipelineEvent {
@@ -108,6 +176,48 @@ impl fmt::Display for PipelineEvent {
             }
             PipelineEvent::Custom { name, payload } => {
                 write!(f, "Custom event '{}' ({} bytes)", name, payload.len())
+            }
+            PipelineEvent::PadAdded {
+                node,
+                pad_name,
+                direction,
+                caps: _,
+            } => {
+                write!(f, "Pad added: {}.{} ({:?})", node, pad_name, direction)
+            }
+            PipelineEvent::PadRemoved {
+                node,
+                pad_name,
+                direction,
+            } => {
+                write!(f, "Pad removed: {}.{} ({:?})", node, pad_name, direction)
+            }
+            PipelineEvent::LinkCreated {
+                source_node,
+                source_pad,
+                sink_node,
+                sink_pad,
+            } => {
+                write!(
+                    f,
+                    "Link created: {}.{} -> {}.{}",
+                    source_node, source_pad, sink_node, sink_pad
+                )
+            }
+            PipelineEvent::LinkRemoved {
+                source_node,
+                source_pad,
+                sink_node,
+                sink_pad,
+            } => {
+                write!(
+                    f,
+                    "Link removed: {}.{} -> {}.{}",
+                    source_node, source_pad, sink_node, sink_pad
+                )
+            }
+            PipelineEvent::NegotiationRequired { node, reason } => {
+                write!(f, "Re-negotiation required ({}): {}", node, reason)
             }
         }
     }
@@ -164,6 +274,76 @@ impl EventSender {
         self.send(PipelineEvent::NodeFinished {
             node: node.into(),
             buffers_processed,
+        });
+    }
+
+    /// Send a pad added event.
+    pub fn send_pad_added(
+        &self,
+        node: impl Into<String>,
+        pad_name: impl Into<String>,
+        direction: PadDirection,
+        caps: Caps,
+    ) {
+        self.send(PipelineEvent::PadAdded {
+            node: node.into(),
+            pad_name: pad_name.into(),
+            direction,
+            caps,
+        });
+    }
+
+    /// Send a pad removed event.
+    pub fn send_pad_removed(
+        &self,
+        node: impl Into<String>,
+        pad_name: impl Into<String>,
+        direction: PadDirection,
+    ) {
+        self.send(PipelineEvent::PadRemoved {
+            node: node.into(),
+            pad_name: pad_name.into(),
+            direction,
+        });
+    }
+
+    /// Send a link created event.
+    pub fn send_link_created(
+        &self,
+        source_node: impl Into<String>,
+        source_pad: impl Into<String>,
+        sink_node: impl Into<String>,
+        sink_pad: impl Into<String>,
+    ) {
+        self.send(PipelineEvent::LinkCreated {
+            source_node: source_node.into(),
+            source_pad: source_pad.into(),
+            sink_node: sink_node.into(),
+            sink_pad: sink_pad.into(),
+        });
+    }
+
+    /// Send a link removed event.
+    pub fn send_link_removed(
+        &self,
+        source_node: impl Into<String>,
+        source_pad: impl Into<String>,
+        sink_node: impl Into<String>,
+        sink_pad: impl Into<String>,
+    ) {
+        self.send(PipelineEvent::LinkRemoved {
+            source_node: source_node.into(),
+            source_pad: source_pad.into(),
+            sink_node: sink_node.into(),
+            sink_pad: sink_pad.into(),
+        });
+    }
+
+    /// Send a negotiation required event.
+    pub fn send_negotiation_required(&self, node: impl Into<String>, reason: impl Into<String>) {
+        self.send(PipelineEvent::NegotiationRequired {
+            node: node.into(),
+            reason: reason.into(),
         });
     }
 

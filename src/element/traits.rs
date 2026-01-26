@@ -664,6 +664,90 @@ pub trait Demuxer: Send {
     fn on_pad_added(&mut self, callback: PadAddedCallback);
 }
 
+/// Input from a specific pad for muxers.
+#[derive(Debug)]
+pub struct MuxerInput {
+    /// The pad ID this buffer came from.
+    pub pad: PadId,
+    /// The buffer data.
+    pub buffer: Buffer,
+}
+
+impl MuxerInput {
+    /// Create a new muxer input.
+    pub fn new(pad: PadId, buffer: Buffer) -> Self {
+        Self { pad, buffer }
+    }
+}
+
+/// A muxer element that combines multiple input pads into one output.
+///
+/// Muxers are used for combining multiple streams into a single stream
+/// (e.g., combining video and audio into a container format).
+///
+/// # Dynamic Pads
+///
+/// Muxers can have dynamic input pads that are created at runtime.
+/// Use `on_pad_added` to receive notifications.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// struct MyMuxer {
+///     inputs: Vec<(PadId, Caps)>,
+///     callback: Option<PadAddedCallback>,
+/// }
+///
+/// impl Muxer for MyMuxer {
+///     fn mux(&mut self, input: MuxerInput) -> Result<Option<Buffer>> {
+///         // Combine inputs and produce output
+///         // Return Some(buffer) when ready to output
+///         Ok(Some(input.buffer))
+///     }
+///
+///     fn inputs(&self) -> &[(PadId, Caps)] {
+///         &self.inputs
+///     }
+///
+///     fn on_pad_added(&mut self, callback: PadAddedCallback) {
+///         self.callback = Some(callback);
+///     }
+/// }
+/// ```
+pub trait Muxer: Send {
+    /// Accept a buffer from an input pad and optionally produce output.
+    ///
+    /// The muxer receives buffers from multiple input pads and combines them.
+    /// It returns `Some(buffer)` when it has produced an output buffer,
+    /// or `None` if it's still waiting for more data.
+    fn mux(&mut self, input: MuxerInput) -> Result<Option<Buffer>>;
+
+    /// Get the name of this muxer (for debugging/logging).
+    fn name(&self) -> &str {
+        std::any::type_name::<Self>()
+    }
+
+    /// Get the current input pads and their formats.
+    fn inputs(&self) -> &[(PadId, Caps)];
+
+    /// Get the output caps (what format this muxer produces).
+    fn output_caps(&self) -> Caps {
+        Caps::any()
+    }
+
+    /// Register a callback for when new input pads are added.
+    ///
+    /// This is called when the muxer accepts a new input stream.
+    fn on_pad_added(&mut self, callback: PadAddedCallback);
+
+    /// Flush the muxer and produce any remaining output.
+    ///
+    /// Called when EOS is received on all input pads.
+    fn flush(&mut self) -> Result<Option<Buffer>> {
+        Ok(None)
+    }
+}
+
 // ============================================================================
 // Dynamic Async Element (Type-Erased)
 // ============================================================================
@@ -677,6 +761,10 @@ pub enum ElementType {
     Sink,
     /// A transform element (transforms buffers).
     Transform,
+    /// A demuxer element (one input, multiple outputs).
+    Demuxer,
+    /// A muxer element (multiple inputs, one output).
+    Muxer,
 }
 
 /// Async dynamic (type-erased) element trait for pipeline execution.
@@ -1094,6 +1182,207 @@ impl<T: AsyncTransform + Send + 'static> SendAsyncElementDyn for AsyncTransformA
     }
 }
 
+// ============================================================================
+// Adapters for Demuxer/Muxer -> AsyncElementDyn
+// ============================================================================
+
+/// Wrapper to adapt a [`Demuxer`] to [`AsyncElementDyn`].
+///
+/// Demuxers process a single input stream and route buffers to multiple output pads.
+/// The adapter stores routed output and returns buffers one at a time via `process()`.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use parallax::element::DemuxerAdapter;
+///
+/// struct MyDemuxer { /* ... */ }
+/// impl Demuxer for MyDemuxer { /* ... */ }
+///
+/// let demuxer = MyDemuxer::new();
+/// let adapter = DemuxerAdapter::new(demuxer);
+/// ```
+pub struct DemuxerAdapter<D: Demuxer> {
+    inner: D,
+    /// Pending routed outputs to return.
+    pending: Vec<(PadId, Buffer)>,
+}
+
+impl<D: Demuxer> DemuxerAdapter<D> {
+    /// Create a new demuxer adapter.
+    pub fn new(demuxer: D) -> Self {
+        Self {
+            inner: demuxer,
+            pending: Vec::new(),
+        }
+    }
+
+    /// Get a reference to the inner demuxer.
+    pub fn inner(&self) -> &D {
+        &self.inner
+    }
+
+    /// Get a mutable reference to the inner demuxer.
+    pub fn inner_mut(&mut self) -> &mut D {
+        &mut self.inner
+    }
+}
+
+impl<D: Demuxer + Send + 'static> SendAsyncElementDyn for DemuxerAdapter<D> {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn element_type(&self) -> ElementType {
+        ElementType::Demuxer
+    }
+
+    async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
+        // First return any pending buffers
+        if !self.pending.is_empty() {
+            let (_, buffer) = self.pending.remove(0);
+            return Ok(Some(buffer));
+        }
+
+        match input {
+            Some(buffer) => {
+                let routed = self.inner.demux(buffer)?;
+                let mut iter = routed.into_iter();
+
+                // Return the first buffer, store the rest
+                if let Some((_, first_buffer)) = iter.next() {
+                    self.pending.extend(iter);
+                    Ok(Some(first_buffer))
+                } else {
+                    Ok(None)
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn process_all(&mut self, input: Option<Buffer>) -> Result<Output> {
+        // Return pending first
+        if !self.pending.is_empty() {
+            let pending: Vec<Buffer> = std::mem::take(&mut self.pending)
+                .into_iter()
+                .map(|(_, b)| b)
+                .collect();
+            return Ok(Output::from(pending));
+        }
+
+        match input {
+            Some(buffer) => {
+                let routed = self.inner.demux(buffer)?;
+                let buffers: Vec<Buffer> = routed.into_iter().map(|(_, b)| b).collect();
+                Ok(Output::from(buffers))
+            }
+            None => Ok(Output::None),
+        }
+    }
+
+    fn input_caps(&self) -> Caps {
+        self.inner.input_caps()
+    }
+
+    fn output_caps(&self) -> Caps {
+        // For demuxers, output caps is the union of all output pad caps
+        // For now, return Any - proper per-pad caps are accessed via outputs()
+        Caps::any()
+    }
+}
+
+/// Wrapper to adapt a [`Muxer`] to [`AsyncElementDyn`].
+///
+/// Muxers accept buffers from multiple input pads and combine them into a single output.
+/// The adapter tracks which pad buffers come from based on buffer metadata.
+///
+/// # Note
+///
+/// Since the standard `process()` interface doesn't carry pad information,
+/// muxers used through this adapter will receive all inputs on PadId(0).
+/// For proper multi-pad muxing, use the executor's native muxer support.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use parallax::element::MuxerAdapter;
+///
+/// struct MyMuxer { /* ... */ }
+/// impl Muxer for MyMuxer { /* ... */ }
+///
+/// let muxer = MyMuxer::new();
+/// let adapter = MuxerAdapter::new(muxer);
+/// ```
+pub struct MuxerAdapter<M: Muxer> {
+    inner: M,
+    /// Counter to generate pad IDs from input order.
+    input_counter: u32,
+}
+
+impl<M: Muxer> MuxerAdapter<M> {
+    /// Create a new muxer adapter.
+    pub fn new(muxer: M) -> Self {
+        Self {
+            inner: muxer,
+            input_counter: 0,
+        }
+    }
+
+    /// Get a reference to the inner muxer.
+    pub fn inner(&self) -> &M {
+        &self.inner
+    }
+
+    /// Get a mutable reference to the inner muxer.
+    pub fn inner_mut(&mut self) -> &mut M {
+        &mut self.inner
+    }
+}
+
+impl<M: Muxer + Send + 'static> SendAsyncElementDyn for MuxerAdapter<M> {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn element_type(&self) -> ElementType {
+        ElementType::Muxer
+    }
+
+    async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
+        match input {
+            Some(buffer) => {
+                // When used through the generic adapter, we don't have pad info
+                // Use a simple counter as pad ID
+                let pad = PadId(self.input_counter);
+                self.input_counter = self.input_counter.wrapping_add(1);
+
+                self.inner.mux(MuxerInput::new(pad, buffer))
+            }
+            None => {
+                // EOS - flush the muxer
+                self.inner.flush()
+            }
+        }
+    }
+
+    async fn process_all(&mut self, input: Option<Buffer>) -> Result<Output> {
+        AsyncElementDyn::process(self, input)
+            .await
+            .map(Output::from)
+    }
+
+    fn input_caps(&self) -> Caps {
+        // For muxers, input caps is the union of all input pad caps
+        // For now, return Any - proper per-pad caps are accessed via inputs()
+        Caps::any()
+    }
+
+    fn output_caps(&self) -> Caps {
+        self.inner.output_caps()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1315,5 +1604,116 @@ mod tests {
             assert_eq!(pad.0, 0);
             assert_eq!(buf.metadata().sequence, 42);
         }
+    }
+
+    #[test]
+    fn test_muxer_input() {
+        let segment = Arc::new(HeapSegment::new(8).unwrap());
+        let handle = MemoryHandle::from_segment(segment);
+        let buffer = Buffer::new(handle, Metadata::from_sequence(42));
+
+        let input = MuxerInput::new(PadId(3), buffer);
+        assert_eq!(input.pad.0, 3);
+        assert_eq!(input.buffer.metadata().sequence, 42);
+    }
+
+    #[test]
+    fn test_element_type_variants() {
+        // Test all ElementType variants
+        assert_eq!(format!("{:?}", ElementType::Source), "Source");
+        assert_eq!(format!("{:?}", ElementType::Sink), "Sink");
+        assert_eq!(format!("{:?}", ElementType::Transform), "Transform");
+        assert_eq!(format!("{:?}", ElementType::Demuxer), "Demuxer");
+        assert_eq!(format!("{:?}", ElementType::Muxer), "Muxer");
+
+        // Test equality
+        assert_eq!(ElementType::Source, ElementType::Source);
+        assert_ne!(ElementType::Source, ElementType::Sink);
+        assert_ne!(ElementType::Demuxer, ElementType::Muxer);
+    }
+
+    // Test demuxer adapter
+    struct TestDemuxer {
+        outputs: Vec<(PadId, Caps)>,
+    }
+
+    impl Demuxer for TestDemuxer {
+        fn demux(&mut self, buffer: Buffer) -> Result<RoutedOutput> {
+            // Route all buffers to pad 0
+            Ok(RoutedOutput::single(PadId(0), buffer))
+        }
+
+        fn outputs(&self) -> &[(PadId, Caps)] {
+            &self.outputs
+        }
+
+        fn on_pad_added(&mut self, _callback: PadAddedCallback) {}
+    }
+
+    #[tokio::test]
+    async fn test_demuxer_adapter() {
+        let demuxer = TestDemuxer {
+            outputs: vec![(PadId(0), Caps::any())],
+        };
+        let mut adapter = DemuxerAdapter::new(demuxer);
+
+        assert_eq!(
+            AsyncElementDyn::element_type(&adapter),
+            ElementType::Demuxer
+        );
+
+        let segment = Arc::new(HeapSegment::new(8).unwrap());
+        let handle = MemoryHandle::from_segment(segment);
+        let buffer = Buffer::new(handle, Metadata::from_sequence(42));
+
+        let result = AsyncElementDyn::process(&mut adapter, Some(buffer))
+            .await
+            .unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().metadata().sequence, 42);
+    }
+
+    // Test muxer adapter
+    struct TestMuxer {
+        inputs: Vec<(PadId, Caps)>,
+        buffer_count: u32,
+    }
+
+    impl Muxer for TestMuxer {
+        fn mux(&mut self, input: MuxerInput) -> Result<Option<Buffer>> {
+            self.buffer_count += 1;
+            // Pass through the buffer
+            Ok(Some(input.buffer))
+        }
+
+        fn inputs(&self) -> &[(PadId, Caps)] {
+            &self.inputs
+        }
+
+        fn on_pad_added(&mut self, _callback: PadAddedCallback) {}
+    }
+
+    #[tokio::test]
+    async fn test_muxer_adapter() {
+        let muxer = TestMuxer {
+            inputs: vec![(PadId(0), Caps::any()), (PadId(1), Caps::any())],
+            buffer_count: 0,
+        };
+        let mut adapter = MuxerAdapter::new(muxer);
+
+        assert_eq!(AsyncElementDyn::element_type(&adapter), ElementType::Muxer);
+
+        let segment = Arc::new(HeapSegment::new(8).unwrap());
+        let handle = MemoryHandle::from_segment(segment);
+        let buffer = Buffer::new(handle, Metadata::from_sequence(42));
+
+        let result = AsyncElementDyn::process(&mut adapter, Some(buffer))
+            .await
+            .unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().metadata().sequence, 42);
+
+        // Verify the muxer received a buffer
+        assert_eq!(adapter.inner().buffer_count, 1);
     }
 }

@@ -7,7 +7,8 @@
 //! - [`Element`]: Transforms buffers (e.g., filter, encoder)
 //! - [`Transform`]: Modern transform trait with multi-output support
 //! - [`AsyncSource`], [`AsyncSink`], [`AsyncTransform`]: Async versions
-//! - [`Demuxer`]: Routes input to multiple output pads
+//! - [`Demuxer`]: Routes input to multiple output pads (1-to-N)
+//! - [`Muxer`]: Combines multiple input pads into one output (N-to-1)
 //!
 //! # Design
 //!
@@ -26,6 +27,8 @@
 //! | `AsyncSink` | [`AsyncSinkAdapter`] |
 //! | `Transform` (sync) | [`TransformAdapter`] |
 //! | `AsyncTransform` | [`AsyncTransformAdapter`] |
+//! | `Demuxer` | [`DemuxerAdapter`] |
+//! | `Muxer` | [`MuxerAdapter`] |
 //!
 //! # Output Types
 //!
@@ -79,11 +82,15 @@ pub use traits::{
     AsyncTransformAdapter,
     // Sync element traits
     Demuxer,
+    DemuxerAdapter,
     DynAsyncElement,
     Element,
     ElementAdapter,
     // Supporting types
     ElementType,
+    Muxer,
+    MuxerAdapter,
+    MuxerInput,
     Output,
     OutputIter,
     PadAddedCallback,

@@ -106,6 +106,10 @@ impl Node {
             ElementType::Source => (vec![], vec![Pad::src()]),
             ElementType::Sink => (vec![Pad::sink()], vec![]),
             ElementType::Transform => (vec![Pad::sink()], vec![Pad::src()]),
+            // Demuxers have one input and multiple outputs (pads created dynamically)
+            ElementType::Demuxer => (vec![Pad::sink()], vec![Pad::src()]),
+            // Muxers have multiple inputs and one output (pads created dynamically)
+            ElementType::Muxer => (vec![Pad::sink()], vec![Pad::src()]),
         };
 
         Self {
@@ -174,6 +178,44 @@ impl Node {
     pub fn add_output_pad(&mut self, pad: Pad) {
         debug_assert!(pad.is_output());
         self.output_pads.push(pad);
+    }
+
+    /// Add an input pad.
+    pub fn add_input_pad(&mut self, pad: Pad) {
+        debug_assert!(pad.is_input());
+        self.input_pads.push(pad);
+    }
+
+    /// Remove an output pad by name.
+    ///
+    /// Returns the removed pad if found.
+    pub fn remove_output_pad(&mut self, name: &str) -> Option<Pad> {
+        if let Some(pos) = self.output_pads.iter().position(|p| p.name() == name) {
+            Some(self.output_pads.remove(pos))
+        } else {
+            None
+        }
+    }
+
+    /// Remove an input pad by name.
+    ///
+    /// Returns the removed pad if found.
+    pub fn remove_input_pad(&mut self, name: &str) -> Option<Pad> {
+        if let Some(pos) = self.input_pads.iter().position(|p| p.name() == name) {
+            Some(self.input_pads.remove(pos))
+        } else {
+            None
+        }
+    }
+
+    /// Get an output pad by name.
+    pub fn get_output_pad(&self, name: &str) -> Option<&Pad> {
+        self.output_pads.iter().find(|p| p.name() == name)
+    }
+
+    /// Get an input pad by name.
+    pub fn get_input_pad(&self, name: &str) -> Option<&Pad> {
+        self.input_pads.iter().find(|p| p.name() == name)
     }
 }
 
@@ -343,6 +385,9 @@ impl Pipeline {
         self.graph
             .add_edge(src.0, sink.0, link)
             .map_err(|_| Error::InvalidSegment("linking would create a cycle".into()))?;
+
+        // Invalidate negotiation since the graph has changed
+        self.negotiation = None;
 
         Ok(())
     }
@@ -658,13 +703,14 @@ impl Pipeline {
         for (link_idx, edge) in self.graph.graph().edge_references().enumerate() {
             let src_node = self.graph.node_weight(edge.source()).unwrap();
             let sink_node = self.graph.node_weight(edge.target()).unwrap();
+            let link = edge.weight();
 
             solver.add_link(NegLinkInfo {
                 id: link_idx,
                 source_element: src_node.name().to_string(),
-                source_pad: 0, // TODO: map pad names to indices
+                source_pad: link.src_pad.clone(),
                 sink_element: sink_node.name().to_string(),
-                sink_pad: 0,
+                sink_pad: link.sink_pad.clone(),
             });
         }
 
@@ -682,26 +728,209 @@ impl Pipeline {
         use crate::format::MediaCaps;
 
         // Convert Caps to MediaCaps
-        let to_media_caps = |caps: &Caps| -> Vec<MediaCaps> {
+        let to_media_caps = |caps: &Caps| -> MediaCaps {
             if caps.is_any() {
-                vec![MediaCaps::any()]
+                MediaCaps::any()
+            } else if let Some(first) = caps.formats().first() {
+                MediaCaps::from(first.clone())
             } else {
-                caps.formats()
-                    .iter()
-                    .map(|f| MediaCaps::from(f.clone()))
-                    .collect()
+                MediaCaps::any()
             }
         };
 
-        // Use cached caps from the node
-        let sink_caps = to_media_caps(node.input_caps());
-        let source_caps = to_media_caps(node.output_caps());
+        let mut element_caps = ElementCaps::new(node.name());
 
-        Ok(ElementCaps {
-            name: node.name().to_string(),
-            sink_caps,
-            source_caps,
-        })
+        // For now, use default pad names "sink" and "src"
+        // TODO: In the future, iterate over actual pads from the node
+        // and collect caps per-pad using element.output_caps_for_pad(pad_name)
+
+        // Add sink pad caps (input)
+        let input_caps = node.input_caps();
+        if !input_caps.is_any() || node.element_type() != ElementType::Source {
+            element_caps.add_sink_pad("sink", to_media_caps(input_caps));
+        }
+
+        // Add source pad caps (output)
+        let output_caps = node.output_caps();
+        if !output_caps.is_any() || node.element_type() != ElementType::Sink {
+            element_caps.add_source_pad("src", to_media_caps(output_caps));
+        }
+
+        Ok(element_caps)
+    }
+
+    // ========================================================================
+    // Dynamic Pad Management
+    // ========================================================================
+
+    /// Add an output pad to a node at runtime.
+    ///
+    /// This is used by demuxers and other elements that create pads dynamically.
+    /// After adding a pad, you can link it to downstream elements.
+    ///
+    /// **Note**: Adding a pad invalidates any previous negotiation. Call
+    /// `negotiate()` again after linking the new pad.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use parallax::pipeline::Pipeline;
+    /// use parallax::element::Pad;
+    ///
+    /// let mut pipeline = Pipeline::new();
+    /// let demuxer = pipeline.add_node("demux", my_demuxer);
+    ///
+    /// // Later, when the demuxer discovers a new stream:
+    /// pipeline.add_output_pad(demuxer, Pad::src_named("video_0"))?;
+    /// ```
+    pub fn add_output_pad(&mut self, node_id: NodeId, pad: Pad) -> Result<()> {
+        let node = self
+            .get_node_mut(node_id)
+            .ok_or_else(|| Error::InvalidSegment(format!("Node {:?} not found", node_id)))?;
+
+        if !pad.is_output() {
+            return Err(Error::InvalidSegment(
+                "Cannot add input pad as output pad".into(),
+            ));
+        }
+
+        // Check for duplicate pad name
+        if node.get_output_pad(pad.name()).is_some() {
+            return Err(Error::InvalidSegment(format!(
+                "Output pad '{}' already exists on node '{}'",
+                pad.name(),
+                node.name()
+            )));
+        }
+
+        node.add_output_pad(pad);
+
+        // Invalidate negotiation since the graph has changed
+        self.negotiation = None;
+
+        Ok(())
+    }
+
+    /// Add an input pad to a node at runtime.
+    ///
+    /// This is used by muxers and other elements that accept dynamic inputs.
+    /// After adding a pad, upstream elements can link to it.
+    ///
+    /// **Note**: Adding a pad invalidates any previous negotiation. Call
+    /// `negotiate()` again after linking the new pad.
+    pub fn add_input_pad(&mut self, node_id: NodeId, pad: Pad) -> Result<()> {
+        let node = self
+            .get_node_mut(node_id)
+            .ok_or_else(|| Error::InvalidSegment(format!("Node {:?} not found", node_id)))?;
+
+        if !pad.is_input() {
+            return Err(Error::InvalidSegment(
+                "Cannot add output pad as input pad".into(),
+            ));
+        }
+
+        // Check for duplicate pad name
+        if node.get_input_pad(pad.name()).is_some() {
+            return Err(Error::InvalidSegment(format!(
+                "Input pad '{}' already exists on node '{}'",
+                pad.name(),
+                node.name()
+            )));
+        }
+
+        node.add_input_pad(pad);
+
+        // Invalidate negotiation since the graph has changed
+        self.negotiation = None;
+
+        Ok(())
+    }
+
+    /// Remove an output pad from a node.
+    ///
+    /// This also removes any links connected to the pad.
+    /// Returns the removed pad if found.
+    pub fn remove_output_pad(&mut self, node_id: NodeId, pad_name: &str) -> Result<Option<Pad>> {
+        // First, remove any links connected to this pad
+        self.remove_links_for_pad(node_id, pad_name, true)?;
+
+        let node = self
+            .get_node_mut(node_id)
+            .ok_or_else(|| Error::InvalidSegment(format!("Node {:?} not found", node_id)))?;
+
+        let pad = node.remove_output_pad(pad_name);
+
+        if pad.is_some() {
+            // Invalidate negotiation since the graph has changed
+            self.negotiation = None;
+        }
+
+        Ok(pad)
+    }
+
+    /// Remove an input pad from a node.
+    ///
+    /// This also removes any links connected to the pad.
+    /// Returns the removed pad if found.
+    pub fn remove_input_pad(&mut self, node_id: NodeId, pad_name: &str) -> Result<Option<Pad>> {
+        // First, remove any links connected to this pad
+        self.remove_links_for_pad(node_id, pad_name, false)?;
+
+        let node = self
+            .get_node_mut(node_id)
+            .ok_or_else(|| Error::InvalidSegment(format!("Node {:?} not found", node_id)))?;
+
+        let pad = node.remove_input_pad(pad_name);
+
+        if pad.is_some() {
+            // Invalidate negotiation since the graph has changed
+            self.negotiation = None;
+        }
+
+        Ok(pad)
+    }
+
+    /// Remove all links connected to a specific pad.
+    fn remove_links_for_pad(
+        &mut self,
+        node_id: NodeId,
+        pad_name: &str,
+        is_output: bool,
+    ) -> Result<()> {
+        // Collect edges to remove
+        let edges_to_remove: Vec<_> = self
+            .graph
+            .graph()
+            .edge_references()
+            .filter(|edge| {
+                let link = edge.weight();
+                if is_output {
+                    edge.source() == node_id.0 && link.src_pad == pad_name
+                } else {
+                    edge.target() == node_id.0 && link.sink_pad == pad_name
+                }
+            })
+            .map(|edge| edge.id())
+            .collect();
+
+        // Remove the edges
+        for edge_id in edges_to_remove {
+            self.graph.remove_edge(edge_id);
+        }
+
+        Ok(())
+    }
+
+    /// Check if the pipeline needs re-negotiation.
+    ///
+    /// Returns `true` if pads have been added/removed since the last negotiation.
+    pub fn needs_renegotiation(&self) -> bool {
+        self.negotiation.is_none()
+    }
+
+    /// Invalidate the current negotiation, forcing re-negotiation before execution.
+    pub fn invalidate_negotiation(&mut self) {
+        self.negotiation = None;
     }
 
     /// Generate a human-readable description of the pipeline.
@@ -902,6 +1131,8 @@ impl Pipeline {
                 ElementType::Source => ("ellipse", "lightgreen"),
                 ElementType::Sink => ("ellipse", "lightcoral"),
                 ElementType::Transform => ("box", "lightblue"),
+                ElementType::Demuxer => ("trapezium", "lightyellow"),
+                ElementType::Muxer => ("invtrapezium", "lightgoldenrod"),
             };
 
             let label = if options.show_element_type {
@@ -1184,7 +1415,8 @@ mod tests {
     use super::*;
     use crate::buffer::Buffer;
     use crate::element::{
-        DynAsyncElement, Element, ElementAdapter, Sink, SinkAdapter, Source, SourceAdapter,
+        DynAsyncElement, Element, ElementAdapter, PadDirection, Sink, SinkAdapter, Source,
+        SourceAdapter,
     };
 
     struct TestSource;
@@ -1521,5 +1753,187 @@ mod tests {
         pipeline.negotiate().unwrap();
         assert!(pipeline.link_format(link_id).is_some());
         assert!(pipeline.link_memory_type(link_id).is_some());
+    }
+
+    // ========================================================================
+    // Dynamic Pad Management Tests
+    // ========================================================================
+
+    #[test]
+    fn test_add_output_pad() {
+        let mut pipeline = Pipeline::new();
+
+        let node_id = pipeline.add_node(
+            "demux",
+            DynAsyncElement::new_box(ElementAdapter::new(TestElement)),
+        );
+
+        // Initially has default pads
+        let node = pipeline.get_node(node_id).unwrap();
+        assert_eq!(node.output_pads().len(), 1); // default "src" pad
+
+        // Add a new output pad
+        pipeline
+            .add_output_pad(node_id, Pad::new("video_0", PadDirection::Output))
+            .unwrap();
+
+        let node = pipeline.get_node(node_id).unwrap();
+        assert_eq!(node.output_pads().len(), 2);
+        assert!(node.get_output_pad("video_0").is_some());
+    }
+
+    #[test]
+    fn test_add_input_pad() {
+        let mut pipeline = Pipeline::new();
+
+        let node_id = pipeline.add_node(
+            "mux",
+            DynAsyncElement::new_box(ElementAdapter::new(TestElement)),
+        );
+
+        // Initially has default pads
+        let node = pipeline.get_node(node_id).unwrap();
+        assert_eq!(node.input_pads().len(), 1); // default "sink" pad
+
+        // Add a new input pad
+        pipeline
+            .add_input_pad(node_id, Pad::new("audio_0", PadDirection::Input))
+            .unwrap();
+
+        let node = pipeline.get_node(node_id).unwrap();
+        assert_eq!(node.input_pads().len(), 2);
+        assert!(node.get_input_pad("audio_0").is_some());
+    }
+
+    #[test]
+    fn test_add_duplicate_pad_fails() {
+        let mut pipeline = Pipeline::new();
+
+        let node_id = pipeline.add_node(
+            "node",
+            DynAsyncElement::new_box(ElementAdapter::new(TestElement)),
+        );
+
+        // Try to add a pad with the same name as default
+        let result = pipeline.add_output_pad(node_id, Pad::new("src", PadDirection::Output));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_remove_output_pad() {
+        let mut pipeline = Pipeline::new();
+
+        let node_id = pipeline.add_node(
+            "demux",
+            DynAsyncElement::new_box(ElementAdapter::new(TestElement)),
+        );
+
+        // Add a pad then remove it
+        pipeline
+            .add_output_pad(node_id, Pad::new("video_0", PadDirection::Output))
+            .unwrap();
+
+        let removed = pipeline.remove_output_pad(node_id, "video_0").unwrap();
+        assert!(removed.is_some());
+        assert_eq!(removed.unwrap().name(), "video_0");
+
+        // Verify it's gone
+        let node = pipeline.get_node(node_id).unwrap();
+        assert!(node.get_output_pad("video_0").is_none());
+    }
+
+    #[test]
+    fn test_remove_pad_removes_links() {
+        let mut pipeline = Pipeline::new();
+
+        let src = pipeline.add_node(
+            "src",
+            DynAsyncElement::new_box(SourceAdapter::new(TestSource)),
+        );
+        let sink = pipeline.add_node("sink", DynAsyncElement::new_box(SinkAdapter::new(TestSink)));
+
+        // Link the nodes
+        pipeline.link(src, sink).unwrap();
+        assert_eq!(pipeline.edge_count(), 1);
+
+        // Remove the output pad - should also remove the link
+        pipeline.remove_output_pad(src, "src").unwrap();
+        assert_eq!(pipeline.edge_count(), 0);
+    }
+
+    #[test]
+    fn test_dynamic_pad_invalidates_negotiation() {
+        let mut pipeline = Pipeline::new();
+
+        let src = pipeline.add_node(
+            "src",
+            DynAsyncElement::new_box(SourceAdapter::new(TestSource)),
+        );
+        let sink = pipeline.add_node("sink", DynAsyncElement::new_box(SinkAdapter::new(TestSink)));
+
+        pipeline.link(src, sink).unwrap();
+
+        // Negotiate
+        pipeline.negotiate().unwrap();
+        assert!(pipeline.is_negotiated());
+
+        // Add a pad - should invalidate negotiation
+        pipeline
+            .add_output_pad(src, Pad::new("extra", PadDirection::Output))
+            .unwrap();
+        assert!(!pipeline.is_negotiated());
+        assert!(pipeline.needs_renegotiation());
+    }
+
+    #[test]
+    fn test_link_pads_with_custom_names() {
+        let mut pipeline = Pipeline::new();
+
+        let demux = pipeline.add_node(
+            "demux",
+            DynAsyncElement::new_box(ElementAdapter::new(TestElement)),
+        );
+        let decoder = pipeline.add_node(
+            "decoder",
+            DynAsyncElement::new_box(ElementAdapter::new(TestElement)),
+        );
+
+        // Add custom pads
+        pipeline
+            .add_output_pad(demux, Pad::new("video_0", PadDirection::Output))
+            .unwrap();
+        pipeline
+            .add_input_pad(decoder, Pad::new("video_in", PadDirection::Input))
+            .unwrap();
+
+        // Link using specific pad names
+        pipeline
+            .link_pads(demux, "video_0", decoder, "video_in")
+            .unwrap();
+
+        // Verify the link
+        let links: Vec<_> = pipeline.links().collect();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].source_pad, "video_0");
+        assert_eq!(links[0].sink_pad, "video_in");
+    }
+
+    #[test]
+    fn test_link_pads_nonexistent_pad_fails() {
+        let mut pipeline = Pipeline::new();
+
+        let src = pipeline.add_node(
+            "src",
+            DynAsyncElement::new_box(SourceAdapter::new(TestSource)),
+        );
+        let sink = pipeline.add_node("sink", DynAsyncElement::new_box(SinkAdapter::new(TestSink)));
+
+        // Try to link with a non-existent source pad
+        let result = pipeline.link_pads(src, "nonexistent", sink, "sink");
+        assert!(result.is_err());
+
+        // Try to link with a non-existent sink pad
+        let result = pipeline.link_pads(src, "src", sink, "nonexistent");
+        assert!(result.is_err());
     }
 }
