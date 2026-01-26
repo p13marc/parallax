@@ -37,5 +37,5 @@ pub mod parser;
 pub use events::{EventReceiver, EventSender, EventStream, PipelineEvent};
 pub use executor::{ExecutorConfig, PipelineExecutor, PipelineHandle};
 pub use factory::ElementFactory;
-pub use graph::{DotOptions, Link, Node, NodeId, Pipeline, PipelineState};
+pub use graph::{DotOptions, Link, LinkId, LinkInfo, Node, NodeId, Pipeline, PipelineState};
 pub use parser::{ParsedElement, ParsedPipeline, PropertyValue, parse_pipeline};

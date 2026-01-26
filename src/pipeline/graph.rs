@@ -2,8 +2,16 @@
 
 use crate::element::{AsyncElementDyn, DynAsyncElement, ElementType, Pad};
 use crate::error::{Error, Result};
-use daggy::{Dag, NodeIndex, Walker};
+use crate::format::{Caps, MediaFormat};
+use crate::memory::MemoryType;
+use crate::negotiation::{
+    ConverterInsertion, ConverterRegistry, ElementCaps, LinkInfo as NegLinkInfo, LinkNegotiation,
+    NegotiationResult, NegotiationSolver,
+};
+use daggy::petgraph::visit::EdgeRef;
+use daggy::{Dag, EdgeIndex, NodeIndex, Walker};
 use std::collections::HashMap;
+use std::fmt::Write;
 
 /// Unique identifier for a node in the pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -14,6 +22,40 @@ impl NodeId {
     pub fn index(&self) -> usize {
         self.0.index()
     }
+}
+
+/// Unique identifier for a link (edge) in the pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LinkId(pub(crate) EdgeIndex);
+
+impl LinkId {
+    /// Get the underlying index.
+    pub fn index(&self) -> usize {
+        self.0.index()
+    }
+}
+
+/// Information about a link in the pipeline, including negotiation results.
+#[derive(Debug, Clone)]
+pub struct LinkInfo {
+    /// The link ID.
+    pub id: LinkId,
+    /// Source node ID.
+    pub source_id: NodeId,
+    /// Source node name.
+    pub source_name: String,
+    /// Source pad name.
+    pub source_pad: String,
+    /// Sink node ID.
+    pub sink_id: NodeId,
+    /// Sink node name.
+    pub sink_name: String,
+    /// Sink pad name.
+    pub sink_pad: String,
+    /// Negotiated format (if negotiation has been run).
+    pub negotiated_format: Option<MediaFormat>,
+    /// Negotiated memory type (if negotiation has been run).
+    pub negotiated_memory: Option<MemoryType>,
 }
 
 /// State of the pipeline.
@@ -41,6 +83,10 @@ pub struct Node {
     element: Option<Box<DynAsyncElement<'static>>>,
     /// Cached element type (so we don't need the element to query it).
     element_type: ElementType,
+    /// Cached input caps (so we don't need the element to query them).
+    input_caps: Caps,
+    /// Cached output caps (so we don't need the element to query them).
+    output_caps: Caps,
     /// Input pads.
     input_pads: Vec<Pad>,
     /// Output pads.
@@ -52,6 +98,8 @@ impl Node {
     pub fn new(name: impl Into<String>, element: Box<DynAsyncElement<'static>>) -> Self {
         let name = name.into();
         let element_type = element.element_type();
+        let input_caps = element.input_caps();
+        let output_caps = element.output_caps();
 
         // Create default pads based on element type
         let (input_pads, output_pads) = match element_type {
@@ -64,6 +112,8 @@ impl Node {
             name,
             element: Some(element),
             element_type,
+            input_caps,
+            output_caps,
             input_pads,
             output_pads,
         }
@@ -98,6 +148,16 @@ impl Node {
     /// Get the element type.
     pub fn element_type(&self) -> ElementType {
         self.element_type
+    }
+
+    /// Get the input caps (formats this element accepts).
+    pub fn input_caps(&self) -> &Caps {
+        &self.input_caps
+    }
+
+    /// Get the output caps (formats this element produces).
+    pub fn output_caps(&self) -> &Caps {
+        &self.output_caps
     }
 
     /// Get input pads.
@@ -171,6 +231,8 @@ pub struct Pipeline {
     state: PipelineState,
     /// Auto-incrementing counter for anonymous node names.
     name_counter: u64,
+    /// Negotiation results (populated after negotiate() is called).
+    negotiation: Option<NegotiationResult>,
 }
 
 impl Pipeline {
@@ -181,6 +243,7 @@ impl Pipeline {
             nodes_by_name: HashMap::new(),
             state: PipelineState::Stopped,
             name_counter: 0,
+            negotiation: None,
         }
     }
 
@@ -400,6 +463,340 @@ impl Pipeline {
         }
 
         Ok(())
+    }
+
+    // ========================================================================
+    // Introspection API
+    // ========================================================================
+
+    /// Iterate over all nodes in the pipeline.
+    ///
+    /// Returns an iterator of (NodeId, &Node) pairs.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use parallax::pipeline::Pipeline;
+    ///
+    /// let pipeline = Pipeline::parse("nullsource ! passthrough ! nullsink").unwrap();
+    /// for (id, node) in pipeline.nodes() {
+    ///     println!("{}: {:?}", node.name(), node.element_type());
+    /// }
+    /// ```
+    pub fn nodes(&self) -> impl Iterator<Item = (NodeId, &Node)> {
+        self.graph
+            .graph()
+            .node_indices()
+            .map(|idx| (NodeId(idx), self.graph.node_weight(idx).unwrap()))
+    }
+
+    /// Iterate over all links in the pipeline with full information.
+    ///
+    /// Returns an iterator of `LinkInfo` structs containing source/sink
+    /// information and negotiated formats (if negotiation has been run).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use parallax::pipeline::Pipeline;
+    ///
+    /// let pipeline = Pipeline::parse("nullsource ! passthrough ! nullsink").unwrap();
+    /// for link in pipeline.links() {
+    ///     println!("{} -> {}", link.source_name, link.sink_name);
+    ///     if let Some(format) = &link.negotiated_format {
+    ///         println!("  format: {:?}", format);
+    ///     }
+    /// }
+    /// ```
+    pub fn links(&self) -> impl Iterator<Item = LinkInfo> + '_ {
+        self.graph.graph().edge_references().map(|edge| {
+            let src_idx = edge.source();
+            let sink_idx = edge.target();
+            let link = edge.weight();
+            let link_id = LinkId(edge.id());
+
+            let src_node = self.graph.node_weight(src_idx).unwrap();
+            let sink_node = self.graph.node_weight(sink_idx).unwrap();
+
+            // Look up negotiation results if available
+            let (negotiated_format, negotiated_memory) = self
+                .negotiation
+                .as_ref()
+                .and_then(|neg| neg.link_caps.get(&link_id.index()))
+                .map(|cap| (Some(cap.format.clone()), Some(cap.memory_type)))
+                .unwrap_or((None, None));
+
+            LinkInfo {
+                id: link_id,
+                source_id: NodeId(src_idx),
+                source_name: src_node.name().to_string(),
+                source_pad: link.src_pad.clone(),
+                sink_id: NodeId(sink_idx),
+                sink_name: sink_node.name().to_string(),
+                sink_pad: link.sink_pad.clone(),
+                negotiated_format,
+                negotiated_memory,
+            }
+        })
+    }
+
+    /// Get information about a specific link by ID.
+    pub fn get_link(&self, id: LinkId) -> Option<LinkInfo> {
+        let (src_idx, sink_idx) = self.graph.graph().edge_endpoints(id.0)?;
+        let link = self.graph.edge_weight(id.0)?;
+        let src_node = self.graph.node_weight(src_idx)?;
+        let sink_node = self.graph.node_weight(sink_idx)?;
+
+        let (negotiated_format, negotiated_memory) = self
+            .negotiation
+            .as_ref()
+            .and_then(|neg| neg.link_caps.get(&id.index()))
+            .map(|cap| (Some(cap.format.clone()), Some(cap.memory_type)))
+            .unwrap_or((None, None));
+
+        Some(LinkInfo {
+            id,
+            source_id: NodeId(src_idx),
+            source_name: src_node.name().to_string(),
+            source_pad: link.src_pad.clone(),
+            sink_id: NodeId(sink_idx),
+            sink_name: sink_node.name().to_string(),
+            sink_pad: link.sink_pad.clone(),
+            negotiated_format,
+            negotiated_memory,
+        })
+    }
+
+    /// Get the negotiated format for a specific link.
+    ///
+    /// Returns `None` if negotiation hasn't been run or the link doesn't exist.
+    pub fn link_format(&self, id: LinkId) -> Option<&MediaFormat> {
+        self.negotiation
+            .as_ref()
+            .and_then(|neg| neg.link_caps.get(&id.index()))
+            .map(|cap| &cap.format)
+    }
+
+    /// Get the negotiated memory type for a specific link.
+    ///
+    /// Returns `None` if negotiation hasn't been run or the link doesn't exist.
+    pub fn link_memory_type(&self, id: LinkId) -> Option<MemoryType> {
+        self.negotiation
+            .as_ref()
+            .and_then(|neg| neg.link_caps.get(&id.index()))
+            .map(|cap| cap.memory_type)
+    }
+
+    /// Check if negotiation has been performed.
+    pub fn is_negotiated(&self) -> bool {
+        self.negotiation.is_some()
+    }
+
+    /// Get the full negotiation result (if negotiation has been run).
+    pub fn negotiation_result(&self) -> Option<&NegotiationResult> {
+        self.negotiation.as_ref()
+    }
+
+    /// Get the list of converters that need to be inserted (if any).
+    ///
+    /// After negotiation, this returns the converters that should be
+    /// inserted to bridge incompatible formats between elements.
+    pub fn pending_converters(&self) -> &[ConverterInsertion] {
+        self.negotiation
+            .as_ref()
+            .map(|n| n.converters.as_slice())
+            .unwrap_or(&[])
+    }
+
+    // ========================================================================
+    // Caps Negotiation
+    // ========================================================================
+
+    /// Run caps negotiation on the pipeline.
+    ///
+    /// This analyzes all elements' input/output caps and finds compatible
+    /// formats for each link. After calling this, you can query negotiated
+    /// formats via `links()`, `link_format()`, etc.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use parallax::pipeline::Pipeline;
+    ///
+    /// let mut pipeline = Pipeline::parse("videotestsrc ! videoconvert ! displaysink")?;
+    /// pipeline.negotiate()?;
+    ///
+    /// for link in pipeline.links() {
+    ///     println!("{} -> {}: {:?}",
+    ///         link.source_name,
+    ///         link.sink_name,
+    ///         link.negotiated_format);
+    /// }
+    /// ```
+    pub fn negotiate(&mut self) -> Result<()> {
+        self.negotiate_with_registry(None)
+    }
+
+    /// Run caps negotiation with a custom converter registry.
+    ///
+    /// The converter registry allows automatic insertion of format converters
+    /// when direct negotiation fails.
+    pub fn negotiate_with_registry(&mut self, registry: Option<ConverterRegistry>) -> Result<()> {
+        let mut solver = NegotiationSolver::new();
+
+        if let Some(reg) = registry {
+            solver = solver.with_converters(reg);
+        }
+
+        // Collect element caps
+        for (node_id, node) in self.nodes() {
+            let element_caps = self.collect_element_caps(node_id, node)?;
+            solver.add_element(element_caps);
+        }
+
+        // Collect links
+        for (link_idx, edge) in self.graph.graph().edge_references().enumerate() {
+            let src_node = self.graph.node_weight(edge.source()).unwrap();
+            let sink_node = self.graph.node_weight(edge.target()).unwrap();
+
+            solver.add_link(NegLinkInfo {
+                id: link_idx,
+                source_element: src_node.name().to_string(),
+                source_pad: 0, // TODO: map pad names to indices
+                sink_element: sink_node.name().to_string(),
+                sink_pad: 0,
+            });
+        }
+
+        // Run negotiation
+        let result = solver
+            .solve()
+            .map_err(|e| Error::InvalidSegment(format!("Negotiation failed: {}", e)))?;
+
+        self.negotiation = Some(result);
+        Ok(())
+    }
+
+    /// Collect caps from an element for negotiation.
+    fn collect_element_caps(&self, _node_id: NodeId, node: &Node) -> Result<ElementCaps> {
+        use crate::format::MediaCaps;
+
+        // Convert Caps to MediaCaps
+        let to_media_caps = |caps: &Caps| -> Vec<MediaCaps> {
+            if caps.is_any() {
+                vec![MediaCaps::any()]
+            } else {
+                caps.formats()
+                    .iter()
+                    .map(|f| MediaCaps::from(f.clone()))
+                    .collect()
+            }
+        };
+
+        // Use cached caps from the node
+        let sink_caps = to_media_caps(node.input_caps());
+        let source_caps = to_media_caps(node.output_caps());
+
+        Ok(ElementCaps {
+            name: node.name().to_string(),
+            sink_caps,
+            source_caps,
+        })
+    }
+
+    /// Generate a human-readable description of the pipeline.
+    ///
+    /// Shows all elements, their connections, and negotiated formats.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use parallax::pipeline::Pipeline;
+    ///
+    /// let pipeline = Pipeline::parse("nullsource ! passthrough ! nullsink").unwrap();
+    /// println!("{}", pipeline.describe());
+    /// ```
+    pub fn describe(&self) -> String {
+        let mut out = String::new();
+
+        writeln!(out, "Pipeline ({:?})", self.state).unwrap();
+        writeln!(out, "  Nodes: {}", self.node_count()).unwrap();
+        writeln!(out, "  Links: {}", self.edge_count()).unwrap();
+        writeln!(
+            out,
+            "  Negotiated: {}",
+            if self.is_negotiated() { "yes" } else { "no" }
+        )
+        .unwrap();
+        writeln!(out).unwrap();
+
+        // List nodes
+        writeln!(out, "Elements:").unwrap();
+        for (id, node) in self.nodes() {
+            let input = node.input_caps();
+            let output = node.output_caps();
+            let caps_info = format!(
+                "in={}, out={}",
+                if input.is_any() {
+                    "any".to_string()
+                } else {
+                    format!("{:?}", input.formats())
+                },
+                if output.is_any() {
+                    "any".to_string()
+                } else {
+                    format!("{:?}", output.formats())
+                }
+            );
+
+            writeln!(
+                out,
+                "  [{}] {} ({:?}) - {}",
+                id.index(),
+                node.name(),
+                node.element_type(),
+                caps_info
+            )
+            .unwrap();
+        }
+        writeln!(out).unwrap();
+
+        // List links with negotiation info
+        writeln!(out, "Links:").unwrap();
+        for link in self.links() {
+            write!(
+                out,
+                "  {} ({}) -> {} ({})",
+                link.source_name, link.source_pad, link.sink_name, link.sink_pad
+            )
+            .unwrap();
+
+            if let Some(format) = &link.negotiated_format {
+                write!(out, " [format: {:?}", format).unwrap();
+                if let Some(mem) = link.negotiated_memory {
+                    write!(out, ", memory: {:?}", mem).unwrap();
+                }
+                write!(out, "]").unwrap();
+            }
+            writeln!(out).unwrap();
+        }
+
+        // List pending converters
+        let converters = self.pending_converters();
+        if !converters.is_empty() {
+            writeln!(out).unwrap();
+            writeln!(out, "Converters to insert:").unwrap();
+            for conv in converters {
+                writeln!(
+                    out,
+                    "  Link {}: {} (cost: {})",
+                    conv.link_id, conv.reason, conv.cost
+                )
+                .unwrap();
+            }
+        }
+
+        out
     }
 }
 
@@ -943,5 +1340,186 @@ mod tests {
 
         assert_eq!(pipeline.get_node(n1).unwrap().name(), "node_0");
         assert_eq!(pipeline.get_node(n2).unwrap().name(), "node_1");
+    }
+
+    // ========================================================================
+    // Introspection API Tests
+    // ========================================================================
+
+    #[test]
+    fn test_nodes_iterator() {
+        let mut pipeline = Pipeline::new();
+
+        let src = pipeline.add_node(
+            "src",
+            DynAsyncElement::new_box(SourceAdapter::new(TestSource)),
+        );
+        let filter = pipeline.add_node(
+            "filter",
+            DynAsyncElement::new_box(ElementAdapter::new(TestElement)),
+        );
+        let sink = pipeline.add_node("sink", DynAsyncElement::new_box(SinkAdapter::new(TestSink)));
+
+        pipeline.link(src, filter).unwrap();
+        pipeline.link(filter, sink).unwrap();
+
+        // Test nodes() iterator
+        let nodes: Vec<_> = pipeline.nodes().collect();
+        assert_eq!(nodes.len(), 3);
+
+        // Check all nodes are present
+        let names: Vec<_> = nodes.iter().map(|(_, n)| n.name()).collect();
+        assert!(names.contains(&"src"));
+        assert!(names.contains(&"filter"));
+        assert!(names.contains(&"sink"));
+    }
+
+    #[test]
+    fn test_links_iterator() {
+        let mut pipeline = Pipeline::new();
+
+        let src = pipeline.add_node(
+            "src",
+            DynAsyncElement::new_box(SourceAdapter::new(TestSource)),
+        );
+        let filter = pipeline.add_node(
+            "filter",
+            DynAsyncElement::new_box(ElementAdapter::new(TestElement)),
+        );
+        let sink = pipeline.add_node("sink", DynAsyncElement::new_box(SinkAdapter::new(TestSink)));
+
+        pipeline.link(src, filter).unwrap();
+        pipeline.link(filter, sink).unwrap();
+
+        // Test links() iterator
+        let links: Vec<_> = pipeline.links().collect();
+        assert_eq!(links.len(), 2);
+
+        // Check link info
+        let link1 = &links[0];
+        assert_eq!(link1.source_name, "src");
+        assert_eq!(link1.sink_name, "filter");
+        assert_eq!(link1.source_pad, "src");
+        assert_eq!(link1.sink_pad, "sink");
+        // Before negotiation, format should be None
+        assert!(link1.negotiated_format.is_none());
+    }
+
+    #[test]
+    fn test_node_caps() {
+        let mut pipeline = Pipeline::new();
+
+        let src = pipeline.add_node(
+            "src",
+            DynAsyncElement::new_box(SourceAdapter::new(TestSource)),
+        );
+
+        // Test cached caps
+        let node = pipeline.get_node(src).unwrap();
+        // TestSource doesn't override caps, so should be Any
+        assert!(node.input_caps().is_any());
+        assert!(node.output_caps().is_any());
+    }
+
+    #[test]
+    fn test_negotiate_pipeline() {
+        let mut pipeline = Pipeline::new();
+
+        let src = pipeline.add_node(
+            "src",
+            DynAsyncElement::new_box(SourceAdapter::new(TestSource)),
+        );
+        let sink = pipeline.add_node("sink", DynAsyncElement::new_box(SinkAdapter::new(TestSink)));
+
+        pipeline.link(src, sink).unwrap();
+
+        // Before negotiation
+        assert!(!pipeline.is_negotiated());
+
+        // Run negotiation
+        pipeline.negotiate().unwrap();
+
+        // After negotiation
+        assert!(pipeline.is_negotiated());
+        assert!(pipeline.negotiation_result().is_some());
+
+        // Check link has negotiated format
+        let links: Vec<_> = pipeline.links().collect();
+        assert_eq!(links.len(), 1);
+        // With Any/Any caps, negotiation should still succeed with defaults
+        assert!(links[0].negotiated_format.is_some());
+    }
+
+    #[test]
+    fn test_describe_pipeline() {
+        let mut pipeline = Pipeline::new();
+
+        let src = pipeline.add_node(
+            "src",
+            DynAsyncElement::new_box(SourceAdapter::new(TestSource)),
+        );
+        let sink = pipeline.add_node("sink", DynAsyncElement::new_box(SinkAdapter::new(TestSink)));
+
+        pipeline.link(src, sink).unwrap();
+
+        // Get description
+        let desc = pipeline.describe();
+
+        // Should contain key info
+        assert!(desc.contains("Pipeline"));
+        assert!(desc.contains("Nodes: 2"));
+        assert!(desc.contains("Links: 1"));
+        assert!(desc.contains("src"));
+        assert!(desc.contains("sink"));
+        assert!(desc.contains("Source"));
+        assert!(desc.contains("Sink"));
+    }
+
+    #[test]
+    fn test_get_link() {
+        let mut pipeline = Pipeline::new();
+
+        let src = pipeline.add_node(
+            "src",
+            DynAsyncElement::new_box(SourceAdapter::new(TestSource)),
+        );
+        let sink = pipeline.add_node("sink", DynAsyncElement::new_box(SinkAdapter::new(TestSink)));
+
+        pipeline.link(src, sink).unwrap();
+
+        // Get link via iterator first to get the ID
+        let links: Vec<_> = pipeline.links().collect();
+        let link_id = links[0].id;
+
+        // Now test get_link
+        let link = pipeline.get_link(link_id).unwrap();
+        assert_eq!(link.source_name, "src");
+        assert_eq!(link.sink_name, "sink");
+    }
+
+    #[test]
+    fn test_link_format_query() {
+        let mut pipeline = Pipeline::new();
+
+        let src = pipeline.add_node(
+            "src",
+            DynAsyncElement::new_box(SourceAdapter::new(TestSource)),
+        );
+        let sink = pipeline.add_node("sink", DynAsyncElement::new_box(SinkAdapter::new(TestSink)));
+
+        pipeline.link(src, sink).unwrap();
+
+        // Get link ID
+        let links: Vec<_> = pipeline.links().collect();
+        let link_id = links[0].id;
+
+        // Before negotiation
+        assert!(pipeline.link_format(link_id).is_none());
+        assert!(pipeline.link_memory_type(link_id).is_none());
+
+        // After negotiation
+        pipeline.negotiate().unwrap();
+        assert!(pipeline.link_format(link_id).is_some());
+        assert!(pipeline.link_memory_type(link_id).is_some());
     }
 }

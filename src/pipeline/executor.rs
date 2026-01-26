@@ -140,6 +140,11 @@ impl PipelineExecutor {
         // Validate pipeline structure
         pipeline.validate()?;
 
+        // Run caps negotiation if not already done
+        if !pipeline.is_negotiated() {
+            pipeline.negotiate()?;
+        }
+
         // Create event sender
         let events = EventSender::new(256);
 
