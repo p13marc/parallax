@@ -57,6 +57,7 @@ mod mapped_file;
 mod pool;
 mod segment;
 mod shared;
+mod shared_refcount;
 
 pub use arena::{Access, ArenaCache, ArenaSlot, CpuArena, IpcSlotRef};
 pub use bitmap::AtomicBitmap;
@@ -65,6 +66,7 @@ pub use huge_pages::{HugePageSegment, HugePageSize};
 pub use mapped_file::MappedFileSegment;
 pub use pool::{LoanedSlot, MemoryPool};
 pub use segment::{IpcHandle, MemorySegment, MemoryType};
+pub use shared_refcount::{SharedArena, SharedArenaCache, SharedIpcSlotRef, SharedSlotRef};
 
 // Deprecated re-exports (kept for backward compatibility)
 #[deprecated(since = "0.2.0", note = "Use CpuSegment instead")]
