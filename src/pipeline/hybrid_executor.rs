@@ -194,17 +194,22 @@ impl HybridExecutor {
     }
 
     /// Start the pipeline and return a handle.
+    ///
+    /// This handles state transitions automatically:
+    /// - Suspended → Idle (prepare: validate, negotiate)
+    /// - Idle → Running (activate)
     pub fn start(&self, pipeline: &mut Pipeline) -> Result<HybridPipelineHandle> {
-        // Validate pipeline structure
-        pipeline.validate()?;
-
-        // Run caps negotiation if not already done
-        if !pipeline.is_negotiated() {
-            pipeline.negotiate()?;
-        }
-
         // Create event sender
         let events = EventSender::new(256);
+
+        // Transition through states properly
+        let old_state = pipeline.state();
+
+        // Prepare if needed (Suspended → Idle)
+        if old_state == PipelineState::Suspended {
+            pipeline.prepare()?;
+            events.send_state_changed(old_state, PipelineState::Idle);
+        }
 
         // Partition the graph based on element affinities
         let mut scheduler = RtScheduler::new(self.config.clone());
@@ -244,10 +249,10 @@ impl HybridExecutor {
             }
         };
 
-        // Emit state change event
-        let old_state = pipeline.state();
-        pipeline.set_state(PipelineState::Running);
-        events.send_state_changed(old_state, PipelineState::Running);
+        // Activate (Idle → Running)
+        let idle_state = pipeline.state();
+        pipeline.activate()?;
+        events.send_state_changed(idle_state, PipelineState::Running);
         events.send(PipelineEvent::Started);
 
         Ok(HybridPipelineHandle {

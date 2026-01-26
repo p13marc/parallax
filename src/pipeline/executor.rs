@@ -136,22 +136,27 @@ impl PipelineExecutor {
     ///
     /// The pipeline runs in the background. Use the handle to wait for completion
     /// or abort the pipeline.
+    ///
+    /// This handles state transitions automatically:
+    /// - Suspended → Idle (prepare: validate, negotiate)
+    /// - Idle → Running (activate)
     pub fn start(&self, pipeline: &mut Pipeline) -> Result<PipelineHandle> {
-        // Validate pipeline structure
-        pipeline.validate()?;
-
-        // Run caps negotiation if not already done
-        if !pipeline.is_negotiated() {
-            pipeline.negotiate()?;
-        }
-
         // Create event sender
         let events = EventSender::new(256);
 
-        // Emit state change event
+        // Transition through states properly
         let old_state = pipeline.state();
-        pipeline.set_state(PipelineState::Running);
-        events.send_state_changed(old_state, PipelineState::Running);
+
+        // Prepare if needed (Suspended → Idle)
+        if old_state == PipelineState::Suspended {
+            pipeline.prepare()?;
+            events.send_state_changed(old_state, PipelineState::Idle);
+        }
+
+        // Activate (Idle → Running)
+        let idle_state = pipeline.state();
+        pipeline.activate()?;
+        events.send_state_changed(idle_state, PipelineState::Running);
         events.send(PipelineEvent::Started);
 
         // Build the channel network
