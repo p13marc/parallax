@@ -179,3 +179,6 @@ name = "15_video_testsrc"
 [[example]]
 name = "16_video_display"
 required-features = ["iced-sink"]
+
+[[example]]
+name = "17_introspection"
