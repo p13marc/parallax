@@ -28,6 +28,7 @@
 //! pipeline.run().await?;
 //! ```
 
+mod driver;
 mod events;
 mod executor;
 pub mod factory;
@@ -37,6 +38,9 @@ pub mod parser;
 pub mod rt_bridge;
 pub mod rt_scheduler;
 
+pub use driver::{
+    DriverConfig, DriverStats, ManualDriver, RtTimerDriverHandle, TimerDriver, TimerDriverHandle,
+};
 pub use events::{EventReceiver, EventSender, EventStream, PipelineEvent};
 pub use executor::{ExecutorConfig, PipelineExecutor, PipelineHandle};
 pub use factory::ElementFactory;
