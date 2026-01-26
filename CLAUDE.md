@@ -181,14 +181,34 @@ See `docs/FINAL_DESIGN_PARALLAX.md` for full details.
 
 | Phase | Focus | Status |
 |-------|-------|--------|
-| 1 | Memory Foundation (CpuSegment, CpuArena) | In Progress |
-| 2 | Caps Negotiation (global constraint solving) | Planned |
-| 3 | Cross-Process IPC (IpcSrc/IpcSink) | Planned |
+| 1 | Memory Foundation (CpuSegment, CpuArena) | ✅ Complete |
+| 2 | Caps Negotiation (global constraint solving) | ✅ Complete |
+| 3 | Cross-Process IPC (IpcSrc/IpcSink) | ✅ Complete |
 | 4 | GPU Integration (Vulkan Video) | Planned |
 | 5 | Pure Rust Codecs (rav1d/rav1e) | Planned |
-| 6 | Process Isolation (seccomp, namespaces) | Planned |
-| 7 | Plugin System (stabby) | Planned |
-| 8 | Distribution (Zenoh, RDMA) | Future |
+| 6 | Process Isolation (transparent auto-IPC) | ✅ Complete |
+| 7 | Plugin System (C-compatible ABI) | ✅ Complete |
+| 8 | Distribution (Zenoh) | ✅ Complete |
+
+### Transparent Process Isolation
+
+Users write normal pipelines - isolation is automatic:
+
+```rust
+// Write a normal pipeline
+let pipeline = Pipeline::parse("filesrc ! h264dec ! displaysink")?;
+
+// Run with selective isolation (decoders in isolated processes)
+pipeline.run_isolating(vec!["*dec*"]).await?;
+
+// Or run fully isolated (each element in its own process)
+pipeline.run_isolated().await?;
+
+// Or run in-process (default, fastest)
+pipeline.run().await?;
+```
+
+The executor automatically injects IPC boundaries where needed.
 
 ## Code Style Guidelines
 
