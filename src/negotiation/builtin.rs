@@ -7,12 +7,12 @@
 //! - Audio format conversion (sample format/channel changes)
 //! - Memory copies (CPU <-> GPU transfers)
 
-use super::converters::{ConverterElement, ConverterFactory, ConverterRegistry, FormatType};
+use super::converters::{ConverterElement, ConverterRegistry, FormatType};
 use crate::buffer::Buffer;
 use crate::element::Element;
 use crate::error::Result;
 use crate::format::{
-    AudioFormat, AudioFormatCaps, FormatCaps, Framerate, PixelFormat, SampleFormat, VideoFormat,
+    AudioFormatCaps, FormatCaps, PixelFormat, SampleFormat,
     VideoFormatCaps,
 };
 use crate::memory::MemoryType;

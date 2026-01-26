@@ -47,6 +47,7 @@ impl std::fmt::Display for GroupId {
 /// Determines how elements are executed: all in-process, each in its own
 /// sandboxed process, or grouped to balance isolation and overhead.
 #[derive(Clone, Debug)]
+#[derive(Default)]
 pub enum ExecutionMode {
     /// All elements run as Tokio tasks in a single process.
     ///
@@ -58,6 +59,7 @@ pub enum ExecutionMode {
     /// - Development and testing
     /// - Trusted pipelines with no untrusted plugins
     /// - Maximum performance when isolation isn't needed
+    #[default]
     InProcess,
 
     /// Each element runs in a separate sandboxed process.
@@ -105,11 +107,6 @@ pub enum ExecutionMode {
     },
 }
 
-impl Default for ExecutionMode {
-    fn default() -> Self {
-        Self::InProcess
-    }
-}
 
 impl ExecutionMode {
     /// Create an in-process execution mode.

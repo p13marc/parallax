@@ -33,7 +33,7 @@ use crate::element::{Sink, Source};
 use crate::error::{Error, Result};
 use crate::execution::{ControlMessage, SerializableMetadata, frame_message, unframe_message};
 use crate::format::Caps;
-use crate::memory::{ArenaCache, CpuArena, IpcSlotRef};
+use crate::memory::{CpuArena, IpcSlotRef};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -290,7 +290,7 @@ impl Sink for IpcSink {
 
         // Send buffer ready message
         let msg = ControlMessage::BufferReady {
-            slot: slot.clone(),
+            slot,
             metadata: SerializableMetadata::from_metadata(buffer.metadata()),
         };
         self.send_message(&msg)?;
@@ -324,25 +324,14 @@ pub struct IpcSrc {
     path: PathBuf,
     /// Connected socket (if any).
     socket: Option<UnixStream>,
-    /// Arena cache for mapping received arenas.
-    arena_cache: ArenaCache,
-    /// Read buffer.
-    read_buf: Vec<u8>,
     /// Whether we're the server (created the socket).
     is_server: bool,
     /// Listener for incoming connections (server mode).
     listener: Option<UnixListener>,
-    /// Registered arenas (id -> info).
-    registered_arenas: std::collections::HashMap<u64, ArenaInfo>,
+    /// Registered arenas (id -> slot_count). Used to track known arenas.
+    registered_arenas: std::collections::HashMap<u64, usize>,
     /// Capabilities.
     caps: Caps,
-}
-
-/// Information about a registered arena.
-struct ArenaInfo {
-    size: usize,
-    slot_size: usize,
-    slot_count: usize,
 }
 
 impl IpcSrc {
@@ -353,8 +342,6 @@ impl IpcSrc {
         Self {
             path: path.as_ref().to_path_buf(),
             socket: None,
-            arena_cache: ArenaCache::new(),
-            read_buf: Vec::with_capacity(4096),
             is_server: false,
             listener: None,
             registered_arenas: std::collections::HashMap::new(),
@@ -367,8 +354,6 @@ impl IpcSrc {
         Self {
             path: path.as_ref().to_path_buf(),
             socket: None,
-            arena_cache: ArenaCache::new(),
-            read_buf: Vec::with_capacity(4096),
             is_server: true,
             listener: None,
             registered_arenas: std::collections::HashMap::new(),
@@ -479,20 +464,12 @@ impl IpcSrc {
     fn handle_arena_registration(
         &mut self,
         arena_id: u64,
-        size: usize,
-        slot_size: usize,
+        _size: usize,
+        _slot_size: usize,
         slot_count: usize,
     ) {
-        self.registered_arenas.insert(
-            arena_id,
-            ArenaInfo {
-                size,
-                slot_size,
-                slot_count,
-            },
-        );
-
-        // TODO: Receive arena fd via SCM_RIGHTS and register with cache
+        self.registered_arenas.insert(arena_id, slot_count);
+        // TODO: Receive arena fd via SCM_RIGHTS and map the arena
     }
 }
 
@@ -516,7 +493,7 @@ impl Source for IpcSrc {
 
                 ControlMessage::BufferReady { slot, metadata } => {
                     // Send acknowledgment
-                    self.send_message(&ControlMessage::BufferDone { slot: slot.clone() })?;
+                    self.send_message(&ControlMessage::BufferDone { slot })?;
 
                     // TODO: Access data from arena cache using slot reference
                     // For now, create a placeholder buffer

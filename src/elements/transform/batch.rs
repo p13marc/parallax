@@ -6,7 +6,6 @@ use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::Element;
 use crate::error::Result;
 use crate::memory::{HeapSegment, MemorySegment};
-use crate::metadata::Metadata;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -157,7 +156,7 @@ impl Batch {
             .pending
             .first()
             .map(|b| b.metadata().clone())
-            .unwrap_or_else(Metadata::new);
+            .unwrap_or_default();
         metadata.sequence = self.sequence;
         self.sequence += 1;
 
@@ -370,6 +369,7 @@ pub struct UnbatchStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metadata::Metadata;
 
     fn create_test_buffer(data: &[u8], seq: u64) -> Buffer {
         let segment = Arc::new(HeapSegment::new(data.len().max(1)).unwrap());

@@ -2,7 +2,7 @@
 
 use parallax::element::{DynAsyncElement, ElementAdapter, SinkAdapter, SourceAdapter};
 use parallax::elements::{NullSink, NullSource, PassThrough, Tee};
-use parallax::pipeline::{Pipeline, PipelineExecutor};
+use parallax::pipeline::{Executor, Pipeline};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -22,7 +22,7 @@ async fn test_null_source_to_null_sink() {
 
     pipeline.link(src, sink).unwrap();
 
-    let executor = PipelineExecutor::new();
+    let executor = Executor::new();
     executor.run(&mut pipeline).await.unwrap();
 }
 
@@ -47,7 +47,7 @@ async fn test_source_passthrough_sink() {
     pipeline.link(src, passthrough).unwrap();
     pipeline.link(passthrough, sink).unwrap();
 
-    let executor = PipelineExecutor::new();
+    let executor = Executor::new();
     executor.run(&mut pipeline).await.unwrap();
 }
 
@@ -72,7 +72,7 @@ async fn test_source_tee_sink() {
     pipeline.link(src, tee).unwrap();
     pipeline.link(tee, sink).unwrap();
 
-    let executor = PipelineExecutor::new();
+    let executor = Executor::new();
     executor.run(&mut pipeline).await.unwrap();
 }
 
@@ -112,7 +112,7 @@ async fn test_long_pipeline() {
     pipeline.link(p3, tee).unwrap();
     pipeline.link(tee, sink).unwrap();
 
-    let executor = PipelineExecutor::new();
+    let executor = Executor::new();
     executor.run(&mut pipeline).await.unwrap();
 }
 
@@ -150,7 +150,7 @@ async fn test_buffer_counting() {
 
     pipeline.link(src, sink).unwrap();
 
-    let executor = PipelineExecutor::new();
+    let executor = Executor::new();
     executor.run(&mut pipeline).await.unwrap();
 
     assert_eq!(count.load(Ordering::Relaxed), 42);
@@ -213,7 +213,7 @@ async fn test_filter_element() {
     pipeline.link(src, filter).unwrap();
     pipeline.link(filter, sink).unwrap();
 
-    let executor = PipelineExecutor::new();
+    let executor = Executor::new();
     executor.run(&mut pipeline).await.unwrap();
 
     assert_eq!(count.load(Ordering::Relaxed), 10);
@@ -326,7 +326,7 @@ async fn test_pipeline_abort() {
 
     pipeline.link(src, sink).unwrap();
 
-    let executor = PipelineExecutor::new();
+    let executor = Executor::new();
     let handle = executor.start(&mut pipeline).unwrap();
 
     // Let it run for a bit
@@ -343,9 +343,9 @@ async fn test_pipeline_abort() {
 /// Test configurable channel capacity.
 #[tokio::test]
 async fn test_executor_config() {
-    use parallax::pipeline::ExecutorConfig;
+    use parallax::pipeline::UnifiedExecutorConfig;
 
-    let config = ExecutorConfig::with_capacity(64);
+    let config = UnifiedExecutorConfig::default().with_channel_capacity(64);
     assert_eq!(config.channel_capacity, 64);
 
     let mut pipeline = Pipeline::new();
@@ -359,7 +359,7 @@ async fn test_executor_config() {
     );
     pipeline.link(src, sink).unwrap();
 
-    let executor = PipelineExecutor::with_config(config);
+    let executor = Executor::with_config(config);
     executor.run(&mut pipeline).await.unwrap();
 }
 
@@ -373,7 +373,7 @@ async fn test_parse_simple_pipeline() {
     let mut pipeline = Pipeline::parse("nullsource count=10 ! nullsink").unwrap();
     assert_eq!(pipeline.node_count(), 2);
 
-    let executor = PipelineExecutor::new();
+    let executor = Executor::new();
     executor.run(&mut pipeline).await.unwrap();
 }
 
@@ -383,7 +383,7 @@ async fn test_parse_pipeline_with_transform() {
     let mut pipeline = Pipeline::parse("nullsource count=5 ! passthrough ! nullsink").unwrap();
     assert_eq!(pipeline.node_count(), 3);
 
-    let executor = PipelineExecutor::new();
+    let executor = Executor::new();
     executor.run(&mut pipeline).await.unwrap();
 }
 
@@ -394,7 +394,7 @@ async fn test_parse_long_pipeline() {
         Pipeline::parse("nullsource count=3 ! passthrough ! tee ! passthrough ! nullsink").unwrap();
     assert_eq!(pipeline.node_count(), 5);
 
-    let executor = PipelineExecutor::new();
+    let executor = Executor::new();
     executor.run(&mut pipeline).await.unwrap();
 }
 
@@ -403,7 +403,7 @@ async fn test_parse_long_pipeline() {
 async fn test_parse_with_properties() {
     let mut pipeline = Pipeline::parse("nullsource count=100 buffer-size=1024 ! nullsink").unwrap();
 
-    let executor = PipelineExecutor::new();
+    let executor = Executor::new();
     executor.run(&mut pipeline).await.unwrap();
 }
 
@@ -453,7 +453,7 @@ async fn test_parse_file_pipeline() {
     let mut pipeline = Pipeline::parse(&pipeline_str).unwrap();
     assert_eq!(pipeline.node_count(), 2);
 
-    let executor = PipelineExecutor::new();
+    let executor = Executor::new();
     executor.run(&mut pipeline).await.unwrap();
 
     // Verify output
@@ -714,7 +714,7 @@ fn test_pipeline_to_json() {
 async fn test_pipeline_events() {
     use parallax::element::{SinkAdapter, SourceAdapter};
     use parallax::elements::{NullSink, NullSource};
-    use parallax::pipeline::{Pipeline, PipelineEvent, PipelineExecutor};
+    use parallax::pipeline::{Executor, Pipeline, PipelineEvent};
 
     let mut pipeline = Pipeline::new();
 
@@ -728,7 +728,7 @@ async fn test_pipeline_events() {
     );
     pipeline.link(src, sink).unwrap();
 
-    let executor = PipelineExecutor::new();
+    let executor = Executor::new();
     let handle = executor.start(&mut pipeline).unwrap();
 
     // Subscribe to events - note that some early events (Started, NodeStarted)
@@ -764,7 +764,7 @@ async fn test_pipeline_events() {
 async fn test_event_wait_eos() {
     use parallax::element::{SinkAdapter, SourceAdapter};
     use parallax::elements::{NullSink, NullSource};
-    use parallax::pipeline::{Pipeline, PipelineExecutor};
+    use parallax::pipeline::{Executor, Pipeline};
 
     let mut pipeline = Pipeline::new();
 
@@ -778,7 +778,7 @@ async fn test_event_wait_eos() {
     );
     pipeline.link(src, sink).unwrap();
 
-    let executor = PipelineExecutor::new();
+    let executor = Executor::new();
     let handle = executor.start(&mut pipeline).unwrap();
 
     let mut receiver = handle.subscribe();
@@ -799,7 +799,7 @@ async fn test_event_wait_eos() {
 async fn test_pipeline_state_transitions() {
     use parallax::element::{SinkAdapter, SourceAdapter};
     use parallax::elements::{NullSink, NullSource};
-    use parallax::pipeline::{Pipeline, PipelineExecutor, PipelineState};
+    use parallax::pipeline::{Executor, Pipeline, PipelineState};
 
     let mut pipeline = Pipeline::new();
 
@@ -816,7 +816,7 @@ async fn test_pipeline_state_transitions() {
     );
     pipeline.link(src, sink).unwrap();
 
-    let executor = PipelineExecutor::new();
+    let executor = Executor::new();
     let handle = executor.start(&mut pipeline).unwrap();
 
     // Should be running now
@@ -832,7 +832,7 @@ async fn test_pipeline_abort_event() {
     use parallax::element::{SinkAdapter, Source, SourceAdapter};
     use parallax::memory::HeapSegment;
     use parallax::metadata::Metadata;
-    use parallax::pipeline::{Pipeline, PipelineEvent, PipelineExecutor};
+    use parallax::pipeline::{Executor, Pipeline, PipelineEvent};
 
     /// A source that produces buffers forever.
     struct InfiniteSource;
@@ -863,7 +863,7 @@ async fn test_pipeline_abort_event() {
     );
     pipeline.link(src, sink).unwrap();
 
-    let executor = PipelineExecutor::new();
+    let executor = Executor::new();
     let handle = executor.start(&mut pipeline).unwrap();
 
     let mut receiver = handle.subscribe();

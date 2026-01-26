@@ -35,7 +35,6 @@ use crate::error::{Error, Result};
 use crate::memory::CpuArena;
 use crate::pipeline::{NodeId, Pipeline, PipelineEvent};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// Configuration for the isolated executor.
@@ -320,8 +319,8 @@ impl IsolatedExecutor {
 
     /// Run pipeline entirely in-process (no isolation).
     async fn run_in_process(&self, pipeline: &mut Pipeline) -> Result<()> {
-        use crate::pipeline::PipelineExecutor;
-        let executor = PipelineExecutor::new();
+        use crate::pipeline::Executor;
+        let executor = Executor::new();
         executor.run(pipeline).await
     }
 
@@ -366,10 +365,6 @@ impl Default for IsolatedExecutor {
 pub struct IsolatedPipelineHandle {
     /// Supervisor managing child processes.
     supervisor: Supervisor,
-    /// Shared memory arenas.
-    arenas: Vec<Arc<CpuArena>>,
-    /// Event channel.
-    events_tx: mpsc::Sender<PipelineEvent>,
     /// Event receiver.
     events_rx: mpsc::Receiver<PipelineEvent>,
 }
@@ -403,6 +398,7 @@ mod tests {
     use crate::element::{DynAsyncElement, Sink, SinkAdapter, Source, SourceAdapter};
     use crate::memory::HeapSegment;
     use crate::metadata::Metadata;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     struct TestSource {

@@ -37,18 +37,33 @@ mod hybrid_executor;
 pub mod parser;
 pub mod rt_bridge;
 pub mod rt_scheduler;
+mod unified_executor;
 
 pub use driver::{
     DriverConfig, DriverStats, ManualDriver, RtTimerDriverHandle, TimerDriver, TimerDriverHandle,
 };
 pub use events::{EventReceiver, EventSender, EventStream, PipelineEvent};
-pub use executor::{ExecutorConfig, PipelineExecutor, PipelineHandle};
 pub use factory::ElementFactory;
 pub use graph::{DotOptions, Link, LinkId, LinkInfo, Node, NodeId, Pipeline, PipelineState};
-pub use hybrid_executor::{HybridExecutor, HybridPipelineHandle};
 pub use parser::{ParsedElement, ParsedPipeline, PropertyValue, parse_pipeline};
 pub use rt_bridge::{AsyncRtBridge, BridgeConfig, EventFd, SharedBridge, shared_bridge};
 pub use rt_scheduler::{
     ActivationRecord, BoundaryDirection, BoundaryEdge, DataThreadHandle, GraphPartition,
     NodeStatus, RtConfig, RtScheduler, SchedulingMode,
 };
+// Unified executor (primary API)
+pub use unified_executor::{
+    Executor, ExecutorConfig as UnifiedExecutorConfig, PipelineHandle as UnifiedPipelineHandle,
+};
+
+// Legacy exports (deprecated - use Executor instead)
+#[deprecated(since = "0.2.0", note = "Use UnifiedExecutorConfig instead")]
+pub use executor::ExecutorConfig;
+#[deprecated(since = "0.2.0", note = "Use Executor instead")]
+pub use executor::PipelineExecutor;
+#[deprecated(since = "0.2.0", note = "Use UnifiedPipelineHandle instead")]
+pub use executor::PipelineHandle;
+#[deprecated(since = "0.2.0", note = "Use Executor instead")]
+pub use hybrid_executor::HybridExecutor;
+#[deprecated(since = "0.2.0", note = "Use UnifiedPipelineHandle instead")]
+pub use hybrid_executor::HybridPipelineHandle;

@@ -56,11 +56,74 @@ pub enum ExecutionMode {
 | Isolated | All untrusted | 21 | 21 |
 | Grouped | 2 codecs untrusted | 2-3 | 2-3 |
 
+### Unified Executor with Automatic Strategy
+
+Parallax uses a unified `Executor` that automatically determines the optimal execution strategy for each element based on **ExecutionHints**. No developer insight required - just run your pipeline and the executor figures out the best approach.
+
+```rust
+// Simply run your pipeline - the executor auto-negotiates strategy
+let mut pipeline = Pipeline::parse("filesrc ! decoder ! videosink")?;
+pipeline.run().await?;  // Automatic: filesrc=async, decoder=isolated, videosink=async
+```
+
+#### Automatic Strategy Detection
+
+Each element declares `ExecutionHints` describing its characteristics:
+
+```rust
+pub struct ExecutionHints {
+    pub trust_level: TrustLevel,      // Trusted, SemiTrusted, Untrusted
+    pub processing: ProcessingHint,    // CpuBound, IoBound, MemoryBound, Unknown
+    pub latency: LatencyHint,          // UltraLow, Low, Normal, Relaxed
+    pub crash_safe: bool,              // Can recover from crashes?
+    pub uses_native_code: bool,        // FFI, unsafe, external libs?
+    pub memory: MemoryHint,            // Normal, Low, High, Streaming
+}
+
+// Elements provide hints (defaults are safe)
+impl Source for MyDecoder {
+    fn execution_hints(&self) -> ExecutionHints {
+        ExecutionHints::native()  // Uses FFI -> will be isolated
+    }
+}
+```
+
+The executor analyzes all hints and chooses:
+
+| Element Characteristics | Strategy |
+|------------------------|----------|
+| Untrusted OR native+unsafe | **Isolated** (separate process) |
+| RT affinity + RT-safe | **RealTime** (dedicated RT thread) |
+| Low latency + RT-safe | **RealTime** |
+| I/O-bound OR async affinity | **Async** (Tokio task) |
+| Everything else | **Async** (default) |
+
+#### Manual Override
+
+You can still configure manually if needed:
+
+```rust
+let config = ExecutorConfig {
+    auto_strategy: false,  // Disable auto-detection
+    scheduling: SchedulingMode::Hybrid,
+    rt: RtConfig {
+        quantum: 256,
+        rt_priority: Some(50),
+        ..Default::default()
+    },
+    ..Default::default()
+};
+
+let executor = Executor::with_config(config);
+executor.start(&mut pipeline).await?;
+```
+
 ### Hybrid Scheduling (PipeWire-inspired)
 
-Parallax uses a hybrid scheduling model inspired by PipeWire that combines:
+Under the hood, the unified executor combines:
 - **Tokio async tasks** for I/O-bound elements (network, file I/O)
 - **Dedicated RT threads** for CPU-bound, real-time-safe elements (audio/video processing)
+- **Isolated processes** for untrusted or native code elements
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -71,9 +134,9 @@ Parallax uses a hybrid scheduling model inspired by PipeWire that combines:
 │  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘          │
 │         │                 │                 │                   │
 │         ▼                 ▼                 ▼                   │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │              AsyncRtBridge (lock-free ring buffer)      │   │
-│  └─────────────────────────────────────────────────────────┘   │
+│  ┌─────────────────────────────────────────────────────────────┐│
+│  │              AsyncRtBridge (lock-free ring buffer)          ││
+│  └─────────────────────────────────────────────────────────────┘│
 └─────────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -84,36 +147,40 @@ Parallax uses a hybrid scheduling model inspired by PipeWire that combines:
 │  │  (RT-safe)   │  │  (RT-safe)   │  │  (RT-safe)   │          │
 │  └──────────────┘  └──────────────┘  └──────────────┘          │
 │                                                                 │
-│  Driver-based scheduling, deterministic latency                │
+│  Driver-based scheduling, deterministic latency                 │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│                    Isolated Process(es)                         │
+│  ┌──────────────┐                                               │
+│  │  FFmpeg      │  seccomp sandbox, IPC via shared memory       │
+│  │  (untrusted) │                                               │
+│  └──────────────┘                                               │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
 **Key concepts:**
 
-- **Element Affinity**: Each element declares its scheduling affinity (`Async`, `RealTime`, or `Auto`)
+- **ExecutionHints**: Each element declares its characteristics for automatic strategy detection
+- **Element Affinity**: Elements can declare scheduling affinity (`Async`, `RealTime`, or `Auto`)
 - **RT-Safety**: Elements declare `is_rt_safe()` - no allocations, no blocking in hot path
 - **Graph Partitioning**: The scheduler automatically partitions the graph and inserts bridges
 - **Driver-based Scheduling**: A driver node (timer or hardware) initiates each processing cycle
 
 ```rust
-// Scheduling modes
+// Scheduling modes (used when auto_strategy is false)
 pub enum SchedulingMode {
     Async,    // All in Tokio (default)
     Hybrid,   // RT-safe nodes in RT threads, rest in Tokio
     RealTime, // All RT-safe nodes in RT threads
 }
 
-// Configure hybrid execution
-let config = RtConfig {
-    mode: SchedulingMode::Hybrid,
-    quantum: 256,        // samples per cycle (audio)
-    rt_priority: Some(50), // SCHED_FIFO priority (requires CAP_SYS_NICE)
-    data_threads: 1,
-    bridge_capacity: 16,
-};
-
-let executor = HybridExecutor::new(config);
-executor.run(&mut pipeline).await?;
+// Per-element execution strategy (determined automatically)
+pub enum ElementStrategy {
+    Async,     // Run as Tokio task
+    RealTime,  // Run in RT thread
+    Isolated,  // Run in separate process
+}
 ```
 
 ### Pipeline State Model (PipeWire-inspired)
@@ -199,14 +266,15 @@ parallax/
 │   ├── metadata.rs         # Metadata, BufferFlags
 │   │
 │   ├── element/            # Element system
-│   │   ├── traits.rs       # Source, Sink, Element, AsyncSource, AsyncSink
+│   │   ├── traits.rs       # Source, Sink, Element, AsyncSource, AsyncSink, ExecutionHints
 │   │   ├── pad.rs          # Pad, PadDirection, PadTemplate
 │   │   └── context.rs      # ElementContext
 │   │
 │   ├── pipeline/           # Pipeline execution
 │   │   ├── graph.rs        # Pipeline DAG (daggy-based)
-│   │   ├── executor.rs     # PipelineExecutor (Tokio tasks + Kanal channels)
-│   │   ├── hybrid_executor.rs # HybridExecutor (async + RT threads)
+│   │   ├── executor.rs     # Legacy PipelineExecutor (deprecated)
+│   │   ├── unified_executor.rs # Unified Executor (async + RT + isolation)
+│   │   ├── hybrid_executor.rs # Legacy HybridExecutor (deprecated)
 │   │   ├── rt_scheduler.rs # RT scheduler (graph partitioning, activation records)
 │   │   ├── rt_bridge.rs    # AsyncRtBridge (lock-free SPSC ring buffer + eventfd)
 │   │   ├── driver.rs       # TimerDriver, ManualDriver (PipeWire-style drivers)
@@ -258,7 +326,11 @@ parallax/
 │   ├── 13_isolate_all.rs         # Full isolation
 │   ├── 14_ipc_manual.rs          # Manual IPC
 │   ├── 15_video_testsrc.rs       # Video test patterns
-│   └── 16_video_display.rs       # GUI display (iced-sink)
+│   ├── 16_video_display.rs       # GUI display (iced-sink)
+│   ├── 17_introspection.rs       # Pipeline introspection and caps
+│   ├── 18_demuxer_muxer.rs       # Demuxer and muxer elements
+│   ├── 19_auto_execution.rs      # Automatic execution strategy
+│   └── 20_dynamic_state.rs       # Dynamic pipeline state changes
 │
 ├── docs/
 │   ├── FINAL_DESIGN_PARALLAX.md  # Complete design document
@@ -269,6 +341,16 @@ parallax/
 ### Key Types
 
 ```rust
+// Execution hints for automatic strategy detection
+pub struct ExecutionHints {
+    pub trust_level: TrustLevel,      // Trusted, SemiTrusted, Untrusted
+    pub processing: ProcessingHint,    // CpuBound, IoBound, MemoryBound, Unknown
+    pub latency: LatencyHint,          // UltraLow, Low, Normal, Relaxed
+    pub crash_safe: bool,
+    pub uses_native_code: bool,
+    pub memory: MemoryHint,            // Normal, Low, High, Streaming
+}
+
 // Element affinity (for hybrid scheduling)
 pub enum Affinity {
     Async,     // Always run in Tokio
@@ -281,18 +363,21 @@ pub trait Source: Send {
     fn produce(&mut self) -> Result<Option<Buffer>>;
     fn affinity(&self) -> Affinity { Affinity::Auto }
     fn is_rt_safe(&self) -> bool { false }
+    fn execution_hints(&self) -> ExecutionHints { ExecutionHints::default() }
 }
 
 pub trait Sink: Send {
     fn consume(&mut self, buffer: Buffer) -> Result<()>;
     fn affinity(&self) -> Affinity { Affinity::Auto }
     fn is_rt_safe(&self) -> bool { false }
+    fn execution_hints(&self) -> ExecutionHints { ExecutionHints::default() }
 }
 
 pub trait Element: Send {
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>>;
     fn affinity(&self) -> Affinity { Affinity::Auto }
     fn is_rt_safe(&self) -> bool { false }
+    fn execution_hints(&self) -> ExecutionHints { ExecutionHints::default() }
 }
 
 // Element traits (async - for I/O bound operations)
@@ -300,12 +385,14 @@ pub trait AsyncSource: Send {
     fn produce(&mut self) -> impl Future<Output = Result<Option<Buffer>>> + Send;
     fn affinity(&self) -> Affinity { Affinity::Async }  // Default to async
     fn is_rt_safe(&self) -> bool { false }
+    fn execution_hints(&self) -> ExecutionHints { ExecutionHints::io_bound() }
 }
 
 pub trait AsyncSink: Send {
     fn consume(&mut self, buffer: Buffer) -> impl Future<Output = Result<()>> + Send;
     fn affinity(&self) -> Affinity { Affinity::Async }
     fn is_rt_safe(&self) -> bool { false }
+    fn execution_hints(&self) -> ExecutionHints { ExecutionHints::io_bound() }
 }
 
 // Pipeline usage
@@ -328,6 +415,7 @@ See `docs/FINAL_DESIGN_PARALLAX.md` for full details.
 | 7 | Plugin System (C-compatible ABI) | ✅ Complete |
 | 8 | Distribution (Zenoh) | ✅ Complete |
 | 9 | Hybrid Scheduling (PipeWire-inspired) | ✅ Complete |
+| 10 | Unified Executor (automatic strategy) | ✅ Complete |
 
 ### Transparent Process Isolation
 

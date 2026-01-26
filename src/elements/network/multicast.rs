@@ -76,7 +76,7 @@ impl UdpMulticastSrc {
 
     /// Set the buffer size for receiving datagrams.
     pub fn with_buffer_size(mut self, size: usize) -> Self {
-        self.buffer_size = size.min(65535).max(1);
+        self.buffer_size = size.clamp(1, 65535);
         self
     }
 

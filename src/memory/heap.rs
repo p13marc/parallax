@@ -107,7 +107,7 @@ impl MemorySegment for HeapSegment {
     }
 
     fn memory_type(&self) -> MemoryType {
-        MemoryType::Heap
+        MemoryType::Cpu
     }
 
     fn ipc_handle(&self) -> Option<IpcHandle> {
@@ -124,7 +124,7 @@ mod tests {
     fn test_heap_segment_creation() {
         let segment = HeapSegment::new(1024).unwrap();
         assert_eq!(segment.len(), 1024);
-        assert_eq!(segment.memory_type(), MemoryType::Heap);
+        assert_eq!(segment.memory_type(), MemoryType::Cpu);
         assert!(segment.ipc_handle().is_none());
     }
 

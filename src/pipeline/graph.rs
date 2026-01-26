@@ -5,7 +5,7 @@ use crate::error::{Error, Result};
 use crate::format::{Caps, MediaFormat};
 use crate::memory::MemoryType;
 use crate::negotiation::{
-    ConverterInsertion, ConverterRegistry, ElementCaps, LinkInfo as NegLinkInfo, LinkNegotiation,
+    ConverterInsertion, ConverterRegistry, ElementCaps, LinkInfo as NegLinkInfo,
     NegotiationResult, NegotiationSolver,
 };
 use daggy::petgraph::visit::EdgeRef;
@@ -255,6 +255,16 @@ impl Node {
             .as_ref()
             .map(|e| e.is_rt_safe())
             .unwrap_or(false)
+    }
+
+    /// Get execution hints for this node's element.
+    ///
+    /// Returns default hints if the element has been taken.
+    pub fn execution_hints(&self) -> crate::element::ExecutionHints {
+        self.element
+            .as_ref()
+            .map(|e| e.execution_hints())
+            .unwrap_or_default()
     }
 }
 
@@ -605,7 +615,7 @@ impl Pipeline {
         self.graph
             .graph()
             .node_indices()
-            .map(|idx| NodeId(idx))
+            .map(NodeId)
             .collect()
     }
 
@@ -1295,7 +1305,7 @@ impl Pipeline {
         dot.push_str("digraph pipeline {\n");
         dot.push_str("    rankdir=LR;\n");
         dot.push_str("    node [shape=box, style=rounded];\n");
-        dot.push_str("\n");
+        dot.push('\n');
 
         // Add nodes
         for idx in self.graph.graph().node_indices() {
@@ -1323,7 +1333,7 @@ impl Pipeline {
             ));
         }
 
-        dot.push_str("\n");
+        dot.push('\n');
 
         // Add edges
         for edge_idx in self.graph.graph().edge_indices() {
@@ -1348,7 +1358,7 @@ impl Pipeline {
 
         // Legend (optional)
         if options.show_legend {
-            dot.push_str("\n");
+            dot.push('\n');
             dot.push_str("    subgraph cluster_legend {\n");
             dot.push_str("        label=\"Legend\";\n");
             dot.push_str("        style=dashed;\n");
@@ -1465,8 +1475,66 @@ impl Pipeline {
     /// pipeline.run().await?;
     /// ```
     pub async fn run(&mut self) -> Result<()> {
-        let executor = crate::pipeline::PipelineExecutor::new();
+        let executor = crate::pipeline::Executor::new();
         executor.run(self).await
+    }
+
+    /// Run the pipeline with custom executor configuration.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use parallax::pipeline::{Pipeline, UnifiedExecutorConfig, SchedulingMode};
+    ///
+    /// let mut pipeline = Pipeline::parse("audiosrc ! sink")?;
+    ///
+    /// // Use low-latency audio configuration
+    /// pipeline.run_with_config(UnifiedExecutorConfig::low_latency_audio()).await?;
+    /// ```
+    pub async fn run_with_config(
+        &mut self,
+        config: crate::pipeline::UnifiedExecutorConfig,
+    ) -> Result<()> {
+        let executor = crate::pipeline::Executor::with_config(config);
+        executor.run(self).await
+    }
+
+    /// Start the pipeline and return a handle for control.
+    ///
+    /// Unlike `run()`, this returns immediately with a handle that can be
+    /// used to wait for completion, abort, or subscribe to events.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use parallax::pipeline::Pipeline;
+    ///
+    /// let mut pipeline = Pipeline::parse("source ! sink")?;
+    /// let handle = pipeline.start()?;
+    ///
+    /// // Subscribe to events
+    /// let mut events = handle.subscribe();
+    /// tokio::spawn(async move {
+    ///     while let Ok(event) = events.recv().await {
+    ///         println!("Event: {:?}", event);
+    ///     }
+    /// });
+    ///
+    /// // Wait for completion
+    /// handle.wait().await?;
+    /// ```
+    pub fn start(&mut self) -> Result<crate::pipeline::UnifiedPipelineHandle> {
+        let executor = crate::pipeline::Executor::new();
+        executor.start(self)
+    }
+
+    /// Start the pipeline with custom executor configuration.
+    pub fn start_with_config(
+        &mut self,
+        config: crate::pipeline::UnifiedExecutorConfig,
+    ) -> Result<crate::pipeline::UnifiedPipelineHandle> {
+        let executor = crate::pipeline::Executor::with_config(config);
+        executor.start(self)
     }
 
     /// Run the pipeline with a specific execution mode.

@@ -26,7 +26,7 @@
 //! let sink = pipeline.add_node("sink", Box::new(sink));
 //! pipeline.link(src, sink)?;
 //!
-//! let executor = PipelineExecutor::new();
+//! let executor = Executor::new();
 //! executor.run(&mut pipeline).await?;
 //!
 //! // Typed pipeline (compile-time checked)
@@ -73,7 +73,7 @@ pub mod prelude {
     pub use crate::format::{AudioFormat, Caps, MediaFormat, RtpFormat, VideoFormat};
     pub use crate::memory::{MemoryPool, MemorySegment, MemoryType};
     pub use crate::metadata::{BufferFlags, Metadata, RtpMeta};
-    pub use crate::pipeline::{Pipeline, PipelineExecutor};
+    pub use crate::pipeline::{Executor, Pipeline};
 }
 
 pub use error::{Error, Result};

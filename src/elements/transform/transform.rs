@@ -275,7 +275,7 @@ impl Chunk {
             }
 
             let handle = MemoryHandle::from_segment_with_len(segment, self.chunk_size);
-            let mut meta = self.pending_metadata.clone().unwrap_or_else(Metadata::new);
+            let mut meta = self.pending_metadata.clone().unwrap_or_default();
             meta.sequence = self.sequence_offset;
             self.sequence_offset += 1;
 
@@ -300,7 +300,7 @@ impl Chunk {
         }
 
         let handle = MemoryHandle::from_segment_with_len(segment, len);
-        let mut meta = self.pending_metadata.take().unwrap_or_else(Metadata::new);
+        let mut meta = self.pending_metadata.take().unwrap_or_default();
         meta.sequence = self.sequence_offset;
         self.sequence_offset += 1;
 
@@ -438,7 +438,7 @@ where
         }
 
         let handle = MemoryHandle::from_segment_with_len(segment, output.len());
-        let mut meta = self.pending_metadata.clone().unwrap_or_else(Metadata::new);
+        let mut meta = self.pending_metadata.clone().unwrap_or_default();
         meta.sequence = self.sequence_offset;
         self.sequence_offset += 1;
 

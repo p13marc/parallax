@@ -138,10 +138,8 @@ impl Source for AppSrc {
         if let Some(buffer) = state.queue.pop_front() {
             state.total_produced += 1;
             Ok(Some(buffer))
-        } else if state.eos {
-            Ok(None) // End of stream
         } else {
-            Ok(None)
+            Ok(None) // Either EOS or no data yet
         }
     }
 

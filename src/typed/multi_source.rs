@@ -412,10 +412,8 @@ where
                     return Ok(None);
                 }
                 // One more try to emit remaining matches
-                if let Some(result) = self.joiner.try_emit() {
-                    if let JoinResult::Matched(a, b) = result {
-                        return Ok(Some((a, b)));
-                    }
+                if let Some(JoinResult::Matched(a, b)) = self.joiner.try_emit() {
+                    return Ok(Some((a, b)));
                 }
             }
         }

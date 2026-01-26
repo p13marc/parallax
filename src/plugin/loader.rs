@@ -187,7 +187,7 @@ impl PluginLoader {
         // SAFETY: Validating the descriptor. Caller guarantees plugin is properly formed.
         unsafe {
             desc.validate()
-                .map_err(|e| PluginError::InvalidDescriptor(e))?;
+                .map_err(PluginError::InvalidDescriptor)?;
         }
 
         // SAFETY: Creating PluginInfo from validated descriptor.

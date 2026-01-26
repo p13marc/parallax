@@ -728,7 +728,7 @@ fn spawn_source_task(
 
                     // Send to bridges (async push with backpressure)
                     for bridge in &output_bridges {
-                        if let Err(_) = bridge.push_async(buffer.clone()).await {
+                        if bridge.push_async(buffer.clone()).await.is_err() {
                             tracing::warn!("source '{}': bridge push failed", name);
                         }
                     }

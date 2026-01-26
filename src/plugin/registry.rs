@@ -199,11 +199,9 @@ impl PluginRegistry {
         // SAFETY: Caller guarantees all plugins are trusted.
         let results = unsafe { self.loader.load_all_from_dir(dir) };
         let mut count = 0;
-        for result in results {
-            if let Ok(plugin) = result {
-                self.register_plugin(plugin);
-                count += 1;
-            }
+        for plugin in results.into_iter().flatten() {
+            self.register_plugin(plugin);
+            count += 1;
         }
         count
     }

@@ -2,7 +2,7 @@
 
 use super::converters::{ConverterFactory, ConverterRegistry, FormatType};
 use super::error::NegotiationError;
-use crate::format::{FormatCaps, MediaCaps, MediaFormat, MemoryCaps};
+use crate::format::{MediaCaps, MediaFormat};
 use crate::memory::MemoryType;
 use std::collections::HashMap;
 
@@ -290,7 +290,9 @@ enum LinkResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::{Framerate, PixelFormat, VideoCodec, VideoFormat, VideoFormatCaps};
+    use crate::format::{
+        FormatCaps, Framerate, MemoryCaps, PixelFormat, VideoCodec, VideoFormat, VideoFormatCaps,
+    };
 
     fn video_1080p() -> MediaFormat {
         MediaFormat::VideoRaw(VideoFormat::new(

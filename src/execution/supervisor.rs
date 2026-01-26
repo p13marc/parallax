@@ -8,10 +8,9 @@
 //! - Implementing restart policies
 
 use super::mode::{ExecutionMode, GroupId};
-use super::protocol::{ControlMessage, ElementState};
-use super::sandbox::ElementSandbox;
+use super::protocol::ElementState;
 use crate::error::{Error, Result};
-use crate::memory::{CpuArena, IpcSlotRef};
+use crate::memory::CpuArena;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

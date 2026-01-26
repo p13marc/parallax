@@ -646,7 +646,6 @@ pub struct ArenaCache {
 struct CachedArenaMapping {
     base: NonNull<u8>,
     size: usize,
-    access: Access,
 }
 
 impl ArenaCache {
@@ -697,8 +696,7 @@ impl ArenaCache {
         let base = NonNull::new(base.cast::<u8>())
             .ok_or_else(|| Error::AllocationFailed("mmap returned null".into()))?;
 
-        self.mappings
-            .insert(key, CachedArenaMapping { base, size, access });
+        self.mappings.insert(key, CachedArenaMapping { base, size });
 
         Ok(())
     }

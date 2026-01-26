@@ -29,7 +29,7 @@ parallax = "0.1"
 Build pipelines at runtime using a GStreamer-like syntax:
 
 ```rust
-use parallax::pipeline::{Pipeline, PipelineExecutor};
+use parallax::pipeline::Pipeline;
 
 #[tokio::main]
 async fn main() -> parallax::Result<()> {
@@ -43,9 +43,8 @@ async fn main() -> parallax::Result<()> {
     let sink = pipeline.add_node("sink", Box::new(sink));
     pipeline.link(src, sink)?;
     
-    // Run the pipeline
-    let executor = PipelineExecutor::new();
-    executor.run(&mut pipeline).await?;
+    // Run the pipeline - executor auto-negotiates strategy
+    pipeline.run().await?;
     
     Ok(())
 }
@@ -94,32 +93,64 @@ while let Some(buffer) = subscriber.recv()? {
 }
 ```
 
-### Hybrid Scheduling (Low Latency)
+### Automatic Execution Strategy
 
-Use PipeWire-inspired scheduling for real-time audio/video:
+The unified executor automatically determines the optimal strategy for each element:
 
 ```rust
-use parallax::pipeline::{Pipeline, HybridExecutor, RtConfig, SchedulingMode};
+use parallax::pipeline::Pipeline;
+
+// Just run - the executor analyzes element hints and chooses strategies
+let mut pipeline = Pipeline::parse("audiosrc ! decoder ! mixer ! audiosink")?;
+pipeline.run().await?;  // Automatic: audiosrc=async, decoder=RT, mixer=RT, audiosink=async
+```
+
+Elements declare `ExecutionHints` describing their characteristics:
+- **trust_level**: Trusted, SemiTrusted, Untrusted
+- **processing**: CpuBound, IoBound, MemoryBound
+- **latency**: UltraLow, Low, Normal, Relaxed
+- **uses_native_code**: true if uses FFI/unsafe
+
+The executor automatically chooses:
+| Characteristics | Strategy |
+|----------------|----------|
+| Untrusted or native+unsafe | Isolated process |
+| RT affinity + RT-safe | RT thread |
+| Low latency + RT-safe | RT thread |
+| I/O-bound | Tokio async |
+
+### Manual Execution Control
+
+For advanced cases, configure the executor manually:
+
+```rust
+use parallax::pipeline::{Pipeline, Executor, ExecutorConfig, SchedulingMode, RtConfig};
 
 let mut pipeline = Pipeline::parse("audiosrc ! decoder ! mixer ! audiosink")?;
 
-// Configure hybrid execution
-let config = RtConfig {
-    mode: SchedulingMode::Hybrid,
-    quantum: 256,           // samples per cycle (5.3ms at 48kHz)
-    rt_priority: Some(50),  // SCHED_FIFO (requires CAP_SYS_NICE)
-    data_threads: 1,
-    bridge_capacity: 16,
+// Disable auto-strategy and configure manually
+let config = ExecutorConfig {
+    auto_strategy: false,
+    scheduling: SchedulingMode::Hybrid,
+    rt: RtConfig {
+        quantum: 256,           // samples per cycle (5.3ms at 48kHz)
+        rt_priority: Some(50),  // SCHED_FIFO (requires CAP_SYS_NICE)
+        data_threads: 1,
+        bridge_capacity: 16,
+        ..Default::default()
+    },
+    ..Default::default()
 };
 
-let executor = HybridExecutor::new(config);
-executor.run(&mut pipeline).await?;
+let executor = Executor::with_config(config);
+executor.start(&mut pipeline).await?;
 ```
 
 The scheduler automatically partitions the graph:
 - **I/O-bound elements** (network, file) → Tokio async tasks
 - **RT-safe elements** (decoders, mixers) → Dedicated RT threads
-- **Lock-free bridges** connect the two domains
+- **Untrusted elements** → Isolated processes
+- **Lock-free bridges** connect different domains
 
 ### Pipeline States
 
@@ -392,6 +423,10 @@ cargo run --example 14_ipc_manual           # Manual IPC boundaries
 # Video
 cargo run --example 15_video_testsrc        # Test pattern generator
 cargo run --example 16_video_display --features iced-sink  # GUI display
+
+# Execution features
+cargo run --example 19_auto_execution       # Automatic execution strategy
+cargo run --example 20_dynamic_state        # Dynamic pipeline state changes
 ```
 
 ## Benchmarks

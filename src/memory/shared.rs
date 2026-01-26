@@ -205,7 +205,7 @@ impl MemorySegment for SharedMemorySegment {
     }
 
     fn memory_type(&self) -> MemoryType {
-        MemoryType::SharedMemory
+        MemoryType::Cpu
     }
 
     fn ipc_handle(&self) -> Option<IpcHandle> {
@@ -247,7 +247,7 @@ mod tests {
     fn test_shared_memory_creation() {
         let segment = SharedMemorySegment::new("test-segment", 4096).unwrap();
         assert_eq!(segment.len(), 4096);
-        assert_eq!(segment.memory_type(), MemoryType::SharedMemory);
+        assert_eq!(segment.memory_type(), MemoryType::Cpu);
         assert!(segment.ipc_handle().is_some());
         assert_eq!(segment.name(), Some("test-segment"));
     }

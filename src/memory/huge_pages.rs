@@ -102,14 +102,14 @@ impl HugePageSegment {
 
         // Round up to huge page boundary
         let page_bytes = page_size.bytes();
-        let aligned_size = (size + page_bytes - 1) / page_bytes * page_bytes;
+        let aligned_size = size.div_ceil(page_bytes) * page_bytes;
 
         // Build mmap flags
         // MAP_HUGETLB | (shift << MAP_HUGE_SHIFT)
         // MAP_HUGE_SHIFT is 26, so we shift the size log2 by 26 bits
         let huge_shift = page_size.shift();
         let huge_flags =
-            MapFlags::from_bits_retain(MapFlags::HUGETLB.bits() | ((huge_shift as u32) << 26));
+            MapFlags::from_bits_retain(MapFlags::HUGETLB.bits() | (huge_shift << 26));
 
         let flags = MapFlags::PRIVATE | huge_flags;
 

@@ -221,7 +221,7 @@ impl UdpSink {
             .ok_or_else(|| Error::Config("invalid address".into()))?;
 
         let socket = UdpSocket::bind("0.0.0.0:0")?;
-        socket.connect(&addr)?;
+        socket.connect(addr)?;
         let local_addr = socket.local_addr()?;
 
         Ok(Self {

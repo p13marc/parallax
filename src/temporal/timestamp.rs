@@ -123,11 +123,7 @@ impl Timestamp {
 
     /// Calculate the absolute difference between two timestamps.
     pub fn abs_diff(&self, other: &Self) -> Duration {
-        let diff = if self.nanos > other.nanos {
-            self.nanos - other.nanos
-        } else {
-            other.nanos - self.nanos
-        };
+        let diff = self.nanos.abs_diff(other.nanos);
         Duration::from_nanos(diff)
     }
 

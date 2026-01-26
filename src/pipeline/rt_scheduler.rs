@@ -632,7 +632,7 @@ pub struct DataThreadHandle {
 impl DataThreadHandle {
     /// Check if the thread is still running.
     pub fn is_running(&self) -> bool {
-        self.handle.as_ref().map_or(false, |h| !h.is_finished())
+        self.handle.as_ref().is_some_and(|h| !h.is_finished())
     }
 
     /// Signal the thread to stop.
@@ -740,7 +740,7 @@ pub fn spawn_data_thread(
                             // No Tokio runtime, create a minimal one
                             let rt = tokio::runtime::Builder::new_current_thread()
                                 .build()
-                                .map_err(|e| Error::Io(e))?;
+                                .map_err(Error::Io)?;
                             rt.block_on(element.process(input))
                         };
 
@@ -779,7 +779,7 @@ pub fn spawn_data_thread(
             tracing::info!("data thread '{}' stopped", name);
             Ok(())
         })
-        .map_err(|e| Error::Io(e))?;
+        .map_err(Error::Io)?;
 
     Ok(DataThreadHandle {
         handle: Some(handle),

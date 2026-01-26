@@ -57,6 +57,176 @@ pub enum Affinity {
 }
 
 // ============================================================================
+// Execution Hints
+// ============================================================================
+
+/// Hints about an element's execution characteristics.
+///
+/// These hints are used by the executor to automatically determine
+/// the best execution strategy (async, RT, isolated) for each element.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// impl Source for H264Decoder {
+///     fn produce(&mut self) -> Result<Option<Buffer>> { /* ... */ }
+///
+///     fn execution_hints(&self) -> ExecutionHints {
+///         ExecutionHints {
+///             // Decoders process untrusted input
+///             trust_level: TrustLevel::Untrusted,
+///             // CPU-intensive processing
+///             processing: ProcessingHint::CpuBound,
+///             // Low latency needed for video
+///             latency: LatencyHint::Low,
+///             // Might crash on malformed input
+///             crash_safe: false,
+///             ..Default::default()
+///         }
+///     }
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExecutionHints {
+    /// Trust level of the data being processed.
+    pub trust_level: TrustLevel,
+    /// Processing characteristics (CPU vs I/O bound).
+    pub processing: ProcessingHint,
+    /// Latency requirements.
+    pub latency: LatencyHint,
+    /// Whether the element might crash on bad input.
+    /// If true, isolation is recommended.
+    pub crash_safe: bool,
+    /// Whether the element uses native code (FFI).
+    /// Native code is harder to sandbox.
+    pub uses_native_code: bool,
+    /// Memory usage hint (helps with scheduling decisions).
+    pub memory: MemoryHint,
+}
+
+impl Default for ExecutionHints {
+    fn default() -> Self {
+        Self {
+            trust_level: TrustLevel::Trusted,
+            processing: ProcessingHint::Unknown,
+            latency: LatencyHint::Normal,
+            crash_safe: true,
+            uses_native_code: false,
+            memory: MemoryHint::Normal,
+        }
+    }
+}
+
+impl ExecutionHints {
+    /// Create hints for a trusted, lightweight element.
+    pub fn trusted() -> Self {
+        Self::default()
+    }
+
+    /// Create hints for an untrusted input handler (e.g., decoder).
+    pub fn untrusted() -> Self {
+        Self {
+            trust_level: TrustLevel::Untrusted,
+            crash_safe: false,
+            ..Default::default()
+        }
+    }
+
+    /// Create hints for a CPU-intensive element.
+    pub fn cpu_intensive() -> Self {
+        Self {
+            processing: ProcessingHint::CpuBound,
+            ..Default::default()
+        }
+    }
+
+    /// Create hints for an I/O-bound element.
+    pub fn io_bound() -> Self {
+        Self {
+            processing: ProcessingHint::IoBound,
+            ..Default::default()
+        }
+    }
+
+    /// Create hints for a low-latency element.
+    pub fn low_latency() -> Self {
+        Self {
+            latency: LatencyHint::Low,
+            ..Default::default()
+        }
+    }
+
+    /// Create hints for an element using native/FFI code.
+    pub fn native() -> Self {
+        Self {
+            uses_native_code: true,
+            crash_safe: false,
+            ..Default::default()
+        }
+    }
+}
+
+/// Trust level of the data being processed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum TrustLevel {
+    /// Data comes from a trusted source (e.g., internal pipeline).
+    #[default]
+    Trusted,
+    /// Data comes from a semi-trusted source (e.g., local file).
+    SemiTrusted,
+    /// Data comes from an untrusted source (e.g., network, user input).
+    /// Elements handling untrusted data should be isolated.
+    Untrusted,
+}
+
+/// Hint about the processing characteristics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ProcessingHint {
+    /// Unknown or mixed processing.
+    #[default]
+    Unknown,
+    /// Primarily CPU-bound (computationally intensive).
+    /// Good candidates for RT threads or dedicated cores.
+    CpuBound,
+    /// Primarily I/O-bound (waiting on I/O operations).
+    /// Best suited for async runtime.
+    IoBound,
+    /// Memory-bound (large data transfers).
+    MemoryBound,
+}
+
+/// Latency requirements hint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum LatencyHint {
+    /// Ultra-low latency required (< 1ms).
+    /// Must run in RT thread.
+    UltraLow,
+    /// Low latency required (< 10ms).
+    /// Prefer RT thread if available.
+    Low,
+    /// Normal latency acceptable (< 100ms).
+    #[default]
+    Normal,
+    /// High latency acceptable (> 100ms).
+    /// Can be scheduled opportunistically.
+    Relaxed,
+}
+
+/// Memory usage hint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum MemoryHint {
+    /// Normal memory usage.
+    #[default]
+    Normal,
+    /// Low memory usage (good for isolation).
+    Low,
+    /// High memory usage (may need special handling).
+    High,
+    /// Streaming (processes data in chunks, doesn't accumulate).
+    Streaming,
+}
+
+// ============================================================================
 // Output Type
 // ============================================================================
 
@@ -83,8 +253,10 @@ pub enum Affinity {
 /// // let out = Output::from(vec![buf1, buf2, buf3]);
 /// ```
 #[derive(Debug)]
+#[derive(Default)]
 pub enum Output {
     /// No output (buffer was filtered/consumed).
+    #[default]
     None,
     /// Single output buffer.
     Single(Buffer),
@@ -165,11 +337,6 @@ impl Output {
     }
 }
 
-impl Default for Output {
-    fn default() -> Self {
-        Self::None
-    }
-}
 
 // Ergonomic conversions
 impl From<Buffer> for Output {
@@ -325,6 +492,15 @@ pub trait Source: Send {
     fn is_rt_safe(&self) -> bool {
         false
     }
+
+    /// Get execution hints for automatic scheduling decisions.
+    ///
+    /// Override this to provide hints about processing characteristics,
+    /// trust level, latency requirements, etc. The executor uses these
+    /// hints to automatically determine the best execution strategy.
+    fn execution_hints(&self) -> ExecutionHints {
+        ExecutionHints::default()
+    }
 }
 
 /// An async source element that produces buffers asynchronously.
@@ -379,6 +555,12 @@ pub trait AsyncSource: Send {
     /// Returns `false` by default.
     fn is_rt_safe(&self) -> bool {
         false
+    }
+
+    /// Get execution hints for automatic scheduling decisions.
+    fn execution_hints(&self) -> ExecutionHints {
+        // Async sources are typically I/O-bound
+        ExecutionHints::io_bound()
     }
 }
 
@@ -436,6 +618,11 @@ pub trait Sink: Send {
     fn is_rt_safe(&self) -> bool {
         false
     }
+
+    /// Get execution hints for automatic scheduling decisions.
+    fn execution_hints(&self) -> ExecutionHints {
+        ExecutionHints::default()
+    }
 }
 
 /// An async sink element that consumes buffers asynchronously.
@@ -485,6 +672,12 @@ pub trait AsyncSink: Send {
     /// Returns `false` by default.
     fn is_rt_safe(&self) -> bool {
         false
+    }
+
+    /// Get execution hints for automatic scheduling decisions.
+    fn execution_hints(&self) -> ExecutionHints {
+        // Async sinks are typically I/O-bound
+        ExecutionHints::io_bound()
     }
 }
 
@@ -559,6 +752,11 @@ pub trait Element: Send {
     fn is_rt_safe(&self) -> bool {
         false
     }
+
+    /// Get execution hints for automatic scheduling decisions.
+    fn execution_hints(&self) -> ExecutionHints {
+        ExecutionHints::default()
+    }
 }
 
 // ============================================================================
@@ -628,6 +826,11 @@ pub trait Transform: Send {
     fn is_rt_safe(&self) -> bool {
         false
     }
+
+    /// Get execution hints for automatic scheduling decisions.
+    fn execution_hints(&self) -> ExecutionHints {
+        ExecutionHints::default()
+    }
 }
 
 /// An async transform element.
@@ -669,6 +872,12 @@ pub trait AsyncTransform: Send {
     /// Returns `false` by default.
     fn is_rt_safe(&self) -> bool {
         false
+    }
+
+    /// Get execution hints for automatic scheduling decisions.
+    fn execution_hints(&self) -> ExecutionHints {
+        // Async transforms are typically I/O-bound
+        ExecutionHints::io_bound()
     }
 }
 
@@ -853,6 +1062,11 @@ pub trait Demuxer: Send {
     fn is_rt_safe(&self) -> bool {
         false
     }
+
+    /// Get execution hints for automatic scheduling decisions.
+    fn execution_hints(&self) -> ExecutionHints {
+        ExecutionHints::default()
+    }
 }
 
 /// Input from a specific pad for muxers.
@@ -955,6 +1169,11 @@ pub trait Muxer: Send {
     fn is_rt_safe(&self) -> bool {
         false
     }
+
+    /// Get execution hints for automatic scheduling decisions.
+    fn execution_hints(&self) -> ExecutionHints {
+        ExecutionHints::default()
+    }
 }
 
 // ============================================================================
@@ -1035,6 +1254,14 @@ pub trait AsyncElementDyn {
     fn is_rt_safe(&self) -> bool {
         false
     }
+
+    /// Get execution hints for automatic scheduling decisions.
+    ///
+    /// These hints help the executor determine the optimal execution
+    /// strategy for each element.
+    fn execution_hints(&self) -> ExecutionHints {
+        ExecutionHints::default()
+    }
 }
 
 // ============================================================================
@@ -1086,6 +1313,10 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
     fn is_rt_safe(&self) -> bool {
         self.inner.is_rt_safe()
     }
+
+    fn execution_hints(&self) -> ExecutionHints {
+        self.inner.execution_hints()
+    }
 }
 
 /// Wrapper to adapt a sync [`Sink`] to [`AsyncElementDyn`].
@@ -1132,6 +1363,10 @@ impl<S: Sink + Send + 'static> SendAsyncElementDyn for SinkAdapter<S> {
 
     fn is_rt_safe(&self) -> bool {
         self.inner.is_rt_safe()
+    }
+
+    fn execution_hints(&self) -> ExecutionHints {
+        self.inner.execution_hints()
     }
 }
 
@@ -1183,6 +1418,10 @@ impl<E: Element + Send + 'static> SendAsyncElementDyn for ElementAdapter<E> {
 
     fn is_rt_safe(&self) -> bool {
         self.inner.is_rt_safe()
+    }
+
+    fn execution_hints(&self) -> ExecutionHints {
+        self.inner.execution_hints()
     }
 }
 
@@ -1268,6 +1507,10 @@ impl<T: Transform + Send + 'static> SendAsyncElementDyn for TransformAdapter<T> 
     fn is_rt_safe(&self) -> bool {
         self.inner.is_rt_safe()
     }
+
+    fn execution_hints(&self) -> ExecutionHints {
+        self.inner.execution_hints()
+    }
 }
 
 // ============================================================================
@@ -1332,6 +1575,10 @@ impl<S: AsyncSource + Send + 'static> SendAsyncElementDyn for AsyncSourceAdapter
     fn is_rt_safe(&self) -> bool {
         self.inner.is_rt_safe()
     }
+
+    fn execution_hints(&self) -> ExecutionHints {
+        self.inner.execution_hints()
+    }
 }
 
 /// Wrapper to adapt an [`AsyncSink`] to [`AsyncElementDyn`].
@@ -1378,6 +1625,10 @@ impl<S: AsyncSink + Send + 'static> SendAsyncElementDyn for AsyncSinkAdapter<S> 
 
     fn is_rt_safe(&self) -> bool {
         self.inner.is_rt_safe()
+    }
+
+    fn execution_hints(&self) -> ExecutionHints {
+        self.inner.execution_hints()
     }
 }
 
@@ -1460,6 +1711,10 @@ impl<T: AsyncTransform + Send + 'static> SendAsyncElementDyn for AsyncTransformA
 
     fn is_rt_safe(&self) -> bool {
         self.inner.is_rt_safe()
+    }
+
+    fn execution_hints(&self) -> ExecutionHints {
+        self.inner.execution_hints()
     }
 }
 
@@ -1579,6 +1834,10 @@ impl<D: Demuxer + Send + 'static> SendAsyncElementDyn for DemuxerAdapter<D> {
     fn is_rt_safe(&self) -> bool {
         self.inner.is_rt_safe()
     }
+
+    fn execution_hints(&self) -> ExecutionHints {
+        self.inner.execution_hints()
+    }
 }
 
 /// Wrapper to adapt a [`Muxer`] to [`AsyncElementDyn`].
@@ -1677,6 +1936,10 @@ impl<M: Muxer + Send + 'static> SendAsyncElementDyn for MuxerAdapter<M> {
 
     fn is_rt_safe(&self) -> bool {
         self.inner.is_rt_safe()
+    }
+
+    fn execution_hints(&self) -> ExecutionHints {
+        self.inner.execution_hints()
     }
 }
 

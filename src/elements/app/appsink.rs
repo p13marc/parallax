@@ -211,8 +211,6 @@ impl AppSinkHandle {
             state.total_pulled += 1;
             self.inner.space_available.notify_one();
             Ok(Some(buffer))
-        } else if state.eos {
-            Ok(None)
         } else {
             Ok(None)
         }

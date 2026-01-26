@@ -90,6 +90,10 @@ pub use traits::{
     ElementAdapter,
     // Supporting types
     ElementType,
+    // Execution hints for automatic scheduling
+    ExecutionHints,
+    LatencyHint,
+    MemoryHint,
     Muxer,
     MuxerAdapter,
     MuxerInput,
@@ -97,6 +101,7 @@ pub use traits::{
     OutputIter,
     PadAddedCallback,
     PadId,
+    ProcessingHint,
     RoutedOutput,
     Sink,
     SinkAdapter,
@@ -104,4 +109,5 @@ pub use traits::{
     SourceAdapter,
     Transform,
     TransformAdapter,
+    TrustLevel,
 };

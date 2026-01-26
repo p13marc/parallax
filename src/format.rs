@@ -68,6 +68,7 @@ use smallvec::SmallVec;
 /// assert_eq!(fixed.intersect(&range), Some(CapsValue::Fixed(1920)));
 /// ```
 #[derive(Clone, Debug, PartialEq)]
+#[derive(Default)]
 pub enum CapsValue<T> {
     /// Exact value (fully constrained).
     Fixed(T),
@@ -81,6 +82,7 @@ pub enum CapsValue<T> {
     /// List of acceptable values (ordered by preference, first is best).
     List(Vec<T>),
     /// Any value accepted (unconstrained).
+    #[default]
     Any,
 }
 
@@ -230,11 +232,6 @@ impl<T: Clone + Ord> CapsValue<T> {
     }
 }
 
-impl<T: Clone + Ord> Default for CapsValue<T> {
-    fn default() -> Self {
-        Self::Any
-    }
-}
 
 impl<T: Clone + Ord> From<T> for CapsValue<T> {
     fn from(value: T) -> Self {
@@ -838,6 +835,7 @@ impl From<AudioFormat> for AudioFormatCaps {
 
 /// Format caps - constraints for any format type.
 #[derive(Clone, Debug, PartialEq)]
+#[derive(Default)]
 pub enum FormatCaps {
     /// Raw video with constraints.
     VideoRaw(VideoFormatCaps),
@@ -854,6 +852,7 @@ pub enum FormatCaps {
     /// Raw bytes.
     Bytes,
     /// Any format.
+    #[default]
     Any,
 }
 
@@ -919,11 +918,6 @@ impl FormatCaps {
     }
 }
 
-impl Default for FormatCaps {
-    fn default() -> Self {
-        Self::Any
-    }
-}
 
 impl From<MediaFormat> for FormatCaps {
     fn from(format: MediaFormat) -> Self {

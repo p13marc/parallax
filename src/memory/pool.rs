@@ -319,6 +319,6 @@ mod tests {
         let pool = MemoryPool::new(segment, 128).unwrap();
 
         let slot = pool.loan().unwrap();
-        assert_eq!(slot.memory_type(), MemoryType::Heap);
+        assert_eq!(slot.memory_type(), MemoryType::Cpu);
     }
 }

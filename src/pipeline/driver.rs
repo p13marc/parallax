@@ -435,7 +435,7 @@ impl TimerDriverHandle {
 
     /// Check if the driver is running.
     pub fn is_running(&self) -> bool {
-        self.task.as_ref().map_or(false, |t| !t.is_finished())
+        self.task.as_ref().is_some_and(|t| !t.is_finished())
     }
 }
 
