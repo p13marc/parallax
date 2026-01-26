@@ -480,7 +480,7 @@ mod tests {
         let mut receiver1 = sender.subscribe();
         let mut receiver2 = sender.subscribe();
 
-        sender.send_state_changed(PipelineState::Stopped, PipelineState::Running);
+        sender.send_state_changed(PipelineState::Suspended, PipelineState::Running);
 
         // Both receivers should get the event
         let e1 = receiver1.recv().await.unwrap();

@@ -58,19 +58,38 @@ pub struct LinkInfo {
     pub negotiated_memory: Option<MemoryType>,
 }
 
-/// State of the pipeline.
+/// State of the pipeline (PipeWire-inspired 3-state model).
+///
+/// This follows PipeWire's state machine:
+/// - **Suspended**: Resources deallocated, minimal memory usage
+/// - **Idle**: Resources allocated, ready to process, but not actively running
+/// - **Running**: Actively processing data
+///
+/// State transitions:
+/// ```text
+/// Suspended <-> Idle <-> Running
+/// ```
+///
+/// The key insight from PipeWire is that "paused" and "stopped" are the same
+/// state (Idle) - the difference is just whether we intend to resume soon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum PipelineState {
-    /// Pipeline is not yet started.
+    /// Resources are deallocated. Minimal memory footprint.
+    /// Transition to Idle to allocate resources.
     #[default]
-    Stopped,
-    /// Pipeline is running.
+    Suspended,
+
+    /// Resources are allocated and ready, but not processing.
+    /// This is the "paused" state - ready to run immediately.
+    /// Transition to Running to start processing.
+    Idle,
+
+    /// Actively processing data through the pipeline.
+    /// Transition to Idle to pause, or to Suspended to release resources.
     Running,
-    /// Pipeline is paused.
-    Paused,
-    /// Pipeline has finished (all sources exhausted).
-    Finished,
-    /// Pipeline encountered an error.
+
+    /// Pipeline encountered an unrecoverable error.
+    /// Must transition to Suspended before recovering.
     Error,
 }
 
@@ -303,7 +322,7 @@ impl Pipeline {
         Self {
             graph: Dag::new(),
             nodes_by_name: HashMap::new(),
-            state: PipelineState::Stopped,
+            state: PipelineState::Suspended,
             name_counter: 0,
             negotiation: None,
         }
@@ -314,9 +333,134 @@ impl Pipeline {
         self.state
     }
 
-    /// Set the pipeline state.
+    /// Set the pipeline state directly (internal use).
     pub fn set_state(&mut self, state: PipelineState) {
         self.state = state;
+    }
+
+    /// Transition from Suspended to Idle (allocate resources).
+    ///
+    /// This prepares the pipeline for execution by:
+    /// - Running caps negotiation if needed
+    /// - Validating the pipeline structure
+    ///
+    /// Returns an error if the transition is invalid.
+    pub fn prepare(&mut self) -> Result<()> {
+        match self.state {
+            PipelineState::Suspended => {
+                // Validate pipeline structure
+                self.validate()?;
+
+                // Run caps negotiation if needed
+                if !self.is_negotiated() {
+                    self.negotiate()?;
+                }
+
+                self.state = PipelineState::Idle;
+                Ok(())
+            }
+            PipelineState::Idle => {
+                // Already prepared, no-op
+                Ok(())
+            }
+            PipelineState::Running => Err(Error::InvalidSegment(
+                "cannot prepare while running, pause first".into(),
+            )),
+            PipelineState::Error => Err(Error::InvalidSegment(
+                "cannot prepare from error state, reset first".into(),
+            )),
+        }
+    }
+
+    /// Transition from Idle to Running (start processing).
+    ///
+    /// The pipeline must be in Idle state (call `prepare()` first).
+    pub fn activate(&mut self) -> Result<()> {
+        match self.state {
+            PipelineState::Idle => {
+                self.state = PipelineState::Running;
+                Ok(())
+            }
+            PipelineState::Running => {
+                // Already running, no-op
+                Ok(())
+            }
+            PipelineState::Suspended => Err(Error::InvalidSegment(
+                "cannot activate from suspended, call prepare() first".into(),
+            )),
+            PipelineState::Error => Err(Error::InvalidSegment(
+                "cannot activate from error state, reset first".into(),
+            )),
+        }
+    }
+
+    /// Transition from Running to Idle (pause processing).
+    ///
+    /// Data threads stop processing but resources remain allocated.
+    pub fn pause(&mut self) -> Result<()> {
+        match self.state {
+            PipelineState::Running => {
+                self.state = PipelineState::Idle;
+                Ok(())
+            }
+            PipelineState::Idle => {
+                // Already paused, no-op
+                Ok(())
+            }
+            PipelineState::Suspended => Err(Error::InvalidSegment(
+                "cannot pause from suspended state".into(),
+            )),
+            PipelineState::Error => Err(Error::InvalidSegment(
+                "cannot pause from error state".into(),
+            )),
+        }
+    }
+
+    /// Transition from Idle to Suspended (release resources).
+    ///
+    /// This deallocates buffers and releases resources.
+    pub fn suspend(&mut self) -> Result<()> {
+        match self.state {
+            PipelineState::Idle => {
+                // Clear negotiation results (resources will be deallocated)
+                self.negotiation = None;
+                self.state = PipelineState::Suspended;
+                Ok(())
+            }
+            PipelineState::Suspended => {
+                // Already suspended, no-op
+                Ok(())
+            }
+            PipelineState::Running => Err(Error::InvalidSegment(
+                "cannot suspend while running, pause first".into(),
+            )),
+            PipelineState::Error => {
+                // Allow recovery from error by suspending
+                self.negotiation = None;
+                self.state = PipelineState::Suspended;
+                Ok(())
+            }
+        }
+    }
+
+    /// Mark the pipeline as having encountered an error.
+    pub fn set_error(&mut self) {
+        self.state = PipelineState::Error;
+    }
+
+    /// Check if the pipeline is in a runnable state.
+    pub fn is_runnable(&self) -> bool {
+        matches!(self.state, PipelineState::Idle | PipelineState::Running)
+    }
+
+    /// Check if the pipeline is currently running.
+    pub fn is_running(&self) -> bool {
+        self.state == PipelineState::Running
+    }
+
+    /// Check if the pipeline has encountered an error.
+    pub fn has_error(&self) -> bool {
+        self.state == PipelineState::Error
     }
 
     /// Add a node to the pipeline.
@@ -1473,7 +1617,7 @@ mod tests {
     fn test_pipeline_creation() {
         let pipeline = Pipeline::new();
         assert!(pipeline.is_empty());
-        assert_eq!(pipeline.state(), PipelineState::Stopped);
+        assert_eq!(pipeline.state(), PipelineState::Suspended);
     }
 
     #[test]
@@ -1964,5 +2108,136 @@ mod tests {
         // Try to link with a non-existent sink pad
         let result = pipeline.link_pads(src, "src", sink, "nonexistent");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_state_transitions() {
+        let mut pipeline = Pipeline::new();
+
+        // Initial state is Suspended
+        assert_eq!(pipeline.state(), PipelineState::Suspended);
+        assert!(!pipeline.is_running());
+        assert!(!pipeline.is_runnable());
+
+        // Add elements to make it valid
+        let src = pipeline.add_node(
+            "src",
+            DynAsyncElement::new_box(SourceAdapter::new(TestSource)),
+        );
+        let sink = pipeline.add_node("sink", DynAsyncElement::new_box(SinkAdapter::new(TestSink)));
+        pipeline.link(src, sink).unwrap();
+
+        // Suspended -> Idle (prepare)
+        pipeline.prepare().unwrap();
+        assert_eq!(pipeline.state(), PipelineState::Idle);
+        assert!(pipeline.is_runnable());
+        assert!(!pipeline.is_running());
+
+        // Idle -> Running (activate)
+        pipeline.activate().unwrap();
+        assert_eq!(pipeline.state(), PipelineState::Running);
+        assert!(pipeline.is_running());
+        assert!(pipeline.is_runnable());
+
+        // Running -> Idle (pause)
+        pipeline.pause().unwrap();
+        assert_eq!(pipeline.state(), PipelineState::Idle);
+        assert!(!pipeline.is_running());
+
+        // Idle -> Suspended (suspend)
+        pipeline.suspend().unwrap();
+        assert_eq!(pipeline.state(), PipelineState::Suspended);
+        assert!(!pipeline.is_runnable());
+    }
+
+    #[test]
+    fn test_invalid_state_transitions() {
+        let mut pipeline = Pipeline::new();
+
+        let src = pipeline.add_node(
+            "src",
+            DynAsyncElement::new_box(SourceAdapter::new(TestSource)),
+        );
+        let sink = pipeline.add_node("sink", DynAsyncElement::new_box(SinkAdapter::new(TestSink)));
+        pipeline.link(src, sink).unwrap();
+
+        // Cannot activate from Suspended
+        assert!(pipeline.activate().is_err());
+
+        // Cannot pause from Suspended
+        assert!(pipeline.pause().is_err());
+
+        // Prepare to Idle
+        pipeline.prepare().unwrap();
+
+        // Cannot suspend while Running (need to pause first)
+        pipeline.activate().unwrap();
+        assert!(pipeline.suspend().is_err());
+
+        // Pause first, then suspend works
+        pipeline.pause().unwrap();
+        pipeline.suspend().unwrap();
+    }
+
+    #[test]
+    fn test_error_state_recovery() {
+        let mut pipeline = Pipeline::new();
+
+        let src = pipeline.add_node(
+            "src",
+            DynAsyncElement::new_box(SourceAdapter::new(TestSource)),
+        );
+        let sink = pipeline.add_node("sink", DynAsyncElement::new_box(SinkAdapter::new(TestSink)));
+        pipeline.link(src, sink).unwrap();
+
+        // Simulate error
+        pipeline.set_error();
+        assert!(pipeline.has_error());
+        assert_eq!(pipeline.state(), PipelineState::Error);
+
+        // Cannot prepare/activate from error
+        assert!(pipeline.prepare().is_err());
+        assert!(pipeline.activate().is_err());
+
+        // Can recover by suspending
+        pipeline.suspend().unwrap();
+        assert_eq!(pipeline.state(), PipelineState::Suspended);
+        assert!(!pipeline.has_error());
+
+        // Now can prepare again
+        pipeline.prepare().unwrap();
+        assert_eq!(pipeline.state(), PipelineState::Idle);
+    }
+
+    #[test]
+    fn test_idempotent_transitions() {
+        let mut pipeline = Pipeline::new();
+
+        let src = pipeline.add_node(
+            "src",
+            DynAsyncElement::new_box(SourceAdapter::new(TestSource)),
+        );
+        let sink = pipeline.add_node("sink", DynAsyncElement::new_box(SinkAdapter::new(TestSink)));
+        pipeline.link(src, sink).unwrap();
+
+        // Double prepare is idempotent
+        pipeline.prepare().unwrap();
+        pipeline.prepare().unwrap();
+        assert_eq!(pipeline.state(), PipelineState::Idle);
+
+        // Double activate is idempotent
+        pipeline.activate().unwrap();
+        pipeline.activate().unwrap();
+        assert_eq!(pipeline.state(), PipelineState::Running);
+
+        // Double pause is idempotent
+        pipeline.pause().unwrap();
+        pipeline.pause().unwrap();
+        assert_eq!(pipeline.state(), PipelineState::Idle);
+
+        // Double suspend is idempotent
+        pipeline.suspend().unwrap();
+        pipeline.suspend().unwrap();
+        assert_eq!(pipeline.state(), PipelineState::Suspended);
     }
 }

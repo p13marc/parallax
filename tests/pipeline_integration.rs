@@ -700,7 +700,7 @@ fn test_pipeline_to_json() {
     let json = pipeline.to_json();
 
     // Check that the JSON output contains expected elements
-    assert!(json.contains("\"state\": \"Stopped\""));
+    assert!(json.contains("\"state\": \"Suspended\""));
     assert!(json.contains("\"node_count\": 3"));
     assert!(json.contains("\"edge_count\": 2"));
     assert!(json.contains("\"nodes\": ["));
@@ -803,8 +803,8 @@ async fn test_pipeline_state_transitions() {
 
     let mut pipeline = Pipeline::new();
 
-    // Initially stopped
-    assert_eq!(pipeline.state(), PipelineState::Stopped);
+    // Initially suspended
+    assert_eq!(pipeline.state(), PipelineState::Suspended);
 
     let src = pipeline.add_node(
         "src",
