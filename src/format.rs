@@ -8,8 +8,256 @@
 //! - **Type safety**: Use enums instead of stringly-typed formats
 //! - **Zero-cost**: Small, Copy types wherever possible
 //! - **Explicit**: Clear format descriptions, no implicit conversions
+//!
+//! # Caps Negotiation
+//!
+//! The caps system supports constraint-based negotiation:
+//!
+//! - [`CapsValue<T>`]: A value that can be fixed, range, list, or any
+//! - [`VideoFormatCaps`]: Video format with constraints
+//! - [`AudioFormatCaps`]: Audio format with constraints
+//! - [`MemoryCaps`]: Memory type constraints
+//! - [`MediaCaps`]: Combined format + memory caps
+//!
+//! ```rust,ignore
+//! use parallax::format::{CapsValue, VideoFormatCaps, PixelFormat, Framerate};
+//!
+//! // Element accepts 1080p or 720p, any framerate
+//! let caps = VideoFormatCaps {
+//!     width: CapsValue::List(vec![1920, 1280]),
+//!     height: CapsValue::List(vec![1080, 720]),
+//!     pixel_format: CapsValue::Fixed(PixelFormat::I420),
+//!     framerate: CapsValue::Any,
+//! };
+//!
+//! // Find common ground with another element
+//! let negotiated = caps.intersect(&other_caps)?;
+//! let fixed = negotiated.fixate()?;
+//! ```
 
+use crate::memory::MemoryType;
 use smallvec::SmallVec;
+
+// ============================================================================
+// CapsValue - constraint value for negotiation
+// ============================================================================
+
+/// A value that can be fixed, range, list, or any.
+///
+/// Used in caps negotiation to express constraints on format parameters.
+/// Supports intersection (finding common ground) and fixation (choosing a value).
+///
+/// # Examples
+///
+/// ```rust
+/// use parallax::format::CapsValue;
+///
+/// // Fixed value
+/// let fixed: CapsValue<u32> = CapsValue::Fixed(1920);
+///
+/// // Range of acceptable values
+/// let range: CapsValue<u32> = CapsValue::Range { min: 720, max: 1920 };
+///
+/// // List of acceptable values (ordered by preference)
+/// let list: CapsValue<u32> = CapsValue::List(vec![1920, 1280, 720]);
+///
+/// // Any value accepted
+/// let any: CapsValue<u32> = CapsValue::Any;
+///
+/// // Intersection finds common ground
+/// assert_eq!(fixed.intersect(&range), Some(CapsValue::Fixed(1920)));
+/// ```
+#[derive(Clone, Debug, PartialEq)]
+pub enum CapsValue<T> {
+    /// Exact value (fully constrained).
+    Fixed(T),
+    /// Range of acceptable values (inclusive).
+    Range {
+        /// Minimum acceptable value.
+        min: T,
+        /// Maximum acceptable value.
+        max: T,
+    },
+    /// List of acceptable values (ordered by preference, first is best).
+    List(Vec<T>),
+    /// Any value accepted (unconstrained).
+    Any,
+}
+
+impl<T: Clone + Ord> CapsValue<T> {
+    /// Check if a value is accepted by this constraint.
+    pub fn accepts(&self, value: &T) -> bool {
+        match self {
+            Self::Fixed(v) => v == value,
+            Self::Range { min, max } => value >= min && value <= max,
+            Self::List(values) => values.contains(value),
+            Self::Any => true,
+        }
+    }
+
+    /// Intersect two constraints, finding common values.
+    ///
+    /// Returns `None` if there's no overlap.
+    pub fn intersect(&self, other: &Self) -> Option<Self> {
+        match (self, other) {
+            // Any intersects with anything
+            (Self::Any, other) => Some(other.clone()),
+            (self_, Self::Any) => Some(self_.clone()),
+
+            // Fixed vs Fixed: must be equal
+            (Self::Fixed(a), Self::Fixed(b)) => {
+                if a == b {
+                    Some(Self::Fixed(a.clone()))
+                } else {
+                    None
+                }
+            }
+
+            // Fixed vs Range: fixed must be in range
+            (Self::Fixed(v), Self::Range { min, max })
+            | (Self::Range { min, max }, Self::Fixed(v)) => {
+                if v >= min && v <= max {
+                    Some(Self::Fixed(v.clone()))
+                } else {
+                    None
+                }
+            }
+
+            // Fixed vs List: fixed must be in list
+            (Self::Fixed(v), Self::List(list)) | (Self::List(list), Self::Fixed(v)) => {
+                if list.contains(v) {
+                    Some(Self::Fixed(v.clone()))
+                } else {
+                    None
+                }
+            }
+
+            // Range vs Range: overlap
+            (
+                Self::Range {
+                    min: min1,
+                    max: max1,
+                },
+                Self::Range {
+                    min: min2,
+                    max: max2,
+                },
+            ) => {
+                let new_min = min1.max(min2);
+                let new_max = max1.min(max2);
+                if new_min <= new_max {
+                    if new_min == new_max {
+                        Some(Self::Fixed(new_min.clone()))
+                    } else {
+                        Some(Self::Range {
+                            min: new_min.clone(),
+                            max: new_max.clone(),
+                        })
+                    }
+                } else {
+                    None
+                }
+            }
+
+            // Range vs List: filter list to values in range
+            (Self::Range { min, max }, Self::List(list))
+            | (Self::List(list), Self::Range { min, max }) => {
+                let filtered: Vec<T> = list
+                    .iter()
+                    .filter(|v| *v >= min && *v <= max)
+                    .cloned()
+                    .collect();
+                match filtered.len() {
+                    0 => None,
+                    1 => Some(Self::Fixed(filtered.into_iter().next().unwrap())),
+                    _ => Some(Self::List(filtered)),
+                }
+            }
+
+            // List vs List: common values (preserving order from first list)
+            (Self::List(list1), Self::List(list2)) => {
+                let common: Vec<T> = list1
+                    .iter()
+                    .filter(|v| list2.contains(v))
+                    .cloned()
+                    .collect();
+                match common.len() {
+                    0 => None,
+                    1 => Some(Self::Fixed(common.into_iter().next().unwrap())),
+                    _ => Some(Self::List(common)),
+                }
+            }
+        }
+    }
+
+    /// Fixate: choose a single value from the constraint.
+    ///
+    /// Returns the preferred value (first in list, min in range).
+    /// Returns `None` for `Any` (cannot fixate without default).
+    pub fn fixate(&self) -> Option<T> {
+        match self {
+            Self::Fixed(v) => Some(v.clone()),
+            Self::Range { min, .. } => Some(min.clone()),
+            Self::List(values) => values.first().cloned(),
+            Self::Any => None,
+        }
+    }
+
+    /// Fixate with a default value for `Any`.
+    pub fn fixate_with_default(&self, default: T) -> T {
+        self.fixate().unwrap_or(default)
+    }
+
+    /// Check if this is a fixed value.
+    #[inline]
+    pub fn is_fixed(&self) -> bool {
+        matches!(self, Self::Fixed(_))
+    }
+
+    /// Check if this accepts any value.
+    #[inline]
+    pub fn is_any(&self) -> bool {
+        matches!(self, Self::Any)
+    }
+
+    /// Get the fixed value if this is fixed.
+    #[inline]
+    pub fn as_fixed(&self) -> Option<&T> {
+        match self {
+            Self::Fixed(v) => Some(v),
+            _ => None,
+        }
+    }
+}
+
+impl<T: Clone + Ord> Default for CapsValue<T> {
+    fn default() -> Self {
+        Self::Any
+    }
+}
+
+impl<T: Clone + Ord> From<T> for CapsValue<T> {
+    fn from(value: T) -> Self {
+        Self::Fixed(value)
+    }
+}
+
+impl<T: Clone + Ord> From<std::ops::RangeInclusive<T>> for CapsValue<T> {
+    fn from(range: std::ops::RangeInclusive<T>) -> Self {
+        let (min, max) = range.into_inner();
+        Self::Range { min, max }
+    }
+}
+
+impl<T: Clone + Ord> From<Vec<T>> for CapsValue<T> {
+    fn from(values: Vec<T>) -> Self {
+        match values.len() {
+            0 => Self::Any,
+            1 => Self::Fixed(values.into_iter().next().unwrap()),
+            _ => Self::List(values),
+        }
+    }
+}
 
 // ============================================================================
 // Media Formats
@@ -106,7 +354,7 @@ impl VideoFormat {
 }
 
 /// Pixel formats (color space and memory layout).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum PixelFormat {
     /// YUV 4:2:0 planar (Y plane, then U plane, then V plane).
@@ -197,6 +445,21 @@ impl Default for Framerate {
     }
 }
 
+impl PartialOrd for Framerate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Framerate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Compare as fractions: a/b vs c/d => a*d vs c*b
+        let lhs = (self.num as u64) * (other.den as u64);
+        let rhs = (other.num as u64) * (self.den as u64);
+        lhs.cmp(&rhs)
+    }
+}
+
 // ============================================================================
 // Audio Formats
 // ============================================================================
@@ -242,7 +505,7 @@ impl AudioFormat {
 }
 
 /// Audio sample formats.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum SampleFormat {
     /// Signed 16-bit integer (most common).
@@ -401,7 +664,453 @@ impl From<&[u8]> for CodecData {
 }
 
 // ============================================================================
-// Caps (Capabilities)
+// Format Caps - constraint-based format negotiation
+// ============================================================================
+
+/// Video format with constraints for negotiation.
+///
+/// Each field can be fixed, a range, a list of options, or any value.
+/// Used during caps negotiation to find compatible formats.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VideoFormatCaps {
+    /// Width constraint.
+    pub width: CapsValue<u32>,
+    /// Height constraint.
+    pub height: CapsValue<u32>,
+    /// Pixel format constraint.
+    pub pixel_format: CapsValue<PixelFormat>,
+    /// Framerate constraint.
+    pub framerate: CapsValue<Framerate>,
+}
+
+impl VideoFormatCaps {
+    /// Create caps that accept any video format.
+    pub fn any() -> Self {
+        Self {
+            width: CapsValue::Any,
+            height: CapsValue::Any,
+            pixel_format: CapsValue::Any,
+            framerate: CapsValue::Any,
+        }
+    }
+
+    /// Create caps for a fixed video format.
+    pub fn fixed(format: VideoFormat) -> Self {
+        Self {
+            width: CapsValue::Fixed(format.width),
+            height: CapsValue::Fixed(format.height),
+            pixel_format: CapsValue::Fixed(format.pixel_format),
+            framerate: CapsValue::Fixed(format.framerate),
+        }
+    }
+
+    /// Intersect with another video caps.
+    pub fn intersect(&self, other: &Self) -> Option<Self> {
+        Some(Self {
+            width: self.width.intersect(&other.width)?,
+            height: self.height.intersect(&other.height)?,
+            pixel_format: self.pixel_format.intersect(&other.pixel_format)?,
+            framerate: self.framerate.intersect(&other.framerate)?,
+        })
+    }
+
+    /// Fixate to a concrete video format.
+    pub fn fixate(&self) -> Option<VideoFormat> {
+        Some(VideoFormat {
+            width: self.width.fixate()?,
+            height: self.height.fixate()?,
+            pixel_format: self.pixel_format.fixate()?,
+            framerate: self.framerate.fixate()?,
+        })
+    }
+
+    /// Fixate with defaults for unconstrained values.
+    ///
+    /// Unlike `fixate()`, this always returns a value by using sensible defaults
+    /// for Any constraints: 1920x1080, I420, 30fps.
+    pub fn fixate_with_defaults(&self) -> VideoFormat {
+        VideoFormat {
+            width: self.width.fixate_with_default(1920),
+            height: self.height.fixate_with_default(1080),
+            pixel_format: self.pixel_format.fixate_with_default(PixelFormat::I420),
+            framerate: self.framerate.fixate_with_default(Framerate::FPS_30),
+        }
+    }
+
+    /// Check if fully fixed.
+    pub fn is_fixed(&self) -> bool {
+        self.width.is_fixed()
+            && self.height.is_fixed()
+            && self.pixel_format.is_fixed()
+            && self.framerate.is_fixed()
+    }
+}
+
+impl Default for VideoFormatCaps {
+    fn default() -> Self {
+        Self::any()
+    }
+}
+
+impl From<VideoFormat> for VideoFormatCaps {
+    fn from(format: VideoFormat) -> Self {
+        Self::fixed(format)
+    }
+}
+
+/// Audio format with constraints for negotiation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AudioFormatCaps {
+    /// Sample rate constraint.
+    pub sample_rate: CapsValue<u32>,
+    /// Number of channels constraint.
+    pub channels: CapsValue<u16>,
+    /// Sample format constraint.
+    pub sample_format: CapsValue<SampleFormat>,
+}
+
+impl AudioFormatCaps {
+    /// Create caps that accept any audio format.
+    pub fn any() -> Self {
+        Self {
+            sample_rate: CapsValue::Any,
+            channels: CapsValue::Any,
+            sample_format: CapsValue::Any,
+        }
+    }
+
+    /// Create caps for a fixed audio format.
+    pub fn fixed(format: AudioFormat) -> Self {
+        Self {
+            sample_rate: CapsValue::Fixed(format.sample_rate),
+            channels: CapsValue::Fixed(format.channels),
+            sample_format: CapsValue::Fixed(format.sample_format),
+        }
+    }
+
+    /// Intersect with another audio caps.
+    pub fn intersect(&self, other: &Self) -> Option<Self> {
+        Some(Self {
+            sample_rate: self.sample_rate.intersect(&other.sample_rate)?,
+            channels: self.channels.intersect(&other.channels)?,
+            sample_format: self.sample_format.intersect(&other.sample_format)?,
+        })
+    }
+
+    /// Fixate to a concrete audio format.
+    pub fn fixate(&self) -> Option<AudioFormat> {
+        Some(AudioFormat {
+            sample_rate: self.sample_rate.fixate()?,
+            channels: self.channels.fixate()?,
+            sample_format: self.sample_format.fixate()?,
+        })
+    }
+
+    /// Fixate with defaults for unconstrained values.
+    ///
+    /// Unlike `fixate()`, this always returns a value by using sensible defaults
+    /// for Any constraints: 48000 Hz, stereo, S16.
+    pub fn fixate_with_defaults(&self) -> AudioFormat {
+        AudioFormat {
+            sample_rate: self.sample_rate.fixate_with_default(48000),
+            channels: self.channels.fixate_with_default(2),
+            sample_format: self.sample_format.fixate_with_default(SampleFormat::S16),
+        }
+    }
+
+    /// Check if fully fixed.
+    pub fn is_fixed(&self) -> bool {
+        self.sample_rate.is_fixed() && self.channels.is_fixed() && self.sample_format.is_fixed()
+    }
+}
+
+impl Default for AudioFormatCaps {
+    fn default() -> Self {
+        Self::any()
+    }
+}
+
+impl From<AudioFormat> for AudioFormatCaps {
+    fn from(format: AudioFormat) -> Self {
+        Self::fixed(format)
+    }
+}
+
+/// Format caps - constraints for any format type.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FormatCaps {
+    /// Raw video with constraints.
+    VideoRaw(VideoFormatCaps),
+    /// Encoded video (codec is fixed, but format params may vary).
+    Video(VideoCodec),
+    /// Raw audio with constraints.
+    AudioRaw(AudioFormatCaps),
+    /// Encoded audio.
+    Audio(AudioCodec),
+    /// RTP stream.
+    Rtp(RtpFormat),
+    /// MPEG-TS.
+    MpegTs,
+    /// Raw bytes.
+    Bytes,
+    /// Any format.
+    Any,
+}
+
+impl FormatCaps {
+    /// Intersect with another format caps.
+    pub fn intersect(&self, other: &Self) -> Option<Self> {
+        match (self, other) {
+            (Self::Any, other) => Some(other.clone()),
+            (self_, Self::Any) => Some(self_.clone()),
+
+            (Self::VideoRaw(a), Self::VideoRaw(b)) => Some(Self::VideoRaw(a.intersect(b)?)),
+            (Self::Video(a), Self::Video(b)) if a == b => Some(Self::Video(*a)),
+            (Self::AudioRaw(a), Self::AudioRaw(b)) => Some(Self::AudioRaw(a.intersect(b)?)),
+            (Self::Audio(a), Self::Audio(b)) if a == b => Some(Self::Audio(*a)),
+            (Self::Rtp(a), Self::Rtp(b)) if a == b => Some(Self::Rtp(*a)),
+            (Self::MpegTs, Self::MpegTs) => Some(Self::MpegTs),
+            (Self::Bytes, Self::Bytes) => Some(Self::Bytes),
+            (Self::Bytes, other) | (other, Self::Bytes) => Some(other.clone()),
+
+            _ => None,
+        }
+    }
+
+    /// Fixate to a concrete media format.
+    pub fn fixate(&self) -> Option<MediaFormat> {
+        match self {
+            Self::VideoRaw(caps) => Some(MediaFormat::VideoRaw(caps.fixate()?)),
+            Self::Video(codec) => Some(MediaFormat::Video(*codec)),
+            Self::AudioRaw(caps) => Some(MediaFormat::AudioRaw(caps.fixate()?)),
+            Self::Audio(codec) => Some(MediaFormat::Audio(*codec)),
+            Self::Rtp(rtp) => Some(MediaFormat::Rtp(*rtp)),
+            Self::MpegTs => Some(MediaFormat::MpegTs),
+            Self::Bytes => Some(MediaFormat::Bytes),
+            Self::Any => None,
+        }
+    }
+
+    /// Fixate with defaults for unconstrained values.
+    ///
+    /// Unlike `fixate()`, this always returns a value by using sensible defaults.
+    /// For `Any`, defaults to raw bytes.
+    pub fn fixate_with_defaults(&self) -> MediaFormat {
+        match self {
+            Self::VideoRaw(caps) => MediaFormat::VideoRaw(caps.fixate_with_defaults()),
+            Self::Video(codec) => MediaFormat::Video(*codec),
+            Self::AudioRaw(caps) => MediaFormat::AudioRaw(caps.fixate_with_defaults()),
+            Self::Audio(codec) => MediaFormat::Audio(*codec),
+            Self::Rtp(rtp) => MediaFormat::Rtp(*rtp),
+            Self::MpegTs => MediaFormat::MpegTs,
+            Self::Bytes => MediaFormat::Bytes,
+            Self::Any => MediaFormat::Bytes,
+        }
+    }
+
+    /// Check if this is a video format (raw or encoded).
+    pub fn is_video(&self) -> bool {
+        matches!(self, Self::VideoRaw(_) | Self::Video(_))
+    }
+
+    /// Check if this is an audio format (raw or encoded).
+    pub fn is_audio(&self) -> bool {
+        matches!(self, Self::AudioRaw(_) | Self::Audio(_))
+    }
+}
+
+impl Default for FormatCaps {
+    fn default() -> Self {
+        Self::Any
+    }
+}
+
+impl From<MediaFormat> for FormatCaps {
+    fn from(format: MediaFormat) -> Self {
+        match format {
+            MediaFormat::VideoRaw(v) => Self::VideoRaw(v.into()),
+            MediaFormat::Video(c) => Self::Video(c),
+            MediaFormat::AudioRaw(a) => Self::AudioRaw(a.into()),
+            MediaFormat::Audio(c) => Self::Audio(c),
+            MediaFormat::Rtp(r) => Self::Rtp(r),
+            MediaFormat::MpegTs => Self::MpegTs,
+            MediaFormat::Bytes => Self::Bytes,
+        }
+    }
+}
+
+// ============================================================================
+// Memory Caps - memory type constraints
+// ============================================================================
+
+/// Memory capabilities for negotiation.
+///
+/// Describes what memory types an element can work with.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemoryCaps {
+    /// Supported memory types (ordered by preference).
+    pub types: CapsValue<MemoryType>,
+    /// Can import (receive) from these types via conversion.
+    pub can_import: Vec<MemoryType>,
+    /// Can export (send) to these types via conversion.
+    pub can_export: Vec<MemoryType>,
+}
+
+impl MemoryCaps {
+    /// Accept only CPU memory.
+    pub fn cpu_only() -> Self {
+        Self {
+            types: CapsValue::Fixed(MemoryType::Cpu),
+            can_import: vec![MemoryType::Cpu],
+            can_export: vec![MemoryType::Cpu],
+        }
+    }
+
+    /// Accept any memory type.
+    pub fn any() -> Self {
+        Self {
+            types: CapsValue::Any,
+            can_import: vec![],
+            can_export: vec![],
+        }
+    }
+
+    /// Prefer GPU memory but can work with CPU.
+    #[allow(deprecated)]
+    pub fn gpu_preferred() -> Self {
+        Self {
+            types: CapsValue::List(vec![MemoryType::GpuDevice, MemoryType::Cpu]),
+            can_import: vec![MemoryType::Cpu, MemoryType::DmaBuf],
+            can_export: vec![MemoryType::Cpu, MemoryType::DmaBuf],
+        }
+    }
+
+    /// Intersect with another memory caps.
+    pub fn intersect(&self, other: &Self) -> Option<Self> {
+        Some(Self {
+            types: self.types.intersect(&other.types)?,
+            // For imports/exports, take union (more capable)
+            can_import: self
+                .can_import
+                .iter()
+                .chain(other.can_import.iter())
+                .cloned()
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect(),
+            can_export: self
+                .can_export
+                .iter()
+                .chain(other.can_export.iter())
+                .cloned()
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect(),
+        })
+    }
+
+    /// Fixate to a concrete memory type.
+    pub fn fixate(&self) -> Option<MemoryType> {
+        self.types.fixate()
+    }
+}
+
+impl Default for MemoryCaps {
+    fn default() -> Self {
+        Self::any()
+    }
+}
+
+// ============================================================================
+// Media Caps - combined format + memory
+// ============================================================================
+
+/// Combined format and memory capabilities.
+///
+/// This is the complete specification for what an element can handle.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MediaCaps {
+    /// Format constraints.
+    pub format: FormatCaps,
+    /// Memory constraints.
+    pub memory: MemoryCaps,
+}
+
+impl MediaCaps {
+    /// Create caps that accept anything.
+    pub fn any() -> Self {
+        Self {
+            format: FormatCaps::Any,
+            memory: MemoryCaps::any(),
+        }
+    }
+
+    /// Create caps with specific format, any memory.
+    pub fn from_format(format: FormatCaps) -> Self {
+        Self {
+            format,
+            memory: MemoryCaps::any(),
+        }
+    }
+
+    /// Create caps with specific format and memory.
+    pub fn new(format: FormatCaps, memory: MemoryCaps) -> Self {
+        Self { format, memory }
+    }
+
+    /// Intersect with another media caps.
+    pub fn intersect(&self, other: &Self) -> Option<Self> {
+        Some(Self {
+            format: self.format.intersect(&other.format)?,
+            memory: self.memory.intersect(&other.memory)?,
+        })
+    }
+
+    /// Fixate format (memory type chosen separately).
+    pub fn fixate_format(&self) -> Option<MediaFormat> {
+        self.format.fixate()
+    }
+
+    /// Fixate format with defaults for unconstrained values.
+    pub fn fixate_format_with_defaults(&self) -> MediaFormat {
+        self.format.fixate_with_defaults()
+    }
+
+    /// Fixate memory type.
+    pub fn fixate_memory(&self) -> Option<MemoryType> {
+        self.memory.fixate()
+    }
+}
+
+impl Default for MediaCaps {
+    fn default() -> Self {
+        Self::any()
+    }
+}
+
+impl From<MediaFormat> for MediaCaps {
+    fn from(format: MediaFormat) -> Self {
+        Self {
+            format: format.into(),
+            memory: MemoryCaps::any(),
+        }
+    }
+}
+
+impl From<Caps> for MediaCaps {
+    fn from(caps: Caps) -> Self {
+        if caps.is_any() {
+            Self::any()
+        } else if let Some(format) = caps.preferred() {
+            Self::from_format(format.clone().into())
+        } else {
+            Self::any()
+        }
+    }
+}
+
+// ============================================================================
+// Caps (Capabilities) - legacy API
 // ============================================================================
 
 /// Capabilities: what formats an element accepts/produces.
@@ -657,5 +1366,323 @@ mod tests {
         assert_eq!(rtp.payload_type, 96);
         assert_eq!(rtp.clock_rate, 90000);
         assert_eq!(rtp.encoding, RtpEncoding::H264);
+    }
+
+    // ========================================================================
+    // CapsValue tests
+    // ========================================================================
+
+    #[test]
+    fn test_caps_value_fixed() {
+        let fixed: CapsValue<u32> = CapsValue::Fixed(1920);
+        assert!(fixed.is_fixed());
+        assert!(!fixed.is_any());
+        assert!(fixed.accepts(&1920));
+        assert!(!fixed.accepts(&1080));
+        assert_eq!(fixed.fixate(), Some(1920));
+    }
+
+    #[test]
+    fn test_caps_value_range() {
+        let range: CapsValue<u32> = CapsValue::Range {
+            min: 720,
+            max: 1920,
+        };
+        assert!(!range.is_fixed());
+        assert!(range.accepts(&720));
+        assert!(range.accepts(&1080));
+        assert!(range.accepts(&1920));
+        assert!(!range.accepts(&480));
+        assert!(!range.accepts(&4096));
+        assert_eq!(range.fixate(), Some(720)); // min is preferred
+    }
+
+    #[test]
+    fn test_caps_value_list() {
+        let list: CapsValue<u32> = CapsValue::List(vec![1920, 1280, 720]);
+        assert!(list.accepts(&1920));
+        assert!(list.accepts(&1280));
+        assert!(!list.accepts(&1080));
+        assert_eq!(list.fixate(), Some(1920)); // first is preferred
+    }
+
+    #[test]
+    fn test_caps_value_any() {
+        let any: CapsValue<u32> = CapsValue::Any;
+        assert!(any.is_any());
+        assert!(any.accepts(&0));
+        assert!(any.accepts(&u32::MAX));
+        assert_eq!(any.fixate(), None);
+        assert_eq!(any.fixate_with_default(1080), 1080);
+    }
+
+    #[test]
+    fn test_caps_value_intersect_fixed_fixed() {
+        let a: CapsValue<u32> = CapsValue::Fixed(1920);
+        let b: CapsValue<u32> = CapsValue::Fixed(1920);
+        let c: CapsValue<u32> = CapsValue::Fixed(1080);
+
+        assert_eq!(a.intersect(&b), Some(CapsValue::Fixed(1920)));
+        assert_eq!(a.intersect(&c), None);
+    }
+
+    #[test]
+    fn test_caps_value_intersect_fixed_range() {
+        let fixed: CapsValue<u32> = CapsValue::Fixed(1080);
+        let range: CapsValue<u32> = CapsValue::Range {
+            min: 720,
+            max: 1920,
+        };
+        let out_of_range: CapsValue<u32> = CapsValue::Fixed(480);
+
+        assert_eq!(fixed.intersect(&range), Some(CapsValue::Fixed(1080)));
+        assert_eq!(range.intersect(&fixed), Some(CapsValue::Fixed(1080)));
+        assert_eq!(out_of_range.intersect(&range), None);
+    }
+
+    #[test]
+    fn test_caps_value_intersect_range_range() {
+        let a: CapsValue<u32> = CapsValue::Range {
+            min: 720,
+            max: 1920,
+        };
+        let b: CapsValue<u32> = CapsValue::Range {
+            min: 1080,
+            max: 4096,
+        };
+        let c: CapsValue<u32> = CapsValue::Range { min: 100, max: 500 };
+
+        // Overlap: 1080-1920
+        assert_eq!(
+            a.intersect(&b),
+            Some(CapsValue::Range {
+                min: 1080,
+                max: 1920
+            })
+        );
+        // No overlap
+        assert_eq!(a.intersect(&c), None);
+    }
+
+    #[test]
+    fn test_caps_value_intersect_list_list() {
+        let a: CapsValue<u32> = CapsValue::List(vec![1920, 1280, 720]);
+        let b: CapsValue<u32> = CapsValue::List(vec![1080, 1280, 720, 480]);
+
+        // Common: 1280, 720 (order from first list)
+        assert_eq!(a.intersect(&b), Some(CapsValue::List(vec![1280, 720])));
+    }
+
+    #[test]
+    fn test_caps_value_intersect_any() {
+        let any: CapsValue<u32> = CapsValue::Any;
+        let fixed: CapsValue<u32> = CapsValue::Fixed(1920);
+
+        assert_eq!(any.intersect(&fixed), Some(CapsValue::Fixed(1920)));
+        assert_eq!(fixed.intersect(&any), Some(CapsValue::Fixed(1920)));
+    }
+
+    #[test]
+    fn test_caps_value_from() {
+        let from_value: CapsValue<u32> = 1920.into();
+        assert_eq!(from_value, CapsValue::Fixed(1920));
+
+        let from_range: CapsValue<u32> = (720..=1920).into();
+        assert_eq!(
+            from_range,
+            CapsValue::Range {
+                min: 720,
+                max: 1920
+            }
+        );
+
+        let from_vec: CapsValue<u32> = vec![1920, 1080].into();
+        assert_eq!(from_vec, CapsValue::List(vec![1920, 1080]));
+
+        let from_single_vec: CapsValue<u32> = vec![1920].into();
+        assert_eq!(from_single_vec, CapsValue::Fixed(1920));
+
+        let from_empty_vec: CapsValue<u32> = Vec::new().into();
+        assert_eq!(from_empty_vec, CapsValue::Any);
+    }
+
+    // ========================================================================
+    // VideoFormatCaps tests
+    // ========================================================================
+
+    #[test]
+    fn test_video_format_caps_any() {
+        let caps = VideoFormatCaps::any();
+        assert!(caps.width.is_any());
+        assert!(caps.height.is_any());
+        assert!(caps.pixel_format.is_any());
+        assert!(caps.framerate.is_any());
+    }
+
+    #[test]
+    fn test_video_format_caps_fixed() {
+        let format = VideoFormat::new(1920, 1080, PixelFormat::I420, Framerate::FPS_30);
+        let caps = VideoFormatCaps::fixed(format);
+
+        assert!(caps.is_fixed());
+        assert_eq!(caps.fixate(), Some(format));
+    }
+
+    #[test]
+    fn test_video_format_caps_intersect() {
+        let producer = VideoFormatCaps {
+            width: CapsValue::List(vec![1920, 1280]),
+            height: CapsValue::List(vec![1080, 720]),
+            pixel_format: CapsValue::List(vec![PixelFormat::I420, PixelFormat::Nv12]),
+            framerate: CapsValue::Any,
+        };
+
+        let consumer = VideoFormatCaps {
+            width: CapsValue::Range {
+                min: 1280,
+                max: 1920,
+            },
+            height: CapsValue::Fixed(720),
+            pixel_format: CapsValue::Fixed(PixelFormat::I420),
+            framerate: CapsValue::Fixed(Framerate::FPS_30),
+        };
+
+        let result = producer.intersect(&consumer).unwrap();
+        assert_eq!(result.width, CapsValue::List(vec![1920, 1280]));
+        assert_eq!(result.height, CapsValue::Fixed(720));
+        assert_eq!(result.pixel_format, CapsValue::Fixed(PixelFormat::I420));
+        assert_eq!(result.framerate, CapsValue::Fixed(Framerate::FPS_30));
+
+        let fixed = result.fixate().unwrap();
+        assert_eq!(fixed.width, 1920);
+        assert_eq!(fixed.height, 720);
+    }
+
+    // ========================================================================
+    // AudioFormatCaps tests
+    // ========================================================================
+
+    #[test]
+    fn test_audio_format_caps_fixed() {
+        let format = AudioFormat::CD_QUALITY;
+        let caps = AudioFormatCaps::fixed(format);
+
+        assert!(caps.is_fixed());
+        assert_eq!(caps.fixate(), Some(format));
+    }
+
+    #[test]
+    fn test_audio_format_caps_intersect() {
+        let a = AudioFormatCaps {
+            sample_rate: CapsValue::List(vec![48000, 44100]),
+            channels: CapsValue::Range { min: 1, max: 8 },
+            sample_format: CapsValue::Any,
+        };
+
+        let b = AudioFormatCaps {
+            sample_rate: CapsValue::Fixed(48000),
+            channels: CapsValue::Fixed(2),
+            sample_format: CapsValue::Fixed(SampleFormat::S16),
+        };
+
+        let result = a.intersect(&b).unwrap();
+        assert_eq!(result.sample_rate, CapsValue::Fixed(48000));
+        assert_eq!(result.channels, CapsValue::Fixed(2));
+        assert_eq!(result.sample_format, CapsValue::Fixed(SampleFormat::S16));
+    }
+
+    // ========================================================================
+    // FormatCaps tests
+    // ========================================================================
+
+    #[test]
+    fn test_format_caps_intersect() {
+        let a = FormatCaps::VideoRaw(VideoFormatCaps::any());
+        let b = FormatCaps::VideoRaw(VideoFormatCaps::fixed(VideoFormat::new(
+            1920,
+            1080,
+            PixelFormat::I420,
+            Framerate::FPS_30,
+        )));
+
+        let result = a.intersect(&b).unwrap();
+        assert!(matches!(result, FormatCaps::VideoRaw(_)));
+    }
+
+    #[test]
+    fn test_format_caps_incompatible() {
+        let video = FormatCaps::VideoRaw(VideoFormatCaps::any());
+        let audio = FormatCaps::AudioRaw(AudioFormatCaps::any());
+
+        assert!(video.intersect(&audio).is_none());
+    }
+
+    #[test]
+    fn test_format_caps_bytes_compatible() {
+        let bytes = FormatCaps::Bytes;
+        let video = FormatCaps::VideoRaw(VideoFormatCaps::any());
+
+        // Bytes is compatible with anything
+        assert!(bytes.intersect(&video).is_some());
+    }
+
+    // ========================================================================
+    // MemoryCaps tests
+    // ========================================================================
+
+    #[test]
+    fn test_memory_caps_cpu_only() {
+        let caps = MemoryCaps::cpu_only();
+        assert_eq!(caps.fixate(), Some(MemoryType::Cpu));
+    }
+
+    #[test]
+    fn test_memory_caps_intersect() {
+        let a = MemoryCaps::cpu_only();
+        let b = MemoryCaps::any();
+
+        let result = a.intersect(&b).unwrap();
+        assert_eq!(result.fixate(), Some(MemoryType::Cpu));
+    }
+
+    // ========================================================================
+    // MediaCaps tests
+    // ========================================================================
+
+    #[test]
+    fn test_media_caps_from_format() {
+        let format = MediaFormat::Video(VideoCodec::H264);
+        let caps: MediaCaps = format.into();
+
+        assert!(matches!(caps.format, FormatCaps::Video(VideoCodec::H264)));
+        assert!(caps.memory.types.is_any());
+    }
+
+    #[test]
+    fn test_media_caps_intersect() {
+        let a = MediaCaps::new(
+            FormatCaps::VideoRaw(VideoFormatCaps::any()),
+            MemoryCaps::any(),
+        );
+        let b = MediaCaps::new(
+            FormatCaps::VideoRaw(VideoFormatCaps::fixed(VideoFormat::new(
+                1920,
+                1080,
+                PixelFormat::I420,
+                Framerate::FPS_30,
+            ))),
+            MemoryCaps::cpu_only(),
+        );
+
+        let result = a.intersect(&b).unwrap();
+        assert_eq!(result.fixate_memory(), Some(MemoryType::Cpu));
+        assert!(result.fixate_format().is_some());
+    }
+
+    #[test]
+    fn test_framerate_ord() {
+        assert!(Framerate::FPS_24 < Framerate::FPS_30);
+        assert!(Framerate::FPS_30 < Framerate::FPS_60);
+        assert!(Framerate::FPS_29_97 < Framerate::FPS_30);
     }
 }

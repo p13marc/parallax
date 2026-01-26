@@ -216,20 +216,32 @@ impl IpcPublisher {
 
     fn ensure_segment_sent(&mut self, buffer: &Buffer) -> Result<u32> {
         let memory = buffer.memory();
-        let segment = memory.segment();
 
-        // Use the segment's base pointer as a key for deduplication
-        let seg_ptr = segment.as_ptr() as usize;
+        // Get the base pointer and IPC handle based on memory type
+        let (seg_ptr, ipc_handle) = match memory {
+            crate::buffer::MemoryHandle::Segment { segment, .. } => {
+                let ptr = segment.as_ptr() as usize;
+                let handle = segment
+                    .ipc_handle()
+                    .ok_or_else(|| Error::Pipeline("segment doesn't support IPC".into()))?;
+                (ptr, handle)
+            }
+            crate::buffer::MemoryHandle::Arena { slot, .. } => {
+                // For arena slots, use the arena's base pointer as the key
+                let arena = slot.arena();
+                let ptr = arena.raw_fd() as usize; // Use fd as unique key for the arena
+                let handle = crate::memory::IpcHandle::Fd {
+                    fd: arena.raw_fd(),
+                    size: arena.total_size(),
+                };
+                (ptr, handle)
+            }
+        };
 
-        // Check if we've already sent this segment
+        // Check if we've already sent this segment/arena
         if let Some(&id) = self.segment_ids.get(&seg_ptr) {
             return Ok(id);
         }
-
-        // Need to get the ipc handle and send the fd
-        let ipc_handle = segment
-            .ipc_handle()
-            .ok_or_else(|| Error::Pipeline("segment doesn't support IPC".into()))?;
 
         // Get the fd from the handle
         let (fd, size) = match ipc_handle {
@@ -261,7 +273,7 @@ impl IpcPublisher {
         let borrowed_fd = unsafe { BorrowedFd::borrow_raw(fd) };
         ipc::send_fds(stream, &[borrowed_fd], &header.to_bytes())?;
 
-        // Remember this segment by its pointer
+        // Remember this segment/arena by its pointer/fd
         self.segment_ids.insert(seg_ptr, id);
 
         Ok(id)

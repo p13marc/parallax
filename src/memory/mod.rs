@@ -13,29 +13,43 @@
 //!
 //! | Backend | Use Case |
 //! |---------|----------|
-//! | [`HeapSegment`] | Default, single-process, simple |
-//! | [`SharedMemorySegment`] | Multi-process, zero-copy IPC |
+//! | [`CpuSegment`] | **Primary**: All CPU memory, always IPC-ready |
 //! | [`HugePageSegment`] | Large allocations, reduced TLB misses |
 //! | [`MappedFileSegment`] | Persistent storage, file I/O |
+//!
+//! # Deprecated Backends
+//!
+//! | Backend | Replacement |
+//! |---------|-------------|
+//! | `HeapSegment` | Use [`CpuSegment`] - same performance, always shareable |
+//! | `SharedMemorySegment` | Use [`CpuSegment`] - unified type for all CPU memory |
+//!
+//! # Design Rationale
+//!
+//! Previously, Parallax had separate `HeapSegment` (malloc-backed) and
+//! `SharedMemorySegment` (memfd-backed). This was unnecessary because
+//! `memfd_create + MAP_SHARED` has zero overhead vs malloc but is always
+//! shareable. Now all CPU memory uses [`CpuSegment`].
 //!
 //! # Example
 //!
 //! ```rust,ignore
-//! use parallax::memory::{MemoryPool, HeapSegment};
+//! use parallax::memory::{CpuSegment, MemorySegment};
 //!
-//! // Create a pool with 16 slots of 64KB each
-//! let pool = MemoryPool::new(HeapSegment::new(16 * 64 * 1024)?, 64 * 1024)?;
+//! // Allocate CPU memory (works like malloc, but shareable)
+//! let segment = CpuSegment::new(64 * 1024)?;
 //!
-//! // Loan a slot
-//! let slot = pool.loan().expect("pool not exhausted");
+//! // Write data
+//! segment.as_mut_slice()[..5].copy_from_slice(b"hello");
 //!
-//! // Write data to the slot
-//! slot.as_mut_slice()[..5].copy_from_slice(b"hello");
-//!
-//! // Slot is returned to pool when dropped
+//! // Get fd for cross-process sharing (always available!)
+//! let fd = segment.fd();
+//! // Send fd via SCM_RIGHTS...
 //! ```
 
+mod arena;
 mod bitmap;
+mod cpu;
 mod heap;
 mod huge_pages;
 pub mod ipc;
@@ -44,10 +58,16 @@ mod pool;
 mod segment;
 mod shared;
 
+pub use arena::{ArenaCache, ArenaSlot, CpuArena, IpcSlotRef};
 pub use bitmap::AtomicBitmap;
-pub use heap::HeapSegment;
+pub use cpu::CpuSegment;
 pub use huge_pages::{HugePageSegment, HugePageSize};
 pub use mapped_file::MappedFileSegment;
 pub use pool::{LoanedSlot, MemoryPool};
 pub use segment::{IpcHandle, MemorySegment, MemoryType};
+
+// Deprecated re-exports (kept for backward compatibility)
+#[deprecated(since = "0.2.0", note = "Use CpuSegment instead")]
+pub use heap::HeapSegment;
+#[deprecated(since = "0.2.0", note = "Use CpuSegment instead")]
 pub use shared::SharedMemorySegment;

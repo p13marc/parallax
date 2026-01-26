@@ -4,28 +4,57 @@ This file provides guidance to Claude Code when working with code in this reposi
 
 ## Project Overview
 
-**Parallax** is a Rust-native streaming pipeline engine inspired by GStreamer, designed for zero-copy data processing across single and multi-process pipelines.
+**Parallax** is a Rust-native streaming pipeline engine designed to compete with GStreamer, offering security-first process isolation, zero-copy memory management, and modern GPU integration.
 
 ### Core Principles
 
-1. **Shared Memory First**: Buffers backed by shared memory for zero-copy multi-process pipelines
-2. **Progressive Typing**: Dynamic pipelines (runtime flexibility) + Typed pipelines (compile-time safety)
-3. **Zero-Copy by Design**: rkyv serialization, loan-based memory pools, Arc sharing
-4. **Linux-Only**: Leverages memfd_create, SCM_RIGHTS, huge pages, potential io_uring
-5. **Sync Processing, Async Orchestration**: Element processing is sync; pipeline orchestration is async
+1. **Security-First**: Inter-process isolation by default, sandboxed elements with seccomp/namespaces
+2. **Shared Memory First**: All CPU buffers are memfd-backed (zero overhead, always IPC-ready)
+3. **Progressive Typing**: Dynamic pipelines (runtime flexibility) + Typed pipelines (compile-time safety)
+4. **Zero-Copy by Design**: Arena allocation, fd passing, rkyv serialization
+5. **Linux-Only**: Leverages memfd_create, SCM_RIGHTS, seccomp, namespaces, cgroups
+6. **Sync Processing, Async Orchestration**: Element processing is sync; pipeline orchestration is async (Tokio)
 
 ### Key Design Decisions
 
 | Aspect | Choice |
 |--------|--------|
-| Async runtime | Tokio |
+| Async runtime | Tokio (shared within process) |
 | Channels | Kanal (MPMC, sync+async) |
 | Parser | winnow |
 | Graph structure | daggy (enforces DAG) |
 | Serialization | rkyv (zero-copy) |
-| Error handling | thiserror (library) + anyhow (app) |
+| Error handling | thiserror (library) |
 | Metrics | metrics-rs + tracing |
 | Linux APIs | rustix |
+| Plugin ABI | stabby (stable Rust ABI) |
+| GPU | Vulkan Video + rust-gpu |
+| Codecs | Vulkan Video (primary) + rav1d/rav1e (fallback) |
+
+### Execution Modes
+
+```rust
+pub enum ExecutionMode {
+    /// All elements as Tokio tasks in ONE runtime (fastest, no isolation)
+    InProcess,
+    
+    /// Each element in separate sandboxed process (max isolation)
+    Isolated { sandbox: ElementSandbox },
+    
+    /// Group elements to minimize processes while isolating untrusted code
+    Grouped {
+        isolated_patterns: Vec<String>,
+        sandbox: ElementSandbox,
+        groups: Option<HashMap<String, GroupId>>,
+    },
+}
+```
+
+| Mode | 20 elements | Tokio Runtimes | Processes |
+|------|-------------|----------------|-----------|
+| InProcess | All trusted | 1 | 1 |
+| Isolated | All untrusted | 21 | 21 |
+| Grouped | 2 codecs untrusted | 2-3 | 2-3 |
 
 ## Build Commands
 
@@ -45,7 +74,26 @@ cargo clippy -- -D warnings
 
 ## Architecture
 
-### Current Implementation (Phase 1 & 2 Complete)
+### Security Model
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      SUPERVISOR PROCESS                         │
+│  • Spawns element processes    • Owns shared memory allocation  │
+│  • Routes control messages     • Handles crash recovery         │
+└─────────────────────────────────────────────────────────────────┘
+        │              │              │              │
+        ▼              ▼              ▼              ▼
+   ┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐
+   │ Element │    │ Element │    │ Element │    │ Element │
+   │  (src)  │───▶│ (codec) │───▶│(filter) │───▶│ (sink)  │
+   └─────────┘    └─────────┘    └─────────┘    └─────────┘
+   seccomp        seccomp        seccomp        seccomp
+```
+
+**Key principle**: Buffers are shared; authority is not.
+
+### Current Implementation
 
 ```
 parallax/
@@ -53,80 +101,54 @@ parallax/
 │   ├── lib.rs              # Public API exports
 │   ├── error.rs            # Error types (thiserror)
 │   │
-│   ├── memory/             # Memory management (COMPLETE)
-│   │   ├── mod.rs          # Module exports
+│   ├── memory/             # Memory management
 │   │   ├── segment.rs      # MemorySegment trait, MemoryType, IpcHandle
-│   │   ├── heap.rs         # HeapSegment (heap-backed, single process)
-│   │   ├── shared.rs       # SharedMemorySegment (memfd_create, multi-process)
+│   │   ├── heap.rs         # HeapSegment (to be replaced by CpuSegment)
+│   │   ├── shared.rs       # SharedMemorySegment (memfd_create)
 │   │   ├── pool.rs         # MemoryPool, LoanedSlot (loan semantics)
 │   │   ├── bitmap.rs       # AtomicBitmap (lock-free slot tracking)
-│   │   └── ipc.rs          # send_fds/recv_fds (SCM_RIGHTS fd passing)
+│   │   └── ipc.rs          # send_fds/recv_fds (SCM_RIGHTS)
 │   │
-│   ├── buffer.rs           # Buffer<T>, MemoryHandle (COMPLETE)
-│   ├── metadata.rs         # Metadata, BufferFlags (COMPLETE)
+│   ├── buffer.rs           # Buffer, MemoryHandle
+│   ├── metadata.rs         # Metadata, BufferFlags
 │   │
-│   ├── element/            # Element system (COMPLETE)
-│   │   ├── mod.rs          # Module exports
-│   │   ├── traits.rs       # Element, Source, Sink, AsyncSource, adapters
+│   ├── element/            # Element system
+│   │   ├── traits.rs       # Source, Sink, Element, AsyncSource, AsyncSink, Transform
 │   │   ├── pad.rs          # Pad, PadDirection, PadTemplate
-│   │   └── context.rs      # ElementContext for runtime info
+│   │   └── context.rs      # ElementContext
 │   │
-│   ├── pipeline/           # Pipeline execution (COMPLETE)
-│   │   ├── mod.rs          # Module exports
+│   ├── pipeline/           # Pipeline execution
 │   │   ├── graph.rs        # Pipeline DAG (daggy-based)
-│   │   └── executor.rs     # PipelineExecutor, task spawning, channel wiring
+│   │   ├── executor.rs     # PipelineExecutor (Tokio tasks + Kanal channels)
+│   │   ├── parser.rs       # Pipeline string parser (winnow)
+│   │   └── factory.rs      # ElementFactory + PluginRegistry
 │   │
-│   └── elements/           # Built-in elements (COMPLETE - 25+ elements)
-│       ├── mod.rs          # Module exports
-│       ├── passthrough.rs  # PassThrough - identity element
-│       ├── tee.rs          # Tee - fanout (1-to-N)
-│       ├── null.rs         # NullSink, NullSource
-│       ├── file.rs         # FileSrc, FileSink
-│       ├── tcp.rs          # TcpSrc, TcpSink, AsyncTcpSrc, AsyncTcpSink
-│       ├── udp.rs          # UdpSrc, UdpSink, AsyncUdpSrc, AsyncUdpSink
-│       ├── fd.rs           # FdSrc, FdSink (raw file descriptors)
-│       ├── appsrc.rs       # AppSrc - inject from application code
-│       ├── appsink.rs      # AppSink - extract to application code
-│       ├── datasrc.rs      # DataSrc - inline data source
-│       ├── testsrc.rs      # TestSrc - test pattern generator
-│       ├── console.rs      # ConsoleSink - debug output
-│       ├── queue.rs        # Queue - async buffering with backpressure
-│       ├── valve.rs        # Valve - on/off flow control
-│       ├── rate_limiter.rs # RateLimiter - throughput limiting
-│       ├── funnel.rs       # Funnel - merge N-to-1
-│       ├── selector.rs     # InputSelector, OutputSelector
-│       ├── concat.rs       # Concat - sequential stream concatenation
-│       └── streamid_demux.rs # StreamIdDemux - demux by stream ID
+│   ├── elements/           # Built-in elements (25+)
+│   │   ├── null.rs         # NullSink, NullSource
+│   │   ├── passthrough.rs  # PassThrough
+│   │   ├── tee.rs          # Tee (fanout)
+│   │   ├── file.rs         # FileSrc, FileSink
+│   │   ├── tcp.rs          # TcpSrc/Sink (sync + async)
+│   │   ├── udp.rs          # UdpSrc/Sink (sync + async)
+│   │   ├── zenoh.rs        # ZenohPub, ZenohSub
+│   │   ├── queue.rs        # Queue (backpressure)
+│   │   ├── valve.rs        # Valve (flow control)
+│   │   └── ...             # Many more
+│   │
+│   └── plugin/             # Plugin system
+│       ├── registry.rs     # PluginRegistry
+│       ├── loader.rs       # Dynamic loading
+│       └── descriptor.rs   # Plugin metadata
 │
-├── tests/
-│   └── pipeline_integration.rs  # Integration tests
+├── docs/
+│   ├── FINAL_DESIGN_PARALLAX.md    # Complete design document
+│   └── PLAN_CAPS_NEGOTIATION.md    # Caps negotiation design
 ```
 
 ### Key Types
 
 ```rust
-// Buffer with pluggable memory backend
-pub struct Buffer<T = ()> {
-    memory: MemoryHandle,
-    metadata: Metadata,
-    validated: AtomicU8,  // rkyv validation cache
-    _marker: PhantomData<T>,
-}
-
-// Memory segment abstraction
-pub trait MemorySegment: Send + Sync {
-    fn as_ptr(&self) -> *const u8;
-    fn as_mut_ptr(&self) -> Option<*mut u8>;
-    fn len(&self) -> usize;
-    fn memory_type(&self) -> MemoryType;
-    fn ipc_handle(&self) -> Option<IpcHandle>;
-}
-
-// Loan-based memory pool
-pub struct MemoryPool { /* ... */ }
-pub struct LoanedSlot { /* RAII guard, returns to pool on drop */ }
-
-// Element traits
+// Element traits (sync)
 pub trait Source: Send {
     fn produce(&mut self) -> Result<Option<Buffer>>;
 }
@@ -139,6 +161,7 @@ pub trait Element: Send {
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>>;
 }
 
+// Element traits (async - for I/O bound operations)
 pub trait AsyncSource: Send {
     fn produce(&mut self) -> impl Future<Output = Result<Option<Buffer>>> + Send;
 }
@@ -146,47 +169,34 @@ pub trait AsyncSource: Send {
 pub trait AsyncSink: Send {
     fn consume(&mut self, buffer: Buffer) -> impl Future<Output = Result<()>> + Send;
 }
+
+// Pipeline usage
+let mut pipeline = Pipeline::parse("videotestsrc ! h264enc ! filesink location=out.h264")?;
+pipeline.run().await?;
 ```
 
-## Implementation Phases
+## Implementation Roadmap
 
-1. **Phase 1**: Core Types & Memory Foundation - COMPLETE
-   - MemorySegment trait + HeapSegment + SharedMemorySegment
-   - MemoryPool with loan semantics
-   - Buffer<T> with MemoryHandle
-   - IPC fd passing (SCM_RIGHTS)
+See `docs/FINAL_DESIGN_PARALLAX.md` for full details.
 
-2. **Phase 2**: Elements & Pipeline Core - COMPLETE
-   - Element traits (Source, Sink, Element, ElementDyn)
-   - Pad abstraction (Pad, PadDirection, PadTemplate)
-   - Pipeline DAG with daggy (cycle detection, validation)
-   - PipelineExecutor with Tokio tasks + Kanal channels
-   - Built-in elements: PassThrough, Tee, NullSink, NullSource
-   - Integration tests
-
-3. **Phase 3**: Sources, Sinks & GStreamer-Equivalent Elements - COMPLETE
-   - File I/O: FileSrc, FileSink
-   - Network: TcpSrc/Sink, UdpSrc/Sink (sync + async variants)
-   - Raw FD: FdSrc, FdSink
-   - Application integration: AppSrc, AppSink (with handles)
-   - Test/utility: DataSrc, TestSrc, ConsoleSink
-   - Transforms: Queue (backpressure/leaky), Valve, RateLimiter
-   - Routing: Funnel (N-to-1), InputSelector, OutputSelector, Concat, StreamIdDemux
-   - AsyncSource and AsyncSink traits
-
-4. **Phase 4**: Typed Pipeline Builder - COMPLETE
-5. **Phase 5**: Events & Observability
-6. **Phase 6**: Advanced Memory Backends
-7. **Phase 7**: Plugin System
-8. **Phase 8**: Optimizations & Polish
+| Phase | Focus | Status |
+|-------|-------|--------|
+| 1 | Memory Foundation (CpuSegment, CpuArena) | In Progress |
+| 2 | Caps Negotiation (global constraint solving) | Planned |
+| 3 | Cross-Process IPC (IpcSrc/IpcSink) | Planned |
+| 4 | GPU Integration (Vulkan Video) | Planned |
+| 5 | Pure Rust Codecs (rav1d/rav1e) | Planned |
+| 6 | Process Isolation (seccomp, namespaces) | Planned |
+| 7 | Plugin System (stabby) | Planned |
+| 8 | Distribution (Zenoh, RDMA) | Future |
 
 ## Code Style Guidelines
 
 - Use `rustfmt` defaults
 - Prefer `thiserror` for error types
 - Use `tracing` for logging/instrumentation
-- Derive `rkyv::Archive`, `rkyv::Serialize`, `rkyv::Deserialize` for types that cross process boundaries
-- Keep element processing (`process()`) sync; async only for I/O and orchestration
+- Derive `rkyv::Archive`, `rkyv::Serialize`, `rkyv::Deserialize` for IPC types
+- Keep element `process()` sync; async only for I/O
 - Document public APIs with examples
 - Write tests for each module
 
@@ -199,32 +209,41 @@ just test-verbose      # Run with output capture disabled
 just watch             # Auto-run on changes
 ```
 
-## Zenoh Integration
+## Pipeline Deployment Modes
 
-Parallax is designed to be compatible with Zenoh for distributed pipelines:
-- Buffers provide `as_bytes()` for ZBytes conversion
-- rkyv format is transparent to Zenoh (just bytes)
-- Zero-copy possible via shared memory bridge
-- Works with all Zenoh topologies
+### Single Binary (gst-launch equivalent)
+```bash
+parallax-launch "videotestsrc ! h264enc ! filesink location=out.h264"
+```
+
+### Multi-Binary (federated pipelines)
+```rust
+// Binary A
+Pipeline::parse("v4l2src ! ipc_sink path=/run/parallax/camera")?;
+
+// Binary B
+Pipeline::parse("ipc_src path=/run/parallax/camera ! encoder ! zenoh_pub key=video")?;
+```
+
+### Cross-Machine (Zenoh)
+```rust
+// Machine A
+Pipeline::parse("camera ! zenoh_pub key=factory/camera/1")?;
+
+// Machine B
+Pipeline::parse("zenoh_sub key=factory/camera/1 ! display")?;
+```
 
 ## Performance Notes
 
 - Buffer cloning is O(1) (Arc increment)
 - Pool slot acquire/release is O(1) amortized (atomic bitmap)
-- rkyv validation is cached (validate once, then zero-cost)
-- Cross-process is true zero-copy via shared memory
-
-## Feature Flags
-
-```toml
-[features]
-default = []
-huge-pages = []     # MAP_HUGETLB support
-io-uring = []       # Future: io_uring async I/O
-gpu = []            # Future: CUDA/Vulkan pinned memory
-rdma = []           # Future: RDMA support
-```
+- All CPU memory is memfd-backed (zero overhead vs malloc, always IPC-ready)
+- Cross-process is true zero-copy (same physical pages via mmap)
+- Arena allocation: 1 fd per pool, not per buffer (avoids fd limits)
 
 ## Documentation
 
-- `FINAL_PLAN.md` - Complete implementation plan and architecture
+- `docs/FINAL_DESIGN_PARALLAX.md` - Complete design document and competitive analysis
+- `docs/PLAN_CAPS_NEGOTIATION.md` - Detailed caps negotiation design
+- `FINAL_PLAN.md` - Original implementation plan (partially outdated)

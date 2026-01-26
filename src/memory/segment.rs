@@ -1,11 +1,24 @@
 //! Memory segment trait and types.
 
 /// Type of memory backing a segment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum MemoryType {
+    /// Unified CPU memory (memfd-backed, always IPC-ready).
+    ///
+    /// This is the primary memory type for Parallax. It has zero overhead
+    /// vs malloc but is always shareable via fd passing.
+    Cpu,
     /// Regular heap memory (single-process only).
+    ///
+    /// **Deprecated**: Use `Cpu` instead. Heap memory cannot be shared
+    /// across processes. This variant is kept for backward compatibility.
+    #[deprecated(since = "0.2.0", note = "Use MemoryType::Cpu instead")]
     Heap,
     /// POSIX shared memory (memfd_create + mmap).
+    ///
+    /// **Deprecated**: Use `Cpu` instead. All CPU memory is now memfd-backed.
+    /// This variant is kept for backward compatibility.
+    #[deprecated(since = "0.2.0", note = "Use MemoryType::Cpu instead")]
     SharedMemory,
     /// Huge pages (2MB or 1GB).
     HugePages,
@@ -15,8 +28,56 @@ pub enum MemoryType {
     GpuAccessible,
     /// GPU device memory.
     GpuDevice,
+    /// DMA-BUF (Linux buffer sharing, GPU-importable).
+    DmaBuf,
     /// RDMA-registered memory.
     RdmaRegistered,
+}
+
+impl MemoryType {
+    /// Can this memory type be shared across processes on the same machine?
+    #[inline]
+    pub fn supports_ipc(&self) -> bool {
+        #[allow(deprecated)]
+        match self {
+            MemoryType::Cpu => true,
+            MemoryType::Heap => false,
+            MemoryType::SharedMemory => true,
+            MemoryType::HugePages => true,
+            MemoryType::MappedFile => true,
+            MemoryType::GpuAccessible => true,
+            MemoryType::GpuDevice => false, // Must export to DmaBuf first
+            MemoryType::DmaBuf => true,
+            MemoryType::RdmaRegistered => true,
+        }
+    }
+
+    /// Can this memory type be sent over network?
+    #[inline]
+    pub fn supports_network(&self) -> bool {
+        #[allow(deprecated)]
+        match self {
+            MemoryType::Cpu => true,
+            MemoryType::Heap => true,
+            MemoryType::SharedMemory => true,
+            MemoryType::HugePages => true,
+            MemoryType::MappedFile => true,
+            MemoryType::GpuAccessible => true,
+            MemoryType::GpuDevice => false, // Must download first
+            MemoryType::DmaBuf => false,    // fd is local
+            MemoryType::RdmaRegistered => true,
+        }
+    }
+
+    /// Is this a CPU-accessible memory type?
+    #[inline]
+    pub fn is_cpu_accessible(&self) -> bool {
+        #[allow(deprecated)]
+        match self {
+            MemoryType::GpuDevice => false,
+            _ => true,
+        }
+    }
 }
 
 /// Handle for sharing memory across processes.

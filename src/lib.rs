@@ -44,6 +44,7 @@ pub mod format;
 pub mod link;
 pub mod memory;
 pub mod metadata;
+pub mod negotiation;
 pub mod observability;
 pub mod pipeline;
 pub mod plugin;
