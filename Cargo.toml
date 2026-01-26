@@ -79,6 +79,18 @@ mpeg2ts-reader = { version = "0.18", optional = true }
 # Iced GUI (optional)
 iced = { version = "0.14", optional = true, features = ["image", "tokio"] }
 
+# Vulkan Video (optional)
+ash = { version = "0.38", optional = true }
+gpu-allocator = { version = "0.27", optional = true }
+
+# H.264 bitstream parsing (optional)
+h264-reader = { version = "0.7", optional = true }
+
+# AV1 software codecs (optional)
+rav1e = { version = "0.7", optional = true }
+# rav1d not yet on crates.io - using dav1d bindings as alternative
+dav1d = { version = "0.10", optional = true }
+
 # Regex (for RegexFilter)
 regex = "1"
 
@@ -99,6 +111,8 @@ huge-pages = []       # MAP_HUGETLB support
 io-uring = []         # Future: io_uring async I/O
 gpu = []              # Future: CUDA/Vulkan pinned memory
 rdma = []             # Future: RDMA support
+vulkan-video = ["dep:ash", "dep:gpu-allocator", "dep:h264-reader"]  # Vulkan Video codecs
+software-codecs = ["dep:rav1e", "dep:dav1d"]  # Software AV1 codecs
 http = ["ureq"]       # HTTP source/sink elements
 websocket = ["tungstenite"]  # WebSocket source/sink elements
 zenoh = ["dep:zenoh"] # Zenoh pub/sub elements

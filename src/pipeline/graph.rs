@@ -645,6 +645,102 @@ impl Pipeline {
     }
 }
 
+// ============================================================================
+// Execution with Isolation
+// ============================================================================
+
+impl Pipeline {
+    /// Run the pipeline with the default in-process executor.
+    ///
+    /// This is the simplest way to run a pipeline - all elements execute
+    /// as Tokio tasks in the current process.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use parallax::pipeline::Pipeline;
+    ///
+    /// let mut pipeline = Pipeline::parse("nullsource count=10 ! nullsink")?;
+    /// pipeline.run().await?;
+    /// ```
+    pub async fn run(&mut self) -> Result<()> {
+        let executor = crate::pipeline::PipelineExecutor::new();
+        executor.run(self).await
+    }
+
+    /// Run the pipeline with a specific execution mode.
+    ///
+    /// This allows transparent process isolation without manually adding
+    /// IpcSrc/IpcSink elements. The executor automatically injects IPC
+    /// boundaries where needed.
+    ///
+    /// # Execution Modes
+    ///
+    /// - `InProcess`: All elements run in the current process (default, fastest)
+    /// - `Isolated`: Each element runs in its own sandboxed process (maximum isolation)
+    /// - `Grouped`: Selective isolation based on patterns (balance of safety and performance)
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use parallax::pipeline::Pipeline;
+    /// use parallax::execution::ExecutionMode;
+    ///
+    /// let mut pipeline = Pipeline::parse("filesrc ! h264dec ! displaysink")?;
+    ///
+    /// // Isolate decoders (they process untrusted input)
+    /// pipeline.run_with_mode(ExecutionMode::grouped(vec!["*dec*".to_string()])).await?;
+    /// ```
+    pub async fn run_with_mode(self, mode: crate::execution::ExecutionMode) -> Result<()> {
+        let executor = crate::execution::IsolatedExecutor::new(mode);
+        executor.run(self).await
+    }
+
+    /// Run the pipeline with full isolation for all elements.
+    ///
+    /// Each element runs in its own sandboxed process. This provides
+    /// maximum security at the cost of IPC overhead.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use parallax::pipeline::Pipeline;
+    ///
+    /// let mut pipeline = Pipeline::parse("filesrc ! decoder ! sink")?;
+    /// pipeline.run_isolated().await?;
+    /// ```
+    pub async fn run_isolated(self) -> Result<()> {
+        self.run_with_mode(crate::execution::ExecutionMode::isolated())
+            .await
+    }
+
+    /// Run the pipeline with selective isolation.
+    ///
+    /// Elements matching any of the patterns run in isolated processes.
+    /// Other elements run together in the main process.
+    ///
+    /// # Pattern Syntax
+    ///
+    /// - `*` matches any sequence of characters
+    /// - `?` matches any single character
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use parallax::pipeline::Pipeline;
+    ///
+    /// let mut pipeline = Pipeline::parse("filesrc ! h264dec ! x264enc ! filesink")?;
+    ///
+    /// // Isolate all codecs (decoders and encoders)
+    /// pipeline.run_isolating(vec!["*dec*", "*enc*"]).await?;
+    /// ```
+    pub async fn run_isolating(self, patterns: Vec<&str>) -> Result<()> {
+        let patterns: Vec<String> = patterns.into_iter().map(|s| s.to_string()).collect();
+        self.run_with_mode(crate::execution::ExecutionMode::grouped(patterns))
+            .await
+    }
+}
+
 /// Options for DOT export.
 #[derive(Debug, Clone)]
 pub struct DotOptions {

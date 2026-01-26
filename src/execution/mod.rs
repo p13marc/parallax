@@ -50,11 +50,16 @@
 //! }).await?;
 //! ```
 
+mod isolated_executor;
 mod mode;
 mod protocol;
 mod sandbox;
 mod supervisor;
 
+pub use isolated_executor::{
+    ElementGroup, ExecutionPlan, IpcBoundary, IsolatedExecutor, IsolatedExecutorConfig,
+    IsolatedPipelineHandle,
+};
 pub use mode::{ExecutionMode, GroupId};
 pub use protocol::{
     ControlMessage, ElementState, SerializableCaps, SerializableMetadata, frame_message,
