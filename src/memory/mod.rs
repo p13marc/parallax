@@ -58,7 +58,7 @@ mod pool;
 mod segment;
 mod shared;
 
-pub use arena::{ArenaCache, ArenaSlot, CpuArena, IpcSlotRef};
+pub use arena::{Access, ArenaCache, ArenaSlot, CpuArena, IpcSlotRef};
 pub use bitmap::AtomicBitmap;
 pub use cpu::CpuSegment;
 pub use huge_pages::{HugePageSegment, HugePageSize};

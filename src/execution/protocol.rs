@@ -420,19 +420,11 @@ mod tests {
                 },
             },
             ControlMessage::BufferReady {
-                slot: IpcSlotRef {
-                    arena_id: 1,
-                    offset: 0,
-                    len: 1024,
-                },
+                slot: IpcSlotRef::new(1, 0, 1024),
                 metadata: SerializableMetadata::default(),
             },
             ControlMessage::BufferDone {
-                slot: IpcSlotRef {
-                    arena_id: 1,
-                    offset: 0,
-                    len: 1024,
-                },
+                slot: IpcSlotRef::new(1, 0, 1024),
             },
             ControlMessage::StateChange {
                 new_state: ElementState::Playing,

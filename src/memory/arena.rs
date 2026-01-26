@@ -349,13 +349,30 @@ impl ArenaSlot {
     /// Get an IPC reference for cross-process sharing.
     ///
     /// The receiver can use this to access the same memory region
-    /// (after mapping the arena fd).
+    /// (after mapping the arena fd). Defaults to read-write access.
     #[inline]
     pub fn ipc_ref(&self) -> IpcSlotRef {
         IpcSlotRef {
             arena_id: self.arena.arena_id,
             offset: self.offset,
             len: self.len,
+            access: Access::ReadWrite,
+        }
+    }
+
+    /// Get an IPC reference with specific access rights.
+    ///
+    /// Use this when you need to restrict access:
+    /// - `Access::ReadOnly` for downstream consumers
+    /// - `Access::WriteOnly` for upstream producers
+    /// - `Access::ReadWrite` for transforms
+    #[inline]
+    pub fn ipc_ref_with_access(&self, access: Access) -> IpcSlotRef {
+        IpcSlotRef {
+            arena_id: self.arena.arena_id,
+            offset: self.offset,
+            len: self.len,
+            access,
         }
     }
 
@@ -442,6 +459,93 @@ impl MemorySegment for ArenaSlot {
 unsafe impl Send for ArenaSlot {}
 unsafe impl Sync for ArenaSlot {}
 
+/// Access rights for shared memory regions.
+///
+/// These rights control how a process can access a shared memory slot.
+/// The supervisor enforces these based on data flow direction:
+/// - Sources produce data → WriteOnly for producer, ReadOnly for consumers
+/// - Sinks consume data → ReadOnly access
+/// - Transforms need both → ReadWrite (or separate read/write regions)
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+#[rkyv(derive(Debug))]
+#[repr(u8)]
+pub enum Access {
+    /// Read-only access (PROT_READ).
+    ///
+    /// Used for downstream elements that only consume buffer data.
+    ReadOnly = 0,
+
+    /// Write-only access (PROT_WRITE).
+    ///
+    /// Used for sources that produce data into buffers.
+    /// Note: On most architectures, write implies read for the CPU.
+    WriteOnly = 1,
+
+    /// Read-write access (PROT_READ | PROT_WRITE).
+    ///
+    /// Used for transforms that read input and write output.
+    #[default]
+    ReadWrite = 2,
+}
+
+impl Access {
+    /// Convert to mmap protection flags.
+    pub fn to_prot_flags(self) -> ProtFlags {
+        match self {
+            Access::ReadOnly => ProtFlags::READ,
+            Access::WriteOnly => ProtFlags::WRITE,
+            Access::ReadWrite => ProtFlags::READ | ProtFlags::WRITE,
+        }
+    }
+
+    /// Check if this access level allows reading.
+    #[inline]
+    pub fn can_read(self) -> bool {
+        matches!(self, Access::ReadOnly | Access::ReadWrite)
+    }
+
+    /// Check if this access level allows writing.
+    #[inline]
+    pub fn can_write(self) -> bool {
+        matches!(self, Access::WriteOnly | Access::ReadWrite)
+    }
+
+    /// Create from a role in the pipeline.
+    ///
+    /// - Sources/producers → WriteOnly (they produce data)
+    /// - Sinks/consumers → ReadOnly (they consume data)
+    /// - Transforms → ReadWrite (they read and write)
+    pub fn for_role(is_producer: bool, is_consumer: bool) -> Self {
+        match (is_producer, is_consumer) {
+            (true, true) => Access::ReadWrite,
+            (true, false) => Access::WriteOnly,
+            (false, true) => Access::ReadOnly,
+            (false, false) => Access::ReadOnly, // Default to read-only for safety
+        }
+    }
+}
+
+impl std::fmt::Display for Access {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Access::ReadOnly => write!(f, "r--"),
+            Access::WriteOnly => write!(f, "-w-"),
+            Access::ReadWrite => write!(f, "rw-"),
+        }
+    }
+}
+
 /// Cross-process slot reference (serializable).
 ///
 /// This is sent over IPC channels to reference a buffer in shared memory.
@@ -451,10 +555,10 @@ unsafe impl Sync for ArenaSlot {}
 /// # Wire Format
 ///
 /// ```text
-/// ┌──────────────────┬──────────────────┬──────────────────┐
-/// │    arena_id      │      offset      │       len        │
-/// │     (8 bytes)    │     (8 bytes)    │     (8 bytes)    │
-/// └──────────────────┴──────────────────┴──────────────────┘
+/// ┌──────────────────┬──────────────────┬──────────────────┬──────────────────┐
+/// │    arena_id      │      offset      │       len        │     access       │
+/// │     (8 bytes)    │     (8 bytes)    │     (8 bytes)    │    (1 byte)      │
+/// └──────────────────┴──────────────────┴──────────────────┴──────────────────┘
 /// ```
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
@@ -467,32 +571,82 @@ pub struct IpcSlotRef {
     pub offset: usize,
     /// Size of the slot data.
     pub len: usize,
+    /// Access rights for this slot reference.
+    pub access: Access,
 }
 
 impl IpcSlotRef {
-    /// Create a new IPC slot reference.
+    /// Create a new IPC slot reference with read-write access.
     pub const fn new(arena_id: u64, offset: usize, len: usize) -> Self {
         Self {
             arena_id,
             offset,
             len,
+            access: Access::ReadWrite,
         }
+    }
+
+    /// Create a new IPC slot reference with specific access rights.
+    pub const fn with_access(arena_id: u64, offset: usize, len: usize, access: Access) -> Self {
+        Self {
+            arena_id,
+            offset,
+            len,
+            access,
+        }
+    }
+
+    /// Create a read-only reference to this slot.
+    ///
+    /// Used when passing buffers downstream for consumption.
+    pub const fn as_read_only(&self) -> Self {
+        Self {
+            arena_id: self.arena_id,
+            offset: self.offset,
+            len: self.len,
+            access: Access::ReadOnly,
+        }
+    }
+
+    /// Create a write-only reference to this slot.
+    ///
+    /// Used when granting a producer access to write data.
+    pub const fn as_write_only(&self) -> Self {
+        Self {
+            arena_id: self.arena_id,
+            offset: self.offset,
+            len: self.len,
+            access: Access::WriteOnly,
+        }
+    }
+
+    /// Check if this reference allows reading.
+    #[inline]
+    pub fn can_read(&self) -> bool {
+        self.access.can_read()
+    }
+
+    /// Check if this reference allows writing.
+    #[inline]
+    pub fn can_write(&self) -> bool {
+        self.access.can_write()
     }
 }
 
 /// Cache for mapping received arena fds.
 ///
 /// When receiving buffers from another process, we cache the mmap
-/// so we only map each arena once.
+/// so we only map each arena once. Each arena can have multiple mappings
+/// with different access rights.
 pub struct ArenaCache {
-    /// Cached arena mappings: arena_id -> (base_ptr, size)
-    mappings: std::collections::HashMap<u64, CachedArenaMapping>,
+    /// Cached arena mappings: (arena_id, access) -> mapping
+    mappings: std::collections::HashMap<(u64, Access), CachedArenaMapping>,
 }
 
 struct CachedArenaMapping {
     base: NonNull<u8>,
     size: usize,
-    // We don't own the fd, just the mapping
+    access: Access,
 }
 
 impl ArenaCache {
@@ -503,7 +657,7 @@ impl ArenaCache {
         }
     }
 
-    /// Map an arena fd and cache it.
+    /// Map an arena fd with read-write access and cache it.
     ///
     /// # Safety
     ///
@@ -514,35 +668,53 @@ impl ArenaCache {
         fd: BorrowedFd<'_>,
         size: usize,
     ) -> Result<()> {
-        if self.mappings.contains_key(&arena_id) {
-            return Ok(()); // Already mapped
+        // SAFETY: Caller guarantees fd and size are valid, we just forward to with_access
+        unsafe { self.map_arena_with_access(arena_id, fd, size, Access::ReadWrite) }
+    }
+
+    /// Map an arena fd with specific access rights and cache it.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure `fd` is a valid arena fd and `size` is correct.
+    pub unsafe fn map_arena_with_access(
+        &mut self,
+        arena_id: u64,
+        fd: BorrowedFd<'_>,
+        size: usize,
+        access: Access,
+    ) -> Result<()> {
+        let key = (arena_id, access);
+        if self.mappings.contains_key(&key) {
+            return Ok(()); // Already mapped with this access level
         }
 
-        let base = unsafe {
-            rustix::mm::mmap(
-                std::ptr::null_mut(),
-                size,
-                ProtFlags::READ | ProtFlags::WRITE,
-                MapFlags::SHARED,
-                fd,
-                0,
-            )?
-        };
+        let prot = access.to_prot_flags();
+
+        let base =
+            unsafe { rustix::mm::mmap(std::ptr::null_mut(), size, prot, MapFlags::SHARED, fd, 0)? };
 
         let base = NonNull::new(base.cast::<u8>())
             .ok_or_else(|| Error::AllocationFailed("mmap returned null".into()))?;
 
         self.mappings
-            .insert(arena_id, CachedArenaMapping { base, size });
+            .insert(key, CachedArenaMapping { base, size, access });
 
         Ok(())
     }
 
     /// Get a slice for an IPC slot reference.
     ///
-    /// Returns `None` if the arena hasn't been mapped yet.
+    /// Returns `None` if the arena hasn't been mapped yet or if the slot
+    /// doesn't have read access.
     pub fn get_slice(&self, slot_ref: &IpcSlotRef) -> Option<&[u8]> {
-        let mapping = self.mappings.get(&slot_ref.arena_id)?;
+        // Check access rights
+        if !slot_ref.access.can_read() {
+            return None;
+        }
+
+        // Try to find a mapping with compatible access
+        let mapping = self.find_mapping(slot_ref.arena_id, slot_ref.access)?;
         if slot_ref.offset + slot_ref.len > mapping.size {
             return None; // Out of bounds
         }
@@ -553,13 +725,20 @@ impl ArenaCache {
 
     /// Get a mutable slice for an IPC slot reference.
     ///
-    /// Returns `None` if the arena hasn't been mapped yet.
+    /// Returns `None` if the arena hasn't been mapped yet or if the slot
+    /// doesn't have write access.
     ///
     /// # Safety
     ///
     /// The caller must ensure exclusive access to this memory region.
     pub unsafe fn get_mut_slice(&self, slot_ref: &IpcSlotRef) -> Option<&mut [u8]> {
-        let mapping = self.mappings.get(&slot_ref.arena_id)?;
+        // Check access rights
+        if !slot_ref.access.can_write() {
+            return None;
+        }
+
+        // Try to find a mapping with compatible access
+        let mapping = self.find_mapping(slot_ref.arena_id, slot_ref.access)?;
         if slot_ref.offset + slot_ref.len > mapping.size {
             return None; // Out of bounds
         }
@@ -568,14 +747,54 @@ impl ArenaCache {
         })
     }
 
-    /// Check if an arena is already mapped.
-    pub fn is_mapped(&self, arena_id: u64) -> bool {
-        self.mappings.contains_key(&arena_id)
+    /// Find a mapping with compatible access rights.
+    fn find_mapping(&self, arena_id: u64, access: Access) -> Option<&CachedArenaMapping> {
+        // First try exact match
+        if let Some(mapping) = self.mappings.get(&(arena_id, access)) {
+            return Some(mapping);
+        }
+
+        // ReadWrite mapping is compatible with any access
+        if let Some(mapping) = self.mappings.get(&(arena_id, Access::ReadWrite)) {
+            return Some(mapping);
+        }
+
+        // For ReadOnly access, a ReadWrite mapping also works (already checked above)
+        // For WriteOnly access, a ReadWrite mapping also works (already checked above)
+        None
     }
 
-    /// Remove a cached mapping.
+    /// Check if an arena is already mapped.
+    pub fn is_mapped(&self, arena_id: u64) -> bool {
+        self.mappings.keys().any(|(id, _)| *id == arena_id)
+    }
+
+    /// Check if an arena is mapped with specific access.
+    pub fn is_mapped_with_access(&self, arena_id: u64, access: Access) -> bool {
+        self.find_mapping(arena_id, access).is_some()
+    }
+
+    /// Remove all cached mappings for an arena.
     pub fn unmap(&mut self, arena_id: u64) {
-        if let Some(mapping) = self.mappings.remove(&arena_id) {
+        let keys: Vec<_> = self
+            .mappings
+            .keys()
+            .filter(|(id, _)| *id == arena_id)
+            .copied()
+            .collect();
+
+        for key in keys {
+            if let Some(mapping) = self.mappings.remove(&key) {
+                unsafe {
+                    let _ = rustix::mm::munmap(mapping.base.as_ptr().cast(), mapping.size);
+                }
+            }
+        }
+    }
+
+    /// Remove a specific mapping with given access.
+    pub fn unmap_with_access(&mut self, arena_id: u64, access: Access) {
+        if let Some(mapping) = self.mappings.remove(&(arena_id, access)) {
             unsafe {
                 let _ = rustix::mm::munmap(mapping.base.as_ptr().cast(), mapping.size);
             }
@@ -584,9 +803,10 @@ impl ArenaCache {
 
     /// Clear all cached mappings.
     pub fn clear(&mut self) {
-        let ids: Vec<u64> = self.mappings.keys().copied().collect();
-        for id in ids {
-            self.unmap(id);
+        for (_, mapping) in self.mappings.drain() {
+            unsafe {
+                let _ = rustix::mm::munmap(mapping.base.as_ptr().cast(), mapping.size);
+            }
         }
     }
 }
@@ -610,6 +830,57 @@ unsafe impl Sync for CachedArenaMapping {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_access_properties() {
+        assert!(Access::ReadOnly.can_read());
+        assert!(!Access::ReadOnly.can_write());
+
+        assert!(!Access::WriteOnly.can_read());
+        assert!(Access::WriteOnly.can_write());
+
+        assert!(Access::ReadWrite.can_read());
+        assert!(Access::ReadWrite.can_write());
+    }
+
+    #[test]
+    fn test_access_for_role() {
+        assert_eq!(Access::for_role(true, false), Access::WriteOnly); // Producer
+        assert_eq!(Access::for_role(false, true), Access::ReadOnly); // Consumer
+        assert_eq!(Access::for_role(true, true), Access::ReadWrite); // Transform
+        assert_eq!(Access::for_role(false, false), Access::ReadOnly); // Default
+    }
+
+    #[test]
+    fn test_access_display() {
+        assert_eq!(format!("{}", Access::ReadOnly), "r--");
+        assert_eq!(format!("{}", Access::WriteOnly), "-w-");
+        assert_eq!(format!("{}", Access::ReadWrite), "rw-");
+    }
+
+    #[test]
+    fn test_ipc_slot_ref_access_conversion() {
+        let slot_ref = IpcSlotRef::new(1, 0, 1024);
+        assert_eq!(slot_ref.access, Access::ReadWrite);
+
+        let readonly = slot_ref.as_read_only();
+        assert_eq!(readonly.access, Access::ReadOnly);
+        assert!(readonly.can_read());
+        assert!(!readonly.can_write());
+
+        let writeonly = slot_ref.as_write_only();
+        assert_eq!(writeonly.access, Access::WriteOnly);
+        assert!(!writeonly.can_read());
+        assert!(writeonly.can_write());
+    }
+
+    #[test]
+    fn test_ipc_slot_ref_with_access() {
+        let slot_ref = IpcSlotRef::with_access(1, 0, 1024, Access::ReadOnly);
+        assert_eq!(slot_ref.access, Access::ReadOnly);
+        assert!(slot_ref.can_read());
+        assert!(!slot_ref.can_write());
+    }
 
     #[test]
     fn test_arena_creation() {
@@ -813,5 +1084,120 @@ mod tests {
         // Unknown arena
         let unknown_ref = IpcSlotRef::new(999999, 0, 4096);
         assert!(cache.get_slice(&unknown_ref).is_none());
+    }
+
+    #[test]
+    fn test_arena_cache_access_control() {
+        let arena = CpuArena::new(4096, 4).unwrap();
+        let mut slot = arena.acquire().unwrap();
+
+        // Write data
+        slot.data_mut()[0] = 42;
+
+        let ipc_ref = slot.ipc_ref();
+
+        // Map with read-write access
+        let mut cache = ArenaCache::new();
+        unsafe {
+            cache
+                .map_arena(arena.id(), arena.fd(), arena.total_size())
+                .unwrap();
+        }
+
+        // Read-write reference should work for both read and write
+        assert!(cache.get_slice(&ipc_ref).is_some());
+        unsafe {
+            assert!(cache.get_mut_slice(&ipc_ref).is_some());
+        }
+
+        // Read-only reference should only allow read
+        let readonly_ref = ipc_ref.as_read_only();
+        assert!(cache.get_slice(&readonly_ref).is_some());
+        unsafe {
+            assert!(cache.get_mut_slice(&readonly_ref).is_none());
+        }
+
+        // Write-only reference should only allow write
+        let writeonly_ref = ipc_ref.as_write_only();
+        assert!(cache.get_slice(&writeonly_ref).is_none());
+        unsafe {
+            assert!(cache.get_mut_slice(&writeonly_ref).is_some());
+        }
+    }
+
+    #[test]
+    fn test_arena_cache_readonly_mapping() {
+        let arena = CpuArena::new(4096, 4).unwrap();
+        let mut slot = arena.acquire().unwrap();
+        slot.data_mut()[0] = 99;
+
+        let ipc_ref = slot.ipc_ref_with_access(Access::ReadOnly);
+
+        // Map with read-only access
+        let mut cache = ArenaCache::new();
+        unsafe {
+            cache
+                .map_arena_with_access(arena.id(), arena.fd(), arena.total_size(), Access::ReadOnly)
+                .unwrap();
+        }
+
+        // Should be able to read
+        let slice = cache.get_slice(&ipc_ref).unwrap();
+        assert_eq!(slice[0], 99);
+
+        // Should NOT be able to get mutable slice (access denied)
+        // Note: The underlying mmap is read-only, so this correctly fails
+        unsafe {
+            // The slot ref is read-only, so get_mut_slice returns None
+            assert!(cache.get_mut_slice(&ipc_ref).is_none());
+        }
+    }
+
+    #[test]
+    fn test_arena_slot_ipc_ref_with_access() {
+        let arena = CpuArena::new(4096, 4).unwrap();
+        let slot = arena.acquire().unwrap();
+
+        // Default ipc_ref should be read-write
+        let default_ref = slot.ipc_ref();
+        assert_eq!(default_ref.access, Access::ReadWrite);
+
+        // ipc_ref_with_access should respect the given access
+        let readonly_ref = slot.ipc_ref_with_access(Access::ReadOnly);
+        assert_eq!(readonly_ref.access, Access::ReadOnly);
+
+        let writeonly_ref = slot.ipc_ref_with_access(Access::WriteOnly);
+        assert_eq!(writeonly_ref.access, Access::WriteOnly);
+    }
+
+    #[test]
+    fn test_arena_cache_multiple_access_levels() {
+        let arena = CpuArena::new(4096, 4).unwrap();
+
+        let mut cache = ArenaCache::new();
+
+        // Map with both read-only and read-write access
+        unsafe {
+            cache
+                .map_arena_with_access(arena.id(), arena.fd(), arena.total_size(), Access::ReadOnly)
+                .unwrap();
+            cache
+                .map_arena_with_access(
+                    arena.id(),
+                    arena.fd(),
+                    arena.total_size(),
+                    Access::ReadWrite,
+                )
+                .unwrap();
+        }
+
+        assert!(cache.is_mapped(arena.id()));
+        assert!(cache.is_mapped_with_access(arena.id(), Access::ReadOnly));
+        assert!(cache.is_mapped_with_access(arena.id(), Access::ReadWrite));
+
+        // Unmap just the read-only mapping
+        cache.unmap_with_access(arena.id(), Access::ReadOnly);
+        assert!(cache.is_mapped(arena.id())); // Still mapped via read-write
+        assert!(cache.is_mapped_with_access(arena.id(), Access::ReadWrite));
     }
 }
