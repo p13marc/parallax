@@ -132,6 +132,7 @@ mod file;
 mod filter;
 mod funnel;
 mod identity;
+mod ipc;
 mod memory;
 mod metadata_ops;
 mod null;
@@ -307,3 +308,6 @@ pub use data_processing::{
     DuplicateFilter, DuplicateFilterStats, ExtractedMetadata, MetadataExtract, RangeFilter,
     RangeFilterStats, RegexFilter, RegexFilterStats,
 };
+
+// IPC elements for cross-process pipelines
+pub use ipc::{IpcSink, IpcSrc};
