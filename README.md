@@ -9,6 +9,7 @@ Parallax provides both dynamic (runtime-configured) and typed (compile-time safe
 - **Zero-copy buffers**: Shared memory with loan-based memory pools
 - **Progressive typing**: Start dynamic, graduate to typed
 - **Multi-process pipelines**: memfd + Unix socket IPC
+- **Hybrid scheduling**: PipeWire-inspired async + RT thread execution
 - **rkyv serialization**: Zero-copy deserialization at boundaries
 - **Linux-optimized**: memfd_create, huge pages, memory-mapped files
 - **Plugin system**: Dynamic element loading with C ABI compatibility
@@ -91,6 +92,56 @@ while let Some(buffer) = subscriber.recv()? {
     // Zero-copy access to data in shared memory
     process(buffer);
 }
+```
+
+### Hybrid Scheduling (Low Latency)
+
+Use PipeWire-inspired scheduling for real-time audio/video:
+
+```rust
+use parallax::pipeline::{Pipeline, HybridExecutor, RtConfig, SchedulingMode};
+
+let mut pipeline = Pipeline::parse("audiosrc ! decoder ! mixer ! audiosink")?;
+
+// Configure hybrid execution
+let config = RtConfig {
+    mode: SchedulingMode::Hybrid,
+    quantum: 256,           // samples per cycle (5.3ms at 48kHz)
+    rt_priority: Some(50),  // SCHED_FIFO (requires CAP_SYS_NICE)
+    data_threads: 1,
+    bridge_capacity: 16,
+};
+
+let executor = HybridExecutor::new(config);
+executor.run(&mut pipeline).await?;
+```
+
+The scheduler automatically partitions the graph:
+- **I/O-bound elements** (network, file) → Tokio async tasks
+- **RT-safe elements** (decoders, mixers) → Dedicated RT threads
+- **Lock-free bridges** connect the two domains
+
+### Pipeline States
+
+Parallax uses a PipeWire-inspired 3-state model:
+
+```
+Suspended <──> Idle <──> Running
+```
+
+| State | Resources | Description |
+|-------|-----------|-------------|
+| **Suspended** | Deallocated | Minimal memory footprint |
+| **Idle** | Allocated | Ready to process (paused) |
+| **Running** | Allocated | Actively processing |
+
+```rust
+let mut pipeline = Pipeline::parse("src ! sink")?;
+
+pipeline.prepare()?;   // Suspended → Idle (allocate, negotiate)
+pipeline.activate()?;  // Idle → Running (start processing)
+pipeline.pause()?;     // Running → Idle (stop, keep resources)
+pipeline.suspend()?;   // Idle → Suspended (release resources)
 ```
 
 ## Architecture
