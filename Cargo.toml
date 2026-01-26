@@ -43,8 +43,8 @@ metrics = "0.24"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Linux system APIs (memfd, mmap, SCM_RIGHTS)
-rustix = { version = "1.0", features = ["mm", "fs", "net", "process", "pipe", "stdio"] }
+# Linux system APIs (memfd, mmap, SCM_RIGHTS, eventfd)
+rustix = { version = "1.0", features = ["mm", "fs", "net", "process", "pipe", "stdio", "event"] }
 futures = "0.3.31"
 libloading = "0.8.9"
 paste = "1.0.15"

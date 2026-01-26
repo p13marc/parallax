@@ -7,6 +7,56 @@ use dynosaur::dynosaur;
 use smallvec::SmallVec;
 
 // ============================================================================
+// Scheduling Affinity
+// ============================================================================
+
+/// Scheduling affinity for elements in hybrid execution mode.
+///
+/// This determines whether an element runs in the Tokio async runtime
+/// (suitable for I/O-bound operations) or in a dedicated real-time thread
+/// (suitable for low-latency processing).
+///
+/// # Example
+///
+/// ```rust,ignore
+/// impl Source for MyAudioSource {
+///     fn produce(&mut self) -> Result<Option<Buffer>> {
+///         // ... produce audio samples
+///     }
+///
+///     fn affinity(&self) -> Affinity {
+///         Affinity::RealTime  // Low-latency audio processing
+///     }
+///
+///     fn is_rt_safe(&self) -> bool {
+///         true  // No allocations, no blocking I/O
+///     }
+/// }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Affinity {
+    /// Runs in Tokio async runtime.
+    ///
+    /// Use this for elements that perform async I/O (network, file),
+    /// or that may block. This is the default for async elements.
+    Async,
+
+    /// Runs in dedicated real-time thread(s).
+    ///
+    /// Use this for elements that need deterministic, low-latency execution.
+    /// Elements with this affinity should be RT-safe (no allocations,
+    /// no blocking syscalls in the hot path).
+    RealTime,
+
+    /// Let the executor decide based on element characteristics.
+    ///
+    /// The executor will check `is_rt_safe()` and other hints to
+    /// determine the best scheduling strategy.
+    #[default]
+    Auto,
+}
+
+// ============================================================================
 // Output Type
 // ============================================================================
 
@@ -254,6 +304,27 @@ pub trait Source: Send {
     fn output_caps(&self) -> Caps {
         Caps::any()
     }
+
+    /// Get the scheduling affinity for this source.
+    ///
+    /// Override this to specify whether this source should run in the
+    /// async runtime or real-time thread.
+    fn affinity(&self) -> Affinity {
+        Affinity::Auto
+    }
+
+    /// Check if this source is safe to run in a real-time context.
+    ///
+    /// An RT-safe source must:
+    /// - Not allocate memory in `produce()` (use pre-allocated buffers)
+    /// - Not perform blocking I/O
+    /// - Not take locks that could be held by non-RT threads
+    /// - Complete in bounded, deterministic time
+    ///
+    /// Returns `false` by default (conservative).
+    fn is_rt_safe(&self) -> bool {
+        false
+    }
 }
 
 /// An async source element that produces buffers asynchronously.
@@ -293,6 +364,22 @@ pub trait AsyncSource: Send {
     fn output_caps(&self) -> Caps {
         Caps::any()
     }
+
+    /// Get the scheduling affinity for this source.
+    ///
+    /// Async sources default to `Async` affinity since they typically
+    /// perform I/O operations that require the async runtime.
+    fn affinity(&self) -> Affinity {
+        Affinity::Async
+    }
+
+    /// Check if this source is safe to run in a real-time context.
+    ///
+    /// Async sources are generally not RT-safe since they use async I/O.
+    /// Returns `false` by default.
+    fn is_rt_safe(&self) -> bool {
+        false
+    }
 }
 
 // ============================================================================
@@ -331,6 +418,24 @@ pub trait Sink: Send {
     fn input_caps(&self) -> Caps {
         Caps::any()
     }
+
+    /// Get the scheduling affinity for this sink.
+    fn affinity(&self) -> Affinity {
+        Affinity::Auto
+    }
+
+    /// Check if this sink is safe to run in a real-time context.
+    ///
+    /// An RT-safe sink must:
+    /// - Not allocate memory in `consume()` (use pre-allocated buffers)
+    /// - Not perform blocking I/O (or use mmap/RT-safe I/O)
+    /// - Not take locks that could be held by non-RT threads
+    /// - Complete in bounded, deterministic time
+    ///
+    /// Returns `false` by default (conservative).
+    fn is_rt_safe(&self) -> bool {
+        false
+    }
 }
 
 /// An async sink element that consumes buffers asynchronously.
@@ -364,6 +469,22 @@ pub trait AsyncSink: Send {
     /// Get the input caps (what formats this sink accepts).
     fn input_caps(&self) -> Caps {
         Caps::any()
+    }
+
+    /// Get the scheduling affinity for this sink.
+    ///
+    /// Async sinks default to `Async` affinity since they typically
+    /// perform I/O operations that require the async runtime.
+    fn affinity(&self) -> Affinity {
+        Affinity::Async
+    }
+
+    /// Check if this sink is safe to run in a real-time context.
+    ///
+    /// Async sinks are generally not RT-safe since they use async I/O.
+    /// Returns `false` by default.
+    fn is_rt_safe(&self) -> bool {
+        false
     }
 }
 
@@ -420,6 +541,24 @@ pub trait Element: Send {
     fn output_caps(&self) -> Caps {
         Caps::any()
     }
+
+    /// Get the scheduling affinity for this element.
+    fn affinity(&self) -> Affinity {
+        Affinity::Auto
+    }
+
+    /// Check if this element is safe to run in a real-time context.
+    ///
+    /// An RT-safe element must:
+    /// - Not allocate memory in `process()` (use pre-allocated buffers)
+    /// - Not perform blocking I/O
+    /// - Not take locks that could be held by non-RT threads
+    /// - Complete in bounded, deterministic time
+    ///
+    /// Returns `false` by default (conservative).
+    fn is_rt_safe(&self) -> bool {
+        false
+    }
 }
 
 // ============================================================================
@@ -471,6 +610,24 @@ pub trait Transform: Send {
     fn output_caps(&self) -> Caps {
         Caps::any()
     }
+
+    /// Get the scheduling affinity for this transform.
+    fn affinity(&self) -> Affinity {
+        Affinity::Auto
+    }
+
+    /// Check if this transform is safe to run in a real-time context.
+    ///
+    /// An RT-safe transform must:
+    /// - Not allocate memory in `transform()` (use pre-allocated buffers)
+    /// - Not perform blocking I/O
+    /// - Not take locks that could be held by non-RT threads
+    /// - Complete in bounded, deterministic time
+    ///
+    /// Returns `false` by default (conservative).
+    fn is_rt_safe(&self) -> bool {
+        false
+    }
 }
 
 /// An async transform element.
@@ -496,6 +653,22 @@ pub trait AsyncTransform: Send {
     /// Get the output caps (what formats this transform produces).
     fn output_caps(&self) -> Caps {
         Caps::any()
+    }
+
+    /// Get the scheduling affinity for this transform.
+    ///
+    /// Async transforms default to `Async` affinity since they typically
+    /// perform I/O operations that require the async runtime.
+    fn affinity(&self) -> Affinity {
+        Affinity::Async
+    }
+
+    /// Check if this transform is safe to run in a real-time context.
+    ///
+    /// Async transforms are generally not RT-safe since they use async I/O.
+    /// Returns `false` by default.
+    fn is_rt_safe(&self) -> bool {
+        false
     }
 }
 
@@ -662,6 +835,24 @@ pub trait Demuxer: Send {
     ///
     /// This is called when the demuxer discovers new streams in the input.
     fn on_pad_added(&mut self, callback: PadAddedCallback);
+
+    /// Get the scheduling affinity for this demuxer.
+    fn affinity(&self) -> Affinity {
+        Affinity::Auto
+    }
+
+    /// Check if this demuxer is safe to run in a real-time context.
+    ///
+    /// An RT-safe demuxer must:
+    /// - Not allocate memory in `demux()` (use pre-allocated buffers)
+    /// - Not perform blocking I/O
+    /// - Not take locks that could be held by non-RT threads
+    /// - Complete in bounded, deterministic time
+    ///
+    /// Returns `false` by default (conservative).
+    fn is_rt_safe(&self) -> bool {
+        false
+    }
 }
 
 /// Input from a specific pad for muxers.
@@ -746,6 +937,24 @@ pub trait Muxer: Send {
     fn flush(&mut self) -> Result<Option<Buffer>> {
         Ok(None)
     }
+
+    /// Get the scheduling affinity for this muxer.
+    fn affinity(&self) -> Affinity {
+        Affinity::Auto
+    }
+
+    /// Check if this muxer is safe to run in a real-time context.
+    ///
+    /// An RT-safe muxer must:
+    /// - Not allocate memory in `mux()` (use pre-allocated buffers)
+    /// - Not perform blocking I/O
+    /// - Not take locks that could be held by non-RT threads
+    /// - Complete in bounded, deterministic time
+    ///
+    /// Returns `false` by default (conservative).
+    fn is_rt_safe(&self) -> bool {
+        false
+    }
 }
 
 // ============================================================================
@@ -810,6 +1019,22 @@ pub trait AsyncElementDyn {
     fn output_caps(&self) -> Caps {
         Caps::any()
     }
+
+    /// Get the scheduling affinity for this element.
+    ///
+    /// This determines whether the element runs in the async runtime
+    /// or in a dedicated real-time thread.
+    fn affinity(&self) -> Affinity {
+        Affinity::Auto
+    }
+
+    /// Check if this element is safe to run in a real-time context.
+    ///
+    /// An RT-safe element must not allocate, block, or take locks
+    /// in the hot path.
+    fn is_rt_safe(&self) -> bool {
+        false
+    }
 }
 
 // ============================================================================
@@ -853,6 +1078,14 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
     fn output_caps(&self) -> Caps {
         self.inner.output_caps()
     }
+
+    fn affinity(&self) -> Affinity {
+        self.inner.affinity()
+    }
+
+    fn is_rt_safe(&self) -> bool {
+        self.inner.is_rt_safe()
+    }
 }
 
 /// Wrapper to adapt a sync [`Sink`] to [`AsyncElementDyn`].
@@ -891,6 +1124,14 @@ impl<S: Sink + Send + 'static> SendAsyncElementDyn for SinkAdapter<S> {
 
     fn input_caps(&self) -> Caps {
         self.inner.input_caps()
+    }
+
+    fn affinity(&self) -> Affinity {
+        self.inner.affinity()
+    }
+
+    fn is_rt_safe(&self) -> bool {
+        self.inner.is_rt_safe()
     }
 }
 
@@ -934,6 +1175,14 @@ impl<E: Element + Send + 'static> SendAsyncElementDyn for ElementAdapter<E> {
 
     fn output_caps(&self) -> Caps {
         self.inner.output_caps()
+    }
+
+    fn affinity(&self) -> Affinity {
+        self.inner.affinity()
+    }
+
+    fn is_rt_safe(&self) -> bool {
+        self.inner.is_rt_safe()
     }
 }
 
@@ -1011,6 +1260,14 @@ impl<T: Transform + Send + 'static> SendAsyncElementDyn for TransformAdapter<T> 
     fn output_caps(&self) -> Caps {
         self.inner.output_caps()
     }
+
+    fn affinity(&self) -> Affinity {
+        self.inner.affinity()
+    }
+
+    fn is_rt_safe(&self) -> bool {
+        self.inner.is_rt_safe()
+    }
 }
 
 // ============================================================================
@@ -1067,6 +1324,14 @@ impl<S: AsyncSource + Send + 'static> SendAsyncElementDyn for AsyncSourceAdapter
     fn output_caps(&self) -> Caps {
         self.inner.output_caps()
     }
+
+    fn affinity(&self) -> Affinity {
+        self.inner.affinity()
+    }
+
+    fn is_rt_safe(&self) -> bool {
+        self.inner.is_rt_safe()
+    }
 }
 
 /// Wrapper to adapt an [`AsyncSink`] to [`AsyncElementDyn`].
@@ -1105,6 +1370,14 @@ impl<S: AsyncSink + Send + 'static> SendAsyncElementDyn for AsyncSinkAdapter<S> 
 
     fn input_caps(&self) -> Caps {
         self.inner.input_caps()
+    }
+
+    fn affinity(&self) -> Affinity {
+        self.inner.affinity()
+    }
+
+    fn is_rt_safe(&self) -> bool {
+        self.inner.is_rt_safe()
     }
 }
 
@@ -1179,6 +1452,14 @@ impl<T: AsyncTransform + Send + 'static> SendAsyncElementDyn for AsyncTransformA
 
     fn output_caps(&self) -> Caps {
         self.inner.output_caps()
+    }
+
+    fn affinity(&self) -> Affinity {
+        self.inner.affinity()
+    }
+
+    fn is_rt_safe(&self) -> bool {
+        self.inner.is_rt_safe()
     }
 }
 
@@ -1290,6 +1571,14 @@ impl<D: Demuxer + Send + 'static> SendAsyncElementDyn for DemuxerAdapter<D> {
         // For now, return Any - proper per-pad caps are accessed via outputs()
         Caps::any()
     }
+
+    fn affinity(&self) -> Affinity {
+        self.inner.affinity()
+    }
+
+    fn is_rt_safe(&self) -> bool {
+        self.inner.is_rt_safe()
+    }
 }
 
 /// Wrapper to adapt a [`Muxer`] to [`AsyncElementDyn`].
@@ -1380,6 +1669,14 @@ impl<M: Muxer + Send + 'static> SendAsyncElementDyn for MuxerAdapter<M> {
 
     fn output_caps(&self) -> Caps {
         self.inner.output_caps()
+    }
+
+    fn affinity(&self) -> Affinity {
+        self.inner.affinity()
+    }
+
+    fn is_rt_safe(&self) -> bool {
+        self.inner.is_rt_safe()
     }
 }
 
@@ -1715,5 +2012,148 @@ mod tests {
 
         // Verify the muxer received a buffer
         assert_eq!(adapter.inner().buffer_count, 1);
+    }
+
+    // ========================================================================
+    // Affinity and RT-safety tests
+    // ========================================================================
+
+    #[test]
+    fn test_affinity_default() {
+        // Default affinity should be Auto
+        assert_eq!(Affinity::default(), Affinity::Auto);
+    }
+
+    #[test]
+    fn test_affinity_variants() {
+        // Test all variants exist and are distinct
+        assert_ne!(Affinity::Async, Affinity::RealTime);
+        assert_ne!(Affinity::Async, Affinity::Auto);
+        assert_ne!(Affinity::RealTime, Affinity::Auto);
+
+        // Test debug formatting
+        assert_eq!(format!("{:?}", Affinity::Async), "Async");
+        assert_eq!(format!("{:?}", Affinity::RealTime), "RealTime");
+        assert_eq!(format!("{:?}", Affinity::Auto), "Auto");
+    }
+
+    #[test]
+    fn test_source_default_affinity() {
+        let source = TestSource { count: 0, max: 1 };
+        // Default affinity should be Auto
+        assert_eq!(source.affinity(), Affinity::Auto);
+        // Default is_rt_safe should be false (conservative)
+        assert!(!source.is_rt_safe());
+    }
+
+    #[test]
+    fn test_sink_default_affinity() {
+        let sink = TestSink { received: vec![] };
+        assert_eq!(sink.affinity(), Affinity::Auto);
+        assert!(!sink.is_rt_safe());
+    }
+
+    #[test]
+    fn test_element_default_affinity() {
+        let element = PassThrough;
+        // Use Element trait explicitly to avoid ambiguity with Transform blanket impl
+        assert_eq!(Element::affinity(&element), Affinity::Auto);
+        assert!(!Element::is_rt_safe(&element));
+    }
+
+    // Test custom RT-safe element
+    struct RtSafeProcessor;
+
+    impl Element for RtSafeProcessor {
+        fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
+            // No allocations, just pass through
+            Ok(Some(buffer))
+        }
+
+        fn affinity(&self) -> Affinity {
+            Affinity::RealTime
+        }
+
+        fn is_rt_safe(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn test_custom_rt_safe_element() {
+        let element = RtSafeProcessor;
+        assert_eq!(Element::affinity(&element), Affinity::RealTime);
+        assert!(Element::is_rt_safe(&element));
+    }
+
+    #[tokio::test]
+    async fn test_adapter_forwards_affinity() {
+        // Test that adapters correctly forward affinity and is_rt_safe
+        let element = RtSafeProcessor;
+        let adapter = ElementAdapter::new(element);
+
+        assert_eq!(SendAsyncElementDyn::affinity(&adapter), Affinity::RealTime);
+        assert!(SendAsyncElementDyn::is_rt_safe(&adapter));
+    }
+
+    // Test async source with Async affinity
+    struct TestAsyncSource;
+
+    impl AsyncSource for TestAsyncSource {
+        async fn produce(&mut self) -> Result<Option<Buffer>> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_async_source_default_affinity() {
+        let source = TestAsyncSource;
+        // Async sources default to Async affinity
+        assert_eq!(AsyncSource::affinity(&source), Affinity::Async);
+        assert!(!AsyncSource::is_rt_safe(&source));
+    }
+
+    #[tokio::test]
+    async fn test_async_source_adapter_affinity() {
+        let source = TestAsyncSource;
+        let adapter = AsyncSourceAdapter::new(source);
+
+        assert_eq!(SendAsyncElementDyn::affinity(&adapter), Affinity::Async);
+        assert!(!SendAsyncElementDyn::is_rt_safe(&adapter));
+    }
+
+    // Test async sink with Async affinity
+    struct TestAsyncSink;
+
+    impl AsyncSink for TestAsyncSink {
+        async fn consume(&mut self, _buffer: Buffer) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_async_sink_default_affinity() {
+        let sink = TestAsyncSink;
+        assert_eq!(AsyncSink::affinity(&sink), Affinity::Async);
+        assert!(!AsyncSink::is_rt_safe(&sink));
+    }
+
+    #[test]
+    fn test_demuxer_default_affinity() {
+        let demuxer = TestDemuxer {
+            outputs: vec![(PadId(0), Caps::any())],
+        };
+        assert_eq!(demuxer.affinity(), Affinity::Auto);
+        assert!(!demuxer.is_rt_safe());
+    }
+
+    #[test]
+    fn test_muxer_default_affinity() {
+        let muxer = TestMuxer {
+            inputs: vec![(PadId(0), Caps::any())],
+            buffer_count: 0,
+        };
+        assert_eq!(muxer.affinity(), Affinity::Auto);
+        assert!(!muxer.is_rt_safe());
     }
 }
