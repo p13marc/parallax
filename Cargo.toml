@@ -129,6 +129,36 @@ harness = false
 name = "memory_pool"
 harness = false
 
+# Basic examples
+[[example]]
+name = "simple_pipeline"
+path = "examples/basics/simple_pipeline.rs"
+
+[[example]]
+name = "typed_pipeline"
+path = "examples/basics/typed_pipeline.rs"
+
+# Video examples
 [[example]]
 name = "video_display"
+path = "examples/video/video_display.rs"
 required-features = ["iced-sink"]
+
+# Network examples
+[[example]]
+name = "tier3_network_elements"
+path = "examples/network/tier3_network_elements.rs"
+
+# IPC examples
+[[example]]
+name = "multi_process"
+path = "examples/ipc/multi_process.rs"
+
+# Element showcase examples
+[[example]]
+name = "new_elements"
+path = "examples/elements/new_elements.rs"
+
+[[example]]
+name = "tier1_tier2_elements"
+path = "examples/elements/tier1_tier2_elements.rs"
