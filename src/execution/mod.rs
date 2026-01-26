@@ -53,7 +53,16 @@
 mod mode;
 mod protocol;
 mod sandbox;
+mod supervisor;
 
 pub use mode::{ExecutionMode, GroupId};
-pub use protocol::{ControlMessage, ElementState};
-pub use sandbox::{CgroupLimits, ElementSandbox, SeccompPolicy};
+pub use protocol::{
+    ControlMessage, ElementState, SerializableCaps, SerializableMetadata, frame_message,
+    unframe_message,
+};
+pub use sandbox::{
+    AllowedPath, ArgConstraint, ArgOp, CgroupLimits, ElementSandbox, SeccompPolicy, SeccompRule,
+};
+pub use supervisor::{
+    BackoffStrategy, ElementId, ElementProcess, ElementStats, RestartPolicy, Supervisor,
+};
