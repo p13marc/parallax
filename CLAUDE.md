@@ -102,10 +102,11 @@ parallax/
 │   ├── error.rs            # Error types (thiserror)
 │   │
 │   ├── memory/             # Memory management
-│   │   ├── segment.rs      # MemorySegment trait, MemoryType, IpcHandle
-│   │   ├── heap.rs         # HeapSegment (to be replaced by CpuSegment)
+│   │   ├── segment.rs      # MemorySegment trait, MemoryType
+│   │   ├── heap.rs         # HeapSegment (simple heap allocation)
 │   │   ├── shared.rs       # SharedMemorySegment (memfd_create)
-│   │   ├── pool.rs         # MemoryPool, LoanedSlot (loan semantics)
+│   │   ├── cpu.rs          # CpuArena (arena allocator for IPC)
+│   │   ├── pool.rs         # MemoryPool, LoanedSlot
 │   │   ├── bitmap.rs       # AtomicBitmap (lock-free slot tracking)
 │   │   └── ipc.rs          # send_fds/recv_fds (SCM_RIGHTS)
 │   │
@@ -113,7 +114,7 @@ parallax/
 │   ├── metadata.rs         # Metadata, BufferFlags
 │   │
 │   ├── element/            # Element system
-│   │   ├── traits.rs       # Source, Sink, Element, AsyncSource, AsyncSink, Transform
+│   │   ├── traits.rs       # Source, Sink, Element, AsyncSource, AsyncSink
 │   │   ├── pad.rs          # Pad, PadDirection, PadTemplate
 │   │   └── context.rs      # ElementContext
 │   │
@@ -123,26 +124,57 @@ parallax/
 │   │   ├── parser.rs       # Pipeline string parser (winnow)
 │   │   └── factory.rs      # ElementFactory + PluginRegistry
 │   │
-│   ├── elements/           # Built-in elements (25+)
-│   │   ├── null.rs         # NullSink, NullSource
-│   │   ├── passthrough.rs  # PassThrough
-│   │   ├── tee.rs          # Tee (fanout)
-│   │   ├── file.rs         # FileSrc, FileSink
-│   │   ├── tcp.rs          # TcpSrc/Sink (sync + async)
-│   │   ├── udp.rs          # UdpSrc/Sink (sync + async)
-│   │   ├── zenoh.rs        # ZenohPub, ZenohSub
-│   │   ├── queue.rs        # Queue (backpressure)
-│   │   ├── valve.rs        # Valve (flow control)
-│   │   └── ...             # Many more
+│   ├── execution/          # Process isolation
+│   │   ├── mode.rs         # ExecutionMode (InProcess, Isolated, Grouped)
+│   │   ├── isolated_executor.rs  # Transparent IPC injection
+│   │   ├── supervisor.rs   # Process supervision
+│   │   └── protocol.rs     # Control message protocol
+│   │
+│   ├── elements/           # Built-in elements (organized by category)
+│   │   ├── network/        # TCP, UDP, Unix, multicast, HTTP, WebSocket, Zenoh
+│   │   ├── rtp/            # RTP, RTCP, codecs, jitter buffer, RTSP
+│   │   ├── io/             # FileSrc/Sink, FdSrc/Sink, ConsoleSink
+│   │   ├── testing/        # TestSrc, VideoTestSrc, DataSrc, Null
+│   │   ├── flow/           # Queue, Tee, Funnel, Selector, Concat, Valve
+│   │   ├── transform/      # Filter, Map, Batch, buffer/metadata ops
+│   │   ├── app/            # AppSrc, AppSink, IcedVideoSink
+│   │   ├── ipc/            # IpcSrc, IpcSink, MemorySrc/Sink
+│   │   ├── timing/         # Delay, Timeout, RateLimiter
+│   │   ├── demux/          # StreamIdDemux, TsDemux
+│   │   └── util/           # PassThrough, Identity
+│   │
+│   ├── typed/              # Type-safe pipeline API
+│   │   ├── pipeline.rs     # PipelineWithSource, PipelineWithTransforms
+│   │   ├── operators.rs    # map, filter, take, skip, collect, etc.
+│   │   └── multi_source.rs # merge, zip, join, temporal_join
 │   │
 │   └── plugin/             # Plugin system
 │       ├── registry.rs     # PluginRegistry
 │       ├── loader.rs       # Dynamic loading
-│       └── descriptor.rs   # Plugin metadata
+│       └── descriptor.rs   # Plugin metadata (C-compatible ABI)
+│
+├── examples/               # One concept per file, numbered
+│   ├── 01_hello_pipeline.rs      # Simplest pipeline
+│   ├── 02_counting_source.rs     # Multiple buffers
+│   ├── 03_transform_element.rs   # Transform element
+│   ├── 04_tee_fanout.rs          # 1-to-N fanout
+│   ├── 05_funnel_merge.rs        # N-to-1 merge
+│   ├── 06_typed_pipeline.rs      # Type-safe pipelines
+│   ├── 07_appsrc_appsink.rs      # Application integration
+│   ├── 08_queue_backpressure.rs  # Backpressure
+│   ├── 09_valve_control.rs       # Flow control
+│   ├── 10_file_io.rs             # File read/write
+│   ├── 11_isolate_in_process.rs  # Default execution
+│   ├── 12_isolate_by_pattern.rs  # Selective isolation
+│   ├── 13_isolate_all.rs         # Full isolation
+│   ├── 14_ipc_manual.rs          # Manual IPC
+│   ├── 15_video_testsrc.rs       # Video test patterns
+│   └── 16_video_display.rs       # GUI display (iced-sink)
 │
 ├── docs/
-│   ├── FINAL_DESIGN_PARALLAX.md    # Complete design document
-│   └── PLAN_CAPS_NEGOTIATION.md    # Caps negotiation design
+│   ├── FINAL_DESIGN_PARALLAX.md  # Complete design document
+│   ├── PLAN_CAPS_NEGOTIATION.md  # Caps negotiation design
+│   └── getting-started.md        # Quick start guide
 ```
 
 ### Key Types

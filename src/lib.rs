@@ -18,17 +18,26 @@
 //!
 //! ```rust,ignore
 //! use parallax::prelude::*;
+//! use parallax::typed::{pipeline, from_iter, map, filter, collect};
 //!
-//! // Dynamic pipeline (string-based)
+//! // Dynamic pipeline (programmatic)
 //! let mut pipeline = Pipeline::new();
-//! pipeline.parse("filesrc location=input.bin ! passthrough ! consolesink")?;
-//! pipeline.play().await?;
+//! let src = pipeline.add_node("src", Box::new(source));
+//! let sink = pipeline.add_node("sink", Box::new(sink));
+//! pipeline.link(src, sink)?;
+//!
+//! let executor = PipelineExecutor::new();
+//! executor.run(&mut pipeline).await?;
 //!
 //! // Typed pipeline (compile-time checked)
-//! let pipeline = TypedPipeline::from_source(FileSrc::new("input.bin"))
-//!     .then(PassThrough::new())
-//!     .sink(ConsoleSink::new());
-//! pipeline.run().await?;
+//! let source = from_iter(vec![1, 2, 3, 4, 5]);
+//! let result = pipeline(source)
+//!     .then(filter(|x: &i32| x % 2 == 0))
+//!     .then(map(|x: i32| x * 10))
+//!     .sink(collect::<i32>())
+//!     .run()?
+//!     .into_inner();
+//! // result: [20, 40]
 //! ```
 
 #![warn(missing_docs)]

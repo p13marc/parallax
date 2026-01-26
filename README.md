@@ -310,29 +310,37 @@ while let Some(buffer) = subscriber.recv()? {
 Run the examples:
 
 ```bash
-# Simple dynamic pipeline
-cargo run --example simple_pipeline
+# Basics
+cargo run --example 01_hello_pipeline       # Simplest pipeline
+cargo run --example 02_counting_source      # Multiple buffers
+cargo run --example 03_transform_element    # Custom transforms
 
-# Typed pipeline with operators
-cargo run --example typed_pipeline
+# Routing
+cargo run --example 04_tee_fanout           # 1-to-N fanout
+cargo run --example 05_funnel_merge         # N-to-1 merge
 
-# Multi-process shared memory
-cargo run --example multi_process
+# Typed pipelines
+cargo run --example 06_typed_pipeline       # Type-safe pipelines
 
-# New elements (AppSrc/AppSink, Queue, Valve, Funnel, Selectors, etc.)
-cargo run --example new_elements
+# Application integration
+cargo run --example 07_appsrc_appsink       # Inject/extract buffers
 
-# Tier 1 & 2 elements (Identity, Memory, Delay, Filters, Batching, etc.)
-cargo run --example tier1_tier2_elements
+# Flow control
+cargo run --example 08_queue_backpressure   # Backpressure handling
+cargo run --example 09_valve_control        # On/off flow control
 
-# Tier 3 network elements (Unix sockets, Multicast)
-cargo run --example tier3_network_elements
+# File I/O
+cargo run --example 10_file_io              # Read/write files
 
-# HTTP elements (requires http feature)
-cargo run --example tier3_network_elements --features http
+# Process isolation
+cargo run --example 11_isolate_in_process   # Default execution
+cargo run --example 12_isolate_by_pattern   # Selective isolation
+cargo run --example 13_isolate_all          # Full isolation
+cargo run --example 14_ipc_manual           # Manual IPC boundaries
 
-# WebSocket elements (requires websocket feature)
-cargo run --example tier3_network_elements --features websocket
+# Video
+cargo run --example 15_video_testsrc        # Test pattern generator
+cargo run --example 16_video_display --features iced-sink  # GUI display
 ```
 
 ## Benchmarks
