@@ -162,3 +162,16 @@ path = "examples/elements/new_elements.rs"
 [[example]]
 name = "tier1_tier2_elements"
 path = "examples/elements/tier1_tier2_elements.rs"
+
+# Process isolation examples
+[[example]]
+name = "easy_isolation"
+path = "examples/isolation/easy_isolation.rs"
+
+[[example]]
+name = "process_isolation"
+path = "examples/isolation/process_isolation.rs"
+
+[[example]]
+name = "cross_process_pipeline"
+path = "examples/isolation/cross_process_pipeline.rs"
