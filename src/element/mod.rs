@@ -37,6 +37,14 @@
 //! - `Output::Single`: One output buffer
 //! - `Output::Multiple`: Multiple output buffers
 //!
+//! # Muxer Synchronization
+//!
+//! For N-to-1 muxers that combine multiple streams, the [`muxer`] module
+//! provides synchronization utilities:
+//! - [`MuxerSyncState`](muxer::MuxerSyncState): PTS-based synchronization
+//! - [`SyncMode`](muxer::SyncMode): Strict, loose, or timed sync
+//! - [`StreamType`](muxer::StreamType): Video, audio, subtitle, data
+//!
 //! # Example
 //!
 //! ```rust,ignore
@@ -64,6 +72,7 @@
 //! ```
 
 mod context;
+pub mod muxer;
 mod pad;
 mod traits;
 

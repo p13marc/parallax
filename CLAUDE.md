@@ -284,6 +284,77 @@ fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
 }
 ```
 
+### Muxer Synchronization (N-to-1)
+
+Parallax provides PTS-based synchronization for N-to-1 muxer elements:
+
+```rust
+use parallax::element::muxer::{MuxerSyncState, MuxerSyncConfig, PadInfo, StreamType, SyncMode};
+
+// Create sync state with 40ms output interval (25fps video)
+let config = MuxerSyncConfig::new()
+    .with_mode(SyncMode::Strict)
+    .with_interval_ms(40);
+
+let mut sync = MuxerSyncState::new(config);
+
+// Add input pads
+let video_pad = sync.add_pad(PadInfo::new("video", StreamType::Video).required());
+let audio_pad = sync.add_pad(PadInfo::new("audio", StreamType::Audio).required());
+let data_pad = sync.add_pad(PadInfo::new("klv", StreamType::Data).optional());
+
+// Push buffers from each input
+sync.push(video_pad, video_buffer)?;
+sync.push(audio_pad, audio_buffer)?;
+
+// Check if ready and collect synchronized output
+if sync.ready_to_output() {
+    let collected = sync.collect_for_output();
+    // Process collected buffers...
+    sync.advance();  // Move to next output interval
+}
+```
+
+**Key types:**
+- `MuxerSyncState` - Core synchronization state machine
+- `MuxerSyncConfig` - Configuration (mode, interval, live)
+- `PadInfo` - Per-pad configuration (name, stream type, required)
+- `StreamType` - Video, Audio, Subtitle, Data
+- `SyncMode` - Synchronization strategy
+
+**Sync modes:**
+| Mode | Behavior |
+|------|----------|
+| `Strict` | Wait for all required pads to have data |
+| `Loose` | Output when primary stream (video) is ready |
+| `Timed { interval_ms }` | Fixed interval output |
+| `Auto` | Strict for non-live, Loose for live sources |
+
+**Pipeline-ready muxer elements:**
+```rust
+use parallax::elements::mux::{TsMuxElement, TsMuxConfig, TsMuxTrack, TsMuxStreamType};
+
+// Create MPEG-TS muxer with video and KLV tracks
+let config = TsMuxConfig::new()
+    .add_track(TsMuxTrack::new(256, TsMuxStreamType::H264).video())
+    .add_track(TsMuxTrack::new(257, TsMuxStreamType::Klv).private_data());
+
+let mut mux = TsMuxElement::new(config)?;
+
+// Push data via MuxerInput
+mux.push(MuxerInput::new(video_pad_id, video_buffer))?;
+mux.push(MuxerInput::new(data_pad_id, klv_buffer))?;
+
+// Pull synchronized output
+if mux.can_output() {
+    if let Some(ts_buffer) = mux.pull()? {
+        // Write TS packets...
+    }
+}
+```
+
+See `examples/39_muxer_element.rs` for a complete example.
+
 ## Build Commands
 
 ```bash
@@ -347,7 +418,8 @@ parallax/
 │   ├── element/            # Element system
 │   │   ├── traits.rs       # Source, Sink, Element, AsyncSource, AsyncSink, ExecutionHints
 │   │   ├── pad.rs          # Pad, PadDirection, PadTemplate
-│   │   └── context.rs      # ElementContext
+│   │   ├── context.rs      # ElementContext
+│   │   └── muxer.rs        # MuxerSyncState, PadInfo, StreamType, SyncMode
 │   │
 │   ├── pipeline/           # Pipeline execution
 │   │   ├── graph.rs        # Pipeline DAG (daggy-based)
@@ -377,7 +449,7 @@ parallax/
 │   │   ├── ipc/            # IpcSrc, IpcSink, MemorySrc/Sink
 │   │   ├── timing/         # Delay, Timeout, RateLimiter
 │   │   ├── demux/          # StreamIdDemux, TsDemux, Mp4Demux
-│   │   ├── mux/            # Mp4Mux
+│   │   ├── mux/            # TsMux, TsMuxElement, Mp4Mux (N-to-1 multiplexing)
 │   │   ├── codec/          # Media codecs (AV1, audio, image - feature-gated)
 │   │   └── util/           # PassThrough, Identity
 │   │
@@ -414,7 +486,8 @@ parallax/
 │   ├── 20_dynamic_state.rs       # Dynamic pipeline state changes
 │   ├── 24_image_codec.rs         # Image encoding/decoding (PNG)
 │   ├── 32_buffer_pool.rs         # Pipeline buffer pooling
-│   └── 33_encoder_element.rs     # Video encoder wrapper (AV1)
+│   ├── 33_encoder_element.rs     # Video encoder wrapper (AV1)
+│   └── 39_muxer_element.rs       # N-to-1 muxer with PTS sync
 │
 ├── docs/
 │   ├── FINAL_DESIGN_PARALLAX.md  # Complete design document

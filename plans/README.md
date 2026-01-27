@@ -34,7 +34,7 @@ Key architectural decisions have been researched and documented in **[00_DESIGN_
 | 00 | [Design Decisions](00_DESIGN_DECISIONS.md) | - | - | ✅ Complete |
 | 01 | [Custom Metadata API](01_CUSTOM_METADATA_API.md) | High | Small | ✅ Complete |
 | 02 | [Codec Element Wrappers](02_CODEC_ELEMENT_WRAPPERS.md) | High | Medium | ✅ Complete |
-| 03 | [Muxer Synchronization](03_MUXER_SYNCHRONIZATION.md) | High | Large | ⬜ Not Started |
+| 03 | [Muxer Synchronization](03_MUXER_SYNCHRONIZATION.md) | High | Large | ✅ Complete |
 | 04 | [Pipeline Buffer Pool](04_PIPELINE_BUFFER_POOL.md) | High | Medium | ✅ Complete |
 | 05 | [Element Trait Consolidation](05_ELEMENT_TRAIT_CONSOLIDATION.md) | Medium | Large | ⬜ Not Started |
 | 06 | [Caps Negotiation](06_CAPS_NEGOTIATION.md) | Medium | Medium | ✅ Complete |
@@ -87,18 +87,18 @@ Key architectural decisions have been researched and documented in **[00_DESIGN_
 - [x] Create example 33 (encoder element)
 - [x] Update documentation (CLAUDE.md)
 
-#### Plan 03: Muxer Synchronization
-- [ ] Define `Muxer` trait with `push()` / `pull()` model
-- [ ] Define `MuxerInput`, `MuxerOutput`, `PadInfo` types
-- [ ] Implement `MuxerSyncState` for PTS synchronization
-- [ ] Implement `TsMuxElement` wrapping existing `TsMux`
-- [ ] Add `MuxerAdapter` for `AsyncElementDyn`
-- [ ] Update executor with `run_muxer_node()` for multi-input
-- [ ] Update `Pipeline` to allow multiple links to muxer
-- [ ] Implement strict/loose/timed sync modes
-- [ ] Write unit tests
-- [ ] Create example 33
-- [ ] Update documentation
+#### Plan 03: Muxer Synchronization ✅
+- [x] Define `Muxer` trait with `push()` / `pull()` model (enhanced existing trait)
+- [x] Define `MuxerInput`, `MuxerOutput`, `PadInfo` types
+- [x] Implement `MuxerSyncState` for PTS synchronization
+- [x] Implement `TsMuxElement` wrapping existing `TsMux`
+- [x] Add `MuxerAdapter` for `AsyncElementDyn` (already existed)
+- [x] Update executor with `run_muxer_node()` for multi-input (spawn_muxer_task exists)
+- [x] Update `Pipeline` to allow multiple links to muxer (already supported)
+- [x] Implement strict/loose/timed/auto sync modes
+- [x] Write unit tests (37 tests in muxer.rs and ts_element.rs)
+- [x] Create example 39 (muxer element)
+- [x] Update documentation
 
 ### Phase 3: Ergonomics (Weeks 4-6)
 
