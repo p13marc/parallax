@@ -35,7 +35,7 @@ Key architectural decisions have been researched and documented in **[00_DESIGN_
 | 01 | [Custom Metadata API](01_CUSTOM_METADATA_API.md) | High | Small | ✅ Complete |
 | 02 | [Codec Element Wrappers](02_CODEC_ELEMENT_WRAPPERS.md) | High | Medium | ⬜ Not Started |
 | 03 | [Muxer Synchronization](03_MUXER_SYNCHRONIZATION.md) | High | Large | ⬜ Not Started |
-| 04 | [Pipeline Buffer Pool](04_PIPELINE_BUFFER_POOL.md) | High | Medium | ⬜ Not Started |
+| 04 | [Pipeline Buffer Pool](04_PIPELINE_BUFFER_POOL.md) | High | Medium | ✅ Complete |
 | 05 | [Element Trait Consolidation](05_ELEMENT_TRAIT_CONSOLIDATION.md) | Medium | Large | ⬜ Not Started |
 | 06 | [Caps Negotiation](06_CAPS_NEGOTIATION.md) | Medium | Medium | ⬜ Not Started |
 | 07 | [Pipeline Builder DSL](07_PIPELINE_BUILDER_DSL.md) | Medium | Small | ⬜ Not Started |
@@ -59,16 +59,16 @@ Key architectural decisions have been researched and documented in **[00_DESIGN_
 - [x] Update example 31 to use new API
 - [x] Update documentation (CLAUDE.md)
 
-#### Plan 04: Pipeline Buffer Pool
-- [ ] Define `BufferPool` trait
-- [ ] Implement `PooledBuffer` with Drop return-to-pool
-- [ ] Implement `FixedSizePool` using `CpuArena`
-- [ ] Add pool to `ProduceContext`
-- [ ] Add `set_pool()` and `create_pool()` to `Pipeline`
-- [ ] Update executor to pass pool to sources
-- [ ] Write unit tests
-- [ ] Create example 34
-- [ ] Update documentation
+#### Plan 04: Pipeline Buffer Pool ✅
+- [x] Define `BufferPool` trait
+- [x] Implement `PooledBuffer` with Drop return-to-pool
+- [x] Implement `FixedSizePool` using `CpuArena`
+- [x] Add pool to `ProduceContext`
+- [x] Add `set_pool()` and `create_pool()` to `Pipeline`
+- [x] Update executor to pass pool to sources
+- [x] Write unit tests
+- [x] Create example 32 (buffer pool)
+- [x] Update documentation
 
 ### Phase 2: Element System (Weeks 2-4)
 
