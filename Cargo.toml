@@ -187,3 +187,21 @@ required-features = ["iced-sink"]
 
 [[example]]
 name = "17_introspection"
+
+[[example]]
+name = "18_demuxer_muxer"
+
+[[example]]
+name = "19_auto_execution"
+
+[[example]]
+name = "20_dynamic_state"
+
+[[example]]
+name = "21_tcp_streaming"
+
+[[example]]
+name = "22_file_processing"
+
+[[example]]
+name = "23_data_pipeline"
