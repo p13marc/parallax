@@ -349,11 +349,12 @@ impl ProcessOutput {
 
 | Crate | Version | Use Case | Plan |
 |-------|---------|----------|------|
-| [`parking_lot`](https://crates.io/crates/parking_lot) | 0.12 | Faster mutexes, condvars | 04 |
 | [`smallvec`](https://crates.io/crates/smallvec) | 1.x | Inline small vectors | 01, 06, 08 |
 | [`bitflags`](https://crates.io/crates/bitflags) | 2.x | Type-safe bitflags (already planned) | 08 |
 | [`dyn-clone`](https://crates.io/crates/dyn-clone) | 1.x | Clone for trait objects | 01 |
 | [`thiserror`](https://crates.io/crates/thiserror) | 1.x | Error types (already using) | All |
+
+> **Note:** `parking_lot` is NOT recommended. Modern `std::sync::Mutex` (since Rust 1.62) is highly optimized and performs comparably. Stick with standard library primitives.
 
 ### Medium Priority (Consider Using)
 
@@ -378,12 +379,12 @@ impl ProcessOutput {
 
 ## Crate Details
 
-### `parking_lot` for Buffer Pool
+### `std::sync` for Buffer Pool
 
-Replace `std::sync` primitives for better performance:
+Use standard library primitives (no external crate needed):
 
 ```rust
-use parking_lot::{Mutex, Condvar};
+use std::sync::{Mutex, Condvar};
 
 pub struct PoolInner {
     state: Mutex<PoolState>,
@@ -392,15 +393,15 @@ pub struct PoolInner {
 
 impl PoolInner {
     pub fn acquire(&self) -> PooledBuffer {
-        let mut state = self.state.lock();
+        let mut state = self.state.lock().unwrap();
         while state.available_count == 0 {
-            self.available.wait(&mut state);
+            state = self.available.wait(state).unwrap();
         }
         state.take_slot()
     }
     
     pub fn release(&self, slot: usize) {
-        let mut state = self.state.lock();
+        let mut state = self.state.lock().unwrap();
         state.return_slot(slot);
         self.available.notify_one();
     }
@@ -514,13 +515,12 @@ assert!(fps30 > ntsc);
 1. **Immediate (Before Implementation):**
    - [ ] Fix blanket impl conflict in Plan 05 (use wrapper types)
    - [ ] Change `ClockTime::NONE` to use `Option<ClockTime>`
-   - [ ] Fix buffer pool busy-wait with proper sync primitives
+   - [ ] Fix buffer pool busy-wait with `std::sync::Condvar`
 
 2. **During Implementation:**
    - [ ] Add `#[must_use]` to appropriate functions
    - [ ] Use `dyn-clone` for metadata cloning
    - [ ] Use `smallvec` for small collections
-   - [ ] Add `parking_lot` to dependencies
 
 3. **Nice to Have:**
    - [ ] Consider `petgraph` for caps negotiation
@@ -539,7 +539,6 @@ tokio = { version = "1", features = ["full"] }
 rkyv = { version = "0.7", features = ["validation"] }
 
 # Add these
-parking_lot = "0.12"
 smallvec = { version = "1", features = ["union", "const_generics"] }
 bitflags = "2"
 dyn-clone = "1"
@@ -549,3 +548,5 @@ petgraph = "0.6"           # For caps negotiation
 derive_more = "1"          # Convenient derives
 strum = { version = "0.26", features = ["derive"] }
 ```
+
+> **Note:** Use `std::sync::{Mutex, Condvar}` - no need for `parking_lot`.

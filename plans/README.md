@@ -4,6 +4,12 @@ This directory contains detailed implementation plans for improving Parallax, de
 
 ---
 
+## Code Quality Reviews
+
+- **[RUST_IDIOMS_REVIEW.md](RUST_IDIOMS_REVIEW.md)** - Review of Rust idioms, anti-patterns, and recommended crates
+
+---
+
 ## Design Decisions
 
 Key architectural decisions have been researched and documented in **[00_DESIGN_DECISIONS.md](00_DESIGN_DECISIONS.md)**, based on analysis of GStreamer, PipeWire, and academic literature.
@@ -288,6 +294,55 @@ Plan 05 (Element Trait Consolidation) is the largest breaking change, which is w
 
 ---
 
+## Ongoing Maintenance Requirements
+
+**IMPORTANT:** Each plan implementation MUST include updates to all relevant artifacts. This is not optional.
+
+### After Every Plan Implementation
+
+| Artifact | What to Update |
+|----------|----------------|
+| **Tests** | Add unit tests for new types, integration tests for interactions |
+| **Examples** | Update existing examples, add new ones demonstrating features |
+| **CLAUDE.md** | Update architecture section, key types, implementation roadmap |
+| **README.md** (root) | Update feature list, API examples if changed |
+| **docs/** | Update getting-started.md, add new guides if needed |
+| **Rustdoc** | Add `///` doc comments to all public APIs |
+| **This README** | Check off completed items, update progress table |
+
+### Checklist Template (Copy for Each Plan)
+
+```markdown
+## Plan XX Implementation Checklist
+
+### Code
+- [ ] Core implementation complete
+- [ ] All compiler warnings resolved
+- [ ] `cargo clippy` passes
+
+### Tests  
+- [ ] Unit tests added (`tests/` or inline `#[cfg(test)]`)
+- [ ] Integration tests added if applicable
+- [ ] All tests pass: `just test`
+
+### Examples
+- [ ] Existing examples updated if API changed
+- [ ] New example added: `examples/XX_feature_name.rs`
+- [ ] Example runs successfully
+
+### Documentation
+- [ ] Rustdoc comments on all public items
+- [ ] CLAUDE.md updated (architecture, key types, roadmap)
+- [ ] Root README.md updated if user-facing
+- [ ] docs/getting-started.md updated if applicable
+
+### Plans
+- [ ] Plan checkboxes marked complete
+- [ ] Progress Overview table updated (⬜→✅)
+```
+
+---
+
 ## Testing Strategy
 
 Each plan should include:
@@ -297,16 +352,24 @@ Each plan should include:
 3. **Example updates** demonstrating new features
 4. **Benchmark tests** for performance-sensitive changes (Plans 04, 05)
 
+Run tests with:
+```bash
+just test              # All tests
+just test-one NAME     # Specific test
+cargo test --doc       # Doctests only
+```
+
 ---
 
 ## Documentation Updates
 
 After completing plans, update:
 
-- [ ] `CLAUDE.md` - Architecture section
-- [ ] `docs/getting-started.md` - New features
-- [ ] `README.md` - Feature list
-- [ ] Rustdoc comments - API documentation
+- [ ] `CLAUDE.md` - Architecture section, key types, roadmap status
+- [ ] `docs/getting-started.md` - New features, updated examples
+- [ ] `README.md` (root) - Feature list, badges
+- [ ] Rustdoc comments - `///` on all public APIs
+- [ ] `plans/README.md` - Progress checkboxes
 
 ---
 
