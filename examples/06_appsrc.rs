@@ -10,7 +10,6 @@
 //! Run: `cargo run --example 06_appsrc`
 
 use parallax::buffer::{Buffer, MemoryHandle};
-use parallax::element::{DynAsyncElement, SinkAdapter, SourceAdapter};
 use parallax::elements::{AppSink, AppSrc};
 use parallax::error::Result;
 use parallax::memory::{CpuArena, HeapSegment, MemorySegment};
@@ -44,14 +43,8 @@ async fn main() -> Result<()> {
     // Build pipeline
     let arena = CpuArena::new(256, 8)?;
     let mut pipeline = Pipeline::new();
-    let src = pipeline.add_node(
-        "appsrc",
-        DynAsyncElement::new_box(SourceAdapter::with_arena(appsrc, arena)),
-    );
-    let sink = pipeline.add_node(
-        "appsink",
-        DynAsyncElement::new_box(SinkAdapter::new(appsink)),
-    );
+    let src = pipeline.add_source_with_arena("appsrc", appsrc, arena);
+    let sink = pipeline.add_sink("appsink", appsink);
     pipeline.link(src, sink)?;
 
     // Spawn producer thread

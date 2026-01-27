@@ -8,15 +8,11 @@
 //!
 //! Run: `cargo run --example 13_image --features image-codecs`
 
-use parallax::buffer::{Buffer, MemoryHandle};
-use parallax::element::{ConsumeContext, DynAsyncElement, Sink, SinkAdapter};
+use parallax::element::{ConsumeContext, Sink};
 use parallax::elements::VideoTestSrc;
 use parallax::elements::codec::{PngDecoder, PngEncoder};
 use parallax::error::Result;
-use parallax::memory::{HeapSegment, MemorySegment};
-use parallax::metadata::Metadata;
 use parallax::pipeline::Pipeline;
-use std::sync::Arc;
 
 struct ImageSink {
     count: u32,
@@ -42,23 +38,20 @@ async fn main() -> Result<()> {
 
     let mut pipeline = Pipeline::new();
 
-    // Video test source: 64x64 RGB frames
-    let src = pipeline.add_node(
+    // Video test source: 64x64 RGB frames (3 frames)
+    let src = pipeline.add_source(
         "videotestsrc",
-        DynAsyncElement::new_box(VideoTestSrc::new(64, 64, 3)), // 3 frames
+        VideoTestSrc::new().with_size(64, 64).with_num_frames(3),
     );
 
     // PNG encoder
-    let encoder = pipeline.add_node("png_enc", DynAsyncElement::new_box(PngEncoder::new(64, 64)));
+    let encoder = pipeline.add_filter("png_enc", PngEncoder::new(64, 64));
 
     // PNG decoder
-    let decoder = pipeline.add_node("png_dec", DynAsyncElement::new_box(PngDecoder::new()));
+    let decoder = pipeline.add_filter("png_dec", PngDecoder::new());
 
     // Sink
-    let sink = pipeline.add_node(
-        "sink",
-        DynAsyncElement::new_box(SinkAdapter::new(ImageSink { count: 0 })),
-    );
+    let sink = pipeline.add_sink("sink", ImageSink { count: 0 });
 
     pipeline.link(src, encoder)?;
     pipeline.link(encoder, decoder)?;

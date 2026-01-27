@@ -1,6 +1,5 @@
 //! Integration tests for the Parallax pipeline system.
 
-use parallax::element::{DynAsyncElement, ElementAdapter, SinkAdapter, SourceAdapter};
 use parallax::elements::{NullSink, NullSource, PassThrough, Tee};
 use parallax::pipeline::{Executor, Pipeline};
 use std::sync::Arc;
@@ -11,14 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 async fn test_null_source_to_null_sink() {
     let mut pipeline = Pipeline::new();
 
-    let src = pipeline.add_node(
-        "src",
-        DynAsyncElement::new_box(SourceAdapter::new(NullSource::new(100))),
-    );
-    let sink = pipeline.add_node(
-        "sink",
-        DynAsyncElement::new_box(SinkAdapter::new(NullSink::new())),
-    );
+    let src = pipeline.add_source("src", NullSource::new(100));
+    let sink = pipeline.add_sink("sink", NullSink::new());
 
     pipeline.link(src, sink).unwrap();
 
@@ -31,18 +24,9 @@ async fn test_null_source_to_null_sink() {
 async fn test_source_passthrough_sink() {
     let mut pipeline = Pipeline::new();
 
-    let src = pipeline.add_node(
-        "src",
-        DynAsyncElement::new_box(SourceAdapter::new(NullSource::new(50))),
-    );
-    let passthrough = pipeline.add_node(
-        "passthrough",
-        DynAsyncElement::new_box(ElementAdapter::new(PassThrough::new())),
-    );
-    let sink = pipeline.add_node(
-        "sink",
-        DynAsyncElement::new_box(SinkAdapter::new(NullSink::new())),
-    );
+    let src = pipeline.add_source("src", NullSource::new(50));
+    let passthrough = pipeline.add_filter("passthrough", PassThrough::new());
+    let sink = pipeline.add_sink("sink", NullSink::new());
 
     pipeline.link(src, passthrough).unwrap();
     pipeline.link(passthrough, sink).unwrap();
@@ -56,18 +40,9 @@ async fn test_source_passthrough_sink() {
 async fn test_source_tee_sink() {
     let mut pipeline = Pipeline::new();
 
-    let src = pipeline.add_node(
-        "src",
-        DynAsyncElement::new_box(SourceAdapter::new(NullSource::new(25))),
-    );
-    let tee = pipeline.add_node(
-        "tee",
-        DynAsyncElement::new_box(ElementAdapter::new(Tee::new())),
-    );
-    let sink = pipeline.add_node(
-        "sink",
-        DynAsyncElement::new_box(SinkAdapter::new(NullSink::new())),
-    );
+    let src = pipeline.add_source("src", NullSource::new(25));
+    let tee = pipeline.add_filter("tee", Tee::new());
+    let sink = pipeline.add_sink("sink", NullSink::new());
 
     pipeline.link(src, tee).unwrap();
     pipeline.link(tee, sink).unwrap();
@@ -81,30 +56,12 @@ async fn test_source_tee_sink() {
 async fn test_long_pipeline() {
     let mut pipeline = Pipeline::new();
 
-    let src = pipeline.add_node(
-        "src",
-        DynAsyncElement::new_box(SourceAdapter::new(NullSource::new(10))),
-    );
-    let p1 = pipeline.add_node(
-        "p1",
-        DynAsyncElement::new_box(ElementAdapter::new(PassThrough::new())),
-    );
-    let p2 = pipeline.add_node(
-        "p2",
-        DynAsyncElement::new_box(ElementAdapter::new(PassThrough::new())),
-    );
-    let p3 = pipeline.add_node(
-        "p3",
-        DynAsyncElement::new_box(ElementAdapter::new(PassThrough::new())),
-    );
-    let tee = pipeline.add_node(
-        "tee",
-        DynAsyncElement::new_box(ElementAdapter::new(Tee::new())),
-    );
-    let sink = pipeline.add_node(
-        "sink",
-        DynAsyncElement::new_box(SinkAdapter::new(NullSink::new())),
-    );
+    let src = pipeline.add_source("src", NullSource::new(10));
+    let p1 = pipeline.add_filter("p1", PassThrough::new());
+    let p2 = pipeline.add_filter("p2", PassThrough::new());
+    let p3 = pipeline.add_filter("p3", PassThrough::new());
+    let tee = pipeline.add_filter("tee", Tee::new());
+    let sink = pipeline.add_sink("sink", NullSink::new());
 
     pipeline.link(src, p1).unwrap();
     pipeline.link(p1, p2).unwrap();
@@ -136,15 +93,12 @@ async fn test_buffer_counting() {
     let count = Arc::new(AtomicU64::new(0));
     let mut pipeline = Pipeline::new();
 
-    let src = pipeline.add_node(
-        "src",
-        DynAsyncElement::new_box(SourceAdapter::new(NullSource::new(42))),
-    );
-    let sink = pipeline.add_node(
+    let src = pipeline.add_source("src", NullSource::new(42));
+    let sink = pipeline.add_sink(
         "sink",
-        DynAsyncElement::new_box(SinkAdapter::new(CountingSink {
+        CountingSink {
             count: count.clone(),
-        })),
+        },
     );
 
     pipeline.link(src, sink).unwrap();
@@ -194,19 +148,13 @@ async fn test_filter_element() {
     let mut pipeline = Pipeline::new();
 
     // Source produces 100 buffers, filter passes every 10th (10 buffers)
-    let src = pipeline.add_node(
-        "src",
-        DynAsyncElement::new_box(SourceAdapter::new(NullSource::new(100))),
-    );
-    let filter = pipeline.add_node(
-        "filter",
-        DynAsyncElement::new_box(ElementAdapter::new(EveryNth { n: 10, current: 0 })),
-    );
-    let sink = pipeline.add_node(
+    let src = pipeline.add_source("src", NullSource::new(100));
+    let filter = pipeline.add_filter("filter", EveryNth { n: 10, current: 0 });
+    let sink = pipeline.add_sink(
         "sink",
-        DynAsyncElement::new_box(SinkAdapter::new(CountingSink {
+        CountingSink {
             count: count.clone(),
-        })),
+        },
     );
 
     pipeline.link(src, filter).unwrap();
@@ -230,19 +178,13 @@ async fn test_pipeline_validation_errors() {
 
     // Pipeline with only source (no sink) should fail
     let mut pipeline = Pipeline::new();
-    pipeline.add_node(
-        "src",
-        DynAsyncElement::new_box(SourceAdapter::new(NullSource::new(10))),
-    );
+    pipeline.add_source("src", NullSource::new(10));
     let result = pipeline.validate();
     assert!(matches!(result, Err(Error::InvalidSegment(_))));
 
     // Pipeline with only sink (no source) should fail
     let mut pipeline = Pipeline::new();
-    pipeline.add_node(
-        "sink",
-        DynAsyncElement::new_box(SinkAdapter::new(NullSink::new())),
-    );
+    pipeline.add_sink("sink", NullSink::new());
     let result = pipeline.validate();
     assert!(matches!(result, Err(Error::InvalidSegment(_))));
 }
@@ -252,18 +194,9 @@ async fn test_pipeline_validation_errors() {
 async fn test_cycle_detection() {
     let mut pipeline = Pipeline::new();
 
-    let a = pipeline.add_node(
-        "a",
-        DynAsyncElement::new_box(ElementAdapter::new(PassThrough::new())),
-    );
-    let b = pipeline.add_node(
-        "b",
-        DynAsyncElement::new_box(ElementAdapter::new(PassThrough::new())),
-    );
-    let c = pipeline.add_node(
-        "c",
-        DynAsyncElement::new_box(ElementAdapter::new(PassThrough::new())),
-    );
+    let a = pipeline.add_filter("a", PassThrough::new());
+    let b = pipeline.add_filter("b", PassThrough::new());
+    let c = pipeline.add_filter("c", PassThrough::new());
 
     // Create a chain: a -> b -> c
     pipeline.link(a, b).unwrap();
@@ -313,15 +246,12 @@ async fn test_pipeline_abort() {
         }
     }
 
-    let src = pipeline.add_node(
-        "src",
-        DynAsyncElement::new_box(SourceAdapter::new(InfiniteSource { seq: 0 })),
-    );
-    let sink = pipeline.add_node(
+    let src = pipeline.add_source("src", InfiniteSource { seq: 0 });
+    let sink = pipeline.add_sink(
         "sink",
-        DynAsyncElement::new_box(SinkAdapter::new(CountingSink {
+        CountingSink {
             count: count.clone(),
-        })),
+        },
     );
 
     pipeline.link(src, sink).unwrap();
@@ -349,14 +279,8 @@ async fn test_executor_config() {
     assert_eq!(config.channel_capacity, 64);
 
     let mut pipeline = Pipeline::new();
-    let src = pipeline.add_node(
-        "src",
-        DynAsyncElement::new_box(SourceAdapter::new(NullSource::new(10))),
-    );
-    let sink = pipeline.add_node(
-        "sink",
-        DynAsyncElement::new_box(SinkAdapter::new(NullSink::new())),
-    );
+    let src = pipeline.add_source("src", NullSource::new(10));
+    let sink = pipeline.add_sink("sink", NullSink::new());
     pipeline.link(src, sink).unwrap();
 
     let executor = Executor::with_config(config);
@@ -712,20 +636,12 @@ fn test_pipeline_to_json() {
 /// Test pipeline event system.
 #[tokio::test]
 async fn test_pipeline_events() {
-    use parallax::element::{SinkAdapter, SourceAdapter};
-    use parallax::elements::{NullSink, NullSource};
-    use parallax::pipeline::{Executor, Pipeline, PipelineEvent};
+    use parallax::pipeline::PipelineEvent;
 
     let mut pipeline = Pipeline::new();
 
-    let src = pipeline.add_node(
-        "src",
-        DynAsyncElement::new_box(SourceAdapter::new(NullSource::new(10))),
-    );
-    let sink = pipeline.add_node(
-        "sink",
-        DynAsyncElement::new_box(SinkAdapter::new(NullSink::new())),
-    );
+    let src = pipeline.add_source("src", NullSource::new(10));
+    let sink = pipeline.add_sink("sink", NullSink::new());
     pipeline.link(src, sink).unwrap();
 
     let executor = Executor::new();
@@ -762,20 +678,10 @@ async fn test_pipeline_events() {
 /// Test wait_eos on event receiver.
 #[tokio::test]
 async fn test_event_wait_eos() {
-    use parallax::element::{SinkAdapter, SourceAdapter};
-    use parallax::elements::{NullSink, NullSource};
-    use parallax::pipeline::{Executor, Pipeline};
-
     let mut pipeline = Pipeline::new();
 
-    let src = pipeline.add_node(
-        "src",
-        DynAsyncElement::new_box(SourceAdapter::new(NullSource::new(5))),
-    );
-    let sink = pipeline.add_node(
-        "sink",
-        DynAsyncElement::new_box(SinkAdapter::new(NullSink::new())),
-    );
+    let src = pipeline.add_source("src", NullSource::new(5));
+    let sink = pipeline.add_sink("sink", NullSink::new());
     pipeline.link(src, sink).unwrap();
 
     let executor = Executor::new();
@@ -797,23 +703,15 @@ async fn test_event_wait_eos() {
 /// Test pipeline state transitions.
 #[tokio::test]
 async fn test_pipeline_state_transitions() {
-    use parallax::element::{SinkAdapter, SourceAdapter};
-    use parallax::elements::{NullSink, NullSource};
-    use parallax::pipeline::{Executor, Pipeline, PipelineState};
+    use parallax::pipeline::PipelineState;
 
     let mut pipeline = Pipeline::new();
 
     // Initially suspended
     assert_eq!(pipeline.state(), PipelineState::Suspended);
 
-    let src = pipeline.add_node(
-        "src",
-        DynAsyncElement::new_box(SourceAdapter::new(NullSource::new(10))),
-    );
-    let sink = pipeline.add_node(
-        "sink",
-        DynAsyncElement::new_box(SinkAdapter::new(NullSink::new())),
-    );
+    let src = pipeline.add_source("src", NullSource::new(10));
+    let sink = pipeline.add_sink("sink", NullSink::new());
     pipeline.link(src, sink).unwrap();
 
     let executor = Executor::new();
@@ -829,12 +727,10 @@ async fn test_pipeline_state_transitions() {
 #[tokio::test]
 async fn test_pipeline_abort_event() {
     use parallax::buffer::{Buffer, MemoryHandle};
-    use parallax::element::{
-        ConsumeContext, ProduceContext, ProduceResult, SinkAdapter, Source, SourceAdapter,
-    };
+    use parallax::element::{ConsumeContext, ProduceContext, ProduceResult, Source};
     use parallax::memory::HeapSegment;
     use parallax::metadata::Metadata;
-    use parallax::pipeline::{Executor, Pipeline, PipelineEvent};
+    use parallax::pipeline::PipelineEvent;
 
     /// A source that produces buffers forever.
     struct InfiniteSource;
@@ -858,14 +754,8 @@ async fn test_pipeline_abort_event() {
     }
 
     let mut pipeline = Pipeline::new();
-    let src = pipeline.add_node(
-        "src",
-        DynAsyncElement::new_box(SourceAdapter::new(InfiniteSource)),
-    );
-    let sink = pipeline.add_node(
-        "sink",
-        DynAsyncElement::new_box(SinkAdapter::new(DiscardSink)),
-    );
+    let src = pipeline.add_source("src", InfiniteSource);
+    let sink = pipeline.add_sink("sink", DiscardSink);
     pipeline.link(src, sink).unwrap();
 
     let executor = Executor::new();

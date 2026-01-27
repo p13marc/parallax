@@ -8,7 +8,6 @@
 //!
 //! Run: `cargo run --example 14_h264 --features h264`
 
-use parallax::element::DynAsyncElement;
 use parallax::elements::codec::OpenH264Encoder;
 use parallax::elements::{FileSink, VideoTestSrc};
 use parallax::error::Result;
@@ -25,22 +24,16 @@ async fn main() -> Result<()> {
     let mut pipeline = Pipeline::new();
 
     // Video test source: 320x240, 30 frames
-    let src = pipeline.add_node(
+    let src = pipeline.add_source(
         "videotestsrc",
-        DynAsyncElement::new_box(VideoTestSrc::new(320, 240, 30)),
+        VideoTestSrc::new().with_size(320, 240).with_num_frames(30),
     );
 
     // H.264 encoder
-    let encoder = pipeline.add_node(
-        "h264enc",
-        DynAsyncElement::new_box(OpenH264Encoder::new(320, 240)?),
-    );
+    let encoder = pipeline.add_filter("h264enc", OpenH264Encoder::new(320, 240)?);
 
     // File sink
-    let sink = pipeline.add_node(
-        "filesink",
-        DynAsyncElement::new_box(FileSink::new(&output_path)),
-    );
+    let sink = pipeline.add_sink("filesink", FileSink::new(&output_path));
 
     pipeline.link(src, encoder)?;
     pipeline.link(encoder, sink)?;

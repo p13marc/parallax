@@ -10,16 +10,13 @@
 //!
 //! Run: `cargo run --example 16_mpegts --features mpeg-ts`
 
-use parallax::buffer::{Buffer, MemoryHandle};
 use parallax::clock::ClockTime;
-use parallax::element::{DynAsyncElement, ProduceContext, ProduceResult, Source, SourceAdapter};
+use parallax::element::{DynAsyncElement, ProduceContext, ProduceResult, Source};
 use parallax::elements::FileSink;
 use parallax::elements::mux::{TsMuxConfig, TsMuxElement, TsMuxStreamType, TsMuxTrack};
 use parallax::error::Result;
-use parallax::memory::{CpuArena, HeapSegment, MemorySegment};
-use parallax::metadata::Metadata;
+use parallax::memory::CpuArena;
 use parallax::pipeline::Pipeline;
-use std::sync::Arc;
 
 /// Simulates H.264 NAL units (simplified)
 struct VideoSource {
@@ -89,38 +86,31 @@ async fn main() -> Result<()> {
 
     // Video source
     let video_arena = CpuArena::new(256, 8)?;
-    let video_src = pipeline.add_node(
+    let video_src = pipeline.add_source_with_arena(
         "video_src",
-        DynAsyncElement::new_box(SourceAdapter::with_arena(
-            VideoSource {
-                frame: 0,
-                max_frames: 10,
-            },
-            video_arena,
-        )),
+        VideoSource {
+            frame: 0,
+            max_frames: 10,
+        },
+        video_arena,
     );
 
     // Data source
     let data_arena = CpuArena::new(256, 8)?;
-    let data_src = pipeline.add_node(
+    let data_src = pipeline.add_source_with_arena(
         "data_src",
-        DynAsyncElement::new_box(SourceAdapter::with_arena(
-            DataSource {
-                packet: 0,
-                max_packets: 10,
-            },
-            data_arena,
-        )),
+        DataSource {
+            packet: 0,
+            max_packets: 10,
+        },
+        data_arena,
     );
 
-    // Muxer
-    let muxer = pipeline.add_node("tsmux", DynAsyncElement::new_box(mux));
+    // Muxer (special element type - needs DynAsyncElement wrapping)
+    let muxer = pipeline.add_element("tsmux", mux);
 
     // File sink
-    let sink = pipeline.add_node(
-        "filesink",
-        DynAsyncElement::new_box(FileSink::new(output_path)),
-    );
+    let sink = pipeline.add_sink("filesink", FileSink::new(output_path));
 
     // Link: video and data → mux → file
     pipeline.link(video_src, muxer)?;

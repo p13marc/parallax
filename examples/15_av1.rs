@@ -8,7 +8,6 @@
 //!
 //! Run: `cargo run --example 15_av1 --features av1-encode`
 
-use parallax::element::DynAsyncElement;
 use parallax::elements::codec::{Rav1eEncoder, Rav1eEncoderConfig};
 use parallax::elements::{FileSink, VideoTestSrc};
 use parallax::error::Result;
@@ -25,9 +24,9 @@ async fn main() -> Result<()> {
     let mut pipeline = Pipeline::new();
 
     // Video test source: 320x240, 10 frames (AV1 encoding is slow)
-    let src = pipeline.add_node(
+    let src = pipeline.add_source(
         "videotestsrc",
-        DynAsyncElement::new_box(VideoTestSrc::new(320, 240, 10)),
+        VideoTestSrc::new().with_size(320, 240).with_num_frames(10),
     );
 
     // AV1 encoder with speed preset for faster encoding
@@ -38,16 +37,10 @@ async fn main() -> Result<()> {
         quantizer: 100, // Lower quality for speed
         ..Default::default()
     };
-    let encoder = pipeline.add_node(
-        "av1enc",
-        DynAsyncElement::new_box(Rav1eEncoder::with_config(config)?),
-    );
+    let encoder = pipeline.add_filter("av1enc", Rav1eEncoder::with_config(config)?);
 
     // File sink
-    let sink = pipeline.add_node(
-        "filesink",
-        DynAsyncElement::new_box(FileSink::new(&output_path)),
-    );
+    let sink = pipeline.add_sink("filesink", FileSink::new(&output_path));
 
     pipeline.link(src, encoder)?;
     pipeline.link(encoder, sink)?;

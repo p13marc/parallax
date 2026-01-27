@@ -1,7 +1,9 @@
 //! Pipeline graph structure using daggy.
 
 use crate::element::{
-    AsyncElementDyn, DynAsyncElement, ElementType, Pad, PipelineElementAdapter, SendPipelineElement,
+    AsyncElementDyn, DynAsyncElement, Element, ElementAdapter, ElementType, Pad,
+    PipelineElementAdapter, SendPipelineElement, Sink, SinkAdapter, Source, SourceAdapter,
+    Transform, TransformAdapter,
 };
 use crate::error::{Error, Result};
 use crate::format::{Caps, MediaFormat};
@@ -579,10 +581,16 @@ impl Pipeline {
         self.state == PipelineState::Error
     }
 
-    /// Add a node to the pipeline.
+    /// Add a node to the pipeline (internal use).
     ///
     /// Returns the node's ID for linking.
-    pub fn add_node(
+    ///
+    /// For public API, prefer using:
+    /// - [`add_source`](Self::add_source) for source elements
+    /// - [`add_sink`](Self::add_sink) for sink elements
+    /// - [`add_transform`](Self::add_transform) for transform elements
+    /// - [`add_element`](Self::add_element) for generic elements
+    pub(crate) fn add_node(
         &mut self,
         name: impl Into<String>,
         element: Box<DynAsyncElement<'static>>,
@@ -595,8 +603,8 @@ impl Pipeline {
         id
     }
 
-    /// Add a node with an auto-generated name.
-    pub fn add_node_auto(&mut self, element: Box<DynAsyncElement<'static>>) -> NodeId {
+    /// Add a node with an auto-generated name (internal use).
+    pub(crate) fn add_node_auto(&mut self, element: Box<DynAsyncElement<'static>>) -> NodeId {
         let name = format!("node_{}", self.name_counter);
         self.name_counter += 1;
         self.add_node(name, element)
@@ -638,6 +646,211 @@ impl Pipeline {
         let name = format!("node_{}", self.name_counter);
         self.name_counter += 1;
         self.add_element(name, element)
+    }
+
+    /// Add a source element to the pipeline.
+    ///
+    /// This automatically wraps the source in a [`SourceAdapter`] for execution.
+    /// The source must provide its own buffers (return `ProduceResult::OwnBuffer`).
+    ///
+    /// For sources that need an arena for buffer allocation, use
+    /// [`add_source_with_arena`](Self::add_source_with_arena).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use parallax::pipeline::Pipeline;
+    /// use parallax::element::{Source, ProduceContext, ProduceResult};
+    ///
+    /// struct MySource { count: u32 }
+    /// impl Source for MySource {
+    ///     fn produce(&mut self, _ctx: &mut ProduceContext) -> parallax::Result<ProduceResult> {
+    ///         if self.count >= 10 {
+    ///             return Ok(ProduceResult::Eos);
+    ///         }
+    ///         self.count += 1;
+    ///         Ok(ProduceResult::WouldBlock)
+    ///     }
+    /// }
+    ///
+    /// let mut pipeline = Pipeline::new();
+    /// let src = pipeline.add_source("my_src", MySource { count: 0 });
+    /// ```
+    pub fn add_source<S: Source + 'static>(
+        &mut self,
+        name: impl Into<String>,
+        source: S,
+    ) -> NodeId {
+        self.add_node(name, DynAsyncElement::new_box(SourceAdapter::new(source)))
+    }
+
+    /// Add a source element with an arena for buffer allocation.
+    ///
+    /// The arena provides pre-allocated buffer slots that the source can write into.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use parallax::pipeline::Pipeline;
+    /// use parallax::element::{Source, ProduceContext, ProduceResult};
+    /// use parallax::memory::CpuArena;
+    ///
+    /// struct MySource { sent: bool }
+    /// impl Source for MySource {
+    ///     fn produce(&mut self, ctx: &mut ProduceContext) -> parallax::Result<ProduceResult> {
+    ///         if self.sent { return Ok(ProduceResult::Eos); }
+    ///         self.sent = true;
+    ///         ctx.output()[..5].copy_from_slice(b"hello");
+    ///         Ok(ProduceResult::Produced(5))
+    ///     }
+    /// }
+    ///
+    /// let arena = CpuArena::new(1024, 4)?;
+    /// let mut pipeline = Pipeline::new();
+    /// let src = pipeline.add_source_with_arena("my_src", MySource { sent: false }, arena);
+    /// ```
+    pub fn add_source_with_arena<S: Source + 'static>(
+        &mut self,
+        name: impl Into<String>,
+        source: S,
+        arena: std::sync::Arc<crate::memory::CpuArena>,
+    ) -> NodeId {
+        self.add_node(
+            name,
+            DynAsyncElement::new_box(SourceAdapter::with_arena(source, arena)),
+        )
+    }
+
+    /// Add a source element with a buffer pool for zero-allocation streaming.
+    ///
+    /// The pool provides pre-allocated buffers with backpressure when exhausted.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use parallax::pipeline::Pipeline;
+    /// use parallax::element::{Source, ProduceContext, ProduceResult};
+    /// use parallax::memory::FixedBufferPool;
+    ///
+    /// struct MySource { count: u32 }
+    /// impl Source for MySource {
+    ///     fn produce(&mut self, ctx: &mut ProduceContext) -> parallax::Result<ProduceResult> {
+    ///         if self.count >= 10 { return Ok(ProduceResult::Eos); }
+    ///         self.count += 1;
+    ///         let mut pooled = ctx.acquire_buffer()?;
+    ///         pooled.data_mut()[..4].copy_from_slice(&self.count.to_le_bytes());
+    ///         pooled.set_len(4);
+    ///         Ok(ProduceResult::OwnBuffer(pooled.into_buffer()))
+    ///     }
+    /// }
+    ///
+    /// let pool = FixedBufferPool::new(256, 4)?;
+    /// let mut pipeline = Pipeline::new();
+    /// let src = pipeline.add_source_with_pool("my_src", MySource { count: 0 }, pool);
+    /// ```
+    pub fn add_source_with_pool<S: Source + 'static>(
+        &mut self,
+        name: impl Into<String>,
+        source: S,
+        pool: std::sync::Arc<dyn BufferPool>,
+    ) -> NodeId {
+        self.add_node(
+            name,
+            DynAsyncElement::new_box(SourceAdapter::with_pool(source, pool)),
+        )
+    }
+
+    /// Add a sink element to the pipeline.
+    ///
+    /// This automatically wraps the sink in a [`SinkAdapter`] for execution.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use parallax::pipeline::Pipeline;
+    /// use parallax::element::{Sink, ConsumeContext};
+    ///
+    /// struct MySink;
+    /// impl Sink for MySink {
+    ///     fn consume(&mut self, ctx: &ConsumeContext) -> parallax::Result<()> {
+    ///         println!("Received {} bytes", ctx.buffer().len());
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// let mut pipeline = Pipeline::new();
+    /// let sink = pipeline.add_sink("my_sink", MySink);
+    /// ```
+    pub fn add_sink<S: Sink + 'static>(&mut self, name: impl Into<String>, sink: S) -> NodeId {
+        self.add_node(name, DynAsyncElement::new_box(SinkAdapter::new(sink)))
+    }
+
+    /// Add a transform element to the pipeline.
+    ///
+    /// This automatically wraps the transform in a [`TransformAdapter`] for execution.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use parallax::pipeline::Pipeline;
+    /// use parallax::element::{Transform, Output};
+    /// use parallax::buffer::Buffer;
+    ///
+    /// struct UpperCase;
+    /// impl Transform for UpperCase {
+    ///     fn transform(&mut self, mut buffer: Buffer) -> parallax::Result<Output> {
+    ///         buffer.data_mut().make_ascii_uppercase();
+    ///         Ok(Output::Single(buffer))
+    ///     }
+    /// }
+    ///
+    /// let mut pipeline = Pipeline::new();
+    /// let xfm = pipeline.add_transform("uppercase", UpperCase);
+    /// ```
+    pub fn add_transform<T: Transform + 'static>(
+        &mut self,
+        name: impl Into<String>,
+        transform: T,
+    ) -> NodeId {
+        self.add_node(
+            name,
+            DynAsyncElement::new_box(TransformAdapter::new(transform)),
+        )
+    }
+
+    /// Add an element (filter) to the pipeline.
+    ///
+    /// This automatically wraps the element in an [`ElementAdapter`] for execution.
+    /// Use this for elements that implement the [`Element`] trait (process one buffer,
+    /// optionally produce one buffer).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use parallax::pipeline::Pipeline;
+    /// use parallax::element::Element;
+    /// use parallax::buffer::Buffer;
+    ///
+    /// struct DropEmpty;
+    /// impl Element for DropEmpty {
+    ///     fn process(&mut self, buffer: Buffer) -> parallax::Result<Option<Buffer>> {
+    ///         if buffer.is_empty() {
+    ///             Ok(None)  // Drop empty buffers
+    ///         } else {
+    ///             Ok(Some(buffer))
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// let mut pipeline = Pipeline::new();
+    /// let filter = pipeline.add_filter("drop_empty", DropEmpty);
+    /// ```
+    pub fn add_filter<E: Element + 'static>(
+        &mut self,
+        name: impl Into<String>,
+        element: E,
+    ) -> NodeId {
+        self.add_node(name, DynAsyncElement::new_box(ElementAdapter::new(element)))
     }
 
     /// Get a node by ID.

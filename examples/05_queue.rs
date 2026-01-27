@@ -9,10 +9,7 @@
 //!
 //! Run: `cargo run --example 05_queue`
 
-use parallax::element::{
-    ConsumeContext, DynAsyncElement, ElementAdapter, ProduceContext, ProduceResult, Sink,
-    SinkAdapter, Source, SourceAdapter,
-};
+use parallax::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
 use parallax::elements::Queue;
 use parallax::error::Result;
 use parallax::memory::CpuArena;
@@ -55,19 +52,10 @@ async fn main() -> Result<()> {
 
     let mut pipeline = Pipeline::new();
 
-    let src = pipeline.add_node(
-        "src",
-        DynAsyncElement::new_box(SourceAdapter::with_arena(
-            FastSource { count: 0, max: 5 },
-            arena,
-        )),
-    );
+    let src = pipeline.add_source_with_arena("src", FastSource { count: 0, max: 5 }, arena);
     // Queue with capacity of 2 buffers
-    let queue = pipeline.add_node(
-        "queue",
-        DynAsyncElement::new_box(ElementAdapter::new(Queue::new(2))),
-    );
-    let sink = pipeline.add_node("sink", DynAsyncElement::new_box(SinkAdapter::new(SlowSink)));
+    let queue = pipeline.add_filter("queue", Queue::new(2));
+    let sink = pipeline.add_sink("sink", SlowSink);
 
     pipeline.link(src, queue)?;
     pipeline.link(queue, sink)?;

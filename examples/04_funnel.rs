@@ -15,10 +15,7 @@
 //! Run: `cargo run --example 04_funnel`
 
 use parallax::buffer::{Buffer, MemoryHandle};
-use parallax::element::{
-    ConsumeContext, DynAsyncElement, ProduceContext, ProduceResult, Sink, SinkAdapter, Source,
-    SourceAdapter,
-};
+use parallax::element::{ConsumeContext, Sink};
 use parallax::elements::Funnel;
 use parallax::error::Result;
 use parallax::memory::{CpuArena, HeapSegment, MemorySegment};
@@ -79,14 +76,8 @@ async fn main() -> Result<()> {
     let arena = CpuArena::new(256, 8)?;
     let mut pipeline = Pipeline::new();
 
-    let src = pipeline.add_node(
-        "funnel",
-        DynAsyncElement::new_box(SourceAdapter::with_arena(funnel, arena)),
-    );
-    let sink = pipeline.add_node(
-        "sink",
-        DynAsyncElement::new_box(SinkAdapter::new(PrintSink)),
-    );
+    let src = pipeline.add_source_with_arena("funnel", funnel, arena);
+    let sink = pipeline.add_sink("sink", PrintSink);
     pipeline.link(src, sink)?;
 
     // Run pipeline

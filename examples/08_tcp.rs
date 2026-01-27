@@ -10,10 +10,7 @@
 //!
 //! Run: `cargo run --example 08_tcp`
 
-use parallax::element::{
-    ConsumeContext, DynAsyncElement, ProduceContext, ProduceResult, Sink, SinkAdapter, Source,
-    SourceAdapter,
-};
+use parallax::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
 use parallax::elements::{TcpSink, TcpSrc};
 use parallax::error::Result;
 use parallax::memory::CpuArena;
@@ -56,14 +53,8 @@ async fn main() -> Result<()> {
     let receiver = tokio::spawn(async move {
         let arena = CpuArena::new(4096, 8)?;
         let mut pipeline = Pipeline::new();
-        let src = pipeline.add_node(
-            "tcpsrc",
-            DynAsyncElement::new_box(SourceAdapter::with_arena(TcpSrc::listen(addr)?, arena)),
-        );
-        let sink = pipeline.add_node(
-            "sink",
-            DynAsyncElement::new_box(SinkAdapter::new(PrintSink)),
-        );
+        let src = pipeline.add_source_with_arena("tcpsrc", TcpSrc::listen(addr)?, arena);
+        let sink = pipeline.add_sink("sink", PrintSink);
         pipeline.link(src, sink)?;
         pipeline.run().await
     });
@@ -74,17 +65,8 @@ async fn main() -> Result<()> {
     // Sender pipeline (client - connects to server)
     let arena = CpuArena::new(256, 8)?;
     let mut pipeline = Pipeline::new();
-    let src = pipeline.add_node(
-        "src",
-        DynAsyncElement::new_box(SourceAdapter::with_arena(
-            MessageSource { count: 0, max: 3 },
-            arena,
-        )),
-    );
-    let sink = pipeline.add_node(
-        "tcpsink",
-        DynAsyncElement::new_box(SinkAdapter::new(TcpSink::connect(addr)?)),
-    );
+    let src = pipeline.add_source_with_arena("src", MessageSource { count: 0, max: 3 }, arena);
+    let sink = pipeline.add_sink("tcpsink", TcpSink::connect(addr)?);
     pipeline.link(src, sink)?;
 
     println!("[Sender] Starting...");

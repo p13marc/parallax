@@ -11,10 +11,7 @@
 //!
 //! Run: `cargo run --example 03_tee`
 
-use parallax::element::{
-    ConsumeContext, DynAsyncElement, ElementAdapter, ProduceContext, ProduceResult, Sink,
-    SinkAdapter, Source, SourceAdapter,
-};
+use parallax::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
 use parallax::elements::Tee;
 use parallax::error::Result;
 use parallax::memory::CpuArena;
@@ -55,25 +52,10 @@ async fn main() -> Result<()> {
 
     let mut pipeline = Pipeline::new();
 
-    let src = pipeline.add_node(
-        "src",
-        DynAsyncElement::new_box(SourceAdapter::with_arena(
-            CounterSource { count: 0, max: 3 },
-            arena,
-        )),
-    );
-    let tee = pipeline.add_node(
-        "tee",
-        DynAsyncElement::new_box(ElementAdapter::new(Tee::new())),
-    );
-    let sink_a = pipeline.add_node(
-        "sink_a",
-        DynAsyncElement::new_box(SinkAdapter::new(NamedSink { name: "A" })),
-    );
-    let sink_b = pipeline.add_node(
-        "sink_b",
-        DynAsyncElement::new_box(SinkAdapter::new(NamedSink { name: "B" })),
-    );
+    let src = pipeline.add_source_with_arena("src", CounterSource { count: 0, max: 3 }, arena);
+    let tee = pipeline.add_filter("tee", Tee::new());
+    let sink_a = pipeline.add_sink("sink_a", NamedSink { name: "A" });
+    let sink_b = pipeline.add_sink("sink_b", NamedSink { name: "B" });
 
     pipeline.link(src, tee)?;
     pipeline.link(tee, sink_a)?;

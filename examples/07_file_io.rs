@@ -8,7 +8,6 @@
 //!
 //! Run: `cargo run --example 07_file_io`
 
-use parallax::element::{DynAsyncElement, SinkAdapter, SourceAdapter};
 use parallax::elements::{FileSink, FileSrc};
 use parallax::error::Result;
 use parallax::memory::CpuArena;
@@ -35,14 +34,8 @@ async fn main() -> Result<()> {
     let arena = CpuArena::new(4096, 8)?;
 
     let mut pipeline = Pipeline::new();
-    let src = pipeline.add_node(
-        "filesrc",
-        DynAsyncElement::new_box(SourceAdapter::with_arena(FileSrc::new(&input_path), arena)),
-    );
-    let sink = pipeline.add_node(
-        "filesink",
-        DynAsyncElement::new_box(SinkAdapter::new(FileSink::new(&output_path))),
-    );
+    let src = pipeline.add_source_with_arena("filesrc", FileSrc::new(&input_path), arena);
+    let sink = pipeline.add_sink("filesink", FileSink::new(&output_path));
     pipeline.link(src, sink)?;
 
     // Run

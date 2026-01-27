@@ -9,10 +9,7 @@
 //!
 //! Run: `cargo run --example 11_buffer_pool`
 
-use parallax::element::{
-    ConsumeContext, DynAsyncElement, ProduceContext, ProduceResult, Sink, SinkAdapter, Source,
-    SourceAdapter,
-};
+use parallax::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
 use parallax::error::Result;
 use parallax::memory::{BufferPool, FixedBufferPool};
 use parallax::pipeline::Pipeline;
@@ -66,14 +63,8 @@ async fn main() -> Result<()> {
     let pool_stats = pool.clone();
 
     let mut pipeline = Pipeline::new();
-    let src = pipeline.add_node(
-        "src",
-        DynAsyncElement::new_box(SourceAdapter::with_pool(
-            PooledSource { count: 0, max: 8 },
-            pool,
-        )),
-    );
-    let sink = pipeline.add_node("sink", DynAsyncElement::new_box(SinkAdapter::new(SlowSink)));
+    let src = pipeline.add_source_with_pool("src", PooledSource { count: 0, max: 8 }, pool);
+    let sink = pipeline.add_sink("sink", SlowSink);
     pipeline.link(src, sink)?;
 
     pipeline.run().await?;

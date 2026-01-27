@@ -9,10 +9,7 @@
 //!
 //! Run: `cargo run --example 01_hello`
 
-use parallax::element::{
-    ConsumeContext, DynAsyncElement, ProduceContext, ProduceResult, Sink, SinkAdapter, Source,
-    SourceAdapter,
-};
+use parallax::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
 use parallax::error::Result;
 use parallax::memory::CpuArena;
 use parallax::pipeline::Pipeline;
@@ -49,17 +46,8 @@ async fn main() -> Result<()> {
     let arena = CpuArena::new(1024, 4)?;
 
     let mut pipeline = Pipeline::new();
-    let src = pipeline.add_node(
-        "src",
-        DynAsyncElement::new_box(SourceAdapter::with_arena(
-            HelloSource { sent: false },
-            arena,
-        )),
-    );
-    let sink = pipeline.add_node(
-        "sink",
-        DynAsyncElement::new_box(SinkAdapter::new(PrintSink)),
-    );
+    let src = pipeline.add_source_with_arena("src", HelloSource { sent: false }, arena);
+    let sink = pipeline.add_sink("sink", PrintSink);
     pipeline.link(src, sink)?;
 
     pipeline.run().await

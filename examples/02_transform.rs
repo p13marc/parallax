@@ -11,8 +11,7 @@
 
 use parallax::buffer::Buffer;
 use parallax::element::{
-    ConsumeContext, DynAsyncElement, Output, ProduceContext, ProduceResult, Sink, SinkAdapter,
-    Source, SourceAdapter, Transform, TransformAdapter,
+    ConsumeContext, Output, ProduceContext, ProduceResult, Sink, Source, Transform,
 };
 use parallax::error::Result;
 use parallax::memory::CpuArena;
@@ -72,21 +71,9 @@ async fn main() -> Result<()> {
     let arena = CpuArena::new(64, 8)?;
 
     let mut pipeline = Pipeline::new();
-    let src = pipeline.add_node(
-        "src",
-        DynAsyncElement::new_box(SourceAdapter::with_arena(
-            CounterSource { count: 0, max: 5 },
-            arena,
-        )),
-    );
-    let transform = pipeline.add_node(
-        "double",
-        DynAsyncElement::new_box(TransformAdapter::new(DoubleTransform)),
-    );
-    let sink = pipeline.add_node(
-        "sink",
-        DynAsyncElement::new_box(SinkAdapter::new(PrintSink)),
-    );
+    let src = pipeline.add_source_with_arena("src", CounterSource { count: 0, max: 5 }, arena);
+    let transform = pipeline.add_transform("double", DoubleTransform);
+    let sink = pipeline.add_sink("sink", PrintSink);
 
     pipeline.link(src, transform)?;
     pipeline.link(transform, sink)?;
