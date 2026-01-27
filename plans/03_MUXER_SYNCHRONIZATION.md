@@ -416,9 +416,37 @@ pipeline.run().await?;
 
 ## Synchronization Modes
 
-Different use cases need different sync strategies:
+**Decision:** Default to **Auto** mode (adaptive based on live/non-live). See [Design Decisions](00_DESIGN_DECISIONS.md#decision-2-muxer-synchronization-strategy).
 
-### Strict Sync (Default)
+```rust
+#[derive(Debug, Clone)]
+pub struct MuxerSyncConfig {
+    pub mode: SyncMode,
+    pub latency: Duration,         // Max wait for slow streams (live)
+    pub sparse_timeout: Duration,  // Timeout for sparse streams
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SyncMode {
+    #[default]
+    Auto,    // Adaptive: strict for non-live, latency-bounded for live
+    Strict,  // Wait for all required streams
+    Loose,   // Output when primary stream ready
+    Timed { interval: Duration },  // Fixed interval output
+}
+
+impl Default for MuxerSyncConfig {
+    fn default() -> Self {
+        Self {
+            mode: SyncMode::Auto,
+            latency: Duration::from_millis(200),
+            sparse_timeout: Duration::from_millis(500),
+        }
+    }
+}
+```
+
+### Strict Sync
 
 Wait for data from all required pads before outputting:
 

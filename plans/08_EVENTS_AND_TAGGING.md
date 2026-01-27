@@ -331,6 +331,8 @@ pub struct CustomEvent {
 
 ### Pipeline Item (Buffer or Event)
 
+> **Design Decision:** Per [Decision 3 in 00_DESIGN_DECISIONS.md](./00_DESIGN_DECISIONS.md), events flow through the **same channel** as buffers (unified approach). This simplifies implementation and ensures proper ordering of serialized events with data. Non-serialized events (flush) use control signals that bypass queues.
+
 ```rust
 /// Item that flows through the pipeline
 #[derive(Debug)]
@@ -349,6 +351,18 @@ impl From<Event> for PipelineItem {
     fn from(event: Event) -> Self {
         PipelineItem::Event(event)
     }
+}
+
+/// Control signals that bypass the data channel (for non-serialized events)
+pub enum ControlSignal {
+    /// Flush start - immediately discard buffered data
+    FlushStart,
+    /// Flush stop - resume normal operation
+    FlushStop { reset_time: bool },
+    /// Pause processing
+    Pause,
+    /// Resume processing
+    Resume,
 }
 ```
 

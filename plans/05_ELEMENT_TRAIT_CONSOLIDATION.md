@@ -33,6 +33,8 @@ The current element system has too many overlapping traits:
 
 ## Proposed Solution
 
+> **Design Decision:** Per [Decision 5 in 00_DESIGN_DECISIONS.md](./00_DESIGN_DECISIONS.md), we adopt **unified async `PipelineElement` with blanket implementations** for sync elements. This eliminates the adapter boilerplate entirely.
+
 Consolidate into a unified element model with:
 1. **Single async trait** as the core abstraction
 2. **Blanket implementations** for sync elements

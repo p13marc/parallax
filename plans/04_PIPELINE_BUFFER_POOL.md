@@ -26,6 +26,8 @@ This causes:
 
 ## Proposed Solution
 
+> **Design Decision:** Per [Decision 6 in 00_DESIGN_DECISIONS.md](./00_DESIGN_DECISIONS.md), we adopt **pipeline-level buffer pools** similar to PipeWire's approach. This simplifies the API (elements don't negotiate pools) and enables automatic pool sizing based on caps negotiation.
+
 Implement a pipeline-level buffer pool that elements can draw from, similar to GStreamer's buffer pools and PipeWire's buffer management.
 
 ### Design Goals

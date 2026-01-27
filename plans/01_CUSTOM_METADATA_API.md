@@ -61,7 +61,9 @@ enum MetaKey {
 }
 ```
 
-**Recommendation:** Start with Option A for simplicity, optimize to Option B if profiling shows overhead.
+**Decision:** Use Option A (HashMap). See [Design Decisions](00_DESIGN_DECISIONS.md#decision-7-metadata-storage-format).
+
+Optimization to SmallVec can be done later if profiling shows overhead.
 
 ---
 
@@ -309,12 +311,44 @@ Use hierarchical namespacing to avoid collisions:
 
 ---
 
+## IPC Serialization Support
+
+**Decision:** Custom metadata MUST be serializable for cross-process pipelines. See [Design Decisions](00_DESIGN_DECISIONS.md#decision-1-custom-metadata-serialization-for-ipc).
+
+Add a `MetaSerialize` trait for IPC-compatible metadata:
+
+```rust
+/// Metadata values must implement this for IPC support
+pub trait MetaSerialize: Send + Sync + 'static {
+    fn serialize(&self) -> Vec<u8>;
+    fn deserialize(bytes: &[u8]) -> Result<Self> where Self: Sized;
+    fn type_id() -> &'static str where Self: Sized;
+}
+
+// Blanket impl for rkyv-compatible types
+impl<T> MetaSerialize for T 
+where 
+    T: rkyv::Archive + rkyv::Serialize<...> + Send + Sync + 'static,
+{
+    fn serialize(&self) -> Vec<u8> {
+        rkyv::to_bytes::<_, 256>(self).unwrap().to_vec()
+    }
+    
+    fn deserialize(bytes: &[u8]) -> Result<Self> {
+        Ok(rkyv::from_bytes(bytes)?)
+    }
+}
+```
+
+For IPC transfer, metadata is serialized alongside buffer references.
+
+---
+
 ## Future Enhancements
 
 1. **Typed metadata registry:** Pre-register known metadata types for better performance
 2. **Metadata forwarding rules:** Which metadata should pass through transforms?
-3. **Serialization support:** rkyv/serde for IPC metadata transfer
-4. **Metadata inspection:** Debug/introspection tools for pipeline debugging
+3. **Metadata inspection:** Debug/introspection tools for pipeline debugging
 
 ---
 

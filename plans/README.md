@@ -4,10 +4,28 @@ This directory contains detailed implementation plans for improving Parallax, de
 
 ---
 
+## Design Decisions
+
+Key architectural decisions have been researched and documented in **[00_DESIGN_DECISIONS.md](00_DESIGN_DECISIONS.md)**, based on analysis of GStreamer, PipeWire, and academic literature.
+
+| Decision | Choice |
+|----------|--------|
+| Metadata serialization for IPC | Yes, via rkyv with `MetaSerialize` trait |
+| Default muxer sync strategy | Auto (adaptive based on live/non-live) |
+| Separate events channel | No, unified channel + control signals for flush |
+| Backward compatibility | No, break freely (pre-production) |
+| Sync/async element traits | Unified async with sync blanket impl |
+| Buffer pool negotiation | Pipeline-level, per-link size negotiation |
+| Metadata storage format | HashMap (optimize later if needed) |
+| Timestamp format | i64 nanoseconds (ClockTime) |
+
+---
+
 ## Progress Overview
 
 | # | Plan | Priority | Effort | Progress |
 |---|------|----------|--------|----------|
+| 00 | [Design Decisions](00_DESIGN_DECISIONS.md) | - | - | ✅ Complete |
 | 01 | [Custom Metadata API](01_CUSTOM_METADATA_API.md) | High | Small | ⬜ Not Started |
 | 02 | [Codec Element Wrappers](02_CODEC_ELEMENT_WRAPPERS.md) | High | Medium | ⬜ Not Started |
 | 03 | [Muxer Synchronization](03_MUXER_SYNCHRONIZATION.md) | High | Large | ⬜ Not Started |
@@ -256,14 +274,17 @@ If you only have limited time, prioritize:
 
 ---
 
-## Breaking Changes
+## Breaking Changes Policy
 
-Only **Plan 05** (Element Trait Consolidation) introduces breaking changes:
-- Removes old element traits
-- Removes adapter types
-- Changes Pipeline API
+**We can break backward compatibility freely** - the codebase is pre-production.
 
-All other plans are additive and maintain backward compatibility.
+This means:
+- No deprecation periods required
+- Direct API changes without aliases
+- All examples updated together with changes
+- Changes documented in CHANGELOG.md
+
+Plan 05 (Element Trait Consolidation) is the largest breaking change, which is why it's scheduled last.
 
 ---
 
@@ -286,17 +307,6 @@ After completing plans, update:
 - [ ] `docs/getting-started.md` - New features
 - [ ] `README.md` - Feature list
 - [ ] Rustdoc comments - API documentation
-
----
-
-## Questions to Resolve
-
-Before starting implementation, consider:
-
-- [ ] **Plan 01:** Should custom metadata be serializable for IPC?
-- [ ] **Plan 03:** What sync strategy should be default (strict vs loose)?
-- [ ] **Plan 05:** Should we keep backward-compatible aliases?
-- [ ] **Plan 08:** Should events use a separate channel from buffers?
 
 ---
 
