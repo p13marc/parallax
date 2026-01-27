@@ -100,6 +100,9 @@ symphonia = { version = "0.5", optional = true, default-features = false }
 zune-jpeg = { version = "0.4", optional = true }
 png = { version = "0.17", optional = true }
 
+# Container formats (pure Rust)
+mp4 = { version = "0.14", optional = true }
+
 # Regex (for RegexFilter)
 regex = "1"
 
@@ -139,6 +142,7 @@ zenoh = ["dep:zenoh"] # Zenoh pub/sub elements
 rtp = ["dep:rtp", "dep:rtcp", "dep:webrtc-util", "dep:webrtc-util-0_10"]  # RTP/RTCP elements
 rtsp = ["rtp", "dep:retina", "dep:url"]  # RTSP client (includes RTP support)
 mpeg-ts = ["dep:mpeg2ts-reader"]  # MPEG-TS demuxer
+mp4-demux = ["dep:mp4"]  # MP4/MOV container demuxer
 iced-sink = ["dep:iced"]  # Iced GUI video sink
 
 [[bench]]

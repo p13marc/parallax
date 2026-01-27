@@ -30,7 +30,10 @@
 //! Delay, timeout, debounce, throttle, rate limiter
 //!
 //! ## [`demux`] - Demultiplexing
-//! Stream ID demux, MPEG-TS demux
+//! Stream ID demux, MPEG-TS demux, MP4 demux
+//!
+//! ## [`mux`] - Multiplexing
+//! MP4 muxer
 //!
 //! ## [`util`] - Utility Elements
 //! PassThrough, Identity
@@ -55,6 +58,7 @@ pub mod demux;
 pub mod flow;
 pub mod io;
 pub mod ipc;
+pub mod mux;
 pub mod network;
 pub mod rtp;
 pub mod testing;
@@ -157,6 +161,19 @@ pub use demux::{StreamIdDemux, StreamIdDemuxStats, StreamOutput};
 #[cfg(feature = "mpeg-ts")]
 pub use demux::{
     TS_PACKET_SIZE, TsDemux, TsDemuxStats, TsElementaryStream, TsFrame, TsProgram, TsStreamType,
+};
+
+#[cfg(feature = "mp4-demux")]
+pub use demux::{
+    Mp4AudioInfo, Mp4Codec, Mp4Demux, Mp4DemuxStats, Mp4Sample, Mp4Track, Mp4TrackType,
+    Mp4VideoInfo,
+};
+
+// Mux
+#[cfg(feature = "mp4-demux")]
+pub use mux::{
+    AudioCodecConfig, Mp4AudioTrackConfig, Mp4Mux, Mp4MuxConfig, Mp4MuxStats, Mp4VideoTrackConfig,
+    VideoCodecConfig,
 };
 
 // Utility

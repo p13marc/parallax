@@ -32,6 +32,7 @@ This file provides guidance to Claude Code when working with code in this reposi
 | Video Codecs | rav1e (AV1 encode), dav1d (AV1 decode) |
 | Audio Codecs | Symphonia (pure Rust: FLAC, MP3, AAC, Vorbis) |
 | Image Codecs | zune-jpeg, png crate (pure Rust) |
+| Container Formats | mp4 crate (pure Rust: MP4 demux/mux) |
 
 ### Execution Modes
 
@@ -337,7 +338,8 @@ parallax/
 │   │   ├── app/            # AppSrc, AppSink, IcedVideoSink
 │   │   ├── ipc/            # IpcSrc, IpcSink, MemorySrc/Sink
 │   │   ├── timing/         # Delay, Timeout, RateLimiter
-│   │   ├── demux/          # StreamIdDemux, TsDemux
+│   │   ├── demux/          # StreamIdDemux, TsDemux, Mp4Demux
+│   │   ├── mux/            # Mp4Mux
 │   │   ├── codec/          # Media codecs (AV1, audio, image - feature-gated)
 │   │   └── util/           # PassThrough, Identity
 │   │
@@ -559,6 +561,10 @@ parallax = { version = "0.1", features = ["audio-vorbis"] }  # Vorbis only
 parallax = { version = "0.1", features = ["image-codecs"] }  # All: JPEG, PNG
 parallax = { version = "0.1", features = ["image-jpeg"] }    # JPEG decoder (zune-jpeg)
 parallax = { version = "0.1", features = ["image-png"] }     # PNG encoder/decoder (png crate)
+
+# Container formats (all pure Rust)
+parallax = { version = "0.1", features = ["mp4-demux"] }     # MP4 demuxer/muxer
+parallax = { version = "0.1", features = ["mpeg-ts"] }       # MPEG-TS demuxer
 ```
 
 ### Codec Summary
@@ -573,6 +579,8 @@ parallax = { version = "0.1", features = ["image-png"] }     # PNG encoder/decod
 | Audio | Vorbis | `audio-vorbis` | symphonia | Yes | Open source lossy format |
 | Image | JPEG | `image-jpeg` | zune-jpeg | Yes | Decoder only |
 | Image | PNG | `image-png` | png | Yes | Encoder and decoder |
+| Container | MP4 | `mp4-demux` | mp4 | Yes | Demuxer and muxer |
+| Container | MPEG-TS | `mpeg-ts` | mpeg2ts-reader | Yes | Demuxer only |
 
 ### Build Dependencies
 
