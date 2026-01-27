@@ -10,11 +10,19 @@
 //! - A video capture device (webcam, etc.)
 //! - User must be in the 'video' group or have permissions to /dev/video*
 //!
-//! The example:
-//! 1. Enumerates available V4L2 devices
-//! 2. Opens the first device (or specified device)
-//! 3. Converts YUYV frames to RGBA for display
-//! 4. Displays live video in an Iced window
+//! # Current Limitation
+//!
+//! Parallax cannot yet express this as a simple pipeline like:
+//!
+//! ```rust,ignore
+//! Pipeline::parse("v4l2src ! videoconvert ! icedsink")?.run()?;
+//! ```
+//!
+//! This is because IcedVideoSink requires running the Iced event loop on the
+//! main thread (a GUI framework constraint). Future work will add a
+//! `Pipeline::run_with_display()` method that handles this automatically.
+//!
+//! For now, this example shows the manual approach with explicit threading.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -213,6 +221,8 @@ fn main() -> Result<()> {
             }
         }
 
+        // Explicitly stop the source to release the device
+        src.stop();
         println!("Capture thread finished. Total frames: {}", frame_count);
     });
 

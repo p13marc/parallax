@@ -23,6 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use v4l::buffer::Type;
+use v4l::io::mmap::Stream as MmapStream;
 use v4l::io::traits::CaptureStream;
 use v4l::prelude::*;
 use v4l::video::Capture;
@@ -126,9 +127,20 @@ impl Default for V4l2Config {
 }
 
 /// V4L2 video capture source.
+///
+/// This source captures video frames from a V4L2 device using memory-mapped
+/// buffers for efficient zero-copy capture.
+///
+/// # Device Lifecycle
+///
+/// The device is properly released when V4l2Src is dropped. The stream
+/// buffers are unmapped and streaming is stopped before the device is closed.
 pub struct V4l2Src {
-    /// The mmap stream.
-    stream: MmapStream<'static>,
+    /// The V4L2 device - must be kept alive for the stream to work.
+    /// Option allows us to control drop order (stream first, then device).
+    device: Option<Device>,
+    /// The mmap stream - dropped before device.
+    stream: Option<MmapStream<'static>>,
     /// Device path.
     path: PathBuf,
     /// Actual format being used.
@@ -180,16 +192,17 @@ impl V4l2Src {
         let actual_fourcc = format.fourcc.repr;
 
         // Create mmap stream
-        // Note: We need to use 'static lifetime here which requires unsafe
-        // In practice, we ensure the device outlives the stream
         let stream = MmapStream::with_buffers(&dev, Type::VideoCapture, config.buffer_count)
             .map_err(DeviceError::V4l2)?;
 
-        // Transmute to 'static lifetime - safe because we own both
+        // SAFETY: We store both `dev` and `stream` in the struct, ensuring
+        // the device outlives the stream. The stream is dropped first in our
+        // Drop implementation, then the device.
         let stream: MmapStream<'static> = unsafe { std::mem::transmute(stream) };
 
         Ok(Self {
-            stream,
+            device: Some(dev),
+            stream: Some(stream),
             path,
             width,
             height,
@@ -221,16 +234,39 @@ impl V4l2Src {
     pub fn enumerate_devices() -> Result<Vec<V4l2DeviceInfo>> {
         enumerate_devices()
     }
+
+    /// Stop capturing and release the device.
+    ///
+    /// This is called automatically on drop, but can be called explicitly
+    /// to release the device early.
+    pub fn stop(&mut self) {
+        // Drop stream first to stop streaming and unmap buffers
+        self.stream.take();
+        // Then drop the device to close the file descriptor
+        self.device.take();
+    }
+}
+
+impl Drop for V4l2Src {
+    fn drop(&mut self) {
+        // Ensure proper drop order: stream first, then device
+        self.stop();
+    }
 }
 
 impl Source for V4l2Src {
     fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
+        let stream = self
+            .stream
+            .as_mut()
+            .ok_or_else(|| DeviceError::NotFound("device closed".to_string()))?;
+
         // Capture a frame
-        let (buffer, _meta) = self.stream.next().map_err(|e| DeviceError::V4l2(e))?;
+        let (buffer, _meta) = stream.next().map_err(DeviceError::V4l2)?;
 
         let len = buffer.len();
-        if len > ctx.output().len() {
-            // Buffer too small, return our own
+        if !ctx.has_buffer() || len > ctx.capacity() {
+            // No buffer provided or buffer too small, return our own
             return Ok(ProduceResult::OwnBuffer(buffer_from_slice(buffer)));
         }
 
@@ -243,8 +279,8 @@ impl Source for V4l2Src {
         let fourcc_str = std::str::from_utf8(&self.fourcc).unwrap_or("????");
         let size = match fourcc_str {
             "MJPG" | "JPEG" => {
-                // MJPEG is compressed, estimate
-                (self.width * self.height / 4) as usize
+                // MJPEG is compressed, estimate max size
+                (self.width * self.height) as usize
             }
             "YUYV" | "UYVY" => {
                 // YUV 4:2:2 = 2 bytes per pixel
