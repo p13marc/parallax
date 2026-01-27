@@ -4,18 +4,139 @@ This directory contains detailed implementation plans for improving Parallax, de
 
 ---
 
-## Overview
+## Progress Overview
 
-| # | Plan | Priority | Effort | Status |
-|---|------|----------|--------|--------|
-| 01 | [Custom Metadata API](01_CUSTOM_METADATA_API.md) | High | Small | Planned |
-| 02 | [Codec Element Wrappers](02_CODEC_ELEMENT_WRAPPERS.md) | High | Medium | Planned |
-| 03 | [Muxer Synchronization](03_MUXER_SYNCHRONIZATION.md) | High | Large | Planned |
-| 04 | [Pipeline Buffer Pool](04_PIPELINE_BUFFER_POOL.md) | High | Medium | Planned |
-| 05 | [Element Trait Consolidation](05_ELEMENT_TRAIT_CONSOLIDATION.md) | Medium | Large | Planned |
-| 06 | [Caps Negotiation](06_CAPS_NEGOTIATION.md) | Medium | Medium | Planned |
-| 07 | [Pipeline Builder DSL](07_PIPELINE_BUILDER_DSL.md) | Medium | Small | Planned |
-| 08 | [Events and Tagging](08_EVENTS_AND_TAGGING.md) | Medium | Medium | Planned |
+| # | Plan | Priority | Effort | Progress |
+|---|------|----------|--------|----------|
+| 01 | [Custom Metadata API](01_CUSTOM_METADATA_API.md) | High | Small | ⬜ Not Started |
+| 02 | [Codec Element Wrappers](02_CODEC_ELEMENT_WRAPPERS.md) | High | Medium | ⬜ Not Started |
+| 03 | [Muxer Synchronization](03_MUXER_SYNCHRONIZATION.md) | High | Large | ⬜ Not Started |
+| 04 | [Pipeline Buffer Pool](04_PIPELINE_BUFFER_POOL.md) | High | Medium | ⬜ Not Started |
+| 05 | [Element Trait Consolidation](05_ELEMENT_TRAIT_CONSOLIDATION.md) | Medium | Large | ⬜ Not Started |
+| 06 | [Caps Negotiation](06_CAPS_NEGOTIATION.md) | Medium | Medium | ⬜ Not Started |
+| 07 | [Pipeline Builder DSL](07_PIPELINE_BUILDER_DSL.md) | Medium | Small | ⬜ Not Started |
+| 08 | [Events and Tagging](08_EVENTS_AND_TAGGING.md) | Medium | Medium | ⬜ Not Started |
+
+**Legend:** ⬜ Not Started | 🟡 In Progress | ✅ Complete
+
+---
+
+## Master Checklist
+
+### Phase 1: Foundation (Weeks 1-2)
+
+#### Plan 01: Custom Metadata API
+- [ ] Define `custom` HashMap field in `Metadata` struct
+- [ ] Implement `set<T>()` and `get<T>()` methods
+- [ ] Implement `set_bytes()` and `get_bytes()` convenience methods
+- [ ] Add `set_klv()` / `klv()` convenience methods
+- [ ] Add `metadata_mut()` to `Buffer`
+- [ ] Write unit tests
+- [ ] Update example 31 to use new API
+- [ ] Update documentation
+
+#### Plan 04: Pipeline Buffer Pool
+- [ ] Define `BufferPool` trait
+- [ ] Implement `PooledBuffer` with Drop return-to-pool
+- [ ] Implement `FixedSizePool` using `CpuArena`
+- [ ] Add pool to `ProduceContext`
+- [ ] Add `set_pool()` and `create_pool()` to `Pipeline`
+- [ ] Update executor to pass pool to sources
+- [ ] Write unit tests
+- [ ] Create example 34
+- [ ] Update documentation
+
+### Phase 2: Element System (Weeks 2-4)
+
+#### Plan 02: Codec Element Wrappers
+- [ ] Define `VideoEncoder` trait
+- [ ] Define `VideoDecoder` trait
+- [ ] Define `VideoFrame` struct
+- [ ] Implement `EncoderElement<E>` wrapper
+- [ ] Implement `DecoderElement<D>` wrapper
+- [ ] Add `flush()` method to `Transform` trait
+- [ ] Adapt `Rav1eEncoder` to `VideoEncoder`
+- [ ] Adapt `OpenH264Encoder` to `VideoEncoder`
+- [ ] Update executor to call `flush()` at EOS
+- [ ] Write unit tests
+- [ ] Create example 32
+- [ ] Update documentation
+
+#### Plan 03: Muxer Synchronization
+- [ ] Define `Muxer` trait with `push()` / `pull()` model
+- [ ] Define `MuxerInput`, `MuxerOutput`, `PadInfo` types
+- [ ] Implement `MuxerSyncState` for PTS synchronization
+- [ ] Implement `TsMuxElement` wrapping existing `TsMux`
+- [ ] Add `MuxerAdapter` for `AsyncElementDyn`
+- [ ] Update executor with `run_muxer_node()` for multi-input
+- [ ] Update `Pipeline` to allow multiple links to muxer
+- [ ] Implement strict/loose/timed sync modes
+- [ ] Write unit tests
+- [ ] Create example 33
+- [ ] Update documentation
+
+### Phase 3: Ergonomics (Weeks 4-6)
+
+#### Plan 06: Caps Negotiation
+- [ ] Define `PixelFormat` enum
+- [ ] Define `VideoCaps` with constraints
+- [ ] Define `SampleFormat` and `AudioCaps`
+- [ ] Define `MediaCaps` unified type
+- [ ] Implement `can_intersect()` and `intersect()`
+- [ ] Update `VideoScale` to declare proper caps
+- [ ] Update other video elements to declare caps
+- [ ] Implement `ConverterRegistry`
+- [ ] Implement `YuvToRgbConverter` and `RgbToYuvConverter`
+- [ ] Add `negotiate_with_converters()` to `Pipeline`
+- [ ] Write unit tests
+- [ ] Create example 35
+- [ ] Update documentation
+
+#### Plan 07: Pipeline Builder DSL
+- [ ] Implement `PipelineBuilder` with state markers
+- [ ] Implement `source()`, `then()`, `sink()` methods
+- [ ] Implement `source_named()`, `then_named()`, `sink_named()`
+- [ ] Implement `TeeBuilder` for branching
+- [ ] Implement `BranchBuilder`
+- [ ] Implement `>>` operator via `Shr` trait
+- [ ] Add mux support with `MuxBuilder`
+- [ ] Write unit tests
+- [ ] Create example 36
+- [ ] Update documentation
+
+### Phase 4: Advanced Features (Weeks 6-8)
+
+#### Plan 08: Events and Tagging
+- [ ] Define `Event` enum with all event types
+- [ ] Define `StreamStartEvent`, `SegmentEvent`, `SeekEvent`, etc.
+- [ ] Define `TagList` and `TagValue`
+- [ ] Define `PipelineItem` (Buffer | Event)
+- [ ] Add `handle_upstream_event()` to element traits
+- [ ] Add `handle_downstream_event()` to element traits
+- [ ] Update `ProcessOutput` to support events
+- [ ] Update executor to route events
+- [ ] Implement seek handling in `FileSrc`
+- [ ] Implement flush handling in `Queue`
+- [ ] Write unit tests
+- [ ] Create examples 37 and 38
+- [ ] Update documentation
+
+### Phase 5: Refactoring (Weeks 8-10)
+
+#### Plan 05: Element Trait Consolidation
+- [ ] Define `ProcessOutput` unified enum
+- [ ] Define `PipelineElement` async trait
+- [ ] Implement blanket impl: `Source` -> `PipelineElement`
+- [ ] Implement blanket impl: `Sink` -> `PipelineElement`
+- [ ] Implement blanket impl: `Transform` -> `PipelineElement`
+- [ ] Add `add_element()` method to `Pipeline`
+- [ ] Update executor to use `PipelineElement`
+- [ ] Migrate all built-in elements
+- [ ] Update all examples to remove adapters
+- [ ] Deprecate old traits and adapters
+- [ ] Remove deprecated code
+- [ ] Write migration guide
+- [ ] Update all documentation
 
 ---
 
@@ -161,10 +282,10 @@ Each plan should include:
 
 After completing plans, update:
 
-- `CLAUDE.md` - Architecture section
-- `docs/getting-started.md` - New features
-- `README.md` - Feature list
-- Rustdoc comments - API documentation
+- [ ] `CLAUDE.md` - Architecture section
+- [ ] `docs/getting-started.md` - New features
+- [ ] `README.md` - Feature list
+- [ ] Rustdoc comments - API documentation
 
 ---
 
@@ -172,10 +293,10 @@ After completing plans, update:
 
 Before starting implementation, consider:
 
-1. **Plan 01:** Should custom metadata be serializable for IPC?
-2. **Plan 03:** What sync strategy should be default (strict vs loose)?
-3. **Plan 05:** Should we keep backward-compatible aliases?
-4. **Plan 08:** Should events use a separate channel from buffers?
+- [ ] **Plan 01:** Should custom metadata be serializable for IPC?
+- [ ] **Plan 03:** What sync strategy should be default (strict vs loose)?
+- [ ] **Plan 05:** Should we keep backward-compatible aliases?
+- [ ] **Plan 08:** Should events use a separate channel from buffers?
 
 ---
 
@@ -186,8 +307,9 @@ When implementing a plan:
 1. Create a feature branch: `git checkout -b plan-01-custom-metadata`
 2. Follow the implementation steps in the plan
 3. Run all tests: `just test`
-4. Update the plan status in this README
-5. Create a PR with the plan number in the title
+4. Update the checkboxes in this README
+5. Update the plan status in the Progress Overview table
+6. Create a PR with the plan number in the title
 
 ---
 
