@@ -59,6 +59,7 @@ pub mod demux;
 pub mod flow;
 pub mod io;
 pub mod ipc;
+pub mod metadata;
 pub mod mux;
 pub mod network;
 pub mod rtp;
@@ -176,6 +177,12 @@ pub use mux::{
     AudioCodecConfig, Mp4AudioTrackConfig, Mp4Mux, Mp4MuxConfig, Mp4MuxStats, Mp4VideoTrackConfig,
     VideoCodecConfig,
 };
+
+#[cfg(feature = "mpeg-ts")]
+pub use mux::{TsMux, TsMuxConfig, TsMuxStats, TsMuxStreamType, TsMuxTrack};
+
+// Metadata
+pub use metadata::{KlvEncoder, KlvTag, StanagMetadataBuilder, Uls, decode_ber_length};
 
 // Utility
 pub use util::{Identity, IdentityStats, PassThrough};

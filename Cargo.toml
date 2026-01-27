@@ -248,3 +248,7 @@ required-features = ["h264"]
 [[example]]
 name = "27_rtsp_transcode_rtp"
 required-features = ["rtsp", "h264"]
+
+[[example]]
+name = "28_mpegts_stanag"
+required-features = ["mpeg-ts"]
