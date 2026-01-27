@@ -6,6 +6,9 @@
 //! - [`FlatMap`]: One-to-many transformation
 //! - [`Chunk`]: Split buffers into fixed-size chunks
 //!
+//! ## Video Processing
+//! - [`VideoScale`]: Scale/resize YUV420 video frames
+//!
 //! ## Batching
 //! - [`Batch`]: Combine multiple buffers into one
 //! - [`Unbatch`]: Split one buffer into many
@@ -39,10 +42,14 @@ mod buffer_ops;
 mod data_processing;
 mod filter;
 mod metadata_ops;
+mod scale;
 mod transform;
 
 // Generic transforms
 pub use transform::{Chunk, FilterMap, FlatMap, Map};
+
+// Video processing
+pub use scale::{ScaleMode, VideoScale};
 
 // Batching
 pub use batch::{Batch, BatchStats, Unbatch, UnbatchStats};
