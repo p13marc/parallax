@@ -106,6 +106,10 @@ impl VideoScale {
             PixelFormat::Gray8 => {
                 self.scale_packed(input, output, 1);
             }
+            PixelFormat::Yuyv | PixelFormat::Uyvy => {
+                // YUYV/UYVY: 2 bytes per pixel average (4 bytes per 2 pixels)
+                self.scale_yuyv(input, output);
+            }
             PixelFormat::I420 => {
                 self.scale_i420(input, output);
             }
@@ -201,6 +205,91 @@ impl VideoScale {
         let in_v = &input[in_v_offset..in_v_offset + (in_w / 2) * (in_h / 2)];
         let out_v = &mut output[out_v_offset..out_v_offset + (out_w / 2) * (out_h / 2)];
         self.scale_plane(in_v, in_w / 2, in_h / 2, out_v, out_w / 2, out_h / 2);
+    }
+
+    /// Scale YUYV/UYVY format (packed YUV 4:2:2).
+    /// This is a simplified scaler that works in Y-only domain for speed.
+    /// For better quality, convert to I420/NV12 first, scale, then convert back.
+    fn scale_yuyv(&self, input: &[u8], output: &mut [u8]) {
+        let in_w = self.input_width as usize;
+        let in_h = self.input_height as usize;
+        let out_w = self.output_width as usize;
+        let out_h = self.output_height as usize;
+
+        // YUYV: Y0 U Y1 V (4 bytes per 2 pixels)
+        // Simplest approach: nearest neighbor scaling treating as macro-pixels
+        match self.algorithm {
+            ScaleAlgorithm::NearestNeighbor => {
+                for out_y in 0..out_h {
+                    let in_y = (out_y * in_h / out_h).min(in_h - 1);
+
+                    // Process 2 output pixels at a time (one macro-pixel)
+                    for out_x in (0..out_w).step_by(2) {
+                        // Map to input position (in macro-pixel units)
+                        let in_x = ((out_x * in_w / out_w) / 2 * 2).min(in_w - 2);
+
+                        let src_idx = (in_y * in_w + in_x) * 2;
+                        let dst_idx = (out_y * out_w + out_x) * 2;
+
+                        // Copy the 4-byte macro-pixel
+                        output[dst_idx] = input[src_idx]; // Y0
+                        output[dst_idx + 1] = input[src_idx + 1]; // U
+                        output[dst_idx + 2] = input[src_idx + 2]; // Y1
+                        output[dst_idx + 3] = input[src_idx + 3]; // V
+                    }
+                }
+            }
+            ScaleAlgorithm::Bilinear => {
+                // For bilinear, we do a simple approximation by interpolating Y values
+                // and using nearest-neighbor for U/V
+                let x_ratio = (in_w as f32 - 1.0) / (out_w as f32).max(1.0);
+                let y_ratio = (in_h as f32 - 1.0) / (out_h as f32).max(1.0);
+
+                for out_y in 0..out_h {
+                    let src_y_f = out_y as f32 * y_ratio;
+                    let y0 = src_y_f.floor() as usize;
+                    let y1 = (y0 + 1).min(in_h - 1);
+                    let y_frac = src_y_f - y0 as f32;
+
+                    for out_x in (0..out_w).step_by(2) {
+                        let src_x_f = out_x as f32 * x_ratio;
+                        let x0 = (src_x_f.floor() as usize / 2 * 2).min(in_w - 2);
+                        let x1 = (x0 + 2).min(in_w - 2);
+                        let x_frac = (src_x_f - x0 as f32) / 2.0;
+
+                        // Interpolate Y0
+                        let y0_00 = input[(y0 * in_w + x0) * 2] as f32;
+                        let y0_10 = input[(y0 * in_w + x1) * 2] as f32;
+                        let y0_01 = input[(y1 * in_w + x0) * 2] as f32;
+                        let y0_11 = input[(y1 * in_w + x1) * 2] as f32;
+                        let y0_top = y0_00 + x_frac * (y0_10 - y0_00);
+                        let y0_bot = y0_01 + x_frac * (y0_11 - y0_01);
+                        let y0_val = (y0_top + y_frac * (y0_bot - y0_top)).round() as u8;
+
+                        // Interpolate Y1
+                        let y1_00 = input[(y0 * in_w + x0) * 2 + 2] as f32;
+                        let y1_10 = input[(y0 * in_w + x1) * 2 + 2] as f32;
+                        let y1_01 = input[(y1 * in_w + x0) * 2 + 2] as f32;
+                        let y1_11 = input[(y1 * in_w + x1) * 2 + 2] as f32;
+                        let y1_top = y1_00 + x_frac * (y1_10 - y1_00);
+                        let y1_bot = y1_01 + x_frac * (y1_11 - y1_01);
+                        let y1_val = (y1_top + y_frac * (y1_bot - y1_top)).round() as u8;
+
+                        // Nearest-neighbor for U/V
+                        let in_x_nn = (src_x_f.round() as usize / 2 * 2).min(in_w - 2);
+                        let in_y_nn = src_y_f.round() as usize;
+                        let u_val = input[(in_y_nn * in_w + in_x_nn) * 2 + 1];
+                        let v_val = input[(in_y_nn * in_w + in_x_nn) * 2 + 3];
+
+                        let dst_idx = (out_y * out_w + out_x) * 2;
+                        output[dst_idx] = y0_val;
+                        output[dst_idx + 1] = u_val;
+                        output[dst_idx + 2] = y1_val;
+                        output[dst_idx + 3] = v_val;
+                    }
+                }
+            }
+        }
     }
 
     /// Scale NV12 format (semi-planar YUV 4:2:0).

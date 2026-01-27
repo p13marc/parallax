@@ -247,3 +247,7 @@ required-features = ["mpeg-ts"]
 [[example]]
 name = "22_v4l2_capture"
 required-features = ["v4l2"]
+
+[[example]]
+name = "23_v4l2_iced_display"
+required-features = ["v4l2", "iced-sink"]

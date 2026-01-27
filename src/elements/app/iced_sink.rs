@@ -37,8 +37,7 @@
 //! handle.run().unwrap();
 //! ```
 
-use crate::buffer::Buffer;
-use crate::element::Sink;
+use crate::element::{ConsumeContext, Sink};
 use crate::error::{Error, Result};
 use iced::widget::{column, container, image, text};
 use iced::{Element, Length, Subscription, Task, Theme};
@@ -246,13 +245,13 @@ impl IcedVideoSink {
 }
 
 impl Sink for IcedVideoSink {
-    fn consume(&mut self, buffer: Buffer) -> Result<()> {
+    fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
         // Check if window is still open
         if !self.state.window_open.load(Ordering::Relaxed) {
             return Err(Error::Element("Window closed".into()));
         }
 
-        let data = buffer.as_bytes();
+        let data = ctx.input();
         let expected_size = (self.config.width * self.config.height) as usize
             * self.config.pixel_format.bytes_per_pixel();
 
@@ -274,8 +273,8 @@ impl Sink for IcedVideoSink {
             pixels: rgba_pixels,
             width: self.config.width,
             height: self.config.height,
-            pts_nanos: buffer.metadata().pts.nanos(),
-            sequence: buffer.metadata().sequence,
+            pts_nanos: ctx.metadata().pts.nanos(),
+            sequence: ctx.metadata().sequence,
         };
 
         // Try to update the frame

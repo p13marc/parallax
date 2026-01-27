@@ -12,6 +12,12 @@ pub enum PixelFormat {
     I420,
     /// Semi-planar YUV 4:2:0 (Y plane, then interleaved UV plane)
     Nv12,
+    /// Packed YUV 4:2:2 (YUYV/YUY2) - common webcam format
+    /// Layout: Y0 U0 Y1 V0 (4 bytes per 2 pixels)
+    Yuyv,
+    /// Packed YUV 4:2:2 (UYVY) - alternative webcam format
+    /// Layout: U0 Y0 V0 Y1 (4 bytes per 2 pixels)
+    Uyvy,
     /// Packed RGB, 3 bytes per pixel (R, G, B)
     Rgb24,
     /// Packed RGBA, 4 bytes per pixel (R, G, B, A)
@@ -26,10 +32,11 @@ pub enum PixelFormat {
 
 impl PixelFormat {
     /// Returns the number of bytes per pixel for packed formats.
-    /// For planar formats, returns None.
+    /// For planar formats and packed YUV 4:2:2, returns None (use buffer_size instead).
     pub fn bytes_per_pixel(&self) -> Option<usize> {
         match self {
             PixelFormat::I420 | PixelFormat::Nv12 => None,
+            PixelFormat::Yuyv | PixelFormat::Uyvy => None, // 2 bytes per pixel average
             PixelFormat::Rgb24 | PixelFormat::Bgr24 => Some(3),
             PixelFormat::Rgba | PixelFormat::Bgra => Some(4),
             PixelFormat::Gray8 => Some(1),
@@ -43,6 +50,7 @@ impl PixelFormat {
         match self {
             PixelFormat::I420 => w * h + 2 * (w / 2) * (h / 2), // Y + U + V
             PixelFormat::Nv12 => w * h + (w / 2) * (h / 2) * 2, // Y + UV interleaved
+            PixelFormat::Yuyv | PixelFormat::Uyvy => w * h * 2, // 4 bytes per 2 pixels
             PixelFormat::Rgb24 | PixelFormat::Bgr24 => w * h * 3,
             PixelFormat::Rgba | PixelFormat::Bgra => w * h * 4,
             PixelFormat::Gray8 => w * h,
@@ -51,7 +59,10 @@ impl PixelFormat {
 
     /// Returns true if this is a YUV format.
     pub fn is_yuv(&self) -> bool {
-        matches!(self, PixelFormat::I420 | PixelFormat::Nv12)
+        matches!(
+            self,
+            PixelFormat::I420 | PixelFormat::Nv12 | PixelFormat::Yuyv | PixelFormat::Uyvy
+        )
     }
 
     /// Returns true if this is an RGB format.
@@ -60,6 +71,21 @@ impl PixelFormat {
             self,
             PixelFormat::Rgb24 | PixelFormat::Rgba | PixelFormat::Bgr24 | PixelFormat::Bgra
         )
+    }
+
+    /// Try to parse a V4L2 fourcc code into a PixelFormat.
+    pub fn from_fourcc(fourcc: &[u8; 4]) -> Option<Self> {
+        match fourcc {
+            b"YUYV" | b"YUY2" => Some(PixelFormat::Yuyv),
+            b"UYVY" => Some(PixelFormat::Uyvy),
+            b"I420" | b"YU12" => Some(PixelFormat::I420),
+            b"NV12" => Some(PixelFormat::Nv12),
+            b"RGB3" => Some(PixelFormat::Rgb24),
+            b"BGR3" => Some(PixelFormat::Bgr24),
+            b"RGBP" | b"RGB4" => Some(PixelFormat::Rgba),
+            b"GREY" | b"Y800" => Some(PixelFormat::Gray8),
+            _ => None,
+        }
     }
 }
 
@@ -181,6 +207,28 @@ impl VideoConvert {
             }
             (PixelFormat::Nv12, PixelFormat::Rgba) => {
                 self.nv12_to_rgba(input, output);
+            }
+
+            // YUYV (packed YUV 4:2:2) to RGB conversions
+            (PixelFormat::Yuyv, PixelFormat::Rgb24) => {
+                self.yuyv_to_rgb24(input, output);
+            }
+            (PixelFormat::Yuyv, PixelFormat::Rgba) => {
+                self.yuyv_to_rgba(input, output);
+            }
+            (PixelFormat::Yuyv, PixelFormat::Bgr24) => {
+                self.yuyv_to_bgr24(input, output);
+            }
+            (PixelFormat::Yuyv, PixelFormat::Bgra) => {
+                self.yuyv_to_bgra(input, output);
+            }
+
+            // UYVY (packed YUV 4:2:2) to RGB conversions
+            (PixelFormat::Uyvy, PixelFormat::Rgb24) => {
+                self.uyvy_to_rgb24(input, output);
+            }
+            (PixelFormat::Uyvy, PixelFormat::Rgba) => {
+                self.uyvy_to_rgba(input, output);
             }
 
             // RGB to YUV conversions
@@ -385,6 +433,200 @@ impl VideoConvert {
                 output[dst_idx + 1] = g;
                 output[dst_idx + 2] = b;
                 output[dst_idx + 3] = 255;
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // YUYV/UYVY (packed YUV 4:2:2) to RGB conversions
+    // -------------------------------------------------------------------------
+
+    /// Convert YUYV (YUY2) to RGB24.
+    /// YUYV layout: Y0 U0 Y1 V0 (4 bytes encode 2 pixels)
+    fn yuyv_to_rgb24(&self, input: &[u8], output: &mut [u8]) {
+        let w = self.width as usize;
+        let h = self.height as usize;
+
+        for row in 0..h {
+            for col in (0..w).step_by(2) {
+                // Read 4 bytes: Y0 U Y1 V
+                let src_idx = (row * w + col) * 2;
+                let y0 = input[src_idx];
+                let u = input[src_idx + 1];
+                let y1 = input[src_idx + 2];
+                let v = input[src_idx + 3];
+
+                // First pixel
+                let (r0, g0, b0) = self.yuv_to_rgb(y0, u, v);
+                let dst_idx0 = (row * w + col) * 3;
+                output[dst_idx0] = r0;
+                output[dst_idx0 + 1] = g0;
+                output[dst_idx0 + 2] = b0;
+
+                // Second pixel
+                let (r1, g1, b1) = self.yuv_to_rgb(y1, u, v);
+                let dst_idx1 = (row * w + col + 1) * 3;
+                output[dst_idx1] = r1;
+                output[dst_idx1 + 1] = g1;
+                output[dst_idx1 + 2] = b1;
+            }
+        }
+    }
+
+    /// Convert YUYV (YUY2) to RGBA.
+    fn yuyv_to_rgba(&self, input: &[u8], output: &mut [u8]) {
+        let w = self.width as usize;
+        let h = self.height as usize;
+
+        for row in 0..h {
+            for col in (0..w).step_by(2) {
+                let src_idx = (row * w + col) * 2;
+                let y0 = input[src_idx];
+                let u = input[src_idx + 1];
+                let y1 = input[src_idx + 2];
+                let v = input[src_idx + 3];
+
+                // First pixel
+                let (r0, g0, b0) = self.yuv_to_rgb(y0, u, v);
+                let dst_idx0 = (row * w + col) * 4;
+                output[dst_idx0] = r0;
+                output[dst_idx0 + 1] = g0;
+                output[dst_idx0 + 2] = b0;
+                output[dst_idx0 + 3] = 255;
+
+                // Second pixel
+                let (r1, g1, b1) = self.yuv_to_rgb(y1, u, v);
+                let dst_idx1 = (row * w + col + 1) * 4;
+                output[dst_idx1] = r1;
+                output[dst_idx1 + 1] = g1;
+                output[dst_idx1 + 2] = b1;
+                output[dst_idx1 + 3] = 255;
+            }
+        }
+    }
+
+    /// Convert YUYV (YUY2) to BGR24.
+    fn yuyv_to_bgr24(&self, input: &[u8], output: &mut [u8]) {
+        let w = self.width as usize;
+        let h = self.height as usize;
+
+        for row in 0..h {
+            for col in (0..w).step_by(2) {
+                let src_idx = (row * w + col) * 2;
+                let y0 = input[src_idx];
+                let u = input[src_idx + 1];
+                let y1 = input[src_idx + 2];
+                let v = input[src_idx + 3];
+
+                // First pixel (BGR order)
+                let (r0, g0, b0) = self.yuv_to_rgb(y0, u, v);
+                let dst_idx0 = (row * w + col) * 3;
+                output[dst_idx0] = b0;
+                output[dst_idx0 + 1] = g0;
+                output[dst_idx0 + 2] = r0;
+
+                // Second pixel
+                let (r1, g1, b1) = self.yuv_to_rgb(y1, u, v);
+                let dst_idx1 = (row * w + col + 1) * 3;
+                output[dst_idx1] = b1;
+                output[dst_idx1 + 1] = g1;
+                output[dst_idx1 + 2] = r1;
+            }
+        }
+    }
+
+    /// Convert YUYV (YUY2) to BGRA.
+    fn yuyv_to_bgra(&self, input: &[u8], output: &mut [u8]) {
+        let w = self.width as usize;
+        let h = self.height as usize;
+
+        for row in 0..h {
+            for col in (0..w).step_by(2) {
+                let src_idx = (row * w + col) * 2;
+                let y0 = input[src_idx];
+                let u = input[src_idx + 1];
+                let y1 = input[src_idx + 2];
+                let v = input[src_idx + 3];
+
+                // First pixel (BGRA order)
+                let (r0, g0, b0) = self.yuv_to_rgb(y0, u, v);
+                let dst_idx0 = (row * w + col) * 4;
+                output[dst_idx0] = b0;
+                output[dst_idx0 + 1] = g0;
+                output[dst_idx0 + 2] = r0;
+                output[dst_idx0 + 3] = 255;
+
+                // Second pixel
+                let (r1, g1, b1) = self.yuv_to_rgb(y1, u, v);
+                let dst_idx1 = (row * w + col + 1) * 4;
+                output[dst_idx1] = b1;
+                output[dst_idx1 + 1] = g1;
+                output[dst_idx1 + 2] = r1;
+                output[dst_idx1 + 3] = 255;
+            }
+        }
+    }
+
+    /// Convert UYVY to RGB24.
+    /// UYVY layout: U0 Y0 V0 Y1 (4 bytes encode 2 pixels)
+    fn uyvy_to_rgb24(&self, input: &[u8], output: &mut [u8]) {
+        let w = self.width as usize;
+        let h = self.height as usize;
+
+        for row in 0..h {
+            for col in (0..w).step_by(2) {
+                // Read 4 bytes: U Y0 V Y1
+                let src_idx = (row * w + col) * 2;
+                let u = input[src_idx];
+                let y0 = input[src_idx + 1];
+                let v = input[src_idx + 2];
+                let y1 = input[src_idx + 3];
+
+                // First pixel
+                let (r0, g0, b0) = self.yuv_to_rgb(y0, u, v);
+                let dst_idx0 = (row * w + col) * 3;
+                output[dst_idx0] = r0;
+                output[dst_idx0 + 1] = g0;
+                output[dst_idx0 + 2] = b0;
+
+                // Second pixel
+                let (r1, g1, b1) = self.yuv_to_rgb(y1, u, v);
+                let dst_idx1 = (row * w + col + 1) * 3;
+                output[dst_idx1] = r1;
+                output[dst_idx1 + 1] = g1;
+                output[dst_idx1 + 2] = b1;
+            }
+        }
+    }
+
+    /// Convert UYVY to RGBA.
+    fn uyvy_to_rgba(&self, input: &[u8], output: &mut [u8]) {
+        let w = self.width as usize;
+        let h = self.height as usize;
+
+        for row in 0..h {
+            for col in (0..w).step_by(2) {
+                let src_idx = (row * w + col) * 2;
+                let u = input[src_idx];
+                let y0 = input[src_idx + 1];
+                let v = input[src_idx + 2];
+                let y1 = input[src_idx + 3];
+
+                // First pixel
+                let (r0, g0, b0) = self.yuv_to_rgb(y0, u, v);
+                let dst_idx0 = (row * w + col) * 4;
+                output[dst_idx0] = r0;
+                output[dst_idx0 + 1] = g0;
+                output[dst_idx0 + 2] = b0;
+                output[dst_idx0 + 3] = 255;
+
+                // Second pixel
+                let (r1, g1, b1) = self.yuv_to_rgb(y1, u, v);
+                let dst_idx1 = (row * w + col + 1) * 4;
+                output[dst_idx1] = r1;
+                output[dst_idx1 + 1] = g1;
+                output[dst_idx1 + 2] = b1;
+                output[dst_idx1 + 3] = 255;
             }
         }
     }
