@@ -88,9 +88,10 @@ gpu-allocator = { version = "0.27", optional = true }
 h264-reader = { version = "0.7", optional = true }
 
 # AV1 software codecs (optional)
-rav1e = { version = "0.7", optional = true }
-# rav1d not yet on crates.io - using dav1d bindings as alternative
-dav1d = { version = "0.10", optional = true }
+# rav1e: use default-features=false to skip asm (slower), or install nasm for optimized builds
+rav1e = { version = "0.8", optional = true, default-features = false, features = ["threading"] }
+# dav1d requires system library (libdav1d-devel on Fedora, libdav1d-dev on Debian)
+dav1d = { version = "0.11", optional = true }
 
 # Regex (for RegexFilter)
 regex = "1"
@@ -113,7 +114,9 @@ io-uring = []         # Future: io_uring async I/O
 gpu = []              # Future: CUDA/Vulkan pinned memory
 rdma = []             # Future: RDMA support
 vulkan-video = ["dep:ash", "dep:gpu-allocator", "dep:h264-reader"]  # Vulkan Video codecs
-software-codecs = ["dep:rav1e", "dep:dav1d"]  # Software AV1 codecs
+software-codecs = ["av1-encode", "av1-decode"]  # All software AV1 codecs
+av1-encode = ["dep:rav1e"]  # AV1 encoder (requires nasm on x86_64)
+av1-decode = ["dep:dav1d"]  # AV1 decoder (requires libdav1d system library)
 http = ["ureq"]       # HTTP source/sink elements
 websocket = ["tungstenite"]  # WebSocket source/sink elements
 zenoh = ["dep:zenoh"] # Zenoh pub/sub elements

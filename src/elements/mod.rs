@@ -34,8 +34,14 @@
 //!
 //! ## [`util`] - Utility Elements
 //! PassThrough, Identity
+//!
+//! ## [`codec`] - Software Codecs (feature-gated)
+//! AV1 decoder (dav1d), AV1 encoder (rav1e)
 
 pub mod app;
+
+#[cfg(any(feature = "av1-encode", feature = "av1-decode"))]
+pub mod codec;
 pub mod demux;
 pub mod flow;
 pub mod io;
@@ -146,3 +152,15 @@ pub use demux::{
 
 // Utility
 pub use util::{Identity, IdentityStats, PassThrough};
+
+// Software codecs - common types
+#[cfg(any(feature = "av1-encode", feature = "av1-decode"))]
+pub use codec::{PixelFormat as CodecPixelFormat, VideoFrame};
+
+// Software codecs - decoder (requires system library)
+#[cfg(feature = "av1-decode")]
+pub use codec::Dav1dDecoder;
+
+// Software codecs - encoder (pure Rust)
+#[cfg(feature = "av1-encode")]
+pub use codec::{Rav1eConfig, Rav1eEncoder};
