@@ -247,18 +247,25 @@ All previously identified minor issues have been resolved:
 
 **Test Status**: All 805 unit tests, 23 doctests, and 14 IPC stress tests pass.
 
-### Short-term (Next Steps)
+### Short-term (Completed January 27, 2026)
 
-3. **Performance benchmarking** (extended):
-   - InProcess vs Isolated latency comparison
-   - Comparison benchmarks vs GStreamer
+7. **Isolation benchmarks** - Added `benches/isolation.rs`:
+   - InProcess pipeline: ~2M buffers/sec
+   - CpuArena vs SharedArena: 27ns vs 37ns (37% overhead for cross-process)
+   - Pipeline startup: 950ns create, 30µs create+run
 
-4. **Security audit** of seccomp sandbox rules.
+8. **Security documentation** - Created `docs/SECURITY_SANDBOX.md`:
+   - Seccomp policies and allowed syscalls
+   - Namespace isolation details
+   - cgroup resource limits
+   - Security recommendations for auditors
 
-5. **Integration examples**:
-   - Camera capture to network stream
-   - Video file transcoding
-   - Live audio processing
+9. **Integration examples**:
+   - `21_tcp_streaming.rs` - Client/server TCP streaming
+   - `22_file_processing.rs` - File transform pipeline
+   - `23_data_pipeline.rs` - Sensor data processing with anomaly detection
+
+### Future Steps
 
 ### Medium-term (1-3 Months)
 
