@@ -28,8 +28,10 @@ This file provides guidance to Claude Code when working with code in this reposi
 | Metrics | metrics-rs + tracing |
 | Linux APIs | rustix |
 | Plugin ABI | stabby (stable Rust ABI) |
-| GPU | Vulkan Video + rust-gpu |
-| Codecs | Vulkan Video (primary) + rav1d/rav1e (fallback) |
+| GPU | Vulkan Video + rust-gpu (planned) |
+| Video Codecs | rav1e (AV1 encode), dav1d (AV1 decode) |
+| Audio Codecs | Symphonia (pure Rust: FLAC, MP3, AAC, Vorbis) |
+| Image Codecs | zune-jpeg, png crate (pure Rust) |
 
 ### Execution Modes
 
@@ -336,6 +338,7 @@ parallax/
 │   │   ├── ipc/            # IpcSrc, IpcSink, MemorySrc/Sink
 │   │   ├── timing/         # Delay, Timeout, RateLimiter
 │   │   ├── demux/          # StreamIdDemux, TsDemux
+│   │   ├── codec/          # Media codecs (AV1, audio, image - feature-gated)
 │   │   └── util/           # PassThrough, Identity
 │   │
 │   ├── typed/              # Type-safe pipeline API
@@ -368,7 +371,8 @@ parallax/
 │   ├── 17_introspection.rs       # Pipeline introspection and caps
 │   ├── 18_demuxer_muxer.rs       # Demuxer and muxer elements
 │   ├── 19_auto_execution.rs      # Automatic execution strategy
-│   └── 20_dynamic_state.rs       # Dynamic pipeline state changes
+│   ├── 20_dynamic_state.rs       # Dynamic pipeline state changes
+│   └── 24_image_codec.rs         # Image encoding/decoding (PNG)
 │
 ├── docs/
 │   ├── FINAL_DESIGN_PARALLAX.md  # Complete design document
@@ -461,7 +465,7 @@ See `docs/FINAL_DESIGN_PARALLAX.md` for full details.
 | 2 | Caps Negotiation (global constraint solving) | ✅ Complete |
 | 3 | Cross-Process IPC (IpcSrc/IpcSink) | ✅ Complete |
 | 4 | GPU Integration (Vulkan Video) | Planned |
-| 5 | Pure Rust Codecs (rav1d/rav1e) | Planned |
+| 5 | Pure Rust Codecs | ✅ Partial (audio/image complete, video AV1 ready) |
 | 6 | Process Isolation (transparent auto-IPC) | ✅ Complete |
 | 7 | Plugin System (C-compatible ABI) | ✅ Complete |
 | 8 | Distribution (Zenoh) | ✅ Complete |
@@ -531,6 +535,51 @@ Pipeline::parse("camera ! zenoh_pub key=factory/camera/1")?;
 // Machine B
 Pipeline::parse("zenoh_sub key=factory/camera/1 ! display")?;
 ```
+
+## Media Codecs
+
+Parallax includes feature-gated media codecs prioritizing **pure Rust implementations** for security and portability.
+
+### Codec Feature Flags
+
+```toml
+[dependencies]
+# Video codecs
+parallax = { version = "0.1", features = ["av1-encode"] }  # AV1 encoder (rav1e, pure Rust)
+parallax = { version = "0.1", features = ["av1-decode"] }  # AV1 decoder (dav1d, C library)
+
+# Audio codecs (all pure Rust via Symphonia)
+parallax = { version = "0.1", features = ["audio-codecs"] }  # All: FLAC, MP3, AAC, Vorbis
+parallax = { version = "0.1", features = ["audio-flac"] }    # FLAC only
+parallax = { version = "0.1", features = ["audio-mp3"] }     # MP3 only
+parallax = { version = "0.1", features = ["audio-aac"] }     # AAC only
+parallax = { version = "0.1", features = ["audio-vorbis"] }  # Vorbis only
+
+# Image codecs (all pure Rust)
+parallax = { version = "0.1", features = ["image-codecs"] }  # All: JPEG, PNG
+parallax = { version = "0.1", features = ["image-jpeg"] }    # JPEG decoder (zune-jpeg)
+parallax = { version = "0.1", features = ["image-png"] }     # PNG encoder/decoder (png crate)
+```
+
+### Codec Summary
+
+| Type | Codec | Feature | Crate | Pure Rust | Notes |
+|------|-------|---------|-------|-----------|-------|
+| Video | AV1 encode | `av1-encode` | rav1e | Yes | Install nasm for SIMD optimizations |
+| Video | AV1 decode | `av1-decode` | dav1d | No | Requires libdav1d system library |
+| Audio | FLAC | `audio-flac` | symphonia | Yes | Lossless audio |
+| Audio | MP3 | `audio-mp3` | symphonia | Yes | Common lossy format |
+| Audio | AAC | `audio-aac` | symphonia | Yes | Common in video containers |
+| Audio | Vorbis | `audio-vorbis` | symphonia | Yes | Open source lossy format |
+| Image | JPEG | `image-jpeg` | zune-jpeg | Yes | Decoder only |
+| Image | PNG | `image-png` | png | Yes | Encoder and decoder |
+
+### Build Dependencies
+
+Most codecs are pure Rust with no external dependencies. Exceptions:
+
+- **av1-encode**: Optionally install `nasm` for x86_64 SIMD optimizations
+- **av1-decode**: Requires `libdav1d-devel` (Fedora) / `libdav1d-dev` (Debian)
 
 ## Performance Notes
 

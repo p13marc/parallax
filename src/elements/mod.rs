@@ -40,7 +40,16 @@
 
 pub mod app;
 
-#[cfg(any(feature = "av1-encode", feature = "av1-decode"))]
+#[cfg(any(
+    feature = "av1-encode",
+    feature = "av1-decode",
+    feature = "audio-flac",
+    feature = "audio-mp3",
+    feature = "audio-aac",
+    feature = "audio-vorbis",
+    feature = "image-jpeg",
+    feature = "image-png"
+))]
 pub mod codec;
 pub mod demux;
 pub mod flow;
@@ -153,14 +162,34 @@ pub use demux::{
 // Utility
 pub use util::{Identity, IdentityStats, PassThrough};
 
-// Software codecs - common types
+// Video codecs - common types
 #[cfg(any(feature = "av1-encode", feature = "av1-decode"))]
 pub use codec::{PixelFormat as CodecPixelFormat, VideoFrame};
 
-// Software codecs - decoder (requires system library)
+// Video codecs - AV1
 #[cfg(feature = "av1-decode")]
 pub use codec::Dav1dDecoder;
 
-// Software codecs - encoder (pure Rust)
 #[cfg(feature = "av1-encode")]
 pub use codec::{Rav1eConfig, Rav1eEncoder};
+
+// Audio codecs (Symphonia - FLAC, MP3, AAC, Vorbis)
+#[cfg(any(
+    feature = "audio-flac",
+    feature = "audio-mp3",
+    feature = "audio-aac",
+    feature = "audio-vorbis"
+))]
+pub use codec::{AudioFormat, AudioFrameInfo, SampleFormat, SymphoniaDecoder};
+
+// Image codecs - common types
+#[cfg(any(feature = "image-jpeg", feature = "image-png"))]
+pub use codec::{ColorType, ImageFrame};
+
+// Image codecs - JPEG
+#[cfg(feature = "image-jpeg")]
+pub use codec::JpegDecoder;
+
+// Image codecs - PNG
+#[cfg(feature = "image-png")]
+pub use codec::{PngDecoder, PngEncoder};

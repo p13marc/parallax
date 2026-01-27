@@ -1,60 +1,114 @@
-//! Video codec elements.
+//! Media codec elements using pure Rust implementations.
 //!
-//! This module provides video encoding and decoding elements:
+//! This module provides encoding and decoding elements for video, audio, and images.
+//! All codecs are implemented in pure Rust with no C dependencies (except where noted).
 //!
-//! - [`Dav1dDecoder`] - AV1 software decoder using dav1d (requires `av1-decode` feature)
-//! - [`Rav1eEncoder`] - AV1 software encoder using rav1e (requires `av1-encode` feature)
+//! # Video Codecs
+//!
+//! | Codec | Feature | Decoder | Encoder | Pure Rust |
+//! |-------|---------|---------|---------|-----------|
+//! | AV1 | `av1-decode` | [`Dav1dDecoder`] | - | No (C lib) |
+//! | AV1 | `av1-encode` | - | [`Rav1eEncoder`] | Yes |
+//!
+//! # Audio Codecs
+//!
+//! | Codec | Feature | Decoder | Encoder | Pure Rust |
+//! |-------|---------|---------|---------|-----------|
+//! | FLAC | `audio-flac` | [`SymphoniaDecoder`] | - | Yes |
+//! | MP3 | `audio-mp3` | [`SymphoniaDecoder`] | - | Yes |
+//! | AAC | `audio-aac` | [`SymphoniaDecoder`] | - | Yes |
+//! | Vorbis | `audio-vorbis` | [`SymphoniaDecoder`] | - | Yes |
+
+//!
+//! # Image Codecs
+//!
+//! | Format | Feature | Decoder | Encoder | Pure Rust |
+//! |--------|---------|---------|---------|-----------|
+//! | JPEG | `image-jpeg` | [`JpegDecoder`] | - | Yes |
+//! | PNG | `image-png` | [`PngDecoder`] | [`PngEncoder`] | Yes |
 //!
 //! # Feature Flags
 //!
-//! These elements can be enabled individually or together:
-//!
 //! ```toml
-//! # Encoder only
-//! parallax = { version = "0.1", features = ["av1-encode"] }
+//! # Video codecs
+//! parallax = { version = "0.1", features = ["av1-encode"] }  # AV1 encoder
+//! parallax = { version = "0.1", features = ["av1-decode"] }  # AV1 decoder (needs libdav1d)
 //!
-//! # Decoder only
-//! parallax = { version = "0.1", features = ["av1-decode"] }
+//! # Audio codecs (all pure Rust)
+//! parallax = { version = "0.1", features = ["audio-codecs"] }  # All audio codecs
+//! parallax = { version = "0.1", features = ["audio-flac"] }    # FLAC only
+//! parallax = { version = "0.1", features = ["audio-mp3"] }     # MP3 only
+
 //!
-//! # Both encoder and decoder
-//! parallax = { version = "0.1", features = ["software-codecs"] }
+//! # Image codecs (all pure Rust)
+//! parallax = { version = "0.1", features = ["image-codecs"] }  # All image codecs
+//! parallax = { version = "0.1", features = ["image-jpeg"] }    # JPEG only
+//! parallax = { version = "0.1", features = ["image-png"] }     # PNG only
 //! ```
 //!
-//! ## Build Dependencies
+//! # Build Dependencies
 //!
-//! ### av1-encode (rav1e)
+//! Most codecs are pure Rust and require no external dependencies.
 //!
-//! Requires **nasm** assembler for x86_64 optimizations:
+//! ## av1-encode (rav1e)
+//!
+//! Optionally install **nasm** for x86_64 SIMD optimizations:
 //!
 //! - **Fedora/RHEL**: `sudo dnf install nasm`
 //! - **Debian/Ubuntu**: `sudo apt install nasm`
 //! - **Arch**: `sudo pacman -S nasm`
 //! - **macOS**: `brew install nasm`
 //!
-//! ### av1-decode (dav1d)
+//! ## av1-decode (dav1d)
 //!
-//! Requires the **libdav1d** library:
+//! Requires the **libdav1d** system library:
 //!
 //! - **Fedora/RHEL**: `sudo dnf install libdav1d-devel`
 //! - **Debian/Ubuntu**: `sudo apt install libdav1d-dev`
 //! - **Arch**: `sudo pacman -S dav1d`
 //! - **macOS**: `brew install dav1d`
 
+// Common types (video frames, pixel formats)
 mod common;
-
-#[cfg(feature = "av1-decode")]
-mod decoder;
-
-#[cfg(feature = "av1-encode")]
-mod encoder;
-
-// Re-export common types
 pub use common::{PixelFormat, VideoFrame};
 
-// Re-export decoder
+// AV1 video codecs
+#[cfg(feature = "av1-decode")]
+mod decoder;
 #[cfg(feature = "av1-decode")]
 pub use decoder::Dav1dDecoder;
 
-// Re-export encoder
+#[cfg(feature = "av1-encode")]
+mod encoder;
 #[cfg(feature = "av1-encode")]
 pub use encoder::{Rav1eConfig, Rav1eEncoder};
+
+// Audio codecs
+#[cfg(any(
+    feature = "audio-flac",
+    feature = "audio-mp3",
+    feature = "audio-aac",
+    feature = "audio-vorbis"
+))]
+mod audio;
+
+#[cfg(any(
+    feature = "audio-flac",
+    feature = "audio-mp3",
+    feature = "audio-aac",
+    feature = "audio-vorbis"
+))]
+pub use audio::{AudioFormat, AudioFrameInfo, SampleFormat, SymphoniaDecoder};
+
+// Image codecs
+#[cfg(any(feature = "image-jpeg", feature = "image-png"))]
+mod image;
+
+#[cfg(any(feature = "image-jpeg", feature = "image-png"))]
+pub use image::{ColorType, ImageFrame};
+
+#[cfg(feature = "image-jpeg")]
+pub use image::JpegDecoder;
+
+#[cfg(feature = "image-png")]
+pub use image::{PngDecoder, PngEncoder};

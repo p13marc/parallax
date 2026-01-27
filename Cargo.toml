@@ -93,6 +93,13 @@ rav1e = { version = "0.8", optional = true, default-features = false, features =
 # dav1d requires system library (libdav1d-devel on Fedora, libdav1d-dev on Debian)
 dav1d = { version = "0.11", optional = true }
 
+# Audio codecs - Symphonia (pure Rust)
+symphonia = { version = "0.5", optional = true, default-features = false }
+
+# Image codecs (pure Rust)
+zune-jpeg = { version = "0.4", optional = true }
+png = { version = "0.17", optional = true }
+
 # Regex (for RegexFilter)
 regex = "1"
 
@@ -116,6 +123,16 @@ vulkan-video = ["dep:ash", "dep:gpu-allocator", "dep:h264-reader"]  # Vulkan Vid
 software-codecs = ["av1-encode", "av1-decode"]  # All software AV1 codecs
 av1-encode = ["dep:rav1e"]  # AV1 encoder (requires nasm on x86_64)
 av1-decode = ["dep:dav1d"]  # AV1 decoder (requires libdav1d system library)
+# Audio codecs (all pure Rust via Symphonia)
+audio-codecs = ["audio-flac", "audio-mp3", "audio-aac", "audio-vorbis"]
+audio-flac = ["dep:symphonia", "symphonia/flac"]
+audio-mp3 = ["dep:symphonia", "symphonia/mp3"]
+audio-aac = ["dep:symphonia", "symphonia/aac"]
+audio-vorbis = ["dep:symphonia", "symphonia/vorbis"]
+# Image codecs (all pure Rust)
+image-codecs = ["image-jpeg", "image-png"]
+image-jpeg = ["dep:zune-jpeg"]
+image-png = ["dep:png"]
 http = ["ureq"]       # HTTP source/sink elements
 websocket = ["tungstenite"]  # WebSocket source/sink elements
 zenoh = ["dep:zenoh"] # Zenoh pub/sub elements
@@ -207,3 +224,7 @@ name = "22_file_processing"
 
 [[example]]
 name = "23_data_pipeline"
+
+[[example]]
+name = "24_image_codec"
+required-features = ["image-codecs"]

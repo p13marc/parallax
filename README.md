@@ -483,6 +483,17 @@ cargo bench
 | `http` | HTTP source/sink elements (uses ureq) |
 | `websocket` | WebSocket source/sink elements (uses tungstenite) |
 | `zenoh` | Zenoh pub/sub and query elements |
+| **Codecs** | |
+| `image-codecs` | All image codecs (JPEG, PNG) |
+| `image-jpeg` | JPEG decoder (zune-jpeg, pure Rust) |
+| `image-png` | PNG encoder/decoder (png crate, pure Rust) |
+| `audio-codecs` | All audio codecs (FLAC, MP3, AAC, Vorbis) |
+| `audio-flac` | FLAC decoder (Symphonia, pure Rust) |
+| `audio-mp3` | MP3 decoder (Symphonia, pure Rust) |
+| `audio-aac` | AAC decoder (Symphonia, pure Rust) |
+| `audio-vorbis` | Vorbis decoder (Symphonia, pure Rust) |
+| `av1-encode` | AV1 encoder (rav1e, pure Rust) |
+| `av1-decode` | AV1 decoder (dav1d, requires libdav1d) |
 
 ## License
 
