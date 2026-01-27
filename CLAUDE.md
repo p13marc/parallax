@@ -29,7 +29,7 @@ This file provides guidance to Claude Code when working with code in this reposi
 | Linux APIs | rustix |
 | Plugin ABI | stabby (stable Rust ABI) |
 | GPU | Vulkan Video + rust-gpu (planned) |
-| Video Codecs | rav1e (AV1 encode), dav1d (AV1 decode) |
+| Video Codecs | OpenH264 (H.264), rav1e (AV1 encode), dav1d (AV1 decode) |
 | Audio Codecs | Symphonia (pure Rust: FLAC, MP3, AAC, Vorbis) |
 | Image Codecs | zune-jpeg, png crate (pure Rust) |
 | Container Formats | mp4 crate (pure Rust: MP4 demux/mux) |
@@ -547,6 +547,7 @@ Parallax includes feature-gated media codecs prioritizing **pure Rust implementa
 ```toml
 [dependencies]
 # Video codecs
+parallax = { version = "0.1", features = ["h264"] }        # H.264 encoder/decoder (OpenH264)
 parallax = { version = "0.1", features = ["av1-encode"] }  # AV1 encoder (rav1e, pure Rust)
 parallax = { version = "0.1", features = ["av1-decode"] }  # AV1 decoder (dav1d, C library)
 
@@ -571,6 +572,7 @@ parallax = { version = "0.1", features = ["mpeg-ts"] }       # MPEG-TS demuxer
 
 | Type | Codec | Feature | Crate | Pure Rust | Notes |
 |------|-------|---------|-------|-----------|-------|
+| Video | H.264 | `h264` | openh264 | No | Requires C++ compiler (g++) |
 | Video | AV1 encode | `av1-encode` | rav1e | Yes | Install nasm for SIMD optimizations |
 | Video | AV1 decode | `av1-decode` | dav1d | No | Requires libdav1d system library |
 | Audio | FLAC | `audio-flac` | symphonia | Yes | Lossless audio |

@@ -44,6 +44,7 @@
 pub mod app;
 
 #[cfg(any(
+    feature = "h264",
     feature = "av1-encode",
     feature = "av1-decode",
     feature = "audio-flac",
@@ -182,6 +183,10 @@ pub use util::{Identity, IdentityStats, PassThrough};
 // Video codecs - common types
 #[cfg(any(feature = "av1-encode", feature = "av1-decode"))]
 pub use codec::{PixelFormat as CodecPixelFormat, VideoFrame};
+
+// Video codecs - H.264
+#[cfg(feature = "h264")]
+pub use codec::{DecodedFrame, H264Decoder, H264Encoder, H264EncoderConfig};
 
 // Video codecs - AV1
 #[cfg(feature = "av1-decode")]

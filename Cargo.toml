@@ -93,6 +93,9 @@ rav1e = { version = "0.8", optional = true, default-features = false, features =
 # dav1d requires system library (libdav1d-devel on Fedora, libdav1d-dev on Debian)
 dav1d = { version = "0.11", optional = true }
 
+# H.264 codec (OpenH264 - ships with source, compiles automatically)
+openh264 = { version = "0.9", optional = true }
+
 # Audio codecs - Symphonia (pure Rust)
 symphonia = { version = "0.5", optional = true, default-features = false }
 
@@ -123,9 +126,10 @@ huge-pages = []       # MAP_HUGETLB support
 gpu = []              # Future: CUDA/Vulkan pinned memory
 rdma = []             # Future: RDMA support
 vulkan-video = ["dep:ash", "dep:gpu-allocator", "dep:h264-reader"]  # Vulkan Video codecs
-software-codecs = ["av1-encode", "av1-decode"]  # All software AV1 codecs
+software-codecs = ["av1-encode", "av1-decode", "h264"]  # All software video codecs
 av1-encode = ["dep:rav1e"]  # AV1 encoder (requires nasm on x86_64)
 av1-decode = ["dep:dav1d"]  # AV1 decoder (requires libdav1d system library)
+h264 = ["dep:openh264"]  # H.264 encoder/decoder (OpenH264, BSD-2 licensed)
 # Audio codecs (all pure Rust via Symphonia)
 audio-codecs = ["audio-flac", "audio-mp3", "audio-aac", "audio-vorbis"]
 audio-flac = ["dep:symphonia", "symphonia/flac"]
@@ -232,3 +236,11 @@ name = "23_data_pipeline"
 [[example]]
 name = "24_image_codec"
 required-features = ["image-codecs"]
+
+[[example]]
+name = "25_mp4_container"
+required-features = ["mp4-demux"]
+
+[[example]]
+name = "26_h264_codec"
+required-features = ["h264"]

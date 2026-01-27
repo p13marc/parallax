@@ -7,6 +7,7 @@
 //!
 //! | Codec | Feature | Decoder | Encoder | Pure Rust |
 //! |-------|---------|---------|---------|-----------|
+//! | H.264 | `h264` | [`H264Decoder`] | [`H264Encoder`] | No (OpenH264) |
 //! | AV1 | `av1-decode` | [`Dav1dDecoder`] | - | No (C lib) |
 //! | AV1 | `av1-encode` | - | [`Rav1eEncoder`] | Yes |
 //!
@@ -31,6 +32,7 @@
 //!
 //! ```toml
 //! # Video codecs
+//! parallax = { version = "0.1", features = ["h264"] }        # H.264 encoder/decoder (OpenH264)
 //! parallax = { version = "0.1", features = ["av1-encode"] }  # AV1 encoder
 //! parallax = { version = "0.1", features = ["av1-decode"] }  # AV1 decoder (needs libdav1d)
 //!
@@ -59,6 +61,15 @@
 //! - **Arch**: `sudo pacman -S nasm`
 //! - **macOS**: `brew install nasm`
 //!
+//! ## h264 (OpenH264)
+//!
+//! Requires a **C++ compiler** to build OpenH264 from source:
+//!
+//! - **Fedora/RHEL**: `sudo dnf install gcc-c++`
+//! - **Debian/Ubuntu**: `sudo apt install g++`
+//! - **Arch**: `sudo pacman -S gcc`
+//! - **macOS**: `xcode-select --install`
+//!
 //! ## av1-decode (dav1d)
 //!
 //! Requires the **libdav1d** system library:
@@ -71,6 +82,12 @@
 // Common types (video frames, pixel formats)
 mod common;
 pub use common::{PixelFormat, VideoFrame};
+
+// H.264 video codec
+#[cfg(feature = "h264")]
+mod h264;
+#[cfg(feature = "h264")]
+pub use h264::{DecodedFrame, H264Decoder, H264Encoder, H264EncoderConfig};
 
 // AV1 video codecs
 #[cfg(feature = "av1-decode")]
