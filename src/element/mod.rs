@@ -74,6 +74,7 @@
 mod context;
 pub mod muxer;
 mod pad;
+mod pipeline_element;
 mod traits;
 
 pub use context::{
@@ -81,6 +82,29 @@ pub use context::{
     ProduceResult,
 };
 pub use pad::{Pad, PadDirection, PadTemplate};
+
+// New unified element system (Plan 05)
+pub use pipeline_element::{
+    // Core unified trait
+    PipelineElement,
+    // Adapter for legacy compatibility
+    PipelineElementAdapter,
+    // Unified output type
+    ProcessOutput,
+    ProcessOutputIter,
+    // Send variant for async contexts
+    SendPipelineElement,
+    // Simple element traits (implement these)
+    SimpleSink,
+    SimpleSource,
+    SimpleTransform,
+    // Wrapper types (use these to create PipelineElement instances)
+    Snk,
+    Src,
+    Xfm,
+};
+
+// Legacy element system (still supported)
 pub use traits::{
     // Scheduling affinity
     Affinity,

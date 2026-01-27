@@ -1,6 +1,8 @@
 //! Pipeline graph structure using daggy.
 
-use crate::element::{AsyncElementDyn, DynAsyncElement, ElementType, Pad};
+use crate::element::{
+    AsyncElementDyn, DynAsyncElement, ElementType, Pad, PipelineElementAdapter, SendPipelineElement,
+};
 use crate::error::{Error, Result};
 use crate::format::{Caps, MediaFormat};
 use crate::memory::{BufferPool, FixedBufferPool, MemoryType};
@@ -598,6 +600,44 @@ impl Pipeline {
         let name = format!("node_{}", self.name_counter);
         self.name_counter += 1;
         self.add_node(name, element)
+    }
+
+    /// Add an element to the pipeline using the new unified `PipelineElement` trait.
+    ///
+    /// This is the recommended way to add elements to a pipeline. It accepts any type
+    /// implementing `SendPipelineElement` (including wrapped simple elements like
+    /// `Src<T>`, `Snk<T>`, and `Xfm<T>`).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use parallax::element::{Src, Snk, Xfm, SimpleSource, SimpleSink, SimpleTransform};
+    ///
+    /// struct MySource { count: u32 }
+    /// impl SimpleSource for MySource { /* ... */ }
+    ///
+    /// struct MySink;
+    /// impl SimpleSink for MySink { /* ... */ }
+    ///
+    /// let mut pipeline = Pipeline::new();
+    /// let src = pipeline.add_element("src", Src(MySource { count: 0 }));
+    /// let sink = pipeline.add_element("sink", Snk(MySink));
+    /// pipeline.link(src, sink)?;
+    /// ```
+    pub fn add_element<T: SendPipelineElement + 'static>(
+        &mut self,
+        name: impl Into<String>,
+        element: T,
+    ) -> NodeId {
+        let adapted = PipelineElementAdapter::new(element);
+        self.add_node(name, DynAsyncElement::new_box(adapted))
+    }
+
+    /// Add an element with an auto-generated name.
+    pub fn add_element_auto<T: SendPipelineElement + 'static>(&mut self, element: T) -> NodeId {
+        let name = format!("node_{}", self.name_counter);
+        self.name_counter += 1;
+        self.add_element(name, element)
     }
 
     /// Get a node by ID.

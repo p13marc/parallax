@@ -487,13 +487,75 @@ parallax/
 │   ├── 24_image_codec.rs         # Image encoding/decoding (PNG)
 │   ├── 32_buffer_pool.rs         # Pipeline buffer pooling
 │   ├── 33_encoder_element.rs     # Video encoder wrapper (AV1)
-│   └── 39_muxer_element.rs       # N-to-1 muxer with PTS sync
+│   ├── 39_muxer_element.rs       # N-to-1 muxer with PTS sync
+│   └── 40_unified_elements.rs    # Simplified element API (Plan 05)
 │
 ├── docs/
 │   ├── FINAL_DESIGN_PARALLAX.md  # Complete design document
 │   ├── PLAN_CAPS_NEGOTIATION.md  # Caps negotiation design
 │   └── getting-started.md        # Quick start guide
 ```
+
+### Unified Element System (Plan 05)
+
+Parallax provides a simplified element API that eliminates adapter boilerplate:
+
+```rust
+use parallax::element::{SimpleSource, SimpleSink, SimpleTransform, ProcessOutput};
+use parallax::element::{Src, Snk, Xfm};
+use parallax::pipeline::Pipeline;
+
+// Define a simple source
+struct Counter { count: u32, max: u32 }
+
+impl SimpleSource for Counter {
+    fn produce(&mut self) -> Result<ProcessOutput> {
+        if self.count >= self.max {
+            return Ok(ProcessOutput::Eos);
+        }
+        self.count += 1;
+        Ok(ProcessOutput::buffer(create_buffer(self.count)))
+    }
+}
+
+// Define a simple sink
+struct Logger;
+
+impl SimpleSink for Logger {
+    fn consume(&mut self, buffer: &Buffer) -> Result<()> {
+        println!("Received: {} bytes", buffer.len());
+        Ok(())
+    }
+}
+
+// Define a simple transform
+struct Doubler;
+
+impl SimpleTransform for Doubler {
+    fn transform(&mut self, buffer: Buffer) -> Result<ProcessOutput> {
+        // Transform and return
+        Ok(ProcessOutput::buffer(transformed))
+    }
+}
+
+// Use with Pipeline.add_element() - no adapters needed!
+let mut pipeline = Pipeline::new();
+let src = pipeline.add_element("src", Src(Counter { count: 0, max: 10 }));
+let xfm = pipeline.add_element("xfm", Xfm(Doubler));
+let sink = pipeline.add_element("sink", Snk(Logger));
+pipeline.link(src, xfm)?;
+pipeline.link(xfm, sink)?;
+```
+
+**Key types:**
+- `ProcessOutput` - Unified output enum (None, Buffer, Buffers, Eos, Pending)
+- `SimpleSource` - Trait for sync sources
+- `SimpleSink` - Trait for sync sinks
+- `SimpleTransform` - Trait for sync transforms
+- `Src<T>`, `Snk<T>`, `Xfm<T>` - Wrapper types implementing `PipelineElement`
+- `PipelineElementAdapter` - Bridge to legacy `AsyncElementDyn`
+
+See `examples/40_unified_elements.rs` for a complete example.
 
 ### Key Types
 
