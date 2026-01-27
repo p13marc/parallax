@@ -50,6 +50,7 @@
 
 pub mod buffer;
 pub mod clock;
+pub mod converters;
 pub mod element;
 pub mod elements;
 pub mod error;
