@@ -40,6 +40,9 @@
 //!
 //! ## `codec` - Software Codecs (feature-gated)
 //! AV1 decoder (dav1d), AV1 encoder (rav1e) - requires codec feature flags
+//!
+//! ## [`device`] - Device Capture (feature-gated)
+//! PipeWire, libcamera, V4L2, ALSA - hardware device capture and playback
 
 pub mod app;
 
@@ -56,6 +59,14 @@ pub mod app;
 ))]
 pub mod codec;
 pub mod demux;
+
+#[cfg(any(
+    feature = "pipewire",
+    feature = "libcamera",
+    feature = "v4l2",
+    feature = "alsa"
+))]
+pub mod device;
 pub mod flow;
 pub mod io;
 pub mod ipc;
@@ -222,3 +233,31 @@ pub use codec::JpegDecoder;
 // Image codecs - PNG
 #[cfg(feature = "image-png")]
 pub use codec::{PngDecoder, PngEncoder};
+
+// Device capture - common types
+#[cfg(any(
+    feature = "pipewire",
+    feature = "libcamera",
+    feature = "v4l2",
+    feature = "alsa"
+))]
+pub use device::{
+    AudioCaptureDevice, CameraLocation, CaptureBackend, DeviceError, VideoCaptureDevice,
+    detect_audio_backend, detect_video_backend, enumerate_audio_devices, enumerate_video_devices,
+};
+
+// Device capture - PipeWire
+#[cfg(feature = "pipewire")]
+pub use device::{PipeWireSink, PipeWireSrc, PipeWireTarget};
+
+// Device capture - libcamera
+#[cfg(feature = "libcamera")]
+pub use device::{LibCameraConfig, LibCameraInfo, LibCameraSrc};
+
+// Device capture - V4L2
+#[cfg(feature = "v4l2")]
+pub use device::{V4l2DeviceInfo, V4l2Src};
+
+// Device capture - ALSA
+#[cfg(feature = "alsa")]
+pub use device::{AlsaDeviceInfo, AlsaFormat, AlsaSampleFormat, AlsaSink, AlsaSrc};

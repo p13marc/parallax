@@ -106,6 +106,21 @@ png = { version = "0.17", optional = true }
 # Container formats (pure Rust)
 mp4 = { version = "0.14", optional = true }
 
+# PipeWire (audio/video capture and playback)
+pipewire = { version = "0.8", optional = true }
+
+# libcamera (modern camera API)
+libcamera = { version = "0.4", optional = true }
+
+# V4L2 (fallback video capture)
+v4l = { version = "0.14", optional = true }
+
+# ALSA (fallback audio capture/playback)
+alsa = { version = "0.9", optional = true }
+
+# XDG Portal (for screen capture permissions on Wayland)
+ashpd = { version = "0.10", optional = true, default-features = false, features = ["tokio"] }
+
 # Regex (for RegexFilter)
 regex = "1"
 
@@ -148,6 +163,16 @@ rtsp = ["rtp", "dep:retina", "dep:url"]  # RTSP client (includes RTP support)
 mpeg-ts = ["dep:mpeg2ts-reader"]  # MPEG-TS demuxer
 mp4-demux = ["dep:mp4"]  # MP4/MOV container demuxer
 iced-sink = ["dep:iced"]  # Iced GUI video sink
+# Device capture (modern Linux stack)
+pipewire = ["dep:pipewire"]  # PipeWire audio/video capture/playback
+libcamera = ["dep:libcamera"]  # Modern camera API (Raspberry Pi, embedded, etc.)
+screen-capture = ["pipewire", "dep:ashpd"]  # Screen capture via XDG portal
+# Device capture (fallback/low-level)
+v4l2 = ["dep:v4l"]  # V4L2 video capture (fallback for simple webcams)
+alsa = ["dep:alsa"]  # ALSA audio capture/playback (fallback)
+# Combined device features
+device-capture = ["pipewire", "libcamera"]  # Recommended device capture stack
+device-all = ["pipewire", "libcamera", "screen-capture", "v4l2", "alsa"]  # All device capture
 
 [[bench]]
 name = "throughput"
@@ -217,3 +242,8 @@ required-features = ["av1-encode"]
 [[example]]
 name = "16_mpegts"
 required-features = ["mpeg-ts"]
+
+# Device capture examples (22-26): require device feature flags
+[[example]]
+name = "22_v4l2_capture"
+required-features = ["v4l2"]

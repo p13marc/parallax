@@ -51,4 +51,14 @@ pub enum Error {
     /// System call error (via rustix).
     #[error("system error: {0}")]
     System(#[from] rustix::io::Errno),
+
+    /// Device capture/playback error.
+    #[cfg(any(
+        feature = "pipewire",
+        feature = "libcamera",
+        feature = "v4l2",
+        feature = "alsa"
+    ))]
+    #[error("device error: {0}")]
+    Device(#[from] crate::elements::device::DeviceError),
 }
