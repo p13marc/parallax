@@ -83,6 +83,16 @@
 mod common;
 pub use common::{PixelFormat, VideoFrame};
 
+// Codec traits
+mod traits;
+pub use traits::{FrameType, VideoDecoder, VideoEncoder};
+
+// Element wrappers
+mod decoder_element;
+mod encoder_element;
+pub use decoder_element::DecoderElement;
+pub use encoder_element::EncoderElement;
+
 // H.264 video codec
 #[cfg(feature = "h264")]
 mod h264;

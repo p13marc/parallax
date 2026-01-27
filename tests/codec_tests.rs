@@ -334,13 +334,10 @@ mod av1_encode_tests {
 
     #[test]
     fn test_rav1e_encoder_creation() {
-        let config = Rav1eConfig {
-            width: 64,
-            height: 64,
-            pixel_format: PixelFormat::Yuv420,
-            speed: 10,
-            quantizer: 100,
-        };
+        let config = Rav1eConfig::default()
+            .dimensions(64, 64)
+            .speed(10)
+            .quantizer(100);
 
         let encoder = Rav1eEncoder::new(config);
         assert!(encoder.is_ok(), "Should create encoder");
@@ -348,13 +345,10 @@ mod av1_encode_tests {
 
     #[test]
     fn test_rav1e_encoder_invalid_dimensions() {
-        let config = Rav1eConfig {
-            width: 0,
-            height: 0,
-            pixel_format: PixelFormat::Yuv420,
-            speed: 10,
-            quantizer: 100,
-        };
+        let config = Rav1eConfig::default()
+            .dimensions(0, 0)
+            .speed(10)
+            .quantizer(100);
 
         let encoder = Rav1eEncoder::new(config);
         assert!(encoder.is_err(), "Should fail with zero dimensions");
@@ -365,13 +359,10 @@ mod av1_encode_tests {
         let width = 64;
         let height = 64;
 
-        let config = Rav1eConfig {
-            width: width as u32,
-            height: height as u32,
-            pixel_format: PixelFormat::Yuv420,
-            speed: 10,
-            quantizer: 100,
-        };
+        let config = Rav1eConfig::default()
+            .dimensions(width, height)
+            .speed(10)
+            .quantizer(100);
 
         let mut encoder = Rav1eEncoder::new(config).expect("Should create encoder");
 

@@ -33,7 +33,7 @@ Key architectural decisions have been researched and documented in **[00_DESIGN_
 |---|------|----------|--------|----------|
 | 00 | [Design Decisions](00_DESIGN_DECISIONS.md) | - | - | ✅ Complete |
 | 01 | [Custom Metadata API](01_CUSTOM_METADATA_API.md) | High | Small | ✅ Complete |
-| 02 | [Codec Element Wrappers](02_CODEC_ELEMENT_WRAPPERS.md) | High | Medium | ⬜ Not Started |
+| 02 | [Codec Element Wrappers](02_CODEC_ELEMENT_WRAPPERS.md) | High | Medium | ✅ Complete |
 | 03 | [Muxer Synchronization](03_MUXER_SYNCHRONIZATION.md) | High | Large | ⬜ Not Started |
 | 04 | [Pipeline Buffer Pool](04_PIPELINE_BUFFER_POOL.md) | High | Medium | ✅ Complete |
 | 05 | [Element Trait Consolidation](05_ELEMENT_TRAIT_CONSOLIDATION.md) | Medium | Large | ⬜ Not Started |
@@ -72,19 +72,20 @@ Key architectural decisions have been researched and documented in **[00_DESIGN_
 
 ### Phase 2: Element System (Weeks 2-4)
 
-#### Plan 02: Codec Element Wrappers
-- [ ] Define `VideoEncoder` trait
-- [ ] Define `VideoDecoder` trait
-- [ ] Define `VideoFrame` struct
-- [ ] Implement `EncoderElement<E>` wrapper
-- [ ] Implement `DecoderElement<D>` wrapper
-- [ ] Add `flush()` method to `Transform` trait
-- [ ] Adapt `Rav1eEncoder` to `VideoEncoder`
-- [ ] Adapt `OpenH264Encoder` to `VideoEncoder`
-- [ ] Update executor to call `flush()` at EOS
-- [ ] Write unit tests
-- [ ] Create example 32
-- [ ] Update documentation
+#### Plan 02: Codec Element Wrappers ✅
+- [x] Define `VideoEncoder` trait
+- [x] Define `VideoDecoder` trait
+- [x] Define `VideoFrame` struct (already existed in common.rs)
+- [x] Implement `EncoderElement<E>` wrapper
+- [x] Implement `DecoderElement<D>` wrapper
+- [x] Add `flush()` method to `Element` and `Transform` traits
+- [x] Add `flush()` to `AsyncElementDyn` trait
+- [x] Adapt `Rav1eEncoder` to `VideoEncoder`
+- [ ] Adapt `OpenH264Encoder` to `VideoEncoder` (deferred - similar pattern)
+- [x] Update executor to call `flush()` at EOS
+- [x] Write unit tests (codec tests updated)
+- [x] Create example 33 (encoder element)
+- [x] Update documentation (CLAUDE.md)
 
 #### Plan 03: Muxer Synchronization
 - [ ] Define `Muxer` trait with `push()` / `pull()` model

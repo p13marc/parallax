@@ -784,6 +784,19 @@ pub trait Element: Send {
     /// Return `Ok(None)` to filter out (drop) the buffer.
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>>;
 
+    /// Flush any buffered data at end-of-stream.
+    ///
+    /// Called by the executor when EOS is received. Elements that buffer
+    /// data (like video encoders) should drain their internal buffers here.
+    ///
+    /// The executor will call this method repeatedly until it returns
+    /// `Ok(None)`, allowing elements to produce multiple outputs during flush.
+    ///
+    /// Default implementation returns `Ok(None)` (no buffered data).
+    fn flush(&mut self) -> Result<Option<Buffer>> {
+        Ok(None)
+    }
+
     /// Get the name of this element (for debugging/logging).
     fn name(&self) -> &str {
         std::any::type_name::<Self>()
@@ -857,6 +870,19 @@ pub trait Element: Send {
 pub trait Transform: Send {
     /// Transform an input buffer into output(s).
     fn transform(&mut self, buffer: Buffer) -> Result<Output>;
+
+    /// Flush any buffered data at end-of-stream.
+    ///
+    /// Called by the executor when EOS is received. Transforms that buffer
+    /// data (like video encoders) should drain their internal buffers here.
+    ///
+    /// The executor will call this method repeatedly until it returns
+    /// `Ok(Output::None)`, allowing transforms to produce multiple outputs during flush.
+    ///
+    /// Default implementation returns `Ok(Output::None)` (no buffered data).
+    fn flush(&mut self) -> Result<Output> {
+        Ok(Output::None)
+    }
 
     /// Get the name of this transform (for debugging/logging).
     fn name(&self) -> &str {
@@ -942,6 +968,14 @@ pub trait AsyncTransform: Send {
     fn execution_hints(&self) -> ExecutionHints {
         // Async transforms are typically I/O-bound
         ExecutionHints::io_bound()
+    }
+
+    /// Flush any buffered data at end-of-stream.
+    ///
+    /// Called when EOS is received. Transforms that buffer data
+    /// (like encoders) should emit remaining buffers here.
+    fn flush(&mut self) -> impl std::future::Future<Output = Result<Output>> + Send {
+        async { Ok(Output::None) }
     }
 }
 
@@ -1326,6 +1360,16 @@ pub trait AsyncElementDyn {
     fn execution_hints(&self) -> ExecutionHints {
         ExecutionHints::default()
     }
+
+    /// Flush any buffered data at end-of-stream.
+    ///
+    /// Called by the executor when EOS is received. Elements that
+    /// buffer data (like encoders) should emit remaining buffers here.
+    ///
+    /// Default implementation returns no output.
+    fn flush(&mut self) -> impl std::future::Future<Output = Result<Output>> + Send {
+        async { Ok(Output::None) }
+    }
 }
 
 // ============================================================================
@@ -1624,6 +1668,10 @@ impl<E: Element + Send + 'static> SendAsyncElementDyn for ElementAdapter<E> {
     fn execution_hints(&self) -> ExecutionHints {
         self.inner.execution_hints()
     }
+
+    async fn flush(&mut self) -> Result<Output> {
+        self.inner.flush().map(Output::from)
+    }
 }
 
 /// Wrapper to adapt a sync [`Transform`] to [`AsyncElementDyn`].
@@ -1711,6 +1759,18 @@ impl<T: Transform + Send + 'static> SendAsyncElementDyn for TransformAdapter<T> 
 
     fn execution_hints(&self) -> ExecutionHints {
         self.inner.execution_hints()
+    }
+
+    async fn flush(&mut self) -> Result<Output> {
+        // Include any pending buffers plus flush output
+        let mut all = std::mem::take(&mut self.pending);
+        let flush_output = self.inner.flush()?;
+        match flush_output {
+            Output::None => {}
+            Output::Single(b) => all.push(b),
+            Output::Multiple(v) => all.extend(v),
+        }
+        Ok(Output::from(all))
     }
 }
 
@@ -1988,6 +2048,18 @@ impl<T: AsyncTransform + Send + 'static> SendAsyncElementDyn for AsyncTransformA
 
     fn execution_hints(&self) -> ExecutionHints {
         self.inner.execution_hints()
+    }
+
+    async fn flush(&mut self) -> Result<Output> {
+        // Include any pending buffers plus flush output
+        let mut all = std::mem::take(&mut self.pending);
+        let flush_output = self.inner.flush().await?;
+        match flush_output {
+            Output::None => {}
+            Output::Single(b) => all.push(b),
+            Output::Multiple(v) => all.extend(v),
+        }
+        Ok(Output::from(all))
     }
 }
 

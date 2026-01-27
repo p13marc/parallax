@@ -413,7 +413,8 @@ parallax/
 │   ├── 19_auto_execution.rs      # Automatic execution strategy
 │   ├── 20_dynamic_state.rs       # Dynamic pipeline state changes
 │   ├── 24_image_codec.rs         # Image encoding/decoding (PNG)
-│   └── 32_buffer_pool.rs         # Pipeline buffer pooling
+│   ├── 32_buffer_pool.rs         # Pipeline buffer pooling
+│   └── 33_encoder_element.rs     # Video encoder wrapper (AV1)
 │
 ├── docs/
 │   ├── FINAL_DESIGN_PARALLAX.md  # Complete design document
@@ -470,10 +471,36 @@ pub trait Sink: Send {
 
 pub trait Element: Send {
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>>;
+    fn flush(&mut self) -> Result<Option<Buffer>> { Ok(None) }  // Called at EOS
     fn affinity(&self) -> Affinity { Affinity::Auto }
     fn is_rt_safe(&self) -> bool { false }
     fn execution_hints(&self) -> ExecutionHints { ExecutionHints::default() }
 }
+
+pub trait Transform: Send {
+    fn transform(&mut self, buffer: Buffer) -> Result<Output>;
+    fn flush(&mut self) -> Result<Output> { Ok(Output::None) }  // Called at EOS
+    fn affinity(&self) -> Affinity { Affinity::Auto }
+    fn is_rt_safe(&self) -> bool { false }
+    fn execution_hints(&self) -> ExecutionHints { ExecutionHints::default() }
+}
+
+// Codec traits for video encoders/decoders
+pub trait VideoEncoder: Send {
+    type Packet: AsRef<[u8]> + Send;
+    fn encode(&mut self, frame: &VideoFrame) -> Result<Vec<Self::Packet>>;
+    fn flush(&mut self) -> Result<Vec<Self::Packet>>;  // Drain buffered frames at EOS
+}
+
+pub trait VideoDecoder: Send {
+    fn decode(&mut self, packet: &[u8]) -> Result<Vec<VideoFrame>>;
+    fn flush(&mut self) -> Result<Vec<VideoFrame>>;  // Drain buffered frames at EOS
+}
+
+// EncoderElement/DecoderElement wrap codec traits for pipeline use
+let encoder = Rav1eEncoder::new(config)?;
+let element = EncoderElement::new(encoder, width, height);
+pipeline.add_node("enc", DynAsyncElement::new_box(TransformAdapter::new(element)));
 
 // Element traits (async - for I/O bound operations)
 pub trait AsyncSource: Send {

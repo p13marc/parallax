@@ -20,7 +20,8 @@ use crate::error::{Error, Result};
 use crate::memory::{HeapSegment, MemorySegment};
 use std::sync::Arc;
 
-use super::common::PixelFormat;
+use super::common::{PixelFormat, VideoFrame};
+use super::traits::VideoEncoder;
 
 /// Configuration for the rav1e AV1 encoder.
 #[derive(Clone, Debug)]
@@ -258,8 +259,8 @@ impl Rav1eEncoder {
         }
     }
 
-    /// Flush remaining frames from the encoder.
-    pub fn flush(&mut self) -> Result<Vec<Vec<u8>>> {
+    /// Flush remaining frames from the encoder (internal implementation).
+    fn flush_internal(&mut self) -> Result<Vec<Vec<u8>>> {
         self.context.flush();
 
         let mut packets = Vec::new();
@@ -321,7 +322,46 @@ impl Element for Rav1eEncoder {
 impl Drop for Rav1eEncoder {
     fn drop(&mut self) {
         // Flush is called automatically, but we ignore remaining packets
-        let _ = self.flush();
+        let _ = self.flush_internal();
+    }
+}
+
+impl VideoEncoder for Rav1eEncoder {
+    type Packet = Vec<u8>;
+
+    fn encode(&mut self, frame: &VideoFrame) -> Result<Vec<Self::Packet>> {
+        // Validate frame format
+        if frame.format != PixelFormat::I420 {
+            return Err(Error::InvalidSegment(format!(
+                "Rav1eEncoder only supports I420, got {:?}",
+                frame.format
+            )));
+        }
+
+        // Validate dimensions match config
+        if frame.width as usize != self.config.width || frame.height as usize != self.config.height
+        {
+            return Err(Error::InvalidSegment(format!(
+                "Frame dimensions {}x{} don't match encoder config {}x{}",
+                frame.width, frame.height, self.config.width, self.config.height
+            )));
+        }
+
+        // Encode the frame
+        match self.encode_frame(&frame.data, frame.pts as u64)? {
+            Some(packet) => Ok(vec![packet]),
+            None => Ok(vec![]), // Encoder buffering
+        }
+    }
+
+    fn flush(&mut self) -> Result<Vec<Self::Packet>> {
+        self.flush_internal()
+    }
+
+    fn has_pending(&self) -> bool {
+        // rav1e may have frames in lookahead buffer
+        // We can't easily query this, so assume true if we've sent any frames
+        self.frame_count > 0
     }
 }
 

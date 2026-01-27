@@ -32,7 +32,7 @@
 
 use crate::buffer::Buffer;
 use crate::element::{
-    Affinity, AsyncElementDyn, DynAsyncElement, ElementType, ExecutionHints, LatencyHint,
+    Affinity, AsyncElementDyn, DynAsyncElement, ElementType, ExecutionHints, LatencyHint, Output,
     ProcessingHint, TrustLevel,
 };
 use crate::error::{Error, Result};
@@ -1096,6 +1096,24 @@ fn spawn_transform_task(
                         }
                     }
                     Ok(Message::Eos) => {
+                        // Flush any buffered data before propagating EOS
+                        match element.flush().await {
+                            Ok(output) => {
+                                let buffers = match output {
+                                    Output::None => vec![],
+                                    Output::Single(b) => vec![b],
+                                    Output::Multiple(v) => v,
+                                };
+                                for buffer in buffers {
+                                    for tx in &outputs {
+                                        let _ = tx.send(Message::Buffer(buffer.clone())).await;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("flush error in '{}': {}", name, e);
+                            }
+                        }
                         for tx in &outputs {
                             let _ = tx.send(Message::Eos).await;
                         }
@@ -1150,6 +1168,26 @@ fn spawn_demuxer_task(
                         }
                     }
                     Ok(Message::Eos) | Err(_) => {
+                        // Flush any buffered data before propagating EOS
+                        match element.flush().await {
+                            Ok(output) => {
+                                let buffers = match output {
+                                    Output::None => vec![],
+                                    Output::Single(b) => vec![b],
+                                    Output::Multiple(v) => v,
+                                };
+                                for buffer in buffers {
+                                    for senders in outputs_by_pad.values() {
+                                        for tx in senders {
+                                            let _ = tx.send(Message::Buffer(buffer.clone())).await;
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("flush error in '{}': {}", name, e);
+                            }
+                        }
                         for senders in outputs_by_pad.values() {
                             for tx in senders {
                                 let _ = tx.send(Message::Eos).await;
@@ -1214,9 +1252,28 @@ fn spawn_muxer_task(
                 Ok(Message::Eos) | Err(_) => {
                     eos_count += 1;
                     if eos_count >= total {
+                        // Flush any remaining data from final processing
                         if let Ok(Some(out)) = element.process(None).await {
                             for tx in &outputs {
                                 let _ = tx.send(Message::Buffer(out.clone())).await;
+                            }
+                        }
+                        // Flush any buffered data before propagating EOS
+                        match element.flush().await {
+                            Ok(output) => {
+                                let buffers = match output {
+                                    Output::None => vec![],
+                                    Output::Single(b) => vec![b],
+                                    Output::Multiple(v) => v,
+                                };
+                                for buffer in buffers {
+                                    for tx in &outputs {
+                                        let _ = tx.send(Message::Buffer(buffer.clone())).await;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("flush error in '{}': {}", name, e);
                             }
                         }
                         for tx in &outputs {
