@@ -162,112 +162,58 @@ name = "isolation"
 harness = false
 
 # Examples - one concept per file, numbered for learning order
+# Run with: cargo run --example <name> [--features <feature>]
+
+# Basic examples (01-12): no special features required
+[[example]]
+name = "01_hello"
 
 [[example]]
-name = "01_hello_pipeline"
+name = "02_transform"
 
 [[example]]
-name = "02_counting_source"
+name = "03_tee"
 
 [[example]]
-name = "03_transform_element"
+name = "04_funnel"
 
 [[example]]
-name = "04_tee_fanout"
+name = "05_queue"
 
 [[example]]
-name = "05_funnel_merge"
+name = "06_appsrc"
 
 [[example]]
-name = "06_typed_pipeline"
+name = "07_file_io"
 
 [[example]]
-name = "07_appsrc_appsink"
+name = "08_tcp"
 
 [[example]]
-name = "08_queue_backpressure"
+name = "09_typed"
 
 [[example]]
-name = "09_valve_control"
+name = "10_builder"
 
 [[example]]
-name = "10_file_io"
+name = "11_buffer_pool"
 
 [[example]]
-name = "11_isolate_in_process"
+name = "12_isolation"
 
+# Codec examples (13-16): require feature flags
 [[example]]
-name = "12_isolate_by_pattern"
-
-[[example]]
-name = "13_isolate_all"
-
-[[example]]
-name = "14_ipc_manual"
-
-[[example]]
-name = "15_video_testsrc"
-
-[[example]]
-name = "16_video_display"
-required-features = ["iced-sink"]
-
-[[example]]
-name = "17_introspection"
-
-[[example]]
-name = "18_demuxer_muxer"
-
-[[example]]
-name = "19_auto_execution"
-
-[[example]]
-name = "20_dynamic_state"
-
-[[example]]
-name = "21_tcp_streaming"
-
-[[example]]
-name = "22_file_processing"
-
-[[example]]
-name = "23_data_pipeline"
-
-[[example]]
-name = "24_image_codec"
+name = "13_image"
 required-features = ["image-codecs"]
 
 [[example]]
-name = "25_mp4_container"
-required-features = ["mp4-demux"]
-
-[[example]]
-name = "26_h264_codec"
+name = "14_h264"
 required-features = ["h264"]
 
 [[example]]
-name = "27_rtsp_transcode_rtp"
-required-features = ["rtsp", "h264"]
-
-[[example]]
-name = "28_mpegts_stanag"
-required-features = ["mpeg-ts"]
-
-[[example]]
-name = "29_rtsp_transcode_stanag"
-required-features = ["mpeg-ts"]
-
-[[example]]
-name = "30_av1_transcode_stanag"
-required-features = ["mpeg-ts"]
-
-[[example]]
-name = "31_av1_pipeline_stanag"
-
-[[example]]
-name = "33_encoder_element"
+name = "15_av1"
 required-features = ["av1-encode"]
 
 [[example]]
-name = "39_muxer_element"
+name = "16_mpegts"
 required-features = ["mpeg-ts"]

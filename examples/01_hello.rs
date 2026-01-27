@@ -1,6 +1,13 @@
-//! Hello World pipeline - the simplest possible example.
+//! # Hello Pipeline
 //!
-//! Run with: cargo run --example 01_hello_pipeline
+//! The simplest possible pipeline: a source that produces one message,
+//! connected to a sink that prints it.
+//!
+//! ```text
+//! [HelloSource] → [PrintSink]
+//! ```
+//!
+//! Run: `cargo run --example 01_hello`
 
 use parallax::element::{
     ConsumeContext, DynAsyncElement, ProduceContext, ProduceResult, Sink, SinkAdapter, Source,
@@ -21,16 +28,9 @@ impl Source for HelloSource {
         }
         self.sent = true;
 
-        let data = b"Hello, Pipeline!";
-        let output = ctx.output();
-        let len = data.len().min(output.len());
-        output[..len].copy_from_slice(&data[..len]);
-
-        Ok(ProduceResult::Produced(len))
-    }
-
-    fn preferred_buffer_size(&self) -> Option<usize> {
-        Some(16) // "Hello, Pipeline!" is 16 bytes
+        let msg = b"Hello, Parallax!";
+        ctx.output()[..msg.len()].copy_from_slice(msg);
+        Ok(ProduceResult::Produced(msg.len()))
     }
 }
 
@@ -38,7 +38,7 @@ struct PrintSink;
 
 impl Sink for PrintSink {
     fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
-        let text = std::str::from_utf8(ctx.input()).unwrap_or("<invalid utf8>");
+        let text = std::str::from_utf8(ctx.input()).unwrap_or("<invalid>");
         println!("Received: {}", text);
         Ok(())
     }
@@ -46,13 +46,11 @@ impl Sink for PrintSink {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Create an arena for buffer allocation (1KB slots, 8 slots)
-    let arena = CpuArena::new(1024, 8)?;
+    let arena = CpuArena::new(1024, 4)?;
 
     let mut pipeline = Pipeline::new();
-
     let src = pipeline.add_node(
-        "source",
+        "src",
         DynAsyncElement::new_box(SourceAdapter::with_arena(
             HelloSource { sent: false },
             arena,
@@ -62,7 +60,7 @@ async fn main() -> Result<()> {
         "sink",
         DynAsyncElement::new_box(SinkAdapter::new(PrintSink)),
     );
-
     pipeline.link(src, sink)?;
+
     pipeline.run().await
 }
