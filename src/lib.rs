@@ -49,6 +49,7 @@ pub mod clock;
 pub mod element;
 pub mod elements;
 pub mod error;
+pub mod event;
 pub mod execution;
 pub mod format;
 pub mod link;
@@ -70,6 +71,7 @@ pub mod prelude {
         Sink, Source, Transform,
     };
     pub use crate::error::{Error, Result};
+    pub use crate::event::{Event, PipelineItem, TagList};
     pub use crate::format::{AudioFormat, Caps, MediaFormat, RtpFormat, VideoFormat};
     pub use crate::memory::{MemoryPool, MemorySegment, MemoryType};
     pub use crate::metadata::{BufferFlags, Metadata, RtpMeta};

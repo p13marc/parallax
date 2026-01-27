@@ -3,6 +3,7 @@
 use crate::buffer::Buffer;
 use crate::element::context::{ConsumeContext, ProduceContext, ProduceResult};
 use crate::error::Result;
+use crate::event::{Event, EventResult};
 use crate::format::Caps;
 use dynosaur::dynosaur;
 use smallvec::SmallVec;
@@ -542,6 +543,17 @@ pub trait Source: Send {
     fn execution_hints(&self) -> ExecutionHints {
         ExecutionHints::default()
     }
+
+    /// Handle an upstream event (seek, QoS, etc.).
+    ///
+    /// Sources are typically the handlers of upstream events like seek.
+    /// Return `EventResult::Handled` if the event was processed,
+    /// `EventResult::NotHandled` otherwise.
+    ///
+    /// Default implementation does not handle any events.
+    fn handle_upstream_event(&mut self, _event: &Event) -> EventResult {
+        EventResult::NotHandled
+    }
 }
 
 /// An async source element that produces buffers asynchronously.
@@ -611,6 +623,17 @@ pub trait AsyncSource: Send {
     fn execution_hints(&self) -> ExecutionHints {
         // Async sources are typically I/O-bound
         ExecutionHints::io_bound()
+    }
+
+    /// Handle an upstream event (seek, QoS, etc.).
+    ///
+    /// Sources are typically the handlers of upstream events like seek.
+    /// Return `EventResult::Handled` if the event was processed,
+    /// `EventResult::NotHandled` otherwise.
+    ///
+    /// Default implementation does not handle any events.
+    fn handle_upstream_event(&mut self, _event: &Event) -> EventResult {
+        EventResult::NotHandled
     }
 }
 
@@ -682,6 +705,17 @@ pub trait Sink: Send {
     fn execution_hints(&self) -> ExecutionHints {
         ExecutionHints::default()
     }
+
+    /// Handle a downstream event (EOS, segment, tags, etc.).
+    ///
+    /// Sinks receive downstream events and can process them.
+    /// Return `Some(event)` to indicate the event was seen (for logging),
+    /// or `None` to consume it silently.
+    ///
+    /// Default implementation forwards all events.
+    fn handle_downstream_event(&mut self, event: Event) -> Option<Event> {
+        Some(event)
+    }
 }
 
 /// An async sink element that consumes buffers asynchronously.
@@ -742,6 +776,17 @@ pub trait AsyncSink: Send {
     fn execution_hints(&self) -> ExecutionHints {
         // Async sinks are typically I/O-bound
         ExecutionHints::io_bound()
+    }
+
+    /// Handle a downstream event (EOS, segment, tags, etc.).
+    ///
+    /// Sinks receive downstream events and can process them.
+    /// Return `Some(event)` to indicate the event was seen (for logging),
+    /// or `None` to consume it silently.
+    ///
+    /// Default implementation forwards all events.
+    fn handle_downstream_event(&mut self, event: Event) -> Option<Event> {
+        Some(event)
     }
 }
 
@@ -834,6 +879,25 @@ pub trait Element: Send {
     fn execution_hints(&self) -> ExecutionHints {
         ExecutionHints::default()
     }
+
+    /// Handle a downstream event (EOS, segment, tags, etc.).
+    ///
+    /// Transform elements can intercept and modify events.
+    /// Return `Some(event)` to forward, `None` to consume.
+    ///
+    /// Default implementation forwards all events.
+    fn handle_downstream_event(&mut self, event: Event) -> Option<Event> {
+        Some(event)
+    }
+
+    /// Handle an upstream event (seek, QoS, etc.).
+    ///
+    /// Return `EventResult::Handled` if processed, `EventResult::NotHandled` to pass upstream.
+    ///
+    /// Default implementation passes all events upstream.
+    fn handle_upstream_event(&mut self, _event: &Event) -> EventResult {
+        EventResult::NotHandled
+    }
 }
 
 // ============================================================================
@@ -921,6 +985,25 @@ pub trait Transform: Send {
     fn execution_hints(&self) -> ExecutionHints {
         ExecutionHints::default()
     }
+
+    /// Handle a downstream event (EOS, segment, tags, etc.).
+    ///
+    /// Transform elements can intercept and modify events.
+    /// Return `Some(event)` to forward, `None` to consume.
+    ///
+    /// Default implementation forwards all events.
+    fn handle_downstream_event(&mut self, event: Event) -> Option<Event> {
+        Some(event)
+    }
+
+    /// Handle an upstream event (seek, QoS, etc.).
+    ///
+    /// Return `EventResult::Handled` if processed, `EventResult::NotHandled` to pass upstream.
+    ///
+    /// Default implementation passes all events upstream.
+    fn handle_upstream_event(&mut self, _event: &Event) -> EventResult {
+        EventResult::NotHandled
+    }
 }
 
 /// An async transform element.
@@ -976,6 +1059,25 @@ pub trait AsyncTransform: Send {
     /// (like encoders) should emit remaining buffers here.
     fn flush(&mut self) -> impl std::future::Future<Output = Result<Output>> + Send {
         async { Ok(Output::None) }
+    }
+
+    /// Handle a downstream event (EOS, segment, tags, etc.).
+    ///
+    /// Transform elements can intercept and modify events.
+    /// Return `Some(event)` to forward, `None` to consume.
+    ///
+    /// Default implementation forwards all events.
+    fn handle_downstream_event(&mut self, event: Event) -> Option<Event> {
+        Some(event)
+    }
+
+    /// Handle an upstream event (seek, QoS, etc.).
+    ///
+    /// Return `EventResult::Handled` if processed, `EventResult::NotHandled` to pass upstream.
+    ///
+    /// Default implementation passes all events upstream.
+    fn handle_upstream_event(&mut self, _event: &Event) -> EventResult {
+        EventResult::NotHandled
     }
 }
 
@@ -1369,6 +1471,29 @@ pub trait AsyncElementDyn {
     /// Default implementation returns no output.
     fn flush(&mut self) -> impl std::future::Future<Output = Result<Output>> + Send {
         async { Ok(Output::None) }
+    }
+
+    /// Handle a downstream event (flows with data: EOS, segment, tags, etc.).
+    ///
+    /// Called when an event arrives from upstream. The element can:
+    /// - Process the event and return `Some(event)` to forward it
+    /// - Consume the event and return `None` to stop propagation
+    /// - Modify the event before forwarding
+    ///
+    /// Default implementation forwards all events unchanged.
+    fn handle_downstream_event(&mut self, event: Event) -> Option<Event> {
+        Some(event)
+    }
+
+    /// Handle an upstream event (flows against data: seek, QoS, etc.).
+    ///
+    /// Called when an event arrives from downstream. The element can:
+    /// - Handle the event and return `EventResult::Handled`
+    /// - Pass it upstream by returning `EventResult::NotHandled`
+    ///
+    /// Default implementation passes all events upstream.
+    fn handle_upstream_event(&mut self, _event: &Event) -> EventResult {
+        EventResult::NotHandled
     }
 }
 
