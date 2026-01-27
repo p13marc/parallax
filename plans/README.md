@@ -37,8 +37,8 @@ Key architectural decisions have been researched and documented in **[00_DESIGN_
 | 03 | [Muxer Synchronization](03_MUXER_SYNCHRONIZATION.md) | High | Large | ⬜ Not Started |
 | 04 | [Pipeline Buffer Pool](04_PIPELINE_BUFFER_POOL.md) | High | Medium | ✅ Complete |
 | 05 | [Element Trait Consolidation](05_ELEMENT_TRAIT_CONSOLIDATION.md) | Medium | Large | ⬜ Not Started |
-| 06 | [Caps Negotiation](06_CAPS_NEGOTIATION.md) | Medium | Medium | ⬜ Not Started |
-| 07 | [Pipeline Builder DSL](07_PIPELINE_BUILDER_DSL.md) | Medium | Small | ⬜ Not Started |
+| 06 | [Caps Negotiation](06_CAPS_NEGOTIATION.md) | Medium | Medium | ✅ Complete |
+| 07 | [Pipeline Builder DSL](07_PIPELINE_BUILDER_DSL.md) | Medium | Small | ✅ Complete |
 | 08 | [Events and Tagging](08_EVENTS_AND_TAGGING.md) | Medium | Medium | ⬜ Not Started |
 
 **Legend:** ⬜ Not Started | 🟡 In Progress | ✅ Complete
@@ -102,32 +102,32 @@ Key architectural decisions have been researched and documented in **[00_DESIGN_
 
 ### Phase 3: Ergonomics (Weeks 4-6)
 
-#### Plan 06: Caps Negotiation
-- [ ] Define `PixelFormat` enum
-- [ ] Define `VideoCaps` with constraints
-- [ ] Define `SampleFormat` and `AudioCaps`
-- [ ] Define `MediaCaps` unified type
-- [ ] Implement `can_intersect()` and `intersect()`
-- [ ] Update `VideoScale` to declare proper caps
-- [ ] Update other video elements to declare caps
-- [ ] Implement `ConverterRegistry`
-- [ ] Implement `YuvToRgbConverter` and `RgbToYuvConverter`
-- [ ] Add `negotiate_with_converters()` to `Pipeline`
-- [ ] Write unit tests
-- [ ] Create example 35
-- [ ] Update documentation
+#### Plan 06: Caps Negotiation ✅
+- [x] Define `PixelFormat` enum (with I420, Nv12, I420_10Le, P010, I422, Yuyv, Uyvy, I444, Rgb24, Rgba, Bgr24, Bgra, Argb, Gray8, Gray16Le)
+- [x] Define `VideoCaps` with constraints (`VideoFormatCaps` with `CapsValue<T>`)
+- [x] Define `SampleFormat` and `AudioCaps` (`AudioFormatCaps` with constraints)
+- [x] Define `MediaCaps` unified type (format + memory)
+- [x] Implement `can_intersect()` and `intersect()` (via `CapsValue::intersect`)
+- [x] Update `VideoScale` to declare proper caps (converters in negotiation/)
+- [x] Update other video elements to declare caps (built-in converters)
+- [x] Implement `ConverterRegistry` (in src/negotiation/converters.rs)
+- [x] Implement `YuvToRgbConverter` and `RgbToYuvConverter` (VideoConvert in builtin.rs)
+- [x] Add `negotiate_with_converters()` to `Pipeline` (via NegotiationSolver)
+- [x] Write unit tests (in src/format.rs)
+- [x] Create example 35 (35_caps_negotiation.rs)
+- [x] Update documentation (CLAUDE.md updated)
 
-#### Plan 07: Pipeline Builder DSL
-- [ ] Implement `PipelineBuilder` with state markers
-- [ ] Implement `source()`, `then()`, `sink()` methods
-- [ ] Implement `source_named()`, `then_named()`, `sink_named()`
-- [ ] Implement `TeeBuilder` for branching
-- [ ] Implement `BranchBuilder`
-- [ ] Implement `>>` operator via `Shr` trait
-- [ ] Add mux support with `MuxBuilder`
-- [ ] Write unit tests
-- [ ] Create example 36
-- [ ] Update documentation
+#### Plan 07: Pipeline Builder DSL ✅
+- [x] Implement `PipelineBuilder` with state markers
+- [x] Implement `source()`, `then()`, `sink()` methods
+- [x] Implement `source_named()`, `then_named()`, `sink_named()`
+- [x] Implement `TeeBuilder` for branching
+- [x] Implement `BranchBuilder`
+- [x] Implement `>>` operator via `Shr` trait
+- [ ] Add mux support with `MuxBuilder` (deferred to Plan 03)
+- [x] Write unit tests
+- [x] Create example 36
+- [x] Update documentation
 
 ### Phase 4: Advanced Features (Weeks 6-8)
 

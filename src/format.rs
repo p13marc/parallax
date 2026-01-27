@@ -358,11 +358,24 @@ impl VideoFormat {
     pub const fn frame_size(&self) -> usize {
         let pixels = self.width as usize * self.height as usize;
         match self.pixel_format {
-            PixelFormat::I420 => pixels * 3 / 2, // Y + U/4 + V/4
-            PixelFormat::Nv12 => pixels * 3 / 2, // Y + UV/2
-            PixelFormat::Yuyv => pixels * 2,     // 2 bytes per pixel
+            // YUV 4:2:0 (1.5 bytes per pixel)
+            PixelFormat::I420 => pixels * 3 / 2,
+            PixelFormat::Nv12 => pixels * 3 / 2,
+            // YUV 4:2:0 10-bit (2.25 bytes per pixel, rounded up)
+            PixelFormat::I420_10Le => pixels * 3, // Each plane is 2 bytes/sample
+            PixelFormat::P010 => pixels * 3,
+            // YUV 4:2:2 (2 bytes per pixel)
+            PixelFormat::I422 => pixels * 2,
+            PixelFormat::Yuyv => pixels * 2,
+            PixelFormat::Uyvy => pixels * 2,
+            // YUV 4:4:4 (3 bytes per pixel)
+            PixelFormat::I444 => pixels * 3,
+            // RGB (3 or 4 bytes per pixel)
             PixelFormat::Rgb24 | PixelFormat::Bgr24 => pixels * 3,
-            PixelFormat::Rgba | PixelFormat::Bgra => pixels * 4,
+            PixelFormat::Rgba | PixelFormat::Bgra | PixelFormat::Argb => pixels * 4,
+            // Grayscale
+            PixelFormat::Gray8 => pixels,
+            PixelFormat::Gray16Le => pixels * 2,
         }
     }
 }
@@ -371,6 +384,9 @@ impl VideoFormat {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum PixelFormat {
+    // ========================================================================
+    // YUV 4:2:0 formats (most common)
+    // ========================================================================
     /// YUV 4:2:0 planar (Y plane, then U plane, then V plane).
     /// Most common format for video codecs.
     #[default]
@@ -378,16 +394,50 @@ pub enum PixelFormat {
     /// YUV 4:2:0 semi-planar (Y plane, then interleaved UV plane).
     /// Common for hardware decoders.
     Nv12,
+    /// YUV 4:2:0 planar, 10-bit little endian.
+    /// Used by 10-bit HEVC, AV1.
+    I420_10Le,
+    /// YUV 4:2:0 semi-planar, 10-bit.
+    /// Common for 10-bit hardware decoders.
+    P010,
+
+    // ========================================================================
+    // YUV 4:2:2 formats (broadcast quality)
+    // ========================================================================
+    /// YUV 4:2:2 planar (Y plane, then U plane, then V plane).
+    I422,
     /// YUV 4:2:2 packed (Y0 U Y1 V).
     Yuyv,
-    /// RGB 8-bit per channel, packed.
+    /// YUV 4:2:2 packed (U Y0 V Y1).
+    Uyvy,
+
+    // ========================================================================
+    // YUV 4:4:4 formats (full chroma)
+    // ========================================================================
+    /// YUV 4:4:4 planar.
+    I444,
+
+    // ========================================================================
+    // RGB formats
+    // ========================================================================
+    /// RGB 8-bit per channel, packed (24 bits/pixel).
     Rgb24,
-    /// RGBA 8-bit per channel, packed.
+    /// RGBA 8-bit per channel, packed (32 bits/pixel).
     Rgba,
-    /// BGR 8-bit per channel, packed.
+    /// BGR 8-bit per channel, packed (24 bits/pixel).
     Bgr24,
-    /// BGRA 8-bit per channel, packed.
+    /// BGRA 8-bit per channel, packed (32 bits/pixel).
     Bgra,
+    /// ARGB 8-bit per channel, packed (32 bits/pixel).
+    Argb,
+
+    // ========================================================================
+    // Grayscale formats
+    // ========================================================================
+    /// 8-bit grayscale.
+    Gray8,
+    /// 16-bit grayscale little endian.
+    Gray16Le,
 }
 
 /// Video codecs.
@@ -728,6 +778,85 @@ impl VideoFormatCaps {
         }
     }
 
+    // ========================================================================
+    // Convenience constructors for common formats
+    // ========================================================================
+
+    /// Create caps for YUV 4:2:0 video (I420) of any size.
+    ///
+    /// This is the most common format for video codecs.
+    pub fn yuv420() -> Self {
+        Self {
+            pixel_format: CapsValue::Fixed(PixelFormat::I420),
+            ..Self::any()
+        }
+    }
+
+    /// Create caps for YUV 4:2:0 video with specific dimensions.
+    pub fn yuv420_size(width: u32, height: u32) -> Self {
+        Self {
+            width: CapsValue::Fixed(width),
+            height: CapsValue::Fixed(height),
+            pixel_format: CapsValue::Fixed(PixelFormat::I420),
+            framerate: CapsValue::Any,
+        }
+    }
+
+    /// Create caps accepting multiple YUV formats.
+    pub fn yuv() -> Self {
+        Self {
+            pixel_format: CapsValue::List(vec![
+                PixelFormat::I420,
+                PixelFormat::Nv12,
+                PixelFormat::I422,
+                PixelFormat::I444,
+            ]),
+            ..Self::any()
+        }
+    }
+
+    /// Create caps for RGB formats.
+    pub fn rgb() -> Self {
+        Self {
+            pixel_format: CapsValue::List(vec![PixelFormat::Rgb24, PixelFormat::Rgba]),
+            ..Self::any()
+        }
+    }
+
+    /// Create caps for RGBA video.
+    pub fn rgba() -> Self {
+        Self {
+            pixel_format: CapsValue::Fixed(PixelFormat::Rgba),
+            ..Self::any()
+        }
+    }
+
+    /// Create caps with a specific size constraint.
+    pub fn with_size(mut self, width: u32, height: u32) -> Self {
+        self.width = CapsValue::Fixed(width);
+        self.height = CapsValue::Fixed(height);
+        self
+    }
+
+    /// Create caps with a size range.
+    pub fn with_size_range(mut self, min_w: u32, max_w: u32, min_h: u32, max_h: u32) -> Self {
+        self.width = CapsValue::Range {
+            min: min_w,
+            max: max_w,
+        };
+        self.height = CapsValue::Range {
+            min: min_h,
+            max: max_h,
+        };
+        self
+    }
+
+    /// Create caps with a specific framerate.
+    pub fn with_framerate(mut self, framerate: Framerate) -> Self {
+        self.framerate = CapsValue::Fixed(framerate);
+        self
+    }
+
     /// Intersect with another video caps.
     pub fn intersect(&self, other: &Self) -> Option<Self> {
         Some(Self {
@@ -810,6 +939,68 @@ impl AudioFormatCaps {
             channels: CapsValue::Fixed(format.channels),
             sample_format: CapsValue::Fixed(format.sample_format),
         }
+    }
+
+    // ========================================================================
+    // Convenience constructors for common formats
+    // ========================================================================
+
+    /// Create caps for S16 audio (most common format).
+    pub fn s16() -> Self {
+        Self {
+            sample_format: CapsValue::Fixed(SampleFormat::S16),
+            ..Self::any()
+        }
+    }
+
+    /// Create caps for F32 audio (common for processing).
+    pub fn f32() -> Self {
+        Self {
+            sample_format: CapsValue::Fixed(SampleFormat::F32),
+            ..Self::any()
+        }
+    }
+
+    /// Create caps for stereo audio.
+    pub fn stereo() -> Self {
+        Self {
+            channels: CapsValue::Fixed(2),
+            ..Self::any()
+        }
+    }
+
+    /// Create caps for mono audio.
+    pub fn mono() -> Self {
+        Self {
+            channels: CapsValue::Fixed(1),
+            ..Self::any()
+        }
+    }
+
+    /// Create caps for standard rates (44100, 48000).
+    pub fn standard_rates() -> Self {
+        Self {
+            sample_rate: CapsValue::List(vec![48000, 44100]),
+            ..Self::any()
+        }
+    }
+
+    /// Create caps with a specific sample rate.
+    pub fn with_rate(mut self, rate: u32) -> Self {
+        self.sample_rate = CapsValue::Fixed(rate);
+        self
+    }
+
+    /// Create caps with a specific channel count.
+    pub fn with_channels(mut self, channels: u16) -> Self {
+        self.channels = CapsValue::Fixed(channels);
+        self
+    }
+
+    /// Create caps with a specific sample format.
+    pub fn with_format(mut self, format: SampleFormat) -> Self {
+        self.sample_format = CapsValue::Fixed(format);
+        self
     }
 
     /// Intersect with another audio caps.

@@ -3,11 +3,27 @@
 //! This module provides the core pipeline infrastructure:
 //!
 //! - [`Pipeline`]: The main pipeline container and DAG
+//! - [`PipelineBuilder`]: Fluent builder for constructing pipelines
 //! - [`Node`]: A node in the pipeline graph (wraps an element)
 //! - [`Link`]: A connection between nodes
 //! - [`PipelineEvent`]: Async events emitted during execution
 //!
-//! # Example
+//! # Builder Example
+//!
+//! ```rust,ignore
+//! use parallax::pipeline::PipelineBuilder;
+//!
+//! // Fluent builder API
+//! let pipeline = PipelineBuilder::new()
+//!     .source(VideoTestSrc::new())
+//!     .then(VideoScale::new(1920, 1080, 1280, 720))
+//!     .sink(FileSink::new("output.yuv"))
+//!     .build()?;
+//!
+//! pipeline.run().await?;
+//! ```
+//!
+//! # Manual Example
 //!
 //! ```rust,ignore
 //! use parallax::pipeline::Pipeline;
@@ -28,6 +44,7 @@
 //! pipeline.run().await?;
 //! ```
 
+mod builder;
 mod driver;
 mod events;
 mod executor;
@@ -54,6 +71,12 @@ pub use rt_scheduler::{
 // Unified executor (primary API)
 pub use unified_executor::{
     Executor, ExecutorConfig as UnifiedExecutorConfig, PipelineHandle as UnifiedPipelineHandle,
+};
+
+// Builder API
+pub use builder::{
+    BranchBuilder, BuiltPipeline, ChainedTransform, ChainedTransform2, FromSource, PipelineBuilder,
+    PipelineFragment, TeeBuilder, ToSink, from, to,
 };
 
 // Legacy exports (deprecated - use Executor instead)
