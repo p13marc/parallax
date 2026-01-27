@@ -2,43 +2,42 @@
 //!
 //! Run with: cargo run --example 01_hello_pipeline
 
-use parallax::buffer::{Buffer, MemoryHandle};
-use parallax::element::{DynAsyncElement, Sink, SinkAdapter, Source, SourceAdapter};
+use parallax::element::{
+    ConsumeContext, DynAsyncElement, ProduceContext, ProduceResult, Sink, SinkAdapter, Source,
+    SourceAdapter,
+};
 use parallax::error::Result;
-use parallax::memory::{HeapSegment, MemorySegment};
-use parallax::metadata::Metadata;
 use parallax::pipeline::Pipeline;
-use std::sync::Arc;
 
 struct HelloSource {
     sent: bool,
 }
 
 impl Source for HelloSource {
-    fn produce(&mut self) -> Result<Option<Buffer>> {
+    fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
         if self.sent {
-            return Ok(None);
+            return Ok(ProduceResult::Eos);
         }
         self.sent = true;
 
         let data = b"Hello, Pipeline!";
-        let segment = Arc::new(HeapSegment::new(data.len())?);
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), segment.as_mut_ptr().unwrap(), data.len());
-        }
+        let output = ctx.output();
+        let len = data.len().min(output.len());
+        output[..len].copy_from_slice(&data[..len]);
 
-        Ok(Some(Buffer::new(
-            MemoryHandle::from_segment(segment),
-            Metadata::new(),
-        )))
+        Ok(ProduceResult::Produced(len))
+    }
+
+    fn preferred_buffer_size(&self) -> Option<usize> {
+        Some(16) // "Hello, Pipeline!" is 16 bytes
     }
 }
 
 struct PrintSink;
 
 impl Sink for PrintSink {
-    fn consume(&mut self, buffer: Buffer) -> Result<()> {
-        let text = std::str::from_utf8(buffer.as_bytes()).unwrap_or("<invalid utf8>");
+    fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
+        let text = std::str::from_utf8(ctx.input()).unwrap_or("<invalid utf8>");
         println!("Received: {}", text);
         Ok(())
     }

@@ -3,7 +3,7 @@
 //! Run with: cargo run --example 14_ipc_manual
 
 use parallax::buffer::{Buffer, MemoryHandle};
-use parallax::element::{Sink, Source};
+use parallax::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
 use parallax::elements::{IpcSink, IpcSrc};
 use parallax::error::Result;
 use parallax::memory::{HeapSegment, MemorySegment};
@@ -25,14 +25,16 @@ fn main() -> Result<()> {
     let consumer = thread::spawn(move || -> Result<u64> {
         let mut src = IpcSrc::new(&socket_path);
         let mut count = 0u64;
+        let mut ctx = ProduceContext::without_buffer();
 
         loop {
-            match src.produce()? {
-                Some(_buffer) => {
+            match src.produce(&mut ctx)? {
+                ProduceResult::OwnBuffer(_buffer) => {
                     count += 1;
                     println!("Received buffer {}", count);
                 }
-                None => break,
+                ProduceResult::Eos => break,
+                _ => {}
             }
         }
         Ok(count)
@@ -58,7 +60,8 @@ fn main() -> Result<()> {
                 MemoryHandle::from_segment(segment),
                 Metadata::from_sequence(i),
             );
-            sink.consume(buffer)?;
+            let ctx = ConsumeContext::new(&buffer);
+            sink.consume(&ctx)?;
             println!("Sent buffer {}", i + 1);
         }
         Ok(())

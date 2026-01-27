@@ -81,26 +81,112 @@ impl MemoryHandle {
 
 ## Element Module
 
+### `ProduceContext`
+
+Context passed to sources for zero-allocation buffer production.
+
+```rust
+pub struct ProduceContext<'a> {
+    // Contains pre-allocated buffer slot from arena pool
+}
+
+impl<'a> ProduceContext<'a> {
+    /// Create a context without a pre-allocated buffer
+    pub fn without_buffer() -> Self;
+    
+    /// Check if a pre-allocated buffer is available
+    pub fn has_buffer(&self) -> bool;
+    
+    /// Get the capacity of the pre-allocated buffer
+    pub fn capacity(&self) -> usize;
+    
+    /// Get mutable access to the output buffer
+    pub fn output(&mut self) -> &mut [u8];
+    
+    /// Set the sequence number in metadata
+    pub fn set_sequence(&mut self, seq: u64);
+    
+    /// Set the PTS (presentation timestamp)
+    pub fn set_pts(&mut self, pts: ClockTime);
+    
+    /// Set keyframe flag
+    pub fn set_keyframe(&mut self, is_keyframe: bool);
+    
+    /// Get mutable access to metadata
+    pub fn metadata_mut(&mut self) -> &mut Metadata;
+}
+```
+
+### `ProduceResult`
+
+Result type returned by sources.
+
+```rust
+pub enum ProduceResult {
+    /// Source wrote n bytes to the provided buffer
+    Produced(usize),
+    
+    /// End of stream
+    Eos,
+    
+    /// Source provides its own buffer (fallback)
+    OwnBuffer(Buffer),
+    
+    /// No data available yet (non-blocking)
+    WouldBlock,
+}
+```
+
+### `ConsumeContext`
+
+Context passed to sinks for buffer consumption.
+
+```rust
+pub struct ConsumeContext<'a> {
+    // Contains reference to the buffer
+}
+
+impl<'a> ConsumeContext<'a> {
+    /// Create a context from a buffer
+    pub fn new(buffer: &'a Buffer) -> Self;
+    
+    /// Get the input data as bytes
+    pub fn input(&self) -> &[u8];
+    
+    /// Get the buffer length
+    pub fn len(&self) -> usize;
+    
+    /// Get access to the buffer metadata
+    pub fn metadata(&self) -> &Metadata;
+    
+    /// Get a reference to the underlying buffer
+    pub fn buffer(&self) -> &Buffer;
+}
+```
+
 ### `Source` Trait
 
-Produces buffers.
+Produces buffers using a context for zero-allocation.
 
 ```rust
 pub trait Source: Send {
-    /// Produce the next buffer
-    /// Returns Ok(None) for end-of-stream
-    fn produce(&mut self) -> Result<Option<Buffer<()>>>;
+    /// Produce data into the provided context
+    /// Returns ProduceResult indicating what was produced
+    fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult>;
+    
+    /// Hint for preferred buffer size (optional)
+    fn preferred_buffer_size(&self) -> Option<usize> { None }
 }
 ```
 
 ### `Sink` Trait
 
-Consumes buffers.
+Consumes buffers via context.
 
 ```rust
 pub trait Sink: Send {
-    /// Consume a buffer
-    fn consume(&mut self, buffer: Buffer<()>) -> Result<()>;
+    /// Consume a buffer from the context
+    fn consume(&mut self, ctx: &ConsumeContext) -> Result<()>;
 }
 ```
 
@@ -112,7 +198,7 @@ Transforms buffers.
 pub trait Element: Send {
     /// Process a buffer, optionally producing output
     /// Returns Ok(None) to filter out the buffer
-    fn process(&mut self, buffer: Buffer<()>) -> Result<Option<Buffer<()>>>;
+    fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>>;
 }
 ```
 
@@ -122,8 +208,22 @@ Async source for I/O-bound operations.
 
 ```rust
 pub trait AsyncSource: Send {
-    /// Produce the next buffer asynchronously
-    fn produce_async(&mut self) -> impl Future<Output = Result<Option<Buffer<()>>>> + Send;
+    /// Produce data asynchronously into the provided context
+    fn produce(&mut self, ctx: &mut ProduceContext<'_>) -> impl Future<Output = Result<ProduceResult>> + Send;
+    
+    /// Hint for preferred buffer size (optional)
+    fn preferred_buffer_size(&self) -> Option<usize> { None }
+}
+```
+
+### `AsyncSink` Trait
+
+Async sink for I/O-bound operations.
+
+```rust
+pub trait AsyncSink: Send {
+    /// Consume a buffer asynchronously
+    fn consume(&mut self, ctx: &ConsumeContext<'_>) -> impl Future<Output = Result<()>> + Send;
 }
 ```
 

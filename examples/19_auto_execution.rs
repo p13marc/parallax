@@ -17,14 +17,12 @@
 //!
 //! Run with: cargo run --example 19_auto_execution
 
-use parallax::buffer::{Buffer, MemoryHandle};
+use parallax::buffer::Buffer;
 use parallax::element::{
-    DynAsyncElement, Element, ElementAdapter, ExecutionHints, ProcessingHint, Sink, SinkAdapter,
-    Source, SourceAdapter,
+    ConsumeContext, DynAsyncElement, Element, ElementAdapter, ExecutionHints, ProcessingHint,
+    ProduceContext, ProduceResult, Sink, SinkAdapter, Source, SourceAdapter,
 };
 use parallax::error::Result;
-use parallax::memory::HeapSegment;
-use parallax::metadata::Metadata;
 use parallax::pipeline::{Executor, Pipeline, UnifiedExecutorConfig};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,15 +34,21 @@ struct TestSource {
 }
 
 impl Source for TestSource {
-    fn produce(&mut self) -> Result<Option<Buffer>> {
+    fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
         if self.current >= self.max {
-            return Ok(None);
+            return Ok(ProduceResult::Eos);
         }
-        let segment = Arc::new(HeapSegment::new(8)?);
-        let handle = MemoryHandle::from_segment(segment);
-        let buffer = Buffer::new(handle, Metadata::from_sequence(self.current));
+        let data = self.current.to_le_bytes();
+        let output = ctx.output();
+        let len = data.len().min(output.len());
+        output[..len].copy_from_slice(&data[..len]);
+        ctx.set_sequence(self.current);
         self.current += 1;
-        Ok(Some(buffer))
+        Ok(ProduceResult::Produced(len))
+    }
+
+    fn preferred_buffer_size(&self) -> Option<usize> {
+        Some(8)
     }
 
     // Override execution_hints to indicate this is I/O-bound
@@ -130,7 +134,7 @@ struct TrustedSink {
 }
 
 impl Sink for TrustedSink {
-    fn consume(&mut self, _buffer: Buffer) -> Result<()> {
+    fn consume(&mut self, _ctx: &ConsumeContext) -> Result<()> {
         self.received.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }

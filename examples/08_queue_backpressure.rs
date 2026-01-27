@@ -2,14 +2,12 @@
 //!
 //! Run with: cargo run --example 08_queue_backpressure
 
-use parallax::buffer::{Buffer, MemoryHandle};
 use parallax::element::{
-    DynAsyncElement, ElementAdapter, Sink, SinkAdapter, Source, SourceAdapter,
+    ConsumeContext, DynAsyncElement, ElementAdapter, ProduceContext, ProduceResult, Sink,
+    SinkAdapter, Source, SourceAdapter,
 };
 use parallax::elements::{LeakyMode, Queue};
 use parallax::error::Result;
-use parallax::memory::{HeapSegment, MemorySegment};
-use parallax::metadata::Metadata;
 use parallax::pipeline::Pipeline;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,24 +19,21 @@ struct FastSource {
 }
 
 impl Source for FastSource {
-    fn produce(&mut self) -> Result<Option<Buffer>> {
+    fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
         if self.current >= self.max {
-            return Ok(None);
+            return Ok(ProduceResult::Eos);
         }
-        let segment = Arc::new(HeapSegment::new(8)?);
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                self.current.to_le_bytes().as_ptr(),
-                segment.as_mut_ptr().unwrap(),
-                8,
-            );
-        }
-        let buffer = Buffer::new(
-            MemoryHandle::from_segment(segment),
-            Metadata::from_sequence(self.current),
-        );
+        let data = self.current.to_le_bytes();
+        let output = ctx.output();
+        let len = data.len().min(output.len());
+        output[..len].copy_from_slice(&data[..len]);
+        ctx.set_sequence(self.current);
         self.current += 1;
-        Ok(Some(buffer))
+        Ok(ProduceResult::Produced(len))
+    }
+
+    fn preferred_buffer_size(&self) -> Option<usize> {
+        Some(8)
     }
 }
 
@@ -47,7 +42,7 @@ struct SlowSink {
 }
 
 impl Sink for SlowSink {
-    fn consume(&mut self, _buffer: Buffer) -> Result<()> {
+    fn consume(&mut self, _ctx: &ConsumeContext) -> Result<()> {
         // Simulate slow processing
         std::thread::sleep(Duration::from_millis(10));
         self.received.fetch_add(1, Ordering::Relaxed);

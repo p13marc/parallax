@@ -2,8 +2,7 @@
 //!
 //! Run with: cargo run --example 15_video_testsrc
 
-use parallax::buffer::Buffer;
-use parallax::element::{DynAsyncElement, Sink, SinkAdapter, SourceAdapter};
+use parallax::element::{ConsumeContext, DynAsyncElement, Sink, SinkAdapter, SourceAdapter};
 use parallax::elements::{PixelFormat, VideoPattern, VideoTestSrc};
 use parallax::error::Result;
 use parallax::pipeline::Pipeline;
@@ -17,13 +16,13 @@ struct FrameCounter {
 }
 
 impl Sink for FrameCounter {
-    fn consume(&mut self, buffer: Buffer) -> Result<()> {
+    fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
         let n = self.count.fetch_add(1, Ordering::Relaxed);
         let expected_size = (self.width * self.height * 4) as usize; // RGBA32
         println!(
             "Frame {}: {} bytes (expected {})",
             n,
-            buffer.len(),
+            ctx.len(),
             expected_size
         );
         Ok(())

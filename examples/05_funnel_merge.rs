@@ -2,12 +2,12 @@
 //!
 //! Run with: cargo run --example 05_funnel_merge
 
-use parallax::buffer::{Buffer, MemoryHandle};
-use parallax::element::{DynAsyncElement, Sink, SinkAdapter, Source, SourceAdapter};
-use parallax::elements::{Funnel, FunnelInput};
+use parallax::element::{
+    ConsumeContext, DynAsyncElement, ProduceContext, ProduceResult, Sink, SinkAdapter, Source,
+    SourceAdapter,
+};
+use parallax::elements::Funnel;
 use parallax::error::Result;
-use parallax::memory::{HeapSegment, MemorySegment};
-use parallax::metadata::Metadata;
 use parallax::pipeline::Pipeline;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,23 +19,23 @@ struct TaggedSource {
 }
 
 impl Source for TaggedSource {
-    fn produce(&mut self) -> Result<Option<Buffer>> {
+    fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
         if self.current >= self.max {
-            return Ok(None);
+            return Ok(ProduceResult::Eos);
         }
         // First byte is tag, rest is counter
-        let segment = Arc::new(HeapSegment::new(9)?);
-        unsafe {
-            let ptr = segment.as_mut_ptr().unwrap();
-            *ptr = self.tag;
-            std::ptr::copy_nonoverlapping(self.current.to_le_bytes().as_ptr(), ptr.add(1), 8);
+        let output = ctx.output();
+        if output.len() >= 9 {
+            output[0] = self.tag;
+            output[1..9].copy_from_slice(&self.current.to_le_bytes());
         }
-        let buffer = Buffer::new(
-            MemoryHandle::from_segment(segment),
-            Metadata::from_sequence(self.current),
-        );
+        ctx.set_sequence(self.current);
         self.current += 1;
-        Ok(Some(buffer))
+        Ok(ProduceResult::Produced(9))
+    }
+
+    fn preferred_buffer_size(&self) -> Option<usize> {
+        Some(9) // 1 byte tag + 8 bytes u64
     }
 }
 
@@ -44,8 +44,8 @@ struct PrintSink {
 }
 
 impl Sink for PrintSink {
-    fn consume(&mut self, buffer: Buffer) -> Result<()> {
-        let data = buffer.as_bytes();
+    fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
+        let data = ctx.input();
         let tag = data[0];
         let value = u64::from_le_bytes(data[1..9].try_into().unwrap());
         println!("From source {}: value {}", tag as char, value);

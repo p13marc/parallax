@@ -26,11 +26,11 @@
 //!
 //! Run with: cargo run --example 20_dynamic_state
 
-use parallax::buffer::{Buffer, MemoryHandle};
-use parallax::element::{DynAsyncElement, Sink, SinkAdapter, Source, SourceAdapter};
+use parallax::element::{
+    ConsumeContext, DynAsyncElement, ProduceContext, ProduceResult, Sink, SinkAdapter, Source,
+    SourceAdapter,
+};
 use parallax::error::Result;
-use parallax::memory::{HeapSegment, MemorySegment};
-use parallax::metadata::Metadata;
 use parallax::pipeline::{Executor, Pipeline, PipelineState};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -42,22 +42,21 @@ struct NumberSource {
 }
 
 impl Source for NumberSource {
-    fn produce(&mut self) -> Result<Option<Buffer>> {
+    fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
         if self.current >= self.max {
-            return Ok(None);
+            return Ok(ProduceResult::Eos);
         }
-        let segment = Arc::new(HeapSegment::new(8)?);
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                self.current.to_le_bytes().as_ptr(),
-                segment.as_mut_ptr().unwrap(),
-                8,
-            );
-        }
-        let handle = MemoryHandle::from_segment(segment);
-        let buffer = Buffer::new(handle, Metadata::from_sequence(self.current));
+        let data = self.current.to_le_bytes();
+        let output = ctx.output();
+        let len = data.len().min(output.len());
+        output[..len].copy_from_slice(&data[..len]);
+        ctx.set_sequence(self.current);
         self.current += 1;
-        Ok(Some(buffer))
+        Ok(ProduceResult::Produced(len))
+    }
+
+    fn preferred_buffer_size(&self) -> Option<usize> {
+        Some(8)
     }
 }
 
@@ -67,7 +66,7 @@ struct CountingSink {
 }
 
 impl Sink for CountingSink {
-    fn consume(&mut self, _buffer: Buffer) -> Result<()> {
+    fn consume(&mut self, _ctx: &ConsumeContext) -> Result<()> {
         self.count.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }

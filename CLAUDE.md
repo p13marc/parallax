@@ -396,16 +396,28 @@ pub enum Affinity {
     Auto,      // Let scheduler decide based on is_rt_safe()
 }
 
+// Buffer production context (PipeWire-style zero-allocation)
+pub enum ProduceResult {
+    Produced(usize),   // Wrote n bytes to provided buffer
+    Eos,               // End of stream
+    OwnBuffer(Buffer), // Source provides its own buffer (fallback)
+    WouldBlock,        // No data available yet
+}
+
+pub struct ProduceContext<'a> { /* pre-allocated buffer slot */ }
+pub struct ConsumeContext<'a> { /* reference to buffer */ }
+
 // Element traits (sync)
 pub trait Source: Send {
-    fn produce(&mut self) -> Result<Option<Buffer>>;
+    fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult>;
+    fn preferred_buffer_size(&self) -> Option<usize> { None }
     fn affinity(&self) -> Affinity { Affinity::Auto }
     fn is_rt_safe(&self) -> bool { false }
     fn execution_hints(&self) -> ExecutionHints { ExecutionHints::default() }
 }
 
 pub trait Sink: Send {
-    fn consume(&mut self, buffer: Buffer) -> Result<()>;
+    fn consume(&mut self, ctx: &ConsumeContext) -> Result<()>;
     fn affinity(&self) -> Affinity { Affinity::Auto }
     fn is_rt_safe(&self) -> bool { false }
     fn execution_hints(&self) -> ExecutionHints { ExecutionHints::default() }
@@ -420,14 +432,15 @@ pub trait Element: Send {
 
 // Element traits (async - for I/O bound operations)
 pub trait AsyncSource: Send {
-    fn produce(&mut self) -> impl Future<Output = Result<Option<Buffer>>> + Send;
+    fn produce(&mut self, ctx: &mut ProduceContext<'_>) -> impl Future<Output = Result<ProduceResult>> + Send;
+    fn preferred_buffer_size(&self) -> Option<usize> { None }
     fn affinity(&self) -> Affinity { Affinity::Async }  // Default to async
     fn is_rt_safe(&self) -> bool { false }
     fn execution_hints(&self) -> ExecutionHints { ExecutionHints::io_bound() }
 }
 
 pub trait AsyncSink: Send {
-    fn consume(&mut self, buffer: Buffer) -> impl Future<Output = Result<()>> + Send;
+    fn consume(&mut self, ctx: &ConsumeContext<'_>) -> impl Future<Output = Result<()>> + Send;
     fn affinity(&self) -> Affinity { Affinity::Async }
     fn is_rt_safe(&self) -> bool { false }
     fn execution_hints(&self) -> ExecutionHints { ExecutionHints::io_bound() }

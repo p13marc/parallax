@@ -2,13 +2,12 @@
 //!
 //! Run with: cargo run --example 02_counting_source
 
-use parallax::buffer::{Buffer, MemoryHandle};
-use parallax::element::{DynAsyncElement, Sink, SinkAdapter, Source, SourceAdapter};
+use parallax::element::{
+    ConsumeContext, DynAsyncElement, ProduceContext, ProduceResult, Sink, SinkAdapter, Source,
+    SourceAdapter,
+};
 use parallax::error::Result;
-use parallax::memory::{HeapSegment, MemorySegment};
-use parallax::metadata::Metadata;
 use parallax::pipeline::Pipeline;
-use std::sync::Arc;
 
 struct CountingSource {
     current: u64,
@@ -16,24 +15,23 @@ struct CountingSource {
 }
 
 impl Source for CountingSource {
-    fn produce(&mut self) -> Result<Option<Buffer>> {
+    fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
         if self.current >= self.max {
-            return Ok(None); // End of stream
+            return Ok(ProduceResult::Eos); // End of stream
         }
 
-        let segment = Arc::new(HeapSegment::new(8)?);
         let data = self.current.to_le_bytes();
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), segment.as_mut_ptr().unwrap(), 8);
-        }
-
-        let buffer = Buffer::new(
-            MemoryHandle::from_segment(segment),
-            Metadata::from_sequence(self.current),
-        );
+        let output = ctx.output();
+        let len = data.len().min(output.len());
+        output[..len].copy_from_slice(&data[..len]);
+        ctx.set_sequence(self.current);
 
         self.current += 1;
-        Ok(Some(buffer))
+        Ok(ProduceResult::Produced(len))
+    }
+
+    fn preferred_buffer_size(&self) -> Option<usize> {
+        Some(8) // We need 8 bytes for a u64
     }
 }
 
@@ -42,8 +40,8 @@ struct PrintSink {
 }
 
 impl Sink for PrintSink {
-    fn consume(&mut self, buffer: Buffer) -> Result<()> {
-        let value = u64::from_le_bytes(buffer.as_bytes().try_into().unwrap());
+    fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
+        let value = u64::from_le_bytes(ctx.input().try_into().unwrap());
         println!("Buffer {}: value = {}", self.count, value);
         self.count += 1;
         Ok(())
