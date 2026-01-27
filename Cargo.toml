@@ -130,6 +130,10 @@ harness = false
 name = "memory_pool"
 harness = false
 
+[[bench]]
+name = "isolation"
+harness = false
+
 # Examples - one concept per file, numbered for learning order
 
 [[example]]
