@@ -247,6 +247,43 @@ SharedArena Memory Layout:
 
 This improves on PipeWire's approach which uses per-process refcounting with message-based coordination.
 
+### Pipeline Buffer Pool
+
+Parallax provides a pipeline-level buffer pool for efficient buffer management:
+
+```rust
+// Create a pool with 10 buffers of 1MB each
+let pool = FixedBufferPool::new(1024 * 1024, 10)?;
+
+// Attach pool to source
+let src = SourceAdapter::with_pool(my_source, pool.clone());
+
+// Or set on pipeline for auto-sizing based on caps
+pipeline.create_pool_from_caps(10)?;
+```
+
+**Key types:**
+- `BufferPool` - Trait for buffer pool implementations
+- `FixedBufferPool` - Fixed-size pool backed by `CpuArena`
+- `PooledBuffer` - RAII buffer that returns to pool on drop
+- `PoolStats` - Statistics (acquisitions, waits, availability)
+
+**Features:**
+- **Backpressure**: `acquire()` blocks when pool is exhausted
+- **Zero-allocation**: Pre-allocated buffers, no malloc during processing
+- **Statistics**: Track acquisitions, wait events, and availability
+- **ProduceContext integration**: Sources can use `ctx.acquire_buffer()`
+
+```rust
+// In a Source::produce() implementation
+fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
+    let mut pooled = ctx.acquire_buffer()?;  // Blocks if pool exhausted
+    pooled.data_mut()[..n].copy_from_slice(&data);
+    pooled.set_len(n);
+    Ok(ProduceResult::OwnBuffer(pooled.into_buffer()))
+}
+```
+
 ## Build Commands
 
 ```bash
@@ -299,7 +336,8 @@ parallax/
 │   │   ├── cpu.rs          # CpuSegment (unified memfd-backed memory)
 │   │   ├── arena.rs        # CpuArena (arena allocator, 1 fd per pool)
 │   │   ├── shared_refcount.rs # SharedArena (cross-process refcounting)
-│   │   ├── pool.rs         # MemoryPool, LoanedSlot
+│   │   ├── buffer_pool.rs  # BufferPool trait, FixedBufferPool, PooledBuffer
+│   │   ├── pool.rs         # MemoryPool, LoanedSlot (low-level)
 │   │   ├── bitmap.rs       # AtomicBitmap (lock-free slot tracking)
 │   │   └── ipc.rs          # send_fds/recv_fds (SCM_RIGHTS)
 │   │
@@ -374,7 +412,8 @@ parallax/
 │   ├── 18_demuxer_muxer.rs       # Demuxer and muxer elements
 │   ├── 19_auto_execution.rs      # Automatic execution strategy
 │   ├── 20_dynamic_state.rs       # Dynamic pipeline state changes
-│   └── 24_image_codec.rs         # Image encoding/decoding (PNG)
+│   ├── 24_image_codec.rs         # Image encoding/decoding (PNG)
+│   └── 32_buffer_pool.rs         # Pipeline buffer pooling
 │
 ├── docs/
 │   ├── FINAL_DESIGN_PARALLAX.md  # Complete design document
@@ -456,6 +495,52 @@ pub trait AsyncSink: Send {
 let mut pipeline = Pipeline::parse("videotestsrc ! h264enc ! filesink location=out.h264")?;
 pipeline.run().await?;
 ```
+
+### Custom Metadata API
+
+Buffers can carry extensible typed metadata for domain-specific data like KLV, SEI NALUs, closed captions, or application-specific values.
+
+```rust
+use parallax::metadata::Metadata;
+
+let mut meta = Metadata::new();
+
+// Store and retrieve typed data (any Clone + Send + Sync + Debug + 'static type)
+meta.set("app/frame_id", 12345u64);
+meta.set("app/quality", 0.95f64);
+assert_eq!(meta.get::<u64>("app/frame_id"), Some(&12345));
+
+// Store custom structs
+#[derive(Clone, Debug)]
+struct GpsPosition { lat: f64, lon: f64 }
+meta.set("sensor/gps", GpsPosition { lat: 37.0, lon: -122.0 });
+
+// Convenience methods for raw bytes
+meta.set_bytes("h264/sei", vec![0x06, 0x05, 0x10]);
+assert_eq!(meta.get_bytes("h264/sei"), Some(&[0x06, 0x05, 0x10][..]));
+
+// KLV/STANAG metadata (common in defense/ISR applications)
+meta.set_klv(vec![0x06, 0x0E, 0x2B, 0x34, /* ... */]);
+assert!(meta.klv().is_some());
+
+// Mutate in place
+if let Some(count) = meta.get_mut::<u32>("app/count") {
+    *count += 1;
+}
+
+// Remove metadata
+let removed: Option<u64> = meta.remove("app/frame_id");
+```
+
+**Key namespaces** (use `"domain/type"` format to avoid collisions):
+- `stanag/*` - STANAG/MISB metadata (KLV, VMTI)
+- `h264/*`, `h265/*`, `av1/*` - Codec-specific (SEI, OBUs)
+- `caption/*` - Closed captions (CEA-608, CEA-708)
+- `audio/*` - Audio metadata (loudness, language)
+- `sensor/*` - Sensor data (GPS, IMU, gimbal)
+- `app/*` - Application-specific data
+
+See `examples/31_av1_pipeline_stanag.rs` for a complete example of attaching KLV metadata to video frames.
 
 ## Implementation Roadmap
 
@@ -599,6 +684,7 @@ Most codecs are pure Rust with no external dependencies. Exceptions:
 - Cross-process is true zero-copy (same physical pages via mmap)
 - Arena allocation: 1 fd per pool, not per buffer (avoids fd limits)
 - SharedArena: Cross-process refcounting with O(1) release via lock-free MPSC queue
+- BufferPool: Pipeline-level pooling with natural backpressure when exhausted
 
 ## Documentation
 

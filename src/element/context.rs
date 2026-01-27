@@ -38,7 +38,8 @@
 //! ```
 
 use crate::buffer::{Buffer, MemoryHandle};
-use crate::memory::{ArenaSlot, MemoryPool};
+use crate::error::{Error, Result};
+use crate::memory::{ArenaSlot, BufferPool, MemoryPool, PooledBuffer};
 use crate::metadata::Metadata;
 use std::sync::Arc;
 
@@ -148,6 +149,8 @@ pub struct ProduceContext<'a> {
     metadata: Metadata,
     /// Capacity of the output buffer.
     capacity: usize,
+    /// Optional buffer pool for acquiring additional buffers.
+    pool: Option<&'a dyn BufferPool>,
 }
 
 impl<'a> ProduceContext<'a> {
@@ -169,6 +172,29 @@ impl<'a> ProduceContext<'a> {
             output,
             metadata: Metadata::new(),
             capacity,
+            pool: None,
+        }
+    }
+
+    /// Create a new produce context with a pre-allocated slot and pool access.
+    ///
+    /// # Safety
+    ///
+    /// The slot must remain valid for the lifetime `'a`.
+    pub fn with_pool(slot: ArenaSlot, pool: &'a dyn BufferPool) -> Self {
+        let capacity = slot.len();
+        // SAFETY: We own the slot and it's valid for the duration of this context.
+        // The pointer is valid because ArenaSlot guarantees valid memory.
+        let output = unsafe {
+            let ptr = slot.as_ptr() as *mut u8;
+            Some(std::slice::from_raw_parts_mut(ptr, capacity))
+        };
+        Self {
+            slot: Some(slot),
+            output,
+            metadata: Metadata::new(),
+            capacity,
+            pool: Some(pool),
         }
     }
 
@@ -181,6 +207,20 @@ impl<'a> ProduceContext<'a> {
             output: None,
             metadata: Metadata::new(),
             capacity: 0,
+            pool: None,
+        }
+    }
+
+    /// Create a produce context with only pool access (no pre-allocated buffer).
+    ///
+    /// Sources can acquire buffers from the pool using `acquire_buffer()`.
+    pub fn with_pool_only(pool: &'a dyn BufferPool) -> Self {
+        Self {
+            slot: None,
+            output: None,
+            metadata: Metadata::new(),
+            capacity: 0,
+            pool: Some(pool),
         }
     }
 
@@ -201,6 +241,59 @@ impl<'a> ProduceContext<'a> {
     #[inline]
     pub fn has_buffer(&self) -> bool {
         self.slot.is_some()
+    }
+
+    /// Check if a buffer pool is available.
+    #[inline]
+    pub fn has_pool(&self) -> bool {
+        self.pool.is_some()
+    }
+
+    /// Acquire a buffer from the pool.
+    ///
+    /// This is the preferred method for pool-aware sources. The returned
+    /// `PooledBuffer` can be written to and then converted to a `Buffer`
+    /// using `into_buffer()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no pool is configured.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
+    ///     if ctx.has_pool() {
+    ///         let mut pooled = ctx.acquire_buffer()?;
+    ///         let n = self.reader.read(pooled.data_mut())?;
+    ///         pooled.set_len(n);
+    ///         pooled.metadata_mut().sequence = self.seq;
+    ///         Ok(ProduceResult::OwnBuffer(pooled.into_buffer()))
+    ///     } else {
+    ///         // Fall back to provided buffer
+    ///         let output = ctx.output();
+    ///         let n = self.reader.read(output)?;
+    ///         Ok(ProduceResult::Produced(n))
+    ///     }
+    /// }
+    /// ```
+    pub fn acquire_buffer(&self) -> Result<PooledBuffer> {
+        match self.pool {
+            Some(pool) => pool.acquire(),
+            None => Err(Error::Config("no buffer pool configured".into())),
+        }
+    }
+
+    /// Try to acquire a buffer from the pool without blocking.
+    ///
+    /// Returns `None` if no pool is configured or the pool is exhausted.
+    pub fn try_acquire_buffer(&self) -> Option<PooledBuffer> {
+        self.pool.and_then(|pool| pool.try_acquire())
+    }
+
+    /// Get the buffer pool, if available.
+    pub fn pool(&self) -> Option<&dyn BufferPool> {
+        self.pool
     }
 
     /// Get the capacity of the output buffer.
@@ -1047,6 +1140,70 @@ mod tests {
         assert!(!result.is_produced());
         assert!(!result.is_eos());
         assert!(result.is_would_block());
+    }
+
+    // ProduceContext pool integration tests
+
+    use crate::memory::FixedBufferPool;
+
+    #[test]
+    fn test_produce_context_with_pool() {
+        let pool = FixedBufferPool::new(1024, 4).unwrap();
+        let arena = Arc::new(CpuArena::new(1024, 4).unwrap());
+        let slot = arena.acquire().unwrap();
+
+        let ctx = ProduceContext::with_pool(slot, pool.as_ref());
+
+        assert!(ctx.has_buffer());
+        assert!(ctx.has_pool());
+        assert!(ctx.pool().is_some());
+    }
+
+    #[test]
+    fn test_produce_context_pool_only() {
+        let pool = FixedBufferPool::new(1024, 4).unwrap();
+        let ctx = ProduceContext::with_pool_only(pool.as_ref());
+
+        assert!(!ctx.has_buffer());
+        assert!(ctx.has_pool());
+    }
+
+    #[test]
+    fn test_produce_context_acquire_buffer() {
+        let pool = FixedBufferPool::new(1024, 4).unwrap();
+        let ctx = ProduceContext::with_pool_only(pool.as_ref());
+
+        let mut pooled = ctx.acquire_buffer().unwrap();
+        pooled.data_mut()[..5].copy_from_slice(b"hello");
+        pooled.set_len(5);
+        pooled.metadata_mut().sequence = 42;
+
+        let buffer = pooled.into_buffer();
+        assert_eq!(buffer.len(), 5);
+        assert_eq!(buffer.as_bytes(), b"hello");
+        assert_eq!(buffer.metadata().sequence, 42);
+    }
+
+    #[test]
+    fn test_produce_context_try_acquire_buffer() {
+        let pool = FixedBufferPool::new(1024, 2).unwrap();
+        let ctx = ProduceContext::with_pool_only(pool.as_ref());
+
+        // Acquire both buffers
+        let _buf1 = ctx.try_acquire_buffer().unwrap();
+        let _buf2 = ctx.try_acquire_buffer().unwrap();
+
+        // Pool exhausted
+        assert!(ctx.try_acquire_buffer().is_none());
+    }
+
+    #[test]
+    fn test_produce_context_no_pool_error() {
+        let ctx = ProduceContext::without_buffer();
+
+        assert!(!ctx.has_pool());
+        assert!(ctx.acquire_buffer().is_err());
+        assert!(ctx.try_acquire_buffer().is_none());
     }
 
     // ConsumeContext tests

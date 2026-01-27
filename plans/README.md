@@ -32,7 +32,7 @@ Key architectural decisions have been researched and documented in **[00_DESIGN_
 | # | Plan | Priority | Effort | Progress |
 |---|------|----------|--------|----------|
 | 00 | [Design Decisions](00_DESIGN_DECISIONS.md) | - | - | ✅ Complete |
-| 01 | [Custom Metadata API](01_CUSTOM_METADATA_API.md) | High | Small | ⬜ Not Started |
+| 01 | [Custom Metadata API](01_CUSTOM_METADATA_API.md) | High | Small | ✅ Complete |
 | 02 | [Codec Element Wrappers](02_CODEC_ELEMENT_WRAPPERS.md) | High | Medium | ⬜ Not Started |
 | 03 | [Muxer Synchronization](03_MUXER_SYNCHRONIZATION.md) | High | Large | ⬜ Not Started |
 | 04 | [Pipeline Buffer Pool](04_PIPELINE_BUFFER_POOL.md) | High | Medium | ⬜ Not Started |
@@ -49,15 +49,15 @@ Key architectural decisions have been researched and documented in **[00_DESIGN_
 
 ### Phase 1: Foundation (Weeks 1-2)
 
-#### Plan 01: Custom Metadata API
-- [ ] Define `custom` HashMap field in `Metadata` struct
-- [ ] Implement `set<T>()` and `get<T>()` methods
-- [ ] Implement `set_bytes()` and `get_bytes()` convenience methods
-- [ ] Add `set_klv()` / `klv()` convenience methods
-- [ ] Add `metadata_mut()` to `Buffer`
-- [ ] Write unit tests
-- [ ] Update example 31 to use new API
-- [ ] Update documentation
+#### Plan 01: Custom Metadata API ✅
+- [x] Define `custom` HashMap field in `Metadata` struct
+- [x] Implement `set<T>()` and `get<T>()` methods
+- [x] Implement `set_bytes()` and `get_bytes()` convenience methods
+- [x] Add `set_klv()` / `klv()` convenience methods
+- [x] Add `metadata_mut()` to `Buffer` (already existed)
+- [x] Write unit tests (15 tests in `src/metadata.rs`)
+- [x] Update example 31 to use new API
+- [x] Update documentation (CLAUDE.md)
 
 #### Plan 04: Pipeline Buffer Pool
 - [ ] Define `BufferPool` trait

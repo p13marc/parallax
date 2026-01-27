@@ -49,6 +49,7 @@
 
 mod arena;
 mod bitmap;
+mod buffer_pool;
 mod cpu;
 mod heap;
 mod huge_pages;
@@ -61,6 +62,7 @@ mod shared_refcount;
 
 pub use arena::{Access, ArenaCache, ArenaSlot, CpuArena, IpcSlotRef};
 pub use bitmap::AtomicBitmap;
+pub use buffer_pool::{BufferPool, FixedBufferPool, PoolStats, PooledBuffer};
 pub use cpu::CpuSegment;
 pub use huge_pages::{HugePageSegment, HugePageSize};
 pub use mapped_file::MappedFileSegment;

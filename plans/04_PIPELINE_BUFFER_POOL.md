@@ -559,15 +559,15 @@ Pool Hierarchy:
 
 ## Validation Criteria
 
-- [ ] `BufferPool` trait defined
-- [ ] `FixedSizePool` implements `BufferPool`
-- [ ] `PooledBuffer` returns to pool on drop
-- [ ] `ProduceContext` supports pool acquisition
-- [ ] Pipeline can create/configure pool
-- [ ] Executor passes pool to sources
-- [ ] Backpressure works (blocks when exhausted)
-- [ ] Statistics tracking works
-- [ ] All existing tests pass
+- [x] `BufferPool` trait defined
+- [x] `FixedSizePool` implements `BufferPool`
+- [x] `PooledBuffer` returns to pool on drop
+- [x] `ProduceContext` supports pool acquisition
+- [x] Pipeline can create/configure pool
+- [x] Executor passes pool to sources
+- [x] Backpressure works (blocks when exhausted)
+- [x] Statistics tracking works
+- [x] All existing tests pass
 
 ---
 

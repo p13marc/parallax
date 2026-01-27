@@ -6,6 +6,7 @@
 //! 2. Uses `AppSrc` with handle for external data injection (video + metadata)
 //! 3. Uses `AppSink` with handle for output extraction
 //! 4. Runs via `pipeline.run().await` (the proper executor path)
+//! 5. Uses the custom metadata API to attach KLV/STANAG data to buffers
 //!
 //! ```text
 //! ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
@@ -241,10 +242,11 @@ async fn main() -> Result<()> {
             }
 
             // Create metadata with sequence number
-            let metadata = Metadata::from_sequence(frame_num);
+            let mut metadata = Metadata::from_sequence(frame_num);
 
-            // If we have sensor metadata, encode it as KLV and log
+            // If we have sensor metadata, attach it to the buffer using custom metadata API
             if let Some(ref sensor_meta) = latest_metadata {
+                // Encode sensor metadata as KLV and attach using set_klv()
                 let klv_data = sensor_meta.to_klv();
                 println!(
                     "   Frame {}: lat={:.4}, lon={:.4}, klv={} bytes",
@@ -252,6 +254,18 @@ async fn main() -> Result<()> {
                     sensor_meta.sensor_lat,
                     sensor_meta.sensor_lon,
                     klv_data.len()
+                );
+                metadata.set_klv(klv_data);
+
+                // Also attach the raw sensor struct for direct access downstream
+                metadata.set(
+                    "sensor/gps",
+                    (sensor_meta.sensor_lat, sensor_meta.sensor_lon),
+                );
+                metadata.set("sensor/altitude", sensor_meta.sensor_alt);
+                metadata.set(
+                    "sensor/attitude",
+                    (sensor_meta.heading, sensor_meta.pitch, sensor_meta.roll),
                 );
             } else {
                 println!("   Frame {}: no metadata yet", frame_num);
@@ -287,9 +301,25 @@ async fn main() -> Result<()> {
         while let Ok(Some(buffer)) = sink_handle.pull_buffer() {
             let size = buffer.as_bytes().len();
             received += 1;
+
+            // Access KLV metadata using the custom metadata API
+            let klv_info = if let Some(klv) = buffer.metadata().klv() {
+                format!("klv={} bytes", klv.len())
+            } else {
+                "no klv".to_string()
+            };
+
+            // Access typed sensor data directly
+            let gps_info =
+                if let Some((lat, lon)) = buffer.metadata().get::<(f64, f64)>("sensor/gps") {
+                    format!("gps=({:.4}, {:.4})", lat, lon)
+                } else {
+                    "no gps".to_string()
+                };
+
             println!(
-                "   Consumer: received frame {}, size={} bytes (expected {})",
-                received, size, expected_size
+                "   Consumer: frame {}, size={} bytes, {}, {}",
+                received, size, klv_info, gps_info
             );
 
             // Verify scaled frame size
@@ -336,7 +366,10 @@ async fn main() -> Result<()> {
     println!("4. DynAsyncElement::new_box() - element boxing for pipeline");
     println!("5. SourceAdapter/SinkAdapter/ElementAdapter - trait bridging");
     println!("6. pipeline.run().await - proper async executor");
-    println!("7. External metadata synchronized with video frames");
+    println!("7. Custom metadata API for KLV/STANAG data:");
+    println!("   - metadata.set_klv(data) / metadata.klv() - binary KLV packets");
+    println!("   - metadata.set(key, value) / metadata.get::<T>(key) - typed data");
+    println!("   - Namespaced keys: \"sensor/gps\", \"sensor/altitude\", etc.");
 
     println!("\n=== Full Pipeline Architecture ===\n");
     println!("In a complete AV1 transcode pipeline, you would add:");

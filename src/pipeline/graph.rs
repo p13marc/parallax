@@ -3,7 +3,7 @@
 use crate::element::{AsyncElementDyn, DynAsyncElement, ElementType, Pad};
 use crate::error::{Error, Result};
 use crate::format::{Caps, MediaFormat};
-use crate::memory::MemoryType;
+use crate::memory::{BufferPool, FixedBufferPool, MemoryType};
 use crate::negotiation::{
     ConverterInsertion, ConverterRegistry, ElementCaps, LinkInfo as NegLinkInfo, NegotiationResult,
     NegotiationSolver,
@@ -12,6 +12,7 @@ use daggy::petgraph::visit::EdgeRef;
 use daggy::{Dag, EdgeIndex, NodeIndex, Walker};
 use std::collections::HashMap;
 use std::fmt::Write;
+use std::sync::Arc;
 
 /// Unique identifier for a node in the pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -324,6 +325,8 @@ pub struct Pipeline {
     name_counter: u64,
     /// Negotiation results (populated after negotiate() is called).
     negotiation: Option<NegotiationResult>,
+    /// Pipeline-level buffer pool for sources.
+    pool: Option<Arc<dyn BufferPool>>,
 }
 
 impl Pipeline {
@@ -335,6 +338,7 @@ impl Pipeline {
             state: PipelineState::Suspended,
             name_counter: 0,
             negotiation: None,
+            pool: None,
         }
     }
 
@@ -466,6 +470,106 @@ impl Pipeline {
     /// Check if the pipeline is currently running.
     pub fn is_running(&self) -> bool {
         self.state == PipelineState::Running
+    }
+
+    // ========================================================================
+    // Buffer Pool Management
+    // ========================================================================
+
+    /// Set the buffer pool for this pipeline.
+    ///
+    /// The pool provides pre-allocated buffers to source elements, enabling
+    /// zero-allocation data production and natural backpressure when the
+    /// pool is exhausted.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use parallax::memory::FixedBufferPool;
+    ///
+    /// let pool = FixedBufferPool::new(1024 * 1024, 10)?; // 10 x 1MB buffers
+    /// pipeline.set_pool(pool);
+    /// ```
+    pub fn set_pool(&mut self, pool: Arc<dyn BufferPool>) {
+        self.pool = Some(pool);
+    }
+
+    /// Create and set a fixed-size buffer pool.
+    ///
+    /// This is a convenience method that creates a `FixedBufferPool` with
+    /// the specified buffer size and count.
+    ///
+    /// # Arguments
+    ///
+    /// * `buffer_size` - Size of each buffer in bytes
+    /// * `buffer_count` - Number of buffers in the pool
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // Create pool for 1080p YUV420 frames
+    /// let frame_size = 1920 * 1080 * 3 / 2;
+    /// pipeline.create_pool(frame_size, 10)?;
+    /// ```
+    pub fn create_pool(&mut self, buffer_size: usize, buffer_count: usize) -> Result<()> {
+        let pool = FixedBufferPool::new(buffer_size, buffer_count)?;
+        self.pool = Some(pool);
+        Ok(())
+    }
+
+    /// Create a buffer pool based on negotiated caps.
+    ///
+    /// This method determines the maximum buffer size from the negotiated
+    /// formats across all links and creates a pool accordingly.
+    ///
+    /// Must be called after `negotiate()` or `prepare()`.
+    ///
+    /// # Arguments
+    ///
+    /// * `buffer_count` - Number of buffers in the pool
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// pipeline.prepare()?;  // Runs negotiation
+    /// pipeline.create_pool_from_caps(10)?;  // Auto-sizes based on caps
+    /// ```
+    pub fn create_pool_from_caps(&mut self, buffer_count: usize) -> Result<()> {
+        let max_size = self.negotiate_buffer_size()?;
+        self.create_pool(max_size, buffer_count)
+    }
+
+    /// Get the buffer pool, if configured.
+    pub fn pool(&self) -> Option<&Arc<dyn BufferPool>> {
+        self.pool.as_ref()
+    }
+
+    /// Check if a buffer pool is configured.
+    pub fn has_pool(&self) -> bool {
+        self.pool.is_some()
+    }
+
+    /// Determine the maximum buffer size from negotiated caps.
+    ///
+    /// Returns a default size if caps are not negotiated or don't specify sizes.
+    fn negotiate_buffer_size(&self) -> Result<usize> {
+        let mut max_size = 0;
+
+        // Check all links for negotiated formats
+        for link in self.links() {
+            if let Some(format) = &link.negotiated_format {
+                if let Some(size) = format.buffer_size() {
+                    max_size = max_size.max(size);
+                }
+            }
+        }
+
+        // Default to 4MB if no sizes determined
+        if max_size == 0 {
+            max_size = 4 * 1024 * 1024;
+        }
+
+        Ok(max_size)
     }
 
     /// Check if the pipeline has encountered an error.

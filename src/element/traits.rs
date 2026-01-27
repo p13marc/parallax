@@ -1345,6 +1345,8 @@ pub struct SourceAdapter<S: Source> {
     inner: S,
     /// Arena for pre-allocated buffers.
     arena: Option<std::sync::Arc<crate::memory::CpuArena>>,
+    /// Buffer pool for high-level pool API with backpressure.
+    pool: Option<std::sync::Arc<dyn crate::memory::BufferPool>>,
 }
 
 impl<S: Source> SourceAdapter<S> {
@@ -1353,6 +1355,7 @@ impl<S: Source> SourceAdapter<S> {
         Self {
             inner: source,
             arena: None,
+            pool: None,
         }
     }
 
@@ -1361,12 +1364,27 @@ impl<S: Source> SourceAdapter<S> {
         Self {
             inner: source,
             arena: Some(arena),
+            pool: None,
+        }
+    }
+
+    /// Create a source adapter with a buffer pool.
+    pub fn with_pool(source: S, pool: std::sync::Arc<dyn crate::memory::BufferPool>) -> Self {
+        Self {
+            inner: source,
+            arena: None,
+            pool: Some(pool),
         }
     }
 
     /// Set the arena for buffer allocation.
     pub fn set_arena(&mut self, arena: std::sync::Arc<crate::memory::CpuArena>) {
         self.arena = Some(arena);
+    }
+
+    /// Set the buffer pool for high-level pool API.
+    pub fn set_pool(&mut self, pool: std::sync::Arc<dyn crate::memory::BufferPool>) {
+        self.pool = Some(pool);
     }
 
     /// Get a reference to the inner source.
@@ -1390,18 +1408,60 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
     }
 
     async fn process(&mut self, _input: Option<Buffer>) -> Result<Option<Buffer>> {
-        // Try to acquire a slot from the arena for the ProduceContext
-        if let Some(arena) = &self.arena {
+        // Priority: pool > arena > no buffer
+        //
+        // If a pool is configured, use it (provides backpressure and stats).
+        // If only arena is configured, use it (simpler, no backpressure).
+        // Otherwise, source must provide its own buffer.
+
+        if let Some(pool) = &self.pool {
+            // Pool-aware path: source can use ctx.acquire_buffer() or we provide a slot
+            if let Some(arena) = &self.arena {
+                // Have both pool and arena - provide slot and pool access
+                if let Some(slot) = arena.acquire() {
+                    let mut ctx = ProduceContext::with_pool(slot, pool.as_ref());
+                    match self.inner.produce(&mut ctx)? {
+                        ProduceResult::Produced(n) => Ok(Some(ctx.finalize(n))),
+                        ProduceResult::Eos => Ok(None),
+                        ProduceResult::OwnBuffer(buffer) => Ok(Some(buffer)),
+                        ProduceResult::WouldBlock => Ok(None),
+                    }
+                } else {
+                    // Arena exhausted - provide pool-only access
+                    let mut ctx = ProduceContext::with_pool_only(pool.as_ref());
+                    match self.inner.produce(&mut ctx)? {
+                        ProduceResult::OwnBuffer(buffer) => Ok(Some(buffer)),
+                        ProduceResult::Eos => Ok(None),
+                        ProduceResult::WouldBlock => Ok(None),
+                        ProduceResult::Produced(_) => Err(crate::error::Error::BufferPool(
+                            "arena exhausted and source doesn't provide own buffer".into(),
+                        )),
+                    }
+                }
+            } else {
+                // Pool only - source must use ctx.acquire_buffer() or provide own
+                let mut ctx = ProduceContext::with_pool_only(pool.as_ref());
+                match self.inner.produce(&mut ctx)? {
+                    ProduceResult::OwnBuffer(buffer) => Ok(Some(buffer)),
+                    ProduceResult::Eos => Ok(None),
+                    ProduceResult::WouldBlock => Ok(None),
+                    ProduceResult::Produced(_) => Err(crate::error::Error::BufferPool(
+                        "no arena configured and source doesn't provide own buffer".into(),
+                    )),
+                }
+            }
+        } else if let Some(arena) = &self.arena {
+            // Arena-only path (legacy)
             if let Some(slot) = arena.acquire() {
                 let mut ctx = ProduceContext::new(slot);
                 match self.inner.produce(&mut ctx)? {
                     ProduceResult::Produced(n) => Ok(Some(ctx.finalize(n))),
                     ProduceResult::Eos => Ok(None),
                     ProduceResult::OwnBuffer(buffer) => Ok(Some(buffer)),
-                    ProduceResult::WouldBlock => Ok(None), // Treat as no data for now
+                    ProduceResult::WouldBlock => Ok(None),
                 }
             } else {
-                // Arena exhausted, try without buffer
+                // Arena exhausted
                 let mut ctx = ProduceContext::without_buffer();
                 match self.inner.produce(&mut ctx)? {
                     ProduceResult::OwnBuffer(buffer) => Ok(Some(buffer)),
@@ -1413,7 +1473,7 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
                 }
             }
         } else {
-            // No arena, source must provide its own buffer
+            // No pool or arena - source must provide its own buffer
             let mut ctx = ProduceContext::without_buffer();
             match self.inner.produce(&mut ctx)? {
                 ProduceResult::OwnBuffer(buffer) => Ok(Some(buffer)),

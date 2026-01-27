@@ -67,8 +67,7 @@ use smallvec::SmallVec;
 /// // Intersection finds common ground
 /// assert_eq!(fixed.intersect(&range), Some(CapsValue::Fixed(1920)));
 /// ```
-#[derive(Clone, Debug, PartialEq)]
-#[derive(Default)]
+#[derive(Clone, Debug, PartialEq, Default)]
 pub enum CapsValue<T> {
     /// Exact value (fully constrained).
     Fixed(T),
@@ -232,7 +231,6 @@ impl<T: Clone + Ord> CapsValue<T> {
     }
 }
 
-
 impl<T: Clone + Ord> From<T> for CapsValue<T> {
     fn from(value: T) -> Self {
         Self::Fixed(value)
@@ -298,6 +296,25 @@ impl MediaFormat {
             (Self::Rtp(a), Self::Rtp(b)) => a.payload_type == b.payload_type,
             (Self::MpegTs, Self::MpegTs) => true,
             _ => false,
+        }
+    }
+
+    /// Get the buffer size in bytes for this format, if determinable.
+    ///
+    /// Returns `Some(size)` for formats with known sizes (raw video/audio),
+    /// or `None` for variable-size formats (encoded, RTP, etc.).
+    pub fn buffer_size(&self) -> Option<usize> {
+        match self {
+            Self::VideoRaw(vf) => Some(vf.frame_size()),
+            Self::AudioRaw(af) => Some(af.frame_size()),
+            // Encoded formats have variable size
+            Self::Video(_) | Self::Audio(_) => None,
+            // RTP packets are variable size
+            Self::Rtp(_) => None,
+            // MPEG-TS packets are 188 bytes, but typically batched
+            Self::MpegTs => Some(188 * 7), // Common batch size
+            // Raw bytes have no size constraint
+            Self::Bytes => None,
         }
     }
 }
@@ -498,6 +515,16 @@ impl AudioFormat {
     /// Get bytes per frame (all channels for one sample time).
     pub const fn bytes_per_frame(&self) -> usize {
         self.sample_format.bytes() * self.channels as usize
+    }
+
+    /// Get a typical buffer size for this audio format.
+    ///
+    /// Returns size for ~10ms of audio, which is a common buffer duration
+    /// used in real-time audio processing.
+    pub const fn frame_size(&self) -> usize {
+        // 10ms worth of samples
+        let samples_per_buffer = self.sample_rate as usize / 100;
+        samples_per_buffer * self.bytes_per_frame()
     }
 }
 
@@ -834,8 +861,7 @@ impl From<AudioFormat> for AudioFormatCaps {
 }
 
 /// Format caps - constraints for any format type.
-#[derive(Clone, Debug, PartialEq)]
-#[derive(Default)]
+#[derive(Clone, Debug, PartialEq, Default)]
 pub enum FormatCaps {
     /// Raw video with constraints.
     VideoRaw(VideoFormatCaps),
@@ -917,7 +943,6 @@ impl FormatCaps {
         matches!(self, Self::AudioRaw(_) | Self::Audio(_))
     }
 }
-
 
 impl From<MediaFormat> for FormatCaps {
     fn from(format: MediaFormat) -> Self {
