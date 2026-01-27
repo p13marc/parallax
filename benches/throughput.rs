@@ -2,10 +2,10 @@
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use parallax::buffer::{Buffer, MemoryHandle};
-use parallax::element::{Element, Sink, Source};
+use parallax::element::{ConsumeContext, Element, ProduceContext, ProduceResult, Sink, Source};
 use parallax::error::Result;
 use parallax::link::LocalLink;
-use parallax::memory::{HeapSegment, MemoryPool, SharedMemorySegment};
+use parallax::memory::{CpuArena, HeapSegment, MemoryPool, SharedMemorySegment};
 use parallax::metadata::Metadata;
 use std::hint::black_box;
 use std::sync::Arc;
@@ -37,17 +37,32 @@ impl BenchSource {
 }
 
 impl Source for BenchSource {
-    fn produce(&mut self) -> Result<Option<Buffer<()>>> {
+    fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
         if self.remaining == 0 {
-            return Ok(None);
+            return Ok(ProduceResult::Eos);
         }
 
         self.remaining -= 1;
-        let segment = Arc::new(HeapSegment::new(self.buffer_size).unwrap());
-        let handle = MemoryHandle::from_segment(segment);
-        let buffer = Buffer::<()>::new(handle, Metadata::from_sequence(self.sequence));
-        self.sequence += 1;
-        Ok(Some(buffer))
+
+        if ctx.has_buffer() {
+            let output = ctx.output();
+            let len = output.len().min(self.buffer_size);
+            output[..len].fill(0);
+            ctx.set_sequence(self.sequence);
+            self.sequence += 1;
+            Ok(ProduceResult::Produced(len))
+        } else {
+            // Fallback: create own buffer
+            let segment = Arc::new(HeapSegment::new(self.buffer_size).unwrap());
+            let handle = MemoryHandle::from_segment(segment);
+            let buffer = Buffer::<()>::new(handle, Metadata::from_sequence(self.sequence));
+            self.sequence += 1;
+            Ok(ProduceResult::OwnBuffer(buffer))
+        }
+    }
+
+    fn preferred_buffer_size(&self) -> Option<usize> {
+        Some(self.buffer_size)
     }
 }
 
@@ -64,9 +79,9 @@ impl BenchSink {
 }
 
 impl Sink for BenchSink {
-    fn consume(&mut self, buffer: Buffer<()>) -> Result<()> {
+    fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
         self.count += 1;
-        self.bytes += buffer.len();
+        self.bytes += ctx.input().len();
         Ok(())
     }
 }
@@ -228,11 +243,27 @@ fn bench_source_to_sink(c: &mut Criterion) {
             &(*count, *size),
             |b, &(count, size)| {
                 b.iter(|| {
+                    let arena = CpuArena::new(size, 16).unwrap();
                     let mut source = BenchSource::new(count, size);
                     let mut sink = BenchSink::new();
 
-                    while let Some(buffer) = source.produce().unwrap() {
-                        sink.consume(buffer).unwrap();
+                    loop {
+                        let slot = arena.acquire().unwrap();
+                        let mut ctx = ProduceContext::new(slot);
+                        match source.produce(&mut ctx).unwrap() {
+                            ProduceResult::Produced(n) => {
+                                let buffer = ctx.finalize(n);
+                                let consume_ctx = ConsumeContext::new(&buffer);
+                                sink.consume(&consume_ctx).unwrap();
+                            }
+                            ProduceResult::OwnBuffer(buffer) => {
+                                let consume_ctx = ConsumeContext::new(&buffer);
+                                sink.consume(&consume_ctx).unwrap();
+                            }
+                            ProduceResult::Eos => break,
+                            ProduceResult::WouldBlock => continue,
+                        }
+                        // Slot is automatically returned to arena when ctx/buffer are dropped
                     }
 
                     black_box(sink.count)

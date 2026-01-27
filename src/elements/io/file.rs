@@ -110,23 +110,49 @@ impl Source for FileSrc {
         let chunk_size = self.chunk_size;
         let file = self.ensure_open()?;
 
-        // Read into the provided buffer
-        let output = ctx.output();
-        let read_len = output.len().min(chunk_size);
-        let bytes_read = file.read(&mut output[..read_len])?;
+        if ctx.has_buffer() {
+            // Use the provided buffer
+            let output = ctx.output();
+            let read_len = output.len().min(chunk_size);
+            let bytes_read = file.read(&mut output[..read_len])?;
 
-        if bytes_read == 0 {
-            // EOF
-            return Ok(ProduceResult::Eos);
+            if bytes_read == 0 {
+                return Ok(ProduceResult::Eos);
+            }
+
+            self.bytes_read += bytes_read as u64;
+            ctx.set_sequence(self.sequence);
+            self.sequence += 1;
+
+            Ok(ProduceResult::Produced(bytes_read))
+        } else {
+            // Fallback: create our own buffer
+            use crate::buffer::{Buffer, MemoryHandle};
+            use crate::memory::HeapSegment;
+            use crate::metadata::Metadata;
+            use std::sync::Arc;
+
+            let segment = Arc::new(HeapSegment::new(chunk_size)?);
+            let mut handle = MemoryHandle::from_segment(segment);
+            let bytes_read = {
+                let data = handle.as_mut_slice().ok_or_else(|| {
+                    crate::error::Error::InvalidSegment("failed to get mutable slice".into())
+                })?;
+                file.read(&mut data[..chunk_size])?
+            };
+
+            if bytes_read == 0 {
+                return Ok(ProduceResult::Eos);
+            }
+
+            self.bytes_read += bytes_read as u64;
+            let metadata = Metadata::from_sequence(self.sequence);
+            self.sequence += 1;
+
+            // Create buffer with only the bytes we read
+            let buffer = Buffer::new(handle.slice(0, bytes_read), metadata);
+            Ok(ProduceResult::OwnBuffer(buffer))
         }
-
-        self.bytes_read += bytes_read as u64;
-
-        // Set metadata
-        ctx.set_sequence(self.sequence);
-        self.sequence += 1;
-
-        Ok(ProduceResult::Produced(bytes_read))
     }
 
     fn name(&self) -> &str {

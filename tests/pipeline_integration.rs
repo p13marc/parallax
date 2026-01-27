@@ -119,8 +119,7 @@ async fn test_long_pipeline() {
 /// Test that the pipeline correctly counts buffers with a custom sink.
 #[tokio::test]
 async fn test_buffer_counting() {
-    use parallax::buffer::Buffer;
-    use parallax::element::Sink;
+    use parallax::element::{ConsumeContext, Sink};
     use parallax::error::Result;
 
     struct CountingSink {
@@ -128,7 +127,7 @@ async fn test_buffer_counting() {
     }
 
     impl Sink for CountingSink {
-        fn consume(&mut self, _buffer: Buffer) -> Result<()> {
+        fn consume(&mut self, _ctx: &ConsumeContext) -> Result<()> {
             self.count.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
@@ -160,7 +159,7 @@ async fn test_buffer_counting() {
 #[tokio::test]
 async fn test_filter_element() {
     use parallax::buffer::Buffer;
-    use parallax::element::{Element, Sink};
+    use parallax::element::{ConsumeContext, Element, Sink};
     use parallax::error::Result;
 
     /// Filter that only passes every Nth buffer.
@@ -185,7 +184,7 @@ async fn test_filter_element() {
     }
 
     impl Sink for CountingSink {
-        fn consume(&mut self, _buffer: Buffer) -> Result<()> {
+        fn consume(&mut self, _ctx: &ConsumeContext) -> Result<()> {
             self.count.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
@@ -279,7 +278,7 @@ async fn test_cycle_detection() {
 #[tokio::test]
 async fn test_pipeline_abort() {
     use parallax::buffer::{Buffer, MemoryHandle};
-    use parallax::element::Source;
+    use parallax::element::{ConsumeContext, ProduceContext, ProduceResult, Source};
     use parallax::error::Result;
     use parallax::memory::HeapSegment;
     use parallax::metadata::Metadata;
@@ -290,12 +289,13 @@ async fn test_pipeline_abort() {
     }
 
     impl Source for InfiniteSource {
-        fn produce(&mut self) -> Result<Option<Buffer>> {
+        fn produce(&mut self, _ctx: &mut ProduceContext) -> Result<ProduceResult> {
+            // Create our own buffer since we don't know if ctx has one
             let segment = std::sync::Arc::new(HeapSegment::new(64)?);
             let handle = MemoryHandle::from_segment(segment);
             let buffer = Buffer::new(handle, Metadata::from_sequence(self.seq));
             self.seq += 1;
-            Ok(Some(buffer))
+            Ok(ProduceResult::OwnBuffer(buffer))
         }
     }
 
@@ -307,7 +307,7 @@ async fn test_pipeline_abort() {
     }
 
     impl parallax::element::Sink for CountingSink {
-        fn consume(&mut self, _buffer: Buffer) -> Result<()> {
+        fn consume(&mut self, _ctx: &ConsumeContext) -> Result<()> {
             self.count.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
@@ -829,7 +829,9 @@ async fn test_pipeline_state_transitions() {
 #[tokio::test]
 async fn test_pipeline_abort_event() {
     use parallax::buffer::{Buffer, MemoryHandle};
-    use parallax::element::{SinkAdapter, Source, SourceAdapter};
+    use parallax::element::{
+        ConsumeContext, ProduceContext, ProduceResult, SinkAdapter, Source, SourceAdapter,
+    };
     use parallax::memory::HeapSegment;
     use parallax::metadata::Metadata;
     use parallax::pipeline::{Executor, Pipeline, PipelineEvent};
@@ -838,16 +840,19 @@ async fn test_pipeline_abort_event() {
     struct InfiniteSource;
 
     impl Source for InfiniteSource {
-        fn produce(&mut self) -> parallax::error::Result<Option<Buffer>> {
+        fn produce(&mut self, _ctx: &mut ProduceContext) -> parallax::error::Result<ProduceResult> {
             let segment = std::sync::Arc::new(HeapSegment::new(64)?);
             let handle = MemoryHandle::from_segment(segment);
-            Ok(Some(Buffer::new(handle, Metadata::default())))
+            Ok(ProduceResult::OwnBuffer(Buffer::new(
+                handle,
+                Metadata::default(),
+            )))
         }
     }
 
     struct DiscardSink;
     impl parallax::element::Sink for DiscardSink {
-        fn consume(&mut self, _buffer: Buffer) -> parallax::error::Result<()> {
+        fn consume(&mut self, _ctx: &ConsumeContext) -> parallax::error::Result<()> {
             Ok(())
         }
     }

@@ -7,6 +7,7 @@ use parallax::element::{
     SourceAdapter,
 };
 use parallax::error::Result;
+use parallax::memory::CpuArena;
 use parallax::pipeline::Pipeline;
 
 struct CountingSource {
@@ -50,11 +51,17 @@ impl Sink for PrintSink {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Create an arena for buffer allocation (1KB slots, 8 slots)
+    let arena = CpuArena::new(1024, 8)?;
+
     let mut pipeline = Pipeline::new();
 
     let src = pipeline.add_node(
         "counter",
-        DynAsyncElement::new_box(SourceAdapter::new(CountingSource { current: 0, max: 5 })),
+        DynAsyncElement::new_box(SourceAdapter::with_arena(
+            CountingSource { current: 0, max: 5 },
+            arena,
+        )),
     );
     let sink = pipeline.add_node(
         "printer",

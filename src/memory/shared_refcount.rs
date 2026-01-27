@@ -248,6 +248,7 @@ impl ReleaseQueue {
     }
 
     /// Check if the queue is empty.
+    #[allow(dead_code)]
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -431,7 +432,8 @@ pub struct SharedArena {
     base: NonNull<u8>,
     /// Total size of the arena.
     total_size: usize,
-    /// Pointer to arena header.
+    /// Pointer to arena header (kept for potential future use in validation).
+    #[allow(dead_code)]
     header: NonNull<ArenaHeader>,
     /// Pointer to release queue.
     release_queue: NonNull<ReleaseQueue>,

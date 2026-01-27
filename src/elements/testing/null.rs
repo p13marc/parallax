@@ -90,19 +90,26 @@ impl Sink for NullSink {
 ///
 /// ```rust
 /// use parallax::elements::NullSource;
-/// use parallax::element::Source;
+/// use parallax::element::{ProduceContext, ProduceResult, Source};
+/// use parallax::memory::CpuArena;
+/// use std::sync::Arc;
 ///
+/// let arena = Arc::new(CpuArena::new(1024, 8).unwrap());
 /// let mut source = NullSource::new(5);
 ///
 /// // Produces 5 buffers, then EOS
-/// for i in 0..5 {
-///     let buffer = source.produce().unwrap();
-///     assert!(buffer.is_some());
+/// for _ in 0..5 {
+///     let slot = arena.acquire().unwrap();
+///     let mut ctx = ProduceContext::new(slot);
+///     let result = source.produce(&mut ctx).unwrap();
+///     assert!(matches!(result, ProduceResult::Produced(_)));
 /// }
 ///
-/// // After 5 buffers, returns None (EOS)
-/// let buffer = source.produce().unwrap();
-/// assert!(buffer.is_none());
+/// // After 5 buffers, returns EOS
+/// let slot = arena.acquire().unwrap();
+/// let mut ctx = ProduceContext::new(slot);
+/// let result = source.produce(&mut ctx).unwrap();
+/// assert!(matches!(result, ProduceResult::Eos));
 /// ```
 pub struct NullSource {
     name: String,
@@ -153,14 +160,28 @@ impl Source for NullSource {
             return Ok(ProduceResult::Eos);
         }
 
-        // Write zeros to the provided buffer
-        let output = ctx.output();
-        let len = output.len().min(self.buffer_size);
-        output[..len].fill(0);
-        ctx.set_sequence(self.current);
+        // Try to use the pre-allocated buffer if available, otherwise create our own
+        if ctx.has_buffer() {
+            let output = ctx.output();
+            let len = output.len().min(self.buffer_size);
+            output[..len].fill(0);
+            ctx.set_sequence(self.current);
+            self.current += 1;
+            Ok(ProduceResult::Produced(len))
+        } else {
+            // Fallback: create our own buffer when no arena is configured
+            use crate::buffer::{Buffer, MemoryHandle};
+            use crate::memory::HeapSegment;
+            use crate::metadata::Metadata;
+            use std::sync::Arc;
 
-        self.current += 1;
-        Ok(ProduceResult::Produced(len))
+            let segment = Arc::new(HeapSegment::new(self.buffer_size)?);
+            let handle = MemoryHandle::from_segment(segment);
+            // HeapSegment is already zero-initialized
+            let buffer = Buffer::new(handle, Metadata::from_sequence(self.current));
+            self.current += 1;
+            Ok(ProduceResult::OwnBuffer(buffer))
+        }
     }
 
     fn name(&self) -> &str {
