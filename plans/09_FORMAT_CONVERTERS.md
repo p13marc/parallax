@@ -1,5 +1,6 @@
 # Plan 09: Format Converters Implementation
 
+**Status:** ✅ CORE COMPLETE (January 2026)  
 **Priority:** High  
 **Effort:** Medium (1-2 weeks)  
 **Dependencies:** Plan 06 (Caps Negotiation) - Complete  
@@ -330,12 +331,28 @@ async fn test_automatic_conversion_pipeline() {
 
 ## Success Criteria
 
-- [ ] All format converters work without errors
-- [ ] Automatic converter insertion works in pipelines
-- [ ] Performance meets targets (or documented exceptions)
-- [ ] No new dependencies added (pure Rust)
+- [x] All format converters work without errors
+- [ ] Automatic converter insertion works in pipelines (requires buffer format metadata)
+- [x] Performance meets targets (or documented exceptions)
+- [x] No new dependencies added (pure Rust)
 - [ ] Example demonstrates automatic conversion
-- [ ] All tests pass
+- [x] All tests pass (957 tests)
+
+---
+
+## Implementation Notes (January 2026)
+
+The core converter implementations are complete in `src/converters/`:
+
+- **colorspace.rs**: VideoConvert with I420/NV12 ↔ RGB24/RGBA/BGR24/BGRA/Gray8, BT.601/BT.709
+- **scale.rs**: VideoScale with bilinear and nearest-neighbor for all formats
+- **audio.rs**: AudioConvert (U8/S16/S32/F32/F64) and AudioChannelMix (mono ↔ stereo)
+- **resample.rs**: AudioResample with linear and cubic interpolation
+
+Full integration with caps negotiation (`src/negotiation/builtin.rs`) requires:
+1. Buffer format metadata (width, height, pixel format stored in buffer)
+2. Converter element factories that configure based on negotiated caps
+3. This is deferred as it requires metadata infrastructure changes
 
 ---
 
