@@ -73,11 +73,10 @@ async fn main() -> Result<()> {
     pipeline.run().await?;
     println!("[Sender] Done\n");
 
-    // Give receiver time to process
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // Note: receiver will block waiting for more data
-    receiver.abort();
+    // Receiver should detect connection close and terminate gracefully
+    println!("[Main] Waiting for receiver to complete...");
+    receiver.await.expect("receiver task panicked")?;
+    println!("[Main] Receiver completed");
 
     Ok(())
 }
