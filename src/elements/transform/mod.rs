@@ -41,12 +41,12 @@ mod batch;
 mod buffer_ops;
 mod data_processing;
 mod filter;
+mod generic;
 mod metadata_ops;
 mod scale;
-mod transform;
 
 // Generic transforms
-pub use transform::{Chunk, FilterMap, FlatMap, Map};
+pub use generic::{Chunk, FilterMap, FlatMap, Map};
 
 // Video processing
 pub use scale::{ScaleMode, VideoScale};

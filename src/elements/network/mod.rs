@@ -4,9 +4,9 @@
 //! - [`UdpSrc`], [`UdpSink`]: UDP datagram I/O
 //! - [`UnixSrc`], [`UnixSink`]: Unix domain socket I/O
 //! - [`UdpMulticastSrc`], [`UdpMulticastSink`]: UDP multicast
-//! - [`HttpSrc`], [`HttpSink`]: HTTP GET/POST (requires `http` feature)
-//! - [`WebSocketSrc`], [`WebSocketSink`]: WebSocket (requires `websocket` feature)
-//! - [`ZenohSrc`], [`ZenohSink`]: Zenoh pub/sub (requires `zenoh` feature)
+//! - `HttpSrc`, `HttpSink`: HTTP GET/POST (requires `http` feature)
+//! - `WebSocketSrc`, `WebSocketSink`: WebSocket (requires `websocket` feature)
+//! - `ZenohSrc`, `ZenohSink`: Zenoh pub/sub (requires `zenoh` feature)
 
 mod multicast;
 mod tcp;

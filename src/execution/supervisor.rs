@@ -569,7 +569,7 @@ mod tests {
         let filter_id = sup.register_element("passthrough");
 
         // Decoder should be isolated (no group)
-        let decoder = sup.get_element(decoder_id).unwrap();
+        let _decoder = sup.get_element(decoder_id).unwrap();
         // In grouped mode with pattern match, isolated elements still get SUPERVISOR group
         // but should_isolate returns true
         assert!(sup.mode().should_isolate("h264_decoder"));

@@ -80,7 +80,7 @@ pub fn send_fds<Fd: AsFd>(socket: &UnixStream, fds: &[Fd], data: &[u8]) -> Resul
 ///
 /// # Returns
 ///
-/// A tuple of (bytes_read, Vec<OwnedFd>) containing the data length and
+/// A tuple of (bytes_read, `Vec<OwnedFd>`) containing the data length and
 /// received file descriptors.
 ///
 /// # Example

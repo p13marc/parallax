@@ -2,7 +2,7 @@
 //!
 //! - [`AppSrc`]: Inject buffers from application code
 //! - [`AppSink`]: Extract buffers to application code
-//! - [`IcedVideoSink`]: Display video in Iced GUI (requires `iced-sink` feature)
+//! - `IcedVideoSink`: Display video in Iced GUI (requires `iced-sink` feature)
 
 mod appsink;
 mod appsrc;

@@ -58,7 +58,7 @@ struct MessageHeader {
 impl MessageHeader {
     const SIZE: usize = 1 + 4 + 8 + 8 + 8; // 29 bytes
 
-    fn to_bytes(&self) -> [u8; Self::SIZE] {
+    fn to_bytes(self) -> [u8; Self::SIZE] {
         let mut buf = [0u8; Self::SIZE];
         buf[0] = self.msg_type;
         buf[1..5].copy_from_slice(&self.segment_id.to_le_bytes());

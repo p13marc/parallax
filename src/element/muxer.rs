@@ -12,7 +12,7 @@
 //! # Key Types
 //!
 //! - [`MuxerSyncState`]: Manages PTS-based synchronization across input pads
-//! - [`PadState`]: Per-pad state including buffer queue and EOS tracking
+//! - `PadState`: Per-pad state including buffer queue and EOS tracking (internal)
 //! - [`SyncMode`]: Synchronization strategy (strict, loose, timed)
 //! - [`MuxerSyncConfig`]: Configuration for sync behavior
 //! - [`StreamType`]: Classification of stream types
@@ -315,6 +315,7 @@ impl PadState {
     }
 
     /// Get the oldest buffer's PTS.
+    #[allow(dead_code)]
     fn oldest_pts(&self) -> Option<ClockTime> {
         self.queue.front().map(|b| b.pts)
     }
@@ -566,7 +567,7 @@ impl MuxerSyncState {
 
     /// Advance the target PTS by one interval.
     pub fn advance(&mut self) {
-        self.target_pts = self.target_pts + self.interval;
+        self.target_pts += self.interval;
     }
 
     /// Advance the target PTS to a specific time.

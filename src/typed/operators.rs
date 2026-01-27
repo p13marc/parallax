@@ -710,7 +710,7 @@ mod tests {
     fn test_inspect() {
         let mut seen = Vec::new();
         let seen_ref = &mut seen;
-        let mut ins = inspect(move |x: &u32| seen_ref.push(*x));
+        let _ins = inspect(move |x: &u32| seen_ref.push(*x));
 
         // Note: This won't work because inspect captures seen_ref
         // In practice you'd use a channel or Arc<Mutex<>>

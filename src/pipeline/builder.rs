@@ -233,7 +233,7 @@ impl PipelineBuilder<HasSource> {
         self
     }
 
-    /// Add an Element (legacy trait that returns Option<Buffer>).
+    /// Add an Element (legacy trait that returns `Option<Buffer>`).
     pub fn then_element<E: Element + 'static>(self, element: E) -> Self {
         let name = self.auto_name_inner::<E>();
         self.then_element_named(name, element)

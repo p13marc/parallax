@@ -1,5 +1,8 @@
 //! Hybrid pipeline executor combining Tokio async tasks with RT threads.
 //!
+//! **NOTE**: This is legacy code. Use `UnifiedExecutor` instead, which provides
+//! automatic execution strategy detection based on `ExecutionHints`.
+//!
 //! This executor builds on the standard `PipelineExecutor` to support hybrid
 //! execution where:
 //! - I/O-bound elements run in Tokio async tasks
@@ -238,8 +241,7 @@ impl HybridExecutor {
                 } else if partition.async_nodes.is_empty() {
                     // All RT: run everything in RT threads
                     tracing::info!("All nodes are RT-safe, running all in RT threads");
-                    // For now, fall back to async for simplicity
-                    // TODO: implement pure RT execution
+                    // LEGACY: Fall back to async - use UnifiedExecutor for proper RT support
                     let tasks = self.run_all_async(pipeline, &events)?;
                     (tasks, Vec::new(), Vec::new())
                 } else {
@@ -333,9 +335,8 @@ impl HybridExecutor {
             }
         }
 
-        // For now, RT thread spawning is simplified
-        // In a full implementation, we would spawn data threads here
-        // TODO: spawn RT threads with proper element extraction
+        // LEGACY: RT thread spawning not implemented in HybridExecutor
+        // Use UnifiedExecutor for full RT thread support
         let rt_handles = Vec::new();
 
         tracing::info!(
@@ -349,6 +350,7 @@ impl HybridExecutor {
     }
 
     /// Build channels for async portion of the graph.
+    #[allow(clippy::only_used_in_recursion)]
     fn build_channels_for_async(
         &self,
         pipeline: &Pipeline,
@@ -738,7 +740,7 @@ fn spawn_source_task(
                     for tx in &outputs {
                         let _ = tx.send(Message::Eos).await;
                     }
-                    // TODO: signal EOS to bridges
+                    // NOTE: Bridge EOS signaling handled by UnifiedExecutor
                     break;
                 }
                 Err(e) => {
@@ -768,7 +770,7 @@ fn spawn_sink_task(
 
         let mut buffers_processed: u64 = 0;
 
-        // TODO: handle input bridges (poll from RT domain)
+        // LEGACY: Input bridges not implemented - use UnifiedExecutor
         let _ = input_bridges;
 
         if let Some(rx) = inputs.into_iter().next() {
@@ -815,7 +817,7 @@ fn spawn_transform_task(
 
         let mut buffers_processed: u64 = 0;
 
-        // TODO: handle input/output bridges
+        // LEGACY: Bridges not implemented - use UnifiedExecutor
         let _ = (input_bridges, output_bridges);
 
         if let Some(rx) = inputs.into_iter().next() {

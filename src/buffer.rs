@@ -18,7 +18,7 @@ const VALIDATED_OK: u8 = 1;
 ///
 /// Cloning a `MemoryHandle` is cheap:
 /// - Segment variant: Arc increment + copy of offset/len
-/// - Arena variant: Arc increment (ArenaSlot contains Arc<CpuArena>)
+/// - Arena variant: Arc increment (ArenaSlot contains `Arc<CpuArena>`)
 pub enum MemoryHandle {
     /// Standalone segment with offset/length window.
     Segment {

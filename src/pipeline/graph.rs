@@ -604,6 +604,7 @@ impl Pipeline {
     }
 
     /// Add a node with an auto-generated name (internal use).
+    #[allow(dead_code)]
     pub(crate) fn add_node_auto(&mut self, element: Box<DynAsyncElement<'static>>) -> NodeId {
         let name = format!("node_{}", self.name_counter);
         self.name_counter += 1;
@@ -1277,7 +1278,7 @@ impl Pipeline {
         let mut element_caps = ElementCaps::new(node.name());
 
         // For now, use default pad names "sink" and "src"
-        // TODO: In the future, iterate over actual pads from the node
+        // NOTE: Future enhancement - iterate over actual pads from the node
         // and collect caps per-pad using element.output_caps_for_pad(pad_name)
 
         // Add sink pad caps (input)

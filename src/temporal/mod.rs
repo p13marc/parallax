@@ -5,7 +5,7 @@
 //!
 //! - [`Timestamp`]: High-precision nanosecond timestamps
 //! - [`TimeRange`]: Represents a time interval
-//! - [`TimestampedBuffer`]: Buffer wrapper with temporal metadata
+//! - [`TimestampedItem`]: Generic wrapper for items with temporal metadata
 //! - Temporal alignment utilities for multi-source joins
 //!
 //! # Temporal Alignment

@@ -408,7 +408,7 @@ mod tests {
     }
 
     impl Source for TestSource {
-        fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
+        fn produce(&mut self, _ctx: &mut ProduceContext) -> Result<ProduceResult> {
             if self.count >= self.max {
                 return Ok(ProduceResult::Eos);
             }

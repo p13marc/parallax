@@ -49,7 +49,7 @@ impl DataSrc {
         }
     }
 
-    /// Create a DataSrc from a Vec<u8>.
+    /// Create a DataSrc from a `Vec<u8>`.
     pub fn from_vec(data: Vec<u8>) -> Self {
         Self {
             name: "datasrc".to_string(),
@@ -187,6 +187,7 @@ mod tests {
     use crate::memory::CpuArena;
     use std::sync::Arc;
 
+    #[allow(dead_code)]
     fn produce_with_arena(
         src: &mut DataSrc,
         arena: &Arc<CpuArena>,

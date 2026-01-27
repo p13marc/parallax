@@ -274,6 +274,7 @@ impl CpuSegment {
     /// If the memory is shared with other processes, external synchronization
     /// is required.
     #[inline]
+    #[allow(clippy::mut_from_ref)] // Interior mutability via mmap is intentional
     pub fn as_mut_slice(&self) -> &mut [u8] {
         // SAFETY: We own the memory and the caller ensures exclusive access
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }

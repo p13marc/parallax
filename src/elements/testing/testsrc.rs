@@ -250,6 +250,7 @@ mod tests {
     use std::sync::Arc;
 
     // Helper to create a ProduceContext with an arena
+    #[allow(dead_code)]
     fn produce_with_arena(src: &mut TestSrc, arena: &Arc<CpuArena>) -> Result<ProduceResult> {
         let slot = arena.acquire().unwrap();
         let mut ctx = ProduceContext::new(slot);

@@ -384,7 +384,7 @@ impl MetaBox {
 /// assert_eq!(meta.sequence, 42);
 /// assert_eq!(meta.get::<u32>("app/frame_number"), Some(&1234));
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Metadata {
     /// Presentation timestamp (when this buffer should be displayed).
     pub pts: ClockTime,
@@ -419,23 +419,6 @@ pub struct Metadata {
     /// Use `set()`, `get()`, and related methods to access.
     /// Keys should be namespaced: `"domain/type"` (e.g., `"stanag/klv"`).
     custom: HashMap<&'static str, MetaBox>,
-}
-
-impl Default for Metadata {
-    fn default() -> Self {
-        Self {
-            pts: ClockTime::default(),
-            dts: ClockTime::default(),
-            duration: ClockTime::default(),
-            sequence: 0,
-            stream_id: 0,
-            flags: BufferFlags::default(),
-            rtp: None,
-            format: None,
-            offset: None,
-            custom: HashMap::new(),
-        }
-    }
 }
 
 impl Metadata {

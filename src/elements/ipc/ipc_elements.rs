@@ -175,8 +175,10 @@ impl IpcSink {
 
         self.send_message(&msg)?;
 
-        // TODO: Send arena fd via SCM_RIGHTS
-        // For now, we rely on the arena being accessible via its ID
+        // NOTE: Arena fd should be sent via SCM_RIGHTS for true cross-process zero-copy.
+        // Currently relies on the arena being accessible via its ID within the same
+        // process group. Full SCM_RIGHTS implementation requires extending the IPC
+        // protocol with fd passing support from memory/ipc.rs (send_fds/recv_fds).
 
         Ok(())
     }
@@ -472,7 +474,11 @@ impl IpcSrc {
         slot_count: usize,
     ) {
         self.registered_arenas.insert(arena_id, slot_count);
-        // TODO: Receive arena fd via SCM_RIGHTS and map the arena
+        // NOTE: Should receive arena fd via SCM_RIGHTS and mmap it for true zero-copy.
+        // Currently only tracks arena metadata. Full implementation requires:
+        // 1. Receive fd via recv_fds() from memory/ipc.rs
+        // 2. mmap the fd to local address space
+        // 3. Create a CpuArena from the mapped region
     }
 }
 
@@ -498,8 +504,10 @@ impl Source for IpcSrc {
                     // Send acknowledgment
                     self.send_message(&ControlMessage::BufferDone { slot })?;
 
-                    // TODO: Access data from arena cache using slot reference
-                    // For now, create a placeholder buffer
+                    // NOTE: With full SCM_RIGHTS support, we would look up the arena
+                    // in a local cache and create a zero-copy buffer view.
+                    // Currently creates a placeholder buffer since arena mapping
+                    // is not yet implemented.
                     let meta = metadata.to_metadata();
 
                     // Create a buffer with the slot reference
@@ -543,8 +551,6 @@ impl Drop for IpcSrc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread;
-    use std::time::Duration;
 
     #[test]
     fn test_ipc_sink_creation() {

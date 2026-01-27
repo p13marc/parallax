@@ -11,10 +11,7 @@ use super::converters::{ConverterElement, ConverterRegistry, FormatType};
 use crate::buffer::Buffer;
 use crate::element::Element;
 use crate::error::Result;
-use crate::format::{
-    AudioFormatCaps, FormatCaps, PixelFormat, SampleFormat,
-    VideoFormatCaps,
-};
+use crate::format::{AudioFormatCaps, FormatCaps, PixelFormat, SampleFormat, VideoFormatCaps};
 use crate::memory::MemoryType;
 use std::sync::Arc;
 
@@ -63,8 +60,8 @@ impl VideoScale {
 
 impl Element for VideoScale {
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
-        // TODO: Implement actual scaling
-        // For now, this is a passthrough that would be filled in with actual scaling logic
+        // PLAN-09: Implement actual scaling (see plans/09_FORMAT_CONVERTERS.md)
+        // For now, passthrough - actual implementation pending
         Ok(Some(buffer))
     }
 }
@@ -123,8 +120,8 @@ impl VideoConvert {
 
 impl Element for VideoConvert {
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
-        // TODO: Implement actual pixel format conversion
-        // For now, this is a passthrough that would be filled in with actual conversion logic
+        // PLAN-09: Implement actual pixel format conversion (see plans/09_FORMAT_CONVERTERS.md)
+        // For now, passthrough - actual implementation pending
         Ok(Some(buffer))
     }
 }
@@ -176,7 +173,7 @@ impl AudioResample {
 
 impl Element for AudioResample {
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
-        // TODO: Implement actual resampling
+        // PLAN-09: Implement actual resampling (see plans/09_FORMAT_CONVERTERS.md)
         Ok(Some(buffer))
     }
 }
@@ -251,7 +248,7 @@ impl Default for AudioConvert {
 
 impl Element for AudioConvert {
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
-        // TODO: Implement actual audio conversion
+        // PLAN-09: Implement actual audio conversion (see plans/09_FORMAT_CONVERTERS.md)
         Ok(Some(buffer))
     }
 }
@@ -325,7 +322,7 @@ impl MemoryCopy {
 
 impl Element for MemoryCopy {
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
-        // TODO: Implement actual memory transfer
+        // PLAN-11: Implement actual memory transfer (see plans/11_GPU_CODEC_FRAMEWORK.md)
         // Would use GPU APIs or DMA for efficient transfers
         Ok(Some(buffer))
     }

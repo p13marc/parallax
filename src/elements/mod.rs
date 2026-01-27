@@ -38,8 +38,8 @@
 //! ## [`util`] - Utility Elements
 //! PassThrough, Identity
 //!
-//! ## [`codec`] - Software Codecs (feature-gated)
-//! AV1 decoder (dav1d), AV1 encoder (rav1e)
+//! ## `codec` - Software Codecs (feature-gated)
+//! AV1 decoder (dav1d), AV1 encoder (rav1e) - requires codec feature flags
 
 pub mod app;
 

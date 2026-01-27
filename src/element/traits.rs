@@ -1,5 +1,8 @@
 //! Core element traits.
 
+// Allow missing docs on dynosaur-generated code
+#![allow(missing_docs)]
+
 use crate::buffer::Buffer;
 use crate::element::context::{ConsumeContext, ProduceContext, ProduceResult};
 use crate::error::Result;

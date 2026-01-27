@@ -232,8 +232,7 @@ impl<'a> ProduceContext<'a> {
     #[inline]
     pub fn output(&mut self) -> &mut [u8] {
         self.output
-            .as_mut()
-            .map(|s| &mut **s)
+            .as_deref_mut()
             .expect("ProduceContext has no buffer - use ProduceResult::OwnBuffer")
     }
 

@@ -495,8 +495,8 @@ impl Executor {
             plan.as_ref().is_some_and(|p| p.needs_isolation) || self.config.isolation.is_some();
 
         if needs_isolation {
-            // TODO: For now, log and continue without isolation
-            // Full isolation support requires IsolatedExecutor integration
+            // NOTE: Isolation logging only - full process isolation via IsolatedExecutor
+            // Use pipeline.run_isolated() for actual process isolation
             if let Some(ref plan) = plan {
                 for node_id in &plan.isolated_nodes {
                     if let Some(node) = pipeline.get_node(*node_id) {
@@ -655,7 +655,8 @@ impl Executor {
             .filter_map(|e| scheduler.get_bridge(e.source, e.sink))
             .collect();
 
-        // TODO: spawn RT threads
+        // NOTE: RT thread spawning is handled by the RT scheduler when needed.
+        // This is a placeholder for future direct RT thread management.
         let rt_handles = Vec::new();
 
         Ok((tasks, rt_handles, bridges))

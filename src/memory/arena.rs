@@ -729,6 +729,7 @@ impl ArenaCache {
     /// # Safety
     ///
     /// The caller must ensure exclusive access to this memory region.
+    #[allow(clippy::mut_from_ref)] // Interior mutability via mmap is intentional
     pub unsafe fn get_mut_slice(&self, slot_ref: &IpcSlotRef) -> Option<&mut [u8]> {
         // Check access rights
         if !slot_ref.access.can_write() {

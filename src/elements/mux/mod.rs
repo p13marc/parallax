@@ -1,8 +1,8 @@
 //! Multiplexing elements.
 //!
-//! - [`Mp4Mux`]: MP4/MOV container muxer (requires `mp4-demux` feature)
-//! - [`TsMux`]: MPEG Transport Stream muxer (requires `mpeg-ts` feature)
-//! - [`TsMuxElement`]: Pipeline-ready TS muxer element (requires `mpeg-ts` feature)
+//! - `Mp4Mux`: MP4/MOV container muxer (requires `mp4-demux` feature)
+//! - `TsMux`: MPEG Transport Stream muxer (requires `mpeg-ts` feature)
+//! - `TsMuxElement`: Pipeline-ready TS muxer element (requires `mpeg-ts` feature)
 //!
 //! # Muxer Elements
 //!

@@ -627,7 +627,7 @@ impl SharedArena {
         }
 
         // Linear scan for a free slot
-        // TODO: Could use a free list or bitmap for O(1) acquire
+        // NOTE: Could use a free list or bitmap for O(1) acquire if this becomes a bottleneck
         for i in 0..self.slot_count {
             let sh = unsafe { &*self.slot_headers.as_ptr().add(i) };
             if sh.try_acquire() {
@@ -638,8 +638,7 @@ impl SharedArena {
                         NonNull::new_unchecked(
                             self.base
                                 .as_ptr()
-                                .add(self.data_offset + i * self.slot_size)
-                                as *mut u8,
+                                .add(self.data_offset + i * self.slot_size),
                         )
                     },
                     data_len: self.slot_size,
@@ -781,7 +780,7 @@ impl SharedArena {
             release_queue: self.release_queue,
             slot_header: unsafe { NonNull::new_unchecked(sh as *const _ as *mut _) },
             data_ptr: unsafe {
-                NonNull::new_unchecked(self.base.as_ptr().add(ipc_ref.data_offset) as *mut u8)
+                NonNull::new_unchecked(self.base.as_ptr().add(ipc_ref.data_offset))
             },
             data_len: ipc_ref.len,
             slot_index: ipc_ref.slot_index,

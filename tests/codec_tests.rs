@@ -3,12 +3,12 @@
 //! These tests verify the codec elements work correctly with the pipeline system.
 
 use parallax::buffer::{Buffer, MemoryHandle};
-use parallax::element::Element;
 use parallax::memory::{HeapSegment, MemorySegment};
 use parallax::metadata::Metadata;
 use std::sync::Arc;
 
 /// Test helper to create a buffer with given data
+#[allow(dead_code)]
 fn create_test_buffer(data: &[u8]) -> Buffer {
     let segment = Arc::new(HeapSegment::new(data.len()).expect("failed to create heap segment"));
     // Copy data into segment

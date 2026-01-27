@@ -746,7 +746,7 @@ mod tests {
 
         // Create async server source
         let mut src = AsyncTcpSrc::listen("127.0.0.1:0").await.unwrap();
-        let addr = match &src.mode {
+        let _addr = match &src.mode {
             TcpMode::Server(a) => *a,
             _ => panic!("expected server mode"),
         };

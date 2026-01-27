@@ -1,8 +1,8 @@
 //! Demultiplexing elements.
 //!
 //! - [`StreamIdDemux`]: Demultiplex by stream ID
-//! - [`TsDemux`]: MPEG Transport Stream demultiplexer (requires `mpeg-ts` feature)
-//! - [`Mp4Demux`]: MP4/MOV container demultiplexer (requires `mp4-demux` feature)
+//! - `TsDemux`: MPEG Transport Stream demultiplexer (requires `mpeg-ts` feature)
+//! - `Mp4Demux`: MP4/MOV container demultiplexer (requires `mp4-demux` feature)
 
 mod streamid_demux;
 

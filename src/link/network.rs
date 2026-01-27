@@ -80,7 +80,7 @@ impl NetworkHeader {
         }
     }
 
-    fn to_bytes(&self) -> [u8; Self::SIZE] {
+    fn to_bytes(self) -> [u8; Self::SIZE] {
         let mut buf = [0u8; Self::SIZE];
         buf[0..4].copy_from_slice(&self.magic);
         buf[4..6].copy_from_slice(&self.version.to_le_bytes());

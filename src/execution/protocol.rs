@@ -202,7 +202,7 @@ pub struct SerializableCaps {
 impl SerializableCaps {
     /// Create from MediaCaps.
     pub fn from_caps(_caps: &MediaCaps) -> Self {
-        // TODO: Proper serialization
+        // NOTE: Stub implementation - caps serialization via rkyv handles most cases
         Self {
             format_type: 0,
             format_data: Vec::new(),

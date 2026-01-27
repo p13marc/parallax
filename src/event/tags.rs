@@ -343,7 +343,7 @@ impl TagList {
 
     /// Set the duration tag.
     pub fn set_duration(&mut self, duration: ClockTime) {
-        self.set("duration", duration.nanos() as u64);
+        self.set("duration", duration.nanos());
     }
 
     /// Get the bitrate tag (bits per second).
@@ -470,6 +470,9 @@ pub enum TagMergeMode {
 // ============================================================================
 
 /// Common tag names as constants for convenience.
+///
+/// These are meant to be used by pipeline applications, not internally.
+#[allow(dead_code)]
 pub mod tag_names {
     /// Stream/track title.
     pub const TITLE: &str = "title";

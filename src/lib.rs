@@ -43,6 +43,10 @@
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 #![deny(unsafe_op_in_unsafe_fn)]
+// Allow these clippy lints that are intentional design choices
+#![allow(clippy::too_many_arguments)] // Complex functions in scheduler/executor
+#![allow(clippy::type_complexity)] // Complex types in typed pipelines and executor returns
+#![allow(clippy::result_large_err)] // Buffer returned in Err for ring buffer full case
 
 pub mod buffer;
 pub mod clock;

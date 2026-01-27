@@ -7,10 +7,7 @@
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use parallax::buffer::Buffer;
-use parallax::element::{
-    ConsumeContext, DynAsyncElement, Element, ElementAdapter, ProduceContext, ProduceResult, Sink,
-    SinkAdapter, Source, SourceAdapter,
-};
+use parallax::element::{ProcessOutput, SimpleSink, SimpleSource, SimpleTransform, Snk, Src, Xfm};
 use parallax::error::Result;
 use parallax::memory::CpuArena;
 use parallax::pipeline::Pipeline;
@@ -19,7 +16,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Source that produces N buffers.
-/// Uses OwnBuffer pattern to work with or without pre-allocated arena.
 struct CountingSource {
     remaining: u64,
     total: u64,
@@ -34,47 +30,33 @@ impl CountingSource {
     }
 }
 
-impl Source for CountingSource {
-    fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
+impl SimpleSource for CountingSource {
+    fn produce(&mut self) -> Result<ProcessOutput> {
         use parallax::buffer::MemoryHandle;
         use parallax::memory::HeapSegment;
         use parallax::metadata::Metadata;
 
         if self.remaining == 0 {
-            return Ok(ProduceResult::Eos);
+            return Ok(ProcessOutput::Eos);
         }
 
         self.remaining -= 1;
         let seq = self.total - self.remaining - 1;
 
-        if ctx.has_buffer() {
-            // Use pre-allocated buffer from arena
-            let output = ctx.output();
-            let data = seq.to_le_bytes();
-            let len = data.len().min(output.len());
-            output[..len].copy_from_slice(&data[..len]);
-            ctx.set_sequence(seq);
-            Ok(ProduceResult::Produced(len))
-        } else {
-            // Fallback: create own buffer
-            let segment = Arc::new(HeapSegment::new(64).unwrap());
-            let handle = MemoryHandle::from_segment(segment);
-            let buffer = Buffer::<()>::new(handle, Metadata::from_sequence(seq));
-            Ok(ProduceResult::OwnBuffer(buffer))
-        }
-    }
-
-    fn preferred_buffer_size(&self) -> Option<usize> {
-        Some(64)
+        // Create own buffer
+        let segment = Arc::new(HeapSegment::new(64).unwrap());
+        let handle = MemoryHandle::from_segment(segment);
+        let buffer = Buffer::<()>::new(handle, Metadata::from_sequence(seq));
+        Ok(ProcessOutput::Buffer(buffer))
     }
 }
 
 /// Passthrough element (simulates processing).
 struct Passthrough;
 
-impl Element for Passthrough {
-    fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
-        Ok(Some(buffer))
+impl SimpleTransform for Passthrough {
+    fn transform(&mut self, buffer: Buffer) -> Result<ProcessOutput> {
+        Ok(ProcessOutput::Buffer(buffer))
     }
 }
 
@@ -89,8 +71,8 @@ impl CountingSink {
     }
 }
 
-impl Sink for CountingSink {
-    fn consume(&mut self, _ctx: &ConsumeContext) -> Result<()> {
+impl SimpleSink for CountingSink {
+    fn consume(&mut self, _buffer: &Buffer) -> Result<()> {
         self.count.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -100,21 +82,9 @@ impl Sink for CountingSink {
 fn build_pipeline(buffer_count: u64, counter: Arc<AtomicU64>) -> Pipeline {
     let mut pipeline = Pipeline::new();
 
-    // Use SourceAdapter without arena - source will use OwnBuffer fallback
-    let src = pipeline.add_node(
-        "source",
-        DynAsyncElement::new_box(SourceAdapter::new(CountingSource::new(buffer_count))),
-    );
-
-    let pass = pipeline.add_node(
-        "passthrough",
-        DynAsyncElement::new_box(ElementAdapter::new(Passthrough)),
-    );
-
-    let sink = pipeline.add_node(
-        "sink",
-        DynAsyncElement::new_box(SinkAdapter::new(CountingSink::new(counter))),
-    );
+    let src = pipeline.add_element("source", Src(CountingSource::new(buffer_count)));
+    let pass = pipeline.add_element("passthrough", Xfm(Passthrough));
+    let sink = pipeline.add_element("sink", Snk(CountingSink::new(counter)));
 
     pipeline.link(src, pass).expect("link src->pass");
     pipeline.link(pass, sink).expect("link pass->sink");
@@ -198,7 +168,7 @@ fn bench_raw_element(c: &mut Criterion) {
                         let handle = MemoryHandle::from_segment(segment);
                         let buffer = Buffer::<()>::new(handle, Metadata::from_sequence(i as u64));
 
-                        if let Ok(Some(_)) = passthrough.process(buffer) {
+                        if let Ok(ProcessOutput::Buffer(_)) = passthrough.transform(buffer) {
                             processed += 1;
                         }
                     }

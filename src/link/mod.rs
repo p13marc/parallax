@@ -7,8 +7,8 @@
 //! ## Link Types
 //!
 //! - [`LocalLink`]: In-process buffered channel (using kanal)
-//! - [`IpcLink`]: Cross-process link using shared memory and Unix sockets
-//! - [`NetworkLink`]: TCP-based network link with rkyv serialization
+//! - [`IpcPublisher`]/[`IpcSubscriber`]: Cross-process link using shared memory and Unix sockets
+//! - [`NetworkSender`]/[`NetworkReceiver`]: TCP-based network link with rkyv serialization
 //!
 //! ## Zero-Copy Semantics
 //!

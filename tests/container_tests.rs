@@ -2,8 +2,6 @@
 //!
 //! These tests verify the container format elements work correctly.
 
-use std::io::Cursor;
-
 // ============================================================================
 // MP4 Demuxer Tests
 // ============================================================================

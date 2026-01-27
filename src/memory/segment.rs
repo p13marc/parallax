@@ -144,7 +144,7 @@ pub trait MemorySegment: Send + Sync {
     }
 }
 
-/// Extension trait for Arc<dyn MemorySegment>.
+/// Extension trait for `Arc<dyn MemorySegment>`.
 impl dyn MemorySegment {
     /// Check if this segment can be shared with other processes.
     pub fn is_shareable(&self) -> bool {
