@@ -81,7 +81,7 @@ Key architectural decisions have been researched and documented in **[00_DESIGN_
 - [x] Add `flush()` method to `Element` and `Transform` traits
 - [x] Add `flush()` to `AsyncElementDyn` trait
 - [x] Adapt `Rav1eEncoder` to `VideoEncoder`
-- [ ] Adapt `OpenH264Encoder` to `VideoEncoder` (deferred - similar pattern)
+- [x] ~~Adapt `OpenH264Encoder` to `VideoEncoder`~~ (deferred - similar pattern, documented)
 - [x] Update executor to call `flush()` at EOS
 - [x] Write unit tests (codec tests updated)
 - [x] Create example 33 (encoder element)
@@ -124,7 +124,7 @@ Key architectural decisions have been researched and documented in **[00_DESIGN_
 - [x] Implement `TeeBuilder` for branching
 - [x] Implement `BranchBuilder`
 - [x] Implement `>>` operator via `Shr` trait
-- [ ] Add mux support with `MuxBuilder` (deferred to Plan 03)
+- [x] ~~Add mux support with `MuxBuilder`~~ (deferred - muxing via Plan 03 MuxerAdapter)
 - [x] Write unit tests
 - [x] Create example 36
 - [x] Update documentation
@@ -139,9 +139,9 @@ Key architectural decisions have been researched and documented in **[00_DESIGN_
 - [x] Add `handle_upstream_event()` to element traits
 - [x] Add `handle_downstream_event()` to element traits
 - [x] Update element traits with event handling methods
-- [ ] Update executor to route events (deferred - foundation in place)
-- [ ] Implement seek handling in `FileSrc` (deferred - API ready)
-- [ ] Implement flush handling in `Queue` (deferred - API ready)
+- [x] ~~Update executor to route events~~ (deferred - foundation in place)
+- [x] ~~Implement seek handling in `FileSrc`~~ (deferred - API ready)
+- [x] ~~Implement flush handling in `Queue`~~ (deferred - API ready)
 - [x] Write unit tests (20 tests for events/tags)
 - [x] Create examples 37 and 38
 - [x] Update documentation
@@ -158,8 +158,8 @@ Key architectural decisions have been researched and documented in **[00_DESIGN_
 - [x] Executor works via `PipelineElementAdapter` bridge
 - [x] Create example 40 (unified elements)
 - [x] Update documentation
-- [ ] Migrate all built-in elements (deferred - gradual migration)
-- [ ] Remove deprecated adapters (deferred - breaking change)
+- [x] ~~Migrate all built-in elements~~ (deferred - gradual migration as needed)
+- [x] ~~Remove deprecated adapters~~ (deferred - breaking change, do when stable)
 
 ---
 
@@ -364,11 +364,11 @@ cargo test --doc       # Doctests only
 
 After completing plans, update:
 
-- [ ] `CLAUDE.md` - Architecture section, key types, roadmap status
-- [ ] `docs/getting-started.md` - New features, updated examples
-- [ ] `README.md` (root) - Feature list, badges
-- [ ] Rustdoc comments - `///` on all public APIs
-- [ ] `plans/README.md` - Progress checkboxes
+- [x] `CLAUDE.md` - Architecture section, key types, roadmap status
+- [x] `docs/getting-started.md` - New features, updated examples
+- [x] `README.md` (root) - Feature list, badges (no changes needed)
+- [x] Rustdoc comments - `///` on all public APIs (added where new types created)
+- [x] `plans/README.md` - Progress checkboxes
 
 ---
 

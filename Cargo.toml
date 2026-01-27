@@ -263,3 +263,11 @@ required-features = ["mpeg-ts"]
 
 [[example]]
 name = "31_av1_pipeline_stanag"
+
+[[example]]
+name = "33_encoder_element"
+required-features = ["av1-encode"]
+
+[[example]]
+name = "39_muxer_element"
+required-features = ["mpeg-ts"]
