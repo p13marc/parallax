@@ -256,3 +256,7 @@ required-features = ["mpeg-ts"]
 [[example]]
 name = "29_rtsp_transcode_stanag"
 required-features = ["mpeg-ts"]
+
+[[example]]
+name = "30_av1_transcode_stanag"
+required-features = ["mpeg-ts"]

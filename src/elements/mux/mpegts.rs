@@ -79,6 +79,9 @@ pub enum TsMuxStreamType {
     H264,
     /// H.265/HEVC video (0x24).
     H265,
+    /// AV1 video (0x06 private + descriptor, or custom).
+    /// Note: AV1 in MPEG-TS uses private data with AV1 descriptor per AOM spec.
+    Av1,
     /// MPEG-2 video (0x02).
     Mpeg2Video,
     /// AAC audio with ADTS transport (0x0F).
@@ -103,6 +106,7 @@ impl TsMuxStreamType {
         match self {
             TsMuxStreamType::H264 => 0x1B,
             TsMuxStreamType::H265 => 0x24,
+            TsMuxStreamType::Av1 => 0x06, // Private data, requires AV1 descriptor
             TsMuxStreamType::Mpeg2Video => 0x02,
             TsMuxStreamType::AacAdts => 0x0F,
             TsMuxStreamType::AacLatm => 0x11,
@@ -118,7 +122,10 @@ impl TsMuxStreamType {
     pub fn is_video(&self) -> bool {
         matches!(
             self,
-            TsMuxStreamType::H264 | TsMuxStreamType::H265 | TsMuxStreamType::Mpeg2Video
+            TsMuxStreamType::H264
+                | TsMuxStreamType::H265
+                | TsMuxStreamType::Av1
+                | TsMuxStreamType::Mpeg2Video
         )
     }
 
@@ -162,7 +169,10 @@ impl TsMuxTrack {
     /// Create a new track with default settings.
     pub fn new(pid: u16, stream_type: TsMuxStreamType) -> Self {
         let stream_id = match stream_type {
-            TsMuxStreamType::H264 | TsMuxStreamType::H265 | TsMuxStreamType::Mpeg2Video => 0xE0,
+            TsMuxStreamType::H264
+            | TsMuxStreamType::H265
+            | TsMuxStreamType::Av1
+            | TsMuxStreamType::Mpeg2Video => 0xE0,
             TsMuxStreamType::AacAdts
             | TsMuxStreamType::AacLatm
             | TsMuxStreamType::MpegAudio
