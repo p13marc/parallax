@@ -1,83 +1,91 @@
 //! # libcamera Video Capture
 //!
-//! Demonstrates libcamera video capture from cameras.
-//!
-//! libcamera is the modern camera stack for Linux, providing a unified API
-//! for complex camera hardware including:
-//! - USB webcams
-//! - MIPI CSI cameras (Raspberry Pi, embedded systems)
-//! - Cameras requiring ISP processing
+//! Demonstrates libcamera camera enumeration and video capture.
+//! libcamera is the modern camera stack for Linux, handling complex
+//! camera pipelines including ISP and 3A algorithms.
 //!
 //! ## Requirements
 //!
 //! - Install: `libcamera-dev` (Ubuntu) or `libcamera-devel` (Fedora)
-//! - A camera supported by libcamera
+//! - A camera supported by libcamera (USB webcams, Raspberry Pi cameras, etc.)
 //!
-//! ## Status
+//! ## Run
 //!
-//! The libcamera feature requires updates to match the current libcamera-rs API.
-//! This example shows the intended usage pattern.
-//!
-//! ## Intended Usage
-//!
-//! ```rust,ignore
-//! use parallax::elements::device::libcamera::{LibCameraSrc, LibCameraConfig, enumerate_cameras};
-//!
-//! // List available cameras
-//! let cameras = enumerate_cameras()?;
-//! for cam in &cameras {
-//!     println!("{}: {} ({:?})", cam.id, cam.model, cam.location);
-//! }
-//!
-//! // Create camera source with default configuration
-//! let camera = LibCameraSrc::new()?;
-//!
-//! // Or with specific configuration
-//! let config = LibCameraConfig {
-//!     width: 1920,
-//!     height: 1080,
-//!     format: PixelFormat::NV12,
-//!     buffer_count: 4,
-//! };
-//! let camera = LibCameraSrc::with_config(config)?;
-//!
-//! // Use in pipeline
-//! let mut pipeline = Pipeline::new();
-//! let src = pipeline.add_async_source("camera", camera);
-//! let sink = pipeline.add_sink("display", display_sink);
-//! pipeline.link(src, sink)?;
-//! pipeline.run().await?;
+//! ```bash
+//! cargo run --example 44_libcamera_capture --features libcamera
 //! ```
-//!
-//! ## libcamera vs V4L2
-//!
-//! | Aspect | V4L2 | libcamera |
-//! |--------|------|-----------|
-//! | API Level | Low (ioctl) | High (C++ lib) |
-//! | Complex cameras | Manual ISP | Automatic |
-//! | 3A algorithms | None | AWB, AE, AF |
-//! | Raspberry Pi | Requires custom | First-class |
-//! | Simple webcams | Easy | Works (overkill) |
 
+#[cfg(feature = "libcamera")]
+use parallax::elements::device::libcamera::{
+    LibCameraConfig, LibCameraSrc, enumerate_cameras, is_available,
+};
+
+#[cfg(feature = "libcamera")]
 fn main() {
     println!("=== libcamera Video Capture Example ===\n");
-    println!("libcamera is the modern camera stack for Linux.");
-    println!();
-    println!("The 'libcamera' feature provides:");
-    println!("  - LibCameraSrc: Video capture from cameras");
-    println!("  - enumerate_cameras(): List available cameras");
-    println!("  - Automatic ISP and 3A (AWB, AE, AF) configuration");
-    println!("  - DMA-BUF support for zero-copy");
-    println!();
-    println!("Requirements:");
-    println!("  Fedora: sudo dnf install libcamera-devel");
-    println!("  Ubuntu: sudo apt install libcamera-dev");
-    println!();
-    println!("Check available cameras with: cam -l");
-    println!();
-    println!("NOTE: The libcamera feature currently needs updates to match");
-    println!("the latest libcamera-rs crate API. See src/elements/device/libcamera.rs");
-    println!();
-    println!("For simple webcams, consider using V4L2 instead:");
-    println!("  cargo run --example 23_v4l2_display --features v4l2,display");
+
+    // Check if libcamera is available
+    if !is_available() {
+        eprintln!("libcamera is not available on this system.");
+        eprintln!("Make sure libcamera is installed and cameras are connected.");
+        return;
+    }
+    println!("libcamera is available.\n");
+
+    // Enumerate cameras
+    println!("Enumerating cameras...");
+    match enumerate_cameras() {
+        Ok(cameras) => {
+            if cameras.is_empty() {
+                println!("No cameras found.");
+                println!("Connect a USB webcam or use a device with a built-in camera.");
+                return;
+            }
+
+            println!("Found {} camera(s):\n", cameras.len());
+            for cam in &cameras {
+                println!("  ID: {}", cam.id);
+                println!("  Model: {}", cam.model);
+                println!("  Location: {:?}", cam.location);
+                println!();
+            }
+
+            // Try to open the first camera
+            let first_camera = &cameras[0];
+            println!("Opening camera: {}", first_camera.id);
+
+            let config = LibCameraConfig {
+                width: 640,
+                height: 480,
+                format: None, // Use default format
+                buffer_count: 4,
+            };
+
+            match LibCameraSrc::with_config(config) {
+                Ok(_src) => {
+                    println!("Successfully opened camera.");
+                    println!();
+                    println!("In a real application, you would use this in a pipeline:");
+                    println!();
+                    println!("  let mut pipeline = Pipeline::new();");
+                    println!("  let src = pipeline.add_async_source(\"camera\", src);");
+                    println!("  // ... add encoder and sink");
+                    println!("  pipeline.run().await?;");
+                }
+                Err(e) => {
+                    eprintln!("Failed to open camera: {}", e);
+                    eprintln!("The camera may be in use by another application.");
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to enumerate cameras: {}", e);
+        }
+    }
+}
+
+#[cfg(not(feature = "libcamera"))]
+fn main() {
+    eprintln!("This example requires the 'libcamera' feature.");
+    eprintln!("Run with: cargo run --example 44_libcamera_capture --features libcamera");
 }

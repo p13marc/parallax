@@ -1,59 +1,78 @@
-//! # PipeWire Audio Capture and Playback
+//! # PipeWire Audio Capture
 //!
-//! Demonstrates PipeWire audio capture from microphone and playback to speakers.
-//!
-//! PipeWire is the modern audio/video server for Linux, replacing PulseAudio
-//! and JACK. It provides low-latency audio with proper session management.
+//! Demonstrates PipeWire audio node enumeration and capture.
 //!
 //! ## Requirements
 //!
-//! - PipeWire must be running (default on Fedora, Ubuntu 22.04+)
+//! - PipeWire daemon must be running
 //! - Install: `libpipewire-0.3-dev` (Ubuntu) or `pipewire-devel` (Fedora)
 //!
-//! ## Status
+//! ## Run
 //!
-//! The PipeWire feature requires updates to match the current pipewire-rs API.
-//! This example shows the intended usage pattern.
-//!
-//! ## Intended Usage
-//!
-//! ```rust,ignore
-//! use parallax::elements::device::pipewire::{enumerate_audio_nodes, PipeWireSrc, PipeWireSink};
-//!
-//! // List available audio nodes
-//! let nodes = enumerate_audio_nodes()?;
-//! for node in &nodes {
-//!     println!("{}: {} (capture: {}, playback: {})",
-//!         node.id, node.description, node.is_capture, node.is_playback);
-//! }
-//!
-//! // Create audio capture source (microphone)
-//! let mut mic = PipeWireSrc::audio(None)?;  // None = default device
-//!
-//! // Create audio playback sink (speakers)
-//! let speaker = PipeWireSink::audio(None)?;
-//!
-//! // Use in pipeline
-//! let mut pipeline = Pipeline::new();
-//! let src = pipeline.add_async_source("mic", mic);
-//! let sink = pipeline.add_async_sink("speaker", speaker);
-//! pipeline.link(src, sink)?;
-//! pipeline.run().await?;
+//! ```bash
+//! cargo run --example 42_pipewire_audio --features pipewire
 //! ```
 
+#[cfg(feature = "pipewire")]
+use parallax::elements::device::pipewire::{PipeWireSrc, enumerate_audio_nodes, is_available};
+
+#[cfg(feature = "pipewire")]
 fn main() {
     println!("=== PipeWire Audio Example ===\n");
-    println!("PipeWire is the modern audio/video server for Linux.");
-    println!();
-    println!("The 'pipewire' feature provides:");
-    println!("  - PipeWireSrc: Audio/video capture from microphones, cameras, screens");
-    println!("  - PipeWireSink: Audio playback to speakers");
-    println!("  - enumerate_audio_nodes(): List available audio devices");
-    println!();
-    println!("Requirements:");
-    println!("  Fedora: sudo dnf install pipewire-devel");
-    println!("  Ubuntu: sudo apt install libpipewire-0.3-dev");
-    println!();
-    println!("NOTE: The pipewire feature currently needs updates to match");
-    println!("the latest pipewire-rs crate API. See src/elements/device/pipewire.rs");
+
+    // Check if PipeWire is available
+    if !is_available() {
+        eprintln!("PipeWire is not available on this system.");
+        eprintln!("Make sure the PipeWire daemon is running.");
+        return;
+    }
+    println!("PipeWire is available.\n");
+
+    // Enumerate audio nodes
+    println!("Enumerating audio nodes...");
+    match enumerate_audio_nodes() {
+        Ok(nodes) => {
+            if nodes.is_empty() {
+                println!("No audio nodes found.");
+            } else {
+                println!("Found {} audio node(s):\n", nodes.len());
+                for node in &nodes {
+                    println!("  [{}] {} - {}", node.id, node.name, node.media_class);
+                    println!("       Description: {}", node.description);
+                    println!(
+                        "       Capture: {}, Playback: {}",
+                        node.is_capture, node.is_playback
+                    );
+                    println!();
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to enumerate audio nodes: {}", e);
+        }
+    }
+
+    // Try to create a capture source
+    println!("Creating audio capture source (default microphone)...");
+    match PipeWireSrc::audio(None) {
+        Ok(_src) => {
+            println!("Successfully created PipeWire audio source.");
+            println!("In a real application, you would use this in a pipeline:");
+            println!();
+            println!("  let mut pipeline = Pipeline::new();");
+            println!("  let src = pipeline.add_async_source(\"mic\", src);");
+            println!("  // ... add processing and sink");
+            println!("  pipeline.run().await?;");
+        }
+        Err(e) => {
+            eprintln!("Failed to create audio source: {}", e);
+            eprintln!("This may be normal if no microphone is available.");
+        }
+    }
+}
+
+#[cfg(not(feature = "pipewire"))]
+fn main() {
+    eprintln!("This example requires the 'pipewire' feature.");
+    eprintln!("Run with: cargo run --example 42_pipewire_audio --features pipewire");
 }
