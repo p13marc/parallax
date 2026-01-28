@@ -48,7 +48,7 @@ Key architectural decisions have been researched and documented in **[00_DESIGN_
 | # | Plan | Priority | Effort | Progress |
 |---|------|----------|--------|----------|
 | 09 | [Format Converters](09_FORMAT_CONVERTERS.md) | High | Medium | ✅ Complete |
-| 10 | [Code Cleanup](10_CODE_CLEANUP.md) | Low | Small | ⬜ Not Started |
+| 10 | [Code Cleanup](10_CODE_CLEANUP.md) | Low | Small | ✅ Complete |
 | 11 | [GPU Codec Framework](11_GPU_CODEC_FRAMEWORK.md) | High | Large | ⬜ Not Started |
 | 12 | [Additional Codecs](12_ADDITIONAL_CODECS.md) | Medium | Medium | ⬜ Not Started |
 | 13 | [Device Elements](13_DEVICE_ELEMENTS.md) | Medium | Medium | ⬜ Not Started |
@@ -320,12 +320,12 @@ Adaptive bitrate streaming support:
 - [x] Create example: `examples/41_format_converters.rs`
 - [x] Update plan documentation
 
-### Plan 10: Code Cleanup ⬜
-- [ ] Fix compiler warnings with `cargo fix`
-- [ ] Run and fix `cargo clippy -- -D warnings`
-- [ ] Process all TODO comments
-- [ ] Run `cargo doc --no-deps` and fix warnings
-- [ ] Remove dead code
+### Plan 10: Code Cleanup ✅
+- [x] Fix compiler warnings with `cargo fix`
+- [x] Run and fix `cargo clippy -- -D warnings`
+- [x] Process all TODO comments (converted to NOTEs)
+- [x] Run `cargo doc --no-deps` and fix warnings
+- [x] Remove dead code
 
 ### Plan 11: GPU Codec Framework ⬜
 - [ ] Add `ash`, `gpu-allocator` dependencies

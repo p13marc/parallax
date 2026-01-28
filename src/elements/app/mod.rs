@@ -2,7 +2,7 @@
 //!
 //! - [`AppSrc`]: Inject buffers from application code
 //! - [`AppSink`]: Extract buffers to application code
-//! - [`AutoVideoSink`]: Display video in a window (requires `display` feature)
+//! - `AutoVideoSink`: Display video in a window (requires `display` feature)
 
 mod appsink;
 mod appsrc;

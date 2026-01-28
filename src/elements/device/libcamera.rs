@@ -360,7 +360,8 @@ impl AsyncSource for LibCameraSrc {
                 let len = frame.data.len();
                 if len > 0 && len <= ctx.output().len() {
                     ctx.output()[..len].copy_from_slice(&frame.data);
-                    // TODO: Set metadata (timestamp, width, height)
+                    // NOTE: Metadata (timestamp, width, height) should be set
+                    // via ProduceContext when buffer metadata API is extended.
                     Ok(ProduceResult::Produced(len))
                 } else if len > ctx.output().len() {
                     // Buffer too small

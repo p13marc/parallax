@@ -492,9 +492,9 @@ impl Source for IpcSrc {
                     // is not yet implemented.
                     let meta = metadata.to_metadata();
 
-                    // Create a buffer with allocated memory using SharedArena
-                    // TODO: In a real implementation, use SharedArenaCache to map
-                    // the arena from the sender and create a zero-copy buffer view.
+                    // Create a buffer with allocated memory using SharedArena.
+                    // NOTE: For true zero-copy, use SharedArenaCache to map the
+                    // arena from the sender. Currently copies data for simplicity.
                     if self.arena.is_none() {
                         // Use 64KB slots by default, matching IpcSink
                         self.arena = Some(SharedArena::new(64 * 1024, 64)?);

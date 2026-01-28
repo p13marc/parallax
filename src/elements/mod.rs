@@ -41,7 +41,7 @@
 //! ## `codec` - Software Codecs (feature-gated)
 //! AV1 decoder (dav1d), AV1 encoder (rav1e) - requires codec feature flags
 //!
-//! ## [`device`] - Device Capture (feature-gated)
+//! ## `device` - Device Capture (feature-gated)
 //! PipeWire, libcamera, V4L2, ALSA - hardware device capture and playback
 
 pub mod app;
