@@ -10,9 +10,8 @@
 use super::mode::{ExecutionMode, GroupId};
 use super::protocol::ElementState;
 use crate::error::{Error, Result};
-use crate::memory::CpuArena;
+use crate::memory::SharedArena;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -162,7 +161,7 @@ pub struct Supervisor {
     /// Running element processes.
     elements: HashMap<ElementId, ElementProcess>,
     /// Shared memory arenas.
-    arenas: HashMap<u64, Arc<CpuArena>>,
+    arenas: HashMap<u64, SharedArena>,
     /// Restart policy.
     restart_policy: RestartPolicy,
     /// Whether the supervisor is running.
@@ -251,7 +250,7 @@ impl Supervisor {
     ///
     /// Returns the arena ID for cross-process reference.
     pub fn create_arena(&mut self, slot_size: usize, slot_count: usize) -> Result<u64> {
-        let arena = CpuArena::new(slot_size, slot_count)?;
+        let arena = SharedArena::new(slot_size, slot_count)?;
         let arena_id = self.next_arena_id;
         self.next_arena_id += 1;
 
@@ -260,7 +259,7 @@ impl Supervisor {
     }
 
     /// Get an arena by ID.
-    pub fn get_arena(&self, arena_id: u64) -> Option<&Arc<CpuArena>> {
+    pub fn get_arena(&self, arena_id: u64) -> Option<&SharedArena> {
         self.arenas.get(&arena_id)
     }
 

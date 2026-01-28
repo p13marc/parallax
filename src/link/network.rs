@@ -22,11 +22,10 @@
 
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::error::{Error, Result};
-use crate::memory::{CpuSegment, MemorySegment};
+use crate::memory::SharedArena;
 use crate::metadata::Metadata;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::Arc;
 
 /// Protocol magic bytes.
 const MAGIC: [u8; 4] = *b"PRLX";
@@ -249,6 +248,8 @@ pub struct NetworkReceiver {
     listener: Option<TcpListener>,
     stream: Option<TcpStream>,
     bytes_received: u64,
+    /// Arena for allocating received buffers.
+    arena: Option<SharedArena>,
 }
 
 impl NetworkReceiver {
@@ -259,6 +260,7 @@ impl NetworkReceiver {
             listener: Some(listener),
             stream: None,
             bytes_received: 0,
+            arena: None,
         })
     }
 
@@ -268,6 +270,7 @@ impl NetworkReceiver {
             listener: None,
             stream: Some(stream),
             bytes_received: 0,
+            arena: None,
         }
     }
 
@@ -349,16 +352,25 @@ impl NetworkReceiver {
                 let sequence = u64::from_le_bytes(payload[..8].try_into().unwrap());
                 let data = &payload[8..];
 
-                // Create buffer with heap-backed memory
-                let segment = Arc::new(CpuSegment::new(data.len())?);
-                let ptr = segment
-                    .as_mut_ptr()
-                    .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+                // Ensure we have an arena, create one if needed
+                // Use a reasonable slot size (at least data.len(), round up to power of 2)
+                let slot_size = data.len().max(4096).next_power_of_two();
+                if self.arena.is_none()
+                    || self.arena.as_ref().map(|a| a.slot_size()).unwrap_or(0) < data.len()
+                {
+                    // Use 32 slots to handle buffering during receive
+                    self.arena = Some(SharedArena::new(slot_size, 32)?);
                 }
 
-                let handle = MemoryHandle::from_segment(segment);
+                let arena = self.arena.as_ref().unwrap();
+                let mut slot = arena
+                    .acquire()
+                    .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+
+                // Copy data to slot
+                slot.data_mut()[..data.len()].copy_from_slice(data);
+
+                let handle = MemoryHandle::with_len(slot, data.len());
                 let metadata = Metadata::from_sequence(sequence);
 
                 Ok(Some(Buffer::new(handle, metadata)))
@@ -384,16 +396,21 @@ impl NetworkReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
     use std::thread;
 
+    // Use a thread-local arena for test buffer creation
+    fn get_test_arena() -> &'static SharedArena {
+        static ARENA: OnceLock<SharedArena> = OnceLock::new();
+        ARENA.get_or_init(|| SharedArena::new(1024 * 1024, 64).unwrap())
+    }
+
     fn make_buffer(data: &[u8], seq: u64) -> Buffer {
-        let segment = Arc::new(CpuSegment::new(data.len()).unwrap());
-        let ptr = segment.as_mut_ptr().unwrap();
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
-        }
+        let arena = get_test_arena();
+        let mut slot = arena.acquire().expect("test arena should have slots");
+        slot.data_mut()[..data.len()].copy_from_slice(data);
         Buffer::new(
-            MemoryHandle::from_segment(segment),
+            MemoryHandle::with_len(slot, data.len()),
             Metadata::from_sequence(seq),
         )
     }

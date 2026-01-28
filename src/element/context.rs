@@ -39,9 +39,8 @@
 
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::error::{Error, Result};
-use crate::memory::{ArenaSlot, BufferPool, MemoryPool, PooledBuffer};
+use crate::memory::{BufferPool, PooledBuffer, SharedSlotRef};
 use crate::metadata::Metadata;
-use std::sync::Arc;
 
 // ============================================================================
 // ProduceResult - return type for source produce()
@@ -142,7 +141,7 @@ impl ProduceResult {
 /// ```
 pub struct ProduceContext<'a> {
     /// Pre-allocated output buffer from the pool.
-    slot: Option<ArenaSlot>,
+    slot: Option<SharedSlotRef>,
     /// Mutable slice view into the slot (if slot is Some).
     output: Option<&'a mut [u8]>,
     /// Metadata for the produced buffer.
@@ -159,10 +158,10 @@ impl<'a> ProduceContext<'a> {
     /// # Safety
     ///
     /// The slot must remain valid for the lifetime `'a`.
-    pub fn new(slot: ArenaSlot) -> Self {
+    pub fn new(slot: SharedSlotRef) -> Self {
         let capacity = slot.len();
         // SAFETY: We own the slot and it's valid for the duration of this context.
-        // The pointer is valid because ArenaSlot guarantees valid memory.
+        // The pointer is valid because SharedSlotRef guarantees valid memory.
         let output = unsafe {
             let ptr = slot.as_ptr() as *mut u8;
             Some(std::slice::from_raw_parts_mut(ptr, capacity))
@@ -181,10 +180,10 @@ impl<'a> ProduceContext<'a> {
     /// # Safety
     ///
     /// The slot must remain valid for the lifetime `'a`.
-    pub fn with_pool(slot: ArenaSlot, pool: &'a dyn BufferPool) -> Self {
+    pub fn with_pool(slot: SharedSlotRef, pool: &'a dyn BufferPool) -> Self {
         let capacity = slot.len();
         // SAFETY: We own the slot and it's valid for the duration of this context.
-        // The pointer is valid because ArenaSlot guarantees valid memory.
+        // The pointer is valid because SharedSlotRef guarantees valid memory.
         let output = unsafe {
             let ptr = slot.as_ptr() as *mut u8;
             Some(std::slice::from_raw_parts_mut(ptr, capacity))
@@ -353,7 +352,7 @@ impl<'a> ProduceContext<'a> {
     pub fn finalize(self, len: usize) -> Buffer {
         assert!(len <= self.capacity, "produced length exceeds capacity");
         let slot = self.slot.expect("cannot finalize without buffer");
-        let handle = MemoryHandle::from_arena_slot_with_len(slot, len);
+        let handle = MemoryHandle::with_len(slot, len);
         Buffer::new(handle, self.metadata)
     }
 
@@ -835,13 +834,13 @@ impl<'a> AsMut<[u8]> for MemoryViewMut<'a> {
 /// Runtime context for an element.
 ///
 /// The context is passed to elements during initialization and provides
-/// access to shared resources like memory pools and configuration.
+/// access to shared resources like memory arenas and configuration.
 #[derive(Clone)]
 pub struct ElementContext {
     /// Name of this element instance.
     name: String,
-    /// Optional memory pool for buffer allocation.
-    pool: Option<Arc<MemoryPool>>,
+    /// Optional shared arena for buffer allocation.
+    arena: Option<std::sync::Arc<crate::memory::SharedArena>>,
 }
 
 impl ElementContext {
@@ -849,15 +848,18 @@ impl ElementContext {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
-            pool: None,
+            arena: None,
         }
     }
 
-    /// Create a context with a memory pool.
-    pub fn with_pool(name: impl Into<String>, pool: Arc<MemoryPool>) -> Self {
+    /// Create a context with a shared arena.
+    pub fn with_arena(
+        name: impl Into<String>,
+        arena: std::sync::Arc<crate::memory::SharedArena>,
+    ) -> Self {
         Self {
             name: name.into(),
-            pool: Some(pool),
+            arena: Some(arena),
         }
     }
 
@@ -866,14 +868,14 @@ impl ElementContext {
         &self.name
     }
 
-    /// Get the memory pool, if one is configured.
-    pub fn pool(&self) -> Option<&Arc<MemoryPool>> {
-        self.pool.as_ref()
+    /// Get the shared arena, if one is configured.
+    pub fn arena(&self) -> Option<&std::sync::Arc<crate::memory::SharedArena>> {
+        self.arena.as_ref()
     }
 
-    /// Set the memory pool.
-    pub fn set_pool(&mut self, pool: Arc<MemoryPool>) {
-        self.pool = Some(pool);
+    /// Set the shared arena.
+    pub fn set_arena(&mut self, arena: std::sync::Arc<crate::memory::SharedArena>) {
+        self.arena = Some(arena);
     }
 }
 
@@ -881,7 +883,7 @@ impl std::fmt::Debug for ElementContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ElementContext")
             .field("name", &self.name)
-            .field("has_pool", &self.pool.is_some())
+            .field("has_arena", &self.arena.is_some())
             .finish()
     }
 }
@@ -889,23 +891,22 @@ impl std::fmt::Debug for ElementContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::{CpuSegment, MemorySegment};
+    use std::sync::Arc;
 
     #[test]
     fn test_context_creation() {
         let ctx = ElementContext::new("test-element");
         assert_eq!(ctx.name(), "test-element");
-        assert!(ctx.pool().is_none());
+        assert!(ctx.arena().is_none());
     }
 
     #[test]
-    fn test_context_with_pool() {
-        let segment = CpuSegment::new(1024).unwrap();
-        let pool = Arc::new(MemoryPool::new(segment, 256).unwrap());
+    fn test_context_with_arena() {
+        let arena = Arc::new(SharedArena::new(1024, 4).unwrap());
 
-        let ctx = ElementContext::with_pool("test-element", pool.clone());
-        assert!(ctx.pool().is_some());
-        assert_eq!(ctx.pool().unwrap().capacity(), pool.capacity());
+        let ctx = ElementContext::with_arena("test-element", arena.clone());
+        assert!(ctx.arena().is_some());
+        assert_eq!(ctx.arena().unwrap().id(), arena.id());
     }
 
     // ProcessContext tests
@@ -1062,12 +1063,11 @@ mod tests {
 
     // ProduceContext tests
 
-    use crate::memory::CpuArena;
-    use std::sync::Arc;
+    use crate::memory::SharedArena;
 
     #[test]
     fn test_produce_context_with_buffer() {
-        let arena = Arc::new(CpuArena::new(1024, 4).unwrap());
+        let arena = SharedArena::new(1024, 4).unwrap();
         let slot = arena.acquire().unwrap();
 
         let mut ctx = ProduceContext::new(slot);
@@ -1109,7 +1109,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "produced length exceeds capacity")]
     fn test_produce_context_finalize_overflow() {
-        let arena = Arc::new(CpuArena::new(1024, 4).unwrap());
+        let arena = SharedArena::new(1024, 4).unwrap();
         let slot = arena.acquire().unwrap();
 
         let ctx = ProduceContext::new(slot);
@@ -1148,7 +1148,7 @@ mod tests {
     #[test]
     fn test_produce_context_with_pool() {
         let pool = FixedBufferPool::new(1024, 4).unwrap();
-        let arena = Arc::new(CpuArena::new(1024, 4).unwrap());
+        let arena = SharedArena::new(1024, 4).unwrap();
         let slot = arena.acquire().unwrap();
 
         let ctx = ProduceContext::with_pool(slot, pool.as_ref());
@@ -1209,13 +1209,11 @@ mod tests {
 
     #[test]
     fn test_consume_context() {
-        let segment = Arc::new(CpuSegment::new(1024).unwrap());
+        let arena = SharedArena::new(1024, 4).unwrap();
+        let mut slot = arena.acquire().unwrap();
         // Write some data
-        unsafe {
-            let ptr = segment.as_ptr() as *mut u8;
-            std::ptr::copy_nonoverlapping(b"hello world".as_ptr(), ptr, 11);
-        }
-        let handle = MemoryHandle::new(segment, 0, 11);
+        slot.data_mut()[..11].copy_from_slice(b"hello world");
+        let handle = MemoryHandle::with_len(slot, 11);
         let meta = Metadata::from_sequence(42).keyframe();
         let buffer = Buffer::new(handle, meta);
 
@@ -1234,8 +1232,9 @@ mod tests {
 
     #[test]
     fn test_consume_context_eos() {
-        let segment = Arc::new(CpuSegment::new(8).unwrap());
-        let handle = MemoryHandle::from_segment(segment);
+        let arena = SharedArena::new(1024, 4).unwrap();
+        let slot = arena.acquire().unwrap();
+        let handle = MemoryHandle::with_len(slot, 8);
         let meta = Metadata::new().eos();
         let buffer = Buffer::new(handle, meta);
 

@@ -14,10 +14,9 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{Sink, Source};
 use crate::error::{Error, Result};
-use crate::memory::{CpuSegment, MemorySegment};
+use crate::memory::SharedArena;
 use crate::metadata::Metadata;
 use std::net::TcpStream;
-use std::sync::Arc;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket, connect};
 
@@ -50,6 +49,7 @@ pub struct WebSocketSrc {
     bytes_read: u64,
     messages_received: u64,
     sequence: u64,
+    arena: Option<SharedArena>,
 }
 
 impl WebSocketSrc {
@@ -66,6 +66,7 @@ impl WebSocketSrc {
             bytes_read: 0,
             messages_received: 0,
             sequence: 0,
+            arena: None,
         })
     }
 
@@ -152,15 +153,20 @@ impl Source for WebSocketSrc {
                     let seq = self.sequence;
                     self.sequence += 1;
 
-                    let segment = Arc::new(CpuSegment::new(data.len().max(1))?);
-                    if !data.is_empty() {
-                        unsafe {
-                            let ptr = segment.as_mut_ptr().unwrap();
-                            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
-                        }
+                    // Lazily initialize arena
+                    if self.arena.is_none() {
+                        self.arena = Some(SharedArena::new(64 * 1024, 32).map_err(|e| {
+                            Error::Element(format!("Failed to create arena: {}", e))
+                        })?);
                     }
+                    let arena = self.arena.as_ref().unwrap();
 
-                    let handle = MemoryHandle::from_segment_with_len(segment, data.len());
+                    let mut slot = arena.acquire().ok_or_else(|| {
+                        Error::Element("Failed to acquire buffer slot".to_string())
+                    })?;
+                    slot.data_mut()[..data.len()].copy_from_slice(&data);
+
+                    let handle = MemoryHandle::with_len(slot, data.len());
                     return Ok(Some(Buffer::new(handle, Metadata::from_sequence(seq))));
                 }
                 Ok(Message::Text(text)) => {
@@ -170,15 +176,20 @@ impl Source for WebSocketSrc {
                     let seq = self.sequence;
                     self.sequence += 1;
 
-                    let segment = Arc::new(CpuSegment::new(data.len().max(1))?);
-                    if !data.is_empty() {
-                        unsafe {
-                            let ptr = segment.as_mut_ptr().unwrap();
-                            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
-                        }
+                    // Lazily initialize arena
+                    if self.arena.is_none() {
+                        self.arena = Some(SharedArena::new(64 * 1024, 32).map_err(|e| {
+                            Error::Element(format!("Failed to create arena: {}", e))
+                        })?);
                     }
+                    let arena = self.arena.as_ref().unwrap();
 
-                    let handle = MemoryHandle::from_segment_with_len(segment, data.len());
+                    let mut slot = arena.acquire().ok_or_else(|| {
+                        Error::Element("Failed to acquire buffer slot".to_string())
+                    })?;
+                    slot.data_mut()[..data.len()].copy_from_slice(&data);
+
+                    let handle = MemoryHandle::with_len(slot, data.len());
                     return Ok(Some(Buffer::new(handle, Metadata::from_sequence(seq))));
                 }
                 Ok(Message::Close(_)) => {

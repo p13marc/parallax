@@ -5,13 +5,12 @@
 //! - [`UdpSrc`]: Reads datagrams from a UDP socket
 //! - [`UdpSink`]: Writes datagrams to a UDP socket
 
-use crate::buffer::Buffer;
+use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{ConsumeContext, ProduceContext, ProduceResult};
 use crate::error::{Error, Result};
-use crate::memory::{CpuSegment, MemorySegment};
+use crate::memory::SharedArena;
 use crate::metadata::Metadata;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
-use std::sync::Arc;
 use std::time::Duration;
 
 /// A UDP source that reads datagrams from a socket.
@@ -39,6 +38,8 @@ pub struct UdpSrc {
     sequence: u64,
     read_timeout: Option<Duration>,
     last_sender: Option<SocketAddr>,
+    /// Arena for buffer allocation.
+    arena: Option<SharedArena>,
 }
 
 impl UdpSrc {
@@ -55,6 +56,7 @@ impl UdpSrc {
             sequence: 0,
             read_timeout: None,
             last_sender: None,
+            arena: None,
         })
     }
 
@@ -158,12 +160,17 @@ impl crate::element::Source for UdpSrc {
                 Err(e) => Err(Error::Io(e)),
             }
         } else {
-            // No buffer provided, allocate our own
-            let segment = Arc::new(CpuSegment::new(self.buffer_size)?);
-            let ptr = segment
-                .as_mut_ptr()
-                .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
-            let slice = unsafe { std::slice::from_raw_parts_mut(ptr, self.buffer_size) };
+            // No buffer provided, allocate from arena
+            // Initialize arena lazily if needed
+            if self.arena.is_none() {
+                self.arena = Some(SharedArena::new(self.buffer_size, 8)?);
+            }
+            let arena = self.arena.as_ref().unwrap();
+
+            let mut slot = arena
+                .acquire()
+                .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+            let slice = slot.data_mut();
 
             // Receive datagram
             match self.socket.recv_from(slice) {
@@ -173,7 +180,7 @@ impl crate::element::Source for UdpSrc {
                     let seq = self.sequence;
                     self.sequence += 1;
 
-                    let handle = crate::buffer::MemoryHandle::from_segment_with_len(segment, n);
+                    let handle = MemoryHandle::with_len(slot, n);
                     let metadata = Metadata::from_sequence(seq);
                     Ok(ProduceResult::OwnBuffer(Buffer::new(handle, metadata)))
                 }
@@ -351,6 +358,8 @@ pub struct AsyncUdpSrc {
     bytes_read: u64,
     sequence: u64,
     last_sender: Option<SocketAddr>,
+    /// Arena for buffer allocation.
+    arena: Option<SharedArena>,
 }
 
 impl AsyncUdpSrc {
@@ -371,6 +380,7 @@ impl AsyncUdpSrc {
             bytes_read: 0,
             sequence: 0,
             last_sender: None,
+            arena: None,
         })
     }
 
@@ -419,12 +429,16 @@ impl AsyncUdpSrc {
 
     /// Receive a datagram asynchronously (convenience method).
     pub async fn recv(&mut self) -> Result<Option<Buffer>> {
-        // Allocate buffer
-        let segment = Arc::new(CpuSegment::new(self.buffer_size)?);
-        let ptr = segment
-            .as_mut_ptr()
-            .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
-        let slice = unsafe { std::slice::from_raw_parts_mut(ptr, self.buffer_size) };
+        // Initialize arena lazily if needed
+        if self.arena.is_none() {
+            self.arena = Some(SharedArena::new(self.buffer_size, 8)?);
+        }
+        let arena = self.arena.as_ref().unwrap();
+
+        let mut slot = arena
+            .acquire()
+            .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+        let slice = slot.data_mut();
 
         // Receive datagram
         let (n, sender) = self.socket.recv_from(slice).await?;
@@ -433,7 +447,7 @@ impl AsyncUdpSrc {
         let seq = self.sequence;
         self.sequence += 1;
 
-        let handle = crate::buffer::MemoryHandle::from_segment_with_len(segment, n);
+        let handle = MemoryHandle::with_len(slot, n);
         let metadata = Metadata::from_sequence(seq);
         Ok(Some(Buffer::new(handle, metadata)))
     }
@@ -456,12 +470,17 @@ impl crate::element::AsyncSource for AsyncUdpSrc {
 
             Ok(ProduceResult::Produced(n))
         } else {
-            // No buffer provided, allocate our own
-            let segment = Arc::new(CpuSegment::new(self.buffer_size)?);
-            let ptr = segment
-                .as_mut_ptr()
-                .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
-            let slice = unsafe { std::slice::from_raw_parts_mut(ptr, self.buffer_size) };
+            // No buffer provided, allocate from arena
+            // Initialize arena lazily if needed
+            if self.arena.is_none() {
+                self.arena = Some(SharedArena::new(self.buffer_size, 8)?);
+            }
+            let arena = self.arena.as_ref().unwrap();
+
+            let mut slot = arena
+                .acquire()
+                .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+            let slice = slot.data_mut();
 
             // Receive datagram
             let (n, sender) = self.socket.recv_from(slice).await?;
@@ -470,7 +489,7 @@ impl crate::element::AsyncSource for AsyncUdpSrc {
             let seq = self.sequence;
             self.sequence += 1;
 
-            let handle = crate::buffer::MemoryHandle::from_segment_with_len(segment, n);
+            let handle = MemoryHandle::with_len(slot, n);
             let metadata = Metadata::from_sequence(seq);
             Ok(ProduceResult::OwnBuffer(Buffer::new(handle, metadata)))
         }
@@ -592,8 +611,14 @@ impl crate::element::AsyncSink for AsyncUdpSink {
 mod tests {
     use super::*;
     use crate::element::{Sink, Source};
-    use crate::memory::CpuArena;
+    use crate::memory::SharedArena;
+    use std::sync::OnceLock;
     use std::thread;
+
+    fn test_arena() -> &'static SharedArena {
+        static ARENA: OnceLock<SharedArena> = OnceLock::new();
+        ARENA.get_or_init(|| SharedArena::new(65535, 16).unwrap())
+    }
 
     #[test]
     fn test_udp_src_creation() {
@@ -629,8 +654,7 @@ mod tests {
         });
 
         // Create arena for receiving
-        let arena = Arc::new(CpuArena::new(65535, 4).unwrap());
-        let slot = arena.acquire().unwrap();
+        let slot = test_arena().acquire().unwrap();
         let mut ctx = ProduceContext::new(slot);
 
         // Receive the datagram
@@ -656,12 +680,10 @@ mod tests {
         // Create sink and send data
         let mut sink = UdpSink::connect(recv_addr).unwrap();
 
-        let segment = Arc::new(CpuSegment::new(9).unwrap());
-        let ptr = segment.as_mut_ptr().unwrap();
-        unsafe {
-            std::ptr::copy_nonoverlapping(b"hello udp".as_ptr(), ptr, 9);
-        }
-        let handle = crate::buffer::MemoryHandle::from_segment_with_len(segment, 9);
+        let arena = SharedArena::new(64, 4).unwrap();
+        let mut slot = arena.acquire().unwrap();
+        slot.data_mut()[..9].copy_from_slice(b"hello udp");
+        let handle = MemoryHandle::with_len(slot, 9);
         let buffer = Buffer::new(handle, Metadata::default());
 
         let ctx = ConsumeContext::new(&buffer);
@@ -677,8 +699,9 @@ mod tests {
     fn test_udp_sink_no_destination() {
         let mut sink = UdpSink::bind("127.0.0.1:0").unwrap();
 
-        let segment = Arc::new(CpuSegment::new(4).unwrap());
-        let handle = crate::buffer::MemoryHandle::from_segment_with_len(segment, 4);
+        let arena = SharedArena::new(64, 4).unwrap();
+        let slot = arena.acquire().unwrap();
+        let handle = MemoryHandle::with_len(slot, 4);
         let buffer = Buffer::new(handle, Metadata::default());
 
         // Should fail without destination
@@ -729,12 +752,10 @@ mod tests {
         // Create sink and send
         let mut sink = AsyncUdpSink::connect(recv_addr).await.unwrap();
 
-        let segment = Arc::new(CpuSegment::new(11).unwrap());
-        let ptr = segment.as_mut_ptr().unwrap();
-        unsafe {
-            std::ptr::copy_nonoverlapping(b"async hello".as_ptr(), ptr, 11);
-        }
-        let handle = crate::buffer::MemoryHandle::from_segment_with_len(segment, 11);
+        let arena = SharedArena::new(64, 4).unwrap();
+        let mut slot = arena.acquire().unwrap();
+        slot.data_mut()[..11].copy_from_slice(b"async hello");
+        let handle = MemoryHandle::with_len(slot, 11);
         let buffer = Buffer::new(handle, Metadata::default());
 
         sink.send(buffer).await.unwrap();

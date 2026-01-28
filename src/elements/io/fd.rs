@@ -222,7 +222,13 @@ impl Sink for FdSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::CpuArena;
+    use crate::memory::SharedArena;
+    use std::sync::OnceLock;
+
+    fn test_arena() -> &'static SharedArena {
+        static ARENA: OnceLock<SharedArena> = OnceLock::new();
+        ARENA.get_or_init(|| SharedArena::new(1024, 64).unwrap())
+    }
 
     #[test]
     fn test_fdsrc_from_pipe() {
@@ -233,12 +239,11 @@ mod tests {
         rustix::io::write(&write_fd, b"hello from pipe").unwrap();
         drop(write_fd);
 
-        // Create arena and source
-        let arena = CpuArena::new(1024, 4).unwrap();
+        // Create source
         let mut src = FdSrc::from_owned(read_fd);
 
         // Acquire slot and create context
-        let slot = arena.acquire().unwrap();
+        let slot = test_arena().acquire().unwrap();
         let mut ctx = ProduceContext::new(slot);
 
         // Produce buffer
@@ -253,7 +258,7 @@ mod tests {
         }
 
         // Should be EOF on next read
-        let slot = arena.acquire().unwrap();
+        let slot = test_arena().acquire().unwrap();
         let mut ctx = ProduceContext::new(slot);
         let result = src.produce(&mut ctx).unwrap();
         assert!(matches!(result, ProduceResult::Eos));
@@ -266,12 +271,11 @@ mod tests {
         // Create a pipe using rustix
         let (read_fd, write_fd) = rustix::pipe::pipe().unwrap();
 
-        // Create arena and sink
-        let arena = CpuArena::new(1024, 4).unwrap();
+        // Create sink
         let mut sink = FdSink::from_owned(write_fd);
 
         // Create buffer using arena
-        let slot = arena.acquire().unwrap();
+        let slot = test_arena().acquire().unwrap();
         let mut ctx = ProduceContext::new(slot);
         let output = ctx.output();
         output[..11].copy_from_slice(b"hello world");
@@ -312,12 +316,11 @@ mod tests {
         rustix::io::write(&write_fd, b"chunk2").unwrap();
         drop(write_fd);
 
-        // Create arena and source
-        let arena = CpuArena::new(1024, 4).unwrap();
+        // Create source
         let mut src = FdSrc::from_owned(read_fd);
 
         // Read first chunk
-        let slot = arena.acquire().unwrap();
+        let slot = test_arena().acquire().unwrap();
         let mut ctx = ProduceContext::new(slot);
         let result = src.produce(&mut ctx).unwrap();
         match result {
@@ -336,11 +339,10 @@ mod tests {
     fn test_fdsink_bytes_written() {
         let (_read_fd, write_fd) = rustix::pipe::pipe().unwrap();
 
-        let arena = CpuArena::new(1024, 4).unwrap();
         let mut sink = FdSink::from_owned(write_fd);
 
         // Write first buffer
-        let slot = arena.acquire().unwrap();
+        let slot = test_arena().acquire().unwrap();
         let mut ctx = ProduceContext::new(slot);
         ctx.output()[..5].copy_from_slice(b"hello");
         let buffer = ctx.finalize(5);
@@ -350,7 +352,7 @@ mod tests {
         assert_eq!(sink.bytes_written(), 5);
 
         // Write second buffer
-        let slot = arena.acquire().unwrap();
+        let slot = test_arena().acquire().unwrap();
         let mut ctx = ProduceContext::new(slot);
         ctx.output()[..5].copy_from_slice(b"world");
         let buffer = ctx.finalize(5);

@@ -15,10 +15,9 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{Sink, Source};
 use crate::error::{Error, Result};
-use crate::memory::{CpuSegment, MemorySegment};
+use crate::memory::SharedArena;
 use crate::metadata::Metadata;
 use std::io::Read;
-use std::sync::Arc;
 use std::time::Duration;
 
 /// HTTP method for sink operations.
@@ -67,6 +66,7 @@ pub struct HttpSrc {
     bytes_read: u64,
     sequence: u64,
     status_code: Option<u16>,
+    arena: Option<SharedArena>,
 }
 
 impl HttpSrc {
@@ -84,6 +84,7 @@ impl HttpSrc {
             bytes_read: 0,
             sequence: 0,
             status_code: None,
+            arena: None,
         })
     }
 
@@ -162,18 +163,27 @@ impl Source for HttpSrc {
             .as_mut()
             .ok_or_else(|| Error::Element("not connected".into()))?;
 
-        let segment = Arc::new(CpuSegment::new(self.chunk_size)?);
-        let ptr = unsafe { segment.as_mut_ptr().unwrap() };
-        let slice = unsafe { std::slice::from_raw_parts_mut(ptr, self.chunk_size) };
+        // Lazily initialize arena
+        if self.arena.is_none() {
+            self.arena = Some(
+                SharedArena::new(self.chunk_size, 16)
+                    .map_err(|e| Error::Element(format!("Failed to create arena: {}", e)))?,
+            );
+        }
+        let arena = self.arena.as_ref().unwrap();
 
-        match reader.read(slice) {
+        let mut slot = arena
+            .acquire()
+            .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+
+        match reader.read(slot.data_mut()) {
             Ok(0) => Ok(None), // EOF
             Ok(n) => {
                 self.bytes_read += n as u64;
                 let seq = self.sequence;
                 self.sequence += 1;
 
-                let handle = MemoryHandle::from_segment_with_len(segment, n);
+                let handle = MemoryHandle::with_len(slot, n);
                 Ok(Some(Buffer::new(handle, Metadata::from_sequence(seq))))
             }
             Err(e) => Err(Error::Io(e)),

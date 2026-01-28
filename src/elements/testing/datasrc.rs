@@ -184,15 +184,16 @@ impl Source for DataSrc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::CpuArena;
-    use std::sync::Arc;
+    use crate::memory::SharedArena;
+    use std::sync::OnceLock;
 
-    #[allow(dead_code)]
-    fn produce_with_arena(
-        src: &mut DataSrc,
-        arena: &Arc<CpuArena>,
-    ) -> Result<Option<crate::buffer::Buffer>> {
-        let slot = arena.acquire().expect("arena slot available");
+    fn test_arena() -> &'static SharedArena {
+        static ARENA: OnceLock<SharedArena> = OnceLock::new();
+        ARENA.get_or_init(|| SharedArena::new(1024, 64).unwrap())
+    }
+
+    fn produce_with_arena(src: &mut DataSrc) -> Result<Option<crate::buffer::Buffer>> {
+        let slot = test_arena().acquire().expect("arena slot available");
         let mut ctx = ProduceContext::new(slot);
         match src.produce(&mut ctx)? {
             ProduceResult::Produced(n) => Ok(Some(ctx.finalize(n))),
@@ -205,101 +206,94 @@ mod tests {
     #[test]
     fn test_datasrc_from_bytes() {
         let mut src = DataSrc::from_bytes(b"hello");
-        let arena = Arc::new(CpuArena::new(1024, 4).unwrap());
 
-        let buf = produce_with_arena(&mut src, &arena).unwrap().unwrap();
+        let buf = produce_with_arena(&mut src).unwrap().unwrap();
         assert_eq!(buf.as_bytes(), b"hello");
 
         // Should be EOS
-        let buf = produce_with_arena(&mut src, &arena).unwrap();
+        let buf = produce_with_arena(&mut src).unwrap();
         assert!(buf.is_none());
     }
 
     #[test]
     fn test_datasrc_from_string() {
         let mut src = DataSrc::from_string("hello world");
-        let arena = Arc::new(CpuArena::new(1024, 4).unwrap());
 
-        let buf = produce_with_arena(&mut src, &arena).unwrap().unwrap();
+        let buf = produce_with_arena(&mut src).unwrap().unwrap();
         assert_eq!(buf.as_bytes(), b"hello world");
     }
 
     #[test]
     fn test_datasrc_chunked() {
         let mut src = DataSrc::from_bytes(b"hello world").with_chunk_size(5);
-        let arena = Arc::new(CpuArena::new(1024, 4).unwrap());
 
-        let buf = produce_with_arena(&mut src, &arena).unwrap().unwrap();
+        let buf = produce_with_arena(&mut src).unwrap().unwrap();
         assert_eq!(buf.as_bytes(), b"hello");
 
-        let buf = produce_with_arena(&mut src, &arena).unwrap().unwrap();
+        let buf = produce_with_arena(&mut src).unwrap().unwrap();
         assert_eq!(buf.as_bytes(), b" worl");
 
-        let buf = produce_with_arena(&mut src, &arena).unwrap().unwrap();
+        let buf = produce_with_arena(&mut src).unwrap().unwrap();
         assert_eq!(buf.as_bytes(), b"d");
 
         // Should be EOS
-        let buf = produce_with_arena(&mut src, &arena).unwrap();
+        let buf = produce_with_arena(&mut src).unwrap();
         assert!(buf.is_none());
     }
 
     #[test]
     fn test_datasrc_repeat() {
         let mut src = DataSrc::from_bytes(b"ab").repeat_n(2);
-        let arena = Arc::new(CpuArena::new(1024, 4).unwrap());
 
         // First iteration
-        let buf = produce_with_arena(&mut src, &arena).unwrap().unwrap();
+        let buf = produce_with_arena(&mut src).unwrap().unwrap();
         assert_eq!(buf.as_bytes(), b"ab");
 
         // Second iteration (repeat 1)
-        let buf = produce_with_arena(&mut src, &arena).unwrap().unwrap();
+        let buf = produce_with_arena(&mut src).unwrap().unwrap();
         assert_eq!(buf.as_bytes(), b"ab");
 
         // Third iteration (repeat 2)
-        let buf = produce_with_arena(&mut src, &arena).unwrap().unwrap();
+        let buf = produce_with_arena(&mut src).unwrap().unwrap();
         assert_eq!(buf.as_bytes(), b"ab");
 
         // Should be EOS (repeated 2 times = 3 total)
-        let buf = produce_with_arena(&mut src, &arena).unwrap();
+        let buf = produce_with_arena(&mut src).unwrap();
         assert!(buf.is_none());
     }
 
     #[test]
     fn test_datasrc_empty() {
         let mut src = DataSrc::from_bytes(b"");
-        let arena = CpuArena::new(1024, 4).unwrap();
 
-        let buf = produce_with_arena(&mut src, &arena).unwrap();
+        let buf = produce_with_arena(&mut src).unwrap();
         assert!(buf.is_none());
     }
 
     #[test]
     fn test_datasrc_reset() {
         let mut src = DataSrc::from_bytes(b"hello");
-        let arena = CpuArena::new(1024, 4).unwrap();
 
-        let _ = produce_with_arena(&mut src, &arena).unwrap();
-        assert!(produce_with_arena(&mut src, &arena).unwrap().is_none());
+        let _ = produce_with_arena(&mut src).unwrap();
+        assert!(produce_with_arena(&mut src).unwrap().is_none());
 
         src.reset();
 
-        let buf = produce_with_arena(&mut src, &arena).unwrap().unwrap();
+        let buf = produce_with_arena(&mut src).unwrap().unwrap();
         assert_eq!(buf.as_bytes(), b"hello");
     }
 
     #[test]
     fn test_datasrc_sequence() {
         let mut src = DataSrc::from_bytes(b"hello world").with_chunk_size(5);
-        let arena = CpuArena::new(1024, 4).unwrap();
 
-        let buf = produce_with_arena(&mut src, &arena).unwrap().unwrap();
+        let buf = produce_with_arena(&mut src).unwrap().unwrap();
         assert_eq!(buf.metadata().sequence, 0);
 
-        let buf = produce_with_arena(&mut src, &arena).unwrap().unwrap();
+        let buf = produce_with_arena(&mut src).unwrap().unwrap();
         assert_eq!(buf.metadata().sequence, 1);
 
-        let buf = produce_with_arena(&mut src, &arena).unwrap().unwrap();
+        let buf = produce_with_arena(&mut src).unwrap().unwrap();
         assert_eq!(buf.metadata().sequence, 2);
     }
 

@@ -17,15 +17,15 @@ use crate::error::Result;
 /// use parallax::elements::PassThrough;
 /// use parallax::element::Element;
 /// # use parallax::buffer::{Buffer, MemoryHandle};
-/// # use parallax::memory::CpuSegment;
+/// # use parallax::memory::SharedArena;
 /// # use parallax::metadata::Metadata;
-/// # use std::sync::Arc;
 ///
 /// let mut passthrough = PassThrough::new();
 ///
 /// // Create a test buffer
-/// # let segment = Arc::new(CpuSegment::new(8).unwrap());
-/// # let handle = MemoryHandle::from_segment(segment);
+/// # let arena = SharedArena::new(64, 4).unwrap();
+/// # let slot = arena.acquire().unwrap();
+/// # let handle = MemoryHandle::new(slot);
 /// # let buffer = Buffer::new(handle, Metadata::from_sequence(42));
 ///
 /// // PassThrough returns the buffer unchanged
@@ -70,16 +70,22 @@ impl Element for PassThrough {
 mod tests {
     use super::*;
     use crate::buffer::MemoryHandle;
-    use crate::memory::CpuSegment;
+    use crate::memory::SharedArena;
     use crate::metadata::Metadata;
-    use std::sync::Arc;
+    use std::sync::OnceLock;
+
+    fn test_arena() -> &'static SharedArena {
+        static ARENA: OnceLock<SharedArena> = OnceLock::new();
+        ARENA.get_or_init(|| SharedArena::new(64, 64).unwrap())
+    }
 
     #[test]
     fn test_passthrough_passes_buffer() {
         let mut passthrough = PassThrough::new();
 
-        let segment = Arc::new(CpuSegment::new(64).unwrap());
-        let handle = MemoryHandle::from_segment(segment);
+        let arena = test_arena();
+        let slot = arena.acquire().unwrap();
+        let handle = MemoryHandle::new(slot);
         let buffer = Buffer::new(handle, Metadata::from_sequence(42));
 
         let result = passthrough.process(buffer).unwrap();

@@ -2,14 +2,12 @@
 //!
 //! Converts between pixel formats (e.g., YUYV -> RGBA for display).
 
-use std::sync::Arc;
-
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::converters::{PixelFormat, VideoConvert};
 use crate::element::Element;
 use crate::error::{Error, Result};
 use crate::format::Caps;
-use crate::memory::{CpuSegment, MemorySegment};
+use crate::memory::SharedArena;
 
 /// Video format conversion element.
 ///
@@ -45,6 +43,8 @@ pub struct VideoConvertElement {
     output_buffer: Vec<u8>,
     /// Element name
     name: String,
+    /// Arena for output buffers
+    arena: Option<SharedArena>,
 }
 
 impl VideoConvertElement {
@@ -60,6 +60,7 @@ impl VideoConvertElement {
             converter: None,
             output_buffer: Vec::new(),
             name: "videoconvert".to_string(),
+            arena: None,
         }
     }
 
@@ -202,18 +203,20 @@ impl Element for VideoConvertElement {
 
         // Create output buffer
         let output_size = self.output_buffer.len();
-        let segment = Arc::new(CpuSegment::new(output_size)?);
 
-        // Copy converted data
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                self.output_buffer.as_ptr(),
-                segment.as_mut_ptr().unwrap(),
-                output_size,
-            );
+        if self.arena.is_none() || self.arena.as_ref().unwrap().slot_size() < output_size {
+            self.arena = Some(SharedArena::new(output_size, 8)?);
         }
 
-        let handle = MemoryHandle::from_segment(segment);
+        let arena = self.arena.as_ref().unwrap();
+        let mut slot = arena
+            .acquire()
+            .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+
+        // Copy converted data
+        slot.data_mut()[..output_size].copy_from_slice(&self.output_buffer);
+
+        let handle = MemoryHandle::new(slot);
         let output = Buffer::new(handle, buffer.metadata().clone());
 
         Ok(Some(output))

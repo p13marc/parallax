@@ -409,8 +409,8 @@ fn calculate_layout(slot_size: usize, slot_count: usize) -> (usize, usize, usize
 
 /// Arena with shared-memory reference counting and lock-free release queue.
 ///
-/// Unlike `CpuArena`, this arena stores refcounts in the shared memory
-/// itself, enabling true cross-process reference counting without messages.
+/// This arena stores refcounts in the shared memory itself, enabling true
+/// cross-process reference counting without messages.
 ///
 /// # Ownership Model
 ///

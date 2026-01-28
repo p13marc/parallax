@@ -28,12 +28,12 @@ pub const MAX_FDS_PER_MESSAGE: usize = 4;
 ///
 /// ```rust,ignore
 /// use std::os::unix::net::UnixStream;
-/// use parallax::memory::ipc::send_fds;
+/// use parallax::memory::{SharedArena, ipc::send_fds};
 ///
 /// let (sender, receiver) = UnixStream::pair()?;
-/// let segment = CpuSegment::with_name("test", 4096)?;
+/// let arena = SharedArena::new(4096, 4)?;
 ///
-/// send_fds(&sender, &[segment.as_fd()], b"hello")?;
+/// send_fds(&sender, &[arena.fd()], b"hello")?;
 /// ```
 pub fn send_fds<Fd: AsFd>(socket: &UnixStream, fds: &[Fd], data: &[u8]) -> Result<()> {
     if fds.is_empty() {
@@ -162,24 +162,22 @@ pub fn recv_segment_handle(socket: &UnixStream) -> Result<(OwnedFd, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::{CpuSegment, MemorySegment};
+    use crate::memory::SharedArena;
 
     #[test]
     fn test_send_recv_fds() {
         let (sender, receiver) = UnixStream::pair().unwrap();
 
-        // Create a shared memory segment
-        let segment = CpuSegment::with_name("test-ipc", 4096).unwrap();
+        // Create a shared memory arena
+        let arena = SharedArena::new(4096, 4).unwrap();
+        let mut slot = arena.acquire().expect("arena not exhausted");
 
         // Write some data to it
-        unsafe {
-            let slice = std::slice::from_raw_parts_mut(segment.as_mut_ptr().unwrap(), 4096);
-            slice[0] = 42;
-            slice[1000] = 123;
-        }
+        slot.data_mut()[0] = 42;
+        slot.data_mut()[1000] = 123;
 
         // Send the fd
-        send_fds(&sender, &[segment.as_fd()], b"hello").unwrap();
+        send_fds(&sender, &[arena.fd()], b"hello").unwrap();
 
         // Receive the fd
         let mut buf = [0u8; 16];
@@ -189,41 +187,42 @@ mod tests {
         assert_eq!(&buf[..5], b"hello");
         assert_eq!(fds.len(), 1);
 
-        // Open the received fd as a segment
-        let received = CpuSegment::from_fd(fds.into_iter().next().unwrap()).unwrap();
+        // Map the received fd as a new arena view
+        let received_fd = fds.into_iter().next().unwrap();
+        let received_arena = unsafe { SharedArena::from_fd(received_fd).unwrap() };
 
-        // Verify we can read the same data
-        unsafe {
-            assert_eq!(*received.as_ptr(), 42);
-            assert_eq!(*received.as_ptr().add(1000), 123);
-        }
+        // Get the same slot (by index) and verify the data
+        let ipc_ref = slot.ipc_ref();
+        let received_slot = received_arena.slot_from_ipc(&ipc_ref).unwrap();
+
+        assert_eq!(received_slot.data()[0], 42);
+        assert_eq!(received_slot.data()[1000], 123);
     }
 
     #[test]
     fn test_send_recv_segment_handle() {
         let (sender, receiver) = UnixStream::pair().unwrap();
 
-        let segment = CpuSegment::with_name("test-handle", 8192).unwrap();
+        let arena = SharedArena::new(8192, 4).unwrap();
+        let mut slot = arena.acquire().expect("arena not exhausted");
 
         // Write test data
-        unsafe {
-            *segment.as_mut_ptr().unwrap() = 99;
-        }
+        slot.data_mut()[0] = 99;
 
         // Send using helper
-        send_segment_handle(&sender, segment.as_fd(), segment.len()).unwrap();
+        send_segment_handle(&sender, arena.fd(), arena.total_size()).unwrap();
 
         // Receive using helper
         let (fd, size) = recv_segment_handle(&receiver).unwrap();
 
-        assert_eq!(size, 8192);
+        assert_eq!(size, arena.total_size());
 
-        // Open and verify
-        let received = CpuSegment::from_fd(fd).unwrap();
-        assert_eq!(received.len(), 8192);
-        unsafe {
-            assert_eq!(*received.as_ptr(), 99);
-        }
+        // Map and verify
+        let received_arena = unsafe { SharedArena::from_fd(fd).unwrap() };
+
+        let ipc_ref = slot.ipc_ref();
+        let received_slot = received_arena.slot_from_ipc(&ipc_ref).unwrap();
+        assert_eq!(received_slot.data()[0], 99);
     }
 
     #[test]
@@ -240,33 +239,30 @@ mod tests {
         // modifications made through one mapping are visible through another
 
         let (sender, receiver) = UnixStream::pair().unwrap();
-        let segment1 = CpuSegment::with_name("test-visibility", 4096).unwrap();
+        let arena1 = SharedArena::new(4096, 4).unwrap();
+        let mut slot1 = arena1.acquire().expect("arena not exhausted");
 
         // Send the fd
-        send_segment_handle(&sender, segment1.as_fd(), segment1.len()).unwrap();
+        send_segment_handle(&sender, arena1.fd(), arena1.total_size()).unwrap();
 
         // Receive and open
-        let (fd, size) = recv_segment_handle(&receiver).unwrap();
-        let segment2 = CpuSegment::from_fd(fd).unwrap();
+        let (fd, _size) = recv_segment_handle(&receiver).unwrap();
+        let arena2 = unsafe { SharedArena::from_fd(fd).unwrap() };
 
-        // Write through segment1
-        unsafe {
-            *segment1.as_mut_ptr().unwrap() = 111;
-        }
+        // Get the same slot via IPC ref
+        let ipc_ref = slot1.ipc_ref();
+        let mut slot2 = arena2.slot_from_ipc(&ipc_ref).unwrap();
 
-        // Read through segment2 - should see the change
-        unsafe {
-            assert_eq!(*segment2.as_ptr(), 111);
-        }
+        // Write through slot1
+        slot1.data_mut()[0] = 111;
 
-        // Write through segment2
-        unsafe {
-            *segment2.as_mut_ptr().unwrap().add(100) = 222;
-        }
+        // Read through slot2 - should see the change
+        assert_eq!(slot2.data()[0], 111);
 
-        // Read through segment1 - should see the change
-        unsafe {
-            assert_eq!(*segment1.as_ptr().add(100), 222);
-        }
+        // Write through slot2
+        slot2.data_mut()[100] = 222;
+
+        // Read through slot1 - should see the change
+        assert_eq!(slot1.data()[100], 222);
     }
 }

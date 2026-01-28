@@ -23,15 +23,15 @@ use crate::error::Result;
 /// use parallax::elements::Tee;
 /// use parallax::element::Element;
 /// # use parallax::buffer::{Buffer, MemoryHandle};
-/// # use parallax::memory::CpuSegment;
+/// # use parallax::memory::SharedArena;
 /// # use parallax::metadata::Metadata;
-/// # use std::sync::Arc;
 ///
 /// let mut tee = Tee::new();
 ///
 /// // Create and process a buffer
-/// # let segment = Arc::new(CpuSegment::new(8).unwrap());
-/// # let handle = MemoryHandle::from_segment(segment);
+/// # let arena = SharedArena::new(64, 4).unwrap();
+/// # let slot = arena.acquire().unwrap();
+/// # let handle = MemoryHandle::new(slot);
 /// # let buffer = Buffer::new(handle, Metadata::from_sequence(0));
 ///
 /// let result = tee.process(buffer).unwrap();
@@ -104,17 +104,27 @@ impl Element for Tee {
 mod tests {
     use super::*;
     use crate::buffer::MemoryHandle;
-    use crate::memory::CpuSegment;
+    use crate::memory::SharedArena;
     use crate::metadata::Metadata;
-    use std::sync::Arc;
+    use std::sync::OnceLock;
+
+    fn test_arena() -> &'static SharedArena {
+        static ARENA: OnceLock<SharedArena> = OnceLock::new();
+        ARENA.get_or_init(|| SharedArena::new(256, 64).unwrap())
+    }
+
+    fn make_buffer(size: usize, seq: u64) -> Buffer {
+        let arena = test_arena();
+        let slot = arena.acquire().unwrap();
+        let handle = MemoryHandle::with_len(slot, size);
+        Buffer::new(handle, Metadata::from_sequence(seq))
+    }
 
     #[test]
     fn test_tee_passes_buffer() {
         let mut tee = Tee::new();
 
-        let segment = Arc::new(CpuSegment::new(64).unwrap());
-        let handle = MemoryHandle::from_segment(segment);
-        let buffer = Buffer::new(handle, Metadata::from_sequence(42));
+        let buffer = make_buffer(64, 42);
 
         let result = tee.process(buffer).unwrap();
         assert!(result.is_some());
@@ -128,18 +138,14 @@ mod tests {
         assert_eq!(tee.bytes(), 0);
 
         // Process a 64-byte buffer
-        let segment = Arc::new(CpuSegment::new(64).unwrap());
-        let handle = MemoryHandle::from_segment(segment);
-        let buffer = Buffer::new(handle, Metadata::from_sequence(0));
+        let buffer = make_buffer(64, 0);
         tee.process(buffer).unwrap();
 
         assert_eq!(tee.count(), 1);
         assert_eq!(tee.bytes(), 64);
 
         // Process another 128-byte buffer
-        let segment = Arc::new(CpuSegment::new(128).unwrap());
-        let handle = MemoryHandle::from_segment(segment);
-        let buffer = Buffer::new(handle, Metadata::from_sequence(1));
+        let buffer = make_buffer(128, 1);
         tee.process(buffer).unwrap();
 
         assert_eq!(tee.count(), 2);
@@ -150,9 +156,7 @@ mod tests {
     fn test_tee_reset() {
         let mut tee = Tee::new();
 
-        let segment = Arc::new(CpuSegment::new(64).unwrap());
-        let handle = MemoryHandle::from_segment(segment);
-        let buffer = Buffer::new(handle, Metadata::from_sequence(0));
+        let buffer = make_buffer(64, 0);
         tee.process(buffer).unwrap();
 
         assert_eq!(tee.count(), 1);

@@ -25,10 +25,9 @@ use super::common::VideoFrame;
 use super::traits::VideoEncoder;
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{ExecutionHints, Output, Transform};
-use crate::error::Result;
-use crate::memory::{CpuSegment, MemorySegment};
+use crate::error::{Error, Result};
+use crate::memory::SharedArena;
 use std::collections::VecDeque;
-use std::sync::Arc;
 
 /// Wraps a [`VideoEncoder`] to work as a pipeline [`Transform`] element.
 ///
@@ -70,6 +69,8 @@ pub struct EncoderElement<E: VideoEncoder> {
     frames_in: u64,
     /// Statistics: packets produced.
     packets_out: u64,
+    /// Arena for output buffer allocation.
+    arena: SharedArena,
 }
 
 impl<E: VideoEncoder> EncoderElement<E> {
@@ -80,8 +81,13 @@ impl<E: VideoEncoder> EncoderElement<E> {
     /// * `encoder` - The video encoder to wrap
     /// * `width` - Expected frame width
     /// * `height` - Expected frame height
-    pub fn new(encoder: E, width: u32, height: u32) -> Self {
-        Self {
+    pub fn new(encoder: E, width: u32, height: u32) -> Result<Self> {
+        // Estimate max packet size (compressed should be smaller than raw frame)
+        let max_packet_size = (width as usize) * (height as usize) * 3;
+        let arena = SharedArena::new(max_packet_size, 16)
+            .map_err(|e| Error::Element(format!("Failed to create arena: {}", e)))?;
+
+        Ok(Self {
             encoder,
             pending_packets: VecDeque::new(),
             flushing: false,
@@ -90,7 +96,8 @@ impl<E: VideoEncoder> EncoderElement<E> {
             height,
             frames_in: 0,
             packets_out: 0,
-        }
+            arena,
+        })
     }
 
     /// Get the number of frames received.
@@ -132,15 +139,19 @@ impl<E: VideoEncoder> EncoderElement<E> {
 
     /// Convert encoded packet to output buffer.
     fn packet_to_buffer(&self, data: Vec<u8>, pts: i64) -> Result<Buffer> {
-        let segment = Arc::new(CpuSegment::new(data.len())?);
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), segment.as_mut_ptr().unwrap(), data.len());
-        }
+        let mut slot = self
+            .arena
+            .acquire()
+            .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+        slot.data_mut()[..data.len()].copy_from_slice(&data);
 
         let mut metadata = crate::metadata::Metadata::new();
         metadata.pts = crate::clock::ClockTime::from_nanos(pts as u64);
 
-        Ok(Buffer::new(MemoryHandle::from_segment(segment), metadata))
+        Ok(Buffer::new(
+            MemoryHandle::with_len(slot, data.len()),
+            metadata,
+        ))
     }
 }
 

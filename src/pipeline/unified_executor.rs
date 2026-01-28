@@ -1303,9 +1303,15 @@ mod tests {
         ConsumeContext, DynAsyncElement, ProduceContext, ProduceResult, Sink, SinkAdapter, Source,
         SourceAdapter,
     };
-    use crate::memory::CpuSegment;
+    use crate::memory::SharedArena;
     use crate::metadata::Metadata;
+    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn test_arena() -> &'static SharedArena {
+        static ARENA: OnceLock<SharedArena> = OnceLock::new();
+        ARENA.get_or_init(|| SharedArena::new(64, 64).unwrap())
+    }
 
     struct CountingSource {
         count: u64,
@@ -1317,8 +1323,9 @@ mod tests {
             if self.count >= self.max {
                 return Ok(ProduceResult::Eos);
             }
-            let segment = Arc::new(CpuSegment::new(8).unwrap());
-            let handle = MemoryHandle::from_segment(segment);
+            let arena = test_arena();
+            let slot = arena.acquire().unwrap();
+            let handle = MemoryHandle::new(slot);
             let buffer = Buffer::new(handle, Metadata::from_sequence(self.count));
             self.count += 1;
             Ok(ProduceResult::OwnBuffer(buffer))

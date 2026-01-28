@@ -20,7 +20,7 @@
 //! ```
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::OnceLock;
 
 use v4l::buffer::Type;
 use v4l::io::mmap::Stream as MmapStream;
@@ -34,18 +34,23 @@ use crate::error::Result;
 use crate::format::{
     Caps, CapsValue, ElementMediaCaps, FormatMemoryCap, MemoryCaps, PixelFormat, VideoFormatCaps,
 };
-use crate::memory::{CpuSegment, MemorySegment};
+use crate::memory::SharedArena;
 use crate::metadata::Metadata;
 
 use super::DeviceError;
 
+/// Shared arena for V4L2 buffers.
+fn v4l2_arena() -> &'static SharedArena {
+    static ARENA: OnceLock<SharedArena> = OnceLock::new();
+    // V4L2 frames can be large (4K = ~12MB for YUYV), use generous slot size
+    ARENA.get_or_init(|| SharedArena::new(16 * 1024 * 1024, 8).unwrap())
+}
+
 /// Helper to create a buffer from a slice.
 fn buffer_from_slice(data: &[u8]) -> Buffer {
-    let segment = Arc::new(CpuSegment::new(data.len()).unwrap());
-    unsafe {
-        std::ptr::copy_nonoverlapping(data.as_ptr(), segment.as_mut_ptr().unwrap(), data.len());
-    }
-    let handle = MemoryHandle::from_segment(segment);
+    let mut slot = v4l2_arena().acquire().unwrap();
+    slot.data_mut()[..data.len()].copy_from_slice(data);
+    let handle = MemoryHandle::with_len(slot, data.len());
     Buffer::new(handle, Metadata::default())
 }
 

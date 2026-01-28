@@ -719,7 +719,8 @@ impl Pipeline {
     /// ```rust,ignore
     /// use parallax::pipeline::Pipeline;
     /// use parallax::element::{Source, ProduceContext, ProduceResult};
-    /// use parallax::memory::CpuArena;
+    /// use parallax::memory::SharedArena;
+    /// use std::sync::Arc;
     ///
     /// struct MySource { sent: bool }
     /// impl Source for MySource {
@@ -731,7 +732,7 @@ impl Pipeline {
     ///     }
     /// }
     ///
-    /// let arena = CpuArena::new(1024, 4)?;
+    /// let arena = Arc::new(SharedArena::new(1024, 4)?);
     /// let mut pipeline = Pipeline::new();
     /// let src = pipeline.add_source_with_arena("my_src", MySource { sent: false }, arena);
     /// ```
@@ -739,7 +740,7 @@ impl Pipeline {
         &mut self,
         name: impl Into<String>,
         source: S,
-        arena: std::sync::Arc<crate::memory::CpuArena>,
+        arena: std::sync::Arc<crate::memory::SharedArena>,
     ) -> NodeId {
         self.add_node(
             name,

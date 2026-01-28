@@ -4,10 +4,9 @@
 
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::Element;
-use crate::error::Result;
-use crate::memory::{CpuSegment, MemorySegment};
+use crate::error::{Error, Result};
+use crate::memory::SharedArena;
 use std::collections::VecDeque;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -41,6 +40,7 @@ pub struct Batch {
     sequence: u64,
     batches_produced: AtomicU64,
     buffers_received: AtomicU64,
+    arena: Option<SharedArena>,
 }
 
 impl Batch {
@@ -57,6 +57,7 @@ impl Batch {
             sequence: 0,
             batches_produced: AtomicU64::new(0),
             buffers_received: AtomicU64::new(0),
+            arena: None,
         }
     }
 
@@ -73,6 +74,7 @@ impl Batch {
             sequence: 0,
             batches_produced: AtomicU64::new(0),
             buffers_received: AtomicU64::new(0),
+            arena: None,
         }
     }
 
@@ -89,6 +91,7 @@ impl Batch {
             sequence: 0,
             batches_produced: AtomicU64::new(0),
             buffers_received: AtomicU64::new(0),
+            arena: None,
         }
     }
 
@@ -137,17 +140,30 @@ impl Batch {
 
         // Concatenate all pending buffer data
         let total_len = self.pending_bytes;
-        let segment = Arc::new(CpuSegment::new(total_len.max(1))?);
+        let alloc_size = total_len.max(1);
+
+        if self.arena.is_none() {
+            self.arena = Some(SharedArena::new(alloc_size, 8)?);
+        }
+
+        // Ensure arena slot is large enough
+        let arena = self.arena.as_ref().unwrap();
+        if arena.slot_size() < alloc_size {
+            self.arena = Some(SharedArena::new(alloc_size, 8)?);
+        }
+
+        let arena = self.arena.as_ref().unwrap();
+        let mut slot = arena
+            .acquire()
+            .ok_or_else(|| Error::Element("arena exhausted".into()))?;
 
         if total_len > 0 {
             let mut offset = 0;
-            unsafe {
-                let ptr = segment.as_mut_ptr().unwrap();
-                for buf in &self.pending {
-                    let data = buf.as_bytes();
-                    std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(offset), data.len());
-                    offset += data.len();
-                }
+            let data = slot.data_mut();
+            for buf in &self.pending {
+                let src = buf.as_bytes();
+                data[offset..offset + src.len()].copy_from_slice(src);
+                offset += src.len();
             }
         }
 
@@ -165,7 +181,7 @@ impl Batch {
         self.batch_start = None;
         self.batches_produced.fetch_add(1, Ordering::Relaxed);
 
-        let handle = MemoryHandle::from_segment_with_len(segment, total_len);
+        let handle = MemoryHandle::with_len(slot, total_len);
         Ok(Some(Buffer::new(handle, metadata)))
     }
 
@@ -261,6 +277,7 @@ pub struct Unbatch {
     pending_chunks: VecDeque<Buffer>,
     count: AtomicU64,
     chunks_produced: AtomicU64,
+    arena: Option<SharedArena>,
 }
 
 impl Unbatch {
@@ -272,6 +289,7 @@ impl Unbatch {
             pending_chunks: VecDeque::new(),
             count: AtomicU64::new(0),
             chunks_produced: AtomicU64::new(0),
+            arena: None,
         }
     }
 
@@ -296,16 +314,22 @@ impl Unbatch {
         let mut offset = 0;
         let mut seq = 0u64;
 
+        // Ensure arena is created with appropriate chunk size
+        if self.arena.is_none() {
+            self.arena = Some(SharedArena::new(self.chunk_size, 8)?);
+        }
+
         while offset < data.len() {
             let chunk_len = (data.len() - offset).min(self.chunk_size);
-            let segment = Arc::new(CpuSegment::new(chunk_len)?);
 
-            unsafe {
-                let ptr = segment.as_mut_ptr().unwrap();
-                std::ptr::copy_nonoverlapping(data[offset..].as_ptr(), ptr, chunk_len);
-            }
+            let arena = self.arena.as_ref().unwrap();
+            let mut slot = arena
+                .acquire()
+                .ok_or_else(|| Error::Element("arena exhausted".into()))?;
 
-            let handle = MemoryHandle::from_segment_with_len(segment, chunk_len);
+            slot.data_mut()[..chunk_len].copy_from_slice(&data[offset..offset + chunk_len]);
+
+            let handle = MemoryHandle::with_len(slot, chunk_len);
             let mut meta = base_metadata.clone();
             meta.sequence = seq;
             if let Some(base_offset) = meta.offset {
@@ -370,16 +394,20 @@ pub struct UnbatchStats {
 mod tests {
     use super::*;
     use crate::metadata::Metadata;
+    use std::sync::OnceLock;
+
+    fn test_arena() -> &'static SharedArena {
+        static ARENA: OnceLock<SharedArena> = OnceLock::new();
+        ARENA.get_or_init(|| SharedArena::new(256, 64).unwrap())
+    }
 
     fn create_test_buffer(data: &[u8], seq: u64) -> Buffer {
-        let segment = Arc::new(CpuSegment::new(data.len().max(1)).unwrap());
+        let arena = test_arena();
+        let mut slot = arena.acquire().unwrap();
         if !data.is_empty() {
-            unsafe {
-                let ptr = segment.as_mut_ptr().unwrap();
-                std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
-            }
+            slot.data_mut()[..data.len()].copy_from_slice(data);
         }
-        let handle = MemoryHandle::from_segment_with_len(segment, data.len());
+        let handle = MemoryHandle::with_len(slot, data.len());
         Buffer::new(handle, Metadata::from_sequence(seq))
     }
 

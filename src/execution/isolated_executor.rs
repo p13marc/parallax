@@ -32,7 +32,7 @@
 use super::mode::{ExecutionMode, GroupId};
 use super::supervisor::{RestartPolicy, Supervisor};
 use crate::error::{Error, Result};
-use crate::memory::CpuArena;
+use crate::memory::SharedArena;
 use crate::pipeline::{NodeId, Pipeline, PipelineEvent};
 use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
@@ -327,7 +327,7 @@ impl IsolatedExecutor {
     /// Run pipeline with process isolation.
     async fn run_isolated(&self, pipeline: &mut Pipeline, plan: ExecutionPlan) -> Result<()> {
         // Create shared memory arena for IPC
-        let _arena = CpuArena::new(self.config.slot_size, self.config.arena_slots)?;
+        let _arena = SharedArena::new(self.config.slot_size, self.config.arena_slots)?;
 
         // Create supervisor to manage child processes
         let mut supervisor = Supervisor::new(self.mode.clone())
@@ -397,10 +397,16 @@ mod tests {
     use crate::buffer::{Buffer, MemoryHandle};
     use crate::element::{ConsumeContext, ProduceContext, ProduceResult};
     use crate::element::{DynAsyncElement, Sink, SinkAdapter, Source, SourceAdapter};
-    use crate::memory::CpuSegment;
+    use crate::memory::SharedArena;
     use crate::metadata::Metadata;
     use std::sync::Arc;
+    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn test_arena() -> &'static SharedArena {
+        static ARENA: OnceLock<SharedArena> = OnceLock::new();
+        ARENA.get_or_init(|| SharedArena::new(64, 64).unwrap())
+    }
 
     struct TestSource {
         count: u64,
@@ -413,8 +419,9 @@ mod tests {
                 return Ok(ProduceResult::Eos);
             }
             // Create our own buffer since we're in tests without an arena
-            let segment = Arc::new(CpuSegment::new(8).unwrap());
-            let handle = MemoryHandle::from_segment(segment);
+            let arena = test_arena();
+            let slot = arena.acquire().unwrap();
+            let handle = MemoryHandle::new(slot);
             let buffer = Buffer::new(handle, Metadata::from_sequence(self.count));
             self.count += 1;
             Ok(ProduceResult::OwnBuffer(buffer))

@@ -24,13 +24,12 @@ use crate::buffer::Buffer;
 use crate::clock::ClockTime;
 use crate::element::{Sink, Source};
 use crate::error::{Error, Result};
-use crate::memory::{CpuSegment, MemorySegment};
+use crate::memory::SharedArena;
 use crate::metadata::{BufferFlags, Metadata, RtpMeta};
 
 use bytes::Bytes;
 use rtp::packet::Packet;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
-use std::sync::Arc;
 use std::time::Duration;
 use webrtc_util::marshal::{Marshal, MarshalSize, Unmarshal};
 
@@ -84,6 +83,9 @@ pub struct RtpSrc {
 
     // Statistics
     stats: RtpSrcStats,
+
+    // Arena for output buffers
+    arena: Option<SharedArena>,
 }
 
 /// Statistics for RtpSrc.
@@ -120,6 +122,7 @@ impl RtpSrc {
             ssrc_filter: None,
             clock_rate: 90000, // Default video clock rate
             stats: RtpSrcStats::default(),
+            arena: None,
         })
     }
 
@@ -262,15 +265,21 @@ impl Source for RtpSrc {
         let payload_len = payload.len();
         self.stats.bytes_received += payload_len as u64;
 
-        let segment = Arc::new(CpuSegment::new(payload_len)?);
-        let ptr = segment
-            .as_mut_ptr()
-            .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
-        unsafe {
-            std::ptr::copy_nonoverlapping(payload.as_ref().as_ptr(), ptr, payload_len);
+        // Lazily initialize arena
+        if self.arena.is_none() {
+            self.arena = Some(
+                SharedArena::new(MAX_RTP_PACKET_SIZE, 64)
+                    .map_err(|e| Error::Element(format!("Failed to create arena: {}", e)))?,
+            );
         }
+        let arena = self.arena.as_ref().unwrap();
 
-        let handle = crate::buffer::MemoryHandle::from_segment_with_len(segment, payload_len);
+        let mut slot = arena
+            .acquire()
+            .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+        slot.data_mut()[..payload_len].copy_from_slice(payload.as_ref());
+
+        let handle = crate::buffer::MemoryHandle::with_len(slot, payload_len);
 
         // Build metadata
         let seq = self.sequence;
@@ -522,6 +531,9 @@ pub struct AsyncRtpSrc {
 
     // Statistics
     stats: RtpSrcStats,
+
+    // Arena for output buffers
+    arena: Option<SharedArena>,
 }
 
 impl AsyncRtpSrc {
@@ -545,6 +557,7 @@ impl AsyncRtpSrc {
             ssrc_filter: None,
             clock_rate: 90000,
             stats: RtpSrcStats::default(),
+            arena: None,
         })
     }
 
@@ -634,15 +647,21 @@ impl AsyncRtpSrc {
         let payload_len = payload.len();
         self.stats.bytes_received += payload_len as u64;
 
-        let segment = Arc::new(CpuSegment::new(payload_len)?);
-        let ptr = segment
-            .as_mut_ptr()
-            .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
-        unsafe {
-            std::ptr::copy_nonoverlapping(payload.as_ref().as_ptr(), ptr, payload_len);
+        // Lazily initialize arena
+        if self.arena.is_none() {
+            self.arena = Some(
+                SharedArena::new(MAX_RTP_PACKET_SIZE, 64)
+                    .map_err(|e| Error::Element(format!("Failed to create arena: {}", e)))?,
+            );
         }
+        let arena = self.arena.as_ref().unwrap();
 
-        let handle = crate::buffer::MemoryHandle::from_segment_with_len(segment, payload_len);
+        let mut slot = arena
+            .acquire()
+            .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+        slot.data_mut()[..payload_len].copy_from_slice(payload.as_ref());
+
+        let handle = crate::buffer::MemoryHandle::with_len(slot, payload_len);
 
         let seq = self.sequence;
         self.sequence += 1;
@@ -846,8 +865,21 @@ fn rand_timestamp() -> u32 {
 mod tests {
     use super::*;
     use crate::element::{Sink, Source};
+    use std::sync::OnceLock;
     use std::thread;
     use std::time::Duration;
+
+    fn test_arena() -> &'static SharedArena {
+        static ARENA: OnceLock<SharedArena> = OnceLock::new();
+        ARENA.get_or_init(|| SharedArena::new(MAX_RTP_PACKET_SIZE, 64).unwrap())
+    }
+
+    fn make_buffer(data: &[u8]) -> Buffer {
+        let mut slot = test_arena().acquire().unwrap();
+        slot.data_mut()[..data.len()].copy_from_slice(data);
+        let handle = crate::buffer::MemoryHandle::with_len(slot, data.len());
+        Buffer::new(handle, Metadata::default())
+    }
 
     #[test]
     fn test_rtp_src_creation() {
@@ -893,13 +925,7 @@ mod tests {
                 .with_payload_type(96);
 
             // Create test buffer
-            let segment = Arc::new(CpuSegment::new(5).unwrap());
-            let ptr = segment.as_mut_ptr().unwrap();
-            unsafe {
-                std::ptr::copy_nonoverlapping(b"hello".as_ptr(), ptr, 5);
-            }
-            let buf_handle = crate::buffer::MemoryHandle::from_segment_with_len(segment, 5);
-            let buffer = Buffer::new(buf_handle, Metadata::default());
+            let buffer = make_buffer(b"hello");
 
             sink.consume(buffer).unwrap();
         });
@@ -936,9 +962,7 @@ mod tests {
         let handle = thread::spawn(move || {
             let mut sink = RtpSink::connect(recv_addr).unwrap().with_payload_type(97); // Wrong PT
 
-            let segment = Arc::new(CpuSegment::new(4).unwrap());
-            let buf_handle = crate::buffer::MemoryHandle::from_segment_with_len(segment, 4);
-            let buffer = Buffer::new(buf_handle, Metadata::default());
+            let buffer = make_buffer(b"test");
 
             sink.consume(buffer).unwrap();
         });
@@ -966,13 +990,7 @@ mod tests {
                 .with_ssrc(0x87654321)
                 .with_payload_type(111);
 
-            let segment = Arc::new(CpuSegment::new(10).unwrap());
-            let ptr = segment.as_mut_ptr().unwrap();
-            unsafe {
-                std::ptr::copy_nonoverlapping(b"async test".as_ptr(), ptr, 10);
-            }
-            let buf_handle = crate::buffer::MemoryHandle::from_segment_with_len(segment, 10);
-            let buffer = Buffer::new(buf_handle, Metadata::default());
+            let buffer = make_buffer(b"async test");
 
             sink.send(buffer).await.unwrap();
         });
@@ -1013,12 +1031,9 @@ mod tests {
                 marker: true,
             };
 
-            let segment = Arc::new(CpuSegment::new(3).unwrap());
-            let ptr = segment.as_mut_ptr().unwrap();
-            unsafe {
-                std::ptr::copy_nonoverlapping(b"rtp".as_ptr(), ptr, 3);
-            }
-            let buf_handle = crate::buffer::MemoryHandle::from_segment_with_len(segment, 3);
+            let mut slot = test_arena().acquire().unwrap();
+            slot.data_mut()[..3].copy_from_slice(b"rtp");
+            let buf_handle = crate::buffer::MemoryHandle::with_len(slot, 3);
             let metadata = Metadata::new().with_rtp(rtp);
             let buffer = Buffer::new(buf_handle, metadata);
 

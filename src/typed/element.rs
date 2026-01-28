@@ -165,9 +165,8 @@ impl<C: Caps> std::ops::DerefMut for TypedBuffer<C> {
 mod tests {
     use super::*;
     use crate::buffer::MemoryHandle;
-    use crate::memory::CpuSegment;
+    use crate::memory::SharedArena;
     use crate::metadata::Metadata;
-    use std::sync::Arc;
 
     #[test]
     fn test_caps_types_are_send() {
@@ -179,8 +178,9 @@ mod tests {
 
     #[test]
     fn test_typed_buffer() {
-        let segment = Arc::new(CpuSegment::new(4).unwrap());
-        let handle = MemoryHandle::from_segment(segment);
+        let arena = SharedArena::new(1024, 4).unwrap();
+        let slot = arena.acquire().unwrap();
+        let handle = MemoryHandle::with_len(slot, 4);
         let buffer = Buffer::new(handle, Metadata::default());
 
         let typed: TypedBuffer<Bytes> = TypedBuffer::new(buffer);

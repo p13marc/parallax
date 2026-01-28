@@ -269,35 +269,8 @@ impl Sink for IpcSink {
         // Get the buffer from context
         let buffer = ctx.buffer();
 
-        // Get or create slot reference
-        let slot_ref = if let Some(ipc_ref) = buffer.memory().ipc_ref() {
-            ipc_ref
-        } else {
-            // Buffer is not in an arena, need to copy to our SharedArena
-            let arena = self
-                .arena
-                .as_ref()
-                .ok_or_else(|| Error::Element("Arena not initialized".into()))?;
-
-            let mut arena_slot = arena
-                .acquire()
-                .ok_or_else(|| Error::Element("Arena full".into()))?;
-
-            // Copy data using ctx.input() which gives buffer data as bytes
-            let data = ctx.input();
-            if data.len() > arena_slot.len() {
-                return Err(Error::Element("Buffer too large for arena slot".into()));
-            }
-            arena_slot.data_mut()[..data.len()].copy_from_slice(data);
-
-            // Get IPC ref with the actual data length
-            SharedIpcSlotRef {
-                arena_id: arena_slot.arena_id(),
-                slot_index: arena_slot.ipc_ref().slot_index,
-                data_offset: 0,
-                len: data.len(),
-            }
-        };
+        // Get slot reference from buffer (all buffers are now backed by SharedArena)
+        let slot_ref = buffer.memory().ipc_ref();
 
         // Send buffer ready message
         let msg = ControlMessage::BufferReady {
@@ -343,6 +316,8 @@ pub struct IpcSrc {
     registered_arenas: std::collections::HashMap<u64, usize>,
     /// Capabilities.
     caps: Caps,
+    /// Arena for creating placeholder buffers (when arena mapping not available).
+    arena: Option<SharedArena>,
 }
 
 impl IpcSrc {
@@ -357,6 +332,7 @@ impl IpcSrc {
             listener: None,
             registered_arenas: std::collections::HashMap::new(),
             caps: Caps::any(),
+            arena: None,
         }
     }
 
@@ -369,6 +345,7 @@ impl IpcSrc {
             listener: None,
             registered_arenas: std::collections::HashMap::new(),
             caps: Caps::any(),
+            arena: None,
         }
     }
 
@@ -484,7 +461,7 @@ impl IpcSrc {
         // Currently only tracks arena metadata. Full implementation requires:
         // 1. Receive fd via recv_fds() from memory/ipc.rs
         // 2. mmap the fd to local address space
-        // 3. Create a CpuArena from the mapped region
+        // 3. Create a SharedArena from the mapped region
     }
 }
 
@@ -516,14 +493,18 @@ impl Source for IpcSrc {
                     // is not yet implemented.
                     let meta = metadata.to_metadata();
 
-                    // Create a buffer with allocated memory
+                    // Create a buffer with allocated memory using SharedArena
                     // TODO: In a real implementation, use SharedArenaCache to map
                     // the arena from the sender and create a zero-copy buffer view.
-                    use crate::memory::CpuSegment;
-                    #[allow(deprecated)]
-                    let segment = std::sync::Arc::new(CpuSegment::new(slot.len)?);
-                    #[allow(deprecated)]
-                    let handle = MemoryHandle::from_segment(segment);
+                    if self.arena.is_none() {
+                        // Use 64KB slots by default, matching IpcSink
+                        self.arena = Some(SharedArena::new(64 * 1024, 64)?);
+                    }
+                    let arena = self.arena.as_ref().unwrap();
+                    let arena_slot = arena
+                        .acquire()
+                        .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+                    let handle = MemoryHandle::with_len(arena_slot, slot.len);
                     let buffer = Buffer::new(handle, meta);
 
                     // IpcSrc receives buffers via IPC, so return OwnBuffer

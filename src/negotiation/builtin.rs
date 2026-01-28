@@ -600,13 +600,13 @@ mod tests {
     #[test]
     fn test_converter_element_process_passthrough() {
         use crate::buffer::MemoryHandle;
-        use crate::memory::CpuSegment;
+        use crate::memory::SharedArena;
         use crate::metadata::Metadata;
-        use std::sync::Arc;
 
         let mut identity = Identity;
-        let segment = Arc::new(CpuSegment::new(4).unwrap());
-        let handle = MemoryHandle::from_segment(segment);
+        let arena = SharedArena::new(64, 4).unwrap();
+        let slot = arena.acquire().unwrap();
+        let handle = MemoryHandle::with_len(slot, 4);
         let buffer = Buffer::new(handle, Metadata::from_sequence(0));
         let result = Element::process(&mut identity, buffer).unwrap();
         assert!(result.is_some());

@@ -81,7 +81,7 @@ pub mod prelude {
         AudioFormat, Caps, ElementMediaCaps, FormatMemoryCap, MediaCaps, MediaFormat, RtpFormat,
         VideoFormat,
     };
-    pub use crate::memory::{MemoryPool, MemorySegment, MemoryType};
+    pub use crate::memory::{MemorySegment, MemoryType};
     pub use crate::metadata::{BufferFlags, Metadata, RtpMeta};
     pub use crate::pipeline::{Executor, Pipeline};
 }

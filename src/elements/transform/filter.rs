@@ -360,19 +360,26 @@ impl Element for MetadataFilter {
 mod tests {
     use super::*;
     use crate::buffer::MemoryHandle;
-    use crate::memory::CpuSegment;
+    use crate::memory::SharedArena;
     use crate::metadata::Metadata;
-    use std::sync::Arc;
+    use std::sync::OnceLock;
+
+    fn test_arena() -> &'static SharedArena {
+        static ARENA: OnceLock<SharedArena> = OnceLock::new();
+        ARENA.get_or_init(|| SharedArena::new(256, 2048).unwrap())
+    }
 
     fn create_test_buffer(size: usize, seq: u64) -> Buffer {
-        let segment = Arc::new(CpuSegment::new(size).unwrap());
-        let handle = MemoryHandle::from_segment(segment);
+        let arena = test_arena();
+        let slot = arena.acquire().unwrap();
+        let handle = MemoryHandle::with_len(slot, size);
         Buffer::new(handle, Metadata::from_sequence(seq))
     }
 
     fn create_buffer_with_stream(seq: u64, stream_id: u32) -> Buffer {
-        let segment = Arc::new(CpuSegment::new(64).unwrap());
-        let handle = MemoryHandle::from_segment(segment);
+        let arena = test_arena();
+        let slot = arena.acquire().unwrap();
+        let handle = MemoryHandle::with_len(slot, 64);
         let mut meta = Metadata::from_sequence(seq);
         meta.stream_id = stream_id;
         Buffer::new(handle, meta)

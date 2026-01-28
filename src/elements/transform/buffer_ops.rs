@@ -4,9 +4,8 @@
 
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::Element;
-use crate::error::Result;
-use crate::memory::{CpuSegment, MemorySegment};
-use std::sync::Arc;
+use crate::error::{Error, Result};
+use crate::memory::SharedArena;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Trims buffers to a maximum size.
@@ -27,6 +26,7 @@ pub struct BufferTrim {
     count: AtomicU64,
     trimmed_count: AtomicU64,
     bytes_trimmed: AtomicU64,
+    arena: Option<SharedArena>,
 }
 
 impl BufferTrim {
@@ -38,6 +38,7 @@ impl BufferTrim {
             count: AtomicU64::new(0),
             trimmed_count: AtomicU64::new(0),
             bytes_trimmed: AtomicU64::new(0),
+            arena: None,
         }
     }
 
@@ -81,15 +82,19 @@ impl Element for BufferTrim {
         self.bytes_trimmed
             .fetch_add(bytes_removed as u64, Ordering::Relaxed);
 
-        let segment = Arc::new(CpuSegment::new(self.max_size)?);
-        let src_data = buffer.as_bytes();
-
-        unsafe {
-            let ptr = segment.as_mut_ptr().unwrap();
-            std::ptr::copy_nonoverlapping(src_data.as_ptr(), ptr, self.max_size);
+        if self.arena.is_none() {
+            self.arena = Some(SharedArena::new(self.max_size, 8)?);
         }
 
-        let handle = MemoryHandle::from_segment_with_len(segment, self.max_size);
+        let arena = self.arena.as_ref().unwrap();
+        let mut slot = arena
+            .acquire()
+            .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+
+        let src_data = buffer.as_bytes();
+        slot.data_mut()[..self.max_size].copy_from_slice(&src_data[..self.max_size]);
+
+        let handle = MemoryHandle::with_len(slot, self.max_size);
         let new_buffer = Buffer::new(handle, buffer.metadata().clone());
 
         Ok(Some(new_buffer))
@@ -132,6 +137,7 @@ pub struct BufferSlice {
     length: Option<usize>,
     count: AtomicU64,
     skip_short: bool,
+    arena: Option<SharedArena>,
 }
 
 impl BufferSlice {
@@ -147,6 +153,7 @@ impl BufferSlice {
             length: Some(length),
             count: AtomicU64::new(0),
             skip_short: false,
+            arena: None,
         }
     }
 
@@ -158,6 +165,7 @@ impl BufferSlice {
             length: None,
             count: AtomicU64::new(0),
             skip_short: false,
+            arena: None,
         }
     }
 
@@ -201,8 +209,14 @@ impl Element for BufferSlice {
                 return Ok(None);
             }
             // Return empty buffer (allocate minimum 1 byte)
-            let segment = Arc::new(CpuSegment::new(1)?);
-            let handle = MemoryHandle::from_segment_with_len(segment, 0);
+            if self.arena.is_none() {
+                self.arena = Some(SharedArena::new(1, 8)?);
+            }
+            let arena = self.arena.as_ref().unwrap();
+            let slot = arena
+                .acquire()
+                .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+            let handle = MemoryHandle::with_len(slot, 0);
             return Ok(Some(Buffer::new(handle, buffer.metadata().clone())));
         }
 
@@ -218,20 +232,31 @@ impl Element for BufferSlice {
         };
 
         if slice_len == 0 {
-            let segment = Arc::new(CpuSegment::new(1)?); // Minimum 1 byte
-            let handle = MemoryHandle::from_segment_with_len(segment, 0);
+            if self.arena.is_none() {
+                self.arena = Some(SharedArena::new(1, 8)?); // Minimum 1 byte
+            }
+            let arena = self.arena.as_ref().unwrap();
+            let slot = arena
+                .acquire()
+                .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+            let handle = MemoryHandle::with_len(slot, 0);
             return Ok(Some(Buffer::new(handle, buffer.metadata().clone())));
         }
 
-        let segment = Arc::new(CpuSegment::new(slice_len)?);
-        let src_data = buffer.as_bytes();
-
-        unsafe {
-            let ptr = segment.as_mut_ptr().unwrap();
-            std::ptr::copy_nonoverlapping(src_data[self.offset..].as_ptr(), ptr, slice_len);
+        if self.arena.is_none() || self.arena.as_ref().unwrap().slot_size() < slice_len {
+            self.arena = Some(SharedArena::new(slice_len, 8)?);
         }
 
-        let handle = MemoryHandle::from_segment_with_len(segment, slice_len);
+        let arena = self.arena.as_ref().unwrap();
+        let mut slot = arena
+            .acquire()
+            .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+
+        let src_data = buffer.as_bytes();
+        slot.data_mut()[..slice_len]
+            .copy_from_slice(&src_data[self.offset..self.offset + slice_len]);
+
+        let handle = MemoryHandle::with_len(slot, slice_len);
         let mut metadata = buffer.metadata().clone();
 
         // Update offset metadata if present
@@ -265,6 +290,7 @@ pub struct BufferPad {
     fill_byte: u8,
     count: AtomicU64,
     padded_count: AtomicU64,
+    arena: Option<SharedArena>,
 }
 
 impl BufferPad {
@@ -276,6 +302,7 @@ impl BufferPad {
             fill_byte,
             count: AtomicU64::new(0),
             padded_count: AtomicU64::new(0),
+            arena: None,
         }
     }
 
@@ -314,22 +341,25 @@ impl Element for BufferPad {
 
         self.padded_count.fetch_add(1, Ordering::Relaxed);
 
-        let segment = Arc::new(CpuSegment::new(self.min_size)?);
-        let src_data = buffer.as_bytes();
-
-        unsafe {
-            let ptr = segment.as_mut_ptr().unwrap();
-            // Copy original data
-            std::ptr::copy_nonoverlapping(src_data.as_ptr(), ptr, src_data.len());
-            // Fill padding
-            std::ptr::write_bytes(
-                ptr.add(src_data.len()),
-                self.fill_byte,
-                self.min_size - src_data.len(),
-            );
+        if self.arena.is_none() {
+            self.arena = Some(SharedArena::new(self.min_size, 8)?);
         }
 
-        let handle = MemoryHandle::from_segment_with_len(segment, self.min_size);
+        let arena = self.arena.as_ref().unwrap();
+        let mut slot = arena
+            .acquire()
+            .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+
+        let src_data = buffer.as_bytes();
+        let data = slot.data_mut();
+        // Copy original data
+        data[..src_data.len()].copy_from_slice(src_data);
+        // Fill padding
+        for byte in &mut data[src_data.len()..self.min_size] {
+            *byte = self.fill_byte;
+        }
+
+        let handle = MemoryHandle::with_len(slot, self.min_size);
         Ok(Some(Buffer::new(handle, buffer.metadata().clone())))
     }
 
@@ -351,14 +381,20 @@ pub struct BufferPadStats {
 mod tests {
     use super::*;
     use crate::metadata::Metadata;
+    use std::sync::OnceLock;
+
+    fn test_arena() -> &'static SharedArena {
+        static ARENA: OnceLock<SharedArena> = OnceLock::new();
+        ARENA.get_or_init(|| SharedArena::new(256, 64).unwrap())
+    }
 
     fn create_test_buffer(data: &[u8], seq: u64) -> Buffer {
-        let segment = Arc::new(CpuSegment::new(data.len()).unwrap());
-        unsafe {
-            let ptr = segment.as_mut_ptr().unwrap();
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+        let arena = test_arena();
+        let mut slot = arena.acquire().unwrap();
+        if !data.is_empty() {
+            slot.data_mut()[..data.len()].copy_from_slice(data);
         }
-        let handle = MemoryHandle::from_segment_with_len(segment, data.len());
+        let handle = MemoryHandle::with_len(slot, data.len());
         Buffer::new(handle, Metadata::from_sequence(seq))
     }
 

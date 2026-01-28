@@ -33,7 +33,7 @@ use crate::buffer::Buffer;
 use crate::element::Element;
 use crate::error::{Error, Result};
 use crate::format::{MediaFormat, RtpEncoding, RtpFormat, VideoCodec};
-use crate::memory::{CpuSegment, MemorySegment};
+use crate::memory::SharedArena;
 use crate::metadata::BufferFlags;
 
 use bytes::Bytes;
@@ -43,7 +43,6 @@ use rtp::codecs::opus::OpusPacket;
 use rtp::codecs::vp8::{Vp8Packet, Vp8Payloader};
 use rtp::codecs::vp9::{Vp9Packet, Vp9Payloader};
 use rtp::packetizer::{Depacketizer, Payloader};
-use std::sync::Arc;
 
 /// Default MTU for RTP payloaders.
 const DEFAULT_MTU: usize = 1400;
@@ -75,6 +74,7 @@ pub struct RtpH264Depay {
     name: String,
     depacketizer: H264Packet,
     stats: DepayStats,
+    arena: Option<SharedArena>,
 }
 
 impl RtpH264Depay {
@@ -84,6 +84,7 @@ impl RtpH264Depay {
             name: "rtp-h264-depay".into(),
             depacketizer: H264Packet::default(),
             stats: DepayStats::default(),
+            arena: None,
         }
     }
 
@@ -126,17 +127,21 @@ impl Element for RtpH264Depay {
                 self.stats.frames_out += 1;
                 self.stats.bytes_out += output.len() as u64;
 
-                // Create output buffer
-                let segment = Arc::new(CpuSegment::new(output.len())?);
-                let ptr = segment
-                    .as_mut_ptr()
-                    .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(output.as_ref().as_ptr(), ptr, output.len());
+                // Lazily initialize arena
+                if self.arena.is_none() {
+                    self.arena =
+                        Some(SharedArena::new(256 * 1024, 32).map_err(|e| {
+                            Error::Element(format!("Failed to create arena: {}", e))
+                        })?);
                 }
+                let arena = self.arena.as_ref().unwrap();
 
-                let handle =
-                    crate::buffer::MemoryHandle::from_segment_with_len(segment, output.len());
+                let mut slot = arena
+                    .acquire()
+                    .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+                slot.data_mut()[..output.len()].copy_from_slice(output.as_ref());
+
+                let handle = crate::buffer::MemoryHandle::with_len(slot, output.len());
 
                 // Preserve metadata, update format
                 let mut metadata = buffer.metadata().clone();
@@ -190,6 +195,7 @@ pub struct RtpH264Pay {
     payloader: H264Payloader,
     mtu: usize,
     stats: PayStats,
+    arena: Option<SharedArena>,
 }
 
 impl RtpH264Pay {
@@ -200,6 +206,7 @@ impl RtpH264Pay {
             payloader: H264Payloader::default(),
             mtu: DEFAULT_MTU,
             stats: PayStats::default(),
+            arena: None,
         }
     }
 
@@ -244,24 +251,26 @@ impl Element for RtpH264Pay {
                 self.stats.packets_out += packets.len() as u64;
                 self.stats.bytes_out += total_len as u64;
 
-                let segment = Arc::new(CpuSegment::new(total_len)?);
-                let ptr = segment
-                    .as_mut_ptr()
-                    .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
+                // Lazily initialize arena
+                if self.arena.is_none() {
+                    self.arena =
+                        Some(SharedArena::new(256 * 1024, 32).map_err(|e| {
+                            Error::Element(format!("Failed to create arena: {}", e))
+                        })?);
+                }
+                let arena = self.arena.as_ref().unwrap();
+
+                let mut slot = arena
+                    .acquire()
+                    .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
 
                 let mut offset = 0;
                 for packet in &packets {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            packet.as_ref().as_ptr(),
-                            ptr.add(offset),
-                            packet.len(),
-                        );
-                    }
+                    slot.data_mut()[offset..offset + packet.len()].copy_from_slice(packet.as_ref());
                     offset += packet.len();
                 }
 
-                let handle = crate::buffer::MemoryHandle::from_segment_with_len(segment, total_len);
+                let handle = crate::buffer::MemoryHandle::with_len(slot, total_len);
 
                 let mut metadata = buffer.metadata().clone();
                 metadata.format = Some(MediaFormat::Rtp(RtpFormat::H264));
@@ -291,6 +300,7 @@ pub struct RtpH265Depay {
     name: String,
     depacketizer: H265Packet,
     stats: DepayStats,
+    arena: Option<SharedArena>,
 }
 
 impl RtpH265Depay {
@@ -300,6 +310,7 @@ impl RtpH265Depay {
             name: "rtp-h265-depay".into(),
             depacketizer: H265Packet::default(),
             stats: DepayStats::default(),
+            arena: None,
         }
     }
 
@@ -335,16 +346,21 @@ impl Element for RtpH265Depay {
                 self.stats.frames_out += 1;
                 self.stats.bytes_out += output.len() as u64;
 
-                let segment = Arc::new(CpuSegment::new(output.len())?);
-                let ptr = segment
-                    .as_mut_ptr()
-                    .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(output.as_ref().as_ptr(), ptr, output.len());
+                // Lazily initialize arena
+                if self.arena.is_none() {
+                    self.arena =
+                        Some(SharedArena::new(256 * 1024, 32).map_err(|e| {
+                            Error::Element(format!("Failed to create arena: {}", e))
+                        })?);
                 }
+                let arena = self.arena.as_ref().unwrap();
 
-                let handle =
-                    crate::buffer::MemoryHandle::from_segment_with_len(segment, output.len());
+                let mut slot = arena
+                    .acquire()
+                    .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+                slot.data_mut()[..output.len()].copy_from_slice(output.as_ref());
+
+                let handle = crate::buffer::MemoryHandle::with_len(slot, output.len());
 
                 let mut metadata = buffer.metadata().clone();
                 metadata.format = Some(MediaFormat::Video(VideoCodec::H265));
@@ -373,6 +389,7 @@ pub struct RtpH265Pay {
     payloader: HevcPayloader,
     mtu: usize,
     stats: PayStats,
+    arena: Option<SharedArena>,
 }
 
 impl RtpH265Pay {
@@ -383,6 +400,7 @@ impl RtpH265Pay {
             payloader: HevcPayloader::default(),
             mtu: DEFAULT_MTU,
             stats: PayStats::default(),
+            arena: None,
         }
     }
 
@@ -426,24 +444,26 @@ impl Element for RtpH265Pay {
                 self.stats.packets_out += packets.len() as u64;
                 self.stats.bytes_out += total_len as u64;
 
-                let segment = Arc::new(CpuSegment::new(total_len)?);
-                let ptr = segment
-                    .as_mut_ptr()
-                    .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
+                // Lazily initialize arena
+                if self.arena.is_none() {
+                    self.arena =
+                        Some(SharedArena::new(256 * 1024, 32).map_err(|e| {
+                            Error::Element(format!("Failed to create arena: {}", e))
+                        })?);
+                }
+                let arena = self.arena.as_ref().unwrap();
+
+                let mut slot = arena
+                    .acquire()
+                    .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
 
                 let mut offset = 0;
                 for packet in &packets {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            packet.as_ptr(),
-                            ptr.add(offset),
-                            packet.len(),
-                        );
-                    }
+                    slot.data_mut()[offset..offset + packet.len()].copy_from_slice(packet.as_ref());
                     offset += packet.len();
                 }
 
-                let handle = crate::buffer::MemoryHandle::from_segment_with_len(segment, total_len);
+                let handle = crate::buffer::MemoryHandle::with_len(slot, total_len);
 
                 let mut metadata = buffer.metadata().clone();
                 metadata.format = Some(MediaFormat::Rtp(RtpFormat::H265));
@@ -471,6 +491,7 @@ pub struct RtpVp8Depay {
     name: String,
     depacketizer: Vp8Packet,
     stats: DepayStats,
+    arena: Option<SharedArena>,
 }
 
 impl RtpVp8Depay {
@@ -480,6 +501,7 @@ impl RtpVp8Depay {
             name: "rtp-vp8-depay".into(),
             depacketizer: Vp8Packet::default(),
             stats: DepayStats::default(),
+            arena: None,
         }
     }
 
@@ -515,16 +537,21 @@ impl Element for RtpVp8Depay {
                 self.stats.frames_out += 1;
                 self.stats.bytes_out += output.len() as u64;
 
-                let segment = Arc::new(CpuSegment::new(output.len())?);
-                let ptr = segment
-                    .as_mut_ptr()
-                    .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(output.as_ref().as_ptr(), ptr, output.len());
+                // Lazily initialize arena
+                if self.arena.is_none() {
+                    self.arena =
+                        Some(SharedArena::new(256 * 1024, 32).map_err(|e| {
+                            Error::Element(format!("Failed to create arena: {}", e))
+                        })?);
                 }
+                let arena = self.arena.as_ref().unwrap();
 
-                let handle =
-                    crate::buffer::MemoryHandle::from_segment_with_len(segment, output.len());
+                let mut slot = arena
+                    .acquire()
+                    .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+                slot.data_mut()[..output.len()].copy_from_slice(output.as_ref());
+
+                let handle = crate::buffer::MemoryHandle::with_len(slot, output.len());
 
                 let mut metadata = buffer.metadata().clone();
                 metadata.format = Some(MediaFormat::Video(VideoCodec::Vp8));
@@ -558,6 +585,7 @@ pub struct RtpVp8Pay {
     payloader: Vp8Payloader,
     mtu: usize,
     stats: PayStats,
+    arena: Option<SharedArena>,
 }
 
 impl RtpVp8Pay {
@@ -568,6 +596,7 @@ impl RtpVp8Pay {
             payloader: Vp8Payloader::default(),
             mtu: DEFAULT_MTU,
             stats: PayStats::default(),
+            arena: None,
         }
     }
 
@@ -610,24 +639,26 @@ impl Element for RtpVp8Pay {
                 self.stats.packets_out += packets.len() as u64;
                 self.stats.bytes_out += total_len as u64;
 
-                let segment = Arc::new(CpuSegment::new(total_len)?);
-                let ptr = segment
-                    .as_mut_ptr()
-                    .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
+                // Lazily initialize arena
+                if self.arena.is_none() {
+                    self.arena =
+                        Some(SharedArena::new(256 * 1024, 32).map_err(|e| {
+                            Error::Element(format!("Failed to create arena: {}", e))
+                        })?);
+                }
+                let arena = self.arena.as_ref().unwrap();
+
+                let mut slot = arena
+                    .acquire()
+                    .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
 
                 let mut offset = 0;
                 for packet in &packets {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            packet.as_ref().as_ptr(),
-                            ptr.add(offset),
-                            packet.len(),
-                        );
-                    }
+                    slot.data_mut()[offset..offset + packet.len()].copy_from_slice(packet.as_ref());
                     offset += packet.len();
                 }
 
-                let handle = crate::buffer::MemoryHandle::from_segment_with_len(segment, total_len);
+                let handle = crate::buffer::MemoryHandle::with_len(slot, total_len);
 
                 let mut metadata = buffer.metadata().clone();
                 metadata.format = Some(MediaFormat::Rtp(RtpFormat::new(
@@ -659,6 +690,7 @@ pub struct RtpVp9Depay {
     name: String,
     depacketizer: Vp9Packet,
     stats: DepayStats,
+    arena: Option<SharedArena>,
 }
 
 impl RtpVp9Depay {
@@ -668,6 +700,7 @@ impl RtpVp9Depay {
             name: "rtp-vp9-depay".into(),
             depacketizer: Vp9Packet::default(),
             stats: DepayStats::default(),
+            arena: None,
         }
     }
 
@@ -703,16 +736,21 @@ impl Element for RtpVp9Depay {
                 self.stats.frames_out += 1;
                 self.stats.bytes_out += output.len() as u64;
 
-                let segment = Arc::new(CpuSegment::new(output.len())?);
-                let ptr = segment
-                    .as_mut_ptr()
-                    .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(output.as_ref().as_ptr(), ptr, output.len());
+                // Lazily initialize arena
+                if self.arena.is_none() {
+                    self.arena =
+                        Some(SharedArena::new(256 * 1024, 32).map_err(|e| {
+                            Error::Element(format!("Failed to create arena: {}", e))
+                        })?);
                 }
+                let arena = self.arena.as_ref().unwrap();
 
-                let handle =
-                    crate::buffer::MemoryHandle::from_segment_with_len(segment, output.len());
+                let mut slot = arena
+                    .acquire()
+                    .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+                slot.data_mut()[..output.len()].copy_from_slice(output.as_ref());
+
+                let handle = crate::buffer::MemoryHandle::with_len(slot, output.len());
 
                 let mut metadata = buffer.metadata().clone();
                 metadata.format = Some(MediaFormat::Video(VideoCodec::Vp9));
@@ -741,6 +779,7 @@ pub struct RtpVp9Pay {
     payloader: Vp9Payloader,
     mtu: usize,
     stats: PayStats,
+    arena: Option<SharedArena>,
 }
 
 impl RtpVp9Pay {
@@ -751,6 +790,7 @@ impl RtpVp9Pay {
             payloader: Vp9Payloader::default(),
             mtu: DEFAULT_MTU,
             stats: PayStats::default(),
+            arena: None,
         }
     }
 
@@ -793,24 +833,26 @@ impl Element for RtpVp9Pay {
                 self.stats.packets_out += packets.len() as u64;
                 self.stats.bytes_out += total_len as u64;
 
-                let segment = Arc::new(CpuSegment::new(total_len)?);
-                let ptr = segment
-                    .as_mut_ptr()
-                    .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
+                // Lazily initialize arena
+                if self.arena.is_none() {
+                    self.arena =
+                        Some(SharedArena::new(256 * 1024, 32).map_err(|e| {
+                            Error::Element(format!("Failed to create arena: {}", e))
+                        })?);
+                }
+                let arena = self.arena.as_ref().unwrap();
+
+                let mut slot = arena
+                    .acquire()
+                    .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
 
                 let mut offset = 0;
                 for packet in &packets {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            packet.as_ref().as_ptr(),
-                            ptr.add(offset),
-                            packet.len(),
-                        );
-                    }
+                    slot.data_mut()[offset..offset + packet.len()].copy_from_slice(packet.as_ref());
                     offset += packet.len();
                 }
 
-                let handle = crate::buffer::MemoryHandle::from_segment_with_len(segment, total_len);
+                let handle = crate::buffer::MemoryHandle::with_len(slot, total_len);
 
                 let mut metadata = buffer.metadata().clone();
                 metadata.format = Some(MediaFormat::Rtp(RtpFormat::new(
@@ -842,6 +884,7 @@ pub struct RtpOpusDepay {
     name: String,
     depacketizer: OpusPacket,
     stats: DepayStats,
+    arena: Option<SharedArena>,
 }
 
 impl RtpOpusDepay {
@@ -851,6 +894,7 @@ impl RtpOpusDepay {
             name: "rtp-opus-depay".into(),
             depacketizer: OpusPacket::default(),
             stats: DepayStats::default(),
+            arena: None,
         }
     }
 
@@ -886,16 +930,21 @@ impl Element for RtpOpusDepay {
                 self.stats.frames_out += 1;
                 self.stats.bytes_out += output.len() as u64;
 
-                let segment = Arc::new(CpuSegment::new(output.len())?);
-                let ptr = segment
-                    .as_mut_ptr()
-                    .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(output.as_ref().as_ptr(), ptr, output.len());
+                // Lazily initialize arena
+                if self.arena.is_none() {
+                    self.arena =
+                        Some(SharedArena::new(64 * 1024, 32).map_err(|e| {
+                            Error::Element(format!("Failed to create arena: {}", e))
+                        })?);
                 }
+                let arena = self.arena.as_ref().unwrap();
 
-                let handle =
-                    crate::buffer::MemoryHandle::from_segment_with_len(segment, output.len());
+                let mut slot = arena
+                    .acquire()
+                    .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+                slot.data_mut()[..output.len()].copy_from_slice(output.as_ref());
+
+                let handle = crate::buffer::MemoryHandle::with_len(slot, output.len());
 
                 let mut metadata = buffer.metadata().clone();
                 metadata.format = Some(MediaFormat::Audio(crate::format::AudioCodec::Opus));
@@ -952,14 +1001,17 @@ pub struct PayStats {
 mod tests {
     use super::*;
     use crate::metadata::Metadata;
+    use std::sync::OnceLock;
+
+    fn test_arena() -> &'static SharedArena {
+        static ARENA: OnceLock<SharedArena> = OnceLock::new();
+        ARENA.get_or_init(|| SharedArena::new(256 * 1024, 64).unwrap())
+    }
 
     fn create_test_buffer(data: &[u8]) -> Buffer {
-        let segment = Arc::new(CpuSegment::new(data.len()).unwrap());
-        let ptr = segment.as_mut_ptr().unwrap();
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
-        }
-        let handle = crate::buffer::MemoryHandle::from_segment_with_len(segment, data.len());
+        let mut slot = test_arena().acquire().unwrap();
+        slot.data_mut()[..data.len()].copy_from_slice(data);
+        let handle = crate::buffer::MemoryHandle::with_len(slot, data.len());
         Buffer::new(handle, Metadata::default())
     }
 

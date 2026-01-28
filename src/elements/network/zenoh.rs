@@ -14,7 +14,7 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{Sink, Source};
 use crate::error::{Error, Result};
-use crate::memory::{CpuSegment, MemorySegment};
+use crate::memory::SharedArena;
 use crate::metadata::Metadata;
 use std::sync::Arc;
 use std::time::Duration;
@@ -89,6 +89,7 @@ pub struct ZenohSrc {
     samples_received: u64,
     sequence: u64,
     timeout: Option<Duration>,
+    arena: Option<SharedArena>,
 }
 
 impl ZenohSrc {
@@ -128,6 +129,7 @@ impl ZenohSrc {
             samples_received: 0,
             sequence: 0,
             timeout: None,
+            arena: None,
         })
     }
 
@@ -178,9 +180,18 @@ impl Source for ZenohSrc {
             match receiver.recv_timeout(timeout) {
                 Ok(sample) => sample,
                 Err(flume::RecvTimeoutError::Timeout) => {
+                    // Lazily initialize arena
+                    if self.arena.is_none() {
+                        self.arena = Some(SharedArena::new(64 * 1024, 32).map_err(|e| {
+                            Error::Element(format!("Failed to create arena: {}", e))
+                        })?);
+                    }
+                    let arena = self.arena.as_ref().unwrap();
+                    let slot = arena.acquire().ok_or_else(|| {
+                        Error::Element("Failed to acquire buffer slot".to_string())
+                    })?;
                     // Return timeout buffer
-                    let segment = Arc::new(CpuSegment::new(1)?);
-                    let handle = MemoryHandle::from_segment_with_len(segment, 0);
+                    let handle = MemoryHandle::with_len(slot, 0);
                     let mut meta = Metadata::from_sequence(self.sequence);
                     meta.flags = meta.flags.insert(crate::metadata::BufferFlags::TIMEOUT);
                     self.sequence += 1;
@@ -203,16 +214,22 @@ impl Source for ZenohSrc {
         let seq = self.sequence;
         self.sequence += 1;
 
-        let segment = Arc::new(CpuSegment::new(data.len().max(1))?);
-        if !data.is_empty() {
-            unsafe {
-                let ptr = segment.as_mut_ptr().unwrap();
-                std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
-            }
+        // Lazily initialize arena
+        if self.arena.is_none() {
+            self.arena = Some(
+                SharedArena::new(64 * 1024, 32)
+                    .map_err(|e| Error::Element(format!("Failed to create arena: {}", e)))?,
+            );
         }
+        let arena = self.arena.as_ref().unwrap();
 
-        let handle = MemoryHandle::from_segment_with_len(segment, data.len());
-        let mut meta = Metadata::from_sequence(seq);
+        let mut slot = arena
+            .acquire()
+            .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+        slot.data_mut()[..data.len()].copy_from_slice(&data);
+
+        let handle = MemoryHandle::with_len(slot, data.len());
+        let meta = Metadata::from_sequence(seq);
 
         // Store key expression in metadata if different from subscription
         let key = sample.key_expr().as_str();
@@ -537,6 +554,7 @@ pub struct ZenohQuerier {
     timeout: Duration,
     queries_sent: u64,
     replies_received: u64,
+    arena: Option<SharedArena>,
 }
 
 impl ZenohQuerier {
@@ -557,6 +575,7 @@ impl ZenohQuerier {
             timeout: Duration::from_secs(10),
             queries_sent: 0,
             replies_received: 0,
+            arena: None,
         }
     }
 
@@ -598,6 +617,15 @@ impl ZenohQuerier {
 
         self.queries_sent += 1;
 
+        // Lazily initialize arena
+        if self.arena.is_none() {
+            self.arena = Some(
+                SharedArena::new(64 * 1024, 64)
+                    .map_err(|e| Error::Element(format!("Failed to create arena: {}", e)))?,
+            );
+        }
+        let arena = self.arena.as_ref().unwrap();
+
         let mut buffers = Vec::new();
         let mut seq = 0u64;
 
@@ -607,15 +635,12 @@ impl ZenohQuerier {
                     let payload = sample.payload();
                     let data: Vec<u8> = payload.to_bytes().to_vec();
 
-                    let segment = Arc::new(CpuSegment::new(data.len().max(1))?);
-                    if !data.is_empty() {
-                        unsafe {
-                            let ptr = segment.as_mut_ptr().unwrap();
-                            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
-                        }
-                    }
+                    let mut slot = arena.acquire().ok_or_else(|| {
+                        Error::Element("Failed to acquire buffer slot".to_string())
+                    })?;
+                    slot.data_mut()[..data.len()].copy_from_slice(&data);
 
-                    let handle = MemoryHandle::from_segment_with_len(segment, data.len());
+                    let handle = MemoryHandle::with_len(slot, data.len());
                     buffers.push(Buffer::new(handle, Metadata::from_sequence(seq)));
                     seq += 1;
                     self.replies_received += 1;
@@ -641,6 +666,15 @@ impl ZenohQuerier {
 
         self.queries_sent += 1;
 
+        // Lazily initialize arena
+        if self.arena.is_none() {
+            self.arena = Some(
+                SharedArena::new(64 * 1024, 64)
+                    .map_err(|e| Error::Element(format!("Failed to create arena: {}", e)))?,
+            );
+        }
+        let arena = self.arena.as_ref().unwrap();
+
         let mut buffers = Vec::new();
         let mut seq = 0u64;
 
@@ -650,15 +684,12 @@ impl ZenohQuerier {
                     let payload = sample.payload();
                     let data: Vec<u8> = payload.to_bytes().to_vec();
 
-                    let segment = Arc::new(CpuSegment::new(data.len().max(1))?);
-                    if !data.is_empty() {
-                        unsafe {
-                            let ptr = segment.as_mut_ptr().unwrap();
-                            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
-                        }
-                    }
+                    let mut slot = arena.acquire().ok_or_else(|| {
+                        Error::Element("Failed to acquire buffer slot".to_string())
+                    })?;
+                    slot.data_mut()[..data.len()].copy_from_slice(&data);
 
-                    let handle = MemoryHandle::from_segment_with_len(segment, data.len());
+                    let handle = MemoryHandle::with_len(slot, data.len());
                     buffers.push(Buffer::new(handle, Metadata::from_sequence(seq)));
                     seq += 1;
                     self.replies_received += 1;

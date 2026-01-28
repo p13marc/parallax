@@ -8,13 +8,12 @@
 
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::error::{Error, Result};
-use crate::memory::{CpuSegment, ipc};
+use crate::memory::{SharedArena, SharedArenaCache, ipc};
 use crate::metadata::Metadata;
 
 use std::collections::HashMap;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::sync::Arc;
 
 /// Message types for IPC protocol.
 #[repr(u8)]
@@ -173,16 +172,22 @@ impl IpcPublisher {
     pub fn send(&mut self, buffer: Buffer) -> Result<()> {
         let memory = buffer.memory();
 
-        // Try to get the segment as CpuSegment
-        // This requires the segment to be a CpuSegment
+        // Ensure the arena fd has been sent to the subscriber
         let segment_id = self.ensure_segment_sent(&buffer)?;
+
+        // Get the IPC reference which has slot_index and data_offset
+        let ipc_ref = memory.ipc_ref();
+
+        // Pack slot_index in upper 32 bits of field1, data_offset in lower 32 bits
+        let field1 =
+            ((ipc_ref.slot_index as u64) << 32) | (ipc_ref.data_offset as u64 & 0xFFFFFFFF);
 
         // Send buffer message
         let header = MessageHeader {
             msg_type: MessageType::Buffer as u8,
             segment_id,
-            field1: memory.offset() as u64,
-            field2: memory.len() as u64,
+            field1,
+            field2: ipc_ref.len as u64,
             sequence: buffer.metadata().sequence,
         };
 
@@ -217,50 +222,15 @@ impl IpcPublisher {
     fn ensure_segment_sent(&mut self, buffer: &Buffer) -> Result<u32> {
         let memory = buffer.memory();
 
-        // Get the base pointer and IPC handle based on memory type
-        #[allow(deprecated)]
-        let (seg_ptr, ipc_handle) = match memory {
-            crate::buffer::MemoryHandle::SharedSlot { slot, .. } => {
-                // For shared slots, use the arena_id as the key
-                let arena_id = slot.arena_id();
-                // Use arena_id as unique key, and create IPC handle from arena fd
-                let handle = crate::memory::IpcHandle::Fd {
-                    fd: slot.arena_fd(),
-                    size: slot.arena_size(),
-                };
-                (arena_id as usize, handle)
-            }
-            crate::buffer::MemoryHandle::Arena { slot, .. } => {
-                // For arena slots, use the arena's base pointer as the key
-                let arena = slot.arena();
-                let ptr = arena.raw_fd() as usize; // Use fd as unique key for the arena
-                let handle = crate::memory::IpcHandle::Fd {
-                    fd: arena.raw_fd(),
-                    size: arena.total_size(),
-                };
-                (ptr, handle)
-            }
-            crate::buffer::MemoryHandle::Segment { segment, .. } => {
-                let ptr = segment.as_ptr() as usize;
-                let handle = segment
-                    .ipc_handle()
-                    .ok_or_else(|| Error::Pipeline("segment doesn't support IPC".into()))?;
-                (ptr, handle)
-            }
-        };
+        // MemoryHandle now only uses SharedSlotRef, use arena_id as the key
+        let arena_id = memory.arena_id();
+        let fd = memory.arena_fd();
+        let size = memory.arena_size();
 
-        // Check if we've already sent this segment/arena
-        if let Some(&id) = self.segment_ids.get(&seg_ptr) {
+        // Check if we've already sent this arena
+        if let Some(&id) = self.segment_ids.get(&(arena_id as usize)) {
             return Ok(id);
         }
-
-        // Get the fd from the handle
-        let (fd, size) = match ipc_handle {
-            crate::memory::IpcHandle::Fd { fd, size } => (fd, size),
-            crate::memory::IpcHandle::Named { .. } => {
-                return Err(Error::Pipeline("named segments not supported yet".into()));
-            }
-        };
 
         let id = self.next_segment_id;
         self.next_segment_id += 1;
@@ -284,8 +254,8 @@ impl IpcPublisher {
         let borrowed_fd = unsafe { BorrowedFd::borrow_raw(fd) };
         ipc::send_fds(stream, &[borrowed_fd], &header.to_bytes())?;
 
-        // Remember this segment/arena by its pointer/fd
-        self.segment_ids.insert(seg_ptr, id);
+        // Remember this arena by its id
+        self.segment_ids.insert(arena_id as usize, id);
 
         Ok(id)
     }
@@ -311,8 +281,10 @@ impl IpcPublisher {
 /// ```
 pub struct IpcSubscriber {
     stream: UnixStream,
-    /// Segments we've received from the publisher (segment_id -> segment)
-    segments: HashMap<u32, Arc<CpuSegment>>,
+    /// Arenas we've received from the publisher (segment_id -> arena)
+    arenas: HashMap<u32, SharedArena>,
+    /// Cache for slot references
+    arena_cache: SharedArenaCache,
 }
 
 impl IpcSubscriber {
@@ -322,7 +294,8 @@ impl IpcSubscriber {
 
         Ok(Self {
             stream,
-            segments: HashMap::new(),
+            arenas: HashMap::new(),
+            arena_cache: SharedArenaCache::new(),
         })
     }
 
@@ -330,7 +303,8 @@ impl IpcSubscriber {
     pub fn from_stream(stream: UnixStream) -> Self {
         Self {
             stream,
-            segments: HashMap::new(),
+            arenas: HashMap::new(),
+            arena_cache: SharedArenaCache::new(),
         }
     }
 
@@ -385,25 +359,51 @@ impl IpcSubscriber {
                     .next()
                     .ok_or_else(|| Error::Pipeline("expected fd for NewSegment".into()))?;
 
-                let size = header.field1 as usize;
-                let segment = unsafe { CpuSegment::from_fd_with_size(fd, size)? };
-                self.segments.insert(header.segment_id, Arc::new(segment));
+                // Map the SharedArena from the received fd
+                let arena = unsafe { SharedArena::from_fd(fd)? };
+                let arena_id = arena.id();
+                self.arenas.insert(header.segment_id, arena);
+
+                // Arena ID is stored in the arena itself
+                let _ = arena_id;
 
                 // Recurse to get the actual buffer
                 self.recv()
             }
             MessageType::Buffer => {
                 let segment_id = header.segment_id;
-                let segment = self
-                    .segments
-                    .get(&segment_id)
-                    .ok_or_else(|| Error::Pipeline(format!("unknown segment id: {}", segment_id)))?
-                    .clone();
+                let arena = self.arenas.get(&segment_id).ok_or_else(|| {
+                    Error::Pipeline(format!("unknown segment id: {}", segment_id))
+                })?;
 
-                let offset = header.field1 as usize;
+                // Unpack slot_index from upper 32 bits, data_offset from lower 32 bits
+                let slot_index = (header.field1 >> 32) as u32;
+                let data_offset = (header.field1 & 0xFFFFFFFF) as usize;
                 let len = header.field2 as usize;
 
-                let handle = MemoryHandle::new(segment, offset, len);
+                // Create an IPC slot reference to reconstruct the slot
+                let ipc_ref = crate::memory::SharedIpcSlotRef {
+                    arena_id: arena.id(),
+                    slot_index,
+                    data_offset,
+                    len,
+                };
+
+                // Get a slot reference from the arena
+                // Since the old protocol doesn't track slot indices properly,
+                // we need to create the handle differently.
+                // For now, we acquire a new slot and copy the reference data.
+                // In a proper implementation, the publisher would send the slot_index.
+
+                // Actually, the publisher sends buffers that reference memory in the arena.
+                // The offset is relative to the arena base. We need to find which slot
+                // contains this offset, or use the arena's slot_from_ipc if available.
+
+                let slot = arena
+                    .slot_from_ipc(&ipc_ref)
+                    .ok_or_else(|| Error::Pipeline("failed to reconstruct slot from IPC".into()))?;
+
+                let handle = MemoryHandle::with_len(slot, len);
                 let metadata = Metadata::from_sequence(header.sequence);
 
                 Ok(Some(Buffer::new(handle, metadata)))
@@ -426,30 +426,33 @@ impl IpcSubscriber {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::MemorySegment;
+    use crate::memory::SharedArena;
     use std::thread;
 
     #[test]
     fn test_ipc_link_socket_pair() {
+        use std::sync::Arc;
+
         let (pub_stream, sub_stream) = UnixStream::pair().unwrap();
 
         let mut publisher = IpcPublisher::from_stream(pub_stream);
         let mut subscriber = IpcSubscriber::from_stream(sub_stream);
 
-        // Create a shared memory segment
-        let segment = Arc::new(CpuSegment::with_name("test-ipc-link", 4096).unwrap());
+        // Create a shared arena with enough slots - use Arc to keep alive across threads
+        let arena = Arc::new(SharedArena::with_name("test-ipc-link", 4096, 16).unwrap());
+        let arena_clone = arena.clone();
 
         // Producer thread
         let producer = thread::spawn(move || {
             for i in 0..10u64 {
-                // Write sequence number to buffer at different offsets
-                let offset = (i as usize) * 8;
-                let ptr = unsafe { segment.as_mut_ptr().unwrap().add(offset) as *mut u64 };
+                // Acquire a slot and write data
+                let mut slot = arena_clone.acquire().expect("arena should have slots");
+                let ptr = slot.data_mut().as_mut_ptr() as *mut u64;
                 unsafe {
                     *ptr = i;
                 }
 
-                let handle = MemoryHandle::new(segment.clone(), offset, 8);
+                let handle = MemoryHandle::with_len(slot, 8);
                 let buffer = Buffer::new(handle, Metadata::from_sequence(i));
 
                 publisher.send(buffer).unwrap();
@@ -472,6 +475,9 @@ mod tests {
             assert_eq!(*seq, i as u64);
             assert_eq!(*val, i as u64);
         }
+
+        // Drop arena after all buffers are consumed
+        drop(arena);
     }
 
     #[test]
@@ -481,18 +487,19 @@ mod tests {
         let mut publisher = IpcPublisher::from_stream(pub_stream);
         let mut subscriber = IpcSubscriber::from_stream(sub_stream);
 
-        // Create shared memory
-        let segment = Arc::new(CpuSegment::with_name("test-zero-copy", 4096).unwrap());
+        // Create shared arena
+        let arena = SharedArena::with_name("test-zero-copy", 4096, 4).unwrap();
 
-        // Write data to segment
-        let ptr = segment.as_mut_ptr().unwrap();
-        unsafe {
-            *ptr = 42u8;
-            *ptr.add(1) = 43u8;
-        }
+        // Acquire slot and write data
+        let mut slot = arena.acquire().unwrap();
+        slot.data_mut()[0] = 42u8;
+        slot.data_mut()[1] = 43u8;
 
-        // Send buffer referencing this segment
-        let handle = MemoryHandle::new(segment.clone(), 0, 2);
+        // Keep a raw pointer for later modification
+        let data_ptr = slot.data_mut().as_mut_ptr();
+
+        // Send buffer referencing this slot
+        let handle = MemoryHandle::with_len(slot, 2);
         let buffer = Buffer::new(handle, Metadata::from_sequence(0));
         publisher.send(buffer).unwrap();
         publisher.send_eos().unwrap();
@@ -505,7 +512,7 @@ mod tests {
 
         // Modify through publisher's view
         unsafe {
-            *ptr = 100u8;
+            *data_ptr = 100u8;
         }
 
         // Should see the change through subscriber's buffer!
@@ -514,25 +521,29 @@ mod tests {
     }
 
     #[test]
-    fn test_ipc_link_multiple_segments() {
+    fn test_ipc_link_multiple_arenas() {
         let (pub_stream, sub_stream) = UnixStream::pair().unwrap();
 
         let mut publisher = IpcPublisher::from_stream(pub_stream);
         let mut subscriber = IpcSubscriber::from_stream(sub_stream);
 
-        // Create two different segments
-        let segment1 = Arc::new(CpuSegment::with_name("test-multi-1", 1024).unwrap());
-        let segment2 = Arc::new(CpuSegment::with_name("test-multi-2", 1024).unwrap());
+        // Create two different arenas - keep them alive until after assertions
+        let arena1 = SharedArena::with_name("test-multi-1", 1024, 4).unwrap();
+        let arena2 = SharedArena::with_name("test-multi-2", 1024, 4).unwrap();
 
-        // Write different data to each
-        unsafe {
-            *segment1.as_mut_ptr().unwrap() = 1u8;
-            *segment2.as_mut_ptr().unwrap() = 2u8;
-        }
+        // Acquire slots and write different data to each
+        let mut slot1 = arena1.acquire().unwrap();
+        let mut slot2 = arena2.acquire().unwrap();
+        slot1.data_mut()[0] = 1u8;
+        slot2.data_mut()[0] = 2u8;
 
-        // Send buffers from both segments
-        let handle1 = MemoryHandle::new(segment1.clone(), 0, 1);
-        let handle2 = MemoryHandle::new(segment2.clone(), 0, 1);
+        // Clone slots so we can send and still verify data
+        let slot1_clone = slot1.clone();
+        let slot2_clone = slot2.clone();
+
+        // Send buffers from both arenas
+        let handle1 = MemoryHandle::with_len(slot1, 1);
+        let handle2 = MemoryHandle::with_len(slot2, 1);
 
         publisher
             .send(Buffer::new(handle1, Metadata::from_sequence(0)))
@@ -542,32 +553,34 @@ mod tests {
             .unwrap();
         publisher.send_eos().unwrap();
 
-        // Receive both
+        // Receive both - subscriber maps its own view of the arenas
         let buf1 = subscriber.recv().unwrap().unwrap();
         let buf2 = subscriber.recv().unwrap().unwrap();
 
         assert_eq!(buf1.as_bytes(), &[1]);
         assert_eq!(buf2.as_bytes(), &[2]);
+
+        // Keep slots alive to ensure refcount stays > 0
+        drop(slot1_clone);
+        drop(slot2_clone);
     }
 
     #[test]
-    fn test_ipc_link_segment_reuse() {
+    fn test_ipc_link_arena_reuse() {
         let (pub_stream, sub_stream) = UnixStream::pair().unwrap();
 
         let mut publisher = IpcPublisher::from_stream(pub_stream);
         let mut subscriber = IpcSubscriber::from_stream(sub_stream);
 
-        // Create one segment
-        let segment = Arc::new(CpuSegment::with_name("test-reuse", 1024).unwrap());
+        // Create one arena with multiple slots
+        let arena = SharedArena::with_name("test-reuse", 1024, 8).unwrap();
 
-        // Send multiple buffers from the same segment
+        // Send multiple buffers from the same arena
         for i in 0..5 {
-            let offset = i * 10;
-            unsafe {
-                *segment.as_mut_ptr().unwrap().add(offset) = i as u8;
-            }
+            let mut slot = arena.acquire().unwrap();
+            slot.data_mut()[0] = i as u8;
 
-            let handle = MemoryHandle::new(segment.clone(), offset, 1);
+            let handle = MemoryHandle::with_len(slot, 1);
             publisher
                 .send(Buffer::new(handle, Metadata::from_sequence(i as u64)))
                 .unwrap();
@@ -582,7 +595,7 @@ mod tests {
         }
         assert_eq!(count, 5);
 
-        // Subscriber should only have one segment (the fd was sent once)
-        assert_eq!(subscriber.segments.len(), 1);
+        // Subscriber should only have one arena (the fd was sent once)
+        assert_eq!(subscriber.arenas.len(), 1);
     }
 }

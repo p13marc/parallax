@@ -23,13 +23,11 @@
 //! ```
 
 use crate::buffer::{Buffer, MemoryHandle};
-
 use crate::error::{Error, Result};
-use crate::memory::{CpuSegment, MemorySegment};
+use crate::memory::SharedArena;
 use crate::metadata::Metadata;
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 // ============================================================================
 // Universal Label (UL) / Universal Label Set (ULS)
@@ -588,24 +586,28 @@ fn calculate_checksum(data: &[u8]) -> u16 {
 // ============================================================================
 
 /// Create a Buffer from KLV data.
+/// Get the global KLV arena (lazily initialized).
+fn klv_arena() -> &'static SharedArena {
+    use std::sync::OnceLock;
+    static ARENA: OnceLock<SharedArena> = OnceLock::new();
+    // 64KB slots should be sufficient for KLV metadata, 32 slots for concurrency
+    ARENA.get_or_init(|| SharedArena::new(65536, 32).expect("Failed to create KLV arena"))
+}
+
 fn create_klv_buffer(data: Vec<u8>) -> Result<Buffer> {
     if data.is_empty() {
         return Err(Error::Element("Empty KLV data".into()));
     }
 
-    let segment = Arc::new(
-        CpuSegment::new(data.len())
-            .map_err(|e| Error::Element(format!("Failed to allocate buffer: {}", e)))?,
-    );
+    let arena = klv_arena();
 
-    let ptr = segment
-        .as_mut_ptr()
-        .ok_or_else(|| Error::Element("Failed to get segment pointer".into()))?;
-    unsafe {
-        std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
-    }
+    let mut slot = arena
+        .acquire()
+        .ok_or_else(|| Error::Element("Failed to acquire slot from arena".into()))?;
 
-    let handle = MemoryHandle::from_segment_with_len(segment, data.len());
+    slot.data_mut()[..data.len()].copy_from_slice(&data);
+
+    let handle = MemoryHandle::with_len(slot, data.len());
     let metadata = Metadata::new();
 
     Ok(Buffer::new(handle, metadata))

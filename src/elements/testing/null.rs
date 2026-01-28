@@ -1,7 +1,8 @@
 //! Null elements - NullSink and NullSource.
 
 use crate::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
-use crate::error::Result;
+use crate::error::{Error, Result};
+use crate::memory::SharedArena;
 
 /// A sink that discards all buffers.
 ///
@@ -16,15 +17,15 @@ use crate::error::Result;
 /// use parallax::elements::NullSink;
 /// use parallax::element::{ConsumeContext, Sink};
 /// # use parallax::buffer::{Buffer, MemoryHandle};
-/// # use parallax::memory::CpuSegment;
+/// # use parallax::memory::SharedArena;
 /// # use parallax::metadata::Metadata;
-/// # use std::sync::Arc;
 ///
 /// let mut sink = NullSink::new();
 ///
 /// // Create a test buffer
-/// # let segment = Arc::new(CpuSegment::new(8).unwrap());
-/// # let handle = MemoryHandle::from_segment(segment);
+/// # let arena = SharedArena::new(8, 4).unwrap();
+/// # let slot = arena.acquire().unwrap();
+/// # let handle = MemoryHandle::new(slot);
 /// # let buffer = Buffer::new(handle, Metadata::from_sequence(0));
 /// # let ctx = ConsumeContext::new(&buffer);
 ///
@@ -91,10 +92,9 @@ impl Sink for NullSink {
 /// ```rust
 /// use parallax::elements::NullSource;
 /// use parallax::element::{ProduceContext, ProduceResult, Source};
-/// use parallax::memory::CpuArena;
-/// use std::sync::Arc;
+/// use parallax::memory::SharedArena;
 ///
-/// let arena = Arc::new(CpuArena::new(1024, 8).unwrap());
+/// let arena = SharedArena::new(1024, 8).unwrap();
 /// let mut source = NullSource::new(5);
 ///
 /// // Produces 5 buffers, then EOS
@@ -119,6 +119,8 @@ pub struct NullSource {
     current: u64,
     /// Size of each buffer in bytes.
     buffer_size: usize,
+    /// Arena for allocating buffers when no ProduceContext buffer is available.
+    arena: Option<SharedArena>,
 }
 
 impl NullSource {
@@ -129,6 +131,7 @@ impl NullSource {
             count,
             current: 0,
             buffer_size: 64,
+            arena: None,
         }
     }
 
@@ -139,6 +142,7 @@ impl NullSource {
             count,
             current: 0,
             buffer_size: 64,
+            arena: None,
         }
     }
 
@@ -171,13 +175,17 @@ impl Source for NullSource {
         } else {
             // Fallback: create our own buffer when no arena is configured
             use crate::buffer::{Buffer, MemoryHandle};
-            use crate::memory::CpuSegment;
             use crate::metadata::Metadata;
-            use std::sync::Arc;
 
-            let segment = Arc::new(CpuSegment::new(self.buffer_size)?);
-            let handle = MemoryHandle::from_segment(segment);
-            // CpuSegment is already zero-initialized
+            if self.arena.is_none() {
+                self.arena = Some(SharedArena::new(self.buffer_size, 8)?);
+            }
+            let arena = self.arena.as_ref().unwrap();
+            let slot = arena
+                .acquire()
+                .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+            // SharedArena slots are already zero-initialized
+            let handle = MemoryHandle::with_len(slot, self.buffer_size);
             let buffer = Buffer::new(handle, Metadata::from_sequence(self.current));
             self.current += 1;
             Ok(ProduceResult::OwnBuffer(buffer))
@@ -197,17 +205,16 @@ impl Source for NullSource {
 mod tests {
     use super::*;
     use crate::buffer::{Buffer, MemoryHandle};
-    use crate::memory::CpuSegment;
     use crate::metadata::Metadata;
-    use std::sync::Arc;
 
     #[test]
     fn test_null_sink_consumes() {
         let mut sink = NullSink::new();
         assert_eq!(sink.count(), 0);
 
-        let segment = Arc::new(CpuSegment::new(64).unwrap());
-        let handle = MemoryHandle::from_segment(segment);
+        let arena = SharedArena::new(64, 4).unwrap();
+        let slot = arena.acquire().unwrap();
+        let handle = MemoryHandle::new(slot);
         let buffer = Buffer::new(handle, Metadata::from_sequence(0));
         let ctx = ConsumeContext::new(&buffer);
 
@@ -223,14 +230,19 @@ mod tests {
 
     #[test]
     fn test_null_source_produces_count() {
-        use crate::memory::CpuArena;
+        use crate::memory::SharedArena;
+        use std::sync::OnceLock;
 
-        let arena = Arc::new(CpuArena::new(1024, 8).unwrap());
+        fn test_arena() -> &'static SharedArena {
+            static ARENA: OnceLock<SharedArena> = OnceLock::new();
+            ARENA.get_or_init(|| SharedArena::new(2048, 16).unwrap())
+        }
+
         let mut source = NullSource::new(5);
         assert_eq!(source.remaining(), 5);
 
         for i in 0..5 {
-            let slot = arena.acquire().unwrap();
+            let slot = test_arena().acquire().unwrap();
             let mut ctx = ProduceContext::new(slot);
             let result = source.produce(&mut ctx).unwrap();
             match result {
@@ -246,7 +258,7 @@ mod tests {
         assert_eq!(source.remaining(), 0);
 
         // Should return Eos
-        let slot = arena.acquire().unwrap();
+        let slot = test_arena().acquire().unwrap();
         let mut ctx = ProduceContext::new(slot);
         let result = source.produce(&mut ctx).unwrap();
         assert!(matches!(result, ProduceResult::Eos));
@@ -254,12 +266,17 @@ mod tests {
 
     #[test]
     fn test_null_source_buffer_size() {
-        use crate::memory::CpuArena;
+        use crate::memory::SharedArena;
+        use std::sync::OnceLock;
 
-        let arena = Arc::new(CpuArena::new(2048, 4).unwrap());
+        fn test_arena() -> &'static SharedArena {
+            static ARENA: OnceLock<SharedArena> = OnceLock::new();
+            ARENA.get_or_init(|| SharedArena::new(2048, 8).unwrap())
+        }
+
         let mut source = NullSource::new(1).with_buffer_size(1024);
 
-        let slot = arena.acquire().unwrap();
+        let slot = test_arena().acquire().unwrap();
         let mut ctx = ProduceContext::new(slot);
         let result = source.produce(&mut ctx).unwrap();
         match result {

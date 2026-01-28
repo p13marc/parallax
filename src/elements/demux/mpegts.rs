@@ -25,7 +25,7 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::clock::ClockTime;
 use crate::error::{Error, Result};
-use crate::memory::{CpuSegment, MemorySegment};
+use crate::memory::SharedArena;
 use crate::metadata::Metadata;
 
 use mpeg2ts_reader::StreamType;
@@ -39,7 +39,14 @@ use mpeg2ts_reader::psi::pat::PAT_PID;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::OnceLock;
+
+/// Shared arena for MPEG-TS demuxer buffers.
+fn ts_demux_arena() -> &'static SharedArena {
+    static ARENA: OnceLock<SharedArena> = OnceLock::new();
+    // PES packets can be large for video, use generous slot size
+    ARENA.get_or_init(|| SharedArena::new(2 * 1024 * 1024, 64).unwrap())
+}
 
 /// Size of a single MPEG-TS packet.
 pub const TS_PACKET_SIZE: usize = 188;
@@ -253,19 +260,13 @@ impl FrameCollector {
             return Err(Error::Element("Empty buffer data".into()));
         }
 
-        let segment = Arc::new(
-            CpuSegment::new(data.len())
-                .map_err(|e| Error::Element(format!("Failed to allocate buffer: {}", e)))?,
-        );
+        let mut slot = ts_demux_arena()
+            .acquire()
+            .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
 
-        let ptr = segment
-            .as_mut_ptr()
-            .ok_or_else(|| Error::Element("Failed to get segment pointer".into()))?;
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
-        }
+        slot.data_mut()[..data.len()].copy_from_slice(data);
 
-        let handle = MemoryHandle::from_segment_with_len(segment, data.len());
+        let handle = MemoryHandle::with_len(slot, data.len());
 
         // Build metadata
         let mut metadata = Metadata::new();

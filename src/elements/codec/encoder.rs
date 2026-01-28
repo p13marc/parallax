@@ -17,8 +17,7 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{Element, ExecutionHints};
 use crate::error::{Error, Result};
-use crate::memory::{CpuSegment, MemorySegment};
-use std::sync::Arc;
+use crate::memory::SharedArena;
 
 use super::common::{PixelFormat, VideoFrame};
 use super::traits::VideoEncoder;
@@ -148,6 +147,8 @@ pub struct Rav1eEncoder {
     context: rav1e::Context<u8>,
     config: Rav1eConfig,
     frame_count: u64,
+    /// Arena for output buffer allocation.
+    arena: Option<SharedArena>,
 }
 
 impl Rav1eEncoder {
@@ -162,6 +163,7 @@ impl Rav1eEncoder {
             context,
             config,
             frame_count: 0,
+            arena: None,
         })
     }
 
@@ -292,21 +294,27 @@ impl Element for Rav1eEncoder {
 
         match self.encode_frame(input, pts)? {
             Some(packet) => {
-                // Create output buffer with encoded data
-                let segment = Arc::new(CpuSegment::new(packet.len())?);
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        packet.as_ptr(),
-                        segment.as_mut_ptr().unwrap(),
-                        packet.len(),
-                    );
+                // Initialize arena on first use
+                if self.arena.is_none() {
+                    // Allocate enough for typical compressed frames
+                    let arena_size = packet.len().max(1024 * 1024); // At least 1MB
+                    self.arena =
+                        Some(SharedArena::new(arena_size, 16).map_err(|e| {
+                            Error::Element(format!("Failed to create arena: {}", e))
+                        })?);
                 }
+
+                let arena = self.arena.as_ref().unwrap();
+                let mut slot = arena
+                    .acquire()
+                    .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+                slot.data_mut()[..packet.len()].copy_from_slice(&packet);
 
                 let metadata = buffer.metadata().clone();
                 // Note: codec info could be added via MediaFormat if needed
 
                 Ok(Some(Buffer::new(
-                    MemoryHandle::from_segment(segment),
+                    MemoryHandle::with_len(slot, packet.len()),
                     metadata,
                 )))
             }

@@ -1603,8 +1603,8 @@ pub trait AsyncElementDyn {
 /// to the source via `ProduceContext`. Set the arena with [`set_arena()`](Self::set_arena).
 pub struct SourceAdapter<S: Source> {
     inner: S,
-    /// Arena for pre-allocated buffers.
-    arena: Option<std::sync::Arc<crate::memory::CpuArena>>,
+    /// Arena for pre-allocated buffers (uses SharedArena for cross-process support).
+    arena: Option<std::sync::Arc<crate::memory::SharedArena>>,
     /// Buffer pool for high-level pool API with backpressure.
     pool: Option<std::sync::Arc<dyn crate::memory::BufferPool>>,
 }
@@ -1620,7 +1620,7 @@ impl<S: Source> SourceAdapter<S> {
     }
 
     /// Create a source adapter with an arena for buffer allocation.
-    pub fn with_arena(source: S, arena: std::sync::Arc<crate::memory::CpuArena>) -> Self {
+    pub fn with_arena(source: S, arena: std::sync::Arc<crate::memory::SharedArena>) -> Self {
         Self {
             inner: source,
             arena: Some(arena),
@@ -1638,7 +1638,7 @@ impl<S: Source> SourceAdapter<S> {
     }
 
     /// Set the arena for buffer allocation.
-    pub fn set_arena(&mut self, arena: std::sync::Arc<crate::memory::CpuArena>) {
+    pub fn set_arena(&mut self, arena: std::sync::Arc<crate::memory::SharedArena>) {
         self.arena = Some(arena);
     }
 
@@ -2099,8 +2099,8 @@ impl<T: Transform + Send + 'static> SendAsyncElementDyn for TransformAdapter<T> 
 /// ```
 pub struct AsyncSourceAdapter<S: AsyncSource> {
     inner: S,
-    /// Arena for pre-allocated buffers.
-    arena: Option<std::sync::Arc<crate::memory::CpuArena>>,
+    /// Arena for pre-allocated buffers (uses SharedArena for cross-process support).
+    arena: Option<std::sync::Arc<crate::memory::SharedArena>>,
 }
 
 impl<S: AsyncSource> AsyncSourceAdapter<S> {
@@ -2113,7 +2113,7 @@ impl<S: AsyncSource> AsyncSourceAdapter<S> {
     }
 
     /// Create an async source adapter with an arena for buffer allocation.
-    pub fn with_arena(source: S, arena: std::sync::Arc<crate::memory::CpuArena>) -> Self {
+    pub fn with_arena(source: S, arena: std::sync::Arc<crate::memory::SharedArena>) -> Self {
         Self {
             inner: source,
             arena: Some(arena),
@@ -2121,7 +2121,7 @@ impl<S: AsyncSource> AsyncSourceAdapter<S> {
     }
 
     /// Set the arena for buffer allocation.
-    pub fn set_arena(&mut self, arena: std::sync::Arc<crate::memory::CpuArena>) {
+    pub fn set_arena(&mut self, arena: std::sync::Arc<crate::memory::SharedArena>) {
         self.arena = Some(arena);
     }
 
@@ -2602,9 +2602,8 @@ impl<M: Muxer + Send + 'static> SendAsyncElementDyn for MuxerAdapter<M> {
 mod tests {
     use super::*;
     use crate::buffer::MemoryHandle;
-    use crate::memory::{CpuArena, CpuSegment};
+    use crate::memory::SharedArena;
     use crate::metadata::Metadata;
-    use std::sync::Arc;
 
     struct TestSource {
         count: u64,
@@ -2659,8 +2658,9 @@ mod tests {
 
     #[test]
     fn test_output_single() {
-        let segment = Arc::new(CpuSegment::new(8).unwrap());
-        let handle = MemoryHandle::from_segment(segment);
+        let arena = SharedArena::new(1024, 4).unwrap();
+        let slot = arena.acquire().unwrap();
+        let handle = MemoryHandle::new(slot);
         let buffer = Buffer::new(handle, Metadata::from_sequence(42));
 
         let out = Output::single(buffer);
@@ -2674,22 +2674,17 @@ mod tests {
         let out: Output = vec![].into();
         assert!(out.is_none());
 
-        let segment = Arc::new(CpuSegment::new(8).unwrap());
-        let handle = MemoryHandle::from_segment(segment);
+        let arena = SharedArena::new(1024, 4).unwrap();
+        let slot = arena.acquire().unwrap();
+        let handle = MemoryHandle::new(slot);
         let buffer = Buffer::new(handle, Metadata::from_sequence(42));
         let out: Output = vec![buffer].into();
         assert!(out.is_single());
 
-        let segment1 = Arc::new(CpuSegment::new(8).unwrap());
-        let segment2 = Arc::new(CpuSegment::new(8).unwrap());
-        let buf1 = Buffer::new(
-            MemoryHandle::from_segment(segment1),
-            Metadata::from_sequence(1),
-        );
-        let buf2 = Buffer::new(
-            MemoryHandle::from_segment(segment2),
-            Metadata::from_sequence(2),
-        );
+        let slot1 = arena.acquire().unwrap();
+        let slot2 = arena.acquire().unwrap();
+        let buf1 = Buffer::new(MemoryHandle::new(slot1), Metadata::from_sequence(1));
+        let buf2 = Buffer::new(MemoryHandle::new(slot2), Metadata::from_sequence(2));
         let out: Output = vec![buf1, buf2].into();
         assert!(out.is_multiple());
         assert_eq!(out.len(), 2);
@@ -2697,16 +2692,11 @@ mod tests {
 
     #[test]
     fn test_output_iterator() {
-        let segment1 = Arc::new(CpuSegment::new(8).unwrap());
-        let segment2 = Arc::new(CpuSegment::new(8).unwrap());
-        let buf1 = Buffer::new(
-            MemoryHandle::from_segment(segment1),
-            Metadata::from_sequence(1),
-        );
-        let buf2 = Buffer::new(
-            MemoryHandle::from_segment(segment2),
-            Metadata::from_sequence(2),
-        );
+        let arena = SharedArena::new(1024, 4).unwrap();
+        let slot1 = arena.acquire().unwrap();
+        let slot2 = arena.acquire().unwrap();
+        let buf1 = Buffer::new(MemoryHandle::new(slot1), Metadata::from_sequence(1));
+        let buf2 = Buffer::new(MemoryHandle::new(slot2), Metadata::from_sequence(2));
         let out: Output = vec![buf1, buf2].into();
 
         let seqs: Vec<u64> = out.into_iter().map(|b| b.metadata().sequence).collect();
@@ -2716,7 +2706,7 @@ mod tests {
     #[tokio::test]
     async fn test_source_adapter() {
         let source = TestSource { count: 0, max: 3 };
-        let arena = CpuArena::new(1024, 8).unwrap();
+        let arena = std::sync::Arc::new(SharedArena::new(1024, 8).unwrap());
         let mut adapter = SourceAdapter::with_arena(source, arena);
 
         assert_eq!(AsyncElementDyn::element_type(&adapter), ElementType::Source);
@@ -2756,9 +2746,10 @@ mod tests {
         assert_eq!(AsyncElementDyn::element_type(&adapter), ElementType::Sink);
 
         // Create and consume some buffers
+        let arena = SharedArena::new(1024, 8).unwrap();
         for i in 0..3 {
-            let segment = Arc::new(CpuSegment::new(8).unwrap());
-            let handle = MemoryHandle::from_segment(segment);
+            let slot = arena.acquire().unwrap();
+            let handle = MemoryHandle::new(slot);
             let buffer = Buffer::new(handle, Metadata::from_sequence(i));
             AsyncElementDyn::process(&mut adapter, Some(buffer))
                 .await
@@ -2776,8 +2767,9 @@ mod tests {
             ElementType::Transform
         );
 
-        let segment = Arc::new(CpuSegment::new(8).unwrap());
-        let handle = MemoryHandle::from_segment(segment);
+        let arena = SharedArena::new(1024, 4).unwrap();
+        let slot = arena.acquire().unwrap();
+        let handle = MemoryHandle::new(slot);
         let buffer = Buffer::new(handle, Metadata::from_sequence(42));
 
         let result = AsyncElementDyn::process(&mut adapter, Some(buffer))
@@ -2791,8 +2783,9 @@ mod tests {
     fn test_element_implements_transform() {
         let mut element = PassThrough;
 
-        let segment = Arc::new(CpuSegment::new(8).unwrap());
-        let handle = MemoryHandle::from_segment(segment);
+        let arena = SharedArena::new(1024, 4).unwrap();
+        let slot = arena.acquire().unwrap();
+        let handle = MemoryHandle::new(slot);
         let buffer = Buffer::new(handle, Metadata::from_sequence(42));
 
         // Use Transform trait on Element
@@ -2812,8 +2805,9 @@ mod tests {
 
     #[test]
     fn test_routed_output() {
-        let segment = Arc::new(CpuSegment::new(8).unwrap());
-        let handle = MemoryHandle::from_segment(segment);
+        let arena = SharedArena::new(1024, 4).unwrap();
+        let slot = arena.acquire().unwrap();
+        let handle = MemoryHandle::new(slot);
         let buffer = Buffer::new(handle, Metadata::from_sequence(42));
 
         let mut output = RoutedOutput::new();
@@ -2830,8 +2824,9 @@ mod tests {
 
     #[test]
     fn test_muxer_input() {
-        let segment = Arc::new(CpuSegment::new(8).unwrap());
-        let handle = MemoryHandle::from_segment(segment);
+        let arena = SharedArena::new(1024, 4).unwrap();
+        let slot = arena.acquire().unwrap();
+        let handle = MemoryHandle::new(slot);
         let buffer = Buffer::new(handle, Metadata::from_sequence(42));
 
         let input = MuxerInput::new(PadId(3), buffer);
@@ -2884,8 +2879,9 @@ mod tests {
             ElementType::Demuxer
         );
 
-        let segment = Arc::new(CpuSegment::new(8).unwrap());
-        let handle = MemoryHandle::from_segment(segment);
+        let arena = SharedArena::new(1024, 4).unwrap();
+        let slot = arena.acquire().unwrap();
+        let handle = MemoryHandle::new(slot);
         let buffer = Buffer::new(handle, Metadata::from_sequence(42));
 
         let result = AsyncElementDyn::process(&mut adapter, Some(buffer))
@@ -2925,8 +2921,9 @@ mod tests {
 
         assert_eq!(AsyncElementDyn::element_type(&adapter), ElementType::Muxer);
 
-        let segment = Arc::new(CpuSegment::new(8).unwrap());
-        let handle = MemoryHandle::from_segment(segment);
+        let arena = SharedArena::new(1024, 4).unwrap();
+        let slot = arena.acquire().unwrap();
+        let handle = MemoryHandle::new(slot);
         let buffer = Buffer::new(handle, Metadata::from_sequence(42));
 
         let result = AsyncElementDyn::process(&mut adapter, Some(buffer))

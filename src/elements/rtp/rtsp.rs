@@ -28,14 +28,13 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::clock::ClockTime;
 use crate::error::{Error, Result};
-use crate::memory::{CpuSegment, MemorySegment};
+use crate::memory::SharedArena;
 use crate::metadata::{BufferFlags, Metadata, RtpMeta};
 
 use futures::StreamExt;
 use retina::client::{Demuxed, Session, SessionOptions, SetupOptions};
 use retina::codec::{AudioFrame, CodecItem, VideoFrame};
 use std::num::NonZeroU32;
-use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
 
@@ -338,6 +337,8 @@ pub struct RtspSession {
     stats: RtspStats,
     /// Selected stream indices.
     selected_streams: Vec<usize>,
+    /// Arena for output buffers.
+    arena: Option<SharedArena>,
 }
 
 impl RtspSession {
@@ -437,6 +438,7 @@ impl RtspSession {
                 ..Default::default()
             },
             selected_streams,
+            arena: None,
         })
     }
 
@@ -570,24 +572,25 @@ impl RtspSession {
 
     /// Create a buffer from bytes with the given metadata.
     fn create_buffer_from_bytes_with_metadata(
-        &self,
+        &mut self,
         data: &[u8],
         metadata: Metadata,
     ) -> Result<Buffer> {
-        let segment = Arc::new(
-            CpuSegment::new(data.len())
-                .map_err(|e| Error::Element(format!("Failed to allocate buffer: {}", e)))?,
-        );
-
-        // Copy data to segment
-        let ptr = segment
-            .as_mut_ptr()
-            .ok_or_else(|| Error::Element("Failed to get segment pointer".into()))?;
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+        // Lazily initialize arena
+        if self.arena.is_none() {
+            self.arena = Some(
+                SharedArena::new(1024 * 1024, 32)
+                    .map_err(|e| Error::Element(format!("Failed to create arena: {}", e)))?,
+            );
         }
+        let arena = self.arena.as_ref().unwrap();
 
-        let handle = MemoryHandle::from_segment_with_len(segment, data.len());
+        let mut slot = arena
+            .acquire()
+            .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+        slot.data_mut()[..data.len()].copy_from_slice(data);
+
+        let handle = MemoryHandle::with_len(slot, data.len());
         Ok(Buffer::new(handle, metadata))
     }
 }

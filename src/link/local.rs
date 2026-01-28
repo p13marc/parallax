@@ -13,16 +13,16 @@ use crate::error::{Error, Result};
 /// ```rust
 /// use parallax::link::LocalLink;
 /// use parallax::buffer::{Buffer, MemoryHandle};
-/// use parallax::memory::CpuSegment;
+/// use parallax::memory::SharedArena;
 /// use parallax::metadata::Metadata;
-/// use std::sync::Arc;
 ///
 /// let (tx, rx) = LocalLink::bounded(16);
 ///
 /// // Send a buffer
-/// let segment = Arc::new(CpuSegment::new(1024).unwrap());
+/// let arena = SharedArena::new(1024, 4).unwrap();
+/// let slot = arena.acquire().unwrap();
 /// let buffer = Buffer::<()>::new(
-///     MemoryHandle::from_segment(segment),
+///     MemoryHandle::new(slot),
 ///     Metadata::default(),
 /// );
 /// tx.send(buffer).unwrap();
@@ -158,17 +158,22 @@ impl LocalReceiver {
 mod tests {
     use super::*;
     use crate::buffer::MemoryHandle;
-    use crate::memory::CpuSegment;
+    use crate::memory::SharedArena;
     use crate::metadata::Metadata;
-    use std::sync::Arc;
+    use std::sync::OnceLock;
     use std::thread;
 
+    fn test_arena() -> &'static SharedArena {
+        static ARENA: OnceLock<SharedArena> = OnceLock::new();
+        // Need 1000+ slots for test_unbounded_link which creates 1000 buffers at once
+        ARENA.get_or_init(|| SharedArena::new(64, 1024).unwrap())
+    }
+
     fn make_buffer(seq: u64) -> Buffer {
-        let segment = Arc::new(CpuSegment::new(64).unwrap());
-        Buffer::new(
-            MemoryHandle::from_segment(segment),
-            Metadata::from_sequence(seq),
-        )
+        let arena = test_arena();
+        arena.reclaim(); // Reclaim any released slots
+        let slot = arena.acquire().expect("arena should have slots");
+        Buffer::new(MemoryHandle::new(slot), Metadata::from_sequence(seq))
     }
 
     #[test]

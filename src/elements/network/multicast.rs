@@ -305,20 +305,20 @@ pub struct UdpMulticastStats {
 mod tests {
     use super::*;
     use crate::buffer::{Buffer, MemoryHandle};
-    use crate::memory::{CpuArena, CpuSegment, MemorySegment};
+    use crate::memory::SharedArena;
     use crate::metadata::Metadata;
-    use std::sync::Arc;
+    use std::sync::OnceLock;
     use std::thread;
 
+    fn test_arena() -> &'static SharedArena {
+        static ARENA: OnceLock<SharedArena> = OnceLock::new();
+        ARENA.get_or_init(|| SharedArena::new(65535, 64).unwrap())
+    }
+
     fn make_buffer(data: &[u8], seq: u64) -> Buffer {
-        let segment = Arc::new(CpuSegment::new(data.len().max(1)).unwrap());
-        if !data.is_empty() {
-            unsafe {
-                let ptr = segment.as_mut_ptr().unwrap();
-                std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
-            }
-        }
-        let handle = MemoryHandle::from_segment_with_len(segment, data.len());
+        let mut slot = test_arena().acquire().unwrap();
+        slot.data_mut()[..data.len()].copy_from_slice(data);
+        let handle = MemoryHandle::with_len(slot, data.len());
         Buffer::new(handle, Metadata::from_sequence(seq))
     }
 
@@ -369,7 +369,7 @@ mod tests {
                 .with_timeout(Duration::from_millis(500))?;
 
             // Create arena for buffer allocation
-            let arena = CpuArena::new(65535, 4).unwrap();
+            let arena = SharedArena::new(65535, 4).unwrap();
             let slot = arena.acquire().unwrap();
             let mut ctx = ProduceContext::new(slot);
 

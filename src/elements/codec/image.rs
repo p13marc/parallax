@@ -27,8 +27,7 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{Element, ExecutionHints};
 use crate::error::{Error, Result};
-use crate::memory::{CpuSegment, MemorySegment};
-use std::sync::Arc;
+use crate::memory::SharedArena;
 
 /// Color type for image data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,12 +111,16 @@ mod jpeg_codec {
     /// Decodes JPEG images to raw RGB pixel data.
     pub struct JpegDecoder {
         frame_count: u64,
+        arena: Option<SharedArena>,
     }
 
     impl JpegDecoder {
         /// Create a new JPEG decoder.
         pub fn new() -> Self {
-            Self { frame_count: 0 }
+            Self {
+                frame_count: 0,
+                arena: None,
+            }
         }
 
         /// Get the number of frames decoded.
@@ -164,15 +167,19 @@ mod jpeg_codec {
                 _ => ColorType::Rgb,
             };
 
-            // Create output buffer
-            let segment = Arc::new(CpuSegment::new(pixels.len())?);
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    pixels.as_ptr(),
-                    segment.as_mut_ptr().unwrap(),
-                    pixels.len(),
+            // Lazily initialize arena
+            if self.arena.is_none() {
+                self.arena = Some(
+                    SharedArena::new(pixels.len().max(1024 * 1024), 16)
+                        .map_err(|e| Error::Element(format!("Failed to create arena: {}", e)))?,
                 );
             }
+            let arena = self.arena.as_ref().unwrap();
+
+            let mut slot = arena
+                .acquire()
+                .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+            slot.data_mut()[..pixels.len()].copy_from_slice(&pixels);
 
             self.frame_count += 1;
 
@@ -180,7 +187,7 @@ mod jpeg_codec {
             // Could store width/height in metadata if needed
 
             Ok(Some(Buffer::new(
-                MemoryHandle::from_segment(segment),
+                MemoryHandle::with_len(slot, pixels.len()),
                 metadata,
             )))
         }
@@ -207,12 +214,16 @@ mod png_codec {
     /// Decodes PNG images to raw pixel data.
     pub struct PngDecoder {
         frame_count: u64,
+        arena: Option<SharedArena>,
     }
 
     impl PngDecoder {
         /// Create a new PNG decoder.
         pub fn new() -> Self {
-            Self { frame_count: 0 }
+            Self {
+                frame_count: 0,
+                arena: None,
+            }
         }
 
         /// Get the number of frames decoded.
@@ -245,21 +256,25 @@ mod png_codec {
             // Truncate to actual size
             pixels.truncate(info.buffer_size());
 
-            // Create output buffer
-            let segment = Arc::new(CpuSegment::new(pixels.len())?);
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    pixels.as_ptr(),
-                    segment.as_mut_ptr().unwrap(),
-                    pixels.len(),
+            // Lazily initialize arena
+            if self.arena.is_none() {
+                self.arena = Some(
+                    SharedArena::new(pixels.len().max(1024 * 1024), 16)
+                        .map_err(|e| Error::Element(format!("Failed to create arena: {}", e)))?,
                 );
             }
+            let arena = self.arena.as_ref().unwrap();
+
+            let mut slot = arena
+                .acquire()
+                .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+            slot.data_mut()[..pixels.len()].copy_from_slice(&pixels);
 
             self.frame_count += 1;
 
             let metadata = buffer.metadata().clone();
             Ok(Some(Buffer::new(
-                MemoryHandle::from_segment(segment),
+                MemoryHandle::with_len(slot, pixels.len()),
                 metadata,
             )))
         }
@@ -277,6 +292,7 @@ mod png_codec {
         height: u32,
         color_type: ColorType,
         frame_count: u64,
+        arena: Option<SharedArena>,
     }
 
     impl PngEncoder {
@@ -292,6 +308,7 @@ mod png_codec {
                 height,
                 color_type,
                 frame_count: 0,
+                arena: None,
             }
         }
 
@@ -341,21 +358,26 @@ mod png_codec {
                     .map_err(|e| Error::InvalidSegment(format!("PNG encode failed: {:?}", e)))?;
             }
 
-            // Create output buffer
-            let segment = Arc::new(CpuSegment::new(output.len())?);
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    output.as_ptr(),
-                    segment.as_mut_ptr().unwrap(),
-                    output.len(),
+            // Lazily initialize arena
+            if self.arena.is_none() {
+                // PNG compression varies; allocate generous size
+                self.arena = Some(
+                    SharedArena::new(output.len().max(1024 * 1024), 16)
+                        .map_err(|e| Error::Element(format!("Failed to create arena: {}", e)))?,
                 );
             }
+            let arena = self.arena.as_ref().unwrap();
+
+            let mut slot = arena
+                .acquire()
+                .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+            slot.data_mut()[..output.len()].copy_from_slice(&output);
 
             self.frame_count += 1;
 
             let metadata = buffer.metadata().clone();
             Ok(Some(Buffer::new(
-                MemoryHandle::from_segment(segment),
+                MemoryHandle::with_len(slot, output.len()),
                 metadata,
             )))
         }

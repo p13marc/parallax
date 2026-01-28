@@ -22,10 +22,8 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::Element;
 use crate::error::{Error, Result};
-use crate::memory::{CpuSegment, MemorySegment};
+use crate::memory::SharedArena;
 use crate::metadata::Metadata;
-
-use std::sync::Arc;
 
 // ============================================================================
 // Scale Mode
@@ -48,7 +46,6 @@ pub enum ScaleMode {
 /// Video scaling element for YUV420 planar frames.
 ///
 /// Scales video frames from source dimensions to target dimensions.
-#[derive(Debug)]
 pub struct VideoScale {
     /// Source width.
     src_width: u32,
@@ -62,6 +59,22 @@ pub struct VideoScale {
     mode: ScaleMode,
     /// Statistics.
     frames_processed: u64,
+    /// Arena for output buffers.
+    arena: Option<SharedArena>,
+}
+
+impl std::fmt::Debug for VideoScale {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VideoScale")
+            .field("src_width", &self.src_width)
+            .field("src_height", &self.src_height)
+            .field("dst_width", &self.dst_width)
+            .field("dst_height", &self.dst_height)
+            .field("mode", &self.mode)
+            .field("frames_processed", &self.frames_processed)
+            .field("arena", &self.arena.as_ref().map(|_| "SharedArena(...)"))
+            .finish()
+    }
 }
 
 impl VideoScale {
@@ -81,6 +94,7 @@ impl VideoScale {
             dst_height,
             mode: ScaleMode::default(),
             frames_processed: 0,
+            arena: None,
         }
     }
 
@@ -268,20 +282,20 @@ impl VideoScale {
     /// Create a Buffer from scaled YUV data.
     pub fn scale_to_buffer(&mut self, input: &[u8], metadata: Metadata) -> Result<Buffer> {
         let scaled = self.scale_yuv420(input)?;
+        let output_size = scaled.len();
 
-        let segment = Arc::new(
-            CpuSegment::new(scaled.len())
-                .map_err(|e| Error::Element(format!("Failed to allocate buffer: {}", e)))?,
-        );
-
-        let ptr = segment
-            .as_mut_ptr()
-            .ok_or_else(|| Error::Element("Failed to get segment pointer".into()))?;
-        unsafe {
-            std::ptr::copy_nonoverlapping(scaled.as_ptr(), ptr, scaled.len());
+        if self.arena.is_none() || self.arena.as_ref().unwrap().slot_size() < output_size {
+            self.arena = Some(SharedArena::new(output_size, 8)?);
         }
 
-        let handle = MemoryHandle::from_segment_with_len(segment, scaled.len());
+        let arena = self.arena.as_ref().unwrap();
+        let mut slot = arena
+            .acquire()
+            .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+
+        slot.data_mut()[..output_size].copy_from_slice(&scaled);
+
+        let handle = MemoryHandle::with_len(slot, output_size);
         Ok(Buffer::new(handle, metadata))
     }
 }
@@ -484,12 +498,10 @@ mod tests {
 
         // Create input buffer
         let input_data: Vec<u8> = vec![128; 24]; // 4x4 YUV420
-        let segment = Arc::new(CpuSegment::new(input_data.len()).unwrap());
-        let ptr = segment.as_mut_ptr().unwrap();
-        unsafe {
-            std::ptr::copy_nonoverlapping(input_data.as_ptr(), ptr, input_data.len());
-        }
-        let handle = MemoryHandle::from_segment_with_len(segment, input_data.len());
+        let arena = SharedArena::new(input_data.len(), 1).unwrap();
+        let mut slot = arena.acquire().unwrap();
+        slot.data_mut()[..input_data.len()].copy_from_slice(&input_data);
+        let handle = MemoryHandle::with_len(slot, input_data.len());
         let buffer = Buffer::new(handle, Metadata::new());
 
         // Process through element

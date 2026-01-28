@@ -4,10 +4,9 @@
 
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::Element;
-use crate::error::Result;
-use crate::memory::{CpuSegment, MemorySegment};
+use crate::error::{Error, Result};
+use crate::memory::SharedArena;
 use crate::metadata::Metadata;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A map element that transforms buffer contents.
@@ -36,6 +35,7 @@ where
     name: String,
     transform: F,
     count: AtomicU64,
+    arena: Option<SharedArena>,
 }
 
 impl<F> Map<F>
@@ -48,6 +48,7 @@ where
             name: "map".to_string(),
             transform,
             count: AtomicU64::new(0),
+            arena: None,
         }
     }
 
@@ -73,20 +74,21 @@ where
         let input = buffer.as_bytes();
         let output = (self.transform)(input);
 
-        if output.is_empty() {
-            // Return empty buffer
-            let segment = Arc::new(CpuSegment::new(1)?);
-            let handle = MemoryHandle::from_segment_with_len(segment, 0);
-            return Ok(Some(Buffer::new(handle, buffer.metadata().clone())));
+        let alloc_size = output.len().max(1);
+        if self.arena.is_none() || self.arena.as_ref().unwrap().slot_size() < alloc_size {
+            self.arena = Some(SharedArena::new(alloc_size, 8)?);
         }
 
-        let segment = Arc::new(CpuSegment::new(output.len())?);
-        unsafe {
-            let ptr = segment.as_mut_ptr().unwrap();
-            std::ptr::copy_nonoverlapping(output.as_ptr(), ptr, output.len());
+        let arena = self.arena.as_ref().unwrap();
+        let mut slot = arena
+            .acquire()
+            .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+
+        if !output.is_empty() {
+            slot.data_mut()[..output.len()].copy_from_slice(&output);
         }
 
-        let handle = MemoryHandle::from_segment_with_len(segment, output.len());
+        let handle = MemoryHandle::with_len(slot, output.len());
         Ok(Some(Buffer::new(handle, buffer.metadata().clone())))
     }
 
@@ -119,6 +121,7 @@ where
     transform: F,
     passed: AtomicU64,
     filtered: AtomicU64,
+    arena: Option<SharedArena>,
 }
 
 impl<F> FilterMap<F>
@@ -132,6 +135,7 @@ where
             transform,
             passed: AtomicU64::new(0),
             filtered: AtomicU64::new(0),
+            arena: None,
         }
     }
 
@@ -163,15 +167,21 @@ where
             Some(output) => {
                 self.passed.fetch_add(1, Ordering::Relaxed);
 
-                let segment = Arc::new(CpuSegment::new(output.len().max(1))?);
-                if !output.is_empty() {
-                    unsafe {
-                        let ptr = segment.as_mut_ptr().unwrap();
-                        std::ptr::copy_nonoverlapping(output.as_ptr(), ptr, output.len());
-                    }
+                let alloc_size = output.len().max(1);
+                if self.arena.is_none() || self.arena.as_ref().unwrap().slot_size() < alloc_size {
+                    self.arena = Some(SharedArena::new(alloc_size, 8)?);
                 }
 
-                let handle = MemoryHandle::from_segment_with_len(segment, output.len());
+                let arena = self.arena.as_ref().unwrap();
+                let mut slot = arena
+                    .acquire()
+                    .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+
+                if !output.is_empty() {
+                    slot.data_mut()[..output.len()].copy_from_slice(&output);
+                }
+
+                let handle = MemoryHandle::with_len(slot, output.len());
                 Ok(Some(Buffer::new(handle, buffer.metadata().clone())))
             }
             None => {
@@ -213,6 +223,7 @@ pub struct Chunk {
     sequence_offset: u64,
     count: AtomicU64,
     chunks_produced: AtomicU64,
+    arena: Option<SharedArena>,
 }
 
 impl Chunk {
@@ -226,6 +237,7 @@ impl Chunk {
             sequence_offset: 0,
             count: AtomicU64::new(0),
             chunks_produced: AtomicU64::new(0),
+            arena: None,
         }
     }
 
@@ -263,18 +275,24 @@ impl Chunk {
             self.pending_metadata = Some(base_metadata);
         }
 
+        // Ensure arena is created with chunk size
+        if self.arena.is_none() {
+            self.arena = Some(SharedArena::new(self.chunk_size, 8)?);
+        }
+
         let mut chunks = Vec::new();
 
         while self.pending.len() >= self.chunk_size {
             let chunk_data: Vec<u8> = self.pending.drain(..self.chunk_size).collect();
 
-            let segment = Arc::new(CpuSegment::new(self.chunk_size)?);
-            unsafe {
-                let ptr = segment.as_mut_ptr().unwrap();
-                std::ptr::copy_nonoverlapping(chunk_data.as_ptr(), ptr, self.chunk_size);
-            }
+            let arena = self.arena.as_ref().unwrap();
+            let mut slot = arena
+                .acquire()
+                .ok_or_else(|| Error::Element("arena exhausted".into()))?;
 
-            let handle = MemoryHandle::from_segment_with_len(segment, self.chunk_size);
+            slot.data_mut()[..self.chunk_size].copy_from_slice(&chunk_data);
+
+            let handle = MemoryHandle::with_len(slot, self.chunk_size);
             let mut meta = self.pending_metadata.clone().unwrap_or_default();
             meta.sequence = self.sequence_offset;
             self.sequence_offset += 1;
@@ -293,13 +311,19 @@ impl Chunk {
         }
 
         let len = self.pending.len();
-        let segment = Arc::new(CpuSegment::new(len)?);
-        unsafe {
-            let ptr = segment.as_mut_ptr().unwrap();
-            std::ptr::copy_nonoverlapping(self.pending.as_ptr(), ptr, len);
+
+        if self.arena.is_none() || self.arena.as_ref().unwrap().slot_size() < len {
+            self.arena = Some(SharedArena::new(len, 8)?);
         }
 
-        let handle = MemoryHandle::from_segment_with_len(segment, len);
+        let arena = self.arena.as_ref().unwrap();
+        let mut slot = arena
+            .acquire()
+            .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+
+        slot.data_mut()[..len].copy_from_slice(&self.pending);
+
+        let handle = MemoryHandle::with_len(slot, len);
         let mut meta = self.pending_metadata.take().unwrap_or_default();
         meta.sequence = self.sequence_offset;
         self.sequence_offset += 1;
@@ -356,6 +380,7 @@ where
     pending: Vec<Vec<u8>>,
     pending_metadata: Option<Metadata>,
     sequence_offset: u64,
+    arena: Option<SharedArena>,
 }
 
 impl<F> FlatMap<F>
@@ -372,6 +397,7 @@ where
             pending: Vec::new(),
             pending_metadata: None,
             sequence_offset: 0,
+            arena: None,
         }
     }
 
@@ -402,15 +428,21 @@ where
         let mut buffers = Vec::with_capacity(outputs.len());
 
         for output in outputs {
-            let segment = Arc::new(CpuSegment::new(output.len().max(1))?);
-            if !output.is_empty() {
-                unsafe {
-                    let ptr = segment.as_mut_ptr().unwrap();
-                    std::ptr::copy_nonoverlapping(output.as_ptr(), ptr, output.len());
-                }
+            let alloc_size = output.len().max(1);
+            if self.arena.is_none() || self.arena.as_ref().unwrap().slot_size() < alloc_size {
+                self.arena = Some(SharedArena::new(alloc_size, 8)?);
             }
 
-            let handle = MemoryHandle::from_segment_with_len(segment, output.len());
+            let arena = self.arena.as_ref().unwrap();
+            let mut slot = arena
+                .acquire()
+                .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+
+            if !output.is_empty() {
+                slot.data_mut()[..output.len()].copy_from_slice(&output);
+            }
+
+            let handle = MemoryHandle::with_len(slot, output.len());
             let mut meta = base_metadata.clone();
             meta.sequence = self.sequence_offset;
             self.sequence_offset += 1;
@@ -429,15 +461,22 @@ where
         }
 
         let output = self.pending.remove(0);
-        let segment = Arc::new(CpuSegment::new(output.len().max(1))?);
-        if !output.is_empty() {
-            unsafe {
-                let ptr = segment.as_mut_ptr().unwrap();
-                std::ptr::copy_nonoverlapping(output.as_ptr(), ptr, output.len());
-            }
+        let alloc_size = output.len().max(1);
+
+        if self.arena.is_none() || self.arena.as_ref().unwrap().slot_size() < alloc_size {
+            self.arena = Some(SharedArena::new(alloc_size, 8)?);
         }
 
-        let handle = MemoryHandle::from_segment_with_len(segment, output.len());
+        let arena = self.arena.as_ref().unwrap();
+        let mut slot = arena
+            .acquire()
+            .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+
+        if !output.is_empty() {
+            slot.data_mut()[..output.len()].copy_from_slice(&output);
+        }
+
+        let handle = MemoryHandle::with_len(slot, output.len());
         let mut meta = self.pending_metadata.clone().unwrap_or_default();
         meta.sequence = self.sequence_offset;
         self.sequence_offset += 1;
@@ -482,16 +521,20 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
+
+    fn test_arena() -> &'static SharedArena {
+        static ARENA: OnceLock<SharedArena> = OnceLock::new();
+        ARENA.get_or_init(|| SharedArena::new(256, 64).unwrap())
+    }
 
     fn create_test_buffer(data: &[u8], seq: u64) -> Buffer {
-        let segment = Arc::new(CpuSegment::new(data.len().max(1)).unwrap());
+        let arena = test_arena();
+        let mut slot = arena.acquire().unwrap();
         if !data.is_empty() {
-            unsafe {
-                let ptr = segment.as_mut_ptr().unwrap();
-                std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
-            }
+            slot.data_mut()[..data.len()].copy_from_slice(data);
         }
-        let handle = MemoryHandle::from_segment_with_len(segment, data.len());
+        let handle = MemoryHandle::with_len(slot, data.len());
         Buffer::new(handle, Metadata::from_sequence(seq))
     }
 

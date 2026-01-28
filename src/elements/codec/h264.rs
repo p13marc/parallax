@@ -33,14 +33,12 @@
 use crate::buffer::Buffer;
 use crate::element::Element;
 use crate::error::{Error, Result};
-use crate::memory::CpuSegment;
+use crate::memory::SharedArena;
 use crate::metadata::Metadata;
 
 use openh264::decoder::{DecodedYUV, Decoder};
 use openh264::encoder::{EncodedBitStream, Encoder, EncoderConfig};
 use openh264::formats::YUVSource;
-
-use std::sync::Arc;
 
 // ============================================================================
 // Encoder Configuration
@@ -148,6 +146,8 @@ pub struct H264Encoder {
     config: H264EncoderConfig,
     frame_count: u64,
     bytes_encoded: u64,
+    /// Arena for output buffer allocation.
+    arena: SharedArena,
 }
 
 impl H264Encoder {
@@ -167,11 +167,16 @@ impl H264Encoder {
         let encoder = Encoder::with_config(encoder_config)
             .map_err(|e| Error::Config(format!("Failed to create H.264 encoder: {:?}", e)))?;
 
+        // Create arena for encoded output buffers (typically < 1MB per frame)
+        let arena = SharedArena::new(1024 * 1024, 16)
+            .map_err(|e| Error::Config(format!("Failed to create arena: {}", e)))?;
+
         Ok(Self {
             encoder,
             config,
             frame_count: 0,
             bytes_encoded: 0,
+            arena,
         })
     }
 
@@ -252,22 +257,16 @@ impl Element for H264Encoder {
             return Ok(None);
         }
 
-        // Create output buffer with encoded data
-        let segment = Arc::new(
-            CpuSegment::new(encoded.len())
-                .map_err(|e| Error::Config(format!("Failed to allocate buffer: {}", e)))?,
-        );
+        // Acquire slot from arena and copy encoded data
+        let mut slot = self
+            .arena
+            .acquire()
+            .ok_or_else(|| Error::Config("Failed to acquire buffer slot".to_string()))?;
 
-        // Copy encoded data to segment
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                encoded.as_ptr(),
-                segment.as_ptr() as *mut u8,
-                encoded.len(),
-            );
-        }
+        // Copy encoded data to slot
+        slot.data_mut()[..encoded.len()].copy_from_slice(&encoded);
 
-        let handle = crate::buffer::MemoryHandle::from_segment(segment);
+        let handle = crate::buffer::MemoryHandle::with_len(slot, encoded.len());
         let metadata = Metadata::from_sequence(self.frame_count - 1);
         Ok(Some(Buffer::new(handle, metadata)))
     }
@@ -284,6 +283,8 @@ pub struct H264Decoder {
     decoder: Decoder,
     frame_count: u64,
     bytes_decoded: u64,
+    /// Arena for output buffer allocation.
+    arena: SharedArena,
 }
 
 impl H264Decoder {
@@ -292,10 +293,15 @@ impl H264Decoder {
         let decoder = Decoder::new()
             .map_err(|e| Error::Config(format!("Failed to create H.264 decoder: {:?}", e)))?;
 
+        // Create arena for decoded YUV frames (1080p YUV420 = ~3MB per frame)
+        let arena = SharedArena::new(4 * 1024 * 1024, 8)
+            .map_err(|e| Error::Config(format!("Failed to create arena: {}", e)))?;
+
         Ok(Self {
             decoder,
             frame_count: 0,
             bytes_decoded: 0,
+            arena,
         })
     }
 
@@ -363,22 +369,16 @@ impl Element for H264Decoder {
             Some(frame) => {
                 let yuv_data = frame.to_yuv420_planar();
 
-                // Create output buffer with decoded YUV data
-                let segment = Arc::new(
-                    CpuSegment::new(yuv_data.len())
-                        .map_err(|e| Error::Config(format!("Failed to allocate buffer: {}", e)))?,
-                );
+                // Acquire slot from arena and copy YUV data
+                let mut slot = self
+                    .arena
+                    .acquire()
+                    .ok_or_else(|| Error::Config("Failed to acquire buffer slot".to_string()))?;
 
-                // Copy YUV data to segment
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        yuv_data.as_ptr(),
-                        segment.as_ptr() as *mut u8,
-                        yuv_data.len(),
-                    );
-                }
+                // Copy YUV data to slot
+                slot.data_mut()[..yuv_data.len()].copy_from_slice(&yuv_data);
 
-                let handle = crate::buffer::MemoryHandle::from_segment(segment);
+                let handle = crate::buffer::MemoryHandle::with_len(slot, yuv_data.len());
                 let mut metadata = Metadata::from_sequence(self.frame_count - 1);
                 metadata.set("width", frame.width() as u64);
                 metadata.set("height", frame.height() as u64);

@@ -487,13 +487,19 @@ pub struct OutputSelectorStats {
 mod tests {
     use super::*;
     use crate::buffer::MemoryHandle;
-    use crate::memory::CpuSegment;
+    use crate::memory::SharedArena;
     use crate::metadata::Metadata;
-    use std::sync::Arc;
+    use std::sync::OnceLock;
+
+    fn test_arena() -> &'static SharedArena {
+        static ARENA: OnceLock<SharedArena> = OnceLock::new();
+        ARENA.get_or_init(|| SharedArena::new(128, 256).unwrap())
+    }
 
     fn create_test_buffer(seq: u64) -> Buffer {
-        let segment = Arc::new(CpuSegment::new(100).unwrap());
-        let handle = MemoryHandle::from_segment(segment);
+        let arena = test_arena();
+        let slot = arena.acquire().unwrap();
+        let handle = MemoryHandle::with_len(slot, 100);
         Buffer::new(handle, Metadata::from_sequence(seq))
     }
 

@@ -24,8 +24,7 @@ use crate::buffer::{Buffer, MemoryHandle};
 use crate::clock::ClockTime;
 use crate::element::{Element, ExecutionHints};
 use crate::error::{Error, Result};
-use crate::memory::{CpuSegment, MemorySegment};
-use std::sync::Arc;
+use crate::memory::SharedArena;
 
 use super::common::{PixelFormat, VideoFrame};
 
@@ -48,6 +47,8 @@ use super::common::{PixelFormat, VideoFrame};
 pub struct Dav1dDecoder {
     decoder: dav1d::Decoder,
     frame_count: u64,
+    /// Arena for output buffer allocation.
+    arena: Option<SharedArena>,
 }
 
 impl Dav1dDecoder {
@@ -60,6 +61,7 @@ impl Dav1dDecoder {
         Ok(Self {
             decoder,
             frame_count: 0,
+            arena: None,
         })
     }
 
@@ -71,6 +73,7 @@ impl Dav1dDecoder {
         Ok(Self {
             decoder,
             frame_count: 0,
+            arena: None,
         })
     }
 
@@ -158,15 +161,19 @@ impl Element for Dav1dDecoder {
 
         match self.decode_frame(input)? {
             Some(frame) => {
-                // Create output buffer with frame data
-                let segment = Arc::new(CpuSegment::new(frame.data.len())?);
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        frame.data.as_ptr(),
-                        segment.as_mut_ptr().unwrap(),
-                        frame.data.len(),
-                    );
+                // Initialize arena on first use with frame size
+                if self.arena.is_none() {
+                    self.arena =
+                        Some(SharedArena::new(frame.data.len(), 16).map_err(|e| {
+                            Error::Element(format!("Failed to create arena: {}", e))
+                        })?);
                 }
+
+                let arena = self.arena.as_ref().unwrap();
+                let mut slot = arena
+                    .acquire()
+                    .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+                slot.data_mut()[..frame.data.len()].copy_from_slice(&frame.data);
 
                 let mut metadata = buffer.metadata().clone();
                 // Store frame timing
@@ -174,7 +181,7 @@ impl Element for Dav1dDecoder {
                 // Note: width/height/format info could be added via MediaFormat if needed
 
                 Ok(Some(Buffer::new(
-                    MemoryHandle::from_segment(segment),
+                    MemoryHandle::with_len(slot, frame.data.len()),
                     metadata,
                 )))
             }

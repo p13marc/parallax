@@ -38,12 +38,19 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::clock::ClockTime;
 use crate::error::{Error, Result};
-use crate::memory::{CpuSegment, MemorySegment};
+use crate::memory::SharedArena;
 use crate::metadata::{BufferFlags, Metadata};
 
 use mp4::{MediaType, Mp4Reader, TrackType};
 use std::io::{Read, Seek};
-use std::sync::Arc;
+use std::sync::OnceLock;
+
+/// Shared arena for MP4 demuxer buffers.
+fn mp4_demux_arena() -> &'static SharedArena {
+    static ARENA: OnceLock<SharedArena> = OnceLock::new();
+    // Video frames can be large, use generous slot size
+    ARENA.get_or_init(|| SharedArena::new(4 * 1024 * 1024, 32).unwrap())
+}
 
 // ============================================================================
 // Codec Types
@@ -513,20 +520,13 @@ impl<R: Read + Seek> Mp4Demux<R> {
         sample: &mp4::Mp4Sample,
         track: &Mp4Track,
     ) -> Result<Buffer> {
-        let segment = Arc::new(
-            CpuSegment::new(data.len())
-                .map_err(|e| Error::Element(format!("Failed to allocate buffer: {}", e)))?,
-        );
+        let mut slot = mp4_demux_arena()
+            .acquire()
+            .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
 
-        let ptr = segment
-            .as_mut_ptr()
-            .ok_or_else(|| Error::Element("Failed to get segment pointer".into()))?;
+        slot.data_mut()[..data.len()].copy_from_slice(data);
 
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
-        }
-
-        let handle = MemoryHandle::from_segment_with_len(segment, data.len());
+        let handle = MemoryHandle::with_len(slot, data.len());
 
         // Build metadata
         let timescale = track.timescale as u128;

@@ -5,15 +5,15 @@
 //!
 //! # Architecture
 //!
-//! - [`MemorySegment`]: Trait for different memory backends
-//! - [`MemoryPool`]: Loan-based memory pool for efficient buffer allocation
-//! - [`LoanedSlot`]: RAII guard that returns memory to pool on drop
+//! - [`SharedArena`]: Arena allocator with cross-process reference counting
+//! - [`SharedSlotRef`]: Zero-allocation slot reference
+//! - [`FixedBufferPool`]: Pipeline-level buffer pool with backpressure
 //!
 //! # Memory Backends
 //!
 //! | Backend | Use Case |
 //! |---------|----------|
-//! | [`CpuSegment`] | **Primary**: All CPU memory, always IPC-ready |
+//! | [`SharedArena`] | **Primary**: Cross-process zero-copy buffers |
 //! | [`HugePageSegment`] | Large allocations, reduced TLB misses |
 //! | [`MappedFileSegment`] | Persistent storage, file I/O |
 //!
@@ -25,40 +25,38 @@
 //! - Every buffer is automatically shareable across processes
 //! - No conversion needed before IPC
 //! - Cross-process = same physical pages (true zero-copy)
+//! - Reference counts stored in shared memory (not on heap)
 //!
 //! # Example
 //!
 //! ```rust,ignore
-//! use parallax::memory::{CpuSegment, MemorySegment};
+//! use parallax::memory::{SharedArena, SharedSlotRef};
 //!
-//! // Allocate CPU memory (works like malloc, but shareable)
-//! let segment = CpuSegment::new(64 * 1024)?;
+//! // Create arena with 16 slots of 64KB each
+//! let arena = SharedArena::new(64 * 1024, 16)?;
+//!
+//! // Acquire a slot
+//! let slot = arena.acquire().expect("arena not exhausted");
 //!
 //! // Write data
-//! segment.as_mut_slice()[..5].copy_from_slice(b"hello");
+//! slot.data_mut()[..5].copy_from_slice(b"hello");
 //!
-//! // Get fd for cross-process sharing (always available!)
-//! let fd = segment.fd();
-//! // Send fd via SCM_RIGHTS...
+//! // Get IPC reference for cross-process sharing
+//! let ipc_ref = slot.ipc_ref();
+//! // Send ipc_ref over Unix socket...
 //! ```
 
-mod arena;
 mod bitmap;
 mod buffer_pool;
-mod cpu;
 mod huge_pages;
 pub mod ipc;
 mod mapped_file;
-mod pool;
 mod segment;
 mod shared_refcount;
 
-pub use arena::{Access, ArenaCache, ArenaSlot, CpuArena, IpcSlotRef};
 pub use bitmap::AtomicBitmap;
 pub use buffer_pool::{BufferPool, FixedBufferPool, PoolStats, PooledBuffer};
-pub use cpu::CpuSegment;
 pub use huge_pages::{HugePageSegment, HugePageSize};
 pub use mapped_file::MappedFileSegment;
-pub use pool::{LoanedSlot, MemoryPool};
 pub use segment::{IpcHandle, MemorySegment, MemoryType};
 pub use shared_refcount::{SharedArena, SharedArenaCache, SharedIpcSlotRef, SharedSlotRef};

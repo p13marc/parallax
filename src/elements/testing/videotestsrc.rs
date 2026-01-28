@@ -6,7 +6,8 @@
 
 use crate::clock::ClockTime;
 use crate::element::{ProduceContext, ProduceResult, Source};
-use crate::error::Result;
+use crate::error::{Error, Result};
+use crate::memory::SharedArena;
 use std::time::{Duration, Instant};
 
 /// Video test pattern types.
@@ -136,6 +137,8 @@ pub struct VideoTestSrc {
     ball_vy: f32,
     ball_radius: f32,
     rng_state: u64,
+    /// Arena for allocating buffers when no ProduceContext buffer is available.
+    arena: Option<SharedArena>,
 }
 
 impl VideoTestSrc {
@@ -164,6 +167,7 @@ impl VideoTestSrc {
             ball_vy: 2.0,
             ball_radius: 30.0,
             rng_state: 0x853c49e6748fea9b,
+            arena: None,
         }
     }
 
@@ -285,6 +289,7 @@ impl VideoTestSrc {
         self.last_produce = None;
         self.ball_x = self.width as f32 / 4.0;
         self.ball_y = self.height as f32 / 4.0;
+        self.arena = None;
     }
 
     // Simple xorshift64 PRNG
@@ -566,9 +571,7 @@ impl Default for VideoTestSrc {
 impl Source for VideoTestSrc {
     fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
         use crate::buffer::{Buffer, MemoryHandle};
-        use crate::memory::{CpuSegment, MemorySegment};
         use crate::metadata::Metadata;
-        use std::sync::Arc;
 
         // Check frame limit
         if let Some(max) = self.num_frames {
@@ -603,19 +606,19 @@ impl Source for VideoTestSrc {
 
             Ok(ProduceResult::Produced(write_size))
         } else {
-            // No buffer provided - allocate our own
-            let segment = Arc::new(
-                CpuSegment::new(frame_size)
-                    .map_err(|e| crate::error::Error::Element(e.to_string()))?,
-            );
-            // Safety: we just allocated this segment and own it exclusively
-            unsafe {
-                let ptr = segment.as_mut_ptr().unwrap();
-                let slice = std::slice::from_raw_parts_mut(ptr, frame_size);
-                self.fill_frame(slice);
+            // No buffer provided - allocate our own using SharedArena
+            if self.arena.is_none() {
+                self.arena = Some(SharedArena::new(frame_size, 8)?);
             }
+            let arena = self.arena.as_ref().unwrap();
+            let mut slot = arena
+                .acquire()
+                .ok_or_else(|| Error::Element("arena exhausted".into()))?;
 
-            let handle = MemoryHandle::from_segment(segment);
+            // Fill the frame data
+            self.fill_frame(slot.data_mut());
+
+            let handle = MemoryHandle::with_len(slot, frame_size);
             let metadata = Metadata::default()
                 .with_sequence(self.sequence - 1)
                 .with_pts(pts)
@@ -1149,11 +1152,19 @@ mod tests {
     use super::*;
     use crate::buffer::Buffer;
     use crate::element::Source;
-    use crate::memory::CpuArena;
-    use std::sync::Arc;
+    use crate::memory::SharedArena;
+    use std::sync::OnceLock;
 
-    // Helper to produce a buffer using CpuArena
-    fn produce_buffer(src: &mut VideoTestSrc, arena: &Arc<CpuArena>) -> Option<Buffer> {
+    fn test_arena() -> &'static SharedArena {
+        static ARENA: OnceLock<SharedArena> = OnceLock::new();
+        // Use 256 slots to handle parallel test execution
+        ARENA.get_or_init(|| SharedArena::new(100 * 100 * 4, 256).unwrap())
+    }
+
+    // Helper to produce a buffer using SharedArena
+    fn produce_buffer(src: &mut VideoTestSrc) -> Option<Buffer> {
+        let arena = test_arena();
+        arena.reclaim(); // Reclaim any released slots
         let slot = arena.acquire().unwrap();
         let mut ctx = ProduceContext::new(slot);
         match src.produce(&mut ctx).unwrap() {
@@ -1164,7 +1175,9 @@ mod tests {
     }
 
     // Helper to check if produce returns Eos
-    fn is_eos(src: &mut VideoTestSrc, arena: &Arc<CpuArena>) -> bool {
+    fn is_eos(src: &mut VideoTestSrc) -> bool {
+        let arena = test_arena();
+        arena.reclaim(); // Reclaim any released slots
         let slot = arena.acquire().unwrap();
         let mut ctx = ProduceContext::new(slot);
         matches!(src.produce(&mut ctx).unwrap(), ProduceResult::Eos)
@@ -1211,8 +1224,7 @@ mod tests {
             .with_resolution(100, 100)
             .with_num_frames(1);
 
-        let arena = CpuArena::new(100 * 100 * 3, 4).unwrap();
-        let buf = produce_buffer(&mut src, &arena).unwrap();
+        let buf = produce_buffer(&mut src).unwrap();
         assert_eq!(buf.len(), 100 * 100 * 3);
         assert!(buf.metadata().is_keyframe());
     }
@@ -1225,8 +1237,7 @@ mod tests {
             .with_resolution(100, 100)
             .with_num_frames(1);
 
-        let arena = CpuArena::new(100 * 100 * 3, 4).unwrap();
-        let buf = produce_buffer(&mut src, &arena).unwrap();
+        let buf = produce_buffer(&mut src).unwrap();
         let data = buf.as_bytes();
 
         // First pixel should be white (255, 255, 255)
@@ -1249,8 +1260,7 @@ mod tests {
             .with_resolution(10, 10)
             .with_num_frames(1);
 
-        let arena = CpuArena::new(10 * 10 * 3, 4).unwrap();
-        let buf = produce_buffer(&mut src, &arena).unwrap();
+        let buf = produce_buffer(&mut src).unwrap();
         let data = buf.as_bytes();
 
         // Every pixel should be (128, 64, 32)
@@ -1268,8 +1278,7 @@ mod tests {
             .with_resolution(10, 10)
             .with_num_frames(1);
 
-        let arena = CpuArena::new(10 * 10 * 3, 4).unwrap();
-        let buf = produce_buffer(&mut src, &arena).unwrap();
+        let buf = produce_buffer(&mut src).unwrap();
         let data = buf.as_bytes();
 
         assert!(data.iter().all(|&b| b == 0));
@@ -1282,8 +1291,7 @@ mod tests {
             .with_resolution(10, 10)
             .with_num_frames(1);
 
-        let arena = CpuArena::new(10 * 10 * 3, 4).unwrap();
-        let buf = produce_buffer(&mut src, &arena).unwrap();
+        let buf = produce_buffer(&mut src).unwrap();
         let data = buf.as_bytes();
 
         assert!(data.iter().all(|&b| b == 255));
@@ -1297,16 +1305,14 @@ mod tests {
             .with_ball_radius(10.0)
             .with_num_frames(10);
 
-        let arena = CpuArena::new(100 * 100 * 3, 16).unwrap();
-
         // Produce multiple frames to test ball movement
         for _ in 0..10 {
-            let buf = produce_buffer(&mut src, &arena);
+            let buf = produce_buffer(&mut src);
             assert!(buf.is_some());
         }
 
         // Should return Eos after 10 frames
-        assert!(is_eos(&mut src, &arena));
+        assert!(is_eos(&mut src));
     }
 
     #[test]
@@ -1315,12 +1321,10 @@ mod tests {
             .with_resolution(10, 10)
             .with_num_frames(3);
 
-        let arena = CpuArena::new(10 * 10 * 3, 8).unwrap();
-
-        assert!(produce_buffer(&mut src, &arena).is_some());
-        assert!(produce_buffer(&mut src, &arena).is_some());
-        assert!(produce_buffer(&mut src, &arena).is_some());
-        assert!(is_eos(&mut src, &arena));
+        assert!(produce_buffer(&mut src).is_some());
+        assert!(produce_buffer(&mut src).is_some());
+        assert!(produce_buffer(&mut src).is_some());
+        assert!(is_eos(&mut src));
 
         assert_eq!(src.frames_produced(), 3);
     }
@@ -1332,18 +1336,16 @@ mod tests {
             .with_framerate(30, 1)
             .with_num_frames(3);
 
-        let arena = CpuArena::new(10 * 10 * 3, 8).unwrap();
-
-        let buf = produce_buffer(&mut src, &arena).unwrap();
+        let buf = produce_buffer(&mut src).unwrap();
         assert_eq!(buf.metadata().sequence, 0);
         assert_eq!(buf.metadata().pts.nanos(), 0);
 
-        let buf = produce_buffer(&mut src, &arena).unwrap();
+        let buf = produce_buffer(&mut src).unwrap();
         assert_eq!(buf.metadata().sequence, 1);
         // At 30fps, frame 1 is at ~33.3ms
         assert!(buf.metadata().pts.millis() >= 33 && buf.metadata().pts.millis() <= 34);
 
-        let buf = produce_buffer(&mut src, &arena).unwrap();
+        let buf = produce_buffer(&mut src).unwrap();
         assert_eq!(buf.metadata().sequence, 2);
         assert!(buf.metadata().pts.millis() >= 66 && buf.metadata().pts.millis() <= 67);
     }
@@ -1354,15 +1356,13 @@ mod tests {
             .with_resolution(10, 10)
             .with_num_frames(2);
 
-        let arena = CpuArena::new(10 * 10 * 3, 8).unwrap();
-
-        produce_buffer(&mut src, &arena);
-        produce_buffer(&mut src, &arena);
-        assert!(is_eos(&mut src, &arena));
+        produce_buffer(&mut src);
+        produce_buffer(&mut src);
+        assert!(is_eos(&mut src));
 
         src.reset();
 
-        assert!(produce_buffer(&mut src, &arena).is_some());
+        assert!(produce_buffer(&mut src).is_some());
         assert_eq!(src.frames_produced(), 1);
     }
 
@@ -1374,8 +1374,7 @@ mod tests {
             .with_resolution(10, 10)
             .with_num_frames(1);
 
-        let arena = CpuArena::new(10 * 10 * 4, 4).unwrap();
-        let buf = produce_buffer(&mut src, &arena).unwrap();
+        let buf = produce_buffer(&mut src).unwrap();
         let data = buf.as_bytes();
 
         // RGBA: red should be (255, 0, 0, 255)
@@ -1393,8 +1392,7 @@ mod tests {
             .with_resolution(10, 10)
             .with_num_frames(1);
 
-        let arena = CpuArena::new(10 * 10 * 3, 4).unwrap();
-        let buf = produce_buffer(&mut src, &arena).unwrap();
+        let buf = produce_buffer(&mut src).unwrap();
         let data = buf.as_bytes();
 
         // BGR: red should be (0, 0, 255)
@@ -1417,9 +1415,8 @@ mod tests {
             .with_seed(12345)
             .with_num_frames(1);
 
-        let arena = CpuArena::new(10 * 10 * 3, 4).unwrap();
-        let buf1 = produce_buffer(&mut src1, &arena).unwrap();
-        let buf2 = produce_buffer(&mut src2, &arena).unwrap();
+        let buf1 = produce_buffer(&mut src1).unwrap();
+        let buf2 = produce_buffer(&mut src2).unwrap();
 
         assert_eq!(buf1.as_bytes(), buf2.as_bytes());
     }
@@ -1431,8 +1428,7 @@ mod tests {
             .with_resolution(360, 1)
             .with_num_frames(1);
 
-        let arena = CpuArena::new(360 * 1 * 3, 4).unwrap();
-        let buf = produce_buffer(&mut src, &arena).unwrap();
+        let buf = produce_buffer(&mut src).unwrap();
         let data = buf.as_bytes();
 
         // First pixel should be red-ish (hue = 0)
@@ -1488,13 +1484,10 @@ mod tests {
     // AsyncVideoTestSrc tests
     // =========================================================================
 
-    // Helper to produce a buffer using CpuArena for async sources
-    async fn async_produce_buffer(
-        src: &mut AsyncVideoTestSrc,
-        arena: &Arc<CpuArena>,
-    ) -> Option<Buffer> {
+    // Helper to produce a buffer using SharedArena for async sources
+    async fn async_produce_buffer(src: &mut AsyncVideoTestSrc) -> Option<Buffer> {
         use crate::element::AsyncSource;
-        let slot = arena.acquire().unwrap();
+        let slot = test_arena().acquire().unwrap();
         let mut ctx = ProduceContext::new(slot);
         match src.produce(&mut ctx).await.unwrap() {
             ProduceResult::Produced(n) => Some(ctx.finalize(n)),
@@ -1504,9 +1497,9 @@ mod tests {
     }
 
     // Helper to check if async produce returns Eos
-    async fn async_is_eos(src: &mut AsyncVideoTestSrc, arena: &Arc<CpuArena>) -> bool {
+    async fn async_is_eos(src: &mut AsyncVideoTestSrc) -> bool {
         use crate::element::AsyncSource;
-        let slot = arena.acquire().unwrap();
+        let slot = test_arena().acquire().unwrap();
         let mut ctx = ProduceContext::new(slot);
         matches!(src.produce(&mut ctx).await.unwrap(), ProduceResult::Eos)
     }
@@ -1542,8 +1535,7 @@ mod tests {
             .with_resolution(100, 100)
             .with_num_frames(1);
 
-        let arena = CpuArena::new(100 * 100 * 3, 4).unwrap();
-        let buf = async_produce_buffer(&mut src, &arena).await.unwrap();
+        let buf = async_produce_buffer(&mut src).await.unwrap();
         assert_eq!(buf.len(), 100 * 100 * 3);
         assert!(buf.metadata().is_keyframe());
     }
@@ -1556,8 +1548,7 @@ mod tests {
             .with_resolution(100, 100)
             .with_num_frames(1);
 
-        let arena = CpuArena::new(100 * 100 * 3, 4).unwrap();
-        let buf = async_produce_buffer(&mut src, &arena).await.unwrap();
+        let buf = async_produce_buffer(&mut src).await.unwrap();
         let data = buf.as_bytes();
 
         // First pixel should be white (255, 255, 255)
@@ -1578,12 +1569,10 @@ mod tests {
             .with_resolution(10, 10)
             .with_num_frames(3);
 
-        let arena = CpuArena::new(10 * 10 * 3, 8).unwrap();
-
-        assert!(async_produce_buffer(&mut src, &arena).await.is_some());
-        assert!(async_produce_buffer(&mut src, &arena).await.is_some());
-        assert!(async_produce_buffer(&mut src, &arena).await.is_some());
-        assert!(async_is_eos(&mut src, &arena).await);
+        assert!(async_produce_buffer(&mut src).await.is_some());
+        assert!(async_produce_buffer(&mut src).await.is_some());
+        assert!(async_produce_buffer(&mut src).await.is_some());
+        assert!(async_is_eos(&mut src).await);
 
         assert_eq!(src.frames_produced(), 3);
     }
@@ -1595,17 +1584,15 @@ mod tests {
             .with_framerate(30, 1)
             .with_num_frames(3);
 
-        let arena = CpuArena::new(10 * 10 * 3, 8).unwrap();
-
-        let buf = async_produce_buffer(&mut src, &arena).await.unwrap();
+        let buf = async_produce_buffer(&mut src).await.unwrap();
         assert_eq!(buf.metadata().sequence, 0);
         assert_eq!(buf.metadata().pts.nanos(), 0);
 
-        let buf = async_produce_buffer(&mut src, &arena).await.unwrap();
+        let buf = async_produce_buffer(&mut src).await.unwrap();
         assert_eq!(buf.metadata().sequence, 1);
         assert!(buf.metadata().pts.millis() >= 33 && buf.metadata().pts.millis() <= 34);
 
-        let buf = async_produce_buffer(&mut src, &arena).await.unwrap();
+        let buf = async_produce_buffer(&mut src).await.unwrap();
         assert_eq!(buf.metadata().sequence, 2);
         assert!(buf.metadata().pts.millis() >= 66 && buf.metadata().pts.millis() <= 67);
     }
@@ -1616,15 +1603,13 @@ mod tests {
             .with_resolution(10, 10)
             .with_num_frames(2);
 
-        let arena = CpuArena::new(10 * 10 * 3, 8).unwrap();
-
-        async_produce_buffer(&mut src, &arena).await;
-        async_produce_buffer(&mut src, &arena).await;
-        assert!(async_is_eos(&mut src, &arena).await);
+        async_produce_buffer(&mut src).await;
+        async_produce_buffer(&mut src).await;
+        assert!(async_is_eos(&mut src).await);
 
         src.reset();
 
-        assert!(async_produce_buffer(&mut src, &arena).await.is_some());
+        assert!(async_produce_buffer(&mut src).await.is_some());
         assert_eq!(src.frames_produced(), 1);
     }
 
@@ -1639,13 +1624,12 @@ mod tests {
             .with_num_frames(3)
             .live(true);
 
-        let arena = CpuArena::new(10 * 10 * 3, 8).unwrap();
         let start = Instant::now();
 
         // Produce 3 frames
-        async_produce_buffer(&mut src, &arena).await;
-        async_produce_buffer(&mut src, &arena).await;
-        async_produce_buffer(&mut src, &arena).await;
+        async_produce_buffer(&mut src).await;
+        async_produce_buffer(&mut src).await;
+        async_produce_buffer(&mut src).await;
 
         let elapsed = start.elapsed();
 
@@ -1669,12 +1653,11 @@ mod tests {
             .with_num_frames(10)
             .live(false);
 
-        let arena = CpuArena::new(10 * 10 * 3, 16).unwrap();
         let start = Instant::now();
 
         // Produce 10 frames
         for _ in 0..10 {
-            async_produce_buffer(&mut src, &arena).await;
+            async_produce_buffer(&mut src).await;
         }
 
         let elapsed = start.elapsed();
@@ -1695,16 +1678,14 @@ mod tests {
             .with_ball_radius(10.0)
             .with_num_frames(10);
 
-        let arena = CpuArena::new(100 * 100 * 3, 16).unwrap();
-
         // Produce multiple frames to test ball movement
         for _ in 0..10 {
-            let buf = async_produce_buffer(&mut src, &arena).await;
+            let buf = async_produce_buffer(&mut src).await;
             assert!(buf.is_some());
         }
 
         // Should return Eos after 10 frames
-        assert!(async_is_eos(&mut src, &arena).await);
+        assert!(async_is_eos(&mut src).await);
     }
 
     #[tokio::test]
@@ -1721,9 +1702,8 @@ mod tests {
             .with_seed(12345)
             .with_num_frames(1);
 
-        let arena = CpuArena::new(10 * 10 * 3, 4).unwrap();
-        let buf1 = async_produce_buffer(&mut src1, &arena).await.unwrap();
-        let buf2 = async_produce_buffer(&mut src2, &arena).await.unwrap();
+        let buf1 = async_produce_buffer(&mut src1).await.unwrap();
+        let buf2 = async_produce_buffer(&mut src2).await.unwrap();
 
         assert_eq!(buf1.as_bytes(), buf2.as_bytes());
     }

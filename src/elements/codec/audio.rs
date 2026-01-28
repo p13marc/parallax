@@ -28,8 +28,7 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{Element, ExecutionHints};
 use crate::error::{Error, Result};
-use crate::memory::{CpuSegment, MemorySegment};
-use std::sync::Arc;
+use crate::memory::SharedArena;
 
 /// Supported audio formats.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,6 +125,8 @@ mod symphonia_decoder {
         last_sample_rate: Option<u32>,
         /// Channel count from last decoded frame.
         last_channels: Option<u16>,
+        /// Arena for output buffers.
+        arena: Option<SharedArena>,
     }
 
     impl SymphoniaDecoder {
@@ -137,6 +138,7 @@ mod symphonia_decoder {
                 input_buffer: Vec::new(),
                 last_sample_rate: None,
                 last_channels: None,
+                arena: None,
             })
         }
 
@@ -160,6 +162,7 @@ mod symphonia_decoder {
                 input_buffer: Vec::new(),
                 last_sample_rate: None,
                 last_channels: None,
+                arena: None,
             })
         }
 
@@ -290,17 +293,30 @@ mod symphonia_decoder {
                 Some((samples, _info)) => {
                     // Convert f32 samples to bytes
                     let byte_len = samples.len() * 4;
-                    let segment = Arc::new(CpuSegment::new(byte_len)?);
 
-                    unsafe {
-                        let ptr = segment.as_mut_ptr().unwrap() as *mut f32;
-                        std::ptr::copy_nonoverlapping(samples.as_ptr(), ptr, samples.len());
+                    // Lazily initialize arena
+                    if self.arena.is_none() {
+                        self.arena =
+                            Some(SharedArena::new(byte_len.max(64 * 1024), 16).map_err(|e| {
+                                Error::Element(format!("Failed to create arena: {}", e))
+                            })?);
                     }
+                    let arena = self.arena.as_ref().unwrap();
+
+                    let mut slot = arena.acquire().ok_or_else(|| {
+                        Error::Element("Failed to acquire buffer slot".to_string())
+                    })?;
+
+                    // Copy f32 samples as bytes
+                    let src_bytes = unsafe {
+                        std::slice::from_raw_parts(samples.as_ptr() as *const u8, byte_len)
+                    };
+                    slot.data_mut()[..byte_len].copy_from_slice(src_bytes);
 
                     let metadata = buffer.metadata().clone();
 
                     Ok(Some(Buffer::new(
-                        MemoryHandle::from_segment(segment),
+                        MemoryHandle::with_len(slot, byte_len),
                         metadata,
                     )))
                 }

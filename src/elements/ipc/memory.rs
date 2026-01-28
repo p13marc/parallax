@@ -4,8 +4,8 @@
 
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
-use crate::error::Result;
-use crate::memory::{CpuSegment, MemorySegment};
+use crate::error::{Error, Result};
+use crate::memory::SharedArena;
 use crate::metadata::Metadata;
 use std::sync::{Arc, Mutex};
 
@@ -31,6 +31,7 @@ pub struct MemorySrc {
     position: usize,
     chunk_size: usize,
     sequence: u64,
+    arena: Option<SharedArena>,
 }
 
 impl MemorySrc {
@@ -42,6 +43,7 @@ impl MemorySrc {
             position: 0,
             chunk_size: 4096,
             sequence: 0,
+            arena: None,
         }
     }
 
@@ -98,16 +100,20 @@ impl Source for MemorySrc {
         let remaining = self.data.len() - self.position;
         let chunk_len = remaining.min(self.chunk_size);
 
-        // Create our own buffer since MemorySrc manages its own memory
-        let segment = Arc::new(CpuSegment::new(chunk_len)?);
-        let ptr = segment.as_mut_ptr().unwrap();
-
-        // Copy data to segment
-        unsafe {
-            std::ptr::copy_nonoverlapping(self.data[self.position..].as_ptr(), ptr, chunk_len);
+        // Create our own buffer using SharedArena
+        if self.arena.is_none() {
+            self.arena = Some(SharedArena::new(self.chunk_size, 8)?);
         }
+        let arena = self.arena.as_ref().unwrap();
+        let mut slot = arena
+            .acquire()
+            .ok_or_else(|| Error::Element("arena exhausted".into()))?;
 
-        let handle = MemoryHandle::from_segment_with_len(segment, chunk_len);
+        // Copy data to slot
+        slot.data_mut()[..chunk_len]
+            .copy_from_slice(&self.data[self.position..self.position + chunk_len]);
+
+        let handle = MemoryHandle::with_len(slot, chunk_len);
         let mut metadata = Metadata::from_sequence(self.sequence);
 
         // Copy any metadata set on the context
@@ -389,12 +395,10 @@ mod tests {
     fn test_memorysink_basic() {
         let mut sink = MemorySink::new();
 
-        let segment = Arc::new(CpuSegment::new(4).unwrap());
-        unsafe {
-            let ptr = segment.as_mut_ptr().unwrap();
-            ptr.copy_from_nonoverlapping([1u8, 2, 3, 4].as_ptr(), 4);
-        }
-        let handle = MemoryHandle::from_segment(segment);
+        let arena = SharedArena::new(4, 4).unwrap();
+        let mut slot = arena.acquire().unwrap();
+        slot.data_mut()[..4].copy_from_slice(&[1u8, 2, 3, 4]);
+        let handle = MemoryHandle::with_len(slot, 4);
         let buffer = Buffer::new(handle, Metadata::new());
 
         consume_buffer(&mut sink, &buffer).unwrap();
@@ -407,13 +411,11 @@ mod tests {
     fn test_memorysink_max_size() {
         let mut sink = MemorySink::new().with_max_size(5);
 
-        for i in 0..3 {
-            let segment = Arc::new(CpuSegment::new(3).unwrap());
-            unsafe {
-                let ptr = segment.as_mut_ptr().unwrap();
-                ptr.copy_from_nonoverlapping([i, i, i].as_ptr(), 3);
-            }
-            let handle = MemoryHandle::from_segment(segment);
+        let arena = SharedArena::new(3, 4).unwrap();
+        for i in 0u8..3 {
+            let mut slot = arena.acquire().unwrap();
+            slot.data_mut()[..3].copy_from_slice(&[i, i, i]);
+            let handle = MemoryHandle::with_len(slot, 3);
             let buffer = Buffer::new(handle, Metadata::new());
             consume_buffer(&mut sink, &buffer).unwrap();
         }
@@ -426,8 +428,9 @@ mod tests {
     fn test_memorysink_take_data() {
         let mut sink = MemorySink::new();
 
-        let segment = Arc::new(CpuSegment::new(4).unwrap());
-        let handle = MemoryHandle::from_segment(segment);
+        let arena = SharedArena::new(4, 4).unwrap();
+        let slot = arena.acquire().unwrap();
+        let handle = MemoryHandle::new(slot);
         let buffer = Buffer::new(handle, Metadata::new());
         consume_buffer(&mut sink, &buffer).unwrap();
 
@@ -441,8 +444,9 @@ mod tests {
     fn test_memorysink_clear() {
         let mut sink = MemorySink::new();
 
-        let segment = Arc::new(CpuSegment::new(4).unwrap());
-        let handle = MemoryHandle::from_segment(segment);
+        let arena = SharedArena::new(4, 4).unwrap();
+        let slot = arena.acquire().unwrap();
+        let handle = MemoryHandle::new(slot);
         let buffer = Buffer::new(handle, Metadata::new());
         consume_buffer(&mut sink, &buffer).unwrap();
 
@@ -454,8 +458,9 @@ mod tests {
     fn test_shared_memorysink() {
         let mut sink = SharedMemorySink::new();
 
-        let segment = Arc::new(CpuSegment::new(4).unwrap());
-        let handle = MemoryHandle::from_segment(segment);
+        let arena = SharedArena::new(4, 4).unwrap();
+        let slot = arena.acquire().unwrap();
+        let handle = MemoryHandle::new(slot);
         let buffer = Buffer::new(handle, Metadata::new());
         let ctx = ConsumeContext::new(&buffer);
         sink.consume(&ctx).unwrap();

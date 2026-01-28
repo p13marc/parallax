@@ -26,10 +26,9 @@ use super::traits::VideoDecoder;
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::clock::ClockTime;
 use crate::element::{ExecutionHints, Output, Transform};
-use crate::error::Result;
-use crate::memory::{CpuSegment, MemorySegment};
+use crate::error::{Error, Result};
+use crate::memory::SharedArena;
 use std::collections::VecDeque;
-use std::sync::Arc;
 
 /// Wraps a [`VideoDecoder`] to work as a pipeline [`Transform`] element.
 ///
@@ -67,6 +66,8 @@ pub struct DecoderElement<D: VideoDecoder> {
     packets_in: u64,
     /// Statistics: frames produced.
     frames_out: u64,
+    /// Arena for output buffer allocation.
+    arena: Option<SharedArena>,
 }
 
 impl<D: VideoDecoder> DecoderElement<D> {
@@ -79,6 +80,7 @@ impl<D: VideoDecoder> DecoderElement<D> {
             flushed: false,
             packets_in: 0,
             frames_out: 0,
+            arena: None,
         }
     }
 
@@ -103,15 +105,20 @@ impl<D: VideoDecoder> DecoderElement<D> {
     }
 
     /// Convert VideoFrame to output buffer.
-    fn frame_to_buffer(&self, frame: VideoFrame) -> Result<Buffer> {
-        let segment = Arc::new(CpuSegment::new(frame.data.len())?);
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                frame.data.as_ptr(),
-                segment.as_mut_ptr().unwrap(),
-                frame.data.len(),
+    fn frame_to_buffer(&mut self, frame: VideoFrame) -> Result<Buffer> {
+        // Initialize arena on first use with frame size
+        if self.arena.is_none() {
+            self.arena = Some(
+                SharedArena::new(frame.data.len(), 16)
+                    .map_err(|e| Error::Element(format!("Failed to create arena: {}", e)))?,
             );
         }
+
+        let arena = self.arena.as_ref().unwrap();
+        let mut slot = arena
+            .acquire()
+            .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+        slot.data_mut()[..frame.data.len()].copy_from_slice(&frame.data);
 
         let mut metadata = crate::metadata::Metadata::new();
         metadata.pts = ClockTime::from_nanos(frame.pts as u64);
@@ -121,7 +128,10 @@ impl<D: VideoDecoder> DecoderElement<D> {
         metadata.set("video/height", frame.height);
         metadata.set("video/format", format!("{:?}", frame.format));
 
-        Ok(Buffer::new(MemoryHandle::from_segment(segment), metadata))
+        Ok(Buffer::new(
+            MemoryHandle::with_len(slot, frame.data.len()),
+            metadata,
+        ))
     }
 }
 

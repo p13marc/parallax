@@ -28,10 +28,6 @@ pub enum ConsoleFormat {
 /// ```rust,no_run
 /// use parallax::elements::{ConsoleSink, ConsoleFormat};
 /// use parallax::element::Sink;
-/// # use parallax::buffer::{Buffer, MemoryHandle};
-/// # use parallax::memory::CpuSegment;
-/// # use parallax::metadata::Metadata;
-/// # use std::sync::Arc;
 ///
 /// // Create a console sink
 /// let mut sink = ConsoleSink::new();
@@ -205,17 +201,20 @@ impl Sink for ConsoleSink {
 mod tests {
     use super::*;
     use crate::buffer::{Buffer, MemoryHandle};
-    use crate::memory::CpuSegment;
-    use std::sync::Arc;
+    use crate::memory::SharedArena;
+    use std::sync::OnceLock;
+
+    fn test_arena() -> &'static SharedArena {
+        static ARENA: OnceLock<SharedArena> = OnceLock::new();
+        ARENA.get_or_init(|| SharedArena::new(256, 64).unwrap())
+    }
 
     fn create_test_buffer(data: &[u8], sequence: u64) -> Buffer {
-        let segment = Arc::new(CpuSegment::new(data.len()).unwrap());
-        // Copy data into segment
-        unsafe {
-            use crate::memory::MemorySegment;
-            std::ptr::copy_nonoverlapping(data.as_ptr(), segment.as_mut_ptr().unwrap(), data.len());
-        }
-        let handle = MemoryHandle::from_segment(segment);
+        let arena = test_arena();
+        let mut slot = arena.acquire().unwrap();
+        // Copy data into slot
+        slot.data_mut()[..data.len()].copy_from_slice(data);
+        let handle = MemoryHandle::with_len(slot, data.len());
         Buffer::new(handle, Metadata::from_sequence(sequence))
     }
 

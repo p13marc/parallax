@@ -33,11 +33,18 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::clock::ClockTime;
 use crate::error::{Error, Result};
-use crate::memory::{CpuSegment, MemorySegment};
+use crate::memory::SharedArena;
 use crate::metadata::Metadata;
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::OnceLock;
+
+/// Shared arena for MPEG-TS muxer buffers.
+fn ts_mux_arena() -> &'static SharedArena {
+    static ARENA: OnceLock<SharedArena> = OnceLock::new();
+    // TS packets are 188 bytes, but we batch them; use moderate slot size
+    ARENA.get_or_init(|| SharedArena::new(1024 * 1024, 32).unwrap())
+}
 
 // ============================================================================
 // Constants
@@ -882,19 +889,13 @@ impl TsMux {
             return Err(Error::Element("Empty TS data".into()));
         }
 
-        let segment = Arc::new(
-            CpuSegment::new(ts_data.len())
-                .map_err(|e| Error::Element(format!("Failed to allocate buffer: {}", e)))?,
-        );
+        let mut slot = ts_mux_arena()
+            .acquire()
+            .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
 
-        let ptr = segment
-            .as_mut_ptr()
-            .ok_or_else(|| Error::Element("Failed to get segment pointer".into()))?;
-        unsafe {
-            std::ptr::copy_nonoverlapping(ts_data.as_ptr(), ptr, ts_data.len());
-        }
+        slot.data_mut()[..ts_data.len()].copy_from_slice(&ts_data);
 
-        let handle = MemoryHandle::from_segment_with_len(segment, ts_data.len());
+        let handle = MemoryHandle::with_len(slot, ts_data.len());
         let metadata = Metadata::new();
 
         Ok(Buffer::new(handle, metadata))

@@ -10,12 +10,11 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{AsyncSource, ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
 use crate::error::{Error, Result};
-use crate::memory::{CpuSegment, MemorySegment};
+use crate::memory::SharedArena;
 use crate::metadata::Metadata;
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
 /// Mode of operation for Unix socket source.
@@ -376,6 +375,8 @@ pub struct AsyncUnixSrc {
     buffer_size: usize,
     bytes_read: u64,
     sequence: u64,
+    /// Arena for buffer allocation.
+    arena: Option<SharedArena>,
 }
 
 impl AsyncUnixSrc {
@@ -391,6 +392,7 @@ impl AsyncUnixSrc {
             buffer_size: 64 * 1024,
             bytes_read: 0,
             sequence: 0,
+            arena: None,
         }
     }
 
@@ -406,6 +408,7 @@ impl AsyncUnixSrc {
             buffer_size: 64 * 1024,
             bytes_read: 0,
             sequence: 0,
+            arena: None,
         }
     }
 
@@ -468,14 +471,19 @@ impl AsyncSource for AsyncUnixSrc {
             ctx.set_sequence(seq);
             Ok(ProduceResult::Produced(result.len()))
         } else {
-            // Fall back to creating our own buffer
-            let segment = Arc::new(CpuSegment::new(result.len())?);
-            unsafe {
-                let ptr = segment.as_mut_ptr().unwrap();
-                std::ptr::copy_nonoverlapping(result.as_ptr(), ptr, result.len());
+            // Fall back to creating our own buffer from arena
+            // Initialize arena lazily if needed
+            if self.arena.is_none() {
+                self.arena = Some(SharedArena::new(self.buffer_size, 8)?);
             }
+            let arena = self.arena.as_ref().unwrap();
 
-            let handle = MemoryHandle::from_segment_with_len(segment, result.len());
+            let mut slot = arena
+                .acquire()
+                .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+            slot.data_mut()[..result.len()].copy_from_slice(&result);
+
+            let handle = MemoryHandle::with_len(slot, result.len());
             Ok(ProduceResult::OwnBuffer(Buffer::new(
                 handle,
                 Metadata::from_sequence(seq),
@@ -565,19 +573,21 @@ impl AsyncUnixSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::CpuArena;
+    use std::sync::OnceLock;
     use std::thread;
     use tempfile::tempdir;
 
+    fn test_arena() -> &'static SharedArena {
+        static ARENA: OnceLock<SharedArena> = OnceLock::new();
+        ARENA.get_or_init(|| SharedArena::new(4096, 64).unwrap())
+    }
+
     fn make_buffer(data: &[u8], seq: u64) -> Buffer {
-        let segment = Arc::new(CpuSegment::new(data.len().max(1)).unwrap());
+        let mut slot = test_arena().acquire().unwrap();
         if !data.is_empty() {
-            unsafe {
-                let ptr = segment.as_mut_ptr().unwrap();
-                std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
-            }
+            slot.data_mut()[..data.len()].copy_from_slice(data);
         }
-        let handle = MemoryHandle::from_segment_with_len(segment, data.len());
+        let handle = MemoryHandle::with_len(slot, data.len());
         Buffer::new(handle, Metadata::from_sequence(seq))
     }
 
@@ -588,7 +598,7 @@ mod tests {
 
         let path_clone = socket_path.clone();
         let server = thread::spawn(move || -> Result<Vec<u8>> {
-            let arena = Arc::new(CpuArena::new(4096, 8).unwrap());
+            let arena = SharedArena::new(4096, 8).unwrap();
             let mut src = UnixSrc::listen(&path_clone)?;
             let mut data = Vec::new();
             loop {

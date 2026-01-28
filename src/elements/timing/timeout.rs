@@ -4,12 +4,19 @@
 
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::Element;
-use crate::error::Result;
-use crate::memory::{CpuSegment, MemorySegment};
+use crate::error::{Error, Result};
+use crate::memory::SharedArena;
 use crate::metadata::Metadata;
-use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+/// Get the global timeout arena (lazily initialized).
+fn timeout_arena() -> &'static SharedArena {
+    static ARENA: OnceLock<SharedArena> = OnceLock::new();
+    // 4KB slots should be sufficient for fallback data, 32 slots for concurrency
+    ARENA.get_or_init(|| SharedArena::new(4096, 32).expect("Failed to create timeout arena"))
+}
 
 /// A timeout element that produces a fallback buffer if no input arrives in time.
 ///
@@ -82,16 +89,16 @@ impl Timeout {
 
     fn create_fallback(&self) -> Result<Option<Buffer>> {
         let len = self.fallback_data.len();
-        let segment = Arc::new(CpuSegment::new(len.max(1))?);
+        let arena = timeout_arena();
+        let mut slot = arena
+            .acquire()
+            .ok_or_else(|| Error::Element("arena exhausted".into()))?;
 
         if !self.fallback_data.is_empty() {
-            unsafe {
-                let ptr = segment.as_mut_ptr().unwrap();
-                std::ptr::copy_nonoverlapping(self.fallback_data.as_ptr(), ptr, len);
-            }
+            slot.data_mut()[..len].copy_from_slice(&self.fallback_data);
         }
 
-        let handle = MemoryHandle::from_segment_with_len(segment, len);
+        let handle = MemoryHandle::with_len(slot, len);
         let mut metadata = Metadata::new();
         metadata.flags = metadata.flags.insert(crate::metadata::BufferFlags::TIMEOUT);
 
@@ -331,9 +338,15 @@ pub struct ThrottleStats {
 mod tests {
     use super::*;
 
+    fn test_arena() -> &'static SharedArena {
+        static ARENA: OnceLock<SharedArena> = OnceLock::new();
+        ARENA.get_or_init(|| SharedArena::new(64, 64).unwrap())
+    }
+
     fn create_test_buffer(seq: u64) -> Buffer {
-        let segment = Arc::new(CpuSegment::new(64).unwrap());
-        let handle = MemoryHandle::from_segment(segment);
+        let arena = test_arena();
+        let slot = arena.acquire().unwrap();
+        let handle = MemoryHandle::new(slot);
         Buffer::new(handle, Metadata::from_sequence(seq))
     }
 

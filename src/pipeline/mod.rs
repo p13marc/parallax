@@ -47,10 +47,8 @@
 mod builder;
 mod driver;
 mod events;
-mod executor;
 pub mod factory;
 mod graph;
-mod hybrid_executor;
 pub mod parser;
 pub mod rt_bridge;
 pub mod rt_scheduler;
@@ -78,15 +76,3 @@ pub use builder::{
     BranchBuilder, BuiltPipeline, ChainedTransform, ChainedTransform2, FromSource, PipelineBuilder,
     PipelineFragment, TeeBuilder, ToSink, from, to,
 };
-
-// Legacy exports (deprecated - use Executor instead)
-#[deprecated(since = "0.2.0", note = "Use UnifiedExecutorConfig instead")]
-pub use executor::ExecutorConfig;
-#[deprecated(since = "0.2.0", note = "Use Executor instead")]
-pub use executor::PipelineExecutor;
-#[deprecated(since = "0.2.0", note = "Use UnifiedPipelineHandle instead")]
-pub use executor::PipelineHandle;
-#[deprecated(since = "0.2.0", note = "Use Executor instead")]
-pub use hybrid_executor::HybridExecutor;
-#[deprecated(since = "0.2.0", note = "Use UnifiedPipelineHandle instead")]
-pub use hybrid_executor::HybridPipelineHandle;

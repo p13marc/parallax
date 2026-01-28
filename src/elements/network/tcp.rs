@@ -5,14 +5,13 @@
 //! - [`TcpSrc`]: Reads data from a TCP connection (client or listener)
 //! - [`TcpSink`]: Writes data to a TCP connection
 
-use crate::buffer::Buffer;
+use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{AsyncSource, ConsumeContext, ProduceContext, ProduceResult};
 use crate::error::{Error, Result};
-use crate::memory::{CpuSegment, MemorySegment};
+use crate::memory::SharedArena;
 use crate::metadata::Metadata;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::Arc;
 use std::time::Duration;
 
 /// Mode of operation for TCP source.
@@ -49,6 +48,8 @@ pub struct TcpSrc {
     bytes_read: u64,
     sequence: u64,
     read_timeout: Option<Duration>,
+    /// Arena for buffer allocation.
+    arena: Option<SharedArena>,
 }
 
 impl TcpSrc {
@@ -71,6 +72,7 @@ impl TcpSrc {
             bytes_read: 0,
             sequence: 0,
             read_timeout: None,
+            arena: None,
         })
     }
 
@@ -95,6 +97,7 @@ impl TcpSrc {
             bytes_read: 0,
             sequence: 0,
             read_timeout: None,
+            arena: None,
         })
     }
 
@@ -190,12 +193,17 @@ impl crate::element::Source for TcpSrc {
                 Err(e) => Err(Error::Io(e)),
             }
         } else {
-            // No buffer provided, allocate our own
-            let segment = Arc::new(CpuSegment::new(self.buffer_size)?);
-            let ptr = segment
-                .as_mut_ptr()
-                .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
-            let slice = unsafe { std::slice::from_raw_parts_mut(ptr, self.buffer_size) };
+            // No buffer provided, allocate from arena
+            // Initialize arena lazily if needed
+            if self.arena.is_none() {
+                self.arena = Some(SharedArena::new(self.buffer_size, 8)?);
+            }
+            let arena = self.arena.as_ref().unwrap();
+
+            let mut slot = arena
+                .acquire()
+                .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+            let slice = slot.data_mut();
 
             match stream.read(slice) {
                 Ok(0) => {
@@ -207,7 +215,7 @@ impl crate::element::Source for TcpSrc {
                     let seq = self.sequence;
                     self.sequence += 1;
 
-                    let handle = crate::buffer::MemoryHandle::from_segment_with_len(segment, n);
+                    let handle = MemoryHandle::with_len(slot, n);
                     let metadata = Metadata::from_sequence(seq);
                     Ok(ProduceResult::OwnBuffer(Buffer::new(handle, metadata)))
                 }
@@ -231,6 +239,8 @@ pub struct AsyncTcpSrc {
     connected: bool,
     bytes_read: u64,
     sequence: u64,
+    /// Arena for buffer allocation.
+    arena: Option<SharedArena>,
 }
 
 impl AsyncTcpSrc {
@@ -250,6 +260,7 @@ impl AsyncTcpSrc {
             connected: false,
             bytes_read: 0,
             sequence: 0,
+            arena: None,
         })
     }
 
@@ -271,6 +282,7 @@ impl AsyncTcpSrc {
             connected: false,
             bytes_read: 0,
             sequence: 0,
+            arena: None,
         })
     }
 
@@ -343,12 +355,17 @@ impl AsyncSource for AsyncTcpSrc {
                 Err(e) => Err(Error::Io(e)),
             }
         } else {
-            // No buffer provided, allocate our own
-            let segment = Arc::new(CpuSegment::new(self.buffer_size)?);
-            let ptr = segment
-                .as_mut_ptr()
-                .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
-            let slice = unsafe { std::slice::from_raw_parts_mut(ptr, self.buffer_size) };
+            // No buffer provided, allocate from arena
+            // Initialize arena lazily if needed
+            if self.arena.is_none() {
+                self.arena = Some(SharedArena::new(self.buffer_size, 8)?);
+            }
+            let arena = self.arena.as_ref().unwrap();
+
+            let mut slot = arena
+                .acquire()
+                .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+            let slice = slot.data_mut();
 
             match stream.read(slice).await {
                 Ok(0) => {
@@ -360,7 +377,7 @@ impl AsyncSource for AsyncTcpSrc {
                     let seq = self.sequence;
                     self.sequence += 1;
 
-                    let handle = crate::buffer::MemoryHandle::from_segment_with_len(segment, n);
+                    let handle = MemoryHandle::with_len(slot, n);
                     let metadata = Metadata::from_sequence(seq);
                     Ok(ProduceResult::OwnBuffer(Buffer::new(handle, metadata)))
                 }
@@ -649,7 +666,13 @@ mod tests {
 
     #[test]
     fn test_tcp_roundtrip() {
-        use crate::memory::CpuArena;
+        use crate::memory::SharedArena;
+        use std::sync::OnceLock;
+
+        fn test_arena() -> &'static SharedArena {
+            static ARENA: OnceLock<SharedArena> = OnceLock::new();
+            ARENA.get_or_init(|| SharedArena::new(1024, 16).unwrap())
+        }
 
         // Create a server source
         let mut src = TcpSrc::listen("127.0.0.1:0").unwrap();
@@ -664,8 +687,7 @@ mod tests {
         });
 
         // Read from the source using the new context-based API
-        let arena = CpuArena::new(1024, 4).unwrap();
-        let slot = arena.acquire().unwrap();
+        let slot = test_arena().acquire().unwrap();
         let mut ctx = ProduceContext::new(slot);
         let result = src.produce(&mut ctx).unwrap();
 
@@ -678,7 +700,7 @@ mod tests {
         }
 
         // Next read should return Eos (connection closed)
-        let slot2 = arena.acquire().unwrap();
+        let slot2 = test_arena().acquire().unwrap();
         let mut ctx2 = ProduceContext::new(slot2);
         let next = src.produce(&mut ctx2).unwrap();
         assert!(matches!(next, ProduceResult::Eos));
@@ -689,7 +711,14 @@ mod tests {
     #[test]
     fn test_tcp_sink_roundtrip() {
         use crate::element::Sink;
+        use crate::memory::SharedArena;
         use std::io::Read;
+        use std::sync::OnceLock;
+
+        fn test_arena() -> &'static SharedArena {
+            static ARENA: OnceLock<SharedArena> = OnceLock::new();
+            ARENA.get_or_init(|| SharedArena::new(1024, 16).unwrap())
+        }
 
         // Create a server that will receive data
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -705,12 +734,9 @@ mod tests {
 
         // Create sink and send data
         let mut sink = TcpSink::connect(addr).unwrap();
-        let segment = Arc::new(CpuSegment::new(11).unwrap());
-        let ptr = segment.as_mut_ptr().unwrap();
-        unsafe {
-            std::ptr::copy_nonoverlapping(b"hello world".as_ptr(), ptr, 11);
-        }
-        let handle_mem = crate::buffer::MemoryHandle::from_segment_with_len(segment, 11);
+        let mut slot = test_arena().acquire().unwrap();
+        slot.data_mut()[..11].copy_from_slice(b"hello world");
+        let handle_mem = crate::buffer::MemoryHandle::with_len(slot, 11);
         let buffer = Buffer::new(handle_mem, Metadata::default());
         let ctx = ConsumeContext::new(&buffer);
         sink.consume(&ctx).unwrap();
@@ -741,8 +767,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_async_tcp_roundtrip() {
-        use crate::memory::CpuArena;
+        use crate::memory::SharedArena;
+        use std::sync::OnceLock;
         use tokio::io::AsyncWriteExt;
+
+        fn test_arena() -> &'static SharedArena {
+            static ARENA: OnceLock<SharedArena> = OnceLock::new();
+            ARENA.get_or_init(|| SharedArena::new(1024, 16).unwrap())
+        }
 
         // Create async server source
         let mut src = AsyncTcpSrc::listen("127.0.0.1:0").await.unwrap();
@@ -761,8 +793,7 @@ mod tests {
         });
 
         // Read from async source using the new context-based API
-        let arena = CpuArena::new(1024, 4).unwrap();
-        let slot = arena.acquire().unwrap();
+        let slot = test_arena().acquire().unwrap();
         let mut ctx = ProduceContext::new(slot);
         let result = src.produce(&mut ctx).await.unwrap();
 

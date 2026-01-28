@@ -8,11 +8,10 @@ use crate::element::{
     ConsumeContext, DynAsyncElement, ElementAdapter, ProduceContext, ProduceResult, SinkAdapter,
     SourceAdapter,
 };
-use crate::error::Result;
-use crate::memory::CpuSegment;
+use crate::error::{Error, Result};
+use crate::memory::SharedArena;
 use crate::metadata::Metadata;
 use crate::pipeline::Pipeline;
-use std::sync::Arc;
 
 use super::element::{TypedSink, TypedSource, TypedTransform};
 
@@ -26,6 +25,8 @@ use super::element::{TypedSink, TypedSource, TypedTransform};
 pub struct TypedSourceBridge<S: TypedSource> {
     inner: S,
     sequence: u64,
+    /// Arena for allocating buffers when context doesn't provide one.
+    arena: Option<SharedArena>,
 }
 
 impl<S: TypedSource> TypedSourceBridge<S> {
@@ -34,6 +35,7 @@ impl<S: TypedSource> TypedSourceBridge<S> {
         Self {
             inner: source,
             sequence: 0,
+            arena: None,
         }
     }
 }
@@ -57,13 +59,25 @@ where
                     self.sequence += 1;
                     Ok(ProduceResult::Produced(bytes.len()))
                 } else {
-                    // Fall back to creating our own buffer
-                    let segment = Arc::new(CpuSegment::new(bytes.len())?);
+                    // Fall back to creating our own buffer using SharedArena
+                    let slot_size = bytes.len().max(4096).next_power_of_two();
+                    if self.arena.is_none()
+                        || self.arena.as_ref().map(|a| a.slot_size()).unwrap_or(0) < bytes.len()
+                    {
+                        self.arena = Some(SharedArena::new(slot_size, 8)?);
+                    }
 
-                    // Copy data to segment
-                    segment.as_mut_slice().copy_from_slice(&bytes);
+                    let arena = self.arena.as_ref().unwrap();
+                    // Reclaim any released slots first
+                    arena.reclaim();
+                    let mut slot = arena
+                        .acquire()
+                        .ok_or_else(|| Error::Element("arena exhausted".into()))?;
 
-                    let handle = MemoryHandle::from_segment(segment);
+                    // Copy data to slot
+                    slot.data_mut()[..bytes.len()].copy_from_slice(&bytes);
+
+                    let handle = MemoryHandle::with_len(slot, bytes.len());
                     let metadata = Metadata::from_sequence(self.sequence);
                     self.sequence += 1;
 
@@ -127,12 +141,17 @@ where
 /// Adapter that wraps a TypedTransform as a dynamic Element.
 pub struct TypedTransformBridge<T: TypedTransform> {
     inner: T,
+    /// Arena for allocating output buffers.
+    arena: Option<SharedArena>,
 }
 
 impl<T: TypedTransform> TypedTransformBridge<T> {
     /// Create a new bridge for a typed transform.
     pub fn new(transform: T) -> Self {
-        Self { inner: transform }
+        Self {
+            inner: transform,
+            arena: None,
+        }
     }
 }
 
@@ -153,12 +172,26 @@ where
         match self.inner.transform(item)? {
             Some(output) => {
                 let out_bytes: Vec<u8> = output.into();
-                let segment = Arc::new(CpuSegment::new(out_bytes.len())?);
 
-                // Copy data to segment
-                segment.as_mut_slice().copy_from_slice(&out_bytes);
+                // Ensure we have an arena with sufficient slot size
+                let slot_size = out_bytes.len().max(4096).next_power_of_two();
+                if self.arena.is_none()
+                    || self.arena.as_ref().map(|a| a.slot_size()).unwrap_or(0) < out_bytes.len()
+                {
+                    self.arena = Some(SharedArena::new(slot_size, 8)?);
+                }
 
-                let handle = MemoryHandle::from_segment(segment);
+                let arena = self.arena.as_ref().unwrap();
+                // Reclaim any released slots first
+                arena.reclaim();
+                let mut slot = arena
+                    .acquire()
+                    .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+
+                // Copy data to slot
+                slot.data_mut()[..out_bytes.len()].copy_from_slice(&out_bytes);
+
+                let handle = MemoryHandle::with_len(slot, out_bytes.len());
                 Ok(Some(Buffer::new(handle, metadata)))
             }
             None => Ok(None),

@@ -35,7 +35,7 @@
 
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::error::Result;
-use crate::memory::{ArenaSlot, CpuArena};
+use crate::memory::{SharedArena, SharedSlotRef};
 use crate::metadata::Metadata;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -124,8 +124,8 @@ pub struct PoolStats {
 /// let buffer = pooled.into_buffer();
 /// ```
 pub struct PooledBuffer {
-    /// The underlying arena slot (will be returned to pool on drop).
-    slot: Option<ArenaSlot>,
+    /// The underlying shared slot reference (will be returned to pool on drop).
+    slot: Option<SharedSlotRef>,
     /// Length of valid data in the buffer.
     len: usize,
     /// Buffer metadata.
@@ -135,8 +135,8 @@ pub struct PooledBuffer {
 }
 
 impl PooledBuffer {
-    /// Create a new pooled buffer from an arena slot.
-    fn new(slot: ArenaSlot, pool_inner: Arc<PoolInner>) -> Self {
+    /// Create a new pooled buffer from a shared slot reference.
+    fn new(slot: SharedSlotRef, pool_inner: Arc<PoolInner>) -> Self {
         let len = slot.len();
         Self {
             slot: Some(slot),
@@ -214,7 +214,7 @@ impl PooledBuffer {
     /// Use this when passing the buffer downstream.
     pub fn into_buffer(mut self) -> Buffer {
         let slot = self.slot.take().expect("PooledBuffer already consumed");
-        let handle = MemoryHandle::from_arena_slot_with_len(slot, self.len);
+        let handle = MemoryHandle::with_len(slot, self.len);
         // Don't decrement in_use - the buffer is detached
         self.pool_inner
             .stats
@@ -250,7 +250,7 @@ impl std::fmt::Debug for PooledBuffer {
 // FixedBufferPool
 // ============================================================================
 
-/// A fixed-size buffer pool using `CpuArena`.
+/// A fixed-size buffer pool using `SharedArena`.
 ///
 /// This is the primary buffer pool implementation. It allocates a single
 /// large memory region (via memfd) and subdivides it into fixed-size slots.
@@ -261,6 +261,7 @@ impl std::fmt::Debug for PooledBuffer {
 /// - Lock-free slot acquisition
 /// - Automatic return on drop
 /// - Backpressure when exhausted
+/// - Cross-process reference counting via shared memory
 ///
 /// # Example
 ///
@@ -279,8 +280,8 @@ pub struct FixedBufferPool {
 
 /// Shared pool state (referenced by both pool and pooled buffers).
 struct PoolInner {
-    /// The underlying arena.
-    arena: Arc<CpuArena>,
+    /// The underlying shared arena.
+    arena: SharedArena,
     /// Statistics tracking.
     stats: PoolStatsInner,
     /// Notification for waiters.
@@ -322,7 +323,7 @@ impl FixedBufferPool {
 
     /// Create a pool with a debug name.
     pub fn with_name(name: &str, buffer_size: usize, buffer_count: usize) -> Result<Arc<Self>> {
-        let arena = CpuArena::with_name(name, buffer_size, buffer_count)?;
+        let arena = SharedArena::with_name(name, buffer_size, buffer_count)?;
 
         Ok(Arc::new(Self {
             inner: Arc::new(PoolInner {
@@ -339,16 +340,8 @@ impl FixedBufferPool {
         }))
     }
 
-    /// Pre-fault all memory to avoid page faults during processing.
-    ///
-    /// Call this after creating the pool to ensure all pages are
-    /// resident in memory.
-    pub fn prefault(&self) {
-        self.inner.arena.prefault();
-    }
-
     /// Get the underlying arena (for advanced use cases).
-    pub fn arena(&self) -> &Arc<CpuArena> {
+    pub fn arena(&self) -> &SharedArena {
         &self.inner.arena
     }
 }
@@ -375,6 +368,10 @@ impl BufferPool for FixedBufferPool {
     }
 
     fn try_acquire(&self) -> Option<PooledBuffer> {
+        // First, reclaim any slots that have been released
+        // This is needed because SharedArena uses a release queue
+        self.inner.arena.reclaim();
+
         let slot = self.inner.arena.acquire()?;
 
         self.inner
@@ -441,6 +438,8 @@ impl BufferPool for FixedBufferPool {
     }
 
     fn available(&self) -> usize {
+        // Reclaim any slots that were released back to the pool
+        self.inner.arena.reclaim();
         self.inner.arena.free_count()
     }
 }

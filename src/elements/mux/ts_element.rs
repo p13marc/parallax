@@ -31,11 +31,10 @@ use crate::element::{Muxer, MuxerInput, PadAddedCallback, PadId};
 use crate::elements::mux::{TsMux, TsMuxConfig, TsMuxStreamType, TsMuxTrack};
 use crate::error::{Error, Result};
 use crate::format::{AudioCodec, Caps, MediaFormat, VideoCodec};
-use crate::memory::{CpuSegment, MemorySegment};
+use crate::memory::SharedArena;
 use crate::metadata::Metadata;
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 // ============================================================================
 // TsMuxElement
@@ -99,6 +98,8 @@ pub struct TsMuxElement {
     video_count: u32,
     audio_count: u32,
     data_count: u32,
+    /// Arena for output buffer allocation.
+    arena: Option<SharedArena>,
 }
 
 impl TsMuxElement {
@@ -159,6 +160,7 @@ impl TsMuxElement {
             video_count,
             audio_count,
             data_count,
+            arena: None,
         })
     }
 
@@ -257,24 +259,28 @@ impl TsMuxElement {
     }
 
     /// Create an output buffer from TS data.
-    fn create_output_buffer(&self, ts_data: Vec<u8>) -> Result<Option<Buffer>> {
+    fn create_output_buffer(&mut self, ts_data: Vec<u8>) -> Result<Option<Buffer>> {
         if ts_data.is_empty() {
             return Ok(None);
         }
 
-        let segment = Arc::new(
-            CpuSegment::new(ts_data.len())
-                .map_err(|e| Error::Element(format!("Failed to allocate buffer: {}", e)))?,
-        );
-
-        let ptr = segment
-            .as_mut_ptr()
-            .ok_or_else(|| Error::Element("Failed to get segment pointer".into()))?;
-        unsafe {
-            std::ptr::copy_nonoverlapping(ts_data.as_ptr(), ptr, ts_data.len());
+        // Initialize arena on first use (typical TS packet output is ~188 * N bytes)
+        if self.arena.is_none() {
+            // Allocate enough for typical muxer output (multiple TS packets)
+            let arena_size = ts_data.len().max(188 * 64); // At least 64 TS packets
+            self.arena = Some(
+                SharedArena::new(arena_size, 16)
+                    .map_err(|e| Error::Element(format!("Failed to create arena: {}", e)))?,
+            );
         }
 
-        let handle = MemoryHandle::from_segment_with_len(segment, ts_data.len());
+        let arena = self.arena.as_ref().unwrap();
+        let mut slot = arena
+            .acquire()
+            .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+        slot.data_mut()[..ts_data.len()].copy_from_slice(&ts_data);
+
+        let handle = MemoryHandle::with_len(slot, ts_data.len());
         let mut metadata = Metadata::new();
         metadata.pts = self.sync.target_pts();
 
@@ -442,15 +448,19 @@ mod tests {
     use super::*;
     use crate::clock::ClockTime;
     use crate::element::muxer::SyncMode;
-    use crate::memory::CpuSegment;
+    use crate::memory::SharedArena;
+    use std::sync::OnceLock;
+
+    fn test_arena() -> &'static SharedArena {
+        static ARENA: OnceLock<SharedArena> = OnceLock::new();
+        ARENA.get_or_init(|| SharedArena::new(1024, 64).unwrap())
+    }
 
     fn make_buffer(pts_ms: u64, data: &[u8]) -> Buffer {
-        let segment = Arc::new(CpuSegment::new(data.len().max(64)).unwrap());
-        let ptr = segment.as_mut_ptr().unwrap();
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
-        }
-        let handle = MemoryHandle::from_segment_with_len(segment, data.len());
+        let arena = test_arena();
+        let mut slot = arena.acquire().unwrap();
+        slot.data_mut()[..data.len()].copy_from_slice(data);
+        let handle = MemoryHandle::with_len(slot, data.len());
         let mut metadata = Metadata::from_sequence(0);
         metadata.pts = ClockTime::from_millis(pts_ms);
         Buffer::new(handle, metadata)

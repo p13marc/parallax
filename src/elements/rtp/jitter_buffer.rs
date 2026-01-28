@@ -595,17 +595,19 @@ impl Default for AsyncJitterBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::{CpuSegment, MemorySegment};
+    use crate::memory::SharedArena;
     use crate::metadata::Metadata;
-    use std::sync::Arc;
+    use std::sync::OnceLock;
+
+    fn test_arena() -> &'static SharedArena {
+        static ARENA: OnceLock<SharedArena> = OnceLock::new();
+        ARENA.get_or_init(|| SharedArena::new(1024, 64).unwrap())
+    }
 
     fn create_rtp_buffer(seq: u16, ts: u32, data: &[u8]) -> Buffer {
-        let segment = Arc::new(CpuSegment::new(data.len()).unwrap());
-        let ptr = segment.as_mut_ptr().unwrap();
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
-        }
-        let handle = crate::buffer::MemoryHandle::from_segment_with_len(segment, data.len());
+        let mut slot = test_arena().acquire().unwrap();
+        slot.data_mut()[..data.len()].copy_from_slice(data);
+        let handle = crate::buffer::MemoryHandle::with_len(slot, data.len());
 
         let rtp = RtpMeta {
             seq,
