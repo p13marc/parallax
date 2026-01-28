@@ -83,10 +83,11 @@ impl Element for BufferTrim {
             .fetch_add(bytes_removed as u64, Ordering::Relaxed);
 
         if self.arena.is_none() {
-            self.arena = Some(SharedArena::new(self.max_size, 8)?);
+            self.arena = Some(SharedArena::new(self.max_size, 32)?);
         }
 
-        let arena = self.arena.as_ref().unwrap();
+        let arena = self.arena.as_mut().unwrap();
+        arena.reclaim();
         let mut slot = arena
             .acquire()
             .ok_or_else(|| Error::Element("arena exhausted".into()))?;
@@ -210,9 +211,10 @@ impl Element for BufferSlice {
             }
             // Return empty buffer (allocate minimum 1 byte)
             if self.arena.is_none() {
-                self.arena = Some(SharedArena::new(1, 8)?);
+                self.arena = Some(SharedArena::new(1, 32)?);
             }
-            let arena = self.arena.as_ref().unwrap();
+            let arena = self.arena.as_mut().unwrap();
+            arena.reclaim();
             let slot = arena
                 .acquire()
                 .ok_or_else(|| Error::Element("arena exhausted".into()))?;
@@ -233,9 +235,10 @@ impl Element for BufferSlice {
 
         if slice_len == 0 {
             if self.arena.is_none() {
-                self.arena = Some(SharedArena::new(1, 8)?); // Minimum 1 byte
+                self.arena = Some(SharedArena::new(1, 32)?); // Minimum 1 byte
             }
-            let arena = self.arena.as_ref().unwrap();
+            let arena = self.arena.as_mut().unwrap();
+            arena.reclaim();
             let slot = arena
                 .acquire()
                 .ok_or_else(|| Error::Element("arena exhausted".into()))?;
@@ -244,10 +247,11 @@ impl Element for BufferSlice {
         }
 
         if self.arena.is_none() || self.arena.as_ref().unwrap().slot_size() < slice_len {
-            self.arena = Some(SharedArena::new(slice_len, 8)?);
+            self.arena = Some(SharedArena::new(slice_len, 32)?);
         }
 
-        let arena = self.arena.as_ref().unwrap();
+        let arena = self.arena.as_mut().unwrap();
+        arena.reclaim();
         let mut slot = arena
             .acquire()
             .ok_or_else(|| Error::Element("arena exhausted".into()))?;
@@ -342,10 +346,11 @@ impl Element for BufferPad {
         self.padded_count.fetch_add(1, Ordering::Relaxed);
 
         if self.arena.is_none() {
-            self.arena = Some(SharedArena::new(self.min_size, 8)?);
+            self.arena = Some(SharedArena::new(self.min_size, 32)?);
         }
 
-        let arena = self.arena.as_ref().unwrap();
+        let arena = self.arena.as_mut().unwrap();
+        arena.reclaim();
         let mut slot = arena
             .acquire()
             .ok_or_else(|| Error::Element("arena exhausted".into()))?;

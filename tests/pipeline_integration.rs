@@ -213,19 +213,29 @@ async fn test_pipeline_abort() {
     use parallax::buffer::{Buffer, MemoryHandle};
     use parallax::element::{ConsumeContext, ProduceContext, ProduceResult, Source};
     use parallax::error::Result;
-    use parallax::memory::HeapSegment;
+    use parallax::memory::SharedArena;
     use parallax::metadata::Metadata;
 
     /// A source that produces buffers forever.
     struct InfiniteSource {
         seq: u64,
+        arena: SharedArena,
+    }
+
+    impl InfiniteSource {
+        fn new() -> Self {
+            Self {
+                seq: 0,
+                arena: SharedArena::new(64, 16).expect("failed to create arena"),
+            }
+        }
     }
 
     impl Source for InfiniteSource {
         fn produce(&mut self, _ctx: &mut ProduceContext) -> Result<ProduceResult> {
-            // Create our own buffer since we don't know if ctx has one
-            let segment = std::sync::Arc::new(HeapSegment::new(64)?);
-            let handle = MemoryHandle::from_segment(segment);
+            // Create our own buffer from arena
+            let slot = self.arena.acquire().expect("failed to acquire slot");
+            let handle = MemoryHandle::with_len(slot, 64);
             let buffer = Buffer::new(handle, Metadata::from_sequence(self.seq));
             self.seq += 1;
             Ok(ProduceResult::OwnBuffer(buffer))
@@ -246,7 +256,7 @@ async fn test_pipeline_abort() {
         }
     }
 
-    let src = pipeline.add_source("src", InfiniteSource { seq: 0 });
+    let src = pipeline.add_source("src", InfiniteSource::new());
     let sink = pipeline.add_sink(
         "sink",
         CountingSink {
@@ -728,17 +738,27 @@ async fn test_pipeline_state_transitions() {
 async fn test_pipeline_abort_event() {
     use parallax::buffer::{Buffer, MemoryHandle};
     use parallax::element::{ConsumeContext, ProduceContext, ProduceResult, Source};
-    use parallax::memory::HeapSegment;
+    use parallax::memory::SharedArena;
     use parallax::metadata::Metadata;
     use parallax::pipeline::PipelineEvent;
 
     /// A source that produces buffers forever.
-    struct InfiniteSource;
+    struct InfiniteSource {
+        arena: SharedArena,
+    }
+
+    impl InfiniteSource {
+        fn new() -> Self {
+            Self {
+                arena: SharedArena::new(64, 16).expect("failed to create arena"),
+            }
+        }
+    }
 
     impl Source for InfiniteSource {
         fn produce(&mut self, _ctx: &mut ProduceContext) -> parallax::error::Result<ProduceResult> {
-            let segment = std::sync::Arc::new(HeapSegment::new(64)?);
-            let handle = MemoryHandle::from_segment(segment);
+            let slot = self.arena.acquire().expect("failed to acquire slot");
+            let handle = MemoryHandle::with_len(slot, 64);
             Ok(ProduceResult::OwnBuffer(Buffer::new(
                 handle,
                 Metadata::default(),
@@ -754,7 +774,7 @@ async fn test_pipeline_abort_event() {
     }
 
     let mut pipeline = Pipeline::new();
-    let src = pipeline.add_source("src", InfiniteSource);
+    let src = pipeline.add_source("src", InfiniteSource::new());
     let sink = pipeline.add_sink("sink", DiscardSink);
     pipeline.link(src, sink).unwrap();
 

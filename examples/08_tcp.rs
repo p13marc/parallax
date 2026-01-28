@@ -13,7 +13,7 @@
 use parallax::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
 use parallax::elements::{TcpSink, TcpSrc};
 use parallax::error::Result;
-use parallax::memory::CpuArena;
+use parallax::memory::SharedArena;
 use parallax::pipeline::Pipeline;
 use std::time::Duration;
 
@@ -51,7 +51,7 @@ async fn main() -> Result<()> {
 
     // Start receiver pipeline (server - listens first)
     let receiver = tokio::spawn(async move {
-        let arena = CpuArena::new(4096, 8)?;
+        let arena = SharedArena::new(4096, 8)?;
         let mut pipeline = Pipeline::new();
         let src = pipeline.add_source_with_arena("tcpsrc", TcpSrc::listen(addr)?, arena);
         let sink = pipeline.add_sink("sink", PrintSink);
@@ -63,7 +63,7 @@ async fn main() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Sender pipeline (client - connects to server)
-    let arena = CpuArena::new(256, 8)?;
+    let arena = SharedArena::new(256, 8)?;
     let mut pipeline = Pipeline::new();
     let src = pipeline.add_source_with_arena("src", MessageSource { count: 0, max: 3 }, arena);
     let sink = pipeline.add_sink("tcpsink", TcpSink::connect(addr)?);

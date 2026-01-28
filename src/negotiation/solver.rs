@@ -229,13 +229,8 @@ impl NegotiationSolver {
                     ) {
                         // Use the first factory (for now, we only support single-hop)
                         if let Some((factory, info)) = factories_with_info.into_iter().next() {
-                            // Fixate source format for the link
-                            let format = source_cap.format.fixate().ok_or_else(|| {
-                                NegotiationError::CannotFixate {
-                                    link_id: link.id,
-                                    reason: "Could not fixate source format".into(),
-                                }
-                            })?;
+                            // Fixate source format for the link (use defaults for Any values)
+                            let format = source_cap.format.fixate_with_defaults();
 
                             return Ok(LinkResult::NeedsConverter {
                                 negotiation: LinkNegotiation {

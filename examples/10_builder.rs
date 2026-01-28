@@ -5,48 +5,68 @@
 //!
 //! Run: `cargo run --example 10_builder`
 
-use parallax::buffer::Buffer;
+use parallax::buffer::{Buffer, MemoryHandle};
 use parallax::element::{
     ConsumeContext, Output, ProduceContext, ProduceResult, Sink, Source, Transform,
 };
 use parallax::error::Result;
-use parallax::memory::{HeapSegment, MemorySegment};
+use parallax::memory::SharedArena;
 use parallax::pipeline::{FromSource, PipelineBuilder, to};
-use std::sync::Arc;
 
 struct NumberSource {
     current: u32,
     max: u32,
+    arena: SharedArena,
+}
+
+impl NumberSource {
+    fn new(max: u32) -> Result<Self> {
+        Ok(Self {
+            current: 0,
+            max,
+            arena: SharedArena::new(64, 8)?,
+        })
+    }
 }
 
 impl Source for NumberSource {
-    fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
+    fn produce(&mut self, _ctx: &mut ProduceContext) -> Result<ProduceResult> {
         if self.current >= self.max {
             return Ok(ProduceResult::Eos);
         }
         self.current += 1;
-        ctx.output()[..4].copy_from_slice(&self.current.to_le_bytes());
-        Ok(ProduceResult::Produced(4))
+
+        // Allocate from our own arena
+        let mut slot = self.arena.acquire().expect("source arena exhausted");
+        slot.data_mut()[..4].copy_from_slice(&self.current.to_le_bytes());
+
+        let buffer = Buffer::new(MemoryHandle::with_len(slot, 4), Default::default());
+        Ok(ProduceResult::OwnBuffer(buffer))
     }
 }
 
-struct SquareTransform;
+struct SquareTransform {
+    arena: SharedArena,
+}
+
+impl SquareTransform {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            arena: SharedArena::new(64, 8)?,
+        })
+    }
+}
 
 impl Transform for SquareTransform {
     fn transform(&mut self, buffer: Buffer) -> Result<Output> {
         let value = u32::from_le_bytes(buffer.as_bytes()[..4].try_into().unwrap());
         let squared = value * value;
 
-        let segment = Arc::new(HeapSegment::new(4)?);
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                squared.to_le_bytes().as_ptr(),
-                segment.as_mut_ptr().unwrap(),
-                4,
-            );
-        }
+        let mut slot = self.arena.acquire().expect("transform arena exhausted");
+        slot.data_mut()[..4].copy_from_slice(&squared.to_le_bytes());
+
         Ok(Output::Single(Buffer::new(
-            parallax::buffer::MemoryHandle::from_segment(segment),
+            MemoryHandle::with_len(slot, 4),
             buffer.metadata().clone(),
         )))
     }
@@ -71,8 +91,8 @@ async fn main() -> Result<()> {
     // Example 1: Simple chain with >> operator
     // Note: Use FromSource wrapper and to() for sink
     println!("--- Linear Pipeline (>> operator) ---");
-    let pipeline = FromSource(NumberSource { current: 0, max: 5 })
-        >> SquareTransform
+    let pipeline = FromSource(NumberSource::new(5)?)
+        >> SquareTransform::new()?
         >> to(PrintSink { label: "Square" });
 
     pipeline.run().await?;
@@ -80,8 +100,8 @@ async fn main() -> Result<()> {
     // Example 2: Fluent builder API
     println!("\n--- Fluent Builder API ---");
     PipelineBuilder::new()
-        .source(NumberSource { current: 0, max: 3 })
-        .then(SquareTransform)
+        .source(NumberSource::new(3)?)
+        .then(SquareTransform::new()?)
         .sink(PrintSink { label: "Result" })
         .build()?
         .run()
@@ -90,8 +110,8 @@ async fn main() -> Result<()> {
     // Example 3: Named elements
     println!("\n--- Named Elements ---");
     PipelineBuilder::new()
-        .source_named("numbers", NumberSource { current: 0, max: 3 })
-        .then_named("square", SquareTransform)
+        .source_named("numbers", NumberSource::new(3)?)
+        .then_named("square", SquareTransform::new()?)
         .sink_named("print", PrintSink { label: "Named" })
         .build()?
         .run()

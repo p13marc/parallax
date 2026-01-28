@@ -528,10 +528,11 @@ impl BufferSplit {
             }
 
             if self.arena.is_none() || self.arena.as_ref().unwrap().slot_size() < part.len() {
-                self.arena = Some(SharedArena::new(part.len(), 8)?);
+                self.arena = Some(SharedArena::new(part.len(), 32)?);
             }
 
-            let arena = self.arena.as_ref().unwrap();
+            let arena = self.arena.as_mut().unwrap();
+            arena.reclaim();
             let mut slot = arena
                 .acquire()
                 .ok_or_else(|| Error::Element("arena exhausted".into()))?;
@@ -593,10 +594,11 @@ impl Element for BufferSplit {
             }
 
             if self.arena.is_none() || self.arena.as_ref().unwrap().slot_size() < part.len() {
-                self.arena = Some(SharedArena::new(part.len(), 8)?);
+                self.arena = Some(SharedArena::new(part.len(), 32)?);
             }
 
-            let arena = self.arena.as_ref().unwrap();
+            let arena = self.arena.as_mut().unwrap();
+            arena.reclaim();
             let mut slot = arena
                 .acquire()
                 .ok_or_else(|| Error::Element("arena exhausted".into()))?;
@@ -630,10 +632,11 @@ impl Element for BufferSplit {
 
         let alloc_size = part.len().max(1);
         if self.arena.is_none() || self.arena.as_ref().unwrap().slot_size() < alloc_size {
-            self.arena = Some(SharedArena::new(alloc_size, 8)?);
+            self.arena = Some(SharedArena::new(alloc_size, 32)?);
         }
 
-        let arena = self.arena.as_ref().unwrap();
+        let arena = self.arena.as_mut().unwrap();
+        arena.reclaim();
         let mut slot = arena
             .acquire()
             .ok_or_else(|| Error::Element("arena exhausted".into()))?;
@@ -745,10 +748,11 @@ impl BufferJoin {
         let alloc_size = total_size.max(1);
 
         if self.arena.is_none() || self.arena.as_ref().unwrap().slot_size() < alloc_size {
-            self.arena = Some(SharedArena::new(alloc_size, 8)?);
+            self.arena = Some(SharedArena::new(alloc_size, 32)?);
         }
 
-        let arena = self.arena.as_ref().unwrap();
+        let arena = self.arena.as_mut().unwrap();
+        arena.reclaim();
         let mut slot = arena
             .acquire()
             .ok_or_else(|| Error::Element("arena exhausted".into()))?;
@@ -891,10 +895,11 @@ impl BufferConcat {
         let len = self.pending.len();
 
         if self.arena.is_none() || self.arena.as_ref().unwrap().slot_size() < len {
-            self.arena = Some(SharedArena::new(len, 8)?);
+            self.arena = Some(SharedArena::new(len, 32)?);
         }
 
-        let arena = self.arena.as_ref().unwrap();
+        let arena = self.arena.as_mut().unwrap();
+        arena.reclaim();
         let mut slot = arena
             .acquire()
             .ok_or_else(|| Error::Element("arena exhausted".into()))?;

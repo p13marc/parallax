@@ -7,7 +7,7 @@
 
 use parallax::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
 use parallax::error::Result;
-use parallax::memory::CpuArena;
+use parallax::memory::SharedArena;
 use parallax::pipeline::Pipeline;
 
 struct CounterSource {
@@ -43,7 +43,7 @@ impl Sink for PrintSink {
 }
 
 fn build_pipeline() -> Result<Pipeline> {
-    let arena = CpuArena::new(64, 8)?;
+    let arena = SharedArena::new(64, 8)?;
     let mut pipeline = Pipeline::new();
 
     let src = pipeline.add_source_with_arena("src", CounterSource { count: 0, max: 3 }, arena);

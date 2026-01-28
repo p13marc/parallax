@@ -431,15 +431,13 @@ mod tests {
 
     #[test]
     fn test_ipc_link_socket_pair() {
-        use std::sync::Arc;
-
         let (pub_stream, sub_stream) = UnixStream::pair().unwrap();
 
         let mut publisher = IpcPublisher::from_stream(pub_stream);
         let mut subscriber = IpcSubscriber::from_stream(sub_stream);
 
-        // Create a shared arena with enough slots - use Arc to keep alive across threads
-        let arena = Arc::new(SharedArena::with_name("test-ipc-link", 4096, 16).unwrap());
+        // Create a shared arena with enough slots - clone for use across threads
+        let arena = SharedArena::with_name("test-ipc-link", 4096, 16).unwrap();
         let arena_clone = arena.clone();
 
         // Producer thread

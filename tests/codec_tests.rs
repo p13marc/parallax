@@ -3,19 +3,26 @@
 //! These tests verify the codec elements work correctly with the pipeline system.
 
 use parallax::buffer::{Buffer, MemoryHandle};
-use parallax::memory::{HeapSegment, MemorySegment};
+use parallax::memory::SharedArena;
 use parallax::metadata::Metadata;
-use std::sync::Arc;
+
+/// Shared arena for test buffer allocation
+fn test_arena() -> SharedArena {
+    // Use thread_local to avoid creating too many arenas
+    thread_local! {
+        static ARENA: SharedArena = SharedArena::new(1024 * 1024, 64)
+            .expect("failed to create test arena");
+    }
+    ARENA.with(|a| a.clone())
+}
 
 /// Test helper to create a buffer with given data
 #[allow(dead_code)]
 fn create_test_buffer(data: &[u8]) -> Buffer {
-    let segment = Arc::new(HeapSegment::new(data.len()).expect("failed to create heap segment"));
-    // Copy data into segment
-    unsafe {
-        std::ptr::copy_nonoverlapping(data.as_ptr(), (*segment).as_ptr() as *mut u8, data.len());
-    }
-    let handle = MemoryHandle::from_segment(segment);
+    let arena = test_arena();
+    let mut slot = arena.acquire().expect("failed to acquire slot from arena");
+    slot.data_mut()[..data.len()].copy_from_slice(data);
+    let handle = MemoryHandle::with_len(slot, data.len());
     Buffer::new(handle, Metadata::from_sequence(0))
 }
 

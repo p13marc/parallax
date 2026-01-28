@@ -11,7 +11,7 @@
 
 use parallax::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
 use parallax::error::Result;
-use parallax::memory::CpuArena;
+use parallax::memory::SharedArena;
 use parallax::pipeline::Pipeline;
 
 struct HelloSource {
@@ -43,7 +43,7 @@ impl Sink for PrintSink {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let arena = CpuArena::new(1024, 4)?;
+    let arena = SharedArena::new(1024, 4)?;
 
     let mut pipeline = Pipeline::new();
     let src = pipeline.add_source_with_arena("src", HelloSource { sent: false }, arena);

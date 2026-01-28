@@ -13,7 +13,7 @@
 use parallax::elements::NullSink;
 use parallax::elements::device::{V4l2Src, enumerate_video_devices};
 use parallax::error::Result;
-use parallax::memory::CpuArena;
+use parallax::memory::SharedArena;
 use parallax::pipeline::Pipeline;
 use std::time::Duration;
 
@@ -80,7 +80,7 @@ async fn main() -> Result<()> {
     println!("\nCapturing for 3 seconds...\n");
 
     // Create arena for buffers
-    let arena = CpuArena::new(frame_size, 4)?;
+    let arena = SharedArena::new(frame_size, 4)?;
 
     // Build pipeline: v4l2src → nullsink
     let mut pipeline = Pipeline::new();

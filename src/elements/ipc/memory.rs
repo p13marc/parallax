@@ -102,9 +102,10 @@ impl Source for MemorySrc {
 
         // Create our own buffer using SharedArena
         if self.arena.is_none() {
-            self.arena = Some(SharedArena::new(self.chunk_size, 8)?);
+            self.arena = Some(SharedArena::new(self.chunk_size, 32)?);
         }
-        let arena = self.arena.as_ref().unwrap();
+        let arena = self.arena.as_mut().unwrap();
+        arena.reclaim();
         let mut slot = arena
             .acquire()
             .ok_or_else(|| Error::Element("arena exhausted".into()))?;

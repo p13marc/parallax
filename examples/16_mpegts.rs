@@ -15,7 +15,7 @@ use parallax::element::{DynAsyncElement, ProduceContext, ProduceResult, Source};
 use parallax::elements::FileSink;
 use parallax::elements::mux::{TsMuxConfig, TsMuxElement, TsMuxStreamType, TsMuxTrack};
 use parallax::error::Result;
-use parallax::memory::CpuArena;
+use parallax::memory::SharedArena;
 use parallax::pipeline::Pipeline;
 
 /// Simulates H.264 NAL units (simplified)
@@ -85,7 +85,7 @@ async fn main() -> Result<()> {
     let mut pipeline = Pipeline::new();
 
     // Video source
-    let video_arena = CpuArena::new(256, 8)?;
+    let video_arena = SharedArena::new(256, 8)?;
     let video_src = pipeline.add_source_with_arena(
         "video_src",
         VideoSource {
@@ -96,7 +96,7 @@ async fn main() -> Result<()> {
     );
 
     // Data source
-    let data_arena = CpuArena::new(256, 8)?;
+    let data_arena = SharedArena::new(256, 8)?;
     let data_src = pipeline.add_source_with_arena(
         "data_src",
         DataSource {

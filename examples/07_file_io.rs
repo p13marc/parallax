@@ -10,7 +10,7 @@
 
 use parallax::elements::{FileSink, FileSrc};
 use parallax::error::Result;
-use parallax::memory::CpuArena;
+use parallax::memory::SharedArena;
 use parallax::pipeline::Pipeline;
 use std::io::Write;
 use tempfile::tempdir;
@@ -31,7 +31,7 @@ async fn main() -> Result<()> {
     println!("Created input file: {:?}", input_path);
 
     // Build pipeline
-    let arena = CpuArena::new(4096, 8)?;
+    let arena = SharedArena::new(4096, 8)?;
 
     let mut pipeline = Pipeline::new();
     let src = pipeline.add_source_with_arena("filesrc", FileSrc::new(&input_path), arena);

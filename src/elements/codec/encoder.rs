@@ -304,7 +304,8 @@ impl Element for Rav1eEncoder {
                         })?);
                 }
 
-                let arena = self.arena.as_ref().unwrap();
+                let arena = self.arena.as_mut().unwrap();
+                arena.reclaim();
                 let mut slot = arena
                     .acquire()
                     .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;

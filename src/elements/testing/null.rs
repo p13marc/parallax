@@ -178,9 +178,12 @@ impl Source for NullSource {
             use crate::metadata::Metadata;
 
             if self.arena.is_none() {
-                self.arena = Some(SharedArena::new(self.buffer_size, 8)?);
+                // Use a reasonable number of slots for test/benchmark workloads
+                self.arena = Some(SharedArena::new(self.buffer_size, 256)?);
             }
-            let arena = self.arena.as_ref().unwrap();
+            let arena = self.arena.as_mut().unwrap();
+            // Reclaim any freed slots before acquiring
+            arena.reclaim();
             let slot = arena
                 .acquire()
                 .ok_or_else(|| Error::Element("arena exhausted".into()))?;

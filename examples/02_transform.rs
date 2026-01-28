@@ -9,12 +9,12 @@
 //!
 //! Run: `cargo run --example 02_transform`
 
-use parallax::buffer::Buffer;
+use parallax::buffer::{Buffer, MemoryHandle};
 use parallax::element::{
     ConsumeContext, Output, ProduceContext, ProduceResult, Sink, Source, Transform,
 };
 use parallax::error::Result;
-use parallax::memory::CpuArena;
+use parallax::memory::SharedArena;
 use parallax::pipeline::Pipeline;
 
 struct CounterSource {
@@ -34,23 +34,28 @@ impl Source for CounterSource {
     }
 }
 
-struct DoubleTransform;
+struct DoubleTransform {
+    arena: SharedArena,
+}
+
+impl DoubleTransform {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            arena: SharedArena::new(64, 8)?,
+        })
+    }
+}
 
 impl Transform for DoubleTransform {
     fn transform(&mut self, buffer: Buffer) -> Result<Output> {
         let value = u32::from_le_bytes(buffer.as_bytes()[..4].try_into().unwrap());
         let doubled = value * 2;
 
-        let segment = std::sync::Arc::new(parallax::memory::HeapSegment::new(4)?);
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                doubled.to_le_bytes().as_ptr(),
-                parallax::memory::MemorySegment::as_mut_ptr(&*segment).unwrap(),
-                4,
-            );
-        }
+        let mut slot = self.arena.acquire().expect("transform arena exhausted");
+        slot.data_mut()[..4].copy_from_slice(&doubled.to_le_bytes());
+
         Ok(Output::Single(Buffer::new(
-            parallax::buffer::MemoryHandle::from_segment(segment),
+            MemoryHandle::with_len(slot, 4),
             buffer.metadata().clone(),
         )))
     }
@@ -68,11 +73,11 @@ impl Sink for PrintSink {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let arena = CpuArena::new(64, 8)?;
+    let arena = SharedArena::new(64, 8)?;
 
     let mut pipeline = Pipeline::new();
     let src = pipeline.add_source_with_arena("src", CounterSource { count: 0, max: 5 }, arena);
-    let transform = pipeline.add_transform("double", DoubleTransform);
+    let transform = pipeline.add_transform("double", DoubleTransform::new()?);
     let sink = pipeline.add_sink("sink", PrintSink);
 
     pipeline.link(src, transform)?;

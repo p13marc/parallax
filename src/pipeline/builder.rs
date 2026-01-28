@@ -27,7 +27,6 @@ use crate::error::Result;
 use crate::memory::SharedArena;
 use crate::pipeline::{NodeId, Pipeline};
 use std::marker::PhantomData;
-use std::sync::Arc;
 
 // ============================================================================
 // State Markers
@@ -69,7 +68,7 @@ pub struct PipelineBuilder<State = Empty> {
     pipeline: Pipeline,
     current_node: Option<NodeId>,
     name_counter: u64,
-    arena: Option<Arc<SharedArena>>,
+    arena: Option<SharedArena>,
     _state: PhantomData<State>,
 }
 
@@ -94,14 +93,14 @@ impl PipelineBuilder<Empty> {
     /// Set an arena for buffer allocation.
     ///
     /// Sources will use this arena to allocate buffers.
-    pub fn with_arena(mut self, arena: Arc<SharedArena>) -> Self {
+    pub fn with_arena(mut self, arena: SharedArena) -> Self {
         self.arena = Some(arena);
         self
     }
 
     /// Create an arena with the given slot size and count.
     pub fn with_new_arena(mut self, slot_size: usize, slot_count: usize) -> Result<Self> {
-        let arena = Arc::new(SharedArena::new(slot_size, slot_count)?);
+        let arena = SharedArena::new(slot_size, slot_count)?;
         self.arena = Some(arena);
         Ok(self)
     }
@@ -436,7 +435,7 @@ pub struct TeeBuilder<'a> {
     pipeline: &'a mut Pipeline,
     tee_node: NodeId,
     name_counter: &'a mut u64,
-    arena: Option<Arc<SharedArena>>,
+    arena: Option<SharedArena>,
 }
 
 impl<'a> TeeBuilder<'a> {
@@ -469,7 +468,7 @@ pub struct BranchBuilder<'a, State = Empty> {
     start_node: NodeId,
     current_node: NodeId,
     name_counter: &'a mut u64,
-    arena: Option<Arc<SharedArena>>,
+    arena: Option<SharedArena>,
     _state: PhantomData<State>,
 }
 
@@ -839,11 +838,10 @@ mod tests {
     async fn test_builder_run() {
         let received = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
 
-        // Keep arena alive for the duration of the test
-        let arena = std::sync::Arc::new(crate::memory::SharedArena::new(64, 8).unwrap());
+        let arena = crate::memory::SharedArena::new(64, 8).unwrap();
 
         let result = PipelineBuilder::new()
-            .with_arena(arena.clone())
+            .with_arena(arena)
             .source(TestSource { count: 0, max: 5 })
             .sink(TestSink {
                 received: received.clone(),
@@ -859,8 +857,5 @@ mod tests {
             5,
             "should have received 5 buffers"
         );
-
-        // Arena dropped after pipeline completes
-        drop(arena);
     }
 }

@@ -17,7 +17,7 @@ use parallax::format::{
     CapsValue, ElementMediaCaps, FormatCaps, FormatMemoryCap, MemoryCaps, PixelFormat,
     VideoFormatCaps,
 };
-use parallax::memory::CpuArena;
+use parallax::memory::SharedArena;
 use parallax::pipeline::Pipeline;
 
 // =============================================================================
@@ -186,7 +186,7 @@ impl Sink for RgbSink {
 async fn main() -> Result<()> {
     println!("=== Multi-Format Caps Negotiation Example ===\n");
 
-    let arena = CpuArena::new(1024, 4)?;
+    let arena = SharedArena::new(1024, 4)?;
 
     // Example 1: Source supports [YUYV, RGB24, I420], Sink accepts [I420]
     // Should negotiate to I420 (the only common format)

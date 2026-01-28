@@ -64,10 +64,10 @@ where
                     if self.arena.is_none()
                         || self.arena.as_ref().map(|a| a.slot_size()).unwrap_or(0) < bytes.len()
                     {
-                        self.arena = Some(SharedArena::new(slot_size, 8)?);
+                        self.arena = Some(SharedArena::new(slot_size, 32)?);
                     }
 
-                    let arena = self.arena.as_ref().unwrap();
+                    let arena = self.arena.as_mut().unwrap();
                     // Reclaim any released slots first
                     arena.reclaim();
                     let mut slot = arena
@@ -178,10 +178,10 @@ where
                 if self.arena.is_none()
                     || self.arena.as_ref().map(|a| a.slot_size()).unwrap_or(0) < out_bytes.len()
                 {
-                    self.arena = Some(SharedArena::new(slot_size, 8)?);
+                    self.arena = Some(SharedArena::new(slot_size, 32)?);
                 }
 
-                let arena = self.arena.as_ref().unwrap();
+                let arena = self.arena.as_mut().unwrap();
                 // Reclaim any released slots first
                 arena.reclaim();
                 let mut slot = arena

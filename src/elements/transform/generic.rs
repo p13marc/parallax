@@ -76,10 +76,11 @@ where
 
         let alloc_size = output.len().max(1);
         if self.arena.is_none() || self.arena.as_ref().unwrap().slot_size() < alloc_size {
-            self.arena = Some(SharedArena::new(alloc_size, 8)?);
+            self.arena = Some(SharedArena::new(alloc_size, 32)?);
         }
 
-        let arena = self.arena.as_ref().unwrap();
+        let arena = self.arena.as_mut().unwrap();
+        arena.reclaim();
         let mut slot = arena
             .acquire()
             .ok_or_else(|| Error::Element("arena exhausted".into()))?;
@@ -169,10 +170,11 @@ where
 
                 let alloc_size = output.len().max(1);
                 if self.arena.is_none() || self.arena.as_ref().unwrap().slot_size() < alloc_size {
-                    self.arena = Some(SharedArena::new(alloc_size, 8)?);
+                    self.arena = Some(SharedArena::new(alloc_size, 32)?);
                 }
 
-                let arena = self.arena.as_ref().unwrap();
+                let arena = self.arena.as_mut().unwrap();
+                arena.reclaim();
                 let mut slot = arena
                     .acquire()
                     .ok_or_else(|| Error::Element("arena exhausted".into()))?;
@@ -277,7 +279,7 @@ impl Chunk {
 
         // Ensure arena is created with chunk size
         if self.arena.is_none() {
-            self.arena = Some(SharedArena::new(self.chunk_size, 8)?);
+            self.arena = Some(SharedArena::new(self.chunk_size, 32)?);
         }
 
         let mut chunks = Vec::new();
@@ -285,7 +287,8 @@ impl Chunk {
         while self.pending.len() >= self.chunk_size {
             let chunk_data: Vec<u8> = self.pending.drain(..self.chunk_size).collect();
 
-            let arena = self.arena.as_ref().unwrap();
+            let arena = self.arena.as_mut().unwrap();
+            arena.reclaim();
             let mut slot = arena
                 .acquire()
                 .ok_or_else(|| Error::Element("arena exhausted".into()))?;
@@ -313,10 +316,11 @@ impl Chunk {
         let len = self.pending.len();
 
         if self.arena.is_none() || self.arena.as_ref().unwrap().slot_size() < len {
-            self.arena = Some(SharedArena::new(len, 8)?);
+            self.arena = Some(SharedArena::new(len, 32)?);
         }
 
-        let arena = self.arena.as_ref().unwrap();
+        let arena = self.arena.as_mut().unwrap();
+        arena.reclaim();
         let mut slot = arena
             .acquire()
             .ok_or_else(|| Error::Element("arena exhausted".into()))?;
@@ -430,10 +434,11 @@ where
         for output in outputs {
             let alloc_size = output.len().max(1);
             if self.arena.is_none() || self.arena.as_ref().unwrap().slot_size() < alloc_size {
-                self.arena = Some(SharedArena::new(alloc_size, 8)?);
+                self.arena = Some(SharedArena::new(alloc_size, 32)?);
             }
 
-            let arena = self.arena.as_ref().unwrap();
+            let arena = self.arena.as_mut().unwrap();
+            arena.reclaim();
             let mut slot = arena
                 .acquire()
                 .ok_or_else(|| Error::Element("arena exhausted".into()))?;
@@ -464,10 +469,11 @@ where
         let alloc_size = output.len().max(1);
 
         if self.arena.is_none() || self.arena.as_ref().unwrap().slot_size() < alloc_size {
-            self.arena = Some(SharedArena::new(alloc_size, 8)?);
+            self.arena = Some(SharedArena::new(alloc_size, 32)?);
         }
 
-        let arena = self.arena.as_ref().unwrap();
+        let arena = self.arena.as_mut().unwrap();
+        arena.reclaim();
         let mut slot = arena
             .acquire()
             .ok_or_else(|| Error::Element("arena exhausted".into()))?;

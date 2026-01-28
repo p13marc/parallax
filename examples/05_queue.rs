@@ -12,7 +12,7 @@
 use parallax::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
 use parallax::elements::Queue;
 use parallax::error::Result;
-use parallax::memory::CpuArena;
+use parallax::memory::SharedArena;
 use parallax::pipeline::Pipeline;
 use std::time::Duration;
 
@@ -48,7 +48,7 @@ impl Sink for SlowSink {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let arena = CpuArena::new(64, 8)?;
+    let arena = SharedArena::new(64, 8)?;
 
     let mut pipeline = Pipeline::new();
 

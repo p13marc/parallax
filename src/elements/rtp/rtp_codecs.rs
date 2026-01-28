@@ -134,7 +134,9 @@ impl Element for RtpH264Depay {
                             Error::Element(format!("Failed to create arena: {}", e))
                         })?);
                 }
-                let arena = self.arena.as_ref().unwrap();
+                let arena = self.arena.as_mut().unwrap();
+
+                arena.reclaim();
 
                 let mut slot = arena
                     .acquire()
@@ -258,7 +260,9 @@ impl Element for RtpH264Pay {
                             Error::Element(format!("Failed to create arena: {}", e))
                         })?);
                 }
-                let arena = self.arena.as_ref().unwrap();
+                let arena = self.arena.as_mut().unwrap();
+
+                arena.reclaim();
 
                 let mut slot = arena
                     .acquire()
@@ -353,7 +357,9 @@ impl Element for RtpH265Depay {
                             Error::Element(format!("Failed to create arena: {}", e))
                         })?);
                 }
-                let arena = self.arena.as_ref().unwrap();
+                let arena = self.arena.as_mut().unwrap();
+
+                arena.reclaim();
 
                 let mut slot = arena
                     .acquire()
@@ -451,7 +457,9 @@ impl Element for RtpH265Pay {
                             Error::Element(format!("Failed to create arena: {}", e))
                         })?);
                 }
-                let arena = self.arena.as_ref().unwrap();
+                let arena = self.arena.as_mut().unwrap();
+
+                arena.reclaim();
 
                 let mut slot = arena
                     .acquire()
@@ -544,7 +552,9 @@ impl Element for RtpVp8Depay {
                             Error::Element(format!("Failed to create arena: {}", e))
                         })?);
                 }
-                let arena = self.arena.as_ref().unwrap();
+                let arena = self.arena.as_mut().unwrap();
+
+                arena.reclaim();
 
                 let mut slot = arena
                     .acquire()
@@ -646,7 +656,9 @@ impl Element for RtpVp8Pay {
                             Error::Element(format!("Failed to create arena: {}", e))
                         })?);
                 }
-                let arena = self.arena.as_ref().unwrap();
+                let arena = self.arena.as_mut().unwrap();
+
+                arena.reclaim();
 
                 let mut slot = arena
                     .acquire()
@@ -743,7 +755,9 @@ impl Element for RtpVp9Depay {
                             Error::Element(format!("Failed to create arena: {}", e))
                         })?);
                 }
-                let arena = self.arena.as_ref().unwrap();
+                let arena = self.arena.as_mut().unwrap();
+
+                arena.reclaim();
 
                 let mut slot = arena
                     .acquire()
@@ -840,7 +854,9 @@ impl Element for RtpVp9Pay {
                             Error::Element(format!("Failed to create arena: {}", e))
                         })?);
                 }
-                let arena = self.arena.as_ref().unwrap();
+                let arena = self.arena.as_mut().unwrap();
+
+                arena.reclaim();
 
                 let mut slot = arena
                     .acquire()
@@ -937,7 +953,9 @@ impl Element for RtpOpusDepay {
                             Error::Element(format!("Failed to create arena: {}", e))
                         })?);
                 }
-                let arena = self.arena.as_ref().unwrap();
+                let arena = self.arena.as_mut().unwrap();
+
+                arena.reclaim();
 
                 let mut slot = arena
                     .acquire()

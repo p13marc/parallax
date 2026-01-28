@@ -196,9 +196,10 @@ impl crate::element::Source for TcpSrc {
             // No buffer provided, allocate from arena
             // Initialize arena lazily if needed
             if self.arena.is_none() {
-                self.arena = Some(SharedArena::new(self.buffer_size, 8)?);
+                self.arena = Some(SharedArena::new(self.buffer_size, 32)?);
             }
-            let arena = self.arena.as_ref().unwrap();
+            let arena = self.arena.as_mut().unwrap();
+            arena.reclaim();
 
             let mut slot = arena
                 .acquire()
@@ -358,9 +359,11 @@ impl AsyncSource for AsyncTcpSrc {
             // No buffer provided, allocate from arena
             // Initialize arena lazily if needed
             if self.arena.is_none() {
-                self.arena = Some(SharedArena::new(self.buffer_size, 8)?);
+                self.arena = Some(SharedArena::new(self.buffer_size, 32)?);
             }
-            let arena = self.arena.as_ref().unwrap();
+            let arena = self.arena.as_mut().unwrap();
+
+            arena.reclaim();
 
             let mut slot = arena
                 .acquire()

@@ -163,9 +163,11 @@ impl crate::element::Source for UdpSrc {
             // No buffer provided, allocate from arena
             // Initialize arena lazily if needed
             if self.arena.is_none() {
-                self.arena = Some(SharedArena::new(self.buffer_size, 8)?);
+                self.arena = Some(SharedArena::new(self.buffer_size, 32)?);
             }
-            let arena = self.arena.as_ref().unwrap();
+            let arena = self.arena.as_mut().unwrap();
+
+            arena.reclaim();
 
             let mut slot = arena
                 .acquire()
@@ -431,9 +433,11 @@ impl AsyncUdpSrc {
     pub async fn recv(&mut self) -> Result<Option<Buffer>> {
         // Initialize arena lazily if needed
         if self.arena.is_none() {
-            self.arena = Some(SharedArena::new(self.buffer_size, 8)?);
+            self.arena = Some(SharedArena::new(self.buffer_size, 32)?);
         }
-        let arena = self.arena.as_ref().unwrap();
+        let arena = self.arena.as_mut().unwrap();
+
+        arena.reclaim();
 
         let mut slot = arena
             .acquire()
@@ -473,9 +477,11 @@ impl crate::element::AsyncSource for AsyncUdpSrc {
             // No buffer provided, allocate from arena
             // Initialize arena lazily if needed
             if self.arena.is_none() {
-                self.arena = Some(SharedArena::new(self.buffer_size, 8)?);
+                self.arena = Some(SharedArena::new(self.buffer_size, 32)?);
             }
-            let arena = self.arena.as_ref().unwrap();
+            let arena = self.arena.as_mut().unwrap();
+
+            arena.reclaim();
 
             let mut slot = arena
                 .acquire()

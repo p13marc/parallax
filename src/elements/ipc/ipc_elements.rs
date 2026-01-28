@@ -38,7 +38,6 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 /// IPC sink that sends buffers to another process.
 ///
@@ -51,7 +50,7 @@ pub struct IpcSink {
     /// Connected socket (if any).
     socket: Option<UnixStream>,
     /// Shared memory arena for buffers (refcount in shared memory).
-    arena: Option<Arc<SharedArena>>,
+    arena: Option<SharedArena>,
     /// Whether we're the server (created the socket).
     is_server: bool,
     /// Listener for incoming connections (server mode).
@@ -140,7 +139,7 @@ impl IpcSink {
             // Create arena and send registration
             if self.arena.is_none() {
                 let arena = SharedArena::new(64 * 1024, 64)?; // 64KB slots, 64 slots = 4MB
-                self.arena = Some(Arc::new(arena));
+                self.arena = Some(arena);
             }
 
             // Send arena registration message
@@ -500,7 +499,8 @@ impl Source for IpcSrc {
                         // Use 64KB slots by default, matching IpcSink
                         self.arena = Some(SharedArena::new(64 * 1024, 64)?);
                     }
-                    let arena = self.arena.as_ref().unwrap();
+                    let arena = self.arena.as_mut().unwrap();
+                    arena.reclaim();
                     let arena_slot = arena
                         .acquire()
                         .ok_or_else(|| Error::Element("arena exhausted".into()))?;

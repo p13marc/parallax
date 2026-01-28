@@ -1604,7 +1604,7 @@ pub trait AsyncElementDyn {
 pub struct SourceAdapter<S: Source> {
     inner: S,
     /// Arena for pre-allocated buffers (uses SharedArena for cross-process support).
-    arena: Option<std::sync::Arc<crate::memory::SharedArena>>,
+    arena: Option<crate::memory::SharedArena>,
     /// Buffer pool for high-level pool API with backpressure.
     pool: Option<std::sync::Arc<dyn crate::memory::BufferPool>>,
 }
@@ -1620,7 +1620,7 @@ impl<S: Source> SourceAdapter<S> {
     }
 
     /// Create a source adapter with an arena for buffer allocation.
-    pub fn with_arena(source: S, arena: std::sync::Arc<crate::memory::SharedArena>) -> Self {
+    pub fn with_arena(source: S, arena: crate::memory::SharedArena) -> Self {
         Self {
             inner: source,
             arena: Some(arena),
@@ -1638,7 +1638,7 @@ impl<S: Source> SourceAdapter<S> {
     }
 
     /// Set the arena for buffer allocation.
-    pub fn set_arena(&mut self, arena: std::sync::Arc<crate::memory::SharedArena>) {
+    pub fn set_arena(&mut self, arena: crate::memory::SharedArena) {
         self.arena = Some(arena);
     }
 
@@ -2100,7 +2100,7 @@ impl<T: Transform + Send + 'static> SendAsyncElementDyn for TransformAdapter<T> 
 pub struct AsyncSourceAdapter<S: AsyncSource> {
     inner: S,
     /// Arena for pre-allocated buffers (uses SharedArena for cross-process support).
-    arena: Option<std::sync::Arc<crate::memory::SharedArena>>,
+    arena: Option<crate::memory::SharedArena>,
 }
 
 impl<S: AsyncSource> AsyncSourceAdapter<S> {
@@ -2113,7 +2113,7 @@ impl<S: AsyncSource> AsyncSourceAdapter<S> {
     }
 
     /// Create an async source adapter with an arena for buffer allocation.
-    pub fn with_arena(source: S, arena: std::sync::Arc<crate::memory::SharedArena>) -> Self {
+    pub fn with_arena(source: S, arena: crate::memory::SharedArena) -> Self {
         Self {
             inner: source,
             arena: Some(arena),
@@ -2121,7 +2121,7 @@ impl<S: AsyncSource> AsyncSourceAdapter<S> {
     }
 
     /// Set the arena for buffer allocation.
-    pub fn set_arena(&mut self, arena: std::sync::Arc<crate::memory::SharedArena>) {
+    pub fn set_arena(&mut self, arena: crate::memory::SharedArena) {
         self.arena = Some(arena);
     }
 
@@ -2706,7 +2706,7 @@ mod tests {
     #[tokio::test]
     async fn test_source_adapter() {
         let source = TestSource { count: 0, max: 3 };
-        let arena = std::sync::Arc::new(SharedArena::new(1024, 8).unwrap());
+        let arena = SharedArena::new(1024, 8).unwrap();
         let mut adapter = SourceAdapter::with_arena(source, arena);
 
         assert_eq!(AsyncElementDyn::element_type(&adapter), ElementType::Source);

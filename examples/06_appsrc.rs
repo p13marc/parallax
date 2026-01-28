@@ -12,20 +12,17 @@
 use parallax::buffer::{Buffer, MemoryHandle};
 use parallax::elements::{AppSink, AppSrc};
 use parallax::error::Result;
-use parallax::memory::{CpuArena, HeapSegment, MemorySegment};
+use parallax::memory::SharedArena;
 use parallax::metadata::Metadata;
 use parallax::pipeline::Pipeline;
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-fn make_buffer(data: &[u8], seq: u64) -> Buffer {
-    let segment = Arc::new(HeapSegment::new(data.len()).unwrap());
-    unsafe {
-        std::ptr::copy_nonoverlapping(data.as_ptr(), segment.as_mut_ptr().unwrap(), data.len());
-    }
+fn make_buffer(arena: &SharedArena, data: &[u8], seq: u64) -> Buffer {
+    let mut slot = arena.acquire().expect("arena exhausted");
+    slot.data_mut()[..data.len()].copy_from_slice(data);
     Buffer::new(
-        MemoryHandle::from_segment_with_len(segment, data.len()),
+        MemoryHandle::with_len(slot, data.len()),
         Metadata::from_sequence(seq),
     )
 }
@@ -40,10 +37,13 @@ async fn main() -> Result<()> {
     let appsink = AppSink::new();
     let sink_handle = appsink.handle();
 
+    // Create arena for producer buffers
+    let producer_arena = SharedArena::new(256, 16)?;
+
     // Build pipeline
-    let arena = CpuArena::new(256, 8)?;
+    let pipeline_arena = SharedArena::new(256, 8)?;
     let mut pipeline = Pipeline::new();
-    let src = pipeline.add_source_with_arena("appsrc", appsrc, arena);
+    let src = pipeline.add_source_with_arena("appsrc", appsrc, pipeline_arena);
     let sink = pipeline.add_sink("appsink", appsink);
     pipeline.link(src, sink)?;
 
@@ -52,7 +52,7 @@ async fn main() -> Result<()> {
         for i in 0..5u64 {
             let msg = format!("Message {}", i);
             src_handle
-                .push_buffer(make_buffer(msg.as_bytes(), i))
+                .push_buffer(make_buffer(&producer_arena, msg.as_bytes(), i))
                 .unwrap();
             println!("[Producer] Pushed: {}", msg);
             thread::sleep(Duration::from_millis(10));

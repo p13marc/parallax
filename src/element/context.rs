@@ -840,7 +840,7 @@ pub struct ElementContext {
     /// Name of this element instance.
     name: String,
     /// Optional shared arena for buffer allocation.
-    arena: Option<std::sync::Arc<crate::memory::SharedArena>>,
+    arena: Option<crate::memory::SharedArena>,
 }
 
 impl ElementContext {
@@ -853,10 +853,7 @@ impl ElementContext {
     }
 
     /// Create a context with a shared arena.
-    pub fn with_arena(
-        name: impl Into<String>,
-        arena: std::sync::Arc<crate::memory::SharedArena>,
-    ) -> Self {
+    pub fn with_arena(name: impl Into<String>, arena: crate::memory::SharedArena) -> Self {
         Self {
             name: name.into(),
             arena: Some(arena),
@@ -869,12 +866,12 @@ impl ElementContext {
     }
 
     /// Get the shared arena, if one is configured.
-    pub fn arena(&self) -> Option<&std::sync::Arc<crate::memory::SharedArena>> {
+    pub fn arena(&self) -> Option<&crate::memory::SharedArena> {
         self.arena.as_ref()
     }
 
     /// Set the shared arena.
-    pub fn set_arena(&mut self, arena: std::sync::Arc<crate::memory::SharedArena>) {
+    pub fn set_arena(&mut self, arena: crate::memory::SharedArena) {
         self.arena = Some(arena);
     }
 }
@@ -891,7 +888,6 @@ impl std::fmt::Debug for ElementContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     #[test]
     fn test_context_creation() {
@@ -902,11 +898,12 @@ mod tests {
 
     #[test]
     fn test_context_with_arena() {
-        let arena = Arc::new(SharedArena::new(1024, 4).unwrap());
+        let arena = SharedArena::new(1024, 4).unwrap();
+        let arena_id = arena.id();
 
-        let ctx = ElementContext::with_arena("test-element", arena.clone());
+        let ctx = ElementContext::with_arena("test-element", arena);
         assert!(ctx.arena().is_some());
-        assert_eq!(ctx.arena().unwrap().id(), arena.id());
+        assert_eq!(ctx.arena().unwrap().id(), arena_id);
     }
 
     // ProcessContext tests

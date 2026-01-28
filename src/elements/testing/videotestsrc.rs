@@ -608,9 +608,12 @@ impl Source for VideoTestSrc {
         } else {
             // No buffer provided - allocate our own using SharedArena
             if self.arena.is_none() {
-                self.arena = Some(SharedArena::new(frame_size, 8)?);
+                // Use enough slots for typical video pipeline buffering
+                self.arena = Some(SharedArena::new(frame_size, 64)?);
             }
-            let arena = self.arena.as_ref().unwrap();
+            let arena = self.arena.as_mut().unwrap();
+            // Reclaim any freed slots before acquiring
+            arena.reclaim();
             let mut slot = arena
                 .acquire()
                 .ok_or_else(|| Error::Element("arena exhausted".into()))?;

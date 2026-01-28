@@ -583,7 +583,9 @@ impl RtspSession {
                     .map_err(|e| Error::Element(format!("Failed to create arena: {}", e)))?,
             );
         }
-        let arena = self.arena.as_ref().unwrap();
+        let arena = self.arena.as_mut().unwrap();
+
+        arena.reclaim();
 
         let mut slot = arena
             .acquire()

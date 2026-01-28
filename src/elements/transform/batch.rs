@@ -143,16 +143,17 @@ impl Batch {
         let alloc_size = total_len.max(1);
 
         if self.arena.is_none() {
-            self.arena = Some(SharedArena::new(alloc_size, 8)?);
+            self.arena = Some(SharedArena::new(alloc_size, 32)?);
         }
 
         // Ensure arena slot is large enough
         let arena = self.arena.as_ref().unwrap();
         if arena.slot_size() < alloc_size {
-            self.arena = Some(SharedArena::new(alloc_size, 8)?);
+            self.arena = Some(SharedArena::new(alloc_size, 32)?);
         }
 
-        let arena = self.arena.as_ref().unwrap();
+        let arena = self.arena.as_mut().unwrap();
+        arena.reclaim();
         let mut slot = arena
             .acquire()
             .ok_or_else(|| Error::Element("arena exhausted".into()))?;
@@ -316,13 +317,14 @@ impl Unbatch {
 
         // Ensure arena is created with appropriate chunk size
         if self.arena.is_none() {
-            self.arena = Some(SharedArena::new(self.chunk_size, 8)?);
+            self.arena = Some(SharedArena::new(self.chunk_size, 32)?);
         }
 
         while offset < data.len() {
             let chunk_len = (data.len() - offset).min(self.chunk_size);
 
-            let arena = self.arena.as_ref().unwrap();
+            let arena = self.arena.as_mut().unwrap();
+            arena.reclaim();
             let mut slot = arena
                 .acquire()
                 .ok_or_else(|| Error::Element("arena exhausted".into()))?;

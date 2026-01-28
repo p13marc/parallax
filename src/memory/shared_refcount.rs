@@ -90,7 +90,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 const ARENA_MAGIC: u64 = 0x504C585F4152454E; // "PLX_AREN" in ASCII
 
 /// Current arena format version.
-const ARENA_VERSION: u32 = 2; // Bumped for queue-based release
+const ARENA_VERSION: u32 = 3; // Bumped for arena-level refcount
 
 /// Size of the release queue (must be power of 2 for efficient modulo).
 /// This limits how many slots can be pending release at once.
@@ -273,8 +273,11 @@ struct ArenaHeader {
     arena_id: AtomicU64,
     /// Offset from arena base to slot headers.
     slot_headers_offset: AtomicU32,
+    /// Arena-level reference count (for cross-process lifetime management).
+    /// When this reaches 0, the arena can be unmapped.
+    refcount: AtomicU32,
     /// Reserved for future use.
-    _reserved: [u8; 20],
+    _reserved: [u8; 16],
 }
 
 impl ArenaHeader {
@@ -510,6 +513,7 @@ impl SharedArena {
             h.arena_id.store(arena_id, Ordering::Release);
             h.slot_headers_offset
                 .store(slot_headers_offset as u32, Ordering::Release);
+            h.refcount.store(1, Ordering::Release); // Initial refcount = 1
         }
 
         // Initialize release queue
@@ -582,9 +586,18 @@ impl SharedArena {
             header.as_ref().validate()?;
         }
 
-        // Read layout from header
+        // Read layout from header and increment refcount
         let (slot_count, slot_size, data_offset, arena_id, slot_headers_offset) = unsafe {
             let h = header.as_ref();
+            // Increment arena refcount (cross-process safe)
+            let old_refcount = h.refcount.fetch_add(1, Ordering::AcqRel);
+            if old_refcount > i32::MAX as u32 {
+                // Overflow protection - decrement and fail
+                h.refcount.fetch_sub(1, Ordering::AcqRel);
+                // Unmap before returning error
+                let _ = rustix::mm::munmap(base.as_ptr().cast(), total_size);
+                return Err(Error::AllocationFailed("arena refcount overflow".into()));
+            }
             (
                 h.slot_count.load(Ordering::Acquire) as usize,
                 h.slot_size.load(Ordering::Acquire) as usize,
@@ -632,6 +645,7 @@ impl SharedArena {
             let sh = unsafe { &*self.slot_headers.as_ptr().add(i) };
             if sh.try_acquire() {
                 return Some(SharedSlotRef {
+                    arena: self.clone(),
                     release_queue: self.release_queue,
                     slot_header: unsafe { NonNull::new_unchecked(sh as *const _ as *mut _) },
                     data_ptr: unsafe {
@@ -643,10 +657,7 @@ impl SharedArena {
                     },
                     data_len: self.slot_size,
                     slot_index: i as u32,
-                    arena_id: self.arena_id,
                     data_offset: self.data_offset + i * self.slot_size,
-                    arena_raw_fd: self.raw_fd(),
-                    arena_total_size: self.total_size,
                 });
             }
         }
@@ -779,6 +790,7 @@ impl SharedArena {
         sh.inc_ref();
 
         Some(SharedSlotRef {
+            arena: self.clone(),
             release_queue: self.release_queue,
             slot_header: unsafe { NonNull::new_unchecked(sh as *const _ as *mut _) },
             data_ptr: unsafe {
@@ -786,19 +798,64 @@ impl SharedArena {
             },
             data_len: ipc_ref.len,
             slot_index: ipc_ref.slot_index,
-            arena_id: self.arena_id,
             data_offset: ipc_ref.data_offset,
-            arena_raw_fd: self.raw_fd(),
-            arena_total_size: self.total_size,
         })
+    }
+}
+
+impl Clone for SharedArena {
+    /// Clone the arena, incrementing the shared refcount.
+    ///
+    /// This works across processes - the refcount is stored in shared memory.
+    /// In-process clones share the same mmap and only increment the refcount.
+    /// The mmap is only unmapped when the last clone is dropped.
+    fn clone(&self) -> Self {
+        // Increment refcount in shared memory
+        let header = unsafe { self.header.as_ref() };
+        let old_refcount = header.refcount.fetch_add(1, Ordering::AcqRel);
+        if old_refcount > i32::MAX as u32 {
+            // Overflow protection
+            header.refcount.fetch_sub(1, Ordering::AcqRel);
+            panic!("SharedArena refcount overflow");
+        }
+
+        // Duplicate the fd so each clone has its own handle
+        let new_fd = rustix::io::fcntl_dupfd_cloexec(&self.fd, 0).expect("failed to dup arena fd");
+
+        // Share the same mmap - don't create a new one!
+        // This is safe because the mmap is MAP_SHARED and all clones
+        // share the same refcount. The mmap is only unmapped when
+        // the refcount drops to 0.
+        Self {
+            fd: new_fd,
+            base: self.base,
+            total_size: self.total_size,
+            header: self.header,
+            release_queue: self.release_queue,
+            slot_headers: self.slot_headers,
+            data_offset: self.data_offset,
+            slot_size: self.slot_size,
+            slot_count: self.slot_count,
+            arena_id: self.arena_id,
+            is_owner: self.is_owner,
+        }
     }
 }
 
 impl Drop for SharedArena {
     fn drop(&mut self) {
-        unsafe {
-            let _ = rustix::mm::munmap(self.base.as_ptr().cast(), self.total_size);
+        // Decrement refcount in shared memory
+        let header = unsafe { self.header.as_ref() };
+        let old_refcount = header.refcount.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(old_refcount > 0, "SharedArena refcount underflow");
+
+        // Only unmap when we're the last reference
+        if old_refcount == 1 {
+            unsafe {
+                let _ = rustix::mm::munmap(self.base.as_ptr().cast(), self.total_size);
+            }
         }
+        // fd is dropped automatically, closing our dup'd handle
     }
 }
 
@@ -828,6 +885,9 @@ impl AsFd for SharedArena {
 /// When the refcount reaches 0, the slot index is pushed to the release
 /// queue for the owner to reclaim.
 pub struct SharedSlotRef {
+    /// Clone of the arena - keeps the mmap alive while slot is in use.
+    /// This uses the shared-memory refcount, so it works across processes.
+    arena: SharedArena,
     /// Pointer to the release queue (for pushing on drop).
     release_queue: NonNull<ReleaseQueue>,
     /// Pointer to the slot header (contains refcount).
@@ -838,14 +898,8 @@ pub struct SharedSlotRef {
     data_len: usize,
     /// Slot index in the arena (for pushing to release queue).
     slot_index: u32,
-    /// Arena ID (for IPC serialization).
-    arena_id: u64,
     /// Offset from arena base to data (for IPC).
     data_offset: usize,
-    /// Raw fd of the arena (for IPC - send this to other processes).
-    arena_raw_fd: i32,
-    /// Total size of the arena (for IPC).
-    arena_total_size: usize,
 }
 
 impl SharedSlotRef {
@@ -867,7 +921,7 @@ impl SharedSlotRef {
     #[inline]
     pub fn ipc_ref(&self) -> SharedIpcSlotRef {
         SharedIpcSlotRef {
-            arena_id: self.arena_id,
+            arena_id: self.arena.id(),
             slot_index: self.slot_index,
             data_offset: self.data_offset,
             len: self.data_len,
@@ -883,7 +937,7 @@ impl SharedSlotRef {
     /// Get the arena ID.
     #[inline]
     pub fn arena_id(&self) -> u64 {
-        self.arena_id
+        self.arena.id()
     }
 
     /// Get the current refcount (for debugging).
@@ -909,13 +963,13 @@ impl SharedSlotRef {
     /// Use this to send the arena fd via SCM_RIGHTS to other processes.
     #[inline]
     pub fn arena_fd(&self) -> i32 {
-        self.arena_raw_fd
+        self.arena.raw_fd()
     }
 
     /// Get the arena's total size (for IPC).
     #[inline]
     pub fn arena_size(&self) -> usize {
-        self.arena_total_size
+        self.arena.total_size()
     }
 
     /// Get raw pointer to data.
@@ -952,15 +1006,13 @@ impl SharedSlotRef {
         }
 
         SharedSlotRef {
+            arena: self.arena.clone(),
             release_queue: self.release_queue,
             slot_header: self.slot_header,
             data_ptr: unsafe { NonNull::new_unchecked(self.data_ptr.as_ptr().add(offset)) },
             data_len: len,
             slot_index: self.slot_index,
-            arena_id: self.arena_id,
             data_offset: self.data_offset + offset,
-            arena_raw_fd: self.arena_raw_fd,
-            arena_total_size: self.arena_total_size,
         }
     }
 }
@@ -973,15 +1025,13 @@ impl Clone for SharedSlotRef {
         }
 
         Self {
+            arena: self.arena.clone(),
             release_queue: self.release_queue,
             slot_header: self.slot_header,
             data_ptr: self.data_ptr,
             data_len: self.data_len,
             slot_index: self.slot_index,
-            arena_id: self.arena_id,
             data_offset: self.data_offset,
-            arena_raw_fd: self.arena_raw_fd,
-            arena_total_size: self.arena_total_size,
         }
     }
 }
@@ -1010,7 +1060,7 @@ unsafe impl Sync for SharedSlotRef {}
 impl std::fmt::Debug for SharedSlotRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SharedSlotRef")
-            .field("arena_id", &self.arena_id)
+            .field("arena_id", &self.arena.id())
             .field("slot_index", &self.slot_index)
             .field("len", &self.data_len)
             .field("refcount", &self.refcount())
@@ -1366,17 +1416,16 @@ mod tests {
 
     #[test]
     fn test_concurrent_refcount() {
-        use std::sync::Arc;
         use std::thread;
 
-        let arena = Arc::new(SharedArena::new(4096, 4).unwrap());
+        let arena = SharedArena::new(4096, 4).unwrap();
         let slot = arena.acquire().unwrap();
         let ipc_ref = slot.ipc_ref();
 
         // Spawn multiple threads that clone/drop the slot
         let handles: Vec<_> = (0..10)
             .map(|_| {
-                let arena = Arc::clone(&arena);
+                let arena = arena.clone();
                 let ipc_ref = ipc_ref;
                 thread::spawn(move || {
                     for _ in 0..100 {
@@ -1409,14 +1458,14 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        let arena = Arc::new(SharedArena::new(4096, 64).unwrap());
+        let arena = SharedArena::new(4096, 64).unwrap();
 
         // Acquire all slots
         let slots: Vec<_> = (0..64).filter_map(|_| arena.acquire()).collect();
         assert_eq!(slots.len(), 64);
         assert_eq!(arena.free_count(), 0);
 
-        // Drop slots from multiple threads
+        // Drop slots from multiple threads (Arc is for the Mutex, not SharedArena)
         let slots = Arc::new(std::sync::Mutex::new(slots));
         let handles: Vec<_> = (0..8)
             .map(|_| {
@@ -1442,5 +1491,121 @@ mod tests {
         assert_eq!(reclaimed, 64);
         assert_eq!(arena.free_count(), 64);
         assert_eq!(arena.pending_count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod clone_drop_tests {
+    use super::*;
+
+    #[test]
+    fn test_clone_then_drop_original() {
+        let arena = SharedArena::new(4096, 4).unwrap();
+        let clone = arena.clone();
+
+        // Drop original - clone should still work
+        drop(arena);
+
+        // Clone should still be usable
+        let slot = clone.acquire().unwrap();
+        assert_eq!(slot.len(), 4096);
+    }
+
+    #[test]
+    fn test_clone_acquire_then_drop_original() {
+        let arena = SharedArena::new(4096, 4).unwrap();
+        let clone = arena.clone();
+
+        // Acquire from original
+        let mut slot = arena.acquire().unwrap();
+        slot.data_mut()[0] = 42;
+
+        // Drop original
+        drop(arena);
+
+        // Slot should still be valid (data in shared memory)
+        assert_eq!(slot.data()[0], 42);
+
+        // Clone should still work
+        let slot2 = clone.acquire().unwrap();
+        assert_eq!(slot2.len(), 4096);
+    }
+
+    #[test]
+    fn test_multiple_clones_sequential_drop() {
+        let arena = SharedArena::new(4096, 4).unwrap();
+        let clone1 = arena.clone();
+        let clone2 = arena.clone();
+        let clone3 = arena.clone();
+
+        drop(arena);
+        drop(clone1);
+
+        // clone2 and clone3 should still work
+        let slot = clone2.acquire().unwrap();
+        assert_eq!(slot.len(), 4096);
+
+        drop(clone2);
+
+        // clone3 should still work
+        let slot2 = clone3.acquire().unwrap();
+        assert_eq!(slot2.len(), 4096);
+    }
+}
+
+#[cfg(test)]
+mod pipeline_sim_tests {
+    use super::*;
+
+    // Simulate what the pipeline does: clone arena into adapter, drop original
+    #[test]
+    fn test_arena_moved_to_adapter() {
+        struct MockSourceAdapter {
+            arena: Option<SharedArena>,
+        }
+
+        let arena = SharedArena::new(64, 8).unwrap();
+
+        // Clone the arena like PipelineBuilder does
+        let cloned = arena.clone();
+
+        // Move clone into adapter (like SourceAdapter::with_arena does)
+        let adapter = MockSourceAdapter {
+            arena: Some(cloned),
+        };
+
+        // Original arena is dropped (like in PipelineBuilder after .source() call)
+        drop(arena);
+
+        // Now use the arena in the adapter
+        let arena_ref = adapter.arena.as_ref().unwrap();
+        let mut slot = arena_ref.acquire().unwrap();
+
+        // Write to the slot
+        slot.data_mut()[0] = 42;
+        assert_eq!(slot.data()[0], 42);
+    }
+
+    #[test]
+    fn test_arena_with_box() {
+        struct MockSourceAdapter {
+            arena: Option<SharedArena>,
+        }
+
+        let arena = SharedArena::new(64, 8).unwrap();
+        let cloned = arena.clone();
+
+        // Box the adapter like Pipeline does
+        let adapter = Box::new(MockSourceAdapter {
+            arena: Some(cloned),
+        });
+
+        drop(arena);
+
+        // Use boxed adapter
+        let arena_ref = adapter.arena.as_ref().unwrap();
+        let mut slot = arena_ref.acquire().unwrap();
+        slot.data_mut()[0] = 42;
+        assert_eq!(slot.data()[0], 42);
     }
 }

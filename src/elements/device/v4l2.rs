@@ -40,15 +40,18 @@ use crate::metadata::Metadata;
 use super::DeviceError;
 
 /// Shared arena for V4L2 buffers.
-fn v4l2_arena() -> &'static SharedArena {
-    static ARENA: OnceLock<SharedArena> = OnceLock::new();
+fn v4l2_arena() -> &'static std::sync::Mutex<SharedArena> {
+    static ARENA: OnceLock<std::sync::Mutex<SharedArena>> = OnceLock::new();
     // V4L2 frames can be large (4K = ~12MB for YUYV), use generous slot size
-    ARENA.get_or_init(|| SharedArena::new(16 * 1024 * 1024, 8).unwrap())
+    // Use 32 slots for pipeline buffering
+    ARENA.get_or_init(|| std::sync::Mutex::new(SharedArena::new(16 * 1024 * 1024, 32).unwrap()))
 }
 
 /// Helper to create a buffer from a slice.
 fn buffer_from_slice(data: &[u8]) -> Buffer {
-    let mut slot = v4l2_arena().acquire().unwrap();
+    let mut arena = v4l2_arena().lock().unwrap();
+    arena.reclaim();
+    let mut slot = arena.acquire().expect("v4l2 arena exhausted");
     slot.data_mut()[..data.len()].copy_from_slice(data);
     let handle = MemoryHandle::with_len(slot, data.len());
     Buffer::new(handle, Metadata::default())

@@ -732,7 +732,7 @@ impl Pipeline {
     ///     }
     /// }
     ///
-    /// let arena = Arc::new(SharedArena::new(1024, 4)?);
+    /// let arena = SharedArena::new(1024, 4)?;
     /// let mut pipeline = Pipeline::new();
     /// let src = pipeline.add_source_with_arena("my_src", MySource { sent: false }, arena);
     /// ```
@@ -740,7 +740,7 @@ impl Pipeline {
         &mut self,
         name: impl Into<String>,
         source: S,
-        arena: std::sync::Arc<crate::memory::SharedArena>,
+        arena: crate::memory::SharedArena,
     ) -> NodeId {
         self.add_node(
             name,
