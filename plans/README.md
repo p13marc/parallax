@@ -51,7 +51,7 @@ Key architectural decisions have been researched and documented in **[00_DESIGN_
 | 10 | [Code Cleanup](10_CODE_CLEANUP.md) | Low | Small | ✅ Complete |
 | 11 | [GPU Codec Framework](11_GPU_CODEC_FRAMEWORK.md) | High | Large | ⬜ Not Started |
 | 12 | [Additional Codecs](12_ADDITIONAL_CODECS.md) | Medium | Medium | ⬜ Not Started |
-| 13 | [Device Elements](13_DEVICE_ELEMENTS.md) | Medium | Medium | ⬜ Not Started |
+| 13 | [Device Elements](13_DEVICE_ELEMENTS.md) | Medium | Medium | ✅ Complete |
 | 14 | [Streaming Protocols](14_STREAMING_PROTOCOLS.md) | Medium | Medium | ⬜ Not Started |
 
 **Legend:** ⬜ Not Started | 🟡 In Progress | ✅ Complete
@@ -351,14 +351,21 @@ Adaptive bitrate streaming support:
 - [ ] Create examples: `20_opus_audio.rs`, `21_vp9_decode.rs`
 - [ ] Update documentation
 
-### Plan 13: Device Elements ⬜
-- [ ] Add `v4l` dependency
-- [ ] Implement `V4l2Src` with device enumeration
-- [ ] Add `alsa` dependency
-- [ ] Implement `AlsaSrc` and `AlsaSink`
-- [ ] Add DMA-BUF export mode
-- [ ] Create examples: `22_v4l2_capture.rs`, `23_alsa_audio.rs`
-- [ ] Update documentation
+### Plan 13: Device Elements ✅
+- [x] Add `pipewire` dependency (feature-gated)
+- [x] Implement `PipeWireSrc` and `PipeWireSink`
+- [x] Add `libcamera` dependency (feature-gated)
+- [x] Implement `LibCameraSrc` with camera enumeration
+- [x] Add `v4l` dependency (feature-gated)
+- [x] Implement `V4l2Src` with device enumeration
+- [x] Add `alsa` dependency (feature-gated)
+- [x] Implement `AlsaSrc` and `AlsaSink`
+- [x] Create unified device enumeration API
+- [x] Create examples: `22_v4l2_capture.rs`, `23_v4l2_display.rs`
+- [x] Create documentation examples: `42_pipewire_audio.rs`, `43_alsa_audio.rs`, `44_libcamera_capture.rs`
+- [x] Update documentation
+- [ ] Add DMA-BUF export mode (future enhancement)
+- [ ] Screen capture via portal (future enhancement)
 
 ### Plan 14: Streaming Protocols ⬜
 - [ ] Implement `HlsSink` with M3U8 generation

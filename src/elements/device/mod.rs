@@ -60,7 +60,7 @@ pub use self::libcamera::{LibCameraConfig, LibCameraInfo, LibCameraSrc};
 pub use self::v4l2::{V4l2DeviceInfo, V4l2Src};
 
 #[cfg(feature = "alsa")]
-pub use self::alsa::{AlsaDeviceInfo, AlsaSink, AlsaSrc};
+pub use self::alsa::{AlsaDeviceInfo, AlsaFormat, AlsaSampleFormat, AlsaSink, AlsaSrc};
 
 /// Device capture/playback errors.
 #[derive(Debug, Error)]
@@ -263,6 +263,7 @@ pub struct AudioCaptureDevice {
 
 /// Enumerate all available video capture devices.
 pub fn enumerate_video_devices() -> Result<Vec<VideoCaptureDevice>> {
+    #[allow(unused_mut)]
     let mut devices = Vec::new();
 
     #[cfg(feature = "libcamera")]
@@ -327,7 +328,10 @@ pub fn enumerate_audio_devices() -> Result<Vec<AudioCaptureDevice>> {
         if let Ok(alsa_devices) = alsa::enumerate_devices() {
             for dev in alsa_devices {
                 // Skip if we already have this device from PipeWire
-                if !devices.iter().any(|d| d.name == dev.name) {
+                if !devices
+                    .iter()
+                    .any(|d: &AudioCaptureDevice| d.name == dev.name)
+                {
                     devices.push(AudioCaptureDevice {
                         id: dev.name.clone(),
                         name: dev.description.clone(),

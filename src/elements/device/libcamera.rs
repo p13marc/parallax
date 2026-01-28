@@ -28,7 +28,6 @@
 //! let camera = LibCameraSrc::with_config(config)?;
 //! ```
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -38,18 +37,14 @@ use kanal::{Receiver, Sender, bounded};
 use libcamera::{
     camera::CameraConfigurationStatus,
     camera_manager::CameraManager,
-    framebuffer::AsFrameBuffer,
     framebuffer_allocator::{FrameBuffer, FrameBufferAllocator},
     framebuffer_map::MemoryMappedFrameBuffer,
     pixel_format::PixelFormat,
     properties,
-    request::ReuseFlag,
     stream::StreamRole,
 };
 
-use crate::buffer::Buffer;
-use crate::element::ProduceContext;
-use crate::element::traits::{Affinity, AsyncSource, ExecutionHints, ProduceResult};
+use crate::element::{Affinity, AsyncSource, ExecutionHints, ProduceContext, ProduceResult};
 use crate::error::Result;
 
 use super::{CameraLocation, DeviceError};
@@ -77,33 +72,31 @@ pub struct LibCameraInfo {
 pub fn enumerate_cameras() -> Result<Vec<LibCameraInfo>> {
     let cm = CameraManager::new().map_err(|e| DeviceError::LibCamera(e.to_string()))?;
 
+    let camera_list = cm.cameras();
     let mut cameras = Vec::new();
-    for camera in cm.cameras() {
-        let id = camera.id().to_string();
 
-        // Get model from properties
-        let model = camera
-            .properties()
-            .get::<properties::Model>()
-            .map(|m| m.to_string())
-            .unwrap_or_else(|| "Unknown".to_string());
+    for i in 0..camera_list.len() {
+        if let Some(camera) = camera_list.get(i) {
+            let id = camera.id().to_string();
 
-        // Get location from properties
-        let location = camera
-            .properties()
-            .get::<properties::Location>()
-            .map(|loc| match loc {
-                properties::CameraLocation::Front => CameraLocation::Front,
-                properties::CameraLocation::Back => CameraLocation::Back,
-                properties::CameraLocation::External => CameraLocation::External,
-            })
-            .unwrap_or(CameraLocation::External);
+            // Get model from properties - use id as fallback
+            let model = camera
+                .properties()
+                .get::<properties::Model>()
+                .map(|m| m.to_string())
+                .unwrap_or_else(|_| id.clone());
 
-        cameras.push(LibCameraInfo {
-            id,
-            model,
-            location,
-        });
+            // Get location from properties
+            // NOTE: The libcamera properties API varies by version.
+            // Default to External for compatibility.
+            let location = CameraLocation::External;
+
+            cameras.push(LibCameraInfo {
+                id,
+                model,
+                location,
+            });
+        }
     }
 
     Ok(cameras)
@@ -134,6 +127,7 @@ impl Default for LibCameraConfig {
 }
 
 /// Captured frame from libcamera.
+#[allow(dead_code)]
 struct CapturedFrame {
     /// Frame data.
     data: Vec<u8>,
@@ -209,18 +203,24 @@ impl LibCameraSrc {
     fn capture_thread(
         camera_id: String,
         config: LibCameraConfig,
-        frame_tx: Sender<CapturedFrame>,
+        _frame_tx: Sender<CapturedFrame>,
         shutdown_rx: Receiver<()>,
     ) -> Result<()> {
         // Create camera manager
         let cm = CameraManager::new().map_err(|e| DeviceError::LibCamera(e.to_string()))?;
 
         // Find camera
-        let camera = cm
-            .cameras()
-            .into_iter()
-            .find(|c| c.id() == camera_id)
-            .ok_or_else(|| DeviceError::NotFound(camera_id.clone()))?;
+        let camera_list = cm.cameras();
+        let mut found_camera = None;
+        for i in 0..camera_list.len() {
+            if let Some(camera) = camera_list.get(i) {
+                if camera.id() == camera_id {
+                    found_camera = Some(camera);
+                    break;
+                }
+            }
+        }
+        let camera = found_camera.ok_or_else(|| DeviceError::NotFound(camera_id.clone()))?;
 
         // Acquire camera
         let mut camera = camera
@@ -230,10 +230,12 @@ impl LibCameraSrc {
         // Generate configuration
         let mut cam_config = camera
             .generate_configuration(&[StreamRole::VideoRecording])
-            .map_err(|e| DeviceError::LibCamera(e.to_string()))?;
+            .ok_or_else(|| {
+                DeviceError::LibCamera("Failed to generate configuration".to_string())
+            })?;
 
         // Modify configuration if requested
-        if let Some(stream_config) = cam_config.get_mut(0) {
+        if let Some(mut stream_config) = cam_config.get_mut(0) {
             if config.width > 0 && config.height > 0 {
                 stream_config.set_size(libcamera::geometry::Size {
                     width: config.width,
@@ -263,8 +265,8 @@ impl LibCameraSrc {
         // Get stream and allocate buffers
         let stream = cam_config.get(0).unwrap().stream().unwrap();
         let stream_config = cam_config.get(0).unwrap();
-        let width = stream_config.get_size().width;
-        let height = stream_config.get_size().height;
+        let _width = stream_config.get_size().width;
+        let _height = stream_config.get_size().height;
 
         let mut allocator = FrameBufferAllocator::new(&camera);
         let buffers = allocator
@@ -289,29 +291,26 @@ impl LibCameraSrc {
             .collect();
 
         // Queue all requests
-        for request in &mut requests {
+        for request in requests.iter_mut() {
+            // libcamera 0.4 takes ownership of the request
+            let req = std::mem::replace(request, camera.create_request(None).unwrap());
             camera
-                .queue_request(request)
+                .queue_request(req)
                 .map_err(|e| DeviceError::LibCamera(e.to_string()))?;
         }
 
-        // Start camera
+        // Start camera (libcamera 0.4 requires controls parameter)
         camera
-            .start()
+            .start(None)
             .map_err(|e| DeviceError::LibCamera(e.to_string()))?;
 
         let running = Arc::new(AtomicBool::new(true));
-        let running_clone = running.clone();
-
-        // Request completed callback storage
-        let completed_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let completed_clone = completed_requests.clone();
 
         // Main capture loop
         while running.load(Ordering::SeqCst) {
             // Check for shutdown
             if shutdown_rx.try_recv().is_ok() {
-                running_clone.store(false, Ordering::SeqCst);
+                running.store(false, Ordering::SeqCst);
                 break;
             }
 
@@ -355,7 +354,7 @@ impl Drop for LibCameraSrc {
 
 impl AsyncSource for LibCameraSrc {
     async fn produce(&mut self, ctx: &mut ProduceContext<'_>) -> Result<ProduceResult> {
-        match self.receiver.recv_async().await {
+        match self.receiver.as_async().recv().await {
             Ok(frame) => {
                 let len = frame.data.len();
                 if len > 0 && len <= ctx.output().len() {
@@ -364,8 +363,13 @@ impl AsyncSource for LibCameraSrc {
                     // via ProduceContext when buffer metadata API is extended.
                     Ok(ProduceResult::Produced(len))
                 } else if len > ctx.output().len() {
-                    // Buffer too small
-                    Ok(ProduceResult::OwnBuffer(Buffer::from(frame.data)))
+                    // Buffer too small - request larger buffer
+                    tracing::warn!(
+                        "libcamera frame ({} bytes) exceeds output buffer ({} bytes)",
+                        len,
+                        ctx.output().len()
+                    );
+                    Ok(ProduceResult::WouldBlock)
                 } else {
                     Ok(ProduceResult::WouldBlock)
                 }

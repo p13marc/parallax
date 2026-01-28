@@ -31,22 +31,20 @@ use std::thread;
 
 use kanal::{Receiver, Sender, bounded};
 use pipewire as pw;
-use pw::prelude::*;
 
-use crate::buffer::Buffer;
-use crate::element::ProduceContext;
-use crate::element::traits::{Affinity, AsyncSink, AsyncSource, ExecutionHints, ProduceResult};
+use crate::element::{
+    Affinity, AsyncSink, AsyncSource, ExecutionHints, ProduceContext, ProduceResult,
+};
 use crate::error::Result;
 
 use super::DeviceError;
 
 /// Check if PipeWire is available on this system.
 pub fn is_available() -> bool {
-    // Try to initialize PipeWire
-    match pw::init() {
-        Ok(_) => true,
-        Err(_) => false,
-    }
+    // Initialize PipeWire - this always succeeds in pipewire 0.8+
+    pw::init();
+    // Try to create a main loop to verify PipeWire is available
+    pw::main_loop::MainLoop::new(None).is_ok()
 }
 
 /// PipeWire capture target.
@@ -86,9 +84,9 @@ pub struct PipeWireNodeInfo {
 /// Enumerate audio nodes available via PipeWire.
 pub fn enumerate_audio_nodes() -> Result<Vec<PipeWireNodeInfo>> {
     // Initialize PipeWire
-    pw::init().map_err(|e| DeviceError::PipeWire(e.to_string()))?;
+    pw::init();
 
-    let mut nodes = Vec::new();
+    let nodes;
 
     // Create main loop and context in a thread
     // PipeWire requires its own main loop
@@ -119,7 +117,13 @@ pub fn enumerate_audio_nodes() -> Result<Vec<PipeWireNodeInfo>> {
             }
         };
 
-        let registry = core.get_registry();
+        let registry = match core.get_registry() {
+            Ok(r) => r,
+            Err(_) => {
+                let _ = tx.send(Vec::new());
+                return;
+            }
+        };
         let collected_nodes = Arc::new(std::sync::Mutex::new(Vec::new()));
         let nodes_clone = collected_nodes.clone();
         let done = Arc::new(AtomicBool::new(false));
@@ -163,7 +167,9 @@ pub fn enumerate_audio_nodes() -> Result<Vec<PipeWireNodeInfo>> {
 
         // Run main loop briefly to collect objects
         for _ in 0..10 {
-            main_loop.iterate(std::time::Duration::from_millis(10));
+            main_loop
+                .loop_()
+                .iterate(std::time::Duration::from_millis(10));
             if done_clone.load(Ordering::SeqCst) {
                 break;
             }
@@ -179,7 +185,6 @@ pub fn enumerate_audio_nodes() -> Result<Vec<PipeWireNodeInfo>> {
     // Wait for enumeration with timeout
     nodes = rx
         .recv_timeout(std::time::Duration::from_secs(2))
-        .unwrap_or(Ok(Vec::new()))
         .unwrap_or_default();
 
     Ok(nodes)
@@ -188,7 +193,7 @@ pub fn enumerate_audio_nodes() -> Result<Vec<PipeWireNodeInfo>> {
 /// PipeWire audio/video capture source.
 pub struct PipeWireSrc {
     /// Receiver for captured buffers.
-    receiver: Receiver<Buffer>,
+    receiver: Receiver<Vec<u8>>,
     /// Sender to request shutdown.
     _shutdown: Sender<()>,
     /// Thread handle.
@@ -271,9 +276,9 @@ impl PipeWireSrc {
 
     /// Internal constructor.
     fn new(target: PipeWireTarget) -> Result<Self> {
-        pw::init().map_err(|e| DeviceError::PipeWire(e.to_string()))?;
+        pw::init();
 
-        let (buffer_tx, buffer_rx) = bounded::<Buffer>(16);
+        let (buffer_tx, buffer_rx) = bounded::<Vec<u8>>(16);
         let (shutdown_tx, shutdown_rx) = bounded::<()>(1);
 
         let target_clone = target.clone();
@@ -292,7 +297,7 @@ impl PipeWireSrc {
     /// Main capture thread.
     fn capture_thread(
         target: PipeWireTarget,
-        buffer_tx: Sender<Buffer>,
+        buffer_tx: Sender<Vec<u8>>,
         shutdown_rx: Receiver<()>,
     ) {
         let main_loop = match pw::main_loop::MainLoop::new(None) {
@@ -350,14 +355,13 @@ impl PipeWireSrc {
                 // Get buffer from stream
                 if let Some(mut pw_buffer) = stream.dequeue_buffer() {
                     if let Some(data) = pw_buffer.datas_mut().first_mut() {
-                        if let Some(chunk) = data.chunk() {
-                            let size = chunk.size() as usize;
-                            if size > 0 {
-                                // Copy data to our buffer
-                                if let Some(slice) = data.data() {
-                                    let buffer = Buffer::copy_from_slice(&slice[..size]);
-                                    let _ = buffer_tx_clone.try_send(buffer);
-                                }
+                        let chunk = data.chunk();
+                        let size = chunk.size() as usize;
+                        if size > 0 {
+                            // Copy data to a Vec for sending
+                            if let Some(slice) = data.data() {
+                                let bytes = slice[..size].to_vec();
+                                let _ = buffer_tx_clone.try_send(bytes);
                             }
                         }
                     }
@@ -366,20 +370,14 @@ impl PipeWireSrc {
             .register();
 
         // Connect stream to default device
-        // Format depends on media type
-        let params = if media_type == "Audio" {
-            // Audio: request interleaved 32-bit float
-            vec![]
-        } else {
-            // Video: request raw video
-            vec![]
-        };
+        // Empty params - accept any format
+        let params: &mut [&pw::spa::pod::Pod] = &mut [];
 
         if let Err(e) = stream.connect(
             pw::spa::utils::Direction::Input,
             None,
             pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
-            &mut params.iter().map(|p| p as *const _).collect::<Vec<_>>(),
+            params,
         ) {
             tracing::error!("Failed to connect PipeWire stream: {:?}", e);
             return;
@@ -392,18 +390,20 @@ impl PipeWireSrc {
                 break;
             }
 
-            main_loop.iterate(std::time::Duration::from_millis(10));
+            main_loop
+                .loop_()
+                .iterate(std::time::Duration::from_millis(10));
         }
     }
 }
 
 impl AsyncSource for PipeWireSrc {
     async fn produce(&mut self, ctx: &mut ProduceContext<'_>) -> Result<ProduceResult> {
-        match self.receiver.recv_async().await {
-            Ok(buffer) => {
-                let len = buffer.len();
+        match self.receiver.as_async().recv().await {
+            Ok(data) => {
+                let len = data.len();
                 if len > 0 {
-                    ctx.output()[..len].copy_from_slice(&buffer);
+                    ctx.output()[..len].copy_from_slice(&data);
                     Ok(ProduceResult::Produced(len))
                 } else {
                     Ok(ProduceResult::WouldBlock)
@@ -438,7 +438,7 @@ impl AsyncSource for PipeWireSrc {
 /// PipeWire audio playback sink.
 pub struct PipeWireSink {
     /// Sender for buffers to play.
-    sender: Sender<Buffer>,
+    sender: Sender<Vec<u8>>,
     /// Sender to request shutdown.
     _shutdown: Sender<()>,
     /// Thread handle.
@@ -452,9 +452,9 @@ impl PipeWireSink {
     ///
     /// * `device` - Device name, or None for default speaker.
     pub fn audio(device: Option<&str>) -> Result<Self> {
-        pw::init().map_err(|e| DeviceError::PipeWire(e.to_string()))?;
+        pw::init();
 
-        let (buffer_tx, buffer_rx) = bounded::<Buffer>(16);
+        let (buffer_tx, buffer_rx) = bounded::<Vec<u8>>(16);
         let (shutdown_tx, shutdown_rx) = bounded::<()>(1);
 
         let device = device.map(|s| s.to_string());
@@ -472,7 +472,7 @@ impl PipeWireSink {
     /// Main playback thread.
     fn playback_thread(
         _device: Option<String>,
-        buffer_rx: Receiver<Buffer>,
+        buffer_rx: Receiver<Vec<u8>>,
         shutdown_rx: Receiver<()>,
     ) {
         let main_loop = match pw::main_loop::MainLoop::new(None) {
@@ -522,14 +522,12 @@ impl PipeWireSink {
                 if let Some(mut pw_buffer) = stream.dequeue_buffer() {
                     if let Some(data) = pw_buffer.datas_mut().first_mut() {
                         // Check if we have data to play
-                        if let Ok(buffer) = buffer_rx_clone.try_recv() {
-                            let len = buffer.len();
+                        if let Ok(Some(audio_data)) = buffer_rx_clone.try_recv() {
                             if let Some(slice) = data.data() {
-                                let copy_len = len.min(slice.len());
-                                slice[..copy_len].copy_from_slice(&buffer[..copy_len]);
-                                if let Some(chunk) = data.chunk_mut() {
-                                    chunk.set_size(copy_len as u32);
-                                }
+                                let copy_len = audio_data.len().min(slice.len());
+                                slice[..copy_len].copy_from_slice(&audio_data[..copy_len]);
+                                let chunk = data.chunk_mut();
+                                *chunk.size_mut() = copy_len as u32;
                             }
                         }
                     }
@@ -538,11 +536,12 @@ impl PipeWireSink {
             .register();
 
         // Connect stream
+        let params: &mut [&pw::spa::pod::Pod] = &mut [];
         if let Err(e) = stream.connect(
             pw::spa::utils::Direction::Output,
             None,
             pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
-            &mut vec![],
+            params,
         ) {
             tracing::error!("Failed to connect PipeWire stream: {:?}", e);
             return;
@@ -553,16 +552,19 @@ impl PipeWireSink {
             if shutdown_rx.try_recv().is_ok() {
                 break;
             }
-            main_loop.iterate(std::time::Duration::from_millis(10));
+            main_loop
+                .loop_()
+                .iterate(std::time::Duration::from_millis(10));
         }
     }
 }
 
 impl AsyncSink for PipeWireSink {
     async fn consume(&mut self, ctx: &crate::element::ConsumeContext<'_>) -> Result<()> {
-        let buffer = Buffer::copy_from_slice(ctx.data());
+        let data = ctx.input().to_vec();
         self.sender
-            .send_async(buffer)
+            .as_async()
+            .send(data)
             .await
             .map_err(|e| DeviceError::PipeWire(e.to_string()))?;
         Ok(())

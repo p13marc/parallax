@@ -21,15 +21,15 @@
 //! let speaker = AlsaSink::new("default", AlsaFormat::default())?;
 //! ```
 
-use std::time::Duration;
+use std::ffi::CString;
 
 use alsa::pcm::{Access, Format, HwParams, PCM};
-use alsa::{Direction, ValueOr};
+use alsa::{Direction, PollDescriptors, ValueOr};
 use tokio::io::unix::AsyncFd;
 
-use crate::buffer::Buffer;
-use crate::element::traits::{Affinity, AsyncSink, AsyncSource, ExecutionHints, ProduceResult};
-use crate::element::{ConsumeContext, ProduceContext};
+use crate::element::{
+    Affinity, AsyncSink, AsyncSource, ConsumeContext, ExecutionHints, ProduceContext, ProduceResult,
+};
 use crate::error::Result;
 
 use super::DeviceError;
@@ -67,7 +67,8 @@ pub fn enumerate_devices() -> Result<Vec<AlsaDeviceInfo>> {
     });
 
     // Enumerate hardware devices using hints
-    if let Ok(hints) = alsa::device_name::HintIter::new(None, "pcm") {
+    let pcm_cstr = CString::new("pcm").unwrap();
+    if let Ok(hints) = alsa::device_name::HintIter::new(None, &pcm_cstr) {
         for hint in hints {
             if let Some(name) = hint.name {
                 // Skip null device
@@ -141,7 +142,7 @@ impl AlsaSampleFormat {
             AlsaSampleFormat::S16LE => Format::s16(),
             AlsaSampleFormat::S32LE => Format::s32(),
             AlsaSampleFormat::F32LE => Format::float(),
-            AlsaSampleFormat::U8 => Format::u8(),
+            AlsaSampleFormat::U8 => Format::U8,
         }
     }
 
@@ -170,11 +171,11 @@ impl AlsaSrc {
     /// Create a capture source for the given device.
     pub fn new(device: &str, format: AlsaFormat) -> Result<Self> {
         let pcm = PCM::new(device, Direction::Capture, false).map_err(|e| {
-            if e.errno() == Some(libc::ENOENT) {
+            if e.errno() == libc::ENOENT {
                 DeviceError::NotFound(device.to_string())
-            } else if e.errno() == Some(libc::EACCES) {
+            } else if e.errno() == libc::EACCES {
                 DeviceError::PermissionDenied(device.to_string())
-            } else if e.errno() == Some(libc::EBUSY) {
+            } else if e.errno() == libc::EBUSY {
                 DeviceError::Busy(device.to_string())
             } else {
                 DeviceError::Alsa(e.to_string())
@@ -233,10 +234,7 @@ impl AlsaSrc {
 
     /// Get poll descriptors for async waiting.
     fn poll_descriptors(&self) -> Result<Vec<libc::pollfd>> {
-        let count = self
-            .pcm
-            .count()
-            .map_err(|e| DeviceError::Alsa(e.to_string()))?;
+        let count = PollDescriptors::count(&self.pcm);
 
         let mut fds = vec![
             libc::pollfd {
@@ -247,9 +245,7 @@ impl AlsaSrc {
             count
         ];
 
-        self.pcm
-            .fill(&mut fds)
-            .map_err(|e| DeviceError::Alsa(e.to_string()))?;
+        PollDescriptors::fill(&self.pcm, &mut fds).map_err(|e| DeviceError::Alsa(e.to_string()))?;
 
         Ok(fds)
     }
@@ -282,7 +278,7 @@ impl AsyncSource for AlsaSrc {
         // Interpret output buffer as i16 slice
         let output = ctx.output();
         let samples = output.len() / 2; // i16 = 2 bytes
-        let frames = samples / self.format.channels as usize;
+        let _frames = samples / self.format.channels as usize;
 
         // Create a mutable i16 slice from the output buffer
         let output_ptr = output.as_mut_ptr() as *mut i16;
@@ -295,7 +291,7 @@ impl AsyncSource for AlsaSrc {
             }
             Err(e) => {
                 // Handle underrun
-                if e.errno() == Some(libc::EPIPE) {
+                if e.errno() == libc::EPIPE {
                     self.pcm
                         .prepare()
                         .map_err(|e| DeviceError::Alsa(e.to_string()))?;
@@ -338,11 +334,11 @@ impl AlsaSink {
     /// Create a playback sink for the given device.
     pub fn new(device: &str, format: AlsaFormat) -> Result<Self> {
         let pcm = PCM::new(device, Direction::Playback, false).map_err(|e| {
-            if e.errno() == Some(libc::ENOENT) {
+            if e.errno() == libc::ENOENT {
                 DeviceError::NotFound(device.to_string())
-            } else if e.errno() == Some(libc::EACCES) {
+            } else if e.errno() == libc::EACCES {
                 DeviceError::PermissionDenied(device.to_string())
-            } else if e.errno() == Some(libc::EBUSY) {
+            } else if e.errno() == libc::EBUSY {
                 DeviceError::Busy(device.to_string())
             } else {
                 DeviceError::Alsa(e.to_string())
@@ -401,10 +397,7 @@ impl AlsaSink {
 
     /// Get poll descriptors for async waiting.
     fn poll_descriptors(&self) -> Result<Vec<libc::pollfd>> {
-        let count = self
-            .pcm
-            .count()
-            .map_err(|e| DeviceError::Alsa(e.to_string()))?;
+        let count = PollDescriptors::count(&self.pcm);
 
         let mut fds = vec![
             libc::pollfd {
@@ -415,9 +408,7 @@ impl AlsaSink {
             count
         ];
 
-        self.pcm
-            .fill(&mut fds)
-            .map_err(|e| DeviceError::Alsa(e.to_string()))?;
+        PollDescriptors::fill(&self.pcm, &mut fds).map_err(|e| DeviceError::Alsa(e.to_string()))?;
 
         Ok(fds)
     }
@@ -425,7 +416,7 @@ impl AlsaSink {
 
 impl AsyncSink for AlsaSink {
     async fn consume(&mut self, ctx: &ConsumeContext<'_>) -> Result<()> {
-        let data = ctx.data();
+        let data = ctx.input();
         let frames = data.len() / self.frame_size;
 
         if frames == 0 {
@@ -456,7 +447,7 @@ impl AsyncSink for AlsaSink {
             Ok(_) => Ok(()),
             Err(e) => {
                 // Handle underrun
-                if e.errno() == Some(libc::EPIPE) {
+                if e.errno() == libc::EPIPE {
                     self.pcm
                         .prepare()
                         .map_err(|e| DeviceError::Alsa(e.to_string()))?;
