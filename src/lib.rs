@@ -77,7 +77,10 @@ pub mod prelude {
     };
     pub use crate::error::{Error, Result};
     pub use crate::event::{Event, PipelineItem, TagList};
-    pub use crate::format::{AudioFormat, Caps, MediaFormat, RtpFormat, VideoFormat};
+    pub use crate::format::{
+        AudioFormat, Caps, ElementMediaCaps, FormatMemoryCap, MediaCaps, MediaFormat, RtpFormat,
+        VideoFormat,
+    };
     pub use crate::memory::{MemoryPool, MemorySegment, MemoryType};
     pub use crate::metadata::{BufferFlags, Metadata, RtpMeta};
     pub use crate::pipeline::{Executor, Pipeline};

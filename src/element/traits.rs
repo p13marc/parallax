@@ -7,7 +7,7 @@ use crate::buffer::Buffer;
 use crate::element::context::{ConsumeContext, ProduceContext, ProduceResult};
 use crate::error::Result;
 use crate::event::{Event, EventResult};
-use crate::format::Caps;
+use crate::format::{Caps, ElementMediaCaps};
 use dynosaur::dynosaur;
 use smallvec::SmallVec;
 
@@ -509,6 +509,17 @@ pub trait Source: Send {
         Caps::any()
     }
 
+    /// Get the output media caps with format+memory constraints.
+    ///
+    /// This is the enhanced version of `output_caps()` that allows specifying
+    /// multiple format+memory combinations. For example, a camera might support
+    /// YUYV on CPU and NV12 on DMA-BUF.
+    ///
+    /// Default implementation converts from `output_caps()` assuming CPU memory.
+    fn output_media_caps(&self) -> ElementMediaCaps {
+        ElementMediaCaps::from(self.output_caps())
+    }
+
     /// Get the preferred buffer size for this source.
     ///
     /// The executor uses this hint when allocating pool buffers.
@@ -601,6 +612,13 @@ pub trait AsyncSource: Send {
         Caps::any()
     }
 
+    /// Get the output media caps with format+memory constraints.
+    ///
+    /// Default implementation converts from `output_caps()` assuming CPU memory.
+    fn output_media_caps(&self) -> ElementMediaCaps {
+        ElementMediaCaps::from(self.output_caps())
+    }
+
     /// Get the preferred buffer size for this source.
     fn preferred_buffer_size(&self) -> Option<usize> {
         None
@@ -686,6 +704,13 @@ pub trait Sink: Send {
         Caps::any()
     }
 
+    /// Get the input media caps with format+memory constraints.
+    ///
+    /// Default implementation converts from `input_caps()` assuming CPU memory.
+    fn input_media_caps(&self) -> ElementMediaCaps {
+        ElementMediaCaps::from(self.input_caps())
+    }
+
     /// Get the scheduling affinity for this sink.
     fn affinity(&self) -> Affinity {
         Affinity::Auto
@@ -757,6 +782,13 @@ pub trait AsyncSink: Send {
     /// Get the input caps (what formats this sink accepts).
     fn input_caps(&self) -> Caps {
         Caps::any()
+    }
+
+    /// Get the input media caps with format+memory constraints.
+    ///
+    /// Default implementation converts from `input_caps()` assuming CPU memory.
+    fn input_media_caps(&self) -> ElementMediaCaps {
+        ElementMediaCaps::from(self.input_caps())
     }
 
     /// Get the scheduling affinity for this sink.
@@ -858,6 +890,20 @@ pub trait Element: Send {
     /// Get the output caps (what formats this element produces).
     fn output_caps(&self) -> Caps {
         Caps::any()
+    }
+
+    /// Get the input media caps with format+memory constraints.
+    ///
+    /// Default implementation converts from `input_caps()` assuming CPU memory.
+    fn input_media_caps(&self) -> ElementMediaCaps {
+        ElementMediaCaps::from(self.input_caps())
+    }
+
+    /// Get the output media caps with format+memory constraints.
+    ///
+    /// Default implementation converts from `output_caps()` assuming CPU memory.
+    fn output_media_caps(&self) -> ElementMediaCaps {
+        ElementMediaCaps::from(self.output_caps())
     }
 
     /// Get the scheduling affinity for this element.
@@ -966,6 +1012,20 @@ pub trait Transform: Send {
         Caps::any()
     }
 
+    /// Get the input media caps with format+memory constraints.
+    ///
+    /// Default implementation converts from `input_caps()` assuming CPU memory.
+    fn input_media_caps(&self) -> ElementMediaCaps {
+        ElementMediaCaps::from(self.input_caps())
+    }
+
+    /// Get the output media caps with format+memory constraints.
+    ///
+    /// Default implementation converts from `output_caps()` assuming CPU memory.
+    fn output_media_caps(&self) -> ElementMediaCaps {
+        ElementMediaCaps::from(self.output_caps())
+    }
+
     /// Get the scheduling affinity for this transform.
     fn affinity(&self) -> Affinity {
         Affinity::Auto
@@ -1032,6 +1092,20 @@ pub trait AsyncTransform: Send {
     /// Get the output caps (what formats this transform produces).
     fn output_caps(&self) -> Caps {
         Caps::any()
+    }
+
+    /// Get the input media caps with format+memory constraints.
+    ///
+    /// Default implementation converts from `input_caps()` assuming CPU memory.
+    fn input_media_caps(&self) -> ElementMediaCaps {
+        ElementMediaCaps::from(self.input_caps())
+    }
+
+    /// Get the output media caps with format+memory constraints.
+    ///
+    /// Default implementation converts from `output_caps()` assuming CPU memory.
+    fn output_media_caps(&self) -> ElementMediaCaps {
+        ElementMediaCaps::from(self.output_caps())
     }
 
     /// Get the scheduling affinity for this transform.
@@ -1442,6 +1516,20 @@ pub trait AsyncElementDyn {
         Caps::any()
     }
 
+    /// Get the input media caps with format+memory constraints.
+    ///
+    /// Default implementation converts from `input_caps()` assuming CPU memory.
+    fn input_media_caps(&self) -> ElementMediaCaps {
+        ElementMediaCaps::from(self.input_caps())
+    }
+
+    /// Get the output media caps with format+memory constraints.
+    ///
+    /// Default implementation converts from `output_caps()` assuming CPU memory.
+    fn output_media_caps(&self) -> ElementMediaCaps {
+        ElementMediaCaps::from(self.output_caps())
+    }
+
     /// Get the scheduling affinity for this element.
     ///
     /// This determines whether the element runs in the async runtime
@@ -1668,6 +1756,10 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
         self.inner.output_caps()
     }
 
+    fn output_media_caps(&self) -> crate::format::ElementMediaCaps {
+        self.inner.output_media_caps()
+    }
+
     fn affinity(&self) -> Affinity {
         self.inner.affinity()
     }
@@ -1730,6 +1822,10 @@ impl<S: Sink + Send + 'static> SendAsyncElementDyn for SinkAdapter<S> {
         self.inner.input_caps()
     }
 
+    fn input_media_caps(&self) -> crate::format::ElementMediaCaps {
+        self.inner.input_media_caps()
+    }
+
     fn affinity(&self) -> Affinity {
         self.inner.affinity()
     }
@@ -1783,6 +1879,14 @@ impl<E: Element + Send + 'static> SendAsyncElementDyn for ElementAdapter<E> {
 
     fn output_caps(&self) -> Caps {
         self.inner.output_caps()
+    }
+
+    fn input_media_caps(&self) -> crate::format::ElementMediaCaps {
+        self.inner.input_media_caps()
+    }
+
+    fn output_media_caps(&self) -> crate::format::ElementMediaCaps {
+        self.inner.output_media_caps()
     }
 
     fn affinity(&self) -> Affinity {
@@ -1939,6 +2043,14 @@ impl<T: Transform + Send + 'static> SendAsyncElementDyn for TransformAdapter<T> 
         self.inner.output_caps()
     }
 
+    fn input_media_caps(&self) -> crate::format::ElementMediaCaps {
+        self.inner.input_media_caps()
+    }
+
+    fn output_media_caps(&self) -> crate::format::ElementMediaCaps {
+        self.inner.output_media_caps()
+    }
+
     fn affinity(&self) -> Affinity {
         self.inner.affinity()
     }
@@ -2080,6 +2192,10 @@ impl<S: AsyncSource + Send + 'static> SendAsyncElementDyn for AsyncSourceAdapter
         self.inner.output_caps()
     }
 
+    fn output_media_caps(&self) -> crate::format::ElementMediaCaps {
+        self.inner.output_media_caps()
+    }
+
     fn affinity(&self) -> Affinity {
         self.inner.affinity()
     }
@@ -2140,6 +2256,10 @@ impl<S: AsyncSink + Send + 'static> SendAsyncElementDyn for AsyncSinkAdapter<S> 
 
     fn input_caps(&self) -> Caps {
         self.inner.input_caps()
+    }
+
+    fn input_media_caps(&self) -> crate::format::ElementMediaCaps {
+        self.inner.input_media_caps()
     }
 
     fn affinity(&self) -> Affinity {

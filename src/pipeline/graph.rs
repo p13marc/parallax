@@ -6,7 +6,7 @@ use crate::element::{
     Transform, TransformAdapter,
 };
 use crate::error::{Error, Result};
-use crate::format::{Caps, MediaFormat};
+use crate::format::{Caps, ElementMediaCaps, MediaFormat};
 use crate::memory::{BufferPool, FixedBufferPool, MemoryType};
 use crate::negotiation::{
     ConverterInsertion, ConverterRegistry, ElementCaps, LinkInfo as NegLinkInfo, NegotiationResult,
@@ -111,6 +111,10 @@ pub struct Node {
     input_caps: Caps,
     /// Cached output caps (so we don't need the element to query them).
     output_caps: Caps,
+    /// Cached input media caps with format+memory constraints.
+    input_media_caps: ElementMediaCaps,
+    /// Cached output media caps with format+memory constraints.
+    output_media_caps: ElementMediaCaps,
     /// Input pads.
     input_pads: Vec<Pad>,
     /// Output pads.
@@ -124,6 +128,8 @@ impl Node {
         let element_type = element.element_type();
         let input_caps = element.input_caps();
         let output_caps = element.output_caps();
+        let input_media_caps = element.input_media_caps();
+        let output_media_caps = element.output_media_caps();
 
         // Create default pads based on element type
         let (input_pads, output_pads) = match element_type {
@@ -142,6 +148,8 @@ impl Node {
             element_type,
             input_caps,
             output_caps,
+            input_media_caps,
+            output_media_caps,
             input_pads,
             output_pads,
         }
@@ -186,6 +194,16 @@ impl Node {
     /// Get the output caps (formats this element produces).
     pub fn output_caps(&self) -> &Caps {
         &self.output_caps
+    }
+
+    /// Get the input media caps with format+memory constraints.
+    pub fn input_media_caps(&self) -> &ElementMediaCaps {
+        &self.input_media_caps
+    }
+
+    /// Get the output media caps with format+memory constraints.
+    pub fn output_media_caps(&self) -> &ElementMediaCaps {
+        &self.output_media_caps
     }
 
     /// Get input pads.
@@ -1366,35 +1384,23 @@ impl Pipeline {
 
     /// Collect caps from an element for negotiation.
     fn collect_element_caps(&self, _node_id: NodeId, node: &Node) -> Result<ElementCaps> {
-        use crate::format::MediaCaps;
-
-        // Convert Caps to MediaCaps
-        let to_media_caps = |caps: &Caps| -> MediaCaps {
-            if caps.is_any() {
-                MediaCaps::any()
-            } else if let Some(first) = caps.formats().first() {
-                MediaCaps::from(first.clone())
-            } else {
-                MediaCaps::any()
-            }
-        };
-
         let mut element_caps = ElementCaps::new(node.name());
 
         // For now, use default pad names "sink" and "src"
         // NOTE: Future enhancement - iterate over actual pads from the node
         // and collect caps per-pad using element.output_caps_for_pad(pad_name)
 
-        // Add sink pad caps (input)
-        let input_caps = node.input_caps();
-        if !input_caps.is_any() || node.element_type() != ElementType::Source {
-            element_caps.add_sink_pad("sink", to_media_caps(input_caps));
+        // Add sink pad caps (input) - use ElementMediaCaps which supports
+        // multiple format+memory combinations
+        let input_media_caps = node.input_media_caps();
+        if !input_media_caps.is_any() || node.element_type() != ElementType::Source {
+            element_caps.add_sink_pad_multi("sink", input_media_caps.clone());
         }
 
-        // Add source pad caps (output)
-        let output_caps = node.output_caps();
-        if !output_caps.is_any() || node.element_type() != ElementType::Sink {
-            element_caps.add_source_pad("src", to_media_caps(output_caps));
+        // Add source pad caps (output) - use ElementMediaCaps
+        let output_media_caps = node.output_media_caps();
+        if !output_media_caps.is_any() || node.element_type() != ElementType::Sink {
+            element_caps.add_source_pad_multi("src", output_media_caps.clone());
         }
 
         Ok(element_caps)
@@ -2765,5 +2771,191 @@ mod tests {
         pipeline.suspend().unwrap();
         pipeline.suspend().unwrap();
         assert_eq!(pipeline.state(), PipelineState::Suspended);
+    }
+
+    // ========================================================================
+    // Multi-format negotiation tests
+    // ========================================================================
+
+    use crate::format::{
+        CapsValue, ElementMediaCaps, FormatCaps, FormatMemoryCap, MemoryCaps, PixelFormat,
+        VideoFormatCaps,
+    };
+
+    /// A source that declares multiple output formats (like a camera).
+    struct MultiFormatSource;
+
+    impl Source for MultiFormatSource {
+        fn produce(&mut self, _ctx: &mut ProduceContext) -> Result<ProduceResult> {
+            Ok(ProduceResult::Eos)
+        }
+
+        fn output_media_caps(&self) -> ElementMediaCaps {
+            // Declare support for YUYV, Rgb24, and I420 at 640x480
+            let yuyv = VideoFormatCaps {
+                width: CapsValue::Fixed(640),
+                height: CapsValue::Fixed(480),
+                pixel_format: CapsValue::Fixed(PixelFormat::Yuyv),
+                framerate: CapsValue::Any,
+            };
+            let rgb = VideoFormatCaps {
+                width: CapsValue::Fixed(640),
+                height: CapsValue::Fixed(480),
+                pixel_format: CapsValue::Fixed(PixelFormat::Rgb24),
+                framerate: CapsValue::Any,
+            };
+            let i420 = VideoFormatCaps {
+                width: CapsValue::Fixed(640),
+                height: CapsValue::Fixed(480),
+                pixel_format: CapsValue::Fixed(PixelFormat::I420),
+                framerate: CapsValue::Any,
+            };
+
+            ElementMediaCaps::new(vec![
+                FormatMemoryCap::new(yuyv.into(), MemoryCaps::cpu_only()),
+                FormatMemoryCap::new(rgb.into(), MemoryCaps::cpu_only()),
+                FormatMemoryCap::new(i420.into(), MemoryCaps::cpu_only()),
+            ])
+        }
+    }
+
+    /// A sink that only accepts I420.
+    struct I420OnlySink;
+
+    impl Sink for I420OnlySink {
+        fn consume(&mut self, _ctx: &ConsumeContext) -> Result<()> {
+            Ok(())
+        }
+
+        fn input_media_caps(&self) -> ElementMediaCaps {
+            let i420 = VideoFormatCaps {
+                width: CapsValue::Any,
+                height: CapsValue::Any,
+                pixel_format: CapsValue::Fixed(PixelFormat::I420),
+                framerate: CapsValue::Any,
+            };
+            ElementMediaCaps::new(vec![FormatMemoryCap::new(
+                i420.into(),
+                MemoryCaps::cpu_only(),
+            )])
+        }
+    }
+
+    /// A sink that only accepts RGBA (incompatible with MultiFormatSource).
+    struct RgbaOnlySink;
+
+    impl Sink for RgbaOnlySink {
+        fn consume(&mut self, _ctx: &ConsumeContext) -> Result<()> {
+            Ok(())
+        }
+
+        fn input_media_caps(&self) -> ElementMediaCaps {
+            let rgba = VideoFormatCaps {
+                width: CapsValue::Any,
+                height: CapsValue::Any,
+                pixel_format: CapsValue::Fixed(PixelFormat::Rgba),
+                framerate: CapsValue::Any,
+            };
+            ElementMediaCaps::new(vec![FormatMemoryCap::new(
+                rgba.into(),
+                MemoryCaps::cpu_only(),
+            )])
+        }
+    }
+
+    #[test]
+    fn test_multi_format_negotiation_finds_common_format() {
+        let mut pipeline = Pipeline::new();
+
+        // Source supports [YUYV, Rgb24, I420], sink only accepts I420
+        let src = pipeline.add_node(
+            "src",
+            DynAsyncElement::new_box(SourceAdapter::new(MultiFormatSource)),
+        );
+        let sink = pipeline.add_node(
+            "sink",
+            DynAsyncElement::new_box(SinkAdapter::new(I420OnlySink)),
+        );
+
+        pipeline.link(src, sink).unwrap();
+
+        // Negotiation should succeed - I420 is supported by both
+        let result = pipeline.negotiate();
+        assert!(result.is_ok(), "Negotiation should succeed: {:?}", result);
+        assert!(pipeline.is_negotiated());
+
+        // Verify negotiated format is I420
+        let neg = pipeline.negotiation.as_ref().unwrap();
+        let link_caps = neg.link_caps.get(&0).unwrap();
+        if let crate::format::MediaFormat::VideoRaw(vf) = &link_caps.format {
+            assert_eq!(vf.pixel_format, PixelFormat::I420);
+            assert_eq!(vf.width, 640);
+            assert_eq!(vf.height, 480);
+        } else {
+            panic!("Expected VideoRaw format, got {:?}", link_caps.format);
+        }
+    }
+
+    #[test]
+    fn test_multi_format_negotiation_fails_when_incompatible() {
+        let mut pipeline = Pipeline::new();
+
+        // Source supports [YUYV, Rgb24, I420], sink only accepts RGBA
+        // No converter registered, so negotiation should fail
+        let src = pipeline.add_node(
+            "src",
+            DynAsyncElement::new_box(SourceAdapter::new(MultiFormatSource)),
+        );
+        let sink = pipeline.add_node(
+            "sink",
+            DynAsyncElement::new_box(SinkAdapter::new(RgbaOnlySink)),
+        );
+
+        pipeline.link(src, sink).unwrap();
+
+        // Negotiation should fail - no common format without converter
+        let result = pipeline.negotiate();
+        assert!(result.is_err(), "Negotiation should fail without converter");
+
+        // Error message should mention the formats
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Yuyv") || err_msg.contains("YUYV"),
+            "Error should mention source formats: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_multi_format_source_caps_are_preserved() {
+        let mut pipeline = Pipeline::new();
+
+        let src = pipeline.add_node(
+            "src",
+            DynAsyncElement::new_box(SourceAdapter::new(MultiFormatSource)),
+        );
+
+        // Check that the node's media caps contain all three formats
+        let node = pipeline.get_node(src).unwrap();
+        let caps = node.output_media_caps();
+
+        assert_eq!(caps.len(), 3, "Should have 3 format capabilities");
+
+        // Verify the formats are in preference order
+        let formats: Vec<_> = caps
+            .iter()
+            .filter_map(|c| {
+                if let FormatCaps::VideoRaw(v) = &c.format {
+                    v.pixel_format.as_fixed().copied()
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        assert_eq!(
+            formats,
+            vec![PixelFormat::Yuyv, PixelFormat::Rgb24, PixelFormat::I420]
+        );
     }
 }

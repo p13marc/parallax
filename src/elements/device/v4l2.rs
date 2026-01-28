@@ -31,7 +31,9 @@ use v4l::video::Capture;
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{Affinity, ExecutionHints, ProduceContext, ProduceResult, Source};
 use crate::error::Result;
-use crate::format::{Caps, PixelFormat};
+use crate::format::{
+    Caps, CapsValue, ElementMediaCaps, FormatMemoryCap, MemoryCaps, PixelFormat, VideoFormatCaps,
+};
 use crate::memory::{HeapSegment, MemorySegment};
 use crate::metadata::Metadata;
 
@@ -127,6 +129,15 @@ impl Default for V4l2Config {
     }
 }
 
+/// A supported format from the V4L2 device.
+#[derive(Debug, Clone)]
+pub struct V4l2SupportedFormat {
+    /// FourCC code.
+    pub fourcc: [u8; 4],
+    /// Supported resolutions (width, height).
+    pub resolutions: Vec<(u32, u32)>,
+}
+
 /// V4L2 video capture source.
 ///
 /// This source captures video frames from a V4L2 device using memory-mapped
@@ -148,6 +159,8 @@ pub struct V4l2Src {
     width: u32,
     height: u32,
     fourcc: [u8; 4],
+    /// All supported formats from the device (cached for caps negotiation).
+    supported_formats: Vec<V4l2SupportedFormat>,
 }
 
 impl V4l2Src {
@@ -170,6 +183,9 @@ impl V4l2Src {
                 DeviceError::V4l2(e)
             }
         })?;
+
+        // Query supported formats for caps negotiation
+        let supported_formats = Self::query_supported_formats(&dev);
 
         // Set format
         let fourcc = if let Some(ref fcc) = config.fourcc {
@@ -208,7 +224,67 @@ impl V4l2Src {
             width,
             height,
             fourcc: actual_fourcc,
+            supported_formats,
         })
+    }
+
+    /// Query supported formats from the device.
+    fn query_supported_formats(dev: &Device) -> Vec<V4l2SupportedFormat> {
+        let mut formats = Vec::new();
+
+        // Enumerate supported formats
+        if let Ok(format_descs) = dev.enum_formats() {
+            for fmt_desc in format_descs {
+                let fourcc = fmt_desc.fourcc.repr;
+
+                // Query supported frame sizes for this format
+                let mut resolutions = Vec::new();
+                if let Ok(sizes) = dev.enum_framesizes(fmt_desc.fourcc) {
+                    for size in sizes {
+                        match size.size {
+                            v4l::framesize::FrameSizeEnum::Discrete(d) => {
+                                resolutions.push((d.width, d.height));
+                            }
+                            v4l::framesize::FrameSizeEnum::Stepwise(s) => {
+                                // For stepwise, add common resolutions within range
+                                for (w, h) in &[
+                                    (640, 480),
+                                    (800, 600),
+                                    (1280, 720),
+                                    (1920, 1080),
+                                    (3840, 2160),
+                                ] {
+                                    if *w >= s.min_width
+                                        && *w <= s.max_width
+                                        && *h >= s.min_height
+                                        && *h <= s.max_height
+                                    {
+                                        resolutions.push((*w, *h));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // If no resolutions found, add a default
+                if resolutions.is_empty() {
+                    resolutions.push((640, 480));
+                }
+
+                formats.push(V4l2SupportedFormat {
+                    fourcc,
+                    resolutions,
+                });
+            }
+        }
+
+        formats
+    }
+
+    /// Get all supported formats from this device.
+    pub fn supported_formats(&self) -> &[V4l2SupportedFormat] {
+        &self.supported_formats
     }
 
     /// Get the device path.
@@ -340,6 +416,101 @@ impl Source for V4l2Src {
         };
 
         Caps::video_raw(self.width, self.height, pixel_format)
+    }
+
+    fn output_media_caps(&self) -> ElementMediaCaps {
+        // Build caps from all supported formats on the device
+        // This demonstrates the enhanced caps negotiation where an element
+        // can declare multiple format+memory combinations.
+
+        let mut caps = Vec::new();
+
+        for supported in &self.supported_formats {
+            let fourcc_str = std::str::from_utf8(&supported.fourcc).unwrap_or("????");
+
+            // Convert V4L2 fourcc to our PixelFormat
+            let pixel_format = match fourcc_str {
+                "YUYV" => Some(PixelFormat::Yuyv),
+                "UYVY" => Some(PixelFormat::Uyvy),
+                "NV12" => Some(PixelFormat::Nv12),
+                "I420" | "YU12" => Some(PixelFormat::I420),
+                "RGB3" => Some(PixelFormat::Rgb24),
+                "BGR3" => Some(PixelFormat::Bgr24),
+                "RGBP" | "RGB4" => Some(PixelFormat::Rgba),
+                "BA24" => Some(PixelFormat::Bgra),
+                "GREY" | "Y800" => Some(PixelFormat::Gray8),
+                // Skip compressed formats like MJPEG
+                _ => None,
+            };
+
+            if let Some(pixel_format) = pixel_format {
+                // Build resolution constraint from supported resolutions
+                let (widths, heights): (Vec<u32>, Vec<u32>) =
+                    supported.resolutions.iter().cloned().unzip();
+
+                let width_caps = if widths.len() == 1 {
+                    CapsValue::Fixed(widths[0])
+                } else {
+                    CapsValue::List(widths)
+                };
+
+                let height_caps = if heights.len() == 1 {
+                    CapsValue::Fixed(heights[0])
+                } else {
+                    CapsValue::List(heights)
+                };
+
+                let format_caps = VideoFormatCaps {
+                    width: width_caps,
+                    height: height_caps,
+                    pixel_format: CapsValue::Fixed(pixel_format),
+                    framerate: CapsValue::Any,
+                };
+
+                // V4L2 produces CPU memory (mmap'd but accessible as CPU)
+                caps.push(FormatMemoryCap::new(
+                    format_caps.into(),
+                    MemoryCaps::cpu_only(),
+                ));
+            }
+        }
+
+        if caps.is_empty() {
+            // Fallback: use current format only
+            let fourcc_str = std::str::from_utf8(&self.fourcc).unwrap_or("????");
+            let pixel_format = match fourcc_str {
+                "YUYV" => Some(PixelFormat::Yuyv),
+                "UYVY" => Some(PixelFormat::Uyvy),
+                "NV12" => Some(PixelFormat::Nv12),
+                "I420" | "YU12" => Some(PixelFormat::I420),
+                "RGB3" => Some(PixelFormat::Rgb24),
+                "BGR3" => Some(PixelFormat::Bgr24),
+                "RGBP" | "RGB4" => Some(PixelFormat::Rgba),
+                "BA24" => Some(PixelFormat::Bgra),
+                "GREY" | "Y800" => Some(PixelFormat::Gray8),
+                _ => None,
+            };
+
+            if let Some(pixel_format) = pixel_format {
+                let format_caps = VideoFormatCaps {
+                    width: CapsValue::Fixed(self.width),
+                    height: CapsValue::Fixed(self.height),
+                    pixel_format: CapsValue::Fixed(pixel_format),
+                    framerate: CapsValue::Any,
+                };
+                caps.push(FormatMemoryCap::new(
+                    format_caps.into(),
+                    MemoryCaps::cpu_only(),
+                ));
+            }
+        }
+
+        if caps.is_empty() {
+            // Still empty (e.g., MJPEG only) - return any CPU
+            ElementMediaCaps::any_cpu()
+        } else {
+            ElementMediaCaps::new(caps)
+        }
     }
 }
 

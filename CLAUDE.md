@@ -481,7 +481,8 @@ parallax/
 │   ├── 13_image.rs               # PNG codec (--features image-codecs)
 │   ├── 14_h264.rs                # H.264 encoding (--features h264)
 │   ├── 15_av1.rs                 # AV1 encoding (--features av1-encode)
-│   └── 16_mpegts.rs              # MPEG-TS muxing (--features mpeg-ts)
+│   ├── 16_mpegts.rs              # MPEG-TS muxing (--features mpeg-ts)
+│   └── 17_multi_format_caps.rs   # Multi-format caps negotiation
 │
 ├── docs/
 │   ├── FINAL_DESIGN_PARALLAX.md  # Complete design document
@@ -696,6 +697,66 @@ let removed: Option<u64> = meta.remove("app/frame_id");
 - `app/*` - Application-specific data
 
 See `examples/31_av1_pipeline_stanag.rs` for a complete example of attaching KLV metadata to video frames.
+
+### Multi-Format Caps Negotiation
+
+Elements can declare multiple supported formats with memory type coupling, and the pipeline automatically negotiates the best common format. This is inspired by GStreamer's GstCapsFeatures.
+
+**Key types:**
+- `ElementMediaCaps` - Holds multiple format+memory combinations, ordered by preference
+- `FormatMemoryCap` - Couples a format constraint with memory type constraints
+- `VideoFormatCaps`, `AudioFormatCaps` - Format constraints with ranges/lists for dimensions, pixel format, etc.
+
+```rust
+use parallax::format::{
+    CapsValue, ElementMediaCaps, FormatMemoryCap, MemoryCaps, PixelFormat, VideoFormatCaps,
+};
+
+// Declare multiple supported formats (e.g., for a camera source)
+impl Source for MyCamera {
+    fn output_media_caps(&self) -> ElementMediaCaps {
+        let yuyv = VideoFormatCaps {
+            width: CapsValue::Fixed(640),
+            height: CapsValue::Fixed(480),
+            pixel_format: CapsValue::Fixed(PixelFormat::Yuyv),
+            framerate: CapsValue::Any,
+        };
+        let rgb24 = VideoFormatCaps {
+            width: CapsValue::Fixed(640),
+            height: CapsValue::Fixed(480),
+            pixel_format: CapsValue::Fixed(PixelFormat::Rgb24),
+            framerate: CapsValue::Any,
+        };
+        
+        // Formats listed in preference order
+        ElementMediaCaps::new(vec![
+            FormatMemoryCap::new(yuyv.into(), MemoryCaps::cpu_only()),
+            FormatMemoryCap::new(rgb24.into(), MemoryCaps::cpu_only()),
+        ])
+    }
+}
+
+// Sink declares what it accepts
+impl Sink for MyDisplay {
+    fn input_media_caps(&self) -> ElementMediaCaps {
+        let rgba = VideoFormatCaps {
+            pixel_format: CapsValue::Fixed(PixelFormat::Rgba),
+            ..VideoFormatCaps::any()
+        };
+        ElementMediaCaps::new(vec![
+            FormatMemoryCap::new(rgba.into(), MemoryCaps::cpu_only()),
+        ])
+    }
+}
+```
+
+**Negotiation behavior:**
+- The solver iterates source formats against sink formats
+- Returns the first (highest preference) intersection
+- If no direct match, looks for converters in the registry
+- Error messages list all attempted format combinations
+
+See `examples/17_multi_format_caps.rs` for a complete example.
 
 ## Implementation Roadmap
 

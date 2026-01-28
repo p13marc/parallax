@@ -1170,6 +1170,18 @@ impl From<MediaFormat> for FormatCaps {
     }
 }
 
+impl From<VideoFormatCaps> for FormatCaps {
+    fn from(caps: VideoFormatCaps) -> Self {
+        Self::VideoRaw(caps)
+    }
+}
+
+impl From<AudioFormatCaps> for FormatCaps {
+    fn from(caps: AudioFormatCaps) -> Self {
+        Self::AudioRaw(caps)
+    }
+}
+
 // ============================================================================
 // Memory Caps - memory type constraints
 // ============================================================================
@@ -1337,6 +1349,338 @@ impl From<Caps> for MediaCaps {
         } else {
             Self::any()
         }
+    }
+}
+
+// ============================================================================
+// ElementMediaCaps - format + memory combinations
+// ============================================================================
+
+/// A single format+memory capability.
+///
+/// This couples a format constraint with its supported memory types.
+/// This is the key insight from GStreamer's GstCapsFeatures: memory type
+/// is part of the format constraint, not separate.
+///
+/// # Example
+///
+/// ```rust
+/// use parallax::format::{FormatMemoryCap, VideoFormatCaps, MemoryCaps, PixelFormat, CapsValue};
+/// use parallax::memory::MemoryType;
+///
+/// // RGB format supported on GPU only
+/// let gpu_rgb = FormatMemoryCap {
+///     format: VideoFormatCaps {
+///         pixel_format: CapsValue::Fixed(PixelFormat::Rgba),
+///         ..VideoFormatCaps::any()
+///     }.into(),
+///     memory: MemoryCaps {
+///         types: CapsValue::Fixed(MemoryType::GpuDevice),
+///         ..MemoryCaps::any()
+///     },
+/// };
+///
+/// // YUV formats supported on CPU
+/// let cpu_yuv = FormatMemoryCap {
+///     format: VideoFormatCaps {
+///         pixel_format: CapsValue::List(vec![PixelFormat::I420, PixelFormat::Nv12]),
+///         ..VideoFormatCaps::any()
+///     }.into(),
+///     memory: MemoryCaps::cpu_only(),
+/// };
+/// ```
+#[derive(Clone, Debug, PartialEq)]
+pub struct FormatMemoryCap {
+    /// Format constraints.
+    pub format: FormatCaps,
+    /// Memory type constraints.
+    pub memory: MemoryCaps,
+}
+
+impl FormatMemoryCap {
+    /// Create a new format+memory capability.
+    pub fn new(format: FormatCaps, memory: MemoryCaps) -> Self {
+        Self { format, memory }
+    }
+
+    /// Create a capability for any format with CPU memory.
+    pub fn any_cpu() -> Self {
+        Self {
+            format: FormatCaps::Any,
+            memory: MemoryCaps::cpu_only(),
+        }
+    }
+
+    /// Create a capability for any format and memory.
+    pub fn any() -> Self {
+        Self {
+            format: FormatCaps::Any,
+            memory: MemoryCaps::any(),
+        }
+    }
+
+    /// Try to intersect this capability with another.
+    ///
+    /// Returns `Some(intersected)` if there's a common format+memory,
+    /// or `None` if they're incompatible.
+    pub fn intersect(&self, other: &Self) -> Option<Self> {
+        Some(Self {
+            format: self.format.intersect(&other.format)?,
+            memory: self.memory.intersect(&other.memory)?,
+        })
+    }
+
+    /// Convert to MediaCaps for backward compatibility.
+    pub fn into_media_caps(self) -> MediaCaps {
+        MediaCaps {
+            format: self.format,
+            memory: self.memory,
+        }
+    }
+}
+
+impl From<MediaCaps> for FormatMemoryCap {
+    fn from(caps: MediaCaps) -> Self {
+        Self {
+            format: caps.format,
+            memory: caps.memory,
+        }
+    }
+}
+
+impl From<FormatMemoryCap> for MediaCaps {
+    fn from(cap: FormatMemoryCap) -> Self {
+        MediaCaps {
+            format: cap.format,
+            memory: cap.memory,
+        }
+    }
+}
+
+/// Element capabilities: multiple format+memory combinations.
+///
+/// This allows elements to express complex constraints like:
+/// - "I support RGB on GPU, but only YUV on CPU"
+/// - "I accept YUYV, MJPEG, or NV12"
+///
+/// Each capability in the list represents an independent option.
+/// The list is ordered by preference (first is best).
+///
+/// # Design Rationale
+///
+/// This is similar to GStreamer's GstCaps which can contain multiple
+/// GstStructure entries, each with its own GstCapsFeatures for memory type.
+/// Unlike GStreamer, we couple format and memory tightly in each entry.
+///
+/// # Examples
+///
+/// ```rust
+/// use parallax::format::{ElementMediaCaps, FormatMemoryCap, VideoFormatCaps, MemoryCaps, PixelFormat, CapsValue};
+/// use parallax::memory::MemoryType;
+///
+/// // Camera that supports multiple formats
+/// let camera_caps = ElementMediaCaps::new(vec![
+///     // YUYV at high resolution
+///     FormatMemoryCap::new(
+///         VideoFormatCaps {
+///             width: CapsValue::Fixed(1920),
+///             height: CapsValue::Fixed(1080),
+///             pixel_format: CapsValue::Fixed(PixelFormat::Yuyv),
+///             ..VideoFormatCaps::any()
+///         }.into(),
+///         MemoryCaps::cpu_only(),
+///     ),
+///     // NV12 at any resolution (from hardware encoder path)
+///     FormatMemoryCap::new(
+///         VideoFormatCaps {
+///             pixel_format: CapsValue::Fixed(PixelFormat::Nv12),
+///             ..VideoFormatCaps::any()
+///         }.into(),
+///         MemoryCaps::cpu_only(),
+///     ),
+/// ]);
+///
+/// // GPU filter that only supports RGB on GPU
+/// let gpu_filter_caps = ElementMediaCaps::new(vec![
+///     FormatMemoryCap::new(
+///         VideoFormatCaps::rgba().into(),
+///         MemoryCaps {
+///             types: CapsValue::Fixed(MemoryType::GpuDevice),
+///             ..MemoryCaps::any()
+///         },
+///     ),
+/// ]);
+/// ```
+#[derive(Clone, Debug, PartialEq)]
+pub struct ElementMediaCaps {
+    /// List of supported format+memory combinations, ordered by preference.
+    caps: SmallVec<[FormatMemoryCap; 2]>,
+}
+
+impl ElementMediaCaps {
+    /// Create new element caps with the given capabilities.
+    pub fn new(caps: impl IntoIterator<Item = FormatMemoryCap>) -> Self {
+        Self {
+            caps: caps.into_iter().collect(),
+        }
+    }
+
+    /// Create caps that accept any format and memory.
+    pub fn any() -> Self {
+        Self {
+            caps: smallvec::smallvec![FormatMemoryCap::any()],
+        }
+    }
+
+    /// Create caps that accept any format but only CPU memory.
+    pub fn any_cpu() -> Self {
+        Self {
+            caps: smallvec::smallvec![FormatMemoryCap::any_cpu()],
+        }
+    }
+
+    /// Create caps for a single format+memory combination.
+    pub fn single(cap: FormatMemoryCap) -> Self {
+        Self {
+            caps: smallvec::smallvec![cap],
+        }
+    }
+
+    /// Create caps from a simple MediaCaps (single format+memory).
+    pub fn from_media_caps(caps: MediaCaps) -> Self {
+        Self::single(caps.into())
+    }
+
+    /// Check if this accepts any format (no constraints).
+    pub fn is_any(&self) -> bool {
+        self.caps.len() == 1
+            && matches!(self.caps[0].format, FormatCaps::Any)
+            && self.caps[0].memory.types.is_any()
+    }
+
+    /// Check if this has exactly one fixed capability.
+    pub fn is_fixed(&self) -> bool {
+        self.caps.len() == 1
+    }
+
+    /// Get the capabilities list.
+    pub fn capabilities(&self) -> &[FormatMemoryCap] {
+        &self.caps
+    }
+
+    /// Iterate over all capabilities.
+    pub fn iter(&self) -> impl Iterator<Item = &FormatMemoryCap> {
+        self.caps.iter()
+    }
+
+    /// Get the number of capabilities.
+    pub fn len(&self) -> usize {
+        self.caps.len()
+    }
+
+    /// Check if empty (no capabilities).
+    pub fn is_empty(&self) -> bool {
+        self.caps.is_empty()
+    }
+
+    /// Get the preferred (first) capability.
+    pub fn preferred(&self) -> Option<&FormatMemoryCap> {
+        self.caps.first()
+    }
+
+    /// Add a capability.
+    pub fn add(&mut self, cap: FormatMemoryCap) {
+        self.caps.push(cap);
+    }
+
+    /// Find the first compatible capability between two caps.
+    ///
+    /// Returns the intersected capability if one exists, preferring
+    /// earlier entries in both lists.
+    pub fn intersect(&self, other: &Self) -> Option<FormatMemoryCap> {
+        // Try each of our caps against each of theirs
+        for our_cap in &self.caps {
+            for their_cap in &other.caps {
+                if let Some(intersected) = our_cap.intersect(their_cap) {
+                    return Some(intersected);
+                }
+            }
+        }
+        None
+    }
+
+    /// Check if there's any compatible format+memory between two caps.
+    pub fn intersects(&self, other: &Self) -> bool {
+        self.intersect(other).is_some()
+    }
+
+    /// Find all compatible capabilities (not just the first).
+    pub fn intersect_all(&self, other: &Self) -> Vec<FormatMemoryCap> {
+        let mut result = Vec::new();
+        for our_cap in &self.caps {
+            for their_cap in &other.caps {
+                if let Some(intersected) = our_cap.intersect(their_cap) {
+                    result.push(intersected);
+                }
+            }
+        }
+        result
+    }
+
+    /// Convert to the best matching MediaCaps for backward compatibility.
+    ///
+    /// Returns the first (preferred) capability as MediaCaps.
+    pub fn to_media_caps(&self) -> MediaCaps {
+        self.caps
+            .first()
+            .cloned()
+            .map(|c| c.into())
+            .unwrap_or_else(MediaCaps::any)
+    }
+
+    /// Convert from simple Caps (format list without memory).
+    ///
+    /// Each format in the Caps becomes a separate capability with CPU memory.
+    pub fn from_caps(caps: &Caps) -> Self {
+        if caps.is_any() {
+            return Self::any_cpu();
+        }
+
+        let caps_vec: SmallVec<[FormatMemoryCap; 2]> = caps
+            .formats()
+            .iter()
+            .map(|f| FormatMemoryCap::new(f.clone().into(), MemoryCaps::cpu_only()))
+            .collect();
+
+        if caps_vec.is_empty() {
+            Self::any_cpu()
+        } else {
+            Self { caps: caps_vec }
+        }
+    }
+}
+
+impl Default for ElementMediaCaps {
+    fn default() -> Self {
+        Self::any()
+    }
+}
+
+impl From<MediaCaps> for ElementMediaCaps {
+    fn from(caps: MediaCaps) -> Self {
+        Self::single(caps.into())
+    }
+}
+
+impl From<Caps> for ElementMediaCaps {
+    fn from(caps: Caps) -> Self {
+        Self::from_caps(&caps)
+    }
+}
+
+impl From<FormatMemoryCap> for ElementMediaCaps {
+    fn from(cap: FormatMemoryCap) -> Self {
+        Self::single(cap)
     }
 }
 
@@ -2037,5 +2381,209 @@ mod tests {
         assert!(Framerate::FPS_24 < Framerate::FPS_30);
         assert!(Framerate::FPS_30 < Framerate::FPS_60);
         assert!(Framerate::FPS_29_97 < Framerate::FPS_30);
+    }
+
+    // ========================================================================
+    // FormatMemoryCap tests
+    // ========================================================================
+
+    #[test]
+    fn test_format_memory_cap_any() {
+        let cap = FormatMemoryCap::any();
+        assert!(matches!(cap.format, FormatCaps::Any));
+        assert!(cap.memory.types.is_any());
+    }
+
+    #[test]
+    fn test_format_memory_cap_intersect() {
+        // GPU RGB
+        let gpu_rgb = FormatMemoryCap::new(
+            VideoFormatCaps::rgba().into(),
+            MemoryCaps {
+                types: CapsValue::Fixed(MemoryType::GpuDevice),
+                ..MemoryCaps::any()
+            },
+        );
+
+        // Any format on GPU
+        let any_gpu = FormatMemoryCap::new(
+            FormatCaps::Any,
+            MemoryCaps {
+                types: CapsValue::Fixed(MemoryType::GpuDevice),
+                ..MemoryCaps::any()
+            },
+        );
+
+        // Should intersect: RGBA on GPU
+        let result = gpu_rgb.intersect(&any_gpu);
+        assert!(result.is_some());
+        let intersected = result.unwrap();
+        assert!(matches!(intersected.format, FormatCaps::VideoRaw(_)));
+        assert_eq!(
+            intersected.memory.types,
+            CapsValue::Fixed(MemoryType::GpuDevice)
+        );
+    }
+
+    #[test]
+    fn test_format_memory_cap_no_intersect_memory_mismatch() {
+        // GPU only
+        let gpu = FormatMemoryCap::new(
+            FormatCaps::Any,
+            MemoryCaps {
+                types: CapsValue::Fixed(MemoryType::GpuDevice),
+                ..MemoryCaps::any()
+            },
+        );
+
+        // CPU only
+        let cpu = FormatMemoryCap::any_cpu();
+
+        // Should NOT intersect: memory types don't match
+        assert!(gpu.intersect(&cpu).is_none());
+    }
+
+    // ========================================================================
+    // ElementMediaCaps tests
+    // ========================================================================
+
+    #[test]
+    fn test_element_media_caps_any() {
+        let caps = ElementMediaCaps::any();
+        assert!(caps.is_any());
+        assert_eq!(caps.capabilities().len(), 1);
+    }
+
+    #[test]
+    fn test_element_media_caps_multi_format() {
+        // Camera supports YUYV and NV12
+        let camera_caps = ElementMediaCaps::new(vec![
+            FormatMemoryCap::new(
+                VideoFormatCaps {
+                    pixel_format: CapsValue::Fixed(PixelFormat::Yuyv),
+                    ..VideoFormatCaps::any()
+                }
+                .into(),
+                MemoryCaps::cpu_only(),
+            ),
+            FormatMemoryCap::new(
+                VideoFormatCaps {
+                    pixel_format: CapsValue::Fixed(PixelFormat::Nv12),
+                    ..VideoFormatCaps::any()
+                }
+                .into(),
+                MemoryCaps::cpu_only(),
+            ),
+        ]);
+
+        assert!(!camera_caps.is_any());
+        assert_eq!(camera_caps.capabilities().len(), 2);
+
+        // Consumer wants NV12
+        let consumer = ElementMediaCaps::single(FormatMemoryCap::new(
+            VideoFormatCaps {
+                pixel_format: CapsValue::Fixed(PixelFormat::Nv12),
+                ..VideoFormatCaps::any()
+            }
+            .into(),
+            MemoryCaps::cpu_only(),
+        ));
+
+        // Should find NV12 as common format
+        let result = camera_caps.intersect(&consumer);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_element_media_caps_format_memory_coupling() {
+        // GPU filter supports RGB on GPU only, but YUV on CPU
+        let gpu_filter = ElementMediaCaps::new(vec![
+            // RGB on GPU (preferred)
+            FormatMemoryCap::new(
+                VideoFormatCaps::rgba().into(),
+                MemoryCaps {
+                    types: CapsValue::Fixed(MemoryType::GpuDevice),
+                    ..MemoryCaps::any()
+                },
+            ),
+            // YUV on CPU (fallback)
+            FormatMemoryCap::new(VideoFormatCaps::yuv420().into(), MemoryCaps::cpu_only()),
+        ]);
+
+        // Source produces RGB on CPU
+        let rgb_cpu_source = ElementMediaCaps::single(FormatMemoryCap::new(
+            VideoFormatCaps::rgba().into(),
+            MemoryCaps::cpu_only(),
+        ));
+
+        // Source produces YUV on CPU
+        let yuv_cpu_source = ElementMediaCaps::single(FormatMemoryCap::new(
+            VideoFormatCaps::yuv420().into(),
+            MemoryCaps::cpu_only(),
+        ));
+
+        // Source produces RGB on GPU
+        let rgb_gpu_source = ElementMediaCaps::single(FormatMemoryCap::new(
+            VideoFormatCaps::rgba().into(),
+            MemoryCaps {
+                types: CapsValue::Fixed(MemoryType::GpuDevice),
+                ..MemoryCaps::any()
+            },
+        ));
+
+        // RGB CPU should NOT match (filter only supports RGB on GPU)
+        assert!(gpu_filter.intersect(&rgb_cpu_source).is_none());
+
+        // YUV CPU should match (filter supports YUV on CPU)
+        assert!(gpu_filter.intersect(&yuv_cpu_source).is_some());
+
+        // RGB GPU should match (filter's preferred option)
+        let result = gpu_filter.intersect(&rgb_gpu_source);
+        assert!(result.is_some());
+        let intersected = result.unwrap();
+        assert_eq!(
+            intersected.memory.types,
+            CapsValue::Fixed(MemoryType::GpuDevice)
+        );
+    }
+
+    #[test]
+    fn test_element_media_caps_from_simple_caps() {
+        let simple = Caps::many([
+            MediaFormat::Video(VideoCodec::H264),
+            MediaFormat::Video(VideoCodec::H265),
+        ]);
+
+        let elem_caps = ElementMediaCaps::from_caps(&simple);
+        assert_eq!(elem_caps.capabilities().len(), 2);
+
+        // Each should have CPU memory (default)
+        for cap in elem_caps.capabilities() {
+            assert_eq!(cap.memory.types, CapsValue::Fixed(MemoryType::Cpu));
+        }
+    }
+
+    #[test]
+    fn test_element_media_caps_intersect_all() {
+        // Source supports both formats on CPU
+        let source = ElementMediaCaps::new(vec![
+            FormatMemoryCap::new(VideoFormatCaps::rgba().into(), MemoryCaps::cpu_only()),
+            FormatMemoryCap::new(VideoFormatCaps::yuv420().into(), MemoryCaps::cpu_only()),
+        ]);
+
+        // Sink accepts both too
+        let sink = ElementMediaCaps::new(vec![
+            FormatMemoryCap::new(VideoFormatCaps::yuv420().into(), MemoryCaps::cpu_only()),
+            FormatMemoryCap::new(VideoFormatCaps::rgba().into(), MemoryCaps::cpu_only()),
+        ]);
+
+        // Should find both as common (RGBA matches RGBA, YUV matches YUV)
+        // Note: RGBA doesn't match YUV and vice versa, so we get 2 matches not 4
+        let all = source.intersect_all(&sink);
+        assert_eq!(all.len(), 2); // RGBA-RGBA and YUV-YUV
+
+        // First match should be RGBA (source's first preference matched against sink)
+        let first = source.intersect(&sink).unwrap();
+        assert!(matches!(first.format, FormatCaps::VideoRaw(_)));
     }
 }
