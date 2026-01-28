@@ -12,10 +12,11 @@ use parallax::pipeline::Pipeline;
 async fn main() -> Result<()> {
     println!("AutoVideoSink Example");
     println!("=====================\n");
-    println!("Displaying video test pattern. Close the window to exit.\n");
+    println!("Displaying animated video test pattern. Close the window to exit.\n");
 
-    // Simple pipeline: videotestsrc generates frames, autovideosink displays them
-    let mut pipeline = Pipeline::parse("videotestsrc ! autovideosink")?;
+    // Simple pipeline: videotestsrc with moving ball pattern -> autovideosink
+    // Use pattern=ball for animation, otherwise SMPTE bars are static
+    let mut pipeline = Pipeline::parse("videotestsrc pattern=ball ! autovideosink")?;
     pipeline.run().await?;
 
     println!("\nDone!");
