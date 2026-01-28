@@ -264,7 +264,7 @@ pipeline.create_pool_from_caps(10)?;
 
 **Key types:**
 - `BufferPool` - Trait for buffer pool implementations
-- `FixedBufferPool` - Fixed-size pool backed by `CpuArena`
+- `FixedBufferPool` - Fixed-size pool backed by SharedArena
 - `PooledBuffer` - RAII buffer that returns to pool on drop
 - `PoolStats` - Statistics (acquisitions, waits, availability)
 
@@ -402,15 +402,12 @@ parallax/
 │   │
 │   ├── memory/             # Memory management
 │   │   ├── segment.rs      # MemorySegment trait, MemoryType
-│   │   ├── heap.rs         # HeapSegment (simple heap allocation)
-│   │   ├── shared.rs       # SharedMemorySegment (memfd_create)
-│   │   ├── cpu.rs          # CpuSegment (unified memfd-backed memory)
-│   │   ├── arena.rs        # CpuArena (arena allocator, 1 fd per pool)
 │   │   ├── shared_refcount.rs # SharedArena (cross-process refcounting)
 │   │   ├── buffer_pool.rs  # BufferPool trait, FixedBufferPool, PooledBuffer
-│   │   ├── pool.rs         # MemoryPool, LoanedSlot (low-level)
 │   │   ├── bitmap.rs       # AtomicBitmap (lock-free slot tracking)
-│   │   └── ipc.rs          # send_fds/recv_fds (SCM_RIGHTS)
+│   │   ├── ipc.rs          # send_fds/recv_fds (SCM_RIGHTS)
+│   │   ├── huge_pages.rs   # Huge page support
+│   │   └── mapped_file.rs  # Memory-mapped file support
 │   │
 │   ├── buffer.rs           # Buffer, MemoryHandle
 │   ├── metadata.rs         # Metadata, BufferFlags
@@ -423,9 +420,7 @@ parallax/
 │   │
 │   ├── pipeline/           # Pipeline execution
 │   │   ├── graph.rs        # Pipeline DAG (daggy-based)
-│   │   ├── executor.rs     # Legacy PipelineExecutor (deprecated)
 │   │   ├── unified_executor.rs # Unified Executor (async + RT + isolation)
-│   │   ├── hybrid_executor.rs # Legacy HybridExecutor (deprecated)
 │   │   ├── rt_scheduler.rs # RT scheduler (graph partitioning, activation records)
 │   │   ├── rt_bridge.rs    # AsyncRtBridge (lock-free SPSC ring buffer + eventfd)
 │   │   ├── driver.rs       # TimerDriver, ManualDriver (PipeWire-style drivers)
@@ -451,6 +446,7 @@ parallax/
 │   │   ├── demux/          # StreamIdDemux, TsDemux, Mp4Demux
 │   │   ├── mux/            # TsMux, TsMuxElement, Mp4Mux (N-to-1 multiplexing)
 │   │   ├── codec/          # Media codecs (AV1, audio, image - feature-gated)
+│   │   ├── device/         # Hardware devices (V4L2, PipeWire, ALSA, libcamera)
 │   │   └── util/           # PassThrough, Identity
 │   │
 │   ├── typed/              # Type-safe pipeline API
@@ -465,10 +461,10 @@ parallax/
 │
 ├── examples/               # One concept per file, all use Pipeline
 │   │   # Basic examples (no features required)
-│   ├── 01_hello.rs               # Simplest pipeline: src → sink
-│   ├── 02_transform.rs           # Transform element: src → xfm → sink
-│   ├── 03_tee.rs                 # Fan-out: src → tee → [sink, sink]
-│   ├── 04_funnel.rs              # Fan-in: [src, src] → funnel → sink
+│   ├── 01_hello.rs               # Simplest pipeline: src -> sink
+│   ├── 02_transform.rs           # Transform element: src -> xfm -> sink
+│   ├── 03_tee.rs                 # Fan-out: src -> tee -> [sink, sink]
+│   ├── 04_funnel.rs              # Fan-in: [src, src] -> funnel -> sink
 │   ├── 05_queue.rs               # Backpressure with queue
 │   ├── 06_appsrc.rs              # Application integration
 │   ├── 07_file_io.rs             # File read/write
@@ -482,12 +478,34 @@ parallax/
 │   ├── 14_h264.rs                # H.264 encoding (--features h264)
 │   ├── 15_av1.rs                 # AV1 encoding (--features av1-encode)
 │   ├── 16_mpegts.rs              # MPEG-TS muxing (--features mpeg-ts)
-│   └── 17_multi_format_caps.rs   # Multi-format caps negotiation
+│   ├── 17_multi_format_caps.rs   # Multi-format caps negotiation
+│   │   # Device examples (require feature flags)
+│   ├── 22_v4l2_capture.rs        # V4L2 camera capture (--features v4l2)
+│   ├── 23_v4l2_display.rs        # V4L2 display output (--features v4l2)
+│   ├── 24_autovideosink.rs       # Auto video sink selection
+│   ├── 41_format_converters.rs   # Format conversion elements
+│   ├── 42_pipewire_audio.rs      # PipeWire audio (--features pipewire)
+│   ├── 43_alsa_audio.rs          # ALSA audio (--features alsa)
+│   └── 44_libcamera_capture.rs   # libcamera capture (--features libcamera)
 │
-├── docs/
-│   ├── FINAL_DESIGN_PARALLAX.md  # Complete design document
-│   ├── PLAN_CAPS_NEGOTIATION.md  # Caps negotiation design
-│   └── getting-started.md        # Quick start guide
+├── docs/                   # Documentation
+│   ├── design.md           # Complete design document and competitive analysis
+│   ├── architecture.md     # High-level architecture overview
+│   ├── api.md              # API reference
+│   ├── memory.md           # Memory management details
+│   ├── plugins.md          # Plugin development guide
+│   ├── security.md         # Security model and sandboxing
+│   ├── getting-started.md  # Quick start guide
+│   │   # Design documents
+│   ├── caps-negotiation-research.md  # Caps negotiation research
+│   ├── vulkan-video-design.md        # Vulkan Video integration design
+│   ├── iced-integration-design.md    # Iced GUI integration design
+│   ├── foundation-design.md          # Foundation layer design
+│   ├── elements-roadmap.md           # Elements implementation roadmap
+│   └── media-streaming-plan.md       # Media streaming plan
+│
+└── plans/                  # Implementation plans (internal)
+    └── README.md           # Plan index and status
 ```
 
 ### Unified Element System (Plan 05)
@@ -760,20 +778,21 @@ See `examples/17_multi_format_caps.rs` for a complete example.
 
 ## Implementation Roadmap
 
-See `docs/FINAL_DESIGN_PARALLAX.md` for full details.
+See `docs/design.md` for full details.
 
 | Phase | Focus | Status |
 |-------|-------|--------|
-| 1 | Memory Foundation (CpuSegment, CpuArena) | ✅ Complete |
-| 2 | Caps Negotiation (global constraint solving) | ✅ Complete |
-| 3 | Cross-Process IPC (IpcSrc/IpcSink) | ✅ Complete |
+| 1 | Memory Foundation (SharedArena) | Complete |
+| 2 | Caps Negotiation (global constraint solving) | Complete |
+| 3 | Cross-Process IPC (IpcSrc/IpcSink) | Complete |
 | 4 | GPU Integration (Vulkan Video) | Planned |
-| 5 | Pure Rust Codecs | ✅ Partial (audio/image complete, video AV1 ready) |
-| 6 | Process Isolation (transparent auto-IPC) | ✅ Complete |
-| 7 | Plugin System (C-compatible ABI) | ✅ Complete |
-| 8 | Distribution (Zenoh) | ✅ Complete |
-| 9 | Hybrid Scheduling (PipeWire-inspired) | ✅ Complete |
-| 10 | Unified Executor (automatic strategy) | ✅ Complete |
+| 5 | Pure Rust Codecs | Partial (audio/image complete, video AV1 ready) |
+| 6 | Process Isolation (transparent auto-IPC) | Complete |
+| 7 | Plugin System (C-compatible ABI) | Complete |
+| 8 | Distribution (Zenoh) | Complete |
+| 9 | Hybrid Scheduling (PipeWire-inspired) | Complete |
+| 10 | Unified Executor (automatic strategy) | Complete |
+| 11 | Device Support (V4L2, PipeWire, ALSA, libcamera) | Complete |
 
 ### Transparent Process Isolation
 
@@ -892,6 +911,39 @@ Most codecs are pure Rust with no external dependencies. Exceptions:
 - **av1-encode**: Optionally install `nasm` for x86_64 SIMD optimizations
 - **av1-decode**: Requires `libdav1d-devel` (Fedora) / `libdav1d-dev` (Debian)
 
+## Device Support
+
+Parallax provides feature-gated device elements for hardware capture and output.
+
+### Device Feature Flags
+
+```toml
+[dependencies]
+# Video capture
+parallax = { version = "0.1", features = ["v4l2"] }       # V4L2 camera capture (Linux)
+parallax = { version = "0.1", features = ["libcamera"] }  # libcamera capture (Linux)
+
+# Audio capture/playback
+parallax = { version = "0.1", features = ["pipewire"] }   # PipeWire audio (Linux)
+parallax = { version = "0.1", features = ["alsa"] }       # ALSA audio (Linux)
+```
+
+### Device Summary
+
+| Type | Device | Feature | Crate | Notes |
+|------|--------|---------|-------|-------|
+| Video | V4L2 | `v4l2` | v4l | Linux video capture |
+| Video | libcamera | `libcamera` | libcamera | Modern camera API |
+| Audio | PipeWire | `pipewire` | pipewire-rs | Modern Linux audio |
+| Audio | ALSA | `alsa` | alsa-rs | Direct ALSA access |
+
+### Build Dependencies
+
+- **v4l2**: Requires `v4l-utils-devel` (Fedora) / `libv4l-dev` (Debian)
+- **libcamera**: Requires `libcamera-devel` (Fedora) / `libcamera-dev` (Debian)
+- **pipewire**: Requires `pipewire-devel` (Fedora) / `libpipewire-0.3-dev` (Debian)
+- **alsa**: Requires `alsa-lib-devel` (Fedora) / `libasound2-dev` (Debian)
+
 ## Performance Notes
 
 - Buffer cloning is O(1) (Arc increment)
@@ -904,6 +956,10 @@ Most codecs are pure Rust with no external dependencies. Exceptions:
 
 ## Documentation
 
-- `docs/FINAL_DESIGN_PARALLAX.md` - Complete design document and competitive analysis
-- `docs/PLAN_CAPS_NEGOTIATION.md` - Detailed caps negotiation design
-- `FINAL_PLAN.md` - Original implementation plan (partially outdated)
+- `docs/design.md` - Complete design document and competitive analysis
+- `docs/architecture.md` - High-level architecture overview
+- `docs/api.md` - API reference
+- `docs/memory.md` - Memory management details
+- `docs/plugins.md` - Plugin development guide
+- `docs/security.md` - Security model and sandboxing
+- `docs/getting-started.md` - Quick start guide

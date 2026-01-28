@@ -442,11 +442,13 @@ let client_slot = cache.get_slot(&ipc_ref)?;
 
 ## Documentation
 
-- [Getting Started](docs/getting-started.md)
-- [Architecture](docs/architecture.md)
-- [API Reference](docs/api.md)
-- [Memory Model](docs/memory.md)
-- [Plugin Development](docs/plugins.md)
+- [Getting Started](docs/getting-started.md) - Quick start guide
+- [Architecture](docs/architecture.md) - System design overview
+- [API Reference](docs/api.md) - Public API documentation
+- [Memory Model](docs/memory.md) - Memory management details
+- [Plugin Development](docs/plugins.md) - Creating plugins
+- [Design Document](docs/design.md) - Comprehensive design reference
+- [Security](docs/security.md) - Sandbox and isolation
 
 ## Examples
 
@@ -509,6 +511,11 @@ cargo bench
 | `http` | HTTP source/sink elements (uses ureq) |
 | `websocket` | WebSocket source/sink elements (uses tungstenite) |
 | `zenoh` | Zenoh pub/sub and query elements |
+| **Device Capture** | |
+| `pipewire` | PipeWire audio/video capture (requires libpipewire) |
+| `libcamera` | Camera capture via libcamera (requires libcamera) |
+| `alsa` | ALSA audio capture/playback (requires libasound) |
+| `v4l2` | V4L2 video capture |
 | **Codecs** | |
 | `image-codecs` | All image codecs (JPEG, PNG) |
 | `image-jpeg` | JPEG decoder (zune-jpeg, pure Rust) |
@@ -520,6 +527,8 @@ cargo bench
 | `audio-vorbis` | Vorbis decoder (Symphonia, pure Rust) |
 | `av1-encode` | AV1 encoder (rav1e, pure Rust) |
 | `av1-decode` | AV1 decoder (dav1d, requires libdav1d) |
+| `h264` | H.264 encoder/decoder (OpenH264) |
+| `mpeg-ts` | MPEG-TS demuxer |
 
 ## License
 
