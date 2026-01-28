@@ -6,7 +6,7 @@ Parallax provides both dynamic (runtime-configured) and typed (compile-time safe
 
 ## Features
 
-- **Zero-copy buffers**: Shared memory with loan-based memory pools
+- **Zero-copy buffers**: Shared memory with cross-process reference counting
 - **Progressive typing**: Start dynamic, graduate to typed
 - **Multi-process pipelines**: memfd + Unix socket IPC
 - **Hybrid scheduling**: PipeWire-inspired async + RT thread execution
@@ -39,8 +39,8 @@ async fn main() -> parallax::Result<()> {
     pipeline.parse("filesrc location=input.bin ! passthrough ! nullsink")?;
     
     // Or build programmatically
-    let src = pipeline.add_node("src", Box::new(source));
-    let sink = pipeline.add_node("sink", Box::new(sink));
+    let src = pipeline.add_source("src", source);
+    let sink = pipeline.add_sink("sink", sink);
     pipeline.link(src, sink)?;
     
     // Run the pipeline - executor auto-negotiates strategy
@@ -77,7 +77,7 @@ fn main() -> parallax::Result<()> {
 Use shared memory for zero-copy IPC with true cross-process reference counting:
 
 ```rust
-use parallax::memory::{SharedArena, SharedSlotRef, SharedArenaCache};
+use parallax::memory::{SharedArena, SharedArenaCache};
 
 // Process A: Owner (creates arena, acquires slots)
 let arena = SharedArena::new(4096, 16)?;  // 16 slots of 4KB each
@@ -90,7 +90,7 @@ send_fd_and_ref(arena.fd(), ipc_ref)?;
 
 // Process B: Client (maps arena, accesses slots)
 let mut cache = SharedArenaCache::new();
-unsafe { cache.map_arena(received_fd)?; }
+cache.map_arena(received_fd)?;
 
 let client_slot = cache.get_slot(&ipc_ref)?;
 assert_eq!(client_slot.data(), b"hello");
@@ -116,12 +116,12 @@ Elements declare `ExecutionHints` describing their characteristics:
 - **trust_level**: Trusted, SemiTrusted, Untrusted
 - **processing**: CpuBound, IoBound, MemoryBound
 - **latency**: UltraLow, Low, Normal, Relaxed
-- **uses_native_code**: true if uses FFI/unsafe
+- **uses_native_code**: true if uses FFI
 
 The executor automatically chooses:
 | Characteristics | Strategy |
 |----------------|----------|
-| Untrusted or native+unsafe | Isolated process |
+| Untrusted or uses native code | Isolated process |
 | RT affinity + RT-safe | RT thread |
 | Low latency + RT-safe | RT thread |
 | I/O-bound | Tokio async |
@@ -198,16 +198,18 @@ pipeline.suspend()?;   // Idle → Suspended (release resources)
 └─────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────┐
-│                     Memory Backend Abstraction                   │
+│                     Shared Memory Foundation                     │
 ├─────────────────────────────────────────────────────────────────┤
+│  All buffers are memfd-backed (zero overhead, always IPC-ready) │
+│                                                                  │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
-│  │  HeapSegment │  │ SharedMemory │  │  HugePages   │          │
-│  │  (default)   │  │   (IPC)      │  │  (2MB/1GB)   │          │
+│  │  CpuArena    │  │ SharedArena  │  │  HugePages   │          │
+│  │  (1 fd/pool) │  │ (cross-proc) │  │  (2MB/1GB)   │          │
 │  └──────────────┘  └──────────────┘  └──────────────┘          │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
-│  │ MappedFile   │  │  GPU Pinned  │  │    RDMA      │          │
-│  │ (persistent) │  │  (future)    │  │   (future)   │          │
-│  └──────────────┘  └──────────────┘  └──────────────┘          │
+│  ┌──────────────┐  ┌──────────────┐                             │
+│  │ MappedFile   │  │  GPU Pinned  │                             │
+│  │ (persistent) │  │  (planned)   │                             │
+│  └──────────────┘  └──────────────┘                             │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -355,19 +357,47 @@ pipeline.suspend()?;   // Idle → Suspended (release resources)
 | `ZenohQueryable` | Handle Zenoh queries |
 | `ZenohQuerier` | Send Zenoh queries |
 
-## Memory Backends
+## Memory Model
+
+All CPU memory in Parallax is **memfd-backed by default**. This means:
+- Zero overhead compared to regular heap allocation
+- Always IPC-ready (can send fd to other processes)
+- Cross-process reference counting works automatically
 
 | Backend | Use Case | IPC Support |
 |---------|----------|-------------|
-| `CpuSegment` | Default, always IPC-ready (memfd-backed) | Yes |
+| `CpuArena` | Default arena allocation (1 fd per pool) | Yes |
 | `SharedArena` | Cross-process refcounting with lock-free release | Yes |
-| `CpuArena` | Arena allocation (1 fd per pool, not per buffer) | Yes |
 | `HugePageSegment` | High-throughput (reduced TLB misses) | Yes |
 | `MappedFileSegment` | Persistent buffers | Yes |
 
-### SharedArena (Cross-Process Refcounting)
+### Cross-Process Reference Counting
 
-Unlike traditional `Arc` which stores refcount on the heap, `SharedArena` stores refcounts **in the shared memory itself**. This enables true cross-process reference counting:
+Traditional reference counting (like `Arc`) stores the refcount on the heap, which doesn't work across processes. Parallax stores refcounts **in the shared memory itself**:
+
+```
+SharedArena Memory Layout:
+┌─────────────────────────────────────────────────────────────────┐
+│ ArenaHeader (cache-aligned)                                     │
+│   magic, version, slot_count, slot_size, arena_id               │
+├─────────────────────────────────────────────────────────────────┤
+│ ReleaseQueue (lock-free MPSC in shared memory)                  │
+│   head: AtomicU32     ← Owner drains here (single consumer)     │
+│   tail: AtomicU32     ← Any process pushes here (multi producer)│
+│   slots: [AtomicU32]  ← Ring buffer of slot indices             │
+├─────────────────────────────────────────────────────────────────┤
+│ SlotHeader[0..N] (8 bytes each)                                 │
+│   refcount: AtomicU32  ← Works across processes!                │
+│   state: AtomicU32     ← Free or Allocated                      │
+├─────────────────────────────────────────────────────────────────┤
+│ SlotData[0..N] (user data)                                      │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**How it works:**
+- **Clone**: Atomic increment in shared memory (works across processes)
+- **Drop**: Atomic decrement; if 0, push slot index to release queue
+- **Reclaim**: Owner drains queue in O(k) where k = released slots
 
 ```rust
 use parallax::memory::{SharedArena, SharedArenaCache};
@@ -377,14 +407,13 @@ let arena = SharedArena::new(4096, 64)?;  // 64 slots of 4KB
 let slot = arena.acquire()?;
 
 // Client process (after receiving arena fd)
-let client_arena = unsafe { SharedArena::from_fd(received_fd)? };
-let client_slot = client_arena.slot_from_ipc(&ipc_ref)?;
+let mut cache = SharedArenaCache::new();
+cache.map_arena(received_fd)?;
 
+let client_slot = cache.get_slot(&ipc_ref)?;
 // Both slots share the same atomic refcount in shared memory!
 // Drop from any process correctly decrements the shared refcount
 ```
-
-**Lock-free release queue**: When refcount hits 0, the slot index is pushed to an MPSC queue in shared memory. The owner drains this queue to reclaim slots in O(k) time.
 
 ## Typed Operators
 
@@ -401,13 +430,13 @@ let client_slot = client_arena.slot_from_ipc(&ipc_ref)?;
 
 | Operation | Cost | Notes |
 |-----------|------|-------|
-| Buffer clone (same process) | O(1) | Arc increment only |
+| Buffer clone (same process) | O(1) | Atomic increment |
 | Buffer clone (cross-process) | O(1) | Atomic increment in shared memory |
-| Buffer access (typed) | O(1) | Direct pointer |
+| Buffer access | O(1) | Direct pointer |
 | Pool slot acquire | O(1) amortized | Atomic bitmap scan |
 | Slot release (SharedArena) | O(1) | Lock-free queue push |
 | Slot reclaim (SharedArena) | O(k) | k = released slots, not total slots |
-| Tee (N outputs) | O(N) Arc clones | No data copying |
+| Tee (N outputs) | O(N) clones | No data copying |
 | Cross-process send | O(1) | Just send IPC ref (no copy) |
 | Cross-process receive | O(1) | Map arena once, then direct access |
 
@@ -425,40 +454,37 @@ Run the examples:
 
 ```bash
 # Basics
-cargo run --example 01_hello_pipeline       # Simplest pipeline
-cargo run --example 02_counting_source      # Multiple buffers
-cargo run --example 03_transform_element    # Custom transforms
-
-# Routing
-cargo run --example 04_tee_fanout           # 1-to-N fanout
-cargo run --example 05_funnel_merge         # N-to-1 merge
-
-# Typed pipelines
-cargo run --example 06_typed_pipeline       # Type-safe pipelines
+cargo run --example 01_hello               # Simplest pipeline
+cargo run --example 02_transform           # Custom transforms
+cargo run --example 03_tee                 # 1-to-N fanout
+cargo run --example 04_funnel              # N-to-1 merge
+cargo run --example 05_queue               # Backpressure handling
 
 # Application integration
-cargo run --example 07_appsrc_appsink       # Inject/extract buffers
+cargo run --example 06_appsrc              # Inject buffers from app
+cargo run --example 07_file_io             # Read/write files
 
-# Flow control
-cargo run --example 08_queue_backpressure   # Backpressure handling
-cargo run --example 09_valve_control        # On/off flow control
+# Network
+cargo run --example 08_tcp                 # TCP streaming
 
-# File I/O
-cargo run --example 10_file_io              # Read/write files
+# Typed pipelines
+cargo run --example 09_typed               # Type-safe pipelines
+cargo run --example 10_builder             # Fluent builder DSL
+
+# Memory management
+cargo run --example 11_buffer_pool         # Pre-allocated buffer pooling
 
 # Process isolation
-cargo run --example 11_isolate_in_process   # Default execution
-cargo run --example 12_isolate_by_pattern   # Selective isolation
-cargo run --example 13_isolate_all          # Full isolation
-cargo run --example 14_ipc_manual           # Manual IPC boundaries
+cargo run --example 12_isolation           # Execution modes
 
-# Video
-cargo run --example 15_video_testsrc        # Test pattern generator
-cargo run --example 16_video_display --features iced-sink  # GUI display
+# Codecs (require feature flags)
+cargo run --example 13_image --features image-codecs  # PNG codec
+cargo run --example 14_h264 --features h264           # H.264 encoding
+cargo run --example 15_av1 --features av1-encode      # AV1 encoding
+cargo run --example 16_mpegts --features mpeg-ts      # MPEG-TS muxing
 
-# Execution features
-cargo run --example 19_auto_execution       # Automatic execution strategy
-cargo run --example 20_dynamic_state        # Dynamic pipeline state changes
+# Caps negotiation
+cargo run --example 17_multi_format_caps   # Multi-format negotiation
 ```
 
 ## Benchmarks
@@ -471,7 +497,7 @@ cargo bench
 
 ## Requirements
 
-- Rust 1.85+
+- Rust 1.75+
 - Linux (uses Linux-specific APIs: memfd_create, SCM_RIGHTS)
 
 ## Feature Flags
