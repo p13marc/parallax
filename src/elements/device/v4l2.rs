@@ -20,7 +20,6 @@
 //! ```
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
 
 use v4l::buffer::Type;
 use v4l::io::mmap::Stream as MmapStream;
@@ -38,24 +37,6 @@ use crate::memory::SharedArena;
 use crate::metadata::Metadata;
 
 use super::DeviceError;
-
-/// Shared arena for V4L2 buffers.
-fn v4l2_arena() -> &'static std::sync::Mutex<SharedArena> {
-    static ARENA: OnceLock<std::sync::Mutex<SharedArena>> = OnceLock::new();
-    // V4L2 frames can be large (4K = ~12MB for YUYV), use generous slot size
-    // Use 32 slots for pipeline buffering
-    ARENA.get_or_init(|| std::sync::Mutex::new(SharedArena::new(16 * 1024 * 1024, 32).unwrap()))
-}
-
-/// Helper to create a buffer from a slice.
-fn buffer_from_slice(data: &[u8]) -> Buffer {
-    let mut arena = v4l2_arena().lock().unwrap();
-    arena.reclaim();
-    let mut slot = arena.acquire().expect("v4l2 arena exhausted");
-    slot.data_mut()[..data.len()].copy_from_slice(data);
-    let handle = MemoryHandle::with_len(slot, data.len());
-    Buffer::new(handle, Metadata::default())
-}
 
 /// Check if V4L2 is available on this system.
 pub fn is_available() -> bool {
@@ -169,6 +150,8 @@ pub struct V4l2Src {
     fourcc: [u8; 4],
     /// All supported formats from the device (cached for caps negotiation).
     supported_formats: Vec<V4l2SupportedFormat>,
+    /// Arena for buffer allocation (per-source to avoid contention).
+    arena: Option<SharedArena>,
 }
 
 impl V4l2Src {
@@ -233,6 +216,7 @@ impl V4l2Src {
             height,
             fourcc: actual_fourcc,
             supported_formats,
+            arena: None,
         })
     }
 
@@ -341,6 +325,15 @@ impl Drop for V4l2Src {
 
 impl Source for V4l2Src {
     fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
+        // Lazily initialize per-source arena before borrowing stream
+        if self.arena.is_none() {
+            // Use preferred_buffer_size or estimated max frame size
+            let slot_size = self
+                .preferred_buffer_size()
+                .unwrap_or(self.width as usize * self.height as usize * 4);
+            self.arena = Some(SharedArena::new(slot_size, 32)?);
+        }
+
         let stream = self
             .stream
             .as_mut()
@@ -351,11 +344,26 @@ impl Source for V4l2Src {
 
         let len = buffer.len();
         if !ctx.has_buffer() || len > ctx.capacity() {
-            // No buffer provided or buffer too small, return our own
-            return Ok(ProduceResult::OwnBuffer(buffer_from_slice(buffer)));
+            // No buffer provided or buffer too small, return our own buffer from arena
+            let arena = self.arena.as_mut().unwrap();
+            arena.reclaim();
+
+            let mut slot = arena
+                .acquire()
+                .ok_or_else(|| crate::error::Error::Element("V4L2 arena exhausted".to_string()))?;
+
+            slot.data_mut()[..len].copy_from_slice(buffer);
+
+            let handle = MemoryHandle::with_len(slot, len);
+
+            return Ok(ProduceResult::OwnBuffer(Buffer::new(
+                handle,
+                Metadata::new(),
+            )));
         }
 
         ctx.output()[..len].copy_from_slice(buffer);
+
         Ok(ProduceResult::Produced(len))
     }
 

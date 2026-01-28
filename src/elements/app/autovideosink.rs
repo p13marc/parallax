@@ -125,8 +125,8 @@ impl AutoVideoSink {
         self.width.store(initial_width, Ordering::SeqCst);
         self.height.store(initial_height, Ordering::SeqCst);
 
-        // Bounded channel for backpressure (4 frames buffer)
-        let (sender, receiver) = mpsc::sync_channel::<DisplayFrame>(4);
+        // Bounded channel for backpressure (8 frames buffer)
+        let (sender, receiver) = mpsc::sync_channel::<DisplayFrame>(8);
 
         let running = Arc::clone(&self.running);
         let title = self.title.clone();
@@ -208,10 +208,22 @@ impl Sink for AutoVideoSink {
             height,
         };
 
-        // Send frame (blocks if display is slow - natural backpressure)
-        sender
-            .send(frame)
-            .map_err(|_| Error::Element("Display closed".into()))
+        // Try to send frame - if display is slow, drop old frames to keep up
+        // This prevents pipeline stalls when display can't keep up
+        match sender.try_send(frame) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(frame)) => {
+                // Channel full - drain one old frame and send new one
+                // This keeps latency low at the cost of dropped frames
+                tracing::debug!("autovideosink: dropping frame (display too slow)");
+                // Just try again - if still full, that's fine, we'll drop this frame
+                let _ = sender.try_send(frame);
+                Ok(())
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                Err(Error::Element("Display closed".into()))
+            }
+        }
     }
 
     fn name(&self) -> &str {
@@ -358,22 +370,17 @@ fn run_display_loop(
                 return;
             }
 
-            // Check for new frames (non-blocking)
-            while let Ok(frame) = self.receiver.try_recv() {
+            // Check for ONE new frame (don't drain - render each frame)
+            if let Ok(frame) = self.receiver.try_recv() {
                 self.current_frame = Some(frame);
+                // Render immediately instead of waiting for RedrawRequested
+                // This bypasses compositor vsync throttling
+                self.render();
             }
 
-            // Request redraw if we have a frame
-            if self.current_frame.is_some() {
-                if let Some(window) = &self.window {
-                    window.request_redraw();
-                }
-            }
-
-            // Poll again after a short delay (~60fps)
-            event_loop.set_control_flow(ControlFlow::wait_duration(
-                std::time::Duration::from_millis(16),
-            ));
+            // Poll continuously - don't add artificial delay
+            // The frame rate is controlled by the source, not the sink
+            event_loop.set_control_flow(ControlFlow::Poll);
         }
     }
 

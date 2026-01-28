@@ -298,11 +298,16 @@ fn create_v4l2src(props: &HashMap<String, PropertyValue>) -> Result<Box<DynAsync
         .map(|v| v.as_string())
         .or_else(|| Some("YUYV".to_string()));
 
+    let buffer_count = props
+        .get("buffer_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(4) as u32;
+
     let config = V4l2Config {
         width,
         height,
         fourcc,
-        buffer_count: 4,
+        buffer_count,
     };
 
     let src = V4l2Src::with_config(&device, config)?;
