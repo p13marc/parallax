@@ -77,8 +77,9 @@ url = { version = "2", optional = true }
 # MPEG-TS demuxer (optional)
 mpeg2ts-reader = { version = "0.18", optional = true }
 
-# Iced GUI (optional)
-iced = { version = "0.14", optional = true, features = ["image", "tokio"] }
+# Display (winit + softbuffer for autovideosink)
+winit = { version = "0.30", optional = true }
+softbuffer = { version = "0.4", optional = true }
 
 # Vulkan Video (optional)
 ash = { version = "0.38", optional = true }
@@ -162,7 +163,7 @@ rtp = ["dep:rtp", "dep:rtcp", "dep:webrtc-util", "dep:webrtc-util-0_10"]  # RTP/
 rtsp = ["rtp", "dep:retina", "dep:url"]  # RTSP client (includes RTP support)
 mpeg-ts = ["dep:mpeg2ts-reader"]  # MPEG-TS demuxer
 mp4-demux = ["dep:mp4"]  # MP4/MOV container demuxer
-iced-sink = ["dep:iced"]  # Iced GUI video sink
+display = ["dep:winit", "dep:softbuffer"]  # Video display window (autovideosink)
 # Device capture (modern Linux stack)
 pipewire = ["dep:pipewire"]  # PipeWire audio/video capture/playback
 libcamera = ["dep:libcamera"]  # Modern camera API (Raspberry Pi, embedded, etc.)
@@ -249,5 +250,9 @@ name = "22_v4l2_capture"
 required-features = ["v4l2"]
 
 [[example]]
-name = "23_v4l2_iced_display"
-required-features = ["v4l2", "iced-sink"]
+name = "23_v4l2_display"
+required-features = ["v4l2", "display"]
+
+[[example]]
+name = "24_autovideosink"
+required-features = ["display"]

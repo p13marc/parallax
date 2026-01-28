@@ -35,6 +35,20 @@ impl ElementFactory {
         factory.register("filesrc", create_filesrc);
         factory.register("filesink", create_filesink);
 
+        // Video display (feature-gated)
+        #[cfg(feature = "display")]
+        factory.register("autovideosink", create_autovideosink);
+
+        // Video processing
+        factory.register("videoconvert", create_videoconvert);
+
+        // Test sources
+        factory.register("videotestsrc", create_videotestsrc);
+
+        // Device sources (feature-gated)
+        #[cfg(feature = "v4l2")]
+        factory.register("v4l2src", create_v4l2src);
+
         factory
     }
 
@@ -178,6 +192,102 @@ fn create_filesink(
 
     let sink = FileSink::new(&location);
     Ok(DynAsyncElement::new_box(SinkAdapter::new(sink)))
+}
+
+#[cfg(feature = "display")]
+fn create_autovideosink(
+    props: &HashMap<String, PropertyValue>,
+) -> Result<Box<DynAsyncElement<'static>>> {
+    use crate::elements::app::AutoVideoSink;
+
+    let mut sink = AutoVideoSink::new();
+
+    if let Some(title) = props.get("title").map(|v| v.as_string()) {
+        sink = sink.with_title(title);
+    }
+
+    if let (Some(w), Some(h)) = (
+        props.get("width").and_then(|v| v.as_u64()),
+        props.get("height").and_then(|v| v.as_u64()),
+    ) {
+        sink = sink.with_size(w as u32, h as u32);
+    }
+
+    Ok(DynAsyncElement::new_box(SinkAdapter::new(sink)))
+}
+
+fn create_videoconvert(
+    _props: &HashMap<String, PropertyValue>,
+) -> Result<Box<DynAsyncElement<'static>>> {
+    use crate::format::PixelFormat;
+    use crate::negotiation::VideoConvert;
+
+    // Default to RGBA output (most common for display)
+    let element = VideoConvert::new(PixelFormat::Rgba);
+    Ok(DynAsyncElement::new_box(ElementAdapter::new(element)))
+}
+
+fn create_videotestsrc(
+    props: &HashMap<String, PropertyValue>,
+) -> Result<Box<DynAsyncElement<'static>>> {
+    use crate::elements::testing::{PixelFormat, VideoPattern, VideoTestSrc};
+
+    let mut src = VideoTestSrc::new();
+
+    // Pattern
+    if let Some(pattern) = props.get("pattern").map(|v| v.as_string()) {
+        src = src.with_pattern(match pattern.as_str() {
+            "smpte" | "smpte-color-bars" => VideoPattern::SmpteColorBars,
+            "checkerboard" => VideoPattern::Checkerboard,
+            "solid" => VideoPattern::SolidColor,
+            "ball" | "moving-ball" => VideoPattern::MovingBall,
+            "gradient" => VideoPattern::Gradient,
+            "black" => VideoPattern::Black,
+            "white" => VideoPattern::White,
+            "red" => VideoPattern::Red,
+            "green" => VideoPattern::Green,
+            "blue" => VideoPattern::Blue,
+            "circular" => VideoPattern::Circular,
+            "snow" => VideoPattern::Snow,
+            _ => VideoPattern::SmpteColorBars,
+        });
+    }
+
+    // Resolution
+    if let (Some(w), Some(h)) = (
+        props.get("width").and_then(|v| v.as_u64()),
+        props.get("height").and_then(|v| v.as_u64()),
+    ) {
+        src = src.with_resolution(w as u32, h as u32);
+    }
+
+    // Frame count
+    if let Some(count) = props.get("num-buffers").and_then(|v| v.as_u64()) {
+        src = src.with_num_frames(count);
+    }
+
+    // FPS
+    if let Some(fps) = props.get("framerate").and_then(|v| v.as_u64()) {
+        src = src.with_framerate(fps as u32, 1);
+    }
+
+    // Use RGBA format for display compatibility
+    src = src.with_pixel_format(PixelFormat::Rgba32);
+
+    Ok(DynAsyncElement::new_box(SourceAdapter::new(src)))
+}
+
+#[cfg(feature = "v4l2")]
+fn create_v4l2src(props: &HashMap<String, PropertyValue>) -> Result<Box<DynAsyncElement<'static>>> {
+    use crate::elements::device::V4l2Src;
+
+    let device = props
+        .get("device")
+        .map(|v| v.as_string())
+        .unwrap_or_else(|| "/dev/video0".to_string());
+
+    let src = V4l2Src::new(&device)?;
+    Ok(DynAsyncElement::new_box(SourceAdapter::new(src)))
 }
 
 #[cfg(test)]

@@ -154,10 +154,8 @@ pub use transform::{
 // App integration
 pub use app::{AppSink, AppSinkHandle, AppSinkStats, AppSrc, AppSrcHandle, AppSrcStats};
 
-#[cfg(feature = "iced-sink")]
-pub use app::{
-    IcedVideoSink, IcedVideoSinkConfig, IcedVideoSinkHandle, IcedVideoSinkStats, InputPixelFormat,
-};
+#[cfg(feature = "display")]
+pub use app::AutoVideoSink;
 
 // IPC
 pub use ipc::{IpcSink, IpcSrc, MemorySink, MemorySinkStats, MemorySrc, SharedMemorySink};

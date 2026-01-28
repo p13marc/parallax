@@ -2,18 +2,16 @@
 //!
 //! - [`AppSrc`]: Inject buffers from application code
 //! - [`AppSink`]: Extract buffers to application code
-//! - `IcedVideoSink`: Display video in Iced GUI (requires `iced-sink` feature)
+//! - [`AutoVideoSink`]: Display video in a window (requires `display` feature)
 
 mod appsink;
 mod appsrc;
 
-#[cfg(feature = "iced-sink")]
-mod iced_sink;
+#[cfg(feature = "display")]
+mod autovideosink;
 
 pub use appsink::{AppSink, AppSinkHandle, AppSinkStats};
 pub use appsrc::{AppSrc, AppSrcHandle, AppSrcStats};
 
-#[cfg(feature = "iced-sink")]
-pub use iced_sink::{
-    IcedVideoSink, IcedVideoSinkConfig, IcedVideoSinkHandle, IcedVideoSinkStats, InputPixelFormat,
-};
+#[cfg(feature = "display")]
+pub use autovideosink::AutoVideoSink;

@@ -1,787 +1,463 @@
-# Plan: Proper Iced Pipeline Integration
+# Plan: Proper Video Display Sink (autovideosink)
 
 ## Problem Statement
 
-Currently, Parallax cannot express a simple pipeline like:
+We want to express pipelines like:
 ```rust
-Pipeline::parse("v4l2src ! videoconvert ! icedsink")?.run()?;
+Pipeline::parse("v4l2src ! videoconvert ! autovideosink")?.run().await?;
 ```
 
-The current `IcedVideoSink` requires manual threading because:
-1. `iced::application(...).run()` blocks the thread to run the event loop
-2. The pipeline executor runs elements as Tokio tasks
-3. These two execution models conflict
+And have it "just work" - automatically creating a window and displaying video.
 
-Additionally, there are broader infrastructure gaps:
-- **No auto-negotiation**: Converters must be manually inserted
-- **Missing factory registrations**: Device elements like `v4l2src` aren't registered
+## How GStreamer Does It
 
-## Root Cause Analysis
+GStreamer's `autovideosink` selects an appropriate sink (like `xvimagesink`). Looking at [xvimagesink.c](https://github.com/GStreamer/gst-plugins-base/blob/master/sys/xvimage/xvimagesink.c):
 
-### How GStreamer Solves This
+1. **Creates its own X11 window** via `gst_xvcontext_create_xwindow()`
+2. **Runs its own event thread** (`gst_xv_image_sink_event_thread`) that:
+   - Loops while `running` is true
+   - Calls `gst_xv_image_sink_handle_xevents()` to process X11 events
+   - Sleeps ~50ms between iterations
+3. **Rendering is non-blocking** - `show_frame()` just blits to the window
+4. **No external main loop required** - the sink is self-contained
 
-GStreamer video sinks (like `gtksink`, `gtkglsink`) work differently:
-1. The **pipeline runs in background threads** managed by GStreamer
-2. The **GUI runs its own event loop** on the main thread
-3. Video sinks use **GstVideoOverlay** interface to render to a GUI widget
-4. Communication happens via **GLib message bus** for thread-safe updates
+Key insight: **GStreamer video sinks don't need special traits or lifecycle management - they're just regular sinks that happen to create windows and run their own event threads.**
 
-Key insight: **GStreamer video sinks don't control the event loop** - they just receive frames and render them to a widget that the GUI toolkit manages.
+## The Parallax Solution
 
-### How Iced Works
-
-Iced follows The Elm Architecture:
-1. **State**: Application state
-2. **Messages**: Events that trigger state changes
-3. **Update**: Handle messages and update state
-4. **View**: Render state to widgets
-
-For async work, Iced provides:
-- `Task::run` - Run a future and get a message when done
-- `Subscription::run` - Create a stream of messages from async work
-- `iced::stream::channel` - Bridge between futures and streams
-
-With `features = ["tokio"]`, Iced uses Tokio as its executor and can run alongside other Tokio tasks.
-
-### The Real Issue
-
-The current `IcedVideoSink` design is **inverted**:
-- It expects to be called by the pipeline executor (push model)
-- But Iced's architecture requires the application to **pull** data via subscriptions
-
-## Solution: Flip the Model
-
-Instead of a "sink" that receives frames, we need:
-1. A **channel** that the pipeline writes frames to
-2. An **Iced subscription** that reads from this channel
-3. An **Iced application** that displays frames
+We can do the same thing using:
+- **[winit](https://github.com/rust-windowing/winit)** - Cross-platform window creation and event handling
+- **[softbuffer](https://github.com/rust-windowing/softbuffer)** - GPU-less 2D buffer display
 
 ### Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Iced Application                              │
-│  ┌──────────────────────────────────────────────────────────────┐│
-│  │ Subscription::run(frame_receiver)                            ││
-│  │   └── Receives: Message::Frame(rgba_data)                    ││
-│  └──────────────────────────────────────────────────────────────┘│
-│                           ▲                                      │
-│                           │ mpsc channel                         │
-│  ┌──────────────────────────────────────────────────────────────┐│
-│  │ fn subscription(&self) -> Subscription<Message>              ││
-│  │   └── Returns the frame subscription                         ││
-│  └──────────────────────────────────────────────────────────────┘│
-└─────────────────────────────────────────────────────────────────┘
-                            ▲
-                            │ frames via channel
-┌─────────────────────────────────────────────────────────────────┐
-│               Parallax Pipeline (Tokio tasks)                    │
-│  ┌──────────┐    ┌──────────┐    ┌──────────────────┐           │
-│  │ v4l2src  │───▶│ convert  │───▶│ ChannelSink      │           │
-│  └──────────┘    └──────────┘    │ (sends to mpsc)  │           │
-│                                  └──────────────────┘           │
-└─────────────────────────────────────────────────────────────────┘
+Pipeline Thread (Tokio):              Display Thread:
+┌─────────────────────────────────┐   ┌──────────────────────────────┐
+│ v4l2src → videoconvert → sink   │   │ winit EventLoop              │
+│                           │     │   │   - Handle resize/close      │
+│                           ▼     │   │   - Redraw on request        │
+│                    ┌──────────┐ │   │                              │
+│                    │ Channel  │─┼───│→ softbuffer Surface          │
+│                    │ (frames) │ │   │   - Blit RGBA pixels         │
+│                    └──────────┘ │   │                              │
+└─────────────────────────────────┘   └──────────────────────────────┘
 ```
+
+The `AutoVideoSink`:
+1. **On creation**: Spawns a display thread with winit event loop
+2. **On `consume()`**: Sends frame via channel (non-blocking with bounded channel)
+3. **Display thread**: Receives frames, blits to softbuffer surface
+4. **On drop**: Signals display thread to close
+
+### Why This Works
+
+- `AutoVideoSink` is a **regular `Sink`** - no special trait needed
+- The sink spawns its own display thread (like GStreamer)
+- `pipeline.run().await` works normally
+- No API changes required
 
 ---
 
-## Implementation Plan
+## Implementation
 
-### Phase 1: Element Factory Registration
+### Phase 1: Core AutoVideoSink
 
-**Goal:** Enable `Pipeline::parse("v4l2src ! ...")` to work.
-
-Currently, the factory only registers: `nullsource`, `nullsink`, `passthrough`, `tee`, `filesrc`, `filesink`.
-
-#### 1.1 Register Device Elements
-
-**File:** `src/pipeline/factory.rs`
+**File:** `src/elements/app/autovideosink.rs`
 
 ```rust
-impl ElementFactory {
-    pub fn new() -> Self {
-        let mut factory = Self { /* ... */ };
+use crate::element::{Sink, ConsumeContext};
+use crate::error::{Error, Result};
+use std::sync::mpsc::{self, SyncSender, Receiver};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 
-        // Existing
-        factory.register("nullsource", create_nullsource);
-        factory.register("nullsink", create_nullsink);
-        // ...
-
-        // NEW: Device sources (feature-gated)
-        #[cfg(feature = "v4l2")]
-        factory.register("v4l2src", create_v4l2src);
-        
-        #[cfg(feature = "pipewire")]
-        factory.register("pipewiresrc", create_pipewiresrc);
-        
-        #[cfg(feature = "libcamera")]
-        factory.register("libcamerasrc", create_libcamerasrc);
-
-        // NEW: Video elements
-        factory.register("videoconvert", create_videoconvert);
-        factory.register("videoscale", create_videoscale);
-
-        // NEW: Display sinks
-        factory.register("channelsink", create_channelsink);
-        #[cfg(feature = "iced-sink")]
-        factory.register("icedsink", create_icedsink);  // Alias for channelsink
-
-        factory
-    }
-}
-```
-
-#### 1.2 Implement Constructors
-
-```rust
-#[cfg(feature = "v4l2")]
-fn create_v4l2src(props: &HashMap<String, PropertyValue>) -> Result<Box<DynAsyncElement<'static>>> {
-    let device = props
-        .get("device")
-        .map(|v| v.as_string())
-        .unwrap_or_else(|| "/dev/video0".to_string());
-    
-    let width = props.get("width").and_then(|v| v.as_u64()).map(|v| v as u32);
-    let height = props.get("height").and_then(|v| v.as_u64()).map(|v| v as u32);
-    
-    let mut config = V4l2Config::default();
-    if let Some(w) = width { config.width = w; }
-    if let Some(h) = height { config.height = h; }
-    
-    let src = V4l2Src::with_config(&device, config)?;
-    Ok(DynAsyncElement::new_box(SourceAdapter::new(src)))
-}
-
-fn create_videoconvert(props: &HashMap<String, PropertyValue>) -> Result<Box<DynAsyncElement<'static>>> {
-    // VideoConvert element that auto-negotiates format
-    let convert = VideoConvertElement::new();
-    Ok(DynAsyncElement::new_box(ElementAdapter::new(convert)))
-}
-```
-
----
-
-### Phase 2: Auto-Negotiation and Converter Insertion
-
-**Goal:** Pipeline automatically inserts `videoconvert` when formats don't match.
-
-This builds on the existing caps negotiation infrastructure in `docs/PLAN_CAPS_NEGOTIATION.md`.
-
-#### 2.1 Elements Declare Their Caps
-
-Each element must declare what formats it produces/accepts:
-
-```rust
-impl Source for V4l2Src {
-    fn output_caps(&self) -> Caps {
-        // V4L2 typically outputs YUYV, MJPG, etc.
-        Caps::video_raw(VideoFormatCaps {
-            width: CapsValue::Fixed(self.width),
-            height: CapsValue::Fixed(self.height),
-            pixel_format: CapsValue::Fixed(self.pixel_format()), // e.g., YUYV
-            framerate: CapsValue::Any,
-        })
-    }
-}
-
-impl Sink for ChannelSink {
-    fn input_caps(&self) -> Caps {
-        // Display sinks require RGBA
-        Caps::video_raw(VideoFormatCaps {
-            width: CapsValue::Fixed(self.width),
-            height: CapsValue::Fixed(self.height),
-            pixel_format: CapsValue::Fixed(PixelFormat::Rgba),
-            framerate: CapsValue::Any,
-        })
-    }
-}
-```
-
-#### 2.2 Converter Registry
-
-**File:** `src/pipeline/converter_registry.rs`
-
-```rust
-/// Registry of format converters
-pub struct ConverterRegistry {
-    /// Map: (from_format, to_format) -> converter factory
-    converters: HashMap<(MediaType, MediaType), ConverterFactory>,
-}
-
-impl ConverterRegistry {
-    pub fn new() -> Self {
-        let mut registry = Self { converters: HashMap::new() };
-        
-        // Register video format converters
-        registry.register_video_converter(
-            |from, to| VideoConvertElement::can_convert(from, to),
-            |from, to| Box::new(VideoConvertElement::new_for(from, to)),
-        );
-        
-        // Register video scalers
-        registry.register_video_scaler(
-            |from, to| VideoScaleElement::can_scale(from, to),
-            |from, to| Box::new(VideoScaleElement::new_for(from, to)),
-        );
-        
-        registry
-    }
-    
-    /// Find a converter (or chain) from src to dst format
-    pub fn find_path(&self, src: &Caps, dst: &Caps) -> Option<Vec<Box<dyn Element>>> {
-        // Use Dijkstra or BFS to find shortest conversion path
-        // Returns empty vec if formats are compatible
-        // Returns None if no conversion path exists
-    }
-}
-```
-
-#### 2.3 Auto-Insert Converters During Pipeline Construction
-
-**File:** `src/pipeline/graph.rs`
-
-```rust
-impl Pipeline {
-    /// Link elements with automatic converter insertion
-    pub fn link_with_negotiation(&mut self, from: NodeId, to: NodeId) -> Result<()> {
-        let from_caps = self.get_node(from)?.output_caps();
-        let to_caps = self.get_node(to)?.input_caps();
-        
-        // Check if formats are compatible
-        if from_caps.intersects(&to_caps) {
-            // Direct link
-            return self.link(from, to);
-        }
-        
-        // Find converter path
-        let converters = self.converter_registry.find_path(&from_caps, &to_caps)
-            .ok_or_else(|| Error::NegotiationFailed {
-                explanation: NegotiationErrorExplanation {
-                    path: vec![
-                        self.get_node(from)?.name().to_string(),
-                        self.get_node(to)?.name().to_string(),
-                    ],
-                    upstream_format: from_caps.clone(),
-                    downstream_format: to_caps.clone(),
-                    suggestions: vec![
-                        "No converter available for this format pair".to_string(),
-                    ],
-                },
-            })?;
-        
-        // Insert converters
-        let mut current = from;
-        for (i, converter) in converters.into_iter().enumerate() {
-            let name = format!("__auto_convert_{}_{}", from, i);
-            let node_id = self.add_node(&name, converter);
-            self.link(current, node_id)?;
-            current = node_id;
-        }
-        self.link(current, to)?;
-        
-        Ok(())
-    }
-}
-```
-
-#### 2.4 Pipeline::parse Uses Auto-Negotiation
-
-```rust
-impl Pipeline {
-    pub fn parse(description: &str) -> Result<Self> {
-        let parsed = parser::parse(description)?;
-        let mut pipeline = Pipeline::new();
-        
-        // Create elements
-        let mut node_ids = Vec::new();
-        for element in &parsed.elements {
-            let elem = pipeline.factory.create(element)?;
-            let id = pipeline.add_node(&element.name, elem);
-            node_ids.push(id);
-        }
-        
-        // Link with auto-negotiation
-        for window in node_ids.windows(2) {
-            pipeline.link_with_negotiation(window[0], window[1])?;
-        }
-        
-        Ok(pipeline)
-    }
-}
-```
-
----
-
-### Phase 3: Core Iced Integration Components
-
-#### 3.1 FrameData Struct
-
-**File:** `src/elements/app/channel_sink.rs`
-
-```rust
-/// Frame data sent through the channel
-#[derive(Debug, Clone)]
-pub struct FrameData {
-    /// RGBA pixel data
-    pub pixels: Vec<u8>,
-    /// Frame width
-    pub width: u32,
-    /// Frame height  
-    pub height: u32,
-    /// Presentation timestamp
-    pub pts: ClockTime,
-    /// Sequence number
-    pub sequence: u64,
-}
-```
-
-#### 3.2 ChannelSink Element
-
-```rust
-use tokio::sync::mpsc;
-
-/// A sink that sends frames to an mpsc channel
-pub struct ChannelSink {
-    sender: mpsc::Sender<FrameData>,
+/// Frame data sent to the display thread.
+struct DisplayFrame {
+    data: Vec<u8>,
     width: u32,
     height: u32,
-    name: String,
 }
 
-impl ChannelSink {
-    pub fn new(sender: mpsc::Sender<FrameData>, width: u32, height: u32) -> Self {
-        Self {
-            sender,
-            width,
-            height,
-            name: "channelsink".to_string(),
-        }
-    }
-}
-
-impl AsyncSink for ChannelSink {
-    async fn consume(&mut self, ctx: &ConsumeContext<'_>) -> Result<()> {
-        let frame = FrameData {
-            pixels: ctx.input().to_vec(),
-            width: self.width,
-            height: self.height,
-            pts: ctx.metadata().pts,
-            sequence: ctx.metadata().sequence,
-        };
-        
-        self.sender.send(frame).await
-            .map_err(|_| Error::Element("receiver dropped".into()))
-    }
-    
-    fn name(&self) -> &str {
-        &self.name
-    }
-    
-    fn input_caps(&self) -> Caps {
-        Caps::video_raw(VideoFormatCaps {
-            width: CapsValue::Fixed(self.width),
-            height: CapsValue::Fixed(self.height),
-            pixel_format: CapsValue::Fixed(PixelFormat::Rgba),
-            framerate: CapsValue::Any,
-        })
-    }
-}
-```
-
-#### 3.3 VideoDisplay Component
-
-**File:** `src/elements/app/video_display.rs`
-
-```rust
-use iced::{widget::image, Element, Subscription};
-use iced::stream;
-use tokio::sync::mpsc;
-
-/// Iced component for displaying video frames
-pub struct VideoDisplay {
-    /// Channel receiver (wrapped for sharing with subscription)
-    receiver: Arc<Mutex<mpsc::Receiver<FrameData>>>,
-    /// Current frame as Iced image handle
-    current_frame: Option<image::Handle>,
-    /// Dimensions
-    width: u32,
-    height: u32,
-    /// Stats
-    frames_displayed: u64,
-}
-
-/// Messages from the video subscription
-#[derive(Debug, Clone)]
-pub enum VideoMessage {
-    /// New frame received
-    NewFrame(FrameData),
-    /// Channel closed (pipeline stopped)
-    Closed,
-}
-
-impl VideoDisplay {
-    /// Create a new video display and return the sender for the pipeline
-    pub fn new(width: u32, height: u32) -> (Self, mpsc::Sender<FrameData>) {
-        let (tx, rx) = mpsc::channel(4);  // Small buffer for backpressure
-        
-        let display = Self {
-            receiver: Arc::new(Mutex::new(rx)),
-            current_frame: None,
-            width,
-            height,
-            frames_displayed: 0,
-        };
-        
-        (display, tx)
-    }
-    
-    /// Handle a video message
-    pub fn update(&mut self, message: VideoMessage) {
-        match message {
-            VideoMessage::NewFrame(frame) => {
-                self.current_frame = Some(image::Handle::from_rgba(
-                    frame.width,
-                    frame.height,
-                    frame.pixels,
-                ));
-                self.frames_displayed += 1;
-            }
-            VideoMessage::Closed => {
-                // Pipeline stopped
-            }
-        }
-    }
-    
-    /// Get the subscription for receiving frames
-    pub fn subscription(&self) -> Subscription<VideoMessage> {
-        let receiver = Arc::clone(&self.receiver);
-        
-        Subscription::run_with_id(
-            std::any::TypeId::of::<Self>(),
-            stream::channel(4, move |mut output| {
-                let receiver = Arc::clone(&receiver);
-                async move {
-                    loop {
-                        let frame = {
-                            let mut rx = receiver.lock().unwrap();
-                            rx.recv().await
-                        };
-                        
-                        match frame {
-                            Some(f) => {
-                                let _ = output.send(VideoMessage::NewFrame(f)).await;
-                            }
-                            None => {
-                                let _ = output.send(VideoMessage::Closed).await;
-                                break;
-                            }
-                        }
-                    }
-                }
-            })
-        )
-    }
-    
-    /// Render as an Iced widget
-    pub fn view(&self) -> Element<'_, VideoMessage> {
-        use iced::widget::{container, text};
-        use iced::Length;
-        
-        if let Some(handle) = &self.current_frame {
-            image::Image::new(handle.clone())
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into()
-        } else {
-            container(text("Waiting for video..."))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .center_x(Length::Fill)
-                .center_y(Length::Fill)
-                .into()
-        }
-    }
-}
-```
-
----
-
-### Phase 4: High-Level API
-
-#### 4.1 Pipeline Builder with Display
-
-**File:** `src/elements/app/mod.rs`
-
-```rust
-/// Create a video pipeline with an Iced display
-/// 
+/// A video sink that automatically creates a window and displays frames.
+///
+/// This sink spawns its own display thread with a winit event loop,
+/// similar to how GStreamer's xvimagesink works. No special lifecycle
+/// management is required - it's just a regular sink.
+///
 /// # Example
-/// 
+///
 /// ```rust,ignore
-/// let (pipeline, display) = VideoPipeline::new()
-///     .source("v4l2src device=/dev/video0")
-///     .display(640, 480)
-///     .build()?;
-/// 
-/// // Start pipeline
-/// let handle = pipeline.start()?;
-/// 
-/// // Run Iced app with the display
-/// MyApp::run_with_video(display)?;
+/// Pipeline::parse("videotestsrc ! videoconvert ! autovideosink")?.run().await?;
 /// ```
-pub struct VideoPipeline {
-    source_desc: Option<String>,
-    transforms: Vec<String>,
+pub struct AutoVideoSink {
+    /// Channel sender for frames
+    sender: Option<SyncSender<DisplayFrame>>,
+    /// Handle to the display thread
+    display_thread: Option<JoinHandle<()>>,
+    /// Flag to signal shutdown
+    running: Arc<AtomicBool>,
+    /// Window title
+    title: String,
+    /// Expected dimensions (0 = auto-detect from first frame)
     width: u32,
     height: u32,
 }
 
-impl VideoPipeline {
+impl AutoVideoSink {
+    /// Create a new auto video sink with default settings.
     pub fn new() -> Self {
         Self {
-            source_desc: None,
-            transforms: Vec::new(),
-            width: 640,
-            height: 480,
+            sender: None,
+            display_thread: None,
+            running: Arc::new(AtomicBool::new(false)),
+            title: "Parallax Video".to_string(),
+            width: 0,
+            height: 0,
         }
     }
-    
-    pub fn source(mut self, desc: &str) -> Self {
-        self.source_desc = Some(desc.to_string());
+
+    /// Set the window title.
+    pub fn with_title(mut self, title: impl Into<String>) -> Self {
+        self.title = title.into();
         self
     }
-    
-    pub fn transform(mut self, desc: &str) -> Self {
-        self.transforms.push(desc.to_string());
-        self
-    }
-    
-    pub fn display(mut self, width: u32, height: u32) -> Self {
+
+    /// Set expected dimensions (optional, auto-detected from first frame).
+    pub fn with_size(mut self, width: u32, height: u32) -> Self {
         self.width = width;
         self.height = height;
         self
     }
-    
-    pub fn build(self) -> Result<(Pipeline, VideoDisplay)> {
-        let (display, sender) = VideoDisplay::new(self.width, self.height);
-        
-        // Build pipeline string
-        let mut parts = Vec::new();
-        if let Some(src) = &self.source_desc {
-            parts.push(src.clone());
+
+    /// Start the display thread.
+    fn start_display(&mut self) -> Result<()> {
+        if self.display_thread.is_some() {
+            return Ok(()); // Already started
         }
-        parts.extend(self.transforms.clone());
-        parts.push("channelsink".to_string());
+
+        let (sender, receiver) = mpsc::sync_channel::<DisplayFrame>(4);
+        let running = Arc::clone(&self.running);
+        let title = self.title.clone();
+        let initial_width = if self.width > 0 { self.width } else { 640 };
+        let initial_height = if self.height > 0 { self.height } else { 480 };
+
+        running.store(true, Ordering::SeqCst);
+
+        let handle = thread::spawn(move || {
+            if let Err(e) = run_display_loop(receiver, running, &title, initial_width, initial_height) {
+                eprintln!("Display error: {}", e);
+            }
+        });
+
+        self.sender = Some(sender);
+        self.display_thread = Some(handle);
+
+        Ok(())
+    }
+
+    /// Stop the display thread.
+    fn stop_display(&mut self) {
+        self.running.store(false, Ordering::SeqCst);
         
-        let pipeline_str = parts.join(" ! ");
-        let mut pipeline = Pipeline::parse(&pipeline_str)?;
-        
-        // Replace the channelsink with our configured one
-        let sink_id = pipeline.find_sink()?;
-        let channel_sink = ChannelSink::new(sender, self.width, self.height);
-        pipeline.replace_element(sink_id, channel_sink)?;
-        
-        Ok((pipeline, display))
+        // Drop sender to unblock receiver
+        self.sender.take();
+
+        // Wait for thread to finish
+        if let Some(handle) = self.display_thread.take() {
+            let _ = handle.join();
+        }
     }
 }
-```
 
-#### 4.2 Simplified API
-
-```rust
-/// One-liner to create video pipeline and display
-pub fn video_pipeline(
-    pipeline_desc: &str,
-    width: u32,
-    height: u32,
-) -> Result<(Pipeline, VideoDisplay)> {
-    let (display, sender) = VideoDisplay::new(width, height);
-    
-    // Parse and modify pipeline
-    let mut pipeline = Pipeline::parse(pipeline_desc)?;
-    
-    // Find and configure the display sink
-    if let Some(sink_id) = pipeline.find_node_by_name("icedsink") {
-        let channel_sink = ChannelSink::new(sender, width, height);
-        pipeline.replace_element(sink_id, channel_sink)?;
-    } else if let Some(sink_id) = pipeline.find_node_by_name("channelsink") {
-        let channel_sink = ChannelSink::new(sender, width, height);
-        pipeline.replace_element(sink_id, channel_sink)?;
-    } else {
-        return Err(Error::Config("Pipeline must end with 'icedsink' or 'channelsink'".into()));
+impl Default for AutoVideoSink {
+    fn default() -> Self {
+        Self::new()
     }
+}
+
+impl Drop for AutoVideoSink {
+    fn drop(&mut self) {
+        self.stop_display();
+    }
+}
+
+impl Sink for AutoVideoSink {
+    fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
+        // Start display thread on first frame
+        if self.sender.is_none() {
+            self.start_display()?;
+        }
+
+        let sender = self.sender.as_ref()
+            .ok_or_else(|| Error::Element("Display not started".into()))?;
+
+        // Get frame dimensions from metadata or use configured size
+        let (width, height) = if let Some(format) = ctx.metadata().format.as_ref() {
+            (format.width(), format.height())
+        } else {
+            (self.width.max(640), self.height.max(480))
+        };
+
+        let frame = DisplayFrame {
+            data: ctx.buffer().to_vec(),
+            width,
+            height,
+        };
+
+        // Send frame (blocks if display is slow - natural backpressure)
+        sender.send(frame)
+            .map_err(|_| Error::Element("Display closed".into()))
+    }
+
+    fn name(&self) -> &str {
+        "autovideosink"
+    }
+}
+
+/// Run the winit display loop in the display thread.
+fn run_display_loop(
+    receiver: Receiver<DisplayFrame>,
+    running: Arc<AtomicBool>,
+    title: &str,
+    initial_width: u32,
+    initial_height: u32,
+) -> Result<()> {
+    use winit::event::{Event, WindowEvent};
+    use winit::event_loop::{ControlFlow, EventLoop};
+    use winit::window::WindowBuilder;
+    use winit::dpi::LogicalSize;
+
+    // Create event loop and window
+    let event_loop = EventLoop::new()
+        .map_err(|e| Error::Element(format!("Failed to create event loop: {}", e)))?;
     
-    Ok((pipeline, display))
-}
-```
+    let window = WindowBuilder::new()
+        .with_title(title)
+        .with_inner_size(LogicalSize::new(initial_width, initial_height))
+        .build(&event_loop)
+        .map_err(|e| Error::Element(format!("Failed to create window: {}", e)))?;
 
----
+    // Create softbuffer context and surface
+    let context = softbuffer::Context::new(&window)
+        .map_err(|e| Error::Element(format!("Failed to create softbuffer context: {}", e)))?;
+    let mut surface = softbuffer::Surface::new(&context, &window)
+        .map_err(|e| Error::Element(format!("Failed to create surface: {}", e)))?;
 
-### Phase 5: Complete Example
+    // Current frame buffer
+    let mut current_frame: Option<DisplayFrame> = None;
 
-**File:** `examples/24_v4l2_iced_simple.rs`
+    event_loop.run(move |event, elwt| {
+        // Check if we should exit
+        if !running.load(Ordering::SeqCst) {
+            elwt.exit();
+            return;
+        }
 
-```rust
-//! Simple V4L2 to Iced display using the new pipeline API.
-//!
-//! Run with: `cargo run --example 24_v4l2_iced_simple --features "v4l2,iced-sink"`
+        match event {
+            Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
+                running.store(false, Ordering::SeqCst);
+                elwt.exit();
+            }
 
-use iced::{Element, Subscription, Task};
-use parallax::elements::app::{video_pipeline, VideoDisplay, VideoMessage};
-use parallax::pipeline::PipelineHandle;
+            Event::WindowEvent { event: WindowEvent::RedrawRequested, .. } => {
+                // Try to receive a new frame (non-blocking)
+                while let Ok(frame) = receiver.try_recv() {
+                    current_frame = Some(frame);
+                }
 
-fn main() -> iced::Result {
-    iced::application("V4L2 Camera", App::update, App::view)
-        .subscription(App::subscription)
-        .run_with(App::new)
-}
+                // Render current frame
+                if let Some(ref frame) = current_frame {
+                    let size = window.inner_size();
+                    let width = size.width as usize;
+                    let height = size.height as usize;
 
-struct App {
-    video: VideoDisplay,
-    pipeline_handle: Option<PipelineHandle>,
-}
+                    // Resize surface if needed
+                    let _ = surface.resize(
+                        std::num::NonZeroU32::new(size.width).unwrap(),
+                        std::num::NonZeroU32::new(size.height).unwrap(),
+                    );
 
-#[derive(Debug, Clone)]
-enum Message {
-    Video(VideoMessage),
-    PipelineReady(PipelineHandle),
-    PipelineError(String),
-}
-
-impl App {
-    fn new() -> (Self, Task<Message>) {
-        // Create pipeline and display
-        let result = video_pipeline(
-            "v4l2src ! videoconvert ! icedsink",
-            640, 480
-        );
-        
-        match result {
-            Ok((mut pipeline, display)) => {
-                // Start pipeline
-                match pipeline.start() {
-                    Ok(handle) => {
-                        (
-                            Self {
-                                video: display,
-                                pipeline_handle: Some(handle),
-                            },
-                            Task::none()
-                        )
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to start pipeline: {}", e);
-                        (
-                            Self {
-                                video: display,
-                                pipeline_handle: None,
-                            },
-                            Task::none()
-                        )
+                    if let Ok(mut buffer) = surface.buffer_mut() {
+                        // Scale/copy frame to surface
+                        blit_frame(&frame, &mut buffer, width, height);
+                        let _ = buffer.present();
                     }
                 }
             }
-            Err(e) => {
-                eprintln!("Failed to create pipeline: {}", e);
-                // Create dummy display
-                let (display, _) = VideoDisplay::new(640, 480);
-                (
-                    Self {
-                        video: display,
-                        pipeline_handle: None,
-                    },
-                    Task::none()
-                )
+
+            Event::AboutToWait => {
+                // Check for new frames periodically
+                if let Ok(frame) = receiver.try_recv() {
+                    current_frame = Some(frame);
+                    window.request_redraw();
+                } else {
+                    // Poll again after a short delay
+                    elwt.set_control_flow(ControlFlow::WaitUntil(
+                        std::time::Instant::now() + std::time::Duration::from_millis(16)
+                    ));
+                }
+            }
+
+            _ => {}
+        }
+    }).map_err(|e| Error::Element(format!("Event loop error: {}", e)))
+}
+
+/// Blit an RGBA frame to the softbuffer surface.
+fn blit_frame(frame: &DisplayFrame, buffer: &mut [u32], dst_width: usize, dst_height: usize) {
+    let src_width = frame.width as usize;
+    let src_height = frame.height as usize;
+
+    // Simple nearest-neighbor scaling
+    for dst_y in 0..dst_height {
+        let src_y = (dst_y * src_height) / dst_height;
+        for dst_x in 0..dst_width {
+            let src_x = (dst_x * src_width) / dst_width;
+            
+            let src_idx = (src_y * src_width + src_x) * 4;
+            if src_idx + 3 < frame.data.len() {
+                let r = frame.data[src_idx] as u32;
+                let g = frame.data[src_idx + 1] as u32;
+                let b = frame.data[src_idx + 2] as u32;
+                // softbuffer expects 0RGB format
+                buffer[dst_y * dst_width + dst_x] = (r << 16) | (g << 8) | b;
             }
         }
     }
+}
+```
+
+### Phase 2: Factory Registration
+
+**File:** `src/pipeline/factory.rs` (modify)
+
+```rust
+impl ElementFactory {
+    pub fn new() -> Self {
+        let mut factory = Self { creators: HashMap::new() };
+        
+        // ... existing registrations ...
+
+        // Display sinks
+        factory.register("autovideosink", create_autovideosink);
+        
+        factory
+    }
+}
+
+fn create_autovideosink(props: &HashMap<String, PropertyValue>) -> Result<Box<DynAsyncElement<'static>>> {
+    use crate::elements::app::AutoVideoSink;
     
-    fn update(&mut self, message: Message) -> Task<Message> {
-        match message {
-            Message::Video(video_msg) => {
-                self.video.update(video_msg);
-            }
-            Message::PipelineReady(handle) => {
-                self.pipeline_handle = Some(handle);
-            }
-            Message::PipelineError(err) => {
-                eprintln!("Pipeline error: {}", err);
-            }
-        }
-        Task::none()
+    let mut sink = AutoVideoSink::new();
+    
+    if let Some(title) = props.get("title").map(|v| v.as_string()) {
+        sink = sink.with_title(title);
+    }
+    if let (Some(w), Some(h)) = (
+        props.get("width").and_then(|v| v.as_u64()),
+        props.get("height").and_then(|v| v.as_u64()),
+    ) {
+        sink = sink.with_size(w as u32, h as u32);
     }
     
-    fn view(&self) -> Element<'_, Message> {
-        self.video.view().map(Message::Video)
-    }
+    Ok(DynAsyncElement::new_box(SinkAdapter::new(sink)))
+}
+```
+
+### Phase 3: Device Source Registration
+
+**File:** `src/pipeline/factory.rs` (modify)
+
+```rust
+// Register v4l2src (feature-gated)
+#[cfg(feature = "v4l2")]
+factory.register("v4l2src", create_v4l2src);
+
+// Register videoconvert
+factory.register("videoconvert", create_videoconvert);
+
+#[cfg(feature = "v4l2")]
+fn create_v4l2src(props: &HashMap<String, PropertyValue>) -> Result<Box<DynAsyncElement<'static>>> {
+    use crate::elements::device::V4l2Src;
     
-    fn subscription(&self) -> Subscription<Message> {
-        self.video.subscription().map(Message::Video)
-    }
+    let device = props.get("device")
+        .map(|v| v.as_string())
+        .unwrap_or_else(|| "/dev/video0".to_string());
+    
+    let src = V4l2Src::new(&device)?;
+    Ok(DynAsyncElement::new_box(SourceAdapter::new(src)))
+}
+
+fn create_videoconvert(_props: &HashMap<String, PropertyValue>) -> Result<Box<DynAsyncElement<'static>>> {
+    use crate::elements::transform::VideoConvertElement;
+    Ok(DynAsyncElement::new_box(TransformAdapter::new(VideoConvertElement::new())))
 }
 ```
 
 ---
 
-## Implementation Phases Summary
+## Implementation Summary
 
 | Phase | Description | Effort |
 |-------|-------------|--------|
-| **1** | Factory registration for device elements | Small |
-| **2** | Auto-negotiation and converter insertion | Medium |
-| **3** | Core Iced integration (ChannelSink, VideoDisplay) | Medium |
-| **4** | High-level API (VideoPipeline builder) | Small |
-| **5** | Examples and documentation | Small |
+| 1 | AutoVideoSink with winit/softbuffer | Medium |
+| 2 | Factory registration for autovideosink | Small |
+| 3 | Factory registration for v4l2src, videoconvert | Small |
 
 ### Dependencies
 
-- Phase 2 depends on caps negotiation infrastructure from `PLAN_CAPS_NEGOTIATION.md`
-- Phase 3 depends on Phase 1 (factory registration)
-- Phase 4 depends on Phase 3
-
-### Feature Flags
-
+Add to `Cargo.toml`:
 ```toml
+[dependencies]
+winit = "0.29"
+softbuffer = "0.4"
+
 [features]
-# Device capture
-v4l2 = ["dep:v4l"]
-pipewire = ["dep:pipewire"]
-libcamera = ["dep:libcamera"]
-
-# Display
-iced-sink = ["dep:iced"]
-
-# Video processing
-video-convert = []  # Pure Rust converters (always available)
+display = ["dep:winit", "dep:softbuffer"]
 ```
 
 ---
 
-## Why This Works
+## Why This Is Better Than the Previous Plan
 
-1. **No blocking**: Pipeline runs in Tokio tasks, Iced runs its event loop, channel bridges them
-2. **Standard Iced pattern**: Uses `Subscription::run` which is the idiomatic way to receive external events
-3. **Decoupled**: Pipeline and GUI are independent, connected only by channel
-4. **Works with `#[tokio::main]`**: Because Iced with `features = ["tokio"]` uses Tokio
-5. **Auto-negotiation**: Converters inserted automatically when formats don't match
-6. **GStreamer-like syntax**: `v4l2src ! videoconvert ! icedsink`
+| Aspect | Previous Plan | This Plan |
+|--------|---------------|-----------|
+| Special traits | `DisplaySink` trait needed | No special traits |
+| API changes | `run()` behavior changed | No API changes |
+| Pipeline execution | Special case for display sinks | Normal execution |
+| Main thread requirement | Yes | No (display runs in own thread) |
+| Complexity | High | Low |
+| GStreamer parity | Different model | Same model |
 
-## Comparison with Current Approach
+---
 
-| Aspect | Current | New |
-|--------|---------|-----|
-| Threading | Manual, error-prone | Automatic via channel |
-| Pipeline syntax | Not possible | `v4l2src ! convert ! icedsink` |
-| Iced integration | Requires `handle.run()` | Standard subscription pattern |
-| Format conversion | Manual in example | Auto via `videoconvert` element |
-| Device release | Had bugs | Pipeline owns lifecycle |
-| Factory | Missing device elements | All elements registered |
-| Caps negotiation | Manual | Automatic with error messages |
+## Testing
+
+```rust
+// This should "just work"
+#[tokio::main]
+async fn main() -> Result<()> {
+    Pipeline::parse("v4l2src ! videoconvert ! autovideosink")?.run().await
+}
+```
+
+---
+
+## Future Enhancements
+
+1. **GPU acceleration**: Use wgpu instead of softbuffer for hardware-accelerated rendering
+2. **GstVideoOverlay equivalent**: Allow application to provide a window handle
+3. **Multiple displays**: Support for multiple video windows
+4. **Fullscreen**: Support for fullscreen mode
+5. **OSD**: Overlay text/graphics on video
+
+---
 
 ## References
 
-- [Iced Subscriptions](https://docs.rs/iced/latest/iced/struct.Subscription.html)
-- [iced::stream::channel](https://docs.rs/iced/latest/iced/stream/fn.channel.html)
-- [GStreamer GUI Integration Tutorial](https://gstreamer.freedesktop.org/documentation/tutorials/basic/toolkit-integration.html)
-- [iced_video_player](https://github.com/jazzfool/iced_video_player) - Uses GStreamer internally
-- [PLAN_CAPS_NEGOTIATION.md](./PLAN_CAPS_NEGOTIATION.md) - Caps negotiation infrastructure
+- [GStreamer xvimagesink source](https://github.com/GStreamer/gst-plugins-base/blob/master/sys/xvimage/xvimagesink.c)
+- [winit](https://github.com/rust-windowing/winit) - Window handling library
+- [softbuffer](https://github.com/rust-windowing/softbuffer) - GPU-less 2D display
+- [GstVideoOverlay](https://gstreamer.freedesktop.org/documentation/video/gstvideooverlay.html) - For future window handle support
