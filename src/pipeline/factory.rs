@@ -1,6 +1,8 @@
 //! Element factory for creating elements from parsed descriptions.
 
-use crate::element::{DynAsyncElement, ElementAdapter, SinkAdapter, SourceAdapter};
+use crate::element::{
+    DynAsyncElement, ElementAdapter, SinkAdapter, SourceAdapter, TransformAdapter,
+};
 use crate::elements::{FileSink, FileSrc, NullSink, NullSource, PassThrough, Tee};
 use crate::error::{Error, Result};
 use crate::pipeline::parser::{ParsedElement, PropertyValue};
@@ -219,12 +221,11 @@ fn create_autovideosink(
 fn create_videoconvert(
     _props: &HashMap<String, PropertyValue>,
 ) -> Result<Box<DynAsyncElement<'static>>> {
-    use crate::format::PixelFormat;
-    use crate::negotiation::VideoConvert;
+    use crate::elements::transform::VideoConvertElement;
 
-    // Default to RGBA output (most common for display)
-    let element = VideoConvert::new(PixelFormat::Rgba);
-    Ok(DynAsyncElement::new_box(ElementAdapter::new(element)))
+    // Auto-detect input format, output to RGBA (most common for display)
+    let element = VideoConvertElement::new();
+    Ok(DynAsyncElement::new_box(TransformAdapter::new(element)))
 }
 
 fn create_videotestsrc(

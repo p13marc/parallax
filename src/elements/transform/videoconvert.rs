@@ -1,0 +1,244 @@
+//! Video format conversion element.
+//!
+//! Converts between pixel formats (e.g., YUYV -> RGBA for display).
+
+use std::sync::Arc;
+
+use crate::buffer::{Buffer, MemoryHandle};
+use crate::converters::{PixelFormat, VideoConvert};
+use crate::element::Element;
+use crate::error::{Error, Result};
+use crate::memory::{HeapSegment, MemorySegment};
+
+/// Video format conversion element.
+///
+/// This element converts video frames between pixel formats. It's commonly
+/// used to convert camera output (YUYV) to display format (RGBA).
+///
+/// # Auto-detection
+///
+/// If input format is not specified, the element will try to auto-detect
+/// based on buffer size and common V4L2 formats.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// // Convert YUYV (640x480) to RGBA
+/// let element = VideoConvertElement::new()
+///     .with_input_format(PixelFormat::Yuyv)
+///     .with_output_format(PixelFormat::Rgba)
+///     .with_size(640, 480);
+/// ```
+pub struct VideoConvertElement {
+    /// Input pixel format (None = auto-detect)
+    input_format: Option<PixelFormat>,
+    /// Output pixel format
+    output_format: PixelFormat,
+    /// Frame width (0 = auto-detect)
+    width: u32,
+    /// Frame height (0 = auto-detect)
+    height: u32,
+    /// Cached converter (created on first frame)
+    converter: Option<VideoConvert>,
+    /// Output buffer for conversion
+    output_buffer: Vec<u8>,
+    /// Element name
+    name: String,
+}
+
+impl VideoConvertElement {
+    /// Create a new video convert element with default settings.
+    ///
+    /// Defaults to RGBA output (most common for display).
+    pub fn new() -> Self {
+        Self {
+            input_format: None,
+            output_format: PixelFormat::Rgba,
+            width: 0,
+            height: 0,
+            converter: None,
+            output_buffer: Vec::new(),
+            name: "videoconvert".to_string(),
+        }
+    }
+
+    /// Set the input pixel format.
+    pub fn with_input_format(mut self, format: PixelFormat) -> Self {
+        self.input_format = Some(format);
+        self
+    }
+
+    /// Set the output pixel format.
+    pub fn with_output_format(mut self, format: PixelFormat) -> Self {
+        self.output_format = format;
+        self
+    }
+
+    /// Set the frame dimensions.
+    pub fn with_size(mut self, width: u32, height: u32) -> Self {
+        self.width = width;
+        self.height = height;
+        self
+    }
+
+    /// Try to detect input format from buffer size.
+    fn detect_format(&self, buffer_size: usize) -> Option<(PixelFormat, u32, u32)> {
+        // Common resolutions to try
+        let resolutions = [
+            (640, 480),
+            (1280, 720),
+            (1920, 1080),
+            (320, 240),
+            (800, 600),
+            (1024, 768),
+            (1280, 960),
+            (352, 288),
+            (176, 144),
+        ];
+
+        // Try YUYV first (most common V4L2 format)
+        for (w, h) in resolutions {
+            if PixelFormat::Yuyv.buffer_size(w, h) == buffer_size {
+                return Some((PixelFormat::Yuyv, w, h));
+            }
+        }
+
+        // Try RGB24
+        for (w, h) in resolutions {
+            if PixelFormat::Rgb24.buffer_size(w, h) == buffer_size {
+                return Some((PixelFormat::Rgb24, w, h));
+            }
+        }
+
+        // Try RGBA
+        for (w, h) in resolutions {
+            if PixelFormat::Rgba.buffer_size(w, h) == buffer_size {
+                return Some((PixelFormat::Rgba, w, h));
+            }
+        }
+
+        None
+    }
+
+    /// Initialize the converter if needed.
+    fn ensure_converter(&mut self, input_size: usize) -> Result<()> {
+        if self.converter.is_some() {
+            return Ok(());
+        }
+
+        // Determine input format and dimensions
+        let (input_format, width, height) = if let Some(fmt) = self.input_format {
+            if self.width > 0 && self.height > 0 {
+                (fmt, self.width, self.height)
+            } else {
+                // Try to derive dimensions from buffer size
+                let expected = fmt.buffer_size(self.width.max(640), self.height.max(480));
+                if input_size == expected {
+                    (fmt, self.width.max(640), self.height.max(480))
+                } else {
+                    return Err(Error::Element(format!(
+                        "Cannot determine dimensions for format {:?} with buffer size {}",
+                        fmt, input_size
+                    )));
+                }
+            }
+        } else {
+            // Auto-detect
+            self.detect_format(input_size).ok_or_else(|| {
+                Error::Element(format!(
+                    "Cannot auto-detect video format for buffer size {}",
+                    input_size
+                ))
+            })?
+        };
+
+        // Create converter
+        let converter = VideoConvert::new(input_format, self.output_format, width, height)?;
+
+        // Allocate output buffer
+        let output_size = self.output_format.buffer_size(width, height);
+        self.output_buffer.resize(output_size, 0);
+
+        self.width = width;
+        self.height = height;
+        self.input_format = Some(input_format);
+        self.converter = Some(converter);
+
+        tracing::info!(
+            "VideoConvert: {:?} {}x{} -> {:?}",
+            input_format,
+            width,
+            height,
+            self.output_format
+        );
+
+        Ok(())
+    }
+}
+
+impl Default for VideoConvertElement {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Element for VideoConvertElement {
+    fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
+        let input_data = buffer.as_bytes();
+
+        // Initialize converter on first frame
+        self.ensure_converter(input_data.len())?;
+
+        let converter = self.converter.as_ref().unwrap();
+
+        // Convert
+        converter.convert(input_data, &mut self.output_buffer)?;
+
+        // Create output buffer
+        let output_size = self.output_buffer.len();
+        let segment = Arc::new(HeapSegment::new(output_size)?);
+
+        // Copy converted data
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.output_buffer.as_ptr(),
+                segment.as_mut_ptr().unwrap(),
+                output_size,
+            );
+        }
+
+        let handle = MemoryHandle::from_segment(segment);
+        let output = Buffer::new(handle, buffer.metadata().clone());
+
+        Ok(Some(output))
+    }
+
+    fn flush(&mut self) -> Result<Option<Buffer>> {
+        Ok(None)
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_detect_yuyv_640x480() {
+        let element = VideoConvertElement::new();
+        let size = PixelFormat::Yuyv.buffer_size(640, 480);
+        let detected = element.detect_format(size);
+        assert_eq!(detected, Some((PixelFormat::Yuyv, 640, 480)));
+    }
+
+    #[test]
+    fn test_detect_yuyv_1280x720() {
+        let element = VideoConvertElement::new();
+        let size = PixelFormat::Yuyv.buffer_size(1280, 720);
+        let detected = element.detect_format(size);
+        assert_eq!(detected, Some((PixelFormat::Yuyv, 1280, 720)));
+    }
+}

@@ -8,6 +8,7 @@
 //!
 //! ## Video Processing
 //! - [`VideoScale`]: Scale/resize YUV420 video frames
+//! - [`VideoConvertElement`]: Convert between pixel formats (YUYV -> RGBA, etc.)
 //!
 //! ## Batching
 //! - [`Batch`]: Combine multiple buffers into one
@@ -44,12 +45,14 @@ mod filter;
 mod generic;
 mod metadata_ops;
 mod scale;
+mod videoconvert;
 
 // Generic transforms
 pub use generic::{Chunk, FilterMap, FlatMap, Map};
 
 // Video processing
 pub use scale::{ScaleMode, VideoScale};
+pub use videoconvert::VideoConvertElement;
 
 // Batching
 pub use batch::{Batch, BatchStats, Unbatch, UnbatchStats};
