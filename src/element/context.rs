@@ -53,6 +53,7 @@ use crate::metadata::Metadata;
 /// - End-of-stream
 /// - Or that they need to provide their own buffer
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // Intentional: avoid heap allocation on hot path
 pub enum ProduceResult {
     /// Produced `n` bytes into the provided buffer.
     ///

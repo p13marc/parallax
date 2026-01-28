@@ -258,6 +258,7 @@ pub enum MemoryHint {
 /// // let out = Output::from(vec![buf1, buf2, buf3]);
 /// ```
 #[derive(Debug, Default)]
+#[allow(clippy::large_enum_variant)] // Intentional: avoid heap allocation on hot path
 pub enum Output {
     /// No output (buffer was filtered/consumed).
     #[default]
@@ -390,6 +391,7 @@ impl IntoIterator for Output {
 /// Iterator over Output buffers.
 pub struct OutputIter(OutputIterInner);
 
+#[allow(clippy::large_enum_variant)] // Internal iterator, avoid heap allocation
 enum OutputIterInner {
     None,
     Single(Option<Buffer>),

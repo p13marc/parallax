@@ -283,7 +283,8 @@ pub struct IpcSubscriber {
     stream: UnixStream,
     /// Arenas we've received from the publisher (segment_id -> arena)
     arenas: HashMap<u32, SharedArena>,
-    /// Cache for slot references
+    /// Cache for slot references (reserved for future zero-copy IPC)
+    #[allow(dead_code)]
     arena_cache: SharedArenaCache,
 }
 

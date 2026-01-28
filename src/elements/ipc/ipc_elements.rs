@@ -484,7 +484,7 @@ impl Source for IpcSrc {
 
                 ControlMessage::BufferReady { slot, metadata } => {
                     // Send acknowledgment
-                    self.send_message(&ControlMessage::BufferDone { slot: slot })?;
+                    self.send_message(&ControlMessage::BufferDone { slot })?;
 
                     // NOTE: With full SCM_RIGHTS support, we would look up the arena
                     // in a local cache via SharedArenaCache and create a zero-copy buffer.

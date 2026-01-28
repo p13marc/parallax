@@ -776,27 +776,29 @@ impl VideoConvert {
     fn gray_to_rgb24(&self, input: &[u8], output: &mut [u8]) {
         let pixel_count = (self.width * self.height) as usize;
 
-        for i in 0..pixel_count {
-            let gray = input[i];
-            let dst = i * 3;
-
-            output[dst] = gray;
-            output[dst + 1] = gray;
-            output[dst + 2] = gray;
+        for (gray, dst_chunk) in input
+            .iter()
+            .take(pixel_count)
+            .zip(output.chunks_exact_mut(3))
+        {
+            dst_chunk[0] = *gray;
+            dst_chunk[1] = *gray;
+            dst_chunk[2] = *gray;
         }
     }
 
     fn gray_to_rgba(&self, input: &[u8], output: &mut [u8]) {
         let pixel_count = (self.width * self.height) as usize;
 
-        for i in 0..pixel_count {
-            let gray = input[i];
-            let dst = i * 4;
-
-            output[dst] = gray;
-            output[dst + 1] = gray;
-            output[dst + 2] = gray;
-            output[dst + 3] = 255;
+        for (gray, dst_chunk) in input
+            .iter()
+            .take(pixel_count)
+            .zip(output.chunks_exact_mut(4))
+        {
+            dst_chunk[0] = *gray;
+            dst_chunk[1] = *gray;
+            dst_chunk[2] = *gray;
+            dst_chunk[3] = 255;
         }
     }
 

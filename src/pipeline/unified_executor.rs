@@ -898,6 +898,7 @@ impl Default for Executor {
 // ============================================================================
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // Intentional: avoid heap allocation on hot path
 enum Message {
     Buffer(Buffer),
     Eos,

@@ -82,6 +82,7 @@ use super::traits::{Affinity, ElementType, ExecutionHints};
 /// let out = ProcessOutput::Eos;
 /// ```
 #[derive(Debug, Default)]
+#[allow(clippy::large_enum_variant)] // Intentional: avoid heap allocation on hot path
 pub enum ProcessOutput {
     /// No output (buffer was filtered/consumed/buffering).
     #[default]
@@ -295,6 +296,7 @@ impl IntoIterator for ProcessOutput {
 /// Iterator over ProcessOutput buffers.
 pub struct ProcessOutputIter(ProcessOutputIterInner);
 
+#[allow(clippy::large_enum_variant)] // Internal iterator, avoid heap allocation
 enum ProcessOutputIterInner {
     None,
     Single(Option<Buffer>),
