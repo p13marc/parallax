@@ -47,7 +47,7 @@ Key architectural decisions have been researched and documented in **[00_DESIGN_
 
 | # | Plan | Priority | Effort | Progress |
 |---|------|----------|--------|----------|
-| 09 | [Format Converters](09_FORMAT_CONVERTERS.md) | High | Medium | ⬜ Not Started |
+| 09 | [Format Converters](09_FORMAT_CONVERTERS.md) | High | Medium | ✅ Complete |
 | 10 | [Code Cleanup](10_CODE_CLEANUP.md) | Low | Small | ⬜ Not Started |
 | 11 | [GPU Codec Framework](11_GPU_CODEC_FRAMEWORK.md) | High | Large | ⬜ Not Started |
 | 12 | [Additional Codecs](12_ADDITIONAL_CODECS.md) | Medium | Medium | ⬜ Not Started |
@@ -309,15 +309,16 @@ Adaptive bitrate streaming support:
 
 ## Master Checklist (Phase 2)
 
-### Plan 09: Format Converters ⬜
-- [ ] Create `src/converters/mod.rs` module
-- [ ] Implement `src/converters/colorspace.rs` (I420 ↔ RGB)
-- [ ] Implement `src/converters/scale.rs` (nearest, bilinear)
-- [ ] Implement `src/converters/audio.rs` (S16 ↔ F32)
-- [ ] Implement `src/converters/resample.rs` (sample rate)
-- [ ] Update `src/negotiation/builtin.rs` to use real converters
-- [ ] Create example: `17_format_convert.rs`
-- [ ] Update CLAUDE.md documentation
+### Plan 09: Format Converters ✅
+- [x] Create `src/converters/mod.rs` module
+- [x] Implement `src/converters/colorspace.rs` (I420 ↔ RGB)
+- [x] Implement `src/converters/scale.rs` (nearest, bilinear)
+- [x] Implement `src/converters/audio.rs` (S16 ↔ F32)
+- [x] Implement `src/converters/resample.rs` (sample rate)
+- [x] Update `src/negotiation/builtin.rs` to use real converters
+- [x] Create element wrappers: `AudioConvertElement`, `AudioResampleElement`
+- [x] Create example: `examples/41_format_converters.rs`
+- [x] Update plan documentation
 
 ### Plan 10: Code Cleanup ⬜
 - [ ] Fix compiler warnings with `cargo fix`

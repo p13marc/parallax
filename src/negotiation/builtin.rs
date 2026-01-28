@@ -454,7 +454,7 @@ pub fn builtin_registry() -> ConverterRegistry {
         }),
     );
 
-    // Audio format conversions
+    // Audio format conversions - use the real AudioConvertElement
     registry.register(
         FormatType::AudioRaw,
         FormatType::AudioRaw,
@@ -462,7 +462,18 @@ pub fn builtin_registry() -> ConverterRegistry {
         MemoryType::Cpu,
         3,
         "audioconvert",
-        Arc::new(|| Box::new(AudioConvert::new())),
+        Arc::new(|| Box::new(crate::elements::transform::AudioConvertElement::new())),
+    );
+
+    // Audio resampling - use the real AudioResampleElement
+    registry.register(
+        FormatType::AudioRaw,
+        FormatType::AudioRaw,
+        MemoryType::Cpu,
+        MemoryType::Cpu,
+        8,
+        "audioresample",
+        Arc::new(|| Box::new(crate::elements::transform::AudioResampleElement::new())),
     );
 
     // CPU to GPU upload

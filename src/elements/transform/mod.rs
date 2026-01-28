@@ -10,6 +10,10 @@
 //! - [`VideoScale`]: Scale/resize YUV420 video frames
 //! - [`VideoConvertElement`]: Convert between pixel formats (YUYV -> RGBA, etc.)
 //!
+//! ## Audio Processing
+//! - [`AudioConvertElement`]: Convert between sample formats (S16 -> F32, etc.)
+//! - [`AudioResampleElement`]: Convert between sample rates (48kHz -> 44.1kHz)
+//!
 //! ## Batching
 //! - [`Batch`]: Combine multiple buffers into one
 //! - [`Unbatch`]: Split one buffer into many
@@ -38,6 +42,8 @@
 //! - [`BufferJoin`]: Join with delimiter
 //! - [`BufferConcat`]: Concatenate buffer contents
 
+mod audioconvert;
+mod audioresample;
 mod batch;
 mod buffer_ops;
 mod data_processing;
@@ -53,6 +59,10 @@ pub use generic::{Chunk, FilterMap, FlatMap, Map};
 // Video processing
 pub use scale::{ScaleMode, VideoScale};
 pub use videoconvert::VideoConvertElement;
+
+// Audio processing
+pub use audioconvert::AudioConvertElement;
+pub use audioresample::AudioResampleElement;
 
 // Batching
 pub use batch::{Batch, BatchStats, Unbatch, UnbatchStats};
