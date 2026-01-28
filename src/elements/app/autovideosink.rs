@@ -261,7 +261,7 @@ fn run_display_loop(
     use winit::window::{Window, WindowAttributes, WindowId};
 
     struct VideoApp {
-        window: Option<Window>,
+        window: Option<std::rc::Rc<Window>>,
         surface: Option<softbuffer::Surface<std::rc::Rc<Window>, std::rc::Rc<Window>>>,
         context: Option<softbuffer::Context<std::rc::Rc<Window>>>,
         receiver: mpsc::Receiver<DisplayFrame>,
@@ -292,7 +292,7 @@ fn run_display_loop(
                             Ok(surface) => {
                                 self.context = Some(context);
                                 self.surface = Some(surface);
-                                self.window = Some(std::rc::Rc::try_unwrap(window).ok().unwrap());
+                                self.window = Some(window);
                             }
                             Err(e) => {
                                 eprintln!("Failed to create surface: {}", e);

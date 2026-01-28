@@ -565,6 +565,11 @@ impl Default for VideoTestSrc {
 
 impl Source for VideoTestSrc {
     fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
+        use crate::buffer::{Buffer, MemoryHandle};
+        use crate::memory::{HeapSegment, MemorySegment};
+        use crate::metadata::Metadata;
+        use std::sync::Arc;
+
         // Check frame limit
         if let Some(max) = self.num_frames {
             if self.sequence >= max {
@@ -575,29 +580,50 @@ impl Source for VideoTestSrc {
         // Wait for next frame time (only in live mode)
         self.wait_for_next_frame();
 
-        // Get the output buffer from context
         let frame_size = self.frame_size();
-        let output = ctx.output();
-
-        // Ensure we have enough space
-        let write_size = output.len().min(frame_size);
-        self.fill_frame(&mut output[..write_size]);
 
         // Calculate PTS based on frame number and framerate
         let pts = ClockTime::from_nanos(
             (self.sequence * self.framerate_den as u64 * 1_000_000_000) / self.framerate_num as u64,
         );
 
-        // Set metadata
-        ctx.set_sequence(self.sequence);
-        ctx.set_pts(pts);
-        ctx.metadata_mut().duration = self.frame_duration();
-        ctx.set_keyframe(); // Video test patterns are always keyframes
-
         self.sequence += 1;
         self.frames_produced += 1;
 
-        Ok(ProduceResult::Produced(write_size))
+        // Check if context has a buffer, otherwise allocate our own
+        if ctx.has_buffer() {
+            let output = ctx.output();
+            let write_size = output.len().min(frame_size);
+            self.fill_frame(&mut output[..write_size]);
+
+            ctx.set_sequence(self.sequence - 1);
+            ctx.set_pts(pts);
+            ctx.metadata_mut().duration = self.frame_duration();
+            ctx.set_keyframe();
+
+            Ok(ProduceResult::Produced(write_size))
+        } else {
+            // No buffer provided - allocate our own
+            let segment = Arc::new(
+                HeapSegment::new(frame_size)
+                    .map_err(|e| crate::error::Error::Element(e.to_string()))?,
+            );
+            // Safety: we just allocated this segment and own it exclusively
+            unsafe {
+                let ptr = segment.as_mut_ptr().unwrap();
+                let slice = std::slice::from_raw_parts_mut(ptr, frame_size);
+                self.fill_frame(slice);
+            }
+
+            let handle = MemoryHandle::from_segment(segment);
+            let metadata = Metadata::default()
+                .with_sequence(self.sequence - 1)
+                .with_pts(pts)
+                .with_duration(self.frame_duration())
+                .keyframe();
+
+            Ok(ProduceResult::OwnBuffer(Buffer::new(handle, metadata)))
+        }
     }
 
     fn name(&self) -> &str {
