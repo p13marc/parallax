@@ -273,7 +273,7 @@ impl Sink for IpcSink {
 
         // Send buffer ready message
         let msg = ControlMessage::BufferReady {
-            slot: slot_ref.clone(),
+            slot: slot_ref,
             metadata: SerializableMetadata::from_metadata(buffer.metadata()),
         };
         self.send_message(&msg)?;
@@ -484,7 +484,7 @@ impl Source for IpcSrc {
 
                 ControlMessage::BufferReady { slot, metadata } => {
                     // Send acknowledgment
-                    self.send_message(&ControlMessage::BufferDone { slot: slot.clone() })?;
+                    self.send_message(&ControlMessage::BufferDone { slot: slot })?;
 
                     // NOTE: With full SCM_RIGHTS support, we would look up the arena
                     // in a local cache via SharedArenaCache and create a zero-copy buffer.

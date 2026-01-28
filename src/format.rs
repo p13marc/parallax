@@ -327,6 +327,7 @@ impl MediaFormat {
 ///
 /// Describes uncompressed video frames with resolution, pixel format, and framerate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub struct VideoFormat {
     /// Frame width in pixels.
     pub width: u32,
@@ -338,16 +339,6 @@ pub struct VideoFormat {
     pub framerate: Framerate,
 }
 
-impl Default for VideoFormat {
-    fn default() -> Self {
-        Self {
-            width: 0,
-            height: 0,
-            pixel_format: PixelFormat::default(),
-            framerate: Framerate::default(),
-        }
-    }
-}
 
 impl VideoFormat {
     /// Create a new video format.
@@ -543,6 +534,7 @@ impl Ord for Framerate {
 ///
 /// Describes uncompressed audio samples.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub struct AudioFormat {
     /// Sample rate in Hz (e.g., 44100, 48000).
     pub sample_rate: u32,
@@ -552,15 +544,6 @@ pub struct AudioFormat {
     pub sample_format: SampleFormat,
 }
 
-impl Default for AudioFormat {
-    fn default() -> Self {
-        Self {
-            sample_rate: 0,
-            channels: 0,
-            sample_format: SampleFormat::default(),
-        }
-    }
-}
 
 impl AudioFormat {
     /// Create a new audio format.
