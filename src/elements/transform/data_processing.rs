@@ -11,7 +11,7 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::Element;
 use crate::error::Result;
-use crate::memory::{HeapSegment, MemorySegment};
+use crate::memory::{CpuSegment, MemorySegment};
 use crate::metadata::Metadata;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -526,7 +526,7 @@ impl BufferSplit {
                 continue;
             }
 
-            let segment = Arc::new(HeapSegment::new(part.len())?);
+            let segment = Arc::new(CpuSegment::new(part.len())?);
             unsafe {
                 let ptr = segment.as_mut_ptr().unwrap();
                 std::ptr::copy_nonoverlapping(part.as_ptr(), ptr, part.len());
@@ -586,7 +586,7 @@ impl Element for BufferSplit {
                 return Ok(None);
             }
 
-            let segment = Arc::new(HeapSegment::new(part.len())?);
+            let segment = Arc::new(CpuSegment::new(part.len())?);
             unsafe {
                 let ptr = segment.as_mut_ptr().unwrap();
                 std::ptr::copy_nonoverlapping(part.as_ptr(), ptr, part.len());
@@ -617,7 +617,7 @@ impl Element for BufferSplit {
             return Ok(None);
         }
 
-        let segment = Arc::new(HeapSegment::new(part.len().max(1))?);
+        let segment = Arc::new(CpuSegment::new(part.len().max(1))?);
         if !part.is_empty() {
             unsafe {
                 let ptr = segment.as_mut_ptr().unwrap();
@@ -723,7 +723,7 @@ impl BufferJoin {
         }
 
         let total_size = self.pending_size + (self.pending.len() - 1) * self.delimiter.len();
-        let segment = Arc::new(HeapSegment::new(total_size.max(1))?);
+        let segment = Arc::new(CpuSegment::new(total_size.max(1))?);
 
         let ptr = segment.as_mut_ptr().unwrap();
         let mut offset = 0;
@@ -867,7 +867,7 @@ impl BufferConcat {
         }
 
         let len = self.pending.len();
-        let segment = Arc::new(HeapSegment::new(len)?);
+        let segment = Arc::new(CpuSegment::new(len)?);
         unsafe {
             let ptr = segment.as_mut_ptr().unwrap();
             std::ptr::copy_nonoverlapping(self.pending.as_ptr(), ptr, len);
@@ -946,7 +946,7 @@ mod tests {
     use super::*;
 
     fn make_buffer(data: &[u8], seq: u64) -> Buffer {
-        let segment = Arc::new(HeapSegment::new(data.len().max(1)).unwrap());
+        let segment = Arc::new(CpuSegment::new(data.len().max(1)).unwrap());
         if !data.is_empty() {
             unsafe {
                 let ptr = segment.as_mut_ptr().unwrap();

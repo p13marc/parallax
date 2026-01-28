@@ -10,7 +10,7 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{AsyncSource, ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
 use crate::error::{Error, Result};
-use crate::memory::{HeapSegment, MemorySegment};
+use crate::memory::{CpuSegment, MemorySegment};
 use crate::metadata::Metadata;
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -469,7 +469,7 @@ impl AsyncSource for AsyncUnixSrc {
             Ok(ProduceResult::Produced(result.len()))
         } else {
             // Fall back to creating our own buffer
-            let segment = Arc::new(HeapSegment::new(result.len())?);
+            let segment = Arc::new(CpuSegment::new(result.len())?);
             unsafe {
                 let ptr = segment.as_mut_ptr().unwrap();
                 std::ptr::copy_nonoverlapping(result.as_ptr(), ptr, result.len());
@@ -570,7 +570,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn make_buffer(data: &[u8], seq: u64) -> Buffer {
-        let segment = Arc::new(HeapSegment::new(data.len().max(1)).unwrap());
+        let segment = Arc::new(CpuSegment::new(data.len().max(1)).unwrap());
         if !data.is_empty() {
             unsafe {
                 let ptr = segment.as_mut_ptr().unwrap();

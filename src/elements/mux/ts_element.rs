@@ -31,7 +31,7 @@ use crate::element::{Muxer, MuxerInput, PadAddedCallback, PadId};
 use crate::elements::mux::{TsMux, TsMuxConfig, TsMuxStreamType, TsMuxTrack};
 use crate::error::{Error, Result};
 use crate::format::{AudioCodec, Caps, MediaFormat, VideoCodec};
-use crate::memory::{HeapSegment, MemorySegment};
+use crate::memory::{CpuSegment, MemorySegment};
 use crate::metadata::Metadata;
 
 use std::collections::HashMap;
@@ -263,7 +263,7 @@ impl TsMuxElement {
         }
 
         let segment = Arc::new(
-            HeapSegment::new(ts_data.len())
+            CpuSegment::new(ts_data.len())
                 .map_err(|e| Error::Element(format!("Failed to allocate buffer: {}", e)))?,
         );
 
@@ -442,10 +442,10 @@ mod tests {
     use super::*;
     use crate::clock::ClockTime;
     use crate::element::muxer::SyncMode;
-    use crate::memory::HeapSegment;
+    use crate::memory::CpuSegment;
 
     fn make_buffer(pts_ms: u64, data: &[u8]) -> Buffer {
-        let segment = Arc::new(HeapSegment::new(data.len().max(64)).unwrap());
+        let segment = Arc::new(CpuSegment::new(data.len().max(64)).unwrap());
         let ptr = segment.as_mut_ptr().unwrap();
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());

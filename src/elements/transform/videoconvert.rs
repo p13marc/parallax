@@ -9,7 +9,7 @@ use crate::converters::{PixelFormat, VideoConvert};
 use crate::element::Element;
 use crate::error::{Error, Result};
 use crate::format::Caps;
-use crate::memory::{HeapSegment, MemorySegment};
+use crate::memory::{CpuSegment, MemorySegment};
 
 /// Video format conversion element.
 ///
@@ -202,7 +202,7 @@ impl Element for VideoConvertElement {
 
         // Create output buffer
         let output_size = self.output_buffer.len();
-        let segment = Arc::new(HeapSegment::new(output_size)?);
+        let segment = Arc::new(CpuSegment::new(output_size)?);
 
         // Copy converted data
         unsafe {

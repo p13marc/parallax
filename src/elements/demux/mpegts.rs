@@ -25,7 +25,7 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::clock::ClockTime;
 use crate::error::{Error, Result};
-use crate::memory::{HeapSegment, MemorySegment};
+use crate::memory::{CpuSegment, MemorySegment};
 use crate::metadata::Metadata;
 
 use mpeg2ts_reader::StreamType;
@@ -254,7 +254,7 @@ impl FrameCollector {
         }
 
         let segment = Arc::new(
-            HeapSegment::new(data.len())
+            CpuSegment::new(data.len())
                 .map_err(|e| Error::Element(format!("Failed to allocate buffer: {}", e)))?,
         );
 

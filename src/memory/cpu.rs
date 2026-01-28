@@ -6,8 +6,8 @@
 //!
 //! # Design Rationale
 //!
-//! Previously, Parallax had separate `HeapSegment` (malloc-backed) and
-//! `SharedMemorySegment` (memfd-backed). This distinction was unnecessary:
+//! Previously, Parallax had separate `CpuSegment` (malloc-backed) and
+//! a separate heap-backed segment. This distinction was unnecessary:
 //!
 //! - `memfd_create` + `MAP_SHARED` has zero overhead vs `malloc`
 //! - Every buffer is automatically shareable via fd passing
@@ -30,7 +30,7 @@
 //! // Send fd over Unix socket via SCM_RIGHTS...
 //!
 //! // In another process:
-//! let received = unsafe { CpuSegment::from_fd(received_fd, 1024 * 1024)? };
+//! let received = CpuSegment::from_fd(received_fd)?;
 //! // Same physical memory - true zero-copy!
 //! ```
 
@@ -54,7 +54,7 @@ fn next_segment_id() -> u64 {
 /// Unified CPU memory segment - always memfd-backed, always IPC-ready.
 ///
 /// This is the primary memory backend for Parallax. It replaces both
-/// `HeapSegment` and `SharedMemorySegment` with a single type that's
+/// separate heap and shared memory types with a single type that's
 /// always shareable across processes with zero overhead.
 ///
 /// # Memory Model
@@ -167,30 +167,81 @@ impl CpuSegment {
         })
     }
 
-    /// Reconstruct a segment from a received file descriptor.
+    /// Reconstruct a segment from a received file descriptor (safe version).
     ///
     /// Use this in the receiving process after getting the fd via `SCM_RIGHTS`.
     /// The resulting segment shares the same physical memory as the sender.
     ///
+    /// This method queries the actual file size from the fd and validates it,
+    /// making it safe to call with any file descriptor.
+    ///
     /// # Arguments
     ///
-    /// * `fd` - File descriptor received from another process
-    /// * `size` - Size of the memory region (must match sender)
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure:
-    /// - `fd` is a valid memfd file descriptor
-    /// - `size` matches the actual size of the memfd
+    /// * `fd` - File descriptor received from another process (should be a memfd)
     ///
     /// # Example
     ///
     /// ```rust,ignore
     /// // In receiving process, after getting fd via SCM_RIGHTS:
-    /// let segment = unsafe { CpuSegment::from_fd(received_fd, size)? };
+    /// let segment = CpuSegment::from_fd(received_fd)?;
     /// // segment now shares memory with sender
     /// ```
-    pub unsafe fn from_fd(fd: OwnedFd, size: usize) -> Result<Self> {
+    pub fn from_fd(fd: OwnedFd) -> Result<Self> {
+        // Query the actual size from the fd
+        let stat = rustix::fs::fstat(&fd)?;
+        let size = stat.st_size as usize;
+
+        if size == 0 {
+            return Err(Error::AllocationFailed("memfd has zero size".into()));
+        }
+
+        // Map the received fd
+        let ptr = unsafe {
+            rustix::mm::mmap(
+                std::ptr::null_mut(),
+                size,
+                ProtFlags::READ | ProtFlags::WRITE,
+                MapFlags::SHARED,
+                &fd,
+                0,
+            )?
+        };
+
+        let ptr = NonNull::new(ptr.cast::<u8>())
+            .ok_or_else(|| Error::AllocationFailed("mmap returned null".into()))?;
+
+        Ok(Self {
+            fd,
+            ptr,
+            len: size,
+            id: next_segment_id(),
+            name: None,
+        })
+    }
+
+    /// Reconstruct a segment from a received file descriptor with explicit size.
+    ///
+    /// Use this when you already know the size and want to skip the fstat call,
+    /// or when you want to map only a portion of the memfd.
+    ///
+    /// # Arguments
+    ///
+    /// * `fd` - File descriptor received from another process
+    /// * `size` - Size of the memory region to map
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure:
+    /// - `fd` is a valid memfd file descriptor
+    /// - `size` does not exceed the actual memfd size
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // In receiving process, when you know the size:
+    /// let segment = unsafe { CpuSegment::from_fd_with_size(received_fd, known_size)? };
+    /// ```
+    pub unsafe fn from_fd_with_size(fd: OwnedFd, size: usize) -> Result<Self> {
         if size == 0 {
             return Err(Error::AllocationFailed(
                 "size must be greater than 0".into(),
@@ -222,19 +273,36 @@ impl CpuSegment {
         })
     }
 
-    /// Reconstruct from a raw file descriptor.
+    /// Reconstruct from a raw file descriptor (safe version).
+    ///
+    /// This duplicates the fd so the segment owns its own reference.
+    /// The size is queried from the fd automatically.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure `fd` is a valid file descriptor.
+    pub unsafe fn from_raw_fd(fd: RawFd) -> Result<Self> {
+        // SAFETY: Caller guarantees fd is valid
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        let owned = rustix::io::fcntl_dupfd_cloexec(borrowed, 0)?;
+        Self::from_fd(owned)
+    }
+
+    /// Reconstruct from a raw file descriptor with explicit size.
     ///
     /// This duplicates the fd so the segment owns its own reference.
     ///
     /// # Safety
     ///
-    /// Same requirements as [`from_fd`](Self::from_fd).
-    pub unsafe fn from_raw_fd(fd: RawFd, size: usize) -> Result<Self> {
+    /// The caller must ensure:
+    /// - `fd` is a valid file descriptor
+    /// - `size` does not exceed the actual file size
+    pub unsafe fn from_raw_fd_with_size(fd: RawFd, size: usize) -> Result<Self> {
         // SAFETY: Caller guarantees fd is valid
         let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
         let owned = rustix::io::fcntl_dupfd_cloexec(borrowed, 0)?;
         // SAFETY: We're forwarding the caller's safety guarantees
-        unsafe { Self::from_fd(owned, size) }
+        unsafe { Self::from_fd_with_size(owned, size) }
     }
 
     /// Get the file descriptor for IPC.
@@ -301,7 +369,7 @@ impl CpuSegment {
     /// This is useful when you need multiple handles to the same memory.
     pub fn try_clone(&self) -> Result<Self> {
         let new_fd = rustix::io::fcntl_dupfd_cloexec(&self.fd, 0)?;
-        unsafe { Self::from_fd(new_fd, self.len) }
+        Self::from_fd(new_fd)
     }
 }
 
@@ -422,7 +490,7 @@ mod tests {
         let dup_fd = rustix::io::fcntl_dupfd_cloexec(&original.fd, 0).unwrap();
 
         // Open from the duplicated fd
-        let reopened = unsafe { CpuSegment::from_fd(dup_fd, 4096).unwrap() };
+        let reopened = CpuSegment::from_fd(dup_fd).unwrap();
 
         // Verify we can read the same data (same physical memory!)
         unsafe {
@@ -439,7 +507,7 @@ mod tests {
 
         // Duplicate fd to simulate another process
         let dup_fd = rustix::io::fcntl_dupfd_cloexec(&segment1.fd, 0).unwrap();
-        let segment2 = unsafe { CpuSegment::from_fd(dup_fd, 4096).unwrap() };
+        let segment2 = CpuSegment::from_fd(dup_fd).unwrap();
 
         // Write via segment1
         segment1.as_mut_slice()[0] = 77;

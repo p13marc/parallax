@@ -17,19 +17,14 @@
 //! | [`HugePageSegment`] | Large allocations, reduced TLB misses |
 //! | [`MappedFileSegment`] | Persistent storage, file I/O |
 //!
-//! # Deprecated Backends
-//!
-//! | Backend | Replacement |
-//! |---------|-------------|
-//! | `HeapSegment` | Use [`CpuSegment`] - same performance, always shareable |
-//! | `SharedMemorySegment` | Use [`CpuSegment`] - unified type for all CPU memory |
-//!
 //! # Design Rationale
 //!
-//! Previously, Parallax had separate `HeapSegment` (malloc-backed) and
-//! `SharedMemorySegment` (memfd-backed). This was unnecessary because
-//! `memfd_create + MAP_SHARED` has zero overhead vs malloc but is always
-//! shareable. Now all CPU memory uses [`CpuSegment`].
+//! All CPU memory is backed by `memfd_create + MAP_SHARED`, which has zero
+//! overhead vs malloc but is always shareable via fd passing. This means:
+//!
+//! - Every buffer is automatically shareable across processes
+//! - No conversion needed before IPC
+//! - Cross-process = same physical pages (true zero-copy)
 //!
 //! # Example
 //!
@@ -51,13 +46,11 @@ mod arena;
 mod bitmap;
 mod buffer_pool;
 mod cpu;
-mod heap;
 mod huge_pages;
 pub mod ipc;
 mod mapped_file;
 mod pool;
 mod segment;
-mod shared;
 mod shared_refcount;
 
 pub use arena::{Access, ArenaCache, ArenaSlot, CpuArena, IpcSlotRef};
@@ -69,9 +62,3 @@ pub use mapped_file::MappedFileSegment;
 pub use pool::{LoanedSlot, MemoryPool};
 pub use segment::{IpcHandle, MemorySegment, MemoryType};
 pub use shared_refcount::{SharedArena, SharedArenaCache, SharedIpcSlotRef, SharedSlotRef};
-
-// Deprecated re-exports (kept for backward compatibility)
-#[deprecated(since = "0.2.0", note = "Use CpuSegment instead")]
-pub use heap::HeapSegment;
-#[deprecated(since = "0.2.0", note = "Use CpuSegment instead")]
-pub use shared::SharedMemorySegment;

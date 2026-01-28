@@ -331,12 +331,12 @@ impl std::fmt::Debug for MemoryHandle {
 ///
 /// ```rust
 /// use parallax::buffer::{Buffer, MemoryHandle};
-/// use parallax::memory::HeapSegment;
+/// use parallax::memory::CpuSegment;
 /// use parallax::metadata::Metadata;
 /// use std::sync::Arc;
 ///
 /// // Create a buffer from a heap segment
-/// let segment = Arc::new(HeapSegment::new(1024).unwrap());
+/// let segment = Arc::new(CpuSegment::new(1024).unwrap());
 /// let handle = MemoryHandle::from_segment(segment);
 /// let buffer = Buffer::<()>::new(handle, Metadata::from_sequence(0));
 ///
@@ -481,10 +481,10 @@ unsafe impl<T: Sync> Sync for Buffer<T> {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::HeapSegment;
+    use crate::memory::CpuSegment;
 
     fn make_test_buffer(size: usize) -> Buffer {
-        let segment = Arc::new(HeapSegment::new(size).unwrap());
+        let segment = Arc::new(CpuSegment::new(size).unwrap());
         let handle = MemoryHandle::from_segment(segment);
         Buffer::new(handle, Metadata::from_sequence(42))
     }
@@ -530,7 +530,7 @@ mod tests {
 
     #[test]
     fn test_memory_handle_slice() {
-        let segment = Arc::new(HeapSegment::new(1024).unwrap());
+        let segment = Arc::new(CpuSegment::new(1024).unwrap());
         let handle = MemoryHandle::from_segment(segment);
 
         let sub = handle.slice(100, 200);
@@ -541,7 +541,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "sub-handle exceeds parent bounds")]
     fn test_memory_handle_slice_out_of_bounds() {
-        let segment = Arc::new(HeapSegment::new(1024).unwrap());
+        let segment = Arc::new(CpuSegment::new(1024).unwrap());
         let handle = MemoryHandle::from_segment(segment);
         let _ = handle.slice(900, 200); // 900 + 200 > 1024
     }

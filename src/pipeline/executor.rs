@@ -795,7 +795,7 @@ mod tests {
         ConsumeContext, DynAsyncElement, Element, ElementAdapter, ProduceContext, ProduceResult,
         Sink, SinkAdapter, Source, SourceAdapter,
     };
-    use crate::memory::HeapSegment;
+    use crate::memory::CpuSegment;
     use crate::metadata::Metadata;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -810,7 +810,7 @@ mod tests {
             if self.count >= self.max {
                 return Ok(ProduceResult::Eos);
             }
-            let segment = Arc::new(HeapSegment::new(8).unwrap());
+            let segment = Arc::new(CpuSegment::new(8).unwrap());
             let handle = MemoryHandle::from_segment(segment);
             let buffer = Buffer::new(handle, Metadata::from_sequence(self.count));
             self.count += 1;
@@ -1040,7 +1040,7 @@ mod tests {
         struct InfiniteSource;
         impl Source for InfiniteSource {
             fn produce(&mut self, _ctx: &mut ProduceContext) -> Result<ProduceResult> {
-                let segment = Arc::new(HeapSegment::new(8).unwrap());
+                let segment = Arc::new(CpuSegment::new(8).unwrap());
                 let handle = MemoryHandle::from_segment(segment);
                 Ok(ProduceResult::OwnBuffer(Buffer::new(
                     handle,

@@ -31,7 +31,7 @@ pub const MAX_FDS_PER_MESSAGE: usize = 4;
 /// use parallax::memory::ipc::send_fds;
 ///
 /// let (sender, receiver) = UnixStream::pair()?;
-/// let segment = SharedMemorySegment::new("test", 4096)?;
+/// let segment = CpuSegment::with_name("test", 4096)?;
 ///
 /// send_fds(&sender, &[segment.as_fd()], b"hello")?;
 /// ```
@@ -162,14 +162,14 @@ pub fn recv_segment_handle(socket: &UnixStream) -> Result<(OwnedFd, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::{MemorySegment, SharedMemorySegment};
+    use crate::memory::{CpuSegment, MemorySegment};
 
     #[test]
     fn test_send_recv_fds() {
         let (sender, receiver) = UnixStream::pair().unwrap();
 
         // Create a shared memory segment
-        let segment = SharedMemorySegment::new("test-ipc", 4096).unwrap();
+        let segment = CpuSegment::with_name("test-ipc", 4096).unwrap();
 
         // Write some data to it
         unsafe {
@@ -190,8 +190,7 @@ mod tests {
         assert_eq!(fds.len(), 1);
 
         // Open the received fd as a segment
-        let received =
-            unsafe { SharedMemorySegment::from_fd(fds.into_iter().next().unwrap(), 4096).unwrap() };
+        let received = CpuSegment::from_fd(fds.into_iter().next().unwrap()).unwrap();
 
         // Verify we can read the same data
         unsafe {
@@ -204,7 +203,7 @@ mod tests {
     fn test_send_recv_segment_handle() {
         let (sender, receiver) = UnixStream::pair().unwrap();
 
-        let segment = SharedMemorySegment::new("test-handle", 8192).unwrap();
+        let segment = CpuSegment::with_name("test-handle", 8192).unwrap();
 
         // Write test data
         unsafe {
@@ -220,7 +219,7 @@ mod tests {
         assert_eq!(size, 8192);
 
         // Open and verify
-        let received = unsafe { SharedMemorySegment::from_fd(fd, size).unwrap() };
+        let received = CpuSegment::from_fd(fd).unwrap();
         assert_eq!(received.len(), 8192);
         unsafe {
             assert_eq!(*received.as_ptr(), 99);
@@ -241,14 +240,14 @@ mod tests {
         // modifications made through one mapping are visible through another
 
         let (sender, receiver) = UnixStream::pair().unwrap();
-        let segment1 = SharedMemorySegment::new("test-visibility", 4096).unwrap();
+        let segment1 = CpuSegment::with_name("test-visibility", 4096).unwrap();
 
         // Send the fd
         send_segment_handle(&sender, segment1.as_fd(), segment1.len()).unwrap();
 
         // Receive and open
         let (fd, size) = recv_segment_handle(&receiver).unwrap();
-        let segment2 = unsafe { SharedMemorySegment::from_fd(fd, size).unwrap() };
+        let segment2 = CpuSegment::from_fd(fd).unwrap();
 
         // Write through segment1
         unsafe {

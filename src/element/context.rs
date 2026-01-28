@@ -889,7 +889,7 @@ impl std::fmt::Debug for ElementContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::{HeapSegment, MemorySegment};
+    use crate::memory::{CpuSegment, MemorySegment};
 
     #[test]
     fn test_context_creation() {
@@ -900,7 +900,7 @@ mod tests {
 
     #[test]
     fn test_context_with_pool() {
-        let segment = HeapSegment::new(1024).unwrap();
+        let segment = CpuSegment::new(1024).unwrap();
         let pool = Arc::new(MemoryPool::new(segment, 256).unwrap());
 
         let ctx = ElementContext::with_pool("test-element", pool.clone());
@@ -1209,7 +1209,7 @@ mod tests {
 
     #[test]
     fn test_consume_context() {
-        let segment = Arc::new(HeapSegment::new(1024).unwrap());
+        let segment = Arc::new(CpuSegment::new(1024).unwrap());
         // Write some data
         unsafe {
             let ptr = segment.as_ptr() as *mut u8;
@@ -1234,7 +1234,7 @@ mod tests {
 
     #[test]
     fn test_consume_context_eos() {
-        let segment = Arc::new(HeapSegment::new(8).unwrap());
+        let segment = Arc::new(CpuSegment::new(8).unwrap());
         let handle = MemoryHandle::from_segment(segment);
         let meta = Metadata::new().eos();
         let buffer = Buffer::new(handle, meta);

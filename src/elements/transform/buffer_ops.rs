@@ -5,7 +5,7 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::Element;
 use crate::error::Result;
-use crate::memory::{HeapSegment, MemorySegment};
+use crate::memory::{CpuSegment, MemorySegment};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -81,7 +81,7 @@ impl Element for BufferTrim {
         self.bytes_trimmed
             .fetch_add(bytes_removed as u64, Ordering::Relaxed);
 
-        let segment = Arc::new(HeapSegment::new(self.max_size)?);
+        let segment = Arc::new(CpuSegment::new(self.max_size)?);
         let src_data = buffer.as_bytes();
 
         unsafe {
@@ -201,7 +201,7 @@ impl Element for BufferSlice {
                 return Ok(None);
             }
             // Return empty buffer (allocate minimum 1 byte)
-            let segment = Arc::new(HeapSegment::new(1)?);
+            let segment = Arc::new(CpuSegment::new(1)?);
             let handle = MemoryHandle::from_segment_with_len(segment, 0);
             return Ok(Some(Buffer::new(handle, buffer.metadata().clone())));
         }
@@ -218,12 +218,12 @@ impl Element for BufferSlice {
         };
 
         if slice_len == 0 {
-            let segment = Arc::new(HeapSegment::new(1)?); // Minimum 1 byte
+            let segment = Arc::new(CpuSegment::new(1)?); // Minimum 1 byte
             let handle = MemoryHandle::from_segment_with_len(segment, 0);
             return Ok(Some(Buffer::new(handle, buffer.metadata().clone())));
         }
 
-        let segment = Arc::new(HeapSegment::new(slice_len)?);
+        let segment = Arc::new(CpuSegment::new(slice_len)?);
         let src_data = buffer.as_bytes();
 
         unsafe {
@@ -314,7 +314,7 @@ impl Element for BufferPad {
 
         self.padded_count.fetch_add(1, Ordering::Relaxed);
 
-        let segment = Arc::new(HeapSegment::new(self.min_size)?);
+        let segment = Arc::new(CpuSegment::new(self.min_size)?);
         let src_data = buffer.as_bytes();
 
         unsafe {
@@ -353,7 +353,7 @@ mod tests {
     use crate::metadata::Metadata;
 
     fn create_test_buffer(data: &[u8], seq: u64) -> Buffer {
-        let segment = Arc::new(HeapSegment::new(data.len()).unwrap());
+        let segment = Arc::new(CpuSegment::new(data.len()).unwrap());
         unsafe {
             let ptr = segment.as_mut_ptr().unwrap();
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());

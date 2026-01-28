@@ -915,12 +915,12 @@ impl<T: SendPipelineElement + 'static> super::traits::SendAsyncElementDyn
 mod tests {
     use super::*;
     use crate::buffer::MemoryHandle;
-    use crate::memory::HeapSegment;
+    use crate::memory::CpuSegment;
     use crate::metadata::Metadata;
     use std::sync::Arc;
 
     fn make_buffer(seq: u64) -> Buffer {
-        let segment = Arc::new(HeapSegment::new(64).unwrap());
+        let segment = Arc::new(CpuSegment::new(64).unwrap());
         let handle = MemoryHandle::from_segment(segment);
         Buffer::new(handle, Metadata::from_sequence(seq))
     }

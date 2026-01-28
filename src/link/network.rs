@@ -22,7 +22,7 @@
 
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::error::{Error, Result};
-use crate::memory::{HeapSegment, MemorySegment};
+use crate::memory::{CpuSegment, MemorySegment};
 use crate::metadata::Metadata;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -350,7 +350,7 @@ impl NetworkReceiver {
                 let data = &payload[8..];
 
                 // Create buffer with heap-backed memory
-                let segment = Arc::new(HeapSegment::new(data.len())?);
+                let segment = Arc::new(CpuSegment::new(data.len())?);
                 let ptr = segment
                     .as_mut_ptr()
                     .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
@@ -387,7 +387,7 @@ mod tests {
     use std::thread;
 
     fn make_buffer(data: &[u8], seq: u64) -> Buffer {
-        let segment = Arc::new(HeapSegment::new(data.len()).unwrap());
+        let segment = Arc::new(CpuSegment::new(data.len()).unwrap());
         let ptr = segment.as_mut_ptr().unwrap();
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());

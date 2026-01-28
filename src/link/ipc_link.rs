@@ -8,7 +8,7 @@
 
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::error::{Error, Result};
-use crate::memory::{SharedMemorySegment, ipc};
+use crate::memory::{CpuSegment, ipc};
 use crate::metadata::Metadata;
 
 use std::collections::HashMap;
@@ -173,8 +173,8 @@ impl IpcPublisher {
     pub fn send(&mut self, buffer: Buffer) -> Result<()> {
         let memory = buffer.memory();
 
-        // Try to get the segment as SharedMemorySegment
-        // This requires the segment to be a SharedMemorySegment
+        // Try to get the segment as CpuSegment
+        // This requires the segment to be a CpuSegment
         let segment_id = self.ensure_segment_sent(&buffer)?;
 
         // Send buffer message
@@ -301,7 +301,7 @@ impl IpcPublisher {
 pub struct IpcSubscriber {
     stream: UnixStream,
     /// Segments we've received from the publisher (segment_id -> segment)
-    segments: HashMap<u32, Arc<SharedMemorySegment>>,
+    segments: HashMap<u32, Arc<CpuSegment>>,
 }
 
 impl IpcSubscriber {
@@ -375,7 +375,7 @@ impl IpcSubscriber {
                     .ok_or_else(|| Error::Pipeline("expected fd for NewSegment".into()))?;
 
                 let size = header.field1 as usize;
-                let segment = unsafe { SharedMemorySegment::from_fd(fd, size)? };
+                let segment = unsafe { CpuSegment::from_fd_with_size(fd, size)? };
                 self.segments.insert(header.segment_id, Arc::new(segment));
 
                 // Recurse to get the actual buffer
@@ -426,7 +426,7 @@ mod tests {
         let mut subscriber = IpcSubscriber::from_stream(sub_stream);
 
         // Create a shared memory segment
-        let segment = Arc::new(SharedMemorySegment::new("test-ipc-link", 4096).unwrap());
+        let segment = Arc::new(CpuSegment::with_name("test-ipc-link", 4096).unwrap());
 
         // Producer thread
         let producer = thread::spawn(move || {
@@ -471,7 +471,7 @@ mod tests {
         let mut subscriber = IpcSubscriber::from_stream(sub_stream);
 
         // Create shared memory
-        let segment = Arc::new(SharedMemorySegment::new("test-zero-copy", 4096).unwrap());
+        let segment = Arc::new(CpuSegment::with_name("test-zero-copy", 4096).unwrap());
 
         // Write data to segment
         let ptr = segment.as_mut_ptr().unwrap();
@@ -510,8 +510,8 @@ mod tests {
         let mut subscriber = IpcSubscriber::from_stream(sub_stream);
 
         // Create two different segments
-        let segment1 = Arc::new(SharedMemorySegment::new("test-multi-1", 1024).unwrap());
-        let segment2 = Arc::new(SharedMemorySegment::new("test-multi-2", 1024).unwrap());
+        let segment1 = Arc::new(CpuSegment::with_name("test-multi-1", 1024).unwrap());
+        let segment2 = Arc::new(CpuSegment::with_name("test-multi-2", 1024).unwrap());
 
         // Write different data to each
         unsafe {
@@ -547,7 +547,7 @@ mod tests {
         let mut subscriber = IpcSubscriber::from_stream(sub_stream);
 
         // Create one segment
-        let segment = Arc::new(SharedMemorySegment::new("test-reuse", 1024).unwrap());
+        let segment = Arc::new(CpuSegment::with_name("test-reuse", 1024).unwrap());
 
         // Send multiple buffers from the same segment
         for i in 0..5 {

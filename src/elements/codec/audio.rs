@@ -28,7 +28,7 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{Element, ExecutionHints};
 use crate::error::{Error, Result};
-use crate::memory::{HeapSegment, MemorySegment};
+use crate::memory::{CpuSegment, MemorySegment};
 use std::sync::Arc;
 
 /// Supported audio formats.
@@ -290,7 +290,7 @@ mod symphonia_decoder {
                 Some((samples, _info)) => {
                     // Convert f32 samples to bytes
                     let byte_len = samples.len() * 4;
-                    let segment = Arc::new(HeapSegment::new(byte_len)?);
+                    let segment = Arc::new(CpuSegment::new(byte_len)?);
 
                     unsafe {
                         let ptr = segment.as_mut_ptr().unwrap() as *mut f32;

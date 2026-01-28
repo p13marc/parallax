@@ -29,7 +29,7 @@ pub enum ConsoleFormat {
 /// use parallax::elements::{ConsoleSink, ConsoleFormat};
 /// use parallax::element::Sink;
 /// # use parallax::buffer::{Buffer, MemoryHandle};
-/// # use parallax::memory::HeapSegment;
+/// # use parallax::memory::CpuSegment;
 /// # use parallax::metadata::Metadata;
 /// # use std::sync::Arc;
 ///
@@ -205,11 +205,11 @@ impl Sink for ConsoleSink {
 mod tests {
     use super::*;
     use crate::buffer::{Buffer, MemoryHandle};
-    use crate::memory::HeapSegment;
+    use crate::memory::CpuSegment;
     use std::sync::Arc;
 
     fn create_test_buffer(data: &[u8], sequence: u64) -> Buffer {
-        let segment = Arc::new(HeapSegment::new(data.len()).unwrap());
+        let segment = Arc::new(CpuSegment::new(data.len()).unwrap());
         // Copy data into segment
         unsafe {
             use crate::memory::MemorySegment;

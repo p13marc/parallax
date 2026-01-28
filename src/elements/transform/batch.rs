@@ -5,7 +5,7 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::Element;
 use crate::error::Result;
-use crate::memory::{HeapSegment, MemorySegment};
+use crate::memory::{CpuSegment, MemorySegment};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -137,7 +137,7 @@ impl Batch {
 
         // Concatenate all pending buffer data
         let total_len = self.pending_bytes;
-        let segment = Arc::new(HeapSegment::new(total_len.max(1))?);
+        let segment = Arc::new(CpuSegment::new(total_len.max(1))?);
 
         if total_len > 0 {
             let mut offset = 0;
@@ -298,7 +298,7 @@ impl Unbatch {
 
         while offset < data.len() {
             let chunk_len = (data.len() - offset).min(self.chunk_size);
-            let segment = Arc::new(HeapSegment::new(chunk_len)?);
+            let segment = Arc::new(CpuSegment::new(chunk_len)?);
 
             unsafe {
                 let ptr = segment.as_mut_ptr().unwrap();
@@ -372,7 +372,7 @@ mod tests {
     use crate::metadata::Metadata;
 
     fn create_test_buffer(data: &[u8], seq: u64) -> Buffer {
-        let segment = Arc::new(HeapSegment::new(data.len().max(1)).unwrap());
+        let segment = Arc::new(CpuSegment::new(data.len().max(1)).unwrap());
         if !data.is_empty() {
             unsafe {
                 let ptr = segment.as_mut_ptr().unwrap();

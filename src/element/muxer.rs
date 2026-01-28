@@ -659,12 +659,12 @@ pub struct MuxerSyncStats {
 mod tests {
     use super::*;
     use crate::buffer::MemoryHandle;
-    use crate::memory::HeapSegment;
+    use crate::memory::CpuSegment;
     use crate::metadata::Metadata;
     use std::sync::Arc;
 
     fn make_buffer(pts_ms: u64, seq: u64) -> Buffer {
-        let segment = Arc::new(HeapSegment::new(64).unwrap());
+        let segment = Arc::new(CpuSegment::new(64).unwrap());
         let handle = MemoryHandle::from_segment(segment);
         let mut metadata = Metadata::from_sequence(seq);
         metadata.pts = ClockTime::from_millis(pts_ms);

@@ -15,7 +15,7 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{Sink, Source};
 use crate::error::{Error, Result};
-use crate::memory::{HeapSegment, MemorySegment};
+use crate::memory::{CpuSegment, MemorySegment};
 use crate::metadata::Metadata;
 use std::io::Read;
 use std::sync::Arc;
@@ -162,7 +162,7 @@ impl Source for HttpSrc {
             .as_mut()
             .ok_or_else(|| Error::Element("not connected".into()))?;
 
-        let segment = Arc::new(HeapSegment::new(self.chunk_size)?);
+        let segment = Arc::new(CpuSegment::new(self.chunk_size)?);
         let ptr = unsafe { segment.as_mut_ptr().unwrap() };
         let slice = unsafe { std::slice::from_raw_parts_mut(ptr, self.chunk_size) };
 

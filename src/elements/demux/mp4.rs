@@ -38,7 +38,7 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::clock::ClockTime;
 use crate::error::{Error, Result};
-use crate::memory::{HeapSegment, MemorySegment};
+use crate::memory::{CpuSegment, MemorySegment};
 use crate::metadata::{BufferFlags, Metadata};
 
 use mp4::{MediaType, Mp4Reader, TrackType};
@@ -514,7 +514,7 @@ impl<R: Read + Seek> Mp4Demux<R> {
         track: &Mp4Track,
     ) -> Result<Buffer> {
         let segment = Arc::new(
-            HeapSegment::new(data.len())
+            CpuSegment::new(data.len())
                 .map_err(|e| Error::Element(format!("Failed to allocate buffer: {}", e)))?,
         );
 

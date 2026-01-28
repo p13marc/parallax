@@ -25,7 +25,7 @@
 use crate::buffer::{Buffer, MemoryHandle};
 
 use crate::error::{Error, Result};
-use crate::memory::{HeapSegment, MemorySegment};
+use crate::memory::{CpuSegment, MemorySegment};
 use crate::metadata::Metadata;
 
 use std::collections::BTreeMap;
@@ -594,7 +594,7 @@ fn create_klv_buffer(data: Vec<u8>) -> Result<Buffer> {
     }
 
     let segment = Arc::new(
-        HeapSegment::new(data.len())
+        CpuSegment::new(data.len())
             .map_err(|e| Error::Element(format!("Failed to allocate buffer: {}", e)))?,
     );
 

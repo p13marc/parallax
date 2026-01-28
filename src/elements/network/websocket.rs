@@ -14,7 +14,7 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{Sink, Source};
 use crate::error::{Error, Result};
-use crate::memory::{HeapSegment, MemorySegment};
+use crate::memory::{CpuSegment, MemorySegment};
 use crate::metadata::Metadata;
 use std::net::TcpStream;
 use std::sync::Arc;
@@ -152,7 +152,7 @@ impl Source for WebSocketSrc {
                     let seq = self.sequence;
                     self.sequence += 1;
 
-                    let segment = Arc::new(HeapSegment::new(data.len().max(1))?);
+                    let segment = Arc::new(CpuSegment::new(data.len().max(1))?);
                     if !data.is_empty() {
                         unsafe {
                             let ptr = segment.as_mut_ptr().unwrap();
@@ -170,7 +170,7 @@ impl Source for WebSocketSrc {
                     let seq = self.sequence;
                     self.sequence += 1;
 
-                    let segment = Arc::new(HeapSegment::new(data.len().max(1))?);
+                    let segment = Arc::new(CpuSegment::new(data.len().max(1))?);
                     if !data.is_empty() {
                         unsafe {
                             let ptr = segment.as_mut_ptr().unwrap();

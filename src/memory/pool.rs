@@ -19,10 +19,10 @@ use std::sync::Arc;
 /// # Example
 ///
 /// ```rust
-/// use parallax::memory::{MemoryPool, HeapSegment};
+/// use parallax::memory::{MemoryPool, CpuSegment};
 ///
 /// // Create a pool with 64KB slots
-/// let segment = HeapSegment::new(16 * 64 * 1024).unwrap();
+/// let segment = CpuSegment::new(16 * 64 * 1024).unwrap();
 /// let pool = MemoryPool::new(segment, 64 * 1024).unwrap();
 ///
 /// // Loan a slot
@@ -222,13 +222,13 @@ unsafe impl Send for LoanedSlot<'_> {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::HeapSegment;
+    use crate::memory::CpuSegment;
     use std::sync::Arc;
     use std::thread;
 
     #[test]
     fn test_pool_creation() {
-        let segment = HeapSegment::new(1024).unwrap();
+        let segment = CpuSegment::new(1024).unwrap();
         let pool = MemoryPool::new(segment, 256).unwrap();
 
         assert_eq!(pool.slot_size(), 256);
@@ -238,7 +238,7 @@ mod tests {
 
     #[test]
     fn test_pool_loan_and_return() {
-        let segment = HeapSegment::new(512).unwrap();
+        let segment = CpuSegment::new(512).unwrap();
         let pool = MemoryPool::new(segment, 128).unwrap();
 
         assert_eq!(pool.available(), 4);
@@ -257,7 +257,7 @@ mod tests {
 
     #[test]
     fn test_pool_exhaustion() {
-        let segment = HeapSegment::new(256).unwrap();
+        let segment = CpuSegment::new(256).unwrap();
         let pool = MemoryPool::new(segment, 128).unwrap();
 
         let slot1 = pool.loan();
@@ -271,7 +271,7 @@ mod tests {
 
     #[test]
     fn test_slot_read_write() {
-        let segment = HeapSegment::new(256).unwrap();
+        let segment = CpuSegment::new(256).unwrap();
         let pool = MemoryPool::new(segment, 128).unwrap();
 
         let mut slot = pool.loan().unwrap();
@@ -282,7 +282,7 @@ mod tests {
 
     #[test]
     fn test_pool_concurrent_access() {
-        let segment = HeapSegment::new(1024 * 1024).unwrap();
+        let segment = CpuSegment::new(1024 * 1024).unwrap();
         let pool = Arc::new(MemoryPool::new(segment, 1024).unwrap());
 
         let initial_capacity = pool.capacity();
@@ -315,7 +315,7 @@ mod tests {
 
     #[test]
     fn test_slot_memory_type() {
-        let segment = HeapSegment::new(256).unwrap();
+        let segment = CpuSegment::new(256).unwrap();
         let pool = MemoryPool::new(segment, 128).unwrap();
 
         let slot = pool.loan().unwrap();

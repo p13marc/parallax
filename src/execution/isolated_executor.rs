@@ -397,7 +397,7 @@ mod tests {
     use crate::buffer::{Buffer, MemoryHandle};
     use crate::element::{ConsumeContext, ProduceContext, ProduceResult};
     use crate::element::{DynAsyncElement, Sink, SinkAdapter, Source, SourceAdapter};
-    use crate::memory::HeapSegment;
+    use crate::memory::CpuSegment;
     use crate::metadata::Metadata;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -413,7 +413,7 @@ mod tests {
                 return Ok(ProduceResult::Eos);
             }
             // Create our own buffer since we're in tests without an arena
-            let segment = Arc::new(HeapSegment::new(8).unwrap());
+            let segment = Arc::new(CpuSegment::new(8).unwrap());
             let handle = MemoryHandle::from_segment(segment);
             let buffer = Buffer::new(handle, Metadata::from_sequence(self.count));
             self.count += 1;

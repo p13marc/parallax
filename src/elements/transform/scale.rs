@@ -22,7 +22,7 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::Element;
 use crate::error::{Error, Result};
-use crate::memory::{HeapSegment, MemorySegment};
+use crate::memory::{CpuSegment, MemorySegment};
 use crate::metadata::Metadata;
 
 use std::sync::Arc;
@@ -270,7 +270,7 @@ impl VideoScale {
         let scaled = self.scale_yuv420(input)?;
 
         let segment = Arc::new(
-            HeapSegment::new(scaled.len())
+            CpuSegment::new(scaled.len())
                 .map_err(|e| Error::Element(format!("Failed to allocate buffer: {}", e)))?,
         );
 
@@ -484,7 +484,7 @@ mod tests {
 
         // Create input buffer
         let input_data: Vec<u8> = vec![128; 24]; // 4x4 YUV420
-        let segment = Arc::new(HeapSegment::new(input_data.len()).unwrap());
+        let segment = Arc::new(CpuSegment::new(input_data.len()).unwrap());
         let ptr = segment.as_mut_ptr().unwrap();
         unsafe {
             std::ptr::copy_nonoverlapping(input_data.as_ptr(), ptr, input_data.len());

@@ -33,7 +33,7 @@ use crate::buffer::Buffer;
 use crate::element::Element;
 use crate::error::{Error, Result};
 use crate::format::{MediaFormat, RtpEncoding, RtpFormat, VideoCodec};
-use crate::memory::{HeapSegment, MemorySegment};
+use crate::memory::{CpuSegment, MemorySegment};
 use crate::metadata::BufferFlags;
 
 use bytes::Bytes;
@@ -127,7 +127,7 @@ impl Element for RtpH264Depay {
                 self.stats.bytes_out += output.len() as u64;
 
                 // Create output buffer
-                let segment = Arc::new(HeapSegment::new(output.len())?);
+                let segment = Arc::new(CpuSegment::new(output.len())?);
                 let ptr = segment
                     .as_mut_ptr()
                     .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
@@ -244,7 +244,7 @@ impl Element for RtpH264Pay {
                 self.stats.packets_out += packets.len() as u64;
                 self.stats.bytes_out += total_len as u64;
 
-                let segment = Arc::new(HeapSegment::new(total_len)?);
+                let segment = Arc::new(CpuSegment::new(total_len)?);
                 let ptr = segment
                     .as_mut_ptr()
                     .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
@@ -335,7 +335,7 @@ impl Element for RtpH265Depay {
                 self.stats.frames_out += 1;
                 self.stats.bytes_out += output.len() as u64;
 
-                let segment = Arc::new(HeapSegment::new(output.len())?);
+                let segment = Arc::new(CpuSegment::new(output.len())?);
                 let ptr = segment
                     .as_mut_ptr()
                     .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
@@ -426,7 +426,7 @@ impl Element for RtpH265Pay {
                 self.stats.packets_out += packets.len() as u64;
                 self.stats.bytes_out += total_len as u64;
 
-                let segment = Arc::new(HeapSegment::new(total_len)?);
+                let segment = Arc::new(CpuSegment::new(total_len)?);
                 let ptr = segment
                     .as_mut_ptr()
                     .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
@@ -515,7 +515,7 @@ impl Element for RtpVp8Depay {
                 self.stats.frames_out += 1;
                 self.stats.bytes_out += output.len() as u64;
 
-                let segment = Arc::new(HeapSegment::new(output.len())?);
+                let segment = Arc::new(CpuSegment::new(output.len())?);
                 let ptr = segment
                     .as_mut_ptr()
                     .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
@@ -610,7 +610,7 @@ impl Element for RtpVp8Pay {
                 self.stats.packets_out += packets.len() as u64;
                 self.stats.bytes_out += total_len as u64;
 
-                let segment = Arc::new(HeapSegment::new(total_len)?);
+                let segment = Arc::new(CpuSegment::new(total_len)?);
                 let ptr = segment
                     .as_mut_ptr()
                     .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
@@ -703,7 +703,7 @@ impl Element for RtpVp9Depay {
                 self.stats.frames_out += 1;
                 self.stats.bytes_out += output.len() as u64;
 
-                let segment = Arc::new(HeapSegment::new(output.len())?);
+                let segment = Arc::new(CpuSegment::new(output.len())?);
                 let ptr = segment
                     .as_mut_ptr()
                     .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
@@ -793,7 +793,7 @@ impl Element for RtpVp9Pay {
                 self.stats.packets_out += packets.len() as u64;
                 self.stats.bytes_out += total_len as u64;
 
-                let segment = Arc::new(HeapSegment::new(total_len)?);
+                let segment = Arc::new(CpuSegment::new(total_len)?);
                 let ptr = segment
                     .as_mut_ptr()
                     .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
@@ -886,7 +886,7 @@ impl Element for RtpOpusDepay {
                 self.stats.frames_out += 1;
                 self.stats.bytes_out += output.len() as u64;
 
-                let segment = Arc::new(HeapSegment::new(output.len())?);
+                let segment = Arc::new(CpuSegment::new(output.len())?);
                 let ptr = segment
                     .as_mut_ptr()
                     .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
@@ -954,7 +954,7 @@ mod tests {
     use crate::metadata::Metadata;
 
     fn create_test_buffer(data: &[u8]) -> Buffer {
-        let segment = Arc::new(HeapSegment::new(data.len()).unwrap());
+        let segment = Arc::new(CpuSegment::new(data.len()).unwrap());
         let ptr = segment.as_mut_ptr().unwrap();
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());

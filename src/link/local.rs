@@ -13,14 +13,14 @@ use crate::error::{Error, Result};
 /// ```rust
 /// use parallax::link::LocalLink;
 /// use parallax::buffer::{Buffer, MemoryHandle};
-/// use parallax::memory::HeapSegment;
+/// use parallax::memory::CpuSegment;
 /// use parallax::metadata::Metadata;
 /// use std::sync::Arc;
 ///
 /// let (tx, rx) = LocalLink::bounded(16);
 ///
 /// // Send a buffer
-/// let segment = Arc::new(HeapSegment::new(1024).unwrap());
+/// let segment = Arc::new(CpuSegment::new(1024).unwrap());
 /// let buffer = Buffer::<()>::new(
 ///     MemoryHandle::from_segment(segment),
 ///     Metadata::default(),
@@ -158,13 +158,13 @@ impl LocalReceiver {
 mod tests {
     use super::*;
     use crate::buffer::MemoryHandle;
-    use crate::memory::HeapSegment;
+    use crate::memory::CpuSegment;
     use crate::metadata::Metadata;
     use std::sync::Arc;
     use std::thread;
 
     fn make_buffer(seq: u64) -> Buffer {
-        let segment = Arc::new(HeapSegment::new(64).unwrap());
+        let segment = Arc::new(CpuSegment::new(64).unwrap());
         Buffer::new(
             MemoryHandle::from_segment(segment),
             Metadata::from_sequence(seq),

@@ -24,7 +24,7 @@ use crate::buffer::Buffer;
 use crate::clock::ClockTime;
 use crate::element::{Sink, Source};
 use crate::error::{Error, Result};
-use crate::memory::{HeapSegment, MemorySegment};
+use crate::memory::{CpuSegment, MemorySegment};
 use crate::metadata::{BufferFlags, Metadata, RtpMeta};
 
 use bytes::Bytes;
@@ -262,7 +262,7 @@ impl Source for RtpSrc {
         let payload_len = payload.len();
         self.stats.bytes_received += payload_len as u64;
 
-        let segment = Arc::new(HeapSegment::new(payload_len)?);
+        let segment = Arc::new(CpuSegment::new(payload_len)?);
         let ptr = segment
             .as_mut_ptr()
             .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
@@ -634,7 +634,7 @@ impl AsyncRtpSrc {
         let payload_len = payload.len();
         self.stats.bytes_received += payload_len as u64;
 
-        let segment = Arc::new(HeapSegment::new(payload_len)?);
+        let segment = Arc::new(CpuSegment::new(payload_len)?);
         let ptr = segment
             .as_mut_ptr()
             .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
@@ -893,7 +893,7 @@ mod tests {
                 .with_payload_type(96);
 
             // Create test buffer
-            let segment = Arc::new(HeapSegment::new(5).unwrap());
+            let segment = Arc::new(CpuSegment::new(5).unwrap());
             let ptr = segment.as_mut_ptr().unwrap();
             unsafe {
                 std::ptr::copy_nonoverlapping(b"hello".as_ptr(), ptr, 5);
@@ -936,7 +936,7 @@ mod tests {
         let handle = thread::spawn(move || {
             let mut sink = RtpSink::connect(recv_addr).unwrap().with_payload_type(97); // Wrong PT
 
-            let segment = Arc::new(HeapSegment::new(4).unwrap());
+            let segment = Arc::new(CpuSegment::new(4).unwrap());
             let buf_handle = crate::buffer::MemoryHandle::from_segment_with_len(segment, 4);
             let buffer = Buffer::new(buf_handle, Metadata::default());
 
@@ -966,7 +966,7 @@ mod tests {
                 .with_ssrc(0x87654321)
                 .with_payload_type(111);
 
-            let segment = Arc::new(HeapSegment::new(10).unwrap());
+            let segment = Arc::new(CpuSegment::new(10).unwrap());
             let ptr = segment.as_mut_ptr().unwrap();
             unsafe {
                 std::ptr::copy_nonoverlapping(b"async test".as_ptr(), ptr, 10);
@@ -1013,7 +1013,7 @@ mod tests {
                 marker: true,
             };
 
-            let segment = Arc::new(HeapSegment::new(3).unwrap());
+            let segment = Arc::new(CpuSegment::new(3).unwrap());
             let ptr = segment.as_mut_ptr().unwrap();
             unsafe {
                 std::ptr::copy_nonoverlapping(b"rtp".as_ptr(), ptr, 3);

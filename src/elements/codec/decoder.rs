@@ -24,7 +24,7 @@ use crate::buffer::{Buffer, MemoryHandle};
 use crate::clock::ClockTime;
 use crate::element::{Element, ExecutionHints};
 use crate::error::{Error, Result};
-use crate::memory::{HeapSegment, MemorySegment};
+use crate::memory::{CpuSegment, MemorySegment};
 use std::sync::Arc;
 
 use super::common::{PixelFormat, VideoFrame};
@@ -159,7 +159,7 @@ impl Element for Dav1dDecoder {
         match self.decode_frame(input)? {
             Some(frame) => {
                 // Create output buffer with frame data
-                let segment = Arc::new(HeapSegment::new(frame.data.len())?);
+                let segment = Arc::new(CpuSegment::new(frame.data.len())?);
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         frame.data.as_ptr(),

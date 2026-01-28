@@ -27,7 +27,7 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{Element, ExecutionHints};
 use crate::error::{Error, Result};
-use crate::memory::{HeapSegment, MemorySegment};
+use crate::memory::{CpuSegment, MemorySegment};
 use std::sync::Arc;
 
 /// Color type for image data.
@@ -165,7 +165,7 @@ mod jpeg_codec {
             };
 
             // Create output buffer
-            let segment = Arc::new(HeapSegment::new(pixels.len())?);
+            let segment = Arc::new(CpuSegment::new(pixels.len())?);
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     pixels.as_ptr(),
@@ -246,7 +246,7 @@ mod png_codec {
             pixels.truncate(info.buffer_size());
 
             // Create output buffer
-            let segment = Arc::new(HeapSegment::new(pixels.len())?);
+            let segment = Arc::new(CpuSegment::new(pixels.len())?);
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     pixels.as_ptr(),
@@ -342,7 +342,7 @@ mod png_codec {
             }
 
             // Create output buffer
-            let segment = Arc::new(HeapSegment::new(output.len())?);
+            let segment = Arc::new(CpuSegment::new(output.len())?);
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     output.as_ptr(),

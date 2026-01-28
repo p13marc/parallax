@@ -305,13 +305,13 @@ pub struct UdpMulticastStats {
 mod tests {
     use super::*;
     use crate::buffer::{Buffer, MemoryHandle};
-    use crate::memory::{CpuArena, HeapSegment, MemorySegment};
+    use crate::memory::{CpuArena, CpuSegment, MemorySegment};
     use crate::metadata::Metadata;
     use std::sync::Arc;
     use std::thread;
 
     fn make_buffer(data: &[u8], seq: u64) -> Buffer {
-        let segment = Arc::new(HeapSegment::new(data.len().max(1)).unwrap());
+        let segment = Arc::new(CpuSegment::new(data.len().max(1)).unwrap());
         if !data.is_empty() {
             unsafe {
                 let ptr = segment.as_mut_ptr().unwrap();

@@ -513,8 +513,8 @@ impl Source for IpcSrc {
                     // Create a buffer with the slot reference
                     // In a real implementation, we would map the arena and create
                     // a proper buffer referencing the shared memory
-                    use crate::memory::HeapSegment;
-                    let segment = std::sync::Arc::new(HeapSegment::new(slot.len)?);
+                    use crate::memory::CpuSegment;
+                    let segment = std::sync::Arc::new(CpuSegment::new(slot.len)?);
                     let handle = MemoryHandle::from_segment(segment);
                     let buffer = Buffer::new(handle, meta);
 

@@ -217,12 +217,12 @@ impl Element for RateLimiter {
 mod tests {
     use super::*;
     use crate::buffer::MemoryHandle;
-    use crate::memory::HeapSegment;
+    use crate::memory::CpuSegment;
     use crate::metadata::Metadata;
     use std::sync::Arc;
 
     fn create_test_buffer(size: usize) -> Buffer {
-        let segment = Arc::new(HeapSegment::new(size).unwrap());
+        let segment = Arc::new(CpuSegment::new(size).unwrap());
         let handle = MemoryHandle::from_segment(segment);
         Buffer::new(handle, Metadata::default())
     }

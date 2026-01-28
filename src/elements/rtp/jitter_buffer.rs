@@ -595,12 +595,12 @@ impl Default for AsyncJitterBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::{HeapSegment, MemorySegment};
+    use crate::memory::{CpuSegment, MemorySegment};
     use crate::metadata::Metadata;
     use std::sync::Arc;
 
     fn create_rtp_buffer(seq: u16, ts: u32, data: &[u8]) -> Buffer {
-        let segment = Arc::new(HeapSegment::new(data.len()).unwrap());
+        let segment = Arc::new(CpuSegment::new(data.len()).unwrap());
         let ptr = segment.as_mut_ptr().unwrap();
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());

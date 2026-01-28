@@ -17,14 +17,14 @@ use crate::error::Result;
 /// use parallax::elements::PassThrough;
 /// use parallax::element::Element;
 /// # use parallax::buffer::{Buffer, MemoryHandle};
-/// # use parallax::memory::HeapSegment;
+/// # use parallax::memory::CpuSegment;
 /// # use parallax::metadata::Metadata;
 /// # use std::sync::Arc;
 ///
 /// let mut passthrough = PassThrough::new();
 ///
 /// // Create a test buffer
-/// # let segment = Arc::new(HeapSegment::new(8).unwrap());
+/// # let segment = Arc::new(CpuSegment::new(8).unwrap());
 /// # let handle = MemoryHandle::from_segment(segment);
 /// # let buffer = Buffer::new(handle, Metadata::from_sequence(42));
 ///
@@ -70,7 +70,7 @@ impl Element for PassThrough {
 mod tests {
     use super::*;
     use crate::buffer::MemoryHandle;
-    use crate::memory::HeapSegment;
+    use crate::memory::CpuSegment;
     use crate::metadata::Metadata;
     use std::sync::Arc;
 
@@ -78,7 +78,7 @@ mod tests {
     fn test_passthrough_passes_buffer() {
         let mut passthrough = PassThrough::new();
 
-        let segment = Arc::new(HeapSegment::new(64).unwrap());
+        let segment = Arc::new(CpuSegment::new(64).unwrap());
         let handle = MemoryHandle::from_segment(segment);
         let buffer = Buffer::new(handle, Metadata::from_sequence(42));
 

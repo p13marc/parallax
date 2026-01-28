@@ -17,7 +17,7 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{Element, ExecutionHints};
 use crate::error::{Error, Result};
-use crate::memory::{HeapSegment, MemorySegment};
+use crate::memory::{CpuSegment, MemorySegment};
 use std::sync::Arc;
 
 use super::common::{PixelFormat, VideoFrame};
@@ -293,7 +293,7 @@ impl Element for Rav1eEncoder {
         match self.encode_frame(input, pts)? {
             Some(packet) => {
                 // Create output buffer with encoded data
-                let segment = Arc::new(HeapSegment::new(packet.len())?);
+                let segment = Arc::new(CpuSegment::new(packet.len())?);
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         packet.as_ptr(),

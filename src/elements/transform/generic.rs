@@ -5,7 +5,7 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::Element;
 use crate::error::Result;
-use crate::memory::{HeapSegment, MemorySegment};
+use crate::memory::{CpuSegment, MemorySegment};
 use crate::metadata::Metadata;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -75,12 +75,12 @@ where
 
         if output.is_empty() {
             // Return empty buffer
-            let segment = Arc::new(HeapSegment::new(1)?);
+            let segment = Arc::new(CpuSegment::new(1)?);
             let handle = MemoryHandle::from_segment_with_len(segment, 0);
             return Ok(Some(Buffer::new(handle, buffer.metadata().clone())));
         }
 
-        let segment = Arc::new(HeapSegment::new(output.len())?);
+        let segment = Arc::new(CpuSegment::new(output.len())?);
         unsafe {
             let ptr = segment.as_mut_ptr().unwrap();
             std::ptr::copy_nonoverlapping(output.as_ptr(), ptr, output.len());
@@ -163,7 +163,7 @@ where
             Some(output) => {
                 self.passed.fetch_add(1, Ordering::Relaxed);
 
-                let segment = Arc::new(HeapSegment::new(output.len().max(1))?);
+                let segment = Arc::new(CpuSegment::new(output.len().max(1))?);
                 if !output.is_empty() {
                     unsafe {
                         let ptr = segment.as_mut_ptr().unwrap();
@@ -268,7 +268,7 @@ impl Chunk {
         while self.pending.len() >= self.chunk_size {
             let chunk_data: Vec<u8> = self.pending.drain(..self.chunk_size).collect();
 
-            let segment = Arc::new(HeapSegment::new(self.chunk_size)?);
+            let segment = Arc::new(CpuSegment::new(self.chunk_size)?);
             unsafe {
                 let ptr = segment.as_mut_ptr().unwrap();
                 std::ptr::copy_nonoverlapping(chunk_data.as_ptr(), ptr, self.chunk_size);
@@ -293,7 +293,7 @@ impl Chunk {
         }
 
         let len = self.pending.len();
-        let segment = Arc::new(HeapSegment::new(len)?);
+        let segment = Arc::new(CpuSegment::new(len)?);
         unsafe {
             let ptr = segment.as_mut_ptr().unwrap();
             std::ptr::copy_nonoverlapping(self.pending.as_ptr(), ptr, len);
@@ -402,7 +402,7 @@ where
         let mut buffers = Vec::with_capacity(outputs.len());
 
         for output in outputs {
-            let segment = Arc::new(HeapSegment::new(output.len().max(1))?);
+            let segment = Arc::new(CpuSegment::new(output.len().max(1))?);
             if !output.is_empty() {
                 unsafe {
                     let ptr = segment.as_mut_ptr().unwrap();
@@ -429,7 +429,7 @@ where
         }
 
         let output = self.pending.remove(0);
-        let segment = Arc::new(HeapSegment::new(output.len().max(1))?);
+        let segment = Arc::new(CpuSegment::new(output.len().max(1))?);
         if !output.is_empty() {
             unsafe {
                 let ptr = segment.as_mut_ptr().unwrap();
@@ -484,7 +484,7 @@ mod tests {
     use super::*;
 
     fn create_test_buffer(data: &[u8], seq: u64) -> Buffer {
-        let segment = Arc::new(HeapSegment::new(data.len().max(1)).unwrap());
+        let segment = Arc::new(CpuSegment::new(data.len().max(1)).unwrap());
         if !data.is_empty() {
             unsafe {
                 let ptr = segment.as_mut_ptr().unwrap();

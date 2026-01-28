@@ -566,7 +566,7 @@ impl Default for VideoTestSrc {
 impl Source for VideoTestSrc {
     fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
         use crate::buffer::{Buffer, MemoryHandle};
-        use crate::memory::{HeapSegment, MemorySegment};
+        use crate::memory::{CpuSegment, MemorySegment};
         use crate::metadata::Metadata;
         use std::sync::Arc;
 
@@ -605,7 +605,7 @@ impl Source for VideoTestSrc {
         } else {
             // No buffer provided - allocate our own
             let segment = Arc::new(
-                HeapSegment::new(frame_size)
+                CpuSegment::new(frame_size)
                     .map_err(|e| crate::error::Error::Element(e.to_string()))?,
             );
             // Safety: we just allocated this segment and own it exclusively

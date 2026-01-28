@@ -26,7 +26,7 @@ use super::traits::VideoEncoder;
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{ExecutionHints, Output, Transform};
 use crate::error::Result;
-use crate::memory::{HeapSegment, MemorySegment};
+use crate::memory::{CpuSegment, MemorySegment};
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -132,7 +132,7 @@ impl<E: VideoEncoder> EncoderElement<E> {
 
     /// Convert encoded packet to output buffer.
     fn packet_to_buffer(&self, data: Vec<u8>, pts: i64) -> Result<Buffer> {
-        let segment = Arc::new(HeapSegment::new(data.len())?);
+        let segment = Arc::new(CpuSegment::new(data.len())?);
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), segment.as_mut_ptr().unwrap(), data.len());
         }

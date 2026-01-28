@@ -8,7 +8,7 @@
 use crate::buffer::Buffer;
 use crate::element::{ConsumeContext, ProduceContext, ProduceResult};
 use crate::error::{Error, Result};
-use crate::memory::{HeapSegment, MemorySegment};
+use crate::memory::{CpuSegment, MemorySegment};
 use crate::metadata::Metadata;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::Arc;
@@ -159,7 +159,7 @@ impl crate::element::Source for UdpSrc {
             }
         } else {
             // No buffer provided, allocate our own
-            let segment = Arc::new(HeapSegment::new(self.buffer_size)?);
+            let segment = Arc::new(CpuSegment::new(self.buffer_size)?);
             let ptr = segment
                 .as_mut_ptr()
                 .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
@@ -420,7 +420,7 @@ impl AsyncUdpSrc {
     /// Receive a datagram asynchronously (convenience method).
     pub async fn recv(&mut self) -> Result<Option<Buffer>> {
         // Allocate buffer
-        let segment = Arc::new(HeapSegment::new(self.buffer_size)?);
+        let segment = Arc::new(CpuSegment::new(self.buffer_size)?);
         let ptr = segment
             .as_mut_ptr()
             .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
@@ -457,7 +457,7 @@ impl crate::element::AsyncSource for AsyncUdpSrc {
             Ok(ProduceResult::Produced(n))
         } else {
             // No buffer provided, allocate our own
-            let segment = Arc::new(HeapSegment::new(self.buffer_size)?);
+            let segment = Arc::new(CpuSegment::new(self.buffer_size)?);
             let ptr = segment
                 .as_mut_ptr()
                 .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
@@ -656,7 +656,7 @@ mod tests {
         // Create sink and send data
         let mut sink = UdpSink::connect(recv_addr).unwrap();
 
-        let segment = Arc::new(HeapSegment::new(9).unwrap());
+        let segment = Arc::new(CpuSegment::new(9).unwrap());
         let ptr = segment.as_mut_ptr().unwrap();
         unsafe {
             std::ptr::copy_nonoverlapping(b"hello udp".as_ptr(), ptr, 9);
@@ -677,7 +677,7 @@ mod tests {
     fn test_udp_sink_no_destination() {
         let mut sink = UdpSink::bind("127.0.0.1:0").unwrap();
 
-        let segment = Arc::new(HeapSegment::new(4).unwrap());
+        let segment = Arc::new(CpuSegment::new(4).unwrap());
         let handle = crate::buffer::MemoryHandle::from_segment_with_len(segment, 4);
         let buffer = Buffer::new(handle, Metadata::default());
 
@@ -729,7 +729,7 @@ mod tests {
         // Create sink and send
         let mut sink = AsyncUdpSink::connect(recv_addr).await.unwrap();
 
-        let segment = Arc::new(HeapSegment::new(11).unwrap());
+        let segment = Arc::new(CpuSegment::new(11).unwrap());
         let ptr = segment.as_mut_ptr().unwrap();
         unsafe {
             std::ptr::copy_nonoverlapping(b"async hello".as_ptr(), ptr, 11);

@@ -5,7 +5,7 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
 use crate::error::Result;
-use crate::memory::{HeapSegment, MemorySegment};
+use crate::memory::{CpuSegment, MemorySegment};
 use crate::metadata::Metadata;
 use std::sync::{Arc, Mutex};
 
@@ -99,7 +99,7 @@ impl Source for MemorySrc {
         let chunk_len = remaining.min(self.chunk_size);
 
         // Create our own buffer since MemorySrc manages its own memory
-        let segment = Arc::new(HeapSegment::new(chunk_len)?);
+        let segment = Arc::new(CpuSegment::new(chunk_len)?);
         let ptr = segment.as_mut_ptr().unwrap();
 
         // Copy data to segment
@@ -389,7 +389,7 @@ mod tests {
     fn test_memorysink_basic() {
         let mut sink = MemorySink::new();
 
-        let segment = Arc::new(HeapSegment::new(4).unwrap());
+        let segment = Arc::new(CpuSegment::new(4).unwrap());
         unsafe {
             let ptr = segment.as_mut_ptr().unwrap();
             ptr.copy_from_nonoverlapping([1u8, 2, 3, 4].as_ptr(), 4);
@@ -408,7 +408,7 @@ mod tests {
         let mut sink = MemorySink::new().with_max_size(5);
 
         for i in 0..3 {
-            let segment = Arc::new(HeapSegment::new(3).unwrap());
+            let segment = Arc::new(CpuSegment::new(3).unwrap());
             unsafe {
                 let ptr = segment.as_mut_ptr().unwrap();
                 ptr.copy_from_nonoverlapping([i, i, i].as_ptr(), 3);
@@ -426,7 +426,7 @@ mod tests {
     fn test_memorysink_take_data() {
         let mut sink = MemorySink::new();
 
-        let segment = Arc::new(HeapSegment::new(4).unwrap());
+        let segment = Arc::new(CpuSegment::new(4).unwrap());
         let handle = MemoryHandle::from_segment(segment);
         let buffer = Buffer::new(handle, Metadata::new());
         consume_buffer(&mut sink, &buffer).unwrap();
@@ -441,7 +441,7 @@ mod tests {
     fn test_memorysink_clear() {
         let mut sink = MemorySink::new();
 
-        let segment = Arc::new(HeapSegment::new(4).unwrap());
+        let segment = Arc::new(CpuSegment::new(4).unwrap());
         let handle = MemoryHandle::from_segment(segment);
         let buffer = Buffer::new(handle, Metadata::new());
         consume_buffer(&mut sink, &buffer).unwrap();
@@ -454,7 +454,7 @@ mod tests {
     fn test_shared_memorysink() {
         let mut sink = SharedMemorySink::new();
 
-        let segment = Arc::new(HeapSegment::new(4).unwrap());
+        let segment = Arc::new(CpuSegment::new(4).unwrap());
         let handle = MemoryHandle::from_segment(segment);
         let buffer = Buffer::new(handle, Metadata::new());
         let ctx = ConsumeContext::new(&buffer);

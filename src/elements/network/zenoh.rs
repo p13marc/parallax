@@ -14,7 +14,7 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{Sink, Source};
 use crate::error::{Error, Result};
-use crate::memory::{HeapSegment, MemorySegment};
+use crate::memory::{CpuSegment, MemorySegment};
 use crate::metadata::Metadata;
 use std::sync::Arc;
 use std::time::Duration;
@@ -179,7 +179,7 @@ impl Source for ZenohSrc {
                 Ok(sample) => sample,
                 Err(flume::RecvTimeoutError::Timeout) => {
                     // Return timeout buffer
-                    let segment = Arc::new(HeapSegment::new(1)?);
+                    let segment = Arc::new(CpuSegment::new(1)?);
                     let handle = MemoryHandle::from_segment_with_len(segment, 0);
                     let mut meta = Metadata::from_sequence(self.sequence);
                     meta.flags = meta.flags.insert(crate::metadata::BufferFlags::TIMEOUT);
@@ -203,7 +203,7 @@ impl Source for ZenohSrc {
         let seq = self.sequence;
         self.sequence += 1;
 
-        let segment = Arc::new(HeapSegment::new(data.len().max(1))?);
+        let segment = Arc::new(CpuSegment::new(data.len().max(1))?);
         if !data.is_empty() {
             unsafe {
                 let ptr = segment.as_mut_ptr().unwrap();
@@ -607,7 +607,7 @@ impl ZenohQuerier {
                     let payload = sample.payload();
                     let data: Vec<u8> = payload.to_bytes().to_vec();
 
-                    let segment = Arc::new(HeapSegment::new(data.len().max(1))?);
+                    let segment = Arc::new(CpuSegment::new(data.len().max(1))?);
                     if !data.is_empty() {
                         unsafe {
                             let ptr = segment.as_mut_ptr().unwrap();
@@ -650,7 +650,7 @@ impl ZenohQuerier {
                     let payload = sample.payload();
                     let data: Vec<u8> = payload.to_bytes().to_vec();
 
-                    let segment = Arc::new(HeapSegment::new(data.len().max(1))?);
+                    let segment = Arc::new(CpuSegment::new(data.len().max(1))?);
                     if !data.is_empty() {
                         unsafe {
                             let ptr = segment.as_mut_ptr().unwrap();

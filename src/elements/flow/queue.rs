@@ -316,13 +316,13 @@ impl Clone for Queue {
 mod tests {
     use super::*;
     use crate::buffer::MemoryHandle;
-    use crate::memory::HeapSegment;
+    use crate::memory::CpuSegment;
     use crate::metadata::Metadata;
     use std::sync::Arc;
     use std::thread;
 
     fn create_test_buffer(size: usize, seq: u64) -> Buffer {
-        let segment = Arc::new(HeapSegment::new(size).unwrap());
+        let segment = Arc::new(CpuSegment::new(size).unwrap());
         let handle = MemoryHandle::from_segment(segment);
         Buffer::new(handle, Metadata::from_sequence(seq))
     }

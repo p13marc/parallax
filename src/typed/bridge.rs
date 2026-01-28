@@ -9,7 +9,7 @@ use crate::element::{
     SourceAdapter,
 };
 use crate::error::Result;
-use crate::memory::{HeapSegment, MemorySegment};
+use crate::memory::CpuSegment;
 use crate::metadata::Metadata;
 use crate::pipeline::Pipeline;
 use std::sync::Arc;
@@ -58,15 +58,10 @@ where
                     Ok(ProduceResult::Produced(bytes.len()))
                 } else {
                     // Fall back to creating our own buffer
-                    let segment = Arc::new(HeapSegment::new(bytes.len())?);
+                    let segment = Arc::new(CpuSegment::new(bytes.len())?);
 
-                    // Copy data to segment (using unsafe as required by the trait)
-                    // SAFETY: HeapSegment is mutable and we have exclusive access via Arc
-                    unsafe {
-                        if let Some(slice) = segment.as_mut_slice() {
-                            slice.copy_from_slice(&bytes);
-                        }
-                    }
+                    // Copy data to segment
+                    segment.as_mut_slice().copy_from_slice(&bytes);
 
                     let handle = MemoryHandle::from_segment(segment);
                     let metadata = Metadata::from_sequence(self.sequence);
@@ -158,14 +153,10 @@ where
         match self.inner.transform(item)? {
             Some(output) => {
                 let out_bytes: Vec<u8> = output.into();
-                let segment = Arc::new(HeapSegment::new(out_bytes.len())?);
+                let segment = Arc::new(CpuSegment::new(out_bytes.len())?);
 
-                // SAFETY: HeapSegment is mutable and we have exclusive access via Arc
-                unsafe {
-                    if let Some(slice) = segment.as_mut_slice() {
-                        slice.copy_from_slice(&out_bytes);
-                    }
-                }
+                // Copy data to segment
+                segment.as_mut_slice().copy_from_slice(&out_bytes);
 
                 let handle = MemoryHandle::from_segment(segment);
                 Ok(Some(Buffer::new(handle, metadata)))

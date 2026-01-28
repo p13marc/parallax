@@ -2602,7 +2602,7 @@ impl<M: Muxer + Send + 'static> SendAsyncElementDyn for MuxerAdapter<M> {
 mod tests {
     use super::*;
     use crate::buffer::MemoryHandle;
-    use crate::memory::{CpuArena, HeapSegment};
+    use crate::memory::{CpuArena, CpuSegment};
     use crate::metadata::Metadata;
     use std::sync::Arc;
 
@@ -2659,7 +2659,7 @@ mod tests {
 
     #[test]
     fn test_output_single() {
-        let segment = Arc::new(HeapSegment::new(8).unwrap());
+        let segment = Arc::new(CpuSegment::new(8).unwrap());
         let handle = MemoryHandle::from_segment(segment);
         let buffer = Buffer::new(handle, Metadata::from_sequence(42));
 
@@ -2674,14 +2674,14 @@ mod tests {
         let out: Output = vec![].into();
         assert!(out.is_none());
 
-        let segment = Arc::new(HeapSegment::new(8).unwrap());
+        let segment = Arc::new(CpuSegment::new(8).unwrap());
         let handle = MemoryHandle::from_segment(segment);
         let buffer = Buffer::new(handle, Metadata::from_sequence(42));
         let out: Output = vec![buffer].into();
         assert!(out.is_single());
 
-        let segment1 = Arc::new(HeapSegment::new(8).unwrap());
-        let segment2 = Arc::new(HeapSegment::new(8).unwrap());
+        let segment1 = Arc::new(CpuSegment::new(8).unwrap());
+        let segment2 = Arc::new(CpuSegment::new(8).unwrap());
         let buf1 = Buffer::new(
             MemoryHandle::from_segment(segment1),
             Metadata::from_sequence(1),
@@ -2697,8 +2697,8 @@ mod tests {
 
     #[test]
     fn test_output_iterator() {
-        let segment1 = Arc::new(HeapSegment::new(8).unwrap());
-        let segment2 = Arc::new(HeapSegment::new(8).unwrap());
+        let segment1 = Arc::new(CpuSegment::new(8).unwrap());
+        let segment2 = Arc::new(CpuSegment::new(8).unwrap());
         let buf1 = Buffer::new(
             MemoryHandle::from_segment(segment1),
             Metadata::from_sequence(1),
@@ -2757,7 +2757,7 @@ mod tests {
 
         // Create and consume some buffers
         for i in 0..3 {
-            let segment = Arc::new(HeapSegment::new(8).unwrap());
+            let segment = Arc::new(CpuSegment::new(8).unwrap());
             let handle = MemoryHandle::from_segment(segment);
             let buffer = Buffer::new(handle, Metadata::from_sequence(i));
             AsyncElementDyn::process(&mut adapter, Some(buffer))
@@ -2776,7 +2776,7 @@ mod tests {
             ElementType::Transform
         );
 
-        let segment = Arc::new(HeapSegment::new(8).unwrap());
+        let segment = Arc::new(CpuSegment::new(8).unwrap());
         let handle = MemoryHandle::from_segment(segment);
         let buffer = Buffer::new(handle, Metadata::from_sequence(42));
 
@@ -2791,7 +2791,7 @@ mod tests {
     fn test_element_implements_transform() {
         let mut element = PassThrough;
 
-        let segment = Arc::new(HeapSegment::new(8).unwrap());
+        let segment = Arc::new(CpuSegment::new(8).unwrap());
         let handle = MemoryHandle::from_segment(segment);
         let buffer = Buffer::new(handle, Metadata::from_sequence(42));
 
@@ -2812,7 +2812,7 @@ mod tests {
 
     #[test]
     fn test_routed_output() {
-        let segment = Arc::new(HeapSegment::new(8).unwrap());
+        let segment = Arc::new(CpuSegment::new(8).unwrap());
         let handle = MemoryHandle::from_segment(segment);
         let buffer = Buffer::new(handle, Metadata::from_sequence(42));
 
@@ -2830,7 +2830,7 @@ mod tests {
 
     #[test]
     fn test_muxer_input() {
-        let segment = Arc::new(HeapSegment::new(8).unwrap());
+        let segment = Arc::new(CpuSegment::new(8).unwrap());
         let handle = MemoryHandle::from_segment(segment);
         let buffer = Buffer::new(handle, Metadata::from_sequence(42));
 
@@ -2884,7 +2884,7 @@ mod tests {
             ElementType::Demuxer
         );
 
-        let segment = Arc::new(HeapSegment::new(8).unwrap());
+        let segment = Arc::new(CpuSegment::new(8).unwrap());
         let handle = MemoryHandle::from_segment(segment);
         let buffer = Buffer::new(handle, Metadata::from_sequence(42));
 
@@ -2925,7 +2925,7 @@ mod tests {
 
         assert_eq!(AsyncElementDyn::element_type(&adapter), ElementType::Muxer);
 
-        let segment = Arc::new(HeapSegment::new(8).unwrap());
+        let segment = Arc::new(CpuSegment::new(8).unwrap());
         let handle = MemoryHandle::from_segment(segment);
         let buffer = Buffer::new(handle, Metadata::from_sequence(42));
 

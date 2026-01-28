@@ -8,7 +8,7 @@
 use crate::buffer::Buffer;
 use crate::element::{AsyncSource, ConsumeContext, ProduceContext, ProduceResult};
 use crate::error::{Error, Result};
-use crate::memory::{HeapSegment, MemorySegment};
+use crate::memory::{CpuSegment, MemorySegment};
 use crate::metadata::Metadata;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -191,7 +191,7 @@ impl crate::element::Source for TcpSrc {
             }
         } else {
             // No buffer provided, allocate our own
-            let segment = Arc::new(HeapSegment::new(self.buffer_size)?);
+            let segment = Arc::new(CpuSegment::new(self.buffer_size)?);
             let ptr = segment
                 .as_mut_ptr()
                 .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
@@ -344,7 +344,7 @@ impl AsyncSource for AsyncTcpSrc {
             }
         } else {
             // No buffer provided, allocate our own
-            let segment = Arc::new(HeapSegment::new(self.buffer_size)?);
+            let segment = Arc::new(CpuSegment::new(self.buffer_size)?);
             let ptr = segment
                 .as_mut_ptr()
                 .ok_or_else(|| Error::Element("cannot get mutable pointer".into()))?;
@@ -705,7 +705,7 @@ mod tests {
 
         // Create sink and send data
         let mut sink = TcpSink::connect(addr).unwrap();
-        let segment = Arc::new(HeapSegment::new(11).unwrap());
+        let segment = Arc::new(CpuSegment::new(11).unwrap());
         let ptr = segment.as_mut_ptr().unwrap();
         unsafe {
             std::ptr::copy_nonoverlapping(b"hello world".as_ptr(), ptr, 11);

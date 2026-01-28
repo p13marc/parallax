@@ -1303,7 +1303,7 @@ mod tests {
         ConsumeContext, DynAsyncElement, ProduceContext, ProduceResult, Sink, SinkAdapter, Source,
         SourceAdapter,
     };
-    use crate::memory::HeapSegment;
+    use crate::memory::CpuSegment;
     use crate::metadata::Metadata;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1317,7 +1317,7 @@ mod tests {
             if self.count >= self.max {
                 return Ok(ProduceResult::Eos);
             }
-            let segment = Arc::new(HeapSegment::new(8).unwrap());
+            let segment = Arc::new(CpuSegment::new(8).unwrap());
             let handle = MemoryHandle::from_segment(segment);
             let buffer = Buffer::new(handle, Metadata::from_sequence(self.count));
             self.count += 1;

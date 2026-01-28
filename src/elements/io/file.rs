@@ -128,11 +128,11 @@ impl Source for FileSrc {
         } else {
             // Fallback: create our own buffer
             use crate::buffer::{Buffer, MemoryHandle};
-            use crate::memory::HeapSegment;
+            use crate::memory::CpuSegment;
             use crate::metadata::Metadata;
             use std::sync::Arc;
 
-            let segment = Arc::new(HeapSegment::new(chunk_size)?);
+            let segment = Arc::new(CpuSegment::new(chunk_size)?);
             let mut handle = MemoryHandle::from_segment(segment);
             let bytes_read = {
                 let data = handle.as_mut_slice().ok_or_else(|| {
@@ -280,7 +280,7 @@ mod tests {
     use super::*;
     use crate::buffer::{Buffer, MemoryHandle};
     use crate::element::{ConsumeContext, ProduceContext, ProduceResult};
-    use crate::memory::{CpuArena, HeapSegment, MemorySegment};
+    use crate::memory::{CpuArena, CpuSegment, MemorySegment};
     use crate::metadata::Metadata;
     use std::io::Write;
     use std::sync::Arc;
@@ -371,7 +371,7 @@ mod tests {
             let mut sink = FileSink::create(&path).unwrap();
 
             // Create a buffer with test data
-            let segment = Arc::new(HeapSegment::new(16).unwrap());
+            let segment = Arc::new(CpuSegment::new(16).unwrap());
             let ptr = segment.as_mut_ptr().unwrap();
             unsafe {
                 std::ptr::copy_nonoverlapping(b"Hello, World!".as_ptr(), ptr, 13);
@@ -414,7 +414,7 @@ mod tests {
         let original_data = b"Parallax streaming pipeline engine";
         {
             let mut sink = FileSink::create(&path).unwrap();
-            let segment = Arc::new(HeapSegment::new(original_data.len()).unwrap());
+            let segment = Arc::new(CpuSegment::new(original_data.len()).unwrap());
             let ptr = segment.as_mut_ptr().unwrap();
             unsafe {
                 std::ptr::copy_nonoverlapping(original_data.as_ptr(), ptr, original_data.len());

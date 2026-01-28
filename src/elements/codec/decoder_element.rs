@@ -27,7 +27,7 @@ use crate::buffer::{Buffer, MemoryHandle};
 use crate::clock::ClockTime;
 use crate::element::{ExecutionHints, Output, Transform};
 use crate::error::Result;
-use crate::memory::{HeapSegment, MemorySegment};
+use crate::memory::{CpuSegment, MemorySegment};
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -104,7 +104,7 @@ impl<D: VideoDecoder> DecoderElement<D> {
 
     /// Convert VideoFrame to output buffer.
     fn frame_to_buffer(&self, frame: VideoFrame) -> Result<Buffer> {
-        let segment = Arc::new(HeapSegment::new(frame.data.len())?);
+        let segment = Arc::new(CpuSegment::new(frame.data.len())?);
         unsafe {
             std::ptr::copy_nonoverlapping(
                 frame.data.as_ptr(),

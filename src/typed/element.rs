@@ -165,7 +165,7 @@ impl<C: Caps> std::ops::DerefMut for TypedBuffer<C> {
 mod tests {
     use super::*;
     use crate::buffer::MemoryHandle;
-    use crate::memory::HeapSegment;
+    use crate::memory::CpuSegment;
     use crate::metadata::Metadata;
     use std::sync::Arc;
 
@@ -179,7 +179,7 @@ mod tests {
 
     #[test]
     fn test_typed_buffer() {
-        let segment = Arc::new(HeapSegment::new(4).unwrap());
+        let segment = Arc::new(CpuSegment::new(4).unwrap());
         let handle = MemoryHandle::from_segment(segment);
         let buffer = Buffer::new(handle, Metadata::default());
 

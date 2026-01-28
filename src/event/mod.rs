@@ -816,12 +816,12 @@ impl EventResult {
 mod tests {
     use super::*;
     use crate::buffer::MemoryHandle;
-    use crate::memory::HeapSegment;
+    use crate::memory::CpuSegment;
     use crate::metadata::Metadata;
     use std::sync::Arc;
 
     fn make_test_buffer() -> Buffer {
-        let segment = Arc::new(HeapSegment::new(16).unwrap());
+        let segment = Arc::new(CpuSegment::new(16).unwrap());
         let handle = MemoryHandle::from_segment(segment);
         Buffer::new(handle, Metadata::from_sequence(0))
     }

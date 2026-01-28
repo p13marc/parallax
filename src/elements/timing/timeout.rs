@@ -5,7 +5,7 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::Element;
 use crate::error::Result;
-use crate::memory::{HeapSegment, MemorySegment};
+use crate::memory::{CpuSegment, MemorySegment};
 use crate::metadata::Metadata;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -82,7 +82,7 @@ impl Timeout {
 
     fn create_fallback(&self) -> Result<Option<Buffer>> {
         let len = self.fallback_data.len();
-        let segment = Arc::new(HeapSegment::new(len.max(1))?);
+        let segment = Arc::new(CpuSegment::new(len.max(1))?);
 
         if !self.fallback_data.is_empty() {
             unsafe {
@@ -332,7 +332,7 @@ mod tests {
     use super::*;
 
     fn create_test_buffer(seq: u64) -> Buffer {
-        let segment = Arc::new(HeapSegment::new(64).unwrap());
+        let segment = Arc::new(CpuSegment::new(64).unwrap());
         let handle = MemoryHandle::from_segment(segment);
         Buffer::new(handle, Metadata::from_sequence(seq))
     }

@@ -16,14 +16,14 @@ use crate::error::Result;
 /// use parallax::elements::NullSink;
 /// use parallax::element::{ConsumeContext, Sink};
 /// # use parallax::buffer::{Buffer, MemoryHandle};
-/// # use parallax::memory::HeapSegment;
+/// # use parallax::memory::CpuSegment;
 /// # use parallax::metadata::Metadata;
 /// # use std::sync::Arc;
 ///
 /// let mut sink = NullSink::new();
 ///
 /// // Create a test buffer
-/// # let segment = Arc::new(HeapSegment::new(8).unwrap());
+/// # let segment = Arc::new(CpuSegment::new(8).unwrap());
 /// # let handle = MemoryHandle::from_segment(segment);
 /// # let buffer = Buffer::new(handle, Metadata::from_sequence(0));
 /// # let ctx = ConsumeContext::new(&buffer);
@@ -171,13 +171,13 @@ impl Source for NullSource {
         } else {
             // Fallback: create our own buffer when no arena is configured
             use crate::buffer::{Buffer, MemoryHandle};
-            use crate::memory::HeapSegment;
+            use crate::memory::CpuSegment;
             use crate::metadata::Metadata;
             use std::sync::Arc;
 
-            let segment = Arc::new(HeapSegment::new(self.buffer_size)?);
+            let segment = Arc::new(CpuSegment::new(self.buffer_size)?);
             let handle = MemoryHandle::from_segment(segment);
-            // HeapSegment is already zero-initialized
+            // CpuSegment is already zero-initialized
             let buffer = Buffer::new(handle, Metadata::from_sequence(self.current));
             self.current += 1;
             Ok(ProduceResult::OwnBuffer(buffer))
@@ -197,7 +197,7 @@ impl Source for NullSource {
 mod tests {
     use super::*;
     use crate::buffer::{Buffer, MemoryHandle};
-    use crate::memory::HeapSegment;
+    use crate::memory::CpuSegment;
     use crate::metadata::Metadata;
     use std::sync::Arc;
 
@@ -206,7 +206,7 @@ mod tests {
         let mut sink = NullSink::new();
         assert_eq!(sink.count(), 0);
 
-        let segment = Arc::new(HeapSegment::new(64).unwrap());
+        let segment = Arc::new(CpuSegment::new(64).unwrap());
         let handle = MemoryHandle::from_segment(segment);
         let buffer = Buffer::new(handle, Metadata::from_sequence(0));
         let ctx = ConsumeContext::new(&buffer);

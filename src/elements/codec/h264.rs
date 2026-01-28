@@ -33,7 +33,7 @@
 use crate::buffer::Buffer;
 use crate::element::Element;
 use crate::error::{Error, Result};
-use crate::memory::HeapSegment;
+use crate::memory::CpuSegment;
 use crate::metadata::Metadata;
 
 use openh264::decoder::{DecodedYUV, Decoder};
@@ -254,7 +254,7 @@ impl Element for H264Encoder {
 
         // Create output buffer with encoded data
         let segment = Arc::new(
-            HeapSegment::new(encoded.len())
+            CpuSegment::new(encoded.len())
                 .map_err(|e| Error::Config(format!("Failed to allocate buffer: {}", e)))?,
         );
 
@@ -365,7 +365,7 @@ impl Element for H264Decoder {
 
                 // Create output buffer with decoded YUV data
                 let segment = Arc::new(
-                    HeapSegment::new(yuv_data.len())
+                    CpuSegment::new(yuv_data.len())
                         .map_err(|e| Error::Config(format!("Failed to allocate buffer: {}", e)))?,
                 );
 
