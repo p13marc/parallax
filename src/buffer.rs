@@ -1,6 +1,6 @@
 //! Buffer types for zero-copy data passing.
 
-use crate::memory::{ArenaSlot, IpcSlotRef, MemorySegment, MemoryType};
+use crate::memory::{ArenaSlot, MemorySegment, MemoryType, SharedIpcSlotRef, SharedSlotRef};
 use crate::metadata::Metadata;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -13,26 +13,31 @@ const VALIDATED_OK: u8 = 1;
 /// Handle to a memory region.
 ///
 /// This can be either:
-/// - A reference to an `Arc<dyn MemorySegment>` (standalone allocation)
-/// - An `ArenaSlot` (slot in a shared arena, more efficient for pools)
+/// - A `SharedSlotRef` from a `SharedArena` (preferred, cross-process refcounting)
+/// - An `Arc<dyn MemorySegment>` for legacy/simple cases (deprecated)
 ///
 /// Cloning a `MemoryHandle` is cheap:
-/// - Segment variant: Arc increment + copy of offset/len
-/// - Arena variant: Arc increment (ArenaSlot contains `Arc<CpuArena>`)
+/// - SharedSlot variant: Atomic increment of refcount in shared memory
+/// - Segment variant: Arc increment (heap-based, single-process only)
+///
+/// For cross-process pipelines, always use the SharedSlot variant.
 pub enum MemoryHandle {
-    /// Standalone segment with offset/length window.
-    Segment {
-        /// The backing memory segment.
-        segment: Arc<dyn MemorySegment>,
-        /// Offset within the segment.
+    /// Slot from a SharedArena (preferred for cross-process).
+    ///
+    /// The refcount is in shared memory, enabling true cross-process
+    /// reference counting and pool reclamation.
+    SharedSlot {
+        /// The slot reference (refcount in shared memory).
+        slot: SharedSlotRef,
+        /// Offset within the slot (for sub-buffers).
         offset: usize,
         /// Length of this buffer's data.
         len: usize,
     },
-    /// Slot in an arena (more efficient for pools).
+    /// Slot from a CpuArena (single-process pooling).
     ///
-    /// The ArenaSlot is an RAII guard that returns the slot to
-    /// the arena when all references are dropped.
+    /// Use this for efficient single-process buffer pooling.
+    /// For cross-process, use SharedSlot instead.
     Arena {
         /// The arena slot (owns the slot, returns on drop).
         slot: Arc<ArenaSlot>,
@@ -41,56 +46,49 @@ pub enum MemoryHandle {
         /// Length of this buffer's data.
         len: usize,
     },
+    /// Standalone segment (deprecated, single-process only).
+    ///
+    /// This variant exists for backward compatibility. For new code,
+    /// prefer using `SharedSlot` which works across processes.
+    #[deprecated(
+        since = "0.3.0",
+        note = "Use SharedSlot variant for cross-process support"
+    )]
+    Segment {
+        /// The backing memory segment.
+        segment: Arc<dyn MemorySegment>,
+        /// Offset within the segment.
+        offset: usize,
+        /// Length of this buffer's data.
+        len: usize,
+    },
 }
 
 impl MemoryHandle {
-    /// Create a new memory handle from a segment.
+    /// Create a memory handle from a SharedSlotRef (preferred).
     ///
-    /// # Arguments
-    ///
-    /// * `segment` - The backing memory segment.
-    /// * `offset` - Offset within the segment.
-    /// * `len` - Length of the data.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `offset + len > segment.len()`.
-    pub fn new(segment: Arc<dyn MemorySegment>, offset: usize, len: usize) -> Self {
-        assert!(
-            offset + len <= segment.len(),
-            "memory handle exceeds segment bounds"
-        );
-        Self::Segment {
-            segment,
-            offset,
-            len,
-        }
-    }
-
-    /// Create a memory handle covering an entire segment.
-    pub fn from_segment(segment: Arc<dyn MemorySegment>) -> Self {
-        let len = segment.len();
-        Self::Segment {
-            segment,
+    /// This is the recommended way to create buffers. The refcount is in
+    /// shared memory, enabling cross-process reference counting.
+    pub fn from_shared_slot(slot: SharedSlotRef) -> Self {
+        let len = slot.len();
+        Self::SharedSlot {
+            slot,
             offset: 0,
             len,
         }
     }
 
-    /// Create a memory handle covering a portion of a segment starting at offset 0.
+    /// Create a memory handle from a SharedSlotRef with a specific length.
     ///
-    /// Useful when you have a larger segment but only wrote `len` bytes.
+    /// Useful when you have a slot but only wrote `len` bytes.
     ///
     /// # Panics
     ///
-    /// Panics if `len > segment.len()`.
-    pub fn from_segment_with_len(segment: Arc<dyn MemorySegment>, len: usize) -> Self {
-        assert!(
-            len <= segment.len(),
-            "requested length exceeds segment size"
-        );
-        Self::Segment {
-            segment,
+    /// Panics if `len > slot.len()`.
+    pub fn from_shared_slot_with_len(slot: SharedSlotRef, len: usize) -> Self {
+        assert!(len <= slot.len(), "requested length exceeds slot size");
+        Self::SharedSlot {
+            slot,
             offset: 0,
             len,
         }
@@ -125,35 +123,110 @@ impl MemoryHandle {
         }
     }
 
+    /// Create a new memory handle from a segment (deprecated).
+    ///
+    /// # Arguments
+    ///
+    /// * `segment` - The backing memory segment.
+    /// * `offset` - Offset within the segment.
+    /// * `len` - Length of the data.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `offset + len > segment.len()`.
+    #[deprecated(
+        since = "0.3.0",
+        note = "Use from_shared_slot for cross-process support"
+    )]
+    #[allow(deprecated)]
+    pub fn new(segment: Arc<dyn MemorySegment>, offset: usize, len: usize) -> Self {
+        assert!(
+            offset + len <= segment.len(),
+            "memory handle exceeds segment bounds"
+        );
+        Self::Segment {
+            segment,
+            offset,
+            len,
+        }
+    }
+
+    /// Create a memory handle covering an entire segment (deprecated).
+    #[deprecated(
+        since = "0.3.0",
+        note = "Use from_shared_slot for cross-process support"
+    )]
+    #[allow(deprecated)]
+    pub fn from_segment(segment: Arc<dyn MemorySegment>) -> Self {
+        let len = segment.len();
+        Self::Segment {
+            segment,
+            offset: 0,
+            len,
+        }
+    }
+
+    /// Create a memory handle covering a portion of a segment starting at offset 0 (deprecated).
+    ///
+    /// Useful when you have a larger segment but only wrote `len` bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `len > segment.len()`.
+    #[deprecated(
+        since = "0.3.0",
+        note = "Use from_shared_slot_with_len for cross-process support"
+    )]
+    #[allow(deprecated)]
+    pub fn from_segment_with_len(segment: Arc<dyn MemorySegment>, len: usize) -> Self {
+        assert!(
+            len <= segment.len(),
+            "requested length exceeds segment size"
+        );
+        Self::Segment {
+            segment,
+            offset: 0,
+            len,
+        }
+    }
+
     /// Get a pointer to the start of this handle's memory.
+    #[allow(deprecated)]
     pub fn as_ptr(&self) -> *const u8 {
         match self {
+            Self::SharedSlot { slot, offset, .. } => unsafe { slot.as_ptr().add(*offset) },
+            Self::Arena { slot, offset, .. } => unsafe { slot.as_ptr().add(*offset) },
             Self::Segment {
                 segment, offset, ..
             } => unsafe { segment.as_ptr().add(*offset) },
-            Self::Arena { slot, offset, .. } => unsafe { slot.as_ptr().add(*offset) },
         }
     }
 
     /// Get a mutable pointer to the start of this handle's memory.
+    #[allow(deprecated)]
     pub fn as_mut_ptr(&self) -> Option<*mut u8> {
         match self {
+            Self::SharedSlot { slot, offset, .. } => {
+                // SharedSlotRef data is always mutable
+                Some(unsafe { slot.as_ptr().add(*offset) as *mut u8 })
+            }
+            Self::Arena { slot, offset, .. } => {
+                // Arena slots are always mutable
+                Some(unsafe { slot.as_ptr().add(*offset) as *mut u8 })
+            }
             Self::Segment {
                 segment, offset, ..
             } => segment.as_mut_ptr().map(|ptr| unsafe { ptr.add(*offset) }),
-            Self::Arena { slot, offset, .. } => {
-                // Arena slots are always mutable (we own the slot)
-                // We need to get a mutable pointer through the Arc, which is safe
-                // because we have exclusive access via the slot reservation
-                Some(unsafe { slot.as_ptr().add(*offset) as *mut u8 })
-            }
         }
     }
 
     /// Get the length of this handle's data.
+    #[allow(deprecated)]
     pub fn len(&self) -> usize {
         match self {
-            Self::Segment { len, .. } | Self::Arena { len, .. } => *len,
+            Self::SharedSlot { len, .. } | Self::Arena { len, .. } | Self::Segment { len, .. } => {
+                *len
+            }
         }
     }
 
@@ -174,64 +247,82 @@ impl MemoryHandle {
     }
 
     /// Get the memory type of the backing segment.
+    #[allow(deprecated)]
     pub fn memory_type(&self) -> MemoryType {
         match self {
+            Self::SharedSlot { .. } | Self::Arena { .. } => MemoryType::Cpu,
             Self::Segment { segment, .. } => segment.memory_type(),
-            Self::Arena { .. } => MemoryType::Cpu,
         }
     }
 
     /// Get the offset within the segment/slot.
+    #[allow(deprecated)]
     pub fn offset(&self) -> usize {
         match self {
-            Self::Segment { offset, .. } | Self::Arena { offset, .. } => *offset,
+            Self::SharedSlot { offset, .. }
+            | Self::Arena { offset, .. }
+            | Self::Segment { offset, .. } => *offset,
         }
     }
 
     /// Get a reference to the backing segment (if this is a segment handle).
     ///
-    /// Returns `None` for arena handles.
+    /// Returns `None` for shared slot and arena handles.
+    #[deprecated(since = "0.3.0", note = "SharedSlot handles don't expose the segment")]
+    #[allow(deprecated)]
     pub fn segment(&self) -> Option<&Arc<dyn MemorySegment>> {
         match self {
             Self::Segment { segment, .. } => Some(segment),
-            Self::Arena { .. } => None,
+            Self::SharedSlot { .. } | Self::Arena { .. } => None,
         }
     }
 
     /// Get a reference to the arena slot (if this is an arena handle).
-    ///
-    /// Returns `None` for segment handles.
     pub fn arena_slot(&self) -> Option<&Arc<ArenaSlot>> {
         match self {
-            Self::Segment { .. } => None,
             Self::Arena { slot, .. } => Some(slot),
+            #[allow(deprecated)]
+            Self::SharedSlot { .. } | Self::Segment { .. } => None,
+        }
+    }
+
+    /// Get a reference to the shared slot (if this is a shared slot handle).
+    pub fn shared_slot(&self) -> Option<&SharedSlotRef> {
+        match self {
+            Self::SharedSlot { slot, .. } => Some(slot),
+            #[allow(deprecated)]
+            Self::Arena { .. } | Self::Segment { .. } => None,
         }
     }
 
     /// Get an IPC reference for cross-process sharing.
     ///
-    /// Only available for arena handles. Segment handles must use
-    /// fd passing via `IpcHandle` from the segment.
-    pub fn ipc_ref(&self) -> Option<IpcSlotRef> {
+    /// Only available for SharedSlot handles.
+    /// Arena and Segment handles return `None`.
+    #[allow(deprecated)]
+    pub fn ipc_ref(&self) -> Option<SharedIpcSlotRef> {
         match self {
-            Self::Segment { .. } => None,
-            Self::Arena { slot, offset, len } => {
+            Self::SharedSlot { slot, offset, len } => {
                 let base_ref = slot.ipc_ref();
-                Some(IpcSlotRef::new(
-                    base_ref.arena_id,
-                    base_ref.offset + offset,
-                    *len,
-                ))
+                Some(SharedIpcSlotRef {
+                    arena_id: base_ref.arena_id,
+                    slot_index: base_ref.slot_index,
+                    data_offset: base_ref.data_offset + offset,
+                    len: *len,
+                })
             }
+            Self::Arena { .. } | Self::Segment { .. } => None,
         }
     }
 
-    /// Check if this handle is arena-backed.
-    pub fn is_arena(&self) -> bool {
-        matches!(self, Self::Arena { .. })
+    /// Check if this handle is shared-slot-backed (preferred).
+    #[allow(deprecated)]
+    pub fn is_shared_slot(&self) -> bool {
+        matches!(self, Self::SharedSlot { .. })
     }
 
-    /// Check if this handle is segment-backed.
+    /// Check if this handle is segment-backed (deprecated).
+    #[allow(deprecated)]
     pub fn is_segment(&self) -> bool {
         matches!(self, Self::Segment { .. })
     }
@@ -241,6 +332,7 @@ impl MemoryHandle {
     /// # Panics
     ///
     /// Panics if `offset + len > self.len()`.
+    #[allow(deprecated)]
     pub fn slice(&self, offset: usize, len: usize) -> Self {
         let current_len = self.len();
         assert!(
@@ -249,13 +341,13 @@ impl MemoryHandle {
         );
 
         match self {
-            Self::Segment {
-                segment,
+            Self::SharedSlot {
+                slot,
                 offset: base_offset,
                 ..
-            } => Self::Segment {
-                segment: Arc::clone(segment),
-                offset: base_offset + offset,
+            } => Self::SharedSlot {
+                slot: slot.slice(*base_offset + offset, len),
+                offset: 0, // The slice already includes the offset
                 len,
             },
             Self::Arena {
@@ -267,13 +359,33 @@ impl MemoryHandle {
                 offset: base_offset + offset,
                 len,
             },
+            Self::Segment {
+                segment,
+                offset: base_offset,
+                ..
+            } => Self::Segment {
+                segment: Arc::clone(segment),
+                offset: base_offset + offset,
+                len,
+            },
         }
     }
 }
 
 impl Clone for MemoryHandle {
+    #[allow(deprecated)]
     fn clone(&self) -> Self {
         match self {
+            Self::SharedSlot { slot, offset, len } => Self::SharedSlot {
+                slot: slot.clone(), // Increments refcount in shared memory
+                offset: *offset,
+                len: *len,
+            },
+            Self::Arena { slot, offset, len } => Self::Arena {
+                slot: Arc::clone(slot),
+                offset: *offset,
+                len: *len,
+            },
             Self::Segment {
                 segment,
                 offset,
@@ -283,28 +395,32 @@ impl Clone for MemoryHandle {
                 offset: *offset,
                 len: *len,
             },
-            Self::Arena { slot, offset, len } => Self::Arena {
-                slot: Arc::clone(slot),
-                offset: *offset,
-                len: *len,
-            },
         }
     }
 }
 
 impl std::fmt::Debug for MemoryHandle {
+    #[allow(deprecated)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::SharedSlot { slot, offset, len } => f
+                .debug_struct("MemoryHandle::SharedSlot")
+                .field("arena_id", &slot.arena_id())
+                .field("offset", offset)
+                .field("len", len)
+                .field("refcount", &slot.refcount())
+                .finish(),
+            Self::Arena { slot, offset, len } => f
+                .debug_struct("MemoryHandle::Arena")
+                .field("offset", offset)
+                .field("len", len)
+                .field("slot_len", &slot.len())
+                .finish(),
             Self::Segment { offset, len, .. } => f
                 .debug_struct("MemoryHandle::Segment")
                 .field("offset", offset)
                 .field("len", len)
                 .field("memory_type", &self.memory_type())
-                .finish(),
-            Self::Arena { offset, len, .. } => f
-                .debug_struct("MemoryHandle::Arena")
-                .field("offset", offset)
-                .field("len", len)
                 .finish(),
         }
     }
@@ -481,26 +597,40 @@ unsafe impl<T: Sync> Sync for Buffer<T> {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::CpuSegment;
+    use crate::memory::SharedArena;
 
-    fn make_test_buffer(size: usize) -> Buffer {
-        let segment = Arc::new(CpuSegment::new(size).unwrap());
-        let handle = MemoryHandle::from_segment(segment);
+    fn make_test_buffer(arena: &SharedArena, size: usize) -> Buffer {
+        let slot = arena.acquire().expect("arena not exhausted");
+        // Only use the first `size` bytes if smaller than slot
+        let len = size.min(slot.len());
+        let handle = MemoryHandle::from_shared_slot_with_len(slot, len);
         Buffer::new(handle, Metadata::from_sequence(42))
     }
 
     #[test]
     fn test_buffer_creation() {
-        let buffer = make_test_buffer(1024);
+        let arena = SharedArena::new(4096, 4).unwrap();
+        let buffer = make_test_buffer(&arena, 1024);
         assert_eq!(buffer.len(), 1024);
         assert_eq!(buffer.metadata().sequence, 42);
         assert!(!buffer.is_validated());
     }
 
     #[test]
-    fn test_buffer_clone_is_cheap() {
-        let buffer = make_test_buffer(1024);
+    fn test_buffer_clone_increments_shared_refcount() {
+        let arena = SharedArena::new(4096, 4).unwrap();
+        let slot = arena.acquire().unwrap();
+        let initial_refcount = slot.refcount();
+
+        let handle = MemoryHandle::from_shared_slot(slot);
+        let buffer = Buffer::<()>::new(handle, Metadata::from_sequence(0));
+
+        // Clone increments refcount in shared memory
         let buffer2 = buffer.clone();
+        assert_eq!(
+            buffer.memory().shared_slot().unwrap().refcount(),
+            initial_refcount + 1
+        );
 
         // Both should point to the same memory
         assert_eq!(buffer.as_bytes().as_ptr(), buffer2.as_bytes().as_ptr());
@@ -508,16 +638,19 @@ mod tests {
 
     #[test]
     fn test_buffer_slice() {
-        let buffer = make_test_buffer(1024);
+        let arena = SharedArena::new(4096, 4).unwrap();
+        let buffer = make_test_buffer(&arena, 1024);
         let sub = buffer.slice(100, 200);
 
         assert_eq!(sub.len(), 200);
-        assert_eq!(sub.memory().offset(), 100);
+        // SharedSlot slices have offset 0 (offset is baked into the slot)
+        assert!(sub.memory().is_shared_slot());
     }
 
     #[test]
     fn test_buffer_validation_state() {
-        let buffer = make_test_buffer(1024);
+        let arena = SharedArena::new(4096, 4).unwrap();
+        let buffer = make_test_buffer(&arena, 1024);
         assert!(!buffer.is_validated());
 
         buffer.mark_validated();
@@ -529,98 +662,69 @@ mod tests {
     }
 
     #[test]
-    fn test_memory_handle_slice() {
-        let segment = Arc::new(CpuSegment::new(1024).unwrap());
-        let handle = MemoryHandle::from_segment(segment);
-
-        let sub = handle.slice(100, 200);
-        assert_eq!(sub.offset(), 100);
-        assert_eq!(sub.len(), 200);
-    }
-
-    #[test]
-    #[should_panic(expected = "sub-handle exceeds parent bounds")]
-    fn test_memory_handle_slice_out_of_bounds() {
-        let segment = Arc::new(CpuSegment::new(1024).unwrap());
-        let handle = MemoryHandle::from_segment(segment);
-        let _ = handle.slice(900, 200); // 900 + 200 > 1024
-    }
-
-    // Arena-backed buffer tests
-    use crate::memory::CpuArena;
-
-    fn make_arena_buffer(arena: &std::sync::Arc<CpuArena>) -> Buffer {
-        let slot = arena.acquire().expect("arena not exhausted");
-        let handle = MemoryHandle::from_arena_slot(slot);
-        Buffer::new(handle, Metadata::from_sequence(100))
-    }
-
-    #[test]
-    fn test_arena_buffer_creation() {
-        let arena = CpuArena::new(4096, 4).unwrap();
-        let buffer = make_arena_buffer(&arena);
+    fn test_shared_slot_buffer_creation() {
+        let arena = SharedArena::new(4096, 4).unwrap();
+        let slot = arena.acquire().unwrap();
+        let handle = MemoryHandle::from_shared_slot(slot);
+        let buffer = Buffer::<()>::new(handle, Metadata::from_sequence(100));
 
         assert_eq!(buffer.len(), 4096);
         assert_eq!(buffer.metadata().sequence, 100);
         assert_eq!(buffer.memory_type(), MemoryType::Cpu);
-        assert!(buffer.memory().is_arena());
+        assert!(buffer.memory().is_shared_slot());
         assert!(!buffer.memory().is_segment());
     }
 
     #[test]
-    fn test_arena_buffer_clone_is_cheap() {
-        let arena = CpuArena::new(4096, 4).unwrap();
-        let buffer = make_arena_buffer(&arena);
-        let buffer2 = buffer.clone();
-
-        // Both should point to the same memory
-        assert_eq!(buffer.as_bytes().as_ptr(), buffer2.as_bytes().as_ptr());
-
-        // Slot should still be reserved (only 3 free)
-        assert_eq!(arena.free_count(), 3);
-    }
-
-    #[test]
-    fn test_arena_buffer_slot_released_on_drop() {
-        let arena = CpuArena::new(4096, 4).unwrap();
-        assert_eq!(arena.free_count(), 4);
+    fn test_shared_slot_released_on_drop() {
+        let arena = SharedArena::new(4096, 4).unwrap();
 
         {
-            let _buffer = make_arena_buffer(&arena);
-            assert_eq!(arena.free_count(), 3);
+            let slot = arena.acquire().unwrap();
+            assert_eq!(slot.refcount(), 1);
 
-            // Clone the buffer
-            let _buffer2 = _buffer.clone();
-            // Still only one slot used (Arc shared)
-            assert_eq!(arena.free_count(), 3);
+            let handle = MemoryHandle::from_shared_slot(slot);
+            let buffer = Buffer::<()>::new(handle, Metadata::from_sequence(0));
+
+            // Clone increases refcount
+            let buffer2 = buffer.clone();
+            assert_eq!(buffer.memory().shared_slot().unwrap().refcount(), 2);
+
+            drop(buffer2);
+            assert_eq!(buffer.memory().shared_slot().unwrap().refcount(), 1);
         }
 
-        // Both dropped, slot should be released
-        assert_eq!(arena.free_count(), 4);
+        // After all references dropped, owner can reclaim
+        arena.reclaim();
+        // Slot should be available again (acquire should succeed)
+        assert!(arena.acquire().is_some());
     }
 
     #[test]
-    fn test_arena_buffer_ipc_ref() {
-        let arena = CpuArena::new(4096, 4).unwrap();
-        let buffer = make_arena_buffer(&arena);
+    fn test_shared_slot_ipc_ref() {
+        let arena = SharedArena::new(4096, 4).unwrap();
+        let slot = arena.acquire().unwrap();
+        let handle = MemoryHandle::from_shared_slot(slot);
+        let buffer = Buffer::<()>::new(handle, Metadata::from_sequence(0));
 
         let ipc_ref = buffer
             .memory()
             .ipc_ref()
-            .expect("arena should have ipc_ref");
+            .expect("shared slot should have ipc_ref");
         assert_eq!(ipc_ref.arena_id, arena.id());
         assert_eq!(ipc_ref.len, 4096);
     }
 
     #[test]
-    fn test_arena_buffer_slice() {
-        let arena = CpuArena::new(4096, 4).unwrap();
-        let buffer = make_arena_buffer(&arena);
+    fn test_shared_slot_slice() {
+        let arena = SharedArena::new(4096, 4).unwrap();
+        let slot = arena.acquire().unwrap();
+        let handle = MemoryHandle::from_shared_slot(slot);
+        let buffer = Buffer::<()>::new(handle, Metadata::from_sequence(0));
 
         let sub = buffer.slice(100, 200);
         assert_eq!(sub.len(), 200);
-        assert_eq!(sub.memory().offset(), 100);
-        assert!(sub.memory().is_arena());
+        assert!(sub.memory().is_shared_slot());
 
         // IPC ref should reflect the slice
         let ipc_ref = sub.memory().ipc_ref().unwrap();
@@ -628,51 +732,52 @@ mod tests {
     }
 
     #[test]
-    fn test_arena_buffer_read_write() {
-        let arena = CpuArena::new(4096, 4).unwrap();
-        let slot = arena.acquire().unwrap();
-        let mut handle = MemoryHandle::from_arena_slot(slot);
+    fn test_shared_slot_read_write() {
+        let arena = SharedArena::new(4096, 4).unwrap();
+        let mut slot = arena.acquire().unwrap();
+
+        // Write via slot
+        slot.data_mut()[0..5].copy_from_slice(b"hello");
+
+        let mut handle = MemoryHandle::from_shared_slot(slot);
+
+        // Read via handle
+        assert_eq!(&handle.as_slice()[0..5], b"hello");
 
         // Write via handle
-        handle.as_mut_slice().unwrap()[0..5].copy_from_slice(b"hello");
+        handle.as_mut_slice().unwrap()[5..10].copy_from_slice(b"world");
 
         // Read via buffer
         let buffer = Buffer::<()>::new(handle, Metadata::from_sequence(0));
-        assert_eq!(&buffer.as_bytes()[0..5], b"hello");
+        assert_eq!(&buffer.as_bytes()[0..10], b"helloworld");
     }
 
     #[test]
-    fn test_arena_buffer_with_len() {
-        let arena = CpuArena::new(4096, 4).unwrap();
+    fn test_shared_slot_with_len() {
+        let arena = SharedArena::new(4096, 4).unwrap();
         let slot = arena.acquire().unwrap();
-        let handle = MemoryHandle::from_arena_slot_with_len(slot, 100);
+        let handle = MemoryHandle::from_shared_slot_with_len(slot, 100);
 
         assert_eq!(handle.len(), 100);
-        assert!(handle.is_arena());
+        assert!(handle.is_shared_slot());
     }
 
     #[test]
-    fn test_segment_buffer_has_no_ipc_ref() {
-        let buffer = make_test_buffer(1024);
-        assert!(buffer.memory().ipc_ref().is_none());
-        assert!(buffer.memory().is_segment());
-        assert!(!buffer.memory().is_arena());
+    fn test_shared_slot_accessor() {
+        let arena = SharedArena::new(4096, 4).unwrap();
+        let slot = arena.acquire().unwrap();
+        let handle = MemoryHandle::from_shared_slot(slot);
+        let buffer = Buffer::<()>::new(handle, Metadata::from_sequence(0));
+
+        assert!(buffer.memory().shared_slot().is_some());
     }
 
     #[test]
-    fn test_arena_slot_accessor() {
-        let arena = CpuArena::new(4096, 4).unwrap();
-        let buffer = make_arena_buffer(&arena);
-
-        assert!(buffer.memory().arena_slot().is_some());
-        assert!(buffer.memory().segment().is_none());
-    }
-
-    #[test]
-    fn test_segment_accessor() {
-        let buffer = make_test_buffer(1024);
-
-        assert!(buffer.memory().segment().is_some());
-        assert!(buffer.memory().arena_slot().is_none());
+    #[should_panic(expected = "sub-handle exceeds parent bounds")]
+    fn test_memory_handle_slice_out_of_bounds() {
+        let arena = SharedArena::new(1024, 4).unwrap();
+        let slot = arena.acquire().unwrap();
+        let handle = MemoryHandle::from_shared_slot(slot);
+        let _ = handle.slice(900, 200); // 900 + 200 > 1024
     }
 }

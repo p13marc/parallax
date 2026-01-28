@@ -218,13 +218,17 @@ impl IpcPublisher {
         let memory = buffer.memory();
 
         // Get the base pointer and IPC handle based on memory type
+        #[allow(deprecated)]
         let (seg_ptr, ipc_handle) = match memory {
-            crate::buffer::MemoryHandle::Segment { segment, .. } => {
-                let ptr = segment.as_ptr() as usize;
-                let handle = segment
-                    .ipc_handle()
-                    .ok_or_else(|| Error::Pipeline("segment doesn't support IPC".into()))?;
-                (ptr, handle)
+            crate::buffer::MemoryHandle::SharedSlot { slot, .. } => {
+                // For shared slots, use the arena_id as the key
+                let arena_id = slot.arena_id();
+                // Use arena_id as unique key, and create IPC handle from arena fd
+                let handle = crate::memory::IpcHandle::Fd {
+                    fd: slot.arena_fd(),
+                    size: slot.arena_size(),
+                };
+                (arena_id as usize, handle)
             }
             crate::buffer::MemoryHandle::Arena { slot, .. } => {
                 // For arena slots, use the arena's base pointer as the key
@@ -234,6 +238,13 @@ impl IpcPublisher {
                     fd: arena.raw_fd(),
                     size: arena.total_size(),
                 };
+                (ptr, handle)
+            }
+            crate::buffer::MemoryHandle::Segment { segment, .. } => {
+                let ptr = segment.as_ptr() as usize;
+                let handle = segment
+                    .ipc_handle()
+                    .ok_or_else(|| Error::Pipeline("segment doesn't support IPC".into()))?;
                 (ptr, handle)
             }
         };

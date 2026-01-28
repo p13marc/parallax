@@ -4,7 +4,7 @@
 //! over Unix sockets. Uses rkyv for zero-copy serialization.
 
 use crate::format::MediaCaps;
-use crate::memory::IpcSlotRef;
+use crate::memory::SharedIpcSlotRef;
 use crate::metadata::Metadata;
 
 /// Control message sent between supervisor and element processes.
@@ -28,7 +28,7 @@ pub enum ControlMessage {
     /// supervisor (for sources).
     BufferReady {
         /// Reference to the buffer in shared memory.
-        slot: IpcSlotRef,
+        slot: SharedIpcSlotRef,
         /// Buffer metadata.
         metadata: SerializableMetadata,
     },
@@ -38,7 +38,7 @@ pub enum ControlMessage {
     /// Sent from element to supervisor after processing a BufferReady message.
     BufferDone {
         /// The slot that was processed.
-        slot: IpcSlotRef,
+        slot: SharedIpcSlotRef,
     },
 
     /// Request a state change.
@@ -420,11 +420,11 @@ mod tests {
                 },
             },
             ControlMessage::BufferReady {
-                slot: IpcSlotRef::new(1, 0, 1024),
+                slot: SharedIpcSlotRef::new(1, 0, 0, 1024),
                 metadata: SerializableMetadata::default(),
             },
             ControlMessage::BufferDone {
-                slot: IpcSlotRef::new(1, 0, 1024),
+                slot: SharedIpcSlotRef::new(1, 0, 0, 1024),
             },
             ControlMessage::StateChange {
                 new_state: ElementState::Playing,

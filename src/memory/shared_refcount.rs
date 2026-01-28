@@ -645,6 +645,8 @@ impl SharedArena {
                     slot_index: i as u32,
                     arena_id: self.arena_id,
                     data_offset: self.data_offset + i * self.slot_size,
+                    arena_raw_fd: self.raw_fd(),
+                    arena_total_size: self.total_size,
                 });
             }
         }
@@ -786,6 +788,8 @@ impl SharedArena {
             slot_index: ipc_ref.slot_index,
             arena_id: self.arena_id,
             data_offset: ipc_ref.data_offset,
+            arena_raw_fd: self.raw_fd(),
+            arena_total_size: self.total_size,
         })
     }
 }
@@ -838,6 +842,10 @@ pub struct SharedSlotRef {
     arena_id: u64,
     /// Offset from arena base to data (for IPC).
     data_offset: usize,
+    /// Raw fd of the arena (for IPC - send this to other processes).
+    arena_raw_fd: i32,
+    /// Total size of the arena (for IPC).
+    arena_total_size: usize,
 }
 
 impl SharedSlotRef {
@@ -896,6 +904,20 @@ impl SharedSlotRef {
         self.data_len == 0
     }
 
+    /// Get the arena's raw file descriptor (for IPC).
+    ///
+    /// Use this to send the arena fd via SCM_RIGHTS to other processes.
+    #[inline]
+    pub fn arena_fd(&self) -> i32 {
+        self.arena_raw_fd
+    }
+
+    /// Get the arena's total size (for IPC).
+    #[inline]
+    pub fn arena_size(&self) -> usize {
+        self.arena_total_size
+    }
+
     /// Get raw pointer to data.
     #[inline]
     pub fn as_ptr(&self) -> *const u8 {
@@ -937,6 +959,8 @@ impl SharedSlotRef {
             slot_index: self.slot_index,
             arena_id: self.arena_id,
             data_offset: self.data_offset + offset,
+            arena_raw_fd: self.arena_raw_fd,
+            arena_total_size: self.arena_total_size,
         }
     }
 }
@@ -956,6 +980,8 @@ impl Clone for SharedSlotRef {
             slot_index: self.slot_index,
             arena_id: self.arena_id,
             data_offset: self.data_offset,
+            arena_raw_fd: self.arena_raw_fd,
+            arena_total_size: self.arena_total_size,
         }
     }
 }

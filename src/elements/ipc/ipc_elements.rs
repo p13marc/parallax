@@ -33,7 +33,7 @@ use crate::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source
 use crate::error::{Error, Result};
 use crate::execution::{ControlMessage, SerializableMetadata, frame_message, unframe_message};
 use crate::format::Caps;
-use crate::memory::{CpuArena, IpcSlotRef};
+use crate::memory::{SharedArena, SharedIpcSlotRef};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -50,14 +50,14 @@ pub struct IpcSink {
     path: PathBuf,
     /// Connected socket (if any).
     socket: Option<UnixStream>,
-    /// Shared memory arena for buffers.
-    arena: Option<Arc<CpuArena>>,
+    /// Shared memory arena for buffers (refcount in shared memory).
+    arena: Option<Arc<SharedArena>>,
     /// Whether we're the server (created the socket).
     is_server: bool,
     /// Listener for incoming connections (server mode).
     listener: Option<UnixListener>,
     /// Pending slots waiting for acknowledgment.
-    pending_slots: VecDeque<IpcSlotRef>,
+    pending_slots: VecDeque<SharedIpcSlotRef>,
     /// Maximum pending buffers before blocking.
     max_pending: usize,
     /// Capabilities.
@@ -139,8 +139,8 @@ impl IpcSink {
 
             // Create arena and send registration
             if self.arena.is_none() {
-                let arena = CpuArena::new(64 * 1024, 64)?; // 64KB slots, 64 slots = 4MB
-                self.arena = Some(arena);
+                let arena = SharedArena::new(64 * 1024, 64)?; // 64KB slots, 64 slots = 4MB
+                self.arena = Some(Arc::new(arena));
             }
 
             // Send arena registration message
@@ -270,10 +270,10 @@ impl Sink for IpcSink {
         let buffer = ctx.buffer();
 
         // Get or create slot reference
-        let slot = if let Some(ipc_ref) = buffer.memory().ipc_ref() {
+        let slot_ref = if let Some(ipc_ref) = buffer.memory().ipc_ref() {
             ipc_ref
         } else {
-            // Buffer is not in an arena, need to copy
+            // Buffer is not in an arena, need to copy to our SharedArena
             let arena = self
                 .arena
                 .as_ref()
@@ -290,17 +290,23 @@ impl Sink for IpcSink {
             }
             arena_slot.data_mut()[..data.len()].copy_from_slice(data);
 
-            arena_slot.ipc_ref()
+            // Get IPC ref with the actual data length
+            SharedIpcSlotRef {
+                arena_id: arena_slot.arena_id(),
+                slot_index: arena_slot.ipc_ref().slot_index,
+                data_offset: 0,
+                len: data.len(),
+            }
         };
 
         // Send buffer ready message
         let msg = ControlMessage::BufferReady {
-            slot,
+            slot: slot_ref.clone(),
             metadata: SerializableMetadata::from_metadata(buffer.metadata()),
         };
         self.send_message(&msg)?;
 
-        self.pending_slots.push_back(slot);
+        self.pending_slots.push_back(slot_ref);
 
         Ok(())
     }
@@ -502,19 +508,21 @@ impl Source for IpcSrc {
 
                 ControlMessage::BufferReady { slot, metadata } => {
                     // Send acknowledgment
-                    self.send_message(&ControlMessage::BufferDone { slot })?;
+                    self.send_message(&ControlMessage::BufferDone { slot: slot.clone() })?;
 
                     // NOTE: With full SCM_RIGHTS support, we would look up the arena
-                    // in a local cache and create a zero-copy buffer view.
+                    // in a local cache via SharedArenaCache and create a zero-copy buffer.
                     // Currently creates a placeholder buffer since arena mapping
                     // is not yet implemented.
                     let meta = metadata.to_metadata();
 
-                    // Create a buffer with the slot reference
-                    // In a real implementation, we would map the arena and create
-                    // a proper buffer referencing the shared memory
+                    // Create a buffer with allocated memory
+                    // TODO: In a real implementation, use SharedArenaCache to map
+                    // the arena from the sender and create a zero-copy buffer view.
                     use crate::memory::CpuSegment;
+                    #[allow(deprecated)]
                     let segment = std::sync::Arc::new(CpuSegment::new(slot.len)?);
+                    #[allow(deprecated)]
                     let handle = MemoryHandle::from_segment(segment);
                     let buffer = Buffer::new(handle, meta);
 
