@@ -280,14 +280,32 @@ fn create_videotestsrc(
 
 #[cfg(feature = "v4l2")]
 fn create_v4l2src(props: &HashMap<String, PropertyValue>) -> Result<Box<DynAsyncElement<'static>>> {
-    use crate::elements::device::V4l2Src;
+    use crate::elements::device::v4l2::{V4l2Config, V4l2Src};
 
     let device = props
         .get("device")
         .map(|v| v.as_string())
         .unwrap_or_else(|| "/dev/video0".to_string());
 
-    let src = V4l2Src::new(&device)?;
+    // Parse optional properties
+    let width = props.get("width").and_then(|v| v.as_u64()).unwrap_or(640) as u32;
+    let height = props.get("height").and_then(|v| v.as_u64()).unwrap_or(480) as u32;
+
+    // Default to YUYV for compatibility with videoconvert
+    // MJPEG requires a decoder which we don't have yet
+    let fourcc = props
+        .get("format")
+        .map(|v| v.as_string())
+        .or_else(|| Some("YUYV".to_string()));
+
+    let config = V4l2Config {
+        width,
+        height,
+        fourcc,
+        buffer_count: 4,
+    };
+
+    let src = V4l2Src::with_config(&device, config)?;
     Ok(DynAsyncElement::new_box(SourceAdapter::new(src)))
 }
 

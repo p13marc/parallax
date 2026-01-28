@@ -64,10 +64,14 @@ impl Element for VideoScale {
         // For now, passthrough - actual implementation pending
         Ok(Some(buffer))
     }
+
+    fn name(&self) -> &str {
+        "videoscale"
+    }
 }
 
 impl ConverterElement for VideoScale {
-    fn name(&self) -> &str {
+    fn converter_name(&self) -> &str {
         "videoscale"
     }
 
@@ -124,10 +128,14 @@ impl Element for VideoConvert {
         // For now, passthrough - actual implementation pending
         Ok(Some(buffer))
     }
+
+    fn name(&self) -> &str {
+        "videoconvert"
+    }
 }
 
 impl ConverterElement for VideoConvert {
-    fn name(&self) -> &str {
+    fn converter_name(&self) -> &str {
         "videoconvert"
     }
 
@@ -176,10 +184,14 @@ impl Element for AudioResample {
         // PLAN-09: Implement actual resampling (see plans/09_FORMAT_CONVERTERS.md)
         Ok(Some(buffer))
     }
+
+    fn name(&self) -> &str {
+        "audioresample"
+    }
 }
 
 impl ConverterElement for AudioResample {
-    fn name(&self) -> &str {
+    fn converter_name(&self) -> &str {
         "audioresample"
     }
 
@@ -251,10 +263,14 @@ impl Element for AudioConvert {
         // PLAN-09: Implement actual audio conversion (see plans/09_FORMAT_CONVERTERS.md)
         Ok(Some(buffer))
     }
+
+    fn name(&self) -> &str {
+        "audioconvert"
+    }
 }
 
 impl ConverterElement for AudioConvert {
-    fn name(&self) -> &str {
+    fn converter_name(&self) -> &str {
         "audioconvert"
     }
 
@@ -326,10 +342,14 @@ impl Element for MemoryCopy {
         // Would use GPU APIs or DMA for efficient transfers
         Ok(Some(buffer))
     }
+
+    fn name(&self) -> &str {
+        "memorycopy"
+    }
 }
 
 impl ConverterElement for MemoryCopy {
-    fn name(&self) -> &str {
+    fn converter_name(&self) -> &str {
         "memorycopy"
     }
 
@@ -372,10 +392,14 @@ impl Element for Identity {
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         Ok(Some(buffer))
     }
+
+    fn name(&self) -> &str {
+        "identity"
+    }
 }
 
 impl ConverterElement for Identity {
-    fn name(&self) -> &str {
+    fn converter_name(&self) -> &str {
         "identity"
     }
 
@@ -414,13 +438,20 @@ pub fn builtin_registry() -> ConverterRegistry {
     let mut registry = ConverterRegistry::new();
 
     // Video format conversions (same memory type)
+    // Use the real VideoConvertElement that does actual YUYV->RGBA conversion
     registry.register(
         FormatType::VideoRaw,
         FormatType::VideoRaw,
         MemoryType::Cpu,
         MemoryType::Cpu,
         5,
-        Arc::new(|| Box::new(VideoConvert::new(PixelFormat::I420))),
+        "videoconvert",
+        Arc::new(|| {
+            Box::new(
+                crate::elements::transform::VideoConvertElement::new()
+                    .with_output_format(crate::converters::PixelFormat::Rgba),
+            )
+        }),
     );
 
     // Audio format conversions
@@ -430,6 +461,7 @@ pub fn builtin_registry() -> ConverterRegistry {
         MemoryType::Cpu,
         MemoryType::Cpu,
         3,
+        "audioconvert",
         Arc::new(|| Box::new(AudioConvert::new())),
     );
 
@@ -440,6 +472,7 @@ pub fn builtin_registry() -> ConverterRegistry {
         MemoryType::Cpu,
         MemoryType::GpuDevice,
         20,
+        "memorycopy",
         Arc::new(|| Box::new(MemoryCopy::cpu_to_gpu())),
     );
 
@@ -450,6 +483,7 @@ pub fn builtin_registry() -> ConverterRegistry {
         MemoryType::GpuDevice,
         MemoryType::Cpu,
         20,
+        "memorycopy",
         Arc::new(|| Box::new(MemoryCopy::gpu_to_cpu())),
     );
 
@@ -460,6 +494,7 @@ pub fn builtin_registry() -> ConverterRegistry {
         MemoryType::Cpu,
         MemoryType::Cpu,
         0,
+        "identity",
         Arc::new(|| Box::new(Identity)),
     );
 
@@ -473,21 +508,21 @@ mod tests {
     #[test]
     fn test_video_scale_creation() {
         let scaler = VideoScale::new(Some(1280), Some(720));
-        assert_eq!(ConverterElement::name(&scaler), "videoscale");
+        assert_eq!(scaler.converter_name(), "videoscale");
         assert_eq!(scaler.cost(), 10);
     }
 
     #[test]
     fn test_video_convert_creation() {
         let converter = VideoConvert::new(PixelFormat::Rgba);
-        assert_eq!(ConverterElement::name(&converter), "videoconvert");
+        assert_eq!(converter.converter_name(), "videoconvert");
         assert_eq!(converter.cost(), 5);
     }
 
     #[test]
     fn test_audio_resample_creation() {
         let resampler = AudioResample::new(48000);
-        assert_eq!(ConverterElement::name(&resampler), "audioresample");
+        assert_eq!(resampler.converter_name(), "audioresample");
         assert_eq!(resampler.cost(), 8);
     }
 
@@ -496,14 +531,14 @@ mod tests {
         let converter = AudioConvert::new()
             .with_format(SampleFormat::F32)
             .with_channels(2);
-        assert_eq!(ConverterElement::name(&converter), "audioconvert");
+        assert_eq!(converter.converter_name(), "audioconvert");
         assert_eq!(converter.cost(), 3);
     }
 
     #[test]
     fn test_memory_copy_creation() {
         let uploader = MemoryCopy::cpu_to_gpu();
-        assert_eq!(ConverterElement::name(&uploader), "memorycopy");
+        assert_eq!(uploader.converter_name(), "memorycopy");
         assert_eq!(uploader.input_memory(), MemoryType::Cpu);
         assert_eq!(uploader.output_memory(), MemoryType::GpuDevice);
         assert_eq!(uploader.cost(), 20);
@@ -512,7 +547,7 @@ mod tests {
     #[test]
     fn test_identity_creation() {
         let identity = Identity;
-        assert_eq!(ConverterElement::name(&identity), "identity");
+        assert_eq!(identity.converter_name(), "identity");
         assert_eq!(identity.cost(), 0);
     }
 

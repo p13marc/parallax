@@ -184,14 +184,14 @@ impl NegotiationSolver {
             let source_memory = source_caps.memory.fixate().unwrap_or(MemoryType::Cpu);
             let sink_memory = sink_caps.memory.fixate().unwrap_or(MemoryType::Cpu);
 
-            if let Some((factories, cost)) = registry.find_path(
+            if let Some((factories_with_info, total_cost)) = registry.find_path(
                 source_format_type,
                 sink_format_type,
                 source_memory,
                 sink_memory,
             ) {
                 // Use the first factory (for now, we only support single-hop)
-                if let Some(factory) = factories.into_iter().next() {
+                if let Some((factory, info)) = factories_with_info.into_iter().next() {
                     // Fixate source format for the link
                     let format = source_caps.format.fixate().ok_or_else(|| {
                         NegotiationError::CannotFixate {
@@ -210,10 +210,14 @@ impl NegotiationSolver {
                             link_id: link.id,
                             factory,
                             reason: format!(
-                                "Convert {:?}/{:?} -> {:?}/{:?}",
-                                source_format_type, source_memory, sink_format_type, sink_memory
+                                "{}: {:?}/{:?} -> {:?}/{:?}",
+                                info.name,
+                                source_format_type,
+                                source_memory,
+                                sink_format_type,
+                                sink_memory
                             ),
-                            cost,
+                            cost: total_cost,
                         },
                     });
                 }

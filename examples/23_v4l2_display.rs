@@ -3,6 +3,9 @@
 //! This example demonstrates capturing video frames from a V4L2 device
 //! (webcam) and displaying them in a native window using AutoVideoSink.
 //!
+//! The pipeline uses caps negotiation to automatically insert a videoconvert
+//! element when the source format (YUYV) doesn't match the sink format (RGBA).
+//!
 //! Run with: `cargo run --example 23_v4l2_display --features "v4l2,display"`
 //!
 //! Requirements:
@@ -16,6 +19,14 @@ use parallax::pipeline::Pipeline;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Enable debug logging
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("parallax=info".parse().unwrap()),
+        )
+        .init();
+
     println!("V4L2 Video Capture with Display");
     println!("================================\n");
 
@@ -46,13 +57,22 @@ async fn main() -> Result<()> {
     println!("\nUsing device: {}", device_path);
     println!("Close window to stop.\n");
 
-    // Simple pipeline: v4l2src -> videoconvert -> autovideosink
-    let pipeline_str = format!(
-        "v4l2src device={} ! videoconvert ! autovideosink",
-        device_path
-    );
+    // Pipeline without explicit videoconvert - negotiation will auto-insert it!
+    // v4l2src outputs YUYV, autovideosink expects RGBA -> videoconvert inserted
+    let pipeline_str = format!("v4l2src device={} ! autovideosink", device_path);
+
+    println!("Pipeline: {}", pipeline_str);
 
     let mut pipeline = Pipeline::parse(&pipeline_str)?;
+
+    // Prepare the pipeline (runs negotiation and inserts converters)
+    pipeline.prepare()?;
+
+    // Show the final pipeline with any auto-inserted converters
+    println!("\nFinal pipeline after negotiation:");
+    println!("{}", pipeline.describe());
+
+    // Run the pipeline
     pipeline.run().await?;
 
     println!("\nDone!");

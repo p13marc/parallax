@@ -1,19 +1,24 @@
 //! Converter registry for format and memory type conversions.
 
+use crate::element::Element;
 use crate::format::{FormatCaps, MediaFormat};
 use crate::memory::MemoryType;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Factory function for creating converter elements.
-pub type ConverterFactory = Arc<dyn Fn() -> Box<dyn ConverterElement> + Send + Sync>;
+///
+/// Returns a boxed element that can be used directly in the pipeline.
+pub type ConverterFactory = Arc<dyn Fn() -> Box<dyn Element + Send> + Send + Sync>;
 
 /// Trait for converter elements.
 ///
 /// Converters transform buffers between formats or memory types.
-pub trait ConverterElement: Send {
+/// This trait extends [`Element`] to provide both processing capability
+/// and format/memory metadata for negotiation.
+pub trait ConverterElement: Element + Send {
     /// Get the name of this converter.
-    fn name(&self) -> &str;
+    fn converter_name(&self) -> &str;
 
     /// Get input format this converter accepts.
     fn input_format(&self) -> FormatCaps;
@@ -29,6 +34,26 @@ pub trait ConverterElement: Send {
 
     /// Get the cost of this conversion (lower is better).
     fn cost(&self) -> u32;
+}
+
+/// Metadata about a converter for use in negotiation.
+///
+/// This is stored in the registry alongside the factory, so we can
+/// query converter capabilities without creating instances.
+#[derive(Clone)]
+pub struct ConverterInfo {
+    /// Name of the converter.
+    pub name: &'static str,
+    /// Input format type.
+    pub from_format: FormatType,
+    /// Output format type.
+    pub to_format: FormatType,
+    /// Input memory type.
+    pub from_memory: MemoryType,
+    /// Output memory type.
+    pub to_memory: MemoryType,
+    /// Cost of conversion.
+    pub cost: u32,
 }
 
 /// Key for looking up converters.
@@ -100,8 +125,8 @@ impl From<&MediaFormat> for FormatType {
 /// conversion paths between incompatible formats/memory types.
 #[derive(Default)]
 pub struct ConverterRegistry {
-    /// Direct converters: key -> (factory, cost).
-    converters: HashMap<ConversionKey, (ConverterFactory, u32)>,
+    /// Direct converters: key -> (factory, info).
+    converters: HashMap<ConversionKey, (ConverterFactory, ConverterInfo)>,
 }
 
 impl ConverterRegistry {
@@ -118,6 +143,7 @@ impl ConverterRegistry {
         from_memory: MemoryType,
         to_memory: MemoryType,
         cost: u32,
+        name: &'static str,
         factory: ConverterFactory,
     ) {
         let key = ConversionKey {
@@ -126,29 +152,39 @@ impl ConverterRegistry {
             from_memory,
             to_memory,
         };
-        self.converters.insert(key, (factory, cost));
+        let info = ConverterInfo {
+            name,
+            from_format,
+            to_format,
+            from_memory,
+            to_memory,
+            cost,
+        };
+        self.converters.insert(key, (factory, info));
     }
 
     /// Find a direct converter.
+    ///
+    /// Returns the factory, info, and cost.
     pub fn find_direct(
         &self,
         from_format: FormatType,
         to_format: FormatType,
         from_memory: MemoryType,
         to_memory: MemoryType,
-    ) -> Option<(&ConverterFactory, u32)> {
+    ) -> Option<(&ConverterFactory, &ConverterInfo)> {
         let key = ConversionKey {
             from_format,
             to_format,
             from_memory,
             to_memory,
         };
-        self.converters.get(&key).map(|(f, c)| (f, *c))
+        self.converters.get(&key).map(|(f, i)| (f, i))
     }
 
     /// Find a conversion path (potentially multiple converters).
     ///
-    /// Returns a list of converter factories and total cost.
+    /// Returns a list of (factory, info) pairs and total cost.
     /// Uses simple BFS for now; could be optimized with Dijkstra.
     pub fn find_path(
         &self,
@@ -156,12 +192,12 @@ impl ConverterRegistry {
         to_format: FormatType,
         from_memory: MemoryType,
         to_memory: MemoryType,
-    ) -> Option<(Vec<ConverterFactory>, u32)> {
+    ) -> Option<(Vec<(ConverterFactory, ConverterInfo)>, u32)> {
         // Check for direct conversion first
-        if let Some((factory, cost)) =
+        if let Some((factory, info)) =
             self.find_direct(from_format, to_format, from_memory, to_memory)
         {
-            return Some((vec![factory.clone()], cost));
+            return Some((vec![(factory.clone(), info.clone())], info.cost));
         }
 
         // If formats match, check for memory-only conversion
@@ -169,10 +205,10 @@ impl ConverterRegistry {
             || from_format == FormatType::Any
             || to_format == FormatType::Any
         {
-            if let Some((factory, cost)) =
+            if let Some((factory, info)) =
                 self.find_direct(FormatType::Any, FormatType::Any, from_memory, to_memory)
             {
-                return Some((vec![factory.clone()], cost));
+                return Some((vec![(factory.clone(), info.clone())], info.cost));
             }
         }
 
@@ -215,14 +251,26 @@ impl std::fmt::Debug for ConverterRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::Buffer;
+    use crate::error::Result;
 
     struct DummyConverter {
         name: String,
         cost: u32,
     }
 
-    impl ConverterElement for DummyConverter {
+    impl Element for DummyConverter {
+        fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
+            Ok(Some(buffer))
+        }
+
         fn name(&self) -> &str {
+            &self.name
+        }
+    }
+
+    impl ConverterElement for DummyConverter {
+        fn converter_name(&self) -> &str {
             &self.name
         }
 
@@ -264,6 +312,7 @@ mod tests {
             MemoryType::Cpu,
             MemoryType::GpuDevice,
             10,
+            "test",
             factory,
         );
 
@@ -276,7 +325,7 @@ mod tests {
             MemoryType::GpuDevice,
         );
         assert!(result.is_some());
-        assert_eq!(result.unwrap().1, 10);
+        assert_eq!(result.unwrap().1.cost, 10);
     }
 
     #[test]
@@ -296,6 +345,7 @@ mod tests {
             MemoryType::Cpu,
             MemoryType::GpuDevice,
             5,
+            "gpu_upload",
             factory,
         );
 

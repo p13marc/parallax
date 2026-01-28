@@ -8,6 +8,7 @@ use crate::buffer::{Buffer, MemoryHandle};
 use crate::converters::{PixelFormat, VideoConvert};
 use crate::element::Element;
 use crate::error::{Error, Result};
+use crate::format::Caps;
 use crate::memory::{HeapSegment, MemorySegment};
 
 /// Video format conversion element.
@@ -186,6 +187,11 @@ impl Element for VideoConvertElement {
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         let input_data = buffer.as_bytes();
 
+        tracing::debug!(
+            "VideoConvert: received buffer with {} bytes",
+            input_data.len()
+        );
+
         // Initialize converter on first frame
         self.ensure_converter(input_data.len())?;
 
@@ -219,6 +225,32 @@ impl Element for VideoConvertElement {
 
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn input_caps(&self) -> Caps {
+        // Accept any raw video format (will convert from input to output format)
+        Caps::video_raw_any()
+    }
+
+    fn output_caps(&self) -> Caps {
+        // Output is always the configured output format
+        // Use 0x0 dimensions since we don't know them until we process the first frame
+        Caps::video_raw_any_resolution(convert_pixel_format(self.output_format))
+    }
+}
+
+/// Convert from converters::PixelFormat to format::PixelFormat
+fn convert_pixel_format(pf: PixelFormat) -> crate::format::PixelFormat {
+    match pf {
+        PixelFormat::Yuyv => crate::format::PixelFormat::Yuyv,
+        PixelFormat::Uyvy => crate::format::PixelFormat::Uyvy,
+        PixelFormat::Nv12 => crate::format::PixelFormat::Nv12,
+        PixelFormat::I420 => crate::format::PixelFormat::I420,
+        PixelFormat::Rgb24 => crate::format::PixelFormat::Rgb24,
+        PixelFormat::Bgr24 => crate::format::PixelFormat::Bgr24,
+        PixelFormat::Rgba => crate::format::PixelFormat::Rgba,
+        PixelFormat::Bgra => crate::format::PixelFormat::Bgra,
+        PixelFormat::Gray8 => crate::format::PixelFormat::Gray8,
     }
 }
 

@@ -26,6 +26,7 @@
 
 use crate::element::{ConsumeContext, Sink};
 use crate::error::{Error, Result};
+use crate::format::{Caps, PixelFormat};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -176,13 +177,19 @@ impl Sink for AutoVideoSink {
     fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
         let data = ctx.input();
 
+        tracing::debug!("AutoVideoSink: received buffer with {} bytes", data.len());
+
         // Detect frame dimensions from data size (assuming RGBA)
         // Common resolutions: 640x480=1228800, 1280x720=3686400, 1920x1080=8294400
         let (width, height) = detect_dimensions(data.len());
 
+        tracing::debug!("AutoVideoSink: detected dimensions {}x{}", width, height);
+
         // Start display thread on first frame
         if self.sender.is_none() {
+            tracing::info!("AutoVideoSink: starting display thread");
             self.start_display(width, height)?;
+            tracing::info!("AutoVideoSink: display thread started");
         }
 
         let sender = self
@@ -209,6 +216,11 @@ impl Sink for AutoVideoSink {
 
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn input_caps(&self) -> Caps {
+        // AutoVideoSink expects RGBA data (any resolution)
+        Caps::video_raw_any_resolution(PixelFormat::Rgba)
     }
 }
 

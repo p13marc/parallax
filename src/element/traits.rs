@@ -1802,6 +1802,68 @@ impl<E: Element + Send + 'static> SendAsyncElementDyn for ElementAdapter<E> {
     }
 }
 
+/// Wrapper to adapt a boxed [`Element`] trait object to [`AsyncElementDyn`].
+///
+/// This is used when the element type is not known at compile time,
+/// such as when creating elements from a factory.
+pub struct BoxedElementAdapter {
+    inner: Box<dyn Element + Send>,
+}
+
+impl BoxedElementAdapter {
+    /// Create a new boxed element adapter.
+    pub fn new(element: Box<dyn Element + Send>) -> Self {
+        Self { inner: element }
+    }
+}
+
+impl SendAsyncElementDyn for BoxedElementAdapter {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn element_type(&self) -> ElementType {
+        ElementType::Transform
+    }
+
+    async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
+        match input {
+            Some(buffer) => self.inner.process(buffer),
+            None => Ok(None),
+        }
+    }
+
+    async fn process_all(&mut self, input: Option<Buffer>) -> Result<Output> {
+        AsyncElementDyn::process(self, input)
+            .await
+            .map(Output::from)
+    }
+
+    fn input_caps(&self) -> Caps {
+        self.inner.input_caps()
+    }
+
+    fn output_caps(&self) -> Caps {
+        self.inner.output_caps()
+    }
+
+    fn affinity(&self) -> Affinity {
+        self.inner.affinity()
+    }
+
+    fn is_rt_safe(&self) -> bool {
+        self.inner.is_rt_safe()
+    }
+
+    fn execution_hints(&self) -> ExecutionHints {
+        self.inner.execution_hints()
+    }
+
+    async fn flush(&mut self) -> Result<Output> {
+        self.inner.flush().map(Output::from)
+    }
+}
+
 /// Wrapper to adapt a sync [`Transform`] to [`AsyncElementDyn`].
 ///
 /// This adapter supports transforms that produce multiple outputs.

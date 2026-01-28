@@ -360,18 +360,25 @@ impl Pipeline {
     ///
     /// This prepares the pipeline for execution by:
     /// - Running caps negotiation if needed
+    /// - Automatically inserting converters if formats don't match
     /// - Validating the pipeline structure
     ///
-    /// Returns an error if the transition is invalid.
+    /// Returns an error if the transition is invalid or negotiation fails.
     pub fn prepare(&mut self) -> Result<()> {
         match self.state {
             PipelineState::Suspended => {
                 // Validate pipeline structure
                 self.validate()?;
 
-                // Run caps negotiation if needed
+                // Run caps negotiation with builtin converter registry
                 if !self.is_negotiated() {
-                    self.negotiate()?;
+                    let registry = crate::negotiation::builtin_registry();
+                    self.negotiate_with_registry(Some(registry))?;
+                }
+
+                // Insert any converters that negotiation identified
+                if !self.pending_converters().is_empty() {
+                    self.insert_pending_converters()?;
                 }
 
                 self.state = PipelineState::Idle;
@@ -1258,6 +1265,103 @@ impl Pipeline {
 
         self.negotiation = Some(result);
         Ok(())
+    }
+
+    /// Insert converters that were identified during negotiation.
+    ///
+    /// This method takes converters from `pending_converters()` and inserts them
+    /// into the pipeline graph. After insertion, it re-runs negotiation to ensure
+    /// the new elements are properly integrated.
+    fn insert_pending_converters(&mut self) -> Result<()> {
+        // Get converters to insert (clone to avoid borrow issues)
+        let converters: Vec<_> = self
+            .negotiation
+            .as_ref()
+            .map(|n| {
+                n.converters
+                    .iter()
+                    .map(|c| (c.link_id, c.reason.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if converters.is_empty() {
+            return Ok(());
+        }
+
+        // Build a map from link_id to edge info before modifying the graph
+        let mut link_info: HashMap<usize, (NodeIndex, NodeIndex, Link)> = HashMap::new();
+        for (idx, edge) in self.graph.graph().edge_references().enumerate() {
+            link_info.insert(idx, (edge.source(), edge.target(), edge.weight().clone()));
+        }
+
+        // Get converter factories from negotiation result
+        let factories: Vec<_> = self
+            .negotiation
+            .take()
+            .map(|n| n.converters)
+            .unwrap_or_default();
+
+        // Insert each converter
+        for conv in factories {
+            let Some((src_idx, sink_idx, link)) = link_info.get(&conv.link_id).cloned() else {
+                tracing::warn!(
+                    "Converter insertion: link {} not found, skipping",
+                    conv.link_id
+                );
+                continue;
+            };
+
+            // Create converter element from factory
+            let converter_element = (conv.factory)();
+            let converter_name = format!("auto_{}", converter_element.name());
+
+            tracing::info!(
+                "Inserting converter '{}' for link {}: {}",
+                converter_name,
+                conv.link_id,
+                conv.reason
+            );
+
+            // Wrap the converter element in a BoxedElementAdapter and add to graph
+            // The factory returns Box<dyn Element + Send>, which we adapt to AsyncElementDyn
+            let adapted: Box<DynAsyncElement<'static>> = DynAsyncElement::new_box(
+                crate::element::BoxedElementAdapter::new(converter_element),
+            );
+            let converter_id = self.add_node(&converter_name, adapted);
+
+            // Find and remove the original edge
+            let edge_to_remove = self
+                .graph
+                .graph()
+                .edge_references()
+                .find(|e| e.source() == src_idx && e.target() == sink_idx)
+                .map(|e| e.id());
+
+            if let Some(edge_idx) = edge_to_remove {
+                self.graph.remove_edge(edge_idx);
+            }
+
+            // Add new edges: source -> converter -> sink
+            let src_link = Link::with_pads(&link.src_pad, "sink");
+            let sink_link = Link::with_pads("src", &link.sink_pad);
+
+            self.graph
+                .add_edge(src_idx, converter_id.0, src_link)
+                .map_err(|_| {
+                    Error::InvalidSegment("converter insertion would create cycle".into())
+                })?;
+
+            self.graph
+                .add_edge(converter_id.0, sink_idx, sink_link)
+                .map_err(|_| {
+                    Error::InvalidSegment("converter insertion would create cycle".into())
+                })?;
+        }
+
+        // Re-negotiate with the new elements
+        let registry = crate::negotiation::builtin_registry();
+        self.negotiate_with_registry(Some(registry))
     }
 
     /// Collect caps from an element for negotiation.

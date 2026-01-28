@@ -45,7 +45,9 @@ pub use builtin::{
     AudioConvert, AudioResample, Identity, MemoryCopy, ScaleAlgorithm, VideoConvert, VideoScale,
     builtin_registry,
 };
-pub use converters::{ConverterElement, ConverterFactory, ConverterRegistry, FormatType};
+pub use converters::{
+    ConverterElement, ConverterFactory, ConverterInfo, ConverterRegistry, FormatType,
+};
 pub use error::NegotiationError;
 pub use solver::{
     ConverterInsertion, ElementCaps, LinkInfo, LinkNegotiation, NegotiationResult,

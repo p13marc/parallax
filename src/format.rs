@@ -338,6 +338,17 @@ pub struct VideoFormat {
     pub framerate: Framerate,
 }
 
+impl Default for VideoFormat {
+    fn default() -> Self {
+        Self {
+            width: 0,
+            height: 0,
+            pixel_format: PixelFormat::default(),
+            framerate: Framerate::default(),
+        }
+    }
+}
+
 impl VideoFormat {
     /// Create a new video format.
     pub const fn new(
@@ -539,6 +550,16 @@ pub struct AudioFormat {
     pub channels: u16,
     /// Sample format (bit depth and type).
     pub sample_format: SampleFormat,
+}
+
+impl Default for AudioFormat {
+    fn default() -> Self {
+        Self {
+            sample_rate: 0,
+            channels: 0,
+            sample_format: SampleFormat::default(),
+        }
+    }
 }
 
 impl AudioFormat {
@@ -1423,6 +1444,128 @@ impl Caps {
             .iter()
             .find(|a| other.0.iter().any(|b| a.compatible(b)))
             .cloned()
+    }
+
+    // ========================================================================
+    // Convenience constructors for video formats
+    // ========================================================================
+
+    /// Create caps for raw video with specific dimensions and pixel format.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use parallax::format::{Caps, PixelFormat};
+    ///
+    /// let caps = Caps::video_raw(1920, 1080, PixelFormat::Rgba);
+    /// assert!(!caps.is_any());
+    /// ```
+    pub fn video_raw(width: u32, height: u32, format: PixelFormat) -> Self {
+        Self::new(MediaFormat::VideoRaw(VideoFormat {
+            width,
+            height,
+            pixel_format: format,
+            ..Default::default()
+        }))
+    }
+
+    /// Create caps for raw video with any dimensions but specific pixel format.
+    ///
+    /// This is useful for sinks that can display any resolution but require
+    /// a specific pixel format (e.g., RGBA for display).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use parallax::format::{Caps, PixelFormat};
+    ///
+    /// let caps = Caps::video_raw_any_resolution(PixelFormat::Rgba);
+    /// assert!(!caps.is_any());
+    /// ```
+    pub fn video_raw_any_resolution(format: PixelFormat) -> Self {
+        // We use 0x0 dimensions to indicate "any resolution"
+        // The negotiation system will recognize this as a wildcard
+        Self::new(MediaFormat::VideoRaw(VideoFormat {
+            width: 0,
+            height: 0,
+            pixel_format: format,
+            ..Default::default()
+        }))
+    }
+
+    /// Create caps for any raw video format.
+    ///
+    /// This matches any raw video, regardless of dimensions or pixel format.
+    pub fn video_raw_any() -> Self {
+        Self::new(MediaFormat::VideoRaw(VideoFormat::default()))
+    }
+
+    // ========================================================================
+    // Convenience constructors for audio formats
+    // ========================================================================
+
+    /// Create caps for raw audio with specific parameters.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use parallax::format::{Caps, SampleFormat};
+    ///
+    /// let caps = Caps::audio_raw(48000, 2, SampleFormat::F32);
+    /// assert!(!caps.is_any());
+    /// ```
+    pub fn audio_raw(sample_rate: u32, channels: u16, format: SampleFormat) -> Self {
+        Self::new(MediaFormat::AudioRaw(AudioFormat {
+            sample_rate,
+            channels,
+            sample_format: format,
+            ..Default::default()
+        }))
+    }
+
+    /// Create caps for raw audio with any sample rate but specific format and channels.
+    pub fn audio_raw_any_rate(channels: u16, format: SampleFormat) -> Self {
+        Self::new(MediaFormat::AudioRaw(AudioFormat {
+            sample_rate: 0,
+            channels,
+            sample_format: format,
+            ..Default::default()
+        }))
+    }
+
+    /// Create caps for any raw audio format.
+    pub fn audio_raw_any() -> Self {
+        Self::new(MediaFormat::AudioRaw(AudioFormat::default()))
+    }
+
+    // ========================================================================
+    // Inspection methods
+    // ========================================================================
+
+    /// Check if this caps represents raw video.
+    pub fn is_video_raw(&self) -> bool {
+        self.0.iter().any(|f| matches!(f, MediaFormat::VideoRaw(_)))
+    }
+
+    /// Check if this caps represents raw audio.
+    pub fn is_audio_raw(&self) -> bool {
+        self.0.iter().any(|f| matches!(f, MediaFormat::AudioRaw(_)))
+    }
+
+    /// Get the pixel format if this is a single video format.
+    pub fn video_pixel_format(&self) -> Option<PixelFormat> {
+        match self.preferred()? {
+            MediaFormat::VideoRaw(v) => Some(v.pixel_format),
+            _ => None,
+        }
+    }
+
+    /// Get the video dimensions if this is a single video format.
+    pub fn video_dimensions(&self) -> Option<(u32, u32)> {
+        match self.preferred()? {
+            MediaFormat::VideoRaw(v) => Some((v.width, v.height)),
+            _ => None,
+        }
     }
 }
 

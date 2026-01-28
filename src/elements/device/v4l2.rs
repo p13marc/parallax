@@ -31,6 +31,7 @@ use v4l::video::Capture;
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{Affinity, ExecutionHints, ProduceContext, ProduceResult, Source};
 use crate::error::Result;
+use crate::format::{Caps, PixelFormat};
 use crate::memory::{HeapSegment, MemorySegment};
 use crate::metadata::Metadata;
 
@@ -313,6 +314,32 @@ impl Source for V4l2Src {
 
     fn execution_hints(&self) -> ExecutionHints {
         ExecutionHints::io_bound()
+    }
+
+    fn output_caps(&self) -> Caps {
+        // Convert V4L2 fourcc to our PixelFormat
+        let fourcc_str = std::str::from_utf8(&self.fourcc).unwrap_or("????");
+        let pixel_format = match fourcc_str {
+            "YUYV" => PixelFormat::Yuyv,
+            "UYVY" => PixelFormat::Uyvy,
+            "NV12" => PixelFormat::Nv12,
+            "I420" | "YU12" => PixelFormat::I420,
+            "RGB3" => PixelFormat::Rgb24,
+            "BGR3" => PixelFormat::Bgr24,
+            "RGBP" | "RGB4" => PixelFormat::Rgba,
+            "BA24" => PixelFormat::Bgra,
+            "GREY" | "Y800" => PixelFormat::Gray8,
+            // MJPEG and other compressed formats - we can't negotiate these
+            // through the raw video pipeline, return any() to allow the
+            // pipeline to fail with "cannot negotiate" if no decoder is available
+            "MJPG" | "JPEG" => return Caps::any(),
+            _ => {
+                tracing::warn!("Unknown V4L2 format: {}, returning Caps::any()", fourcc_str);
+                return Caps::any();
+            }
+        };
+
+        Caps::video_raw(self.width, self.height, pixel_format)
     }
 }
 
