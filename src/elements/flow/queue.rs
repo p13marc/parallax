@@ -32,7 +32,7 @@
 use crate::buffer::Buffer;
 use crate::element::Element;
 use crate::error::{Error, Result};
-use crate::pipeline::flow::{FlowSignal, WaterMarks};
+use crate::pipeline::flow::{FlowSignal, FlowStateHandle, SharedFlowState, WaterMarks};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -68,6 +68,8 @@ struct QueueInner {
     not_full: Condvar,
     /// Current flow signal (atomic for lock-free reads)
     flow_signal: AtomicU8,
+    /// Shared flow state for external consumers (sources)
+    shared_flow_state: FlowStateHandle,
 }
 
 struct QueueState {
@@ -115,6 +117,7 @@ impl Queue {
                 not_empty: Condvar::new(),
                 not_full: Condvar::new(),
                 flow_signal: AtomicU8::new(FlowSignal::Ready as u8),
+                shared_flow_state: Arc::new(SharedFlowState::new()),
             }),
             leaky: LeakyMode::None,
             water_marks: None,
@@ -140,6 +143,7 @@ impl Queue {
                 not_empty: Condvar::new(),
                 not_full: Condvar::new(),
                 flow_signal: AtomicU8::new(FlowSignal::Ready as u8),
+                shared_flow_state: Arc::new(SharedFlowState::new()),
             }),
             leaky: LeakyMode::None,
             water_marks: None,
@@ -229,6 +233,28 @@ impl Queue {
         (state.buffers.len() as f64 / state.max_buffers as f64) * 100.0
     }
 
+    /// Get a flow state handle that stays synchronized with queue state.
+    ///
+    /// This handle can be shared with upstream sources to enable them to
+    /// respond to backpressure. When the queue reaches high water mark,
+    /// the handle will signal `Busy`; when it drops to low water mark,
+    /// it signals `Ready`.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let queue = Queue::new(100).with_flow_control();
+    /// let flow_state = queue.flow_state_handle();
+    ///
+    /// // Share with source
+    /// source.set_flow_state(flow_state.clone());
+    ///
+    /// // Source can now check: if !flow_state.should_produce() { drop_frame(); }
+    /// ```
+    pub fn flow_state_handle(&self) -> FlowStateHandle {
+        Arc::clone(&self.inner.shared_flow_state)
+    }
+
     /// Update flow signal based on current fill level.
     fn update_flow_signal(&self, level: usize) {
         let Some(wm) = &self.water_marks else {
@@ -251,9 +277,11 @@ impl Queue {
             return; // No change
         };
 
+        // Update both internal and shared state
         self.inner
             .flow_signal
             .store(new_signal as u8, Ordering::Release);
+        self.inner.shared_flow_state.set_signal(new_signal);
     }
 
     /// Flush all buffers from the queue.
@@ -725,5 +753,52 @@ mod tests {
         // Pop to 1 - at low water
         queue.pop_timeout(Some(Duration::from_millis(100))).unwrap();
         assert_eq!(queue.flow_signal(), FlowSignal::Ready);
+    }
+
+    #[test]
+    fn test_queue_flow_state_handle_sync() {
+        let queue = Queue::new(10).with_flow_control();
+        let flow_state = queue.flow_state_handle();
+
+        // Initial state should be Ready
+        assert_eq!(flow_state.signal(), FlowSignal::Ready);
+        assert!(flow_state.should_produce());
+
+        // Fill to high water (8)
+        for i in 0..8 {
+            queue.push(create_test_buffer(10, i)).unwrap();
+        }
+
+        // Handle should now show Busy
+        assert_eq!(flow_state.signal(), FlowSignal::Busy);
+        assert!(!flow_state.should_produce());
+
+        // Drain to low water (2)
+        for _ in 0..6 {
+            queue.pop_timeout(Some(Duration::from_millis(100))).unwrap();
+        }
+
+        // Handle should now show Ready again
+        assert_eq!(flow_state.signal(), FlowSignal::Ready);
+        assert!(flow_state.should_produce());
+    }
+
+    #[test]
+    fn test_queue_flow_state_handle_shared() {
+        let queue = Queue::new(10).with_flow_control();
+        let handle1 = queue.flow_state_handle();
+        let handle2 = queue.flow_state_handle();
+
+        // Both handles point to the same state
+        for i in 0..8 {
+            queue.push(create_test_buffer(10, i)).unwrap();
+        }
+
+        assert_eq!(handle1.signal(), FlowSignal::Busy);
+        assert_eq!(handle2.signal(), FlowSignal::Busy);
+
+        // Both see the same backpressure event count
+        assert!(handle1.backpressure_events() >= 1);
+        assert_eq!(handle1.backpressure_events(), handle2.backpressure_events());
     }
 }
