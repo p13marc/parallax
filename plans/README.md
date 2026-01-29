@@ -52,7 +52,7 @@ Key architectural decisions have been researched and documented in **[00_DESIGN_
 | 11 | [GPU Codec Framework](11_GPU_CODEC_FRAMEWORK.md) | High | Large | 🟡 In Progress |
 | 12 | [Additional Codecs](12_ADDITIONAL_CODECS.md) | Medium | Medium | ✅ Complete |
 | 13 | [Device Elements](13_DEVICE_ELEMENTS.md) | Medium | Medium | ✅ Complete |
-| 14 | [Streaming Protocols](14_STREAMING_PROTOCOLS.md) | Medium | Medium | ⬜ Not Started |
+| 14 | [Streaming Protocols](14_STREAMING_PROTOCOLS.md) | Medium | Medium | ✅ Complete |
 
 **Legend:** ⬜ Not Started | 🟡 In Progress | ✅ Complete
 
@@ -373,14 +373,14 @@ Adaptive bitrate streaming support:
 - [x] Add DMA-BUF export mode for V4L2 (`V4l2Config::dmabuf_export`)
 - [x] Screen capture via XDG portal (`ScreenCaptureSrc`, example `46_screen_capture.rs`)
 
-### Plan 14: Streaming Protocols ⬜
-- [ ] Implement `HlsSink` with M3U8 generation
-- [ ] Implement segment rotation
-- [ ] Add `quick-xml` dependency
-- [ ] Implement `DashSink` with MPD generation
-- [ ] Implement multi-rendition ABR pipeline
-- [ ] Create examples: `25_hls_output.rs`, `26_dash_output.rs`
-- [ ] Update documentation
+### Plan 14: Streaming Protocols ✅
+- [x] Implement `HlsSink` with M3U8 generation
+- [x] Implement segment rotation (SegmentWriter, SegmentBoundaryDetector)
+- [x] Add `quick-xml` dependency for MPD generation
+- [x] Implement `DashSink` with MPD generation
+- [x] Implement ABR configuration (HlsVariant, DashAdaptationSet, DashRepresentation)
+- [x] Create examples: `25_hls_output.rs`, `26_dash_output.rs`
+- [x] Update documentation (module docs, Cargo.toml examples)
 
 ---
 

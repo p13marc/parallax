@@ -560,6 +560,7 @@ parallax/
 │   │   ├── mux/            # TsMux, TsMuxElement, Mp4Mux (N-to-1 multiplexing)
 │   │   ├── codec/          # Media codecs (AV1, audio, image - feature-gated)
 │   │   ├── device/         # Hardware devices (V4L2, PipeWire, ALSA, libcamera)
+│   │   ├── streaming/      # HLS/DASH output (HlsSink, DashSink)
 │   │   └── util/           # PassThrough, Identity
 │   │
 │   ├── typed/              # Type-safe pipeline API
