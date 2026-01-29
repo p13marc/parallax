@@ -24,20 +24,15 @@
 //! // Initialize (shows permission dialog)
 //! capture.initialize().await?;
 //!
-//! // Use in a pipeline
-//! let pipeline = Pipeline::new();
-//! pipeline.add_element("screen", Src(capture));
+//! // Receive frames
+//! while let Some(frame) = capture.recv_frame_timeout(Duration::from_millis(100)) {
+//!     println!("Got frame: {}x{}", frame.width, frame.height);
+//! }
 //! ```
-//!
-//! # How It Works
-//!
-//! 1. Create a ScreenCast session via D-Bus portal
-//! 2. User is prompted to select a screen/window
-//! 3. Portal returns a PipeWire node ID and fd
-//! 4. We connect to PipeWire using the fd and capture frames from that node
-//! 5. Frames are delivered as BGRA or other negotiated format
 
 use std::os::fd::OwnedFd;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread;
 
 use ashpd::desktop::PersistMode;
@@ -45,6 +40,7 @@ use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
 use ashpd::enumflags2::BitFlags;
 use kanal::{Receiver, Sender, bounded};
 use pipewire as pw;
+use pw::spa;
 
 use crate::buffer::Buffer;
 use crate::element::{Affinity, ExecutionHints, ProduceContext, ProduceResult, Source};
@@ -88,8 +84,10 @@ pub struct ScreenCaptureConfig {
     /// Whether to show the cursor in the capture.
     pub show_cursor: bool,
     /// Whether to persist the session across restarts.
-    /// If true, the user won't be prompted again if they previously granted permission.
     pub persist_session: bool,
+    /// Maximum number of frames to capture before EOS.
+    /// None means unlimited (capture until manually stopped).
+    pub max_frames: Option<u32>,
 }
 
 impl Default for ScreenCaptureConfig {
@@ -98,7 +96,16 @@ impl Default for ScreenCaptureConfig {
             source_type: CaptureSourceType::Monitor,
             show_cursor: true,
             persist_session: false,
+            max_frames: None,
         }
+    }
+}
+
+impl ScreenCaptureConfig {
+    /// Set the maximum number of frames to capture.
+    pub fn with_max_frames(mut self, max_frames: u32) -> Self {
+        self.max_frames = Some(max_frames);
+        self
     }
 }
 
@@ -124,15 +131,11 @@ pub struct CapturedFrame {
     pub height: u32,
     /// Bytes per row (stride).
     pub stride: u32,
-    /// Pixel format (typically BGRA on most systems).
+    /// Pixel format.
     pub format: PixelFormat,
 }
 
 /// Screen capture source element.
-///
-/// Captures screen content via XDG Desktop Portal and PipeWire.
-/// The user will be prompted to select a screen or window when the
-/// element is first started.
 pub struct ScreenCaptureSrc {
     config: ScreenCaptureConfig,
     /// Receiver for captured frames from PipeWire thread.
@@ -147,6 +150,10 @@ pub struct ScreenCaptureSrc {
     arena: Option<SharedArena>,
     /// Whether the session has been initialized.
     initialized: bool,
+    /// Frame counter for PipeWire thread (debugging).
+    frame_count: Arc<AtomicU32>,
+    /// Frames output by produce() - used for max_frames limit.
+    frames_produced: u32,
 }
 
 impl std::fmt::Debug for ScreenCaptureSrc {
@@ -155,15 +162,13 @@ impl std::fmt::Debug for ScreenCaptureSrc {
             .field("config", &self.config)
             .field("info", &self.info)
             .field("initialized", &self.initialized)
+            .field("frame_count", &self.frame_count.load(Ordering::Relaxed))
             .finish()
     }
 }
 
 impl ScreenCaptureSrc {
     /// Create a new screen capture source with the given configuration.
-    ///
-    /// This only sets up the configuration. The actual portal session
-    /// is created when `initialize()` is called (typically during pipeline prepare).
     pub fn new(config: ScreenCaptureConfig) -> Self {
         Self {
             config,
@@ -173,6 +178,8 @@ impl ScreenCaptureSrc {
             info: None,
             arena: None,
             initialized: false,
+            frame_count: Arc::new(AtomicU32::new(0)),
+            frames_produced: 0,
         }
     }
 
@@ -182,9 +189,6 @@ impl ScreenCaptureSrc {
     }
 
     /// Initialize the portal session and start capturing.
-    ///
-    /// This will prompt the user to select a screen/window to capture.
-    /// Must be called before producing frames.
     pub async fn initialize(&mut self) -> Result<ScreenCaptureInfo> {
         if self.initialized {
             return self
@@ -269,12 +273,18 @@ impl ScreenCaptureSrc {
         };
 
         // Start the capture thread
-        let (frame_tx, frame_rx) = bounded::<CapturedFrame>(8);
+        let (frame_tx, frame_rx) = bounded::<CapturedFrame>(16);
         let (shutdown_tx, shutdown_rx) = bounded::<()>(1);
 
         let capture_node_id = node_id;
+        let frame_count = self.frame_count.clone();
+
         let capture_thread = thread::spawn(move || {
-            Self::capture_thread(pw_fd, capture_node_id, frame_tx, shutdown_rx);
+            if let Err(e) =
+                Self::capture_thread(pw_fd, capture_node_id, frame_tx, shutdown_rx, frame_count)
+            {
+                tracing::error!("Screen capture thread error: {}", e);
+            }
         });
 
         self.frame_receiver = Some(frame_rx);
@@ -282,6 +292,13 @@ impl ScreenCaptureSrc {
         self.capture_thread = Some(capture_thread);
         self.info = Some(info.clone());
         self.initialized = true;
+
+        tracing::info!(
+            "Screen capture initialized: {}x{}, node_id={}",
+            info.width,
+            info.height,
+            info.node_id
+        );
 
         Ok(info)
     }
@@ -292,33 +309,36 @@ impl ScreenCaptureSrc {
         node_id: u32,
         frame_tx: Sender<CapturedFrame>,
         shutdown_rx: Receiver<()>,
-    ) {
+        frame_count: Arc<AtomicU32>,
+    ) -> std::result::Result<(), String> {
         pw::init();
 
-        let main_loop = match pw::main_loop::MainLoop::new(None) {
-            Ok(ml) => ml,
-            Err(e) => {
-                tracing::error!("Failed to create PipeWire main loop: {}", e);
-                return;
-            }
-        };
+        // Use ThreadLoop instead of MainLoop - it runs in its own thread
+        // and is what OBS and other applications use for portal screen capture
+        let thread_loop =
+            unsafe { pw::thread_loop::ThreadLoop::new(Some("parallax-capture"), None) }
+                .map_err(|e| format!("Failed to create thread loop: {}", e))?;
 
-        let context = match pw::context::Context::new(&main_loop) {
-            Ok(ctx) => ctx,
-            Err(e) => {
-                tracing::error!("Failed to create PipeWire context: {}", e);
-                return;
-            }
-        };
+        // Create context with the thread loop
+        let context = pw::context::Context::new(&thread_loop)
+            .map_err(|e| format!("Failed to create context: {}", e))?;
 
-        // Connect using the fd from the portal
-        let core = match context.connect_fd(pw_fd, None) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!("Failed to connect to PipeWire via fd: {}", e);
-                return;
-            }
-        };
+        // Start the thread loop BEFORE connecting (following OBS pattern)
+        thread_loop.start();
+        tracing::debug!("Thread loop started");
+
+        // Lock the thread loop for all PipeWire operations
+        let _lock = thread_loop.lock();
+        tracing::debug!("Thread loop locked");
+
+        // Connect using the fd from the portal (with lock held)
+        let core = context
+            .connect_fd(pw_fd, None)
+            .map_err(|e| format!("Failed to connect via fd: {}", e))?;
+        tracing::debug!("Connected to core via fd");
+
+        let stream_running = Arc::new(AtomicBool::new(false));
+        let stream_running_clone = stream_running.clone();
 
         let props = pw::properties::properties! {
             *pw::keys::MEDIA_TYPE => "Video",
@@ -326,86 +346,258 @@ impl ScreenCaptureSrc {
             *pw::keys::MEDIA_ROLE => "Screen",
         };
 
-        let stream = match pw::stream::Stream::new(&core, "parallax-screen-capture", props) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!("Failed to create PipeWire stream: {}", e);
-                return;
-            }
-        };
+        let stream = pw::stream::Stream::new(&core, "parallax-screen-capture", props)
+            .map_err(|e| format!("Failed to create stream: {}", e))?;
+        tracing::debug!("Stream created");
+
+        // Shared state for video format info
+        let video_width = Arc::new(AtomicU32::new(0));
+        let video_height = Arc::new(AtomicU32::new(0));
+        let video_width_process = video_width.clone();
+        let video_height_process = video_height.clone();
 
         let frame_tx_clone = frame_tx.clone();
+        let frame_count_clone = frame_count.clone();
 
         let _listener = stream
             .add_local_listener_with_user_data(())
-            .process(move |stream, _| {
-                if let Some(mut pw_buffer) = stream.dequeue_buffer() {
-                    if let Some(data) = pw_buffer.datas_mut().first_mut() {
-                        let chunk = data.chunk();
-                        let size = chunk.size() as usize;
-                        let stride = chunk.stride() as u32;
-
-                        if size > 0 {
-                            if let Some(slice) = data.data() {
-                                let bytes = slice[..size].to_vec();
-
-                                // Try to determine dimensions from stride and size
-                                // Assuming BGRA (4 bytes per pixel)
-                                let width = if stride > 0 { stride / 4 } else { 0 };
-                                let height = if width > 0 && size > 0 {
-                                    (size as u32) / stride
-                                } else {
-                                    0
-                                };
-
-                                let frame = CapturedFrame {
-                                    data: bytes,
-                                    width,
-                                    height,
-                                    stride,
-                                    format: PixelFormat::Bgra,
-                                };
-
-                                let _ = frame_tx_clone.try_send(frame);
-                            }
-                        }
-                    }
+            .state_changed(move |_stream, _user_data, old, new| {
+                tracing::debug!("Stream state changed: {:?} -> {:?}", old, new);
+                if new == pw::stream::StreamState::Streaming {
+                    stream_running_clone.store(true, Ordering::SeqCst);
+                    tracing::info!("Screen capture stream is now streaming");
                 }
             })
-            .register();
+            .param_changed(move |_stream, _user_data, id, param| {
+                let Some(param) = param else { return };
 
-        // Connect to the specific node from the portal
-        let params: &mut [&pw::spa::pod::Pod] = &mut [];
+                if id != spa::param::ParamType::Format.as_raw() {
+                    return;
+                }
 
-        if let Err(e) = stream.connect(
-            pw::spa::utils::Direction::Input,
-            Some(node_id),
-            pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
-            params,
-        ) {
-            tracing::error!(
-                "Failed to connect PipeWire stream to node {}: {:?}",
-                node_id,
-                e
-            );
-            return;
-        }
+                // Try to parse video format
+                if let Ok((media_type, media_subtype)) =
+                    spa::param::format_utils::parse_format(param)
+                {
+                    tracing::info!(
+                        "Format: media_type={:?}, media_subtype={:?}",
+                        media_type,
+                        media_subtype
+                    );
+                }
 
-        tracing::info!("Screen capture started, connected to node {}", node_id);
+                // Parse video info to get dimensions
+                let mut video_info = spa::param::video::VideoInfoRaw::default();
+                if video_info.parse(param).is_ok() {
+                    let size = video_info.size();
+                    video_width.store(size.width, Ordering::SeqCst);
+                    video_height.store(size.height, Ordering::SeqCst);
+                    tracing::info!(
+                        "Video format: {}x{}, format={:?}",
+                        size.width,
+                        size.height,
+                        video_info.format()
+                    );
+                }
+            })
+            .process(move |stream, _user_data| {
+                tracing::trace!("Process callback entered");
 
-        // Run main loop until shutdown
+                let Some(mut buffer) = stream.dequeue_buffer() else {
+                    tracing::trace!("No buffer available to dequeue");
+                    return;
+                };
+
+                let datas = buffer.datas_mut();
+                if datas.is_empty() {
+                    tracing::trace!("Buffer has no data planes");
+                    return;
+                }
+
+                let data = &mut datas[0];
+                let chunk = data.chunk();
+                let size = chunk.size() as usize;
+                let stride = chunk.stride() as u32;
+
+                if size == 0 {
+                    tracing::trace!("Buffer chunk size is 0");
+                    return;
+                }
+
+                let Some(slice) = data.data() else {
+                    return;
+                };
+
+                // Get dimensions from parsed format or calculate from stride
+                let width = video_width_process.load(Ordering::SeqCst);
+                let height = video_height_process.load(Ordering::SeqCst);
+
+                // If we don't have dimensions from format, estimate from stride
+                let (width, height) = if width > 0 && height > 0 {
+                    (width, height)
+                } else if stride > 0 {
+                    // Assume BGRA (4 bytes per pixel)
+                    let w = stride / 4;
+                    let h = if w > 0 { size as u32 / stride } else { 0 };
+                    (w, h)
+                } else {
+                    (0, 0)
+                };
+
+                if width == 0 || height == 0 {
+                    tracing::warn!(
+                        "Got frame with unknown dimensions, size={}, stride={}",
+                        size,
+                        stride
+                    );
+                    return;
+                }
+
+                let bytes = slice[..size].to_vec();
+                let frame = CapturedFrame {
+                    data: bytes,
+                    width,
+                    height,
+                    stride,
+                    format: PixelFormat::Bgra, // Most common for screen capture
+                };
+
+                let count = frame_count_clone.fetch_add(1, Ordering::Relaxed) + 1;
+
+                if count <= 5 || count % 30 == 0 {
+                    tracing::debug!(
+                        "Captured frame {}: {}x{}, {} bytes",
+                        count,
+                        width,
+                        height,
+                        frame.data.len()
+                    );
+                }
+
+                if let Err(e) = frame_tx_clone.try_send(frame) {
+                    tracing::warn!("Frame channel full or closed: {}", e);
+                }
+            })
+            .register()
+            .map_err(|e| format!("Failed to register listener: {}", e))?;
+
+        // Build format params - specify what video formats we accept
+        let format_obj = spa::pod::object!(
+            spa::utils::SpaTypes::ObjectParamFormat,
+            spa::param::ParamType::EnumFormat,
+            spa::pod::property!(
+                spa::param::format::FormatProperties::MediaType,
+                Id,
+                spa::param::format::MediaType::Video
+            ),
+            spa::pod::property!(
+                spa::param::format::FormatProperties::MediaSubtype,
+                Id,
+                spa::param::format::MediaSubtype::Raw
+            ),
+            spa::pod::property!(
+                spa::param::format::FormatProperties::VideoFormat,
+                Choice,
+                Enum,
+                Id,
+                spa::param::video::VideoFormat::BGRx,
+                spa::param::video::VideoFormat::BGRx,
+                spa::param::video::VideoFormat::BGRA,
+                spa::param::video::VideoFormat::RGBx,
+                spa::param::video::VideoFormat::RGBA,
+                spa::param::video::VideoFormat::RGB,
+            ),
+            spa::pod::property!(
+                spa::param::format::FormatProperties::VideoSize,
+                Choice,
+                Range,
+                Rectangle,
+                spa::utils::Rectangle {
+                    width: 1920,
+                    height: 1080
+                },
+                spa::utils::Rectangle {
+                    width: 1,
+                    height: 1
+                },
+                spa::utils::Rectangle {
+                    width: 4096,
+                    height: 4096
+                }
+            ),
+            spa::pod::property!(
+                spa::param::format::FormatProperties::VideoFramerate,
+                Choice,
+                Range,
+                Fraction,
+                spa::utils::Fraction { num: 30, denom: 1 },
+                spa::utils::Fraction { num: 0, denom: 1 },
+                spa::utils::Fraction { num: 120, denom: 1 }
+            ),
+        );
+
+        let format_bytes: Vec<u8> = spa::pod::serialize::PodSerializer::serialize(
+            std::io::Cursor::new(Vec::new()),
+            &spa::pod::Value::Object(format_obj),
+        )
+        .map_err(|e| format!("Failed to serialize format params: {:?}", e))?
+        .0
+        .into_inner();
+
+        let format_pod = spa::pod::Pod::from_bytes(&format_bytes)
+            .ok_or_else(|| "Failed to create format pod".to_string())?;
+
+        let mut params = [format_pod];
+        tracing::debug!("Built format params, connecting stream...");
+
+        // Connect to the portal's screencast node
+        stream
+            .connect(
+                spa::utils::Direction::Input,
+                Some(node_id),
+                pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
+                &mut params,
+            )
+            .map_err(|e| format!("Failed to connect stream to node {}: {:?}", node_id, e))?;
+
+        tracing::info!("Screen capture stream connecting to node {}", node_id);
+
+        // Unlock the thread loop - the PipeWire thread will now process events
+        drop(_lock);
+        tracing::debug!("Thread loop unlocked, PipeWire processing events");
+
+        // Wait for shutdown signal while the thread loop runs
         loop {
-            if shutdown_rx.try_recv().is_ok() {
-                tracing::debug!("Screen capture shutdown requested");
-                break;
+            match shutdown_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(()) => {
+                    tracing::debug!("Screen capture shutdown requested (received signal)");
+                    break;
+                }
+                Err(kanal::ReceiveErrorTimeout::Closed)
+                | Err(kanal::ReceiveErrorTimeout::SendClosed) => {
+                    tracing::debug!("Screen capture shutdown (channel closed)");
+                    break;
+                }
+                Err(kanal::ReceiveErrorTimeout::Timeout) => {
+                    // No shutdown yet, continue
+                    let count = frame_count.load(Ordering::Relaxed);
+                    if count > 0 && count % 30 == 0 {
+                        tracing::debug!("Still capturing, total frames: {}", count);
+                    }
+                }
             }
-
-            main_loop
-                .loop_()
-                .iterate(std::time::Duration::from_millis(10));
         }
 
-        tracing::debug!("Screen capture thread exiting");
+        // Stop the thread loop
+        thread_loop.stop();
+
+        tracing::info!("PipeWire thread loop stopped");
+
+        tracing::debug!(
+            "Screen capture thread exiting, captured {} frames",
+            frame_count.load(Ordering::Relaxed)
+        );
+        Ok(())
     }
 
     /// Get the capture info (available after initialization).
@@ -421,6 +613,11 @@ impl ScreenCaptureSrc {
     /// Set the arena for output buffers.
     pub fn set_arena(&mut self, arena: SharedArena) {
         self.arena = Some(arena);
+    }
+
+    /// Get the number of frames captured so far.
+    pub fn frame_count(&self) -> u32 {
+        self.frame_count.load(Ordering::Relaxed)
     }
 
     /// Try to receive a frame without blocking.
@@ -445,16 +642,48 @@ impl ScreenCaptureSrc {
 
 impl Source for ScreenCaptureSrc {
     fn produce(&mut self, _ctx: &mut ProduceContext) -> Result<ProduceResult> {
-        // Try to receive a frame
+        // Check if we've reached the frame limit (check frames we've actually output)
+        if let Some(max) = self.config.max_frames {
+            if self.frames_produced >= max {
+                tracing::info!("Screen capture: reached max frames ({})", max);
+                return Ok(ProduceResult::Eos);
+            }
+        }
+
+        // Lazy initialization: if not initialized, do it now
+        // This uses block_in_place to run the async portal interaction
+        if !self.initialized {
+            tracing::info!("Screen capture: lazy initialization starting...");
+            let info = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(self.initialize())
+            })?;
+            tracing::info!("Screen capture initialized: {}x{}", info.width, info.height);
+            // Note: Arena is created lazily when we see the actual frame size
+        }
+
         let frame = match self.try_recv_frame() {
             Some(f) => f,
             None => return Ok(ProduceResult::WouldBlock),
         };
 
-        // Get arena for output
-        let arena = self.arena.as_ref().ok_or_else(|| {
-            Error::InvalidSegment("Screen capture not initialized with arena".into())
-        })?;
+        // Ensure we have an arena large enough for this frame
+        // The actual frame size may differ from portal-reported dimensions
+        let frame_size = frame.data.len();
+        if self.arena.is_none()
+            || self.arena.as_ref().map(|a| a.slot_size()).unwrap_or(0) < frame_size
+        {
+            tracing::debug!(
+                "Creating arena for frame size: {} bytes ({}x{})",
+                frame_size,
+                frame.width,
+                frame.height
+            );
+            let arena = SharedArena::new(frame_size, 8)
+                .map_err(|e| Error::AllocationFailed(format!("Failed to create arena: {}", e)))?;
+            self.arena = Some(arena);
+        }
+
+        let arena = self.arena.as_ref().unwrap();
 
         let frame_size = frame.data.len();
         let mut slot = arena.acquire().ok_or_else(|| {
@@ -472,7 +701,6 @@ impl Source for ScreenCaptureSrc {
             )));
         }
 
-        // Copy frame data
         slot.data_mut()[..frame_size].copy_from_slice(&frame.data);
 
         let handle = crate::buffer::MemoryHandle::with_len(slot, frame_size);
@@ -482,12 +710,14 @@ impl Source for ScreenCaptureSrc {
         metadata.set("video/stride", frame.stride);
         metadata.set("video/format", format!("{:?}", frame.format));
 
+        // Increment frames produced counter
+        self.frames_produced += 1;
+
         let buffer = Buffer::new(handle, metadata);
         Ok(ProduceResult::OwnBuffer(buffer))
     }
 
     fn output_media_caps(&self) -> ElementMediaCaps {
-        // Get dimensions from info if available, otherwise use defaults
         let (width, height) = self
             .info
             .as_ref()
@@ -526,12 +756,9 @@ impl Source for ScreenCaptureSrc {
 
 impl Drop for ScreenCaptureSrc {
     fn drop(&mut self) {
-        // Signal the capture thread to stop
         if let Some(tx) = self.shutdown_sender.take() {
             let _ = tx.send(());
         }
-
-        // Wait for the thread to finish
         if let Some(thread) = self.capture_thread.take() {
             let _ = thread.join();
         }
@@ -570,5 +797,6 @@ mod tests {
         let src = ScreenCaptureSrc::default_config();
         assert!(!src.is_initialized());
         assert!(src.info().is_none());
+        assert_eq!(src.frame_count(), 0);
     }
 }

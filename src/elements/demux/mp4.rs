@@ -550,7 +550,7 @@ impl<R: Read + Seek> Mp4Demux<R> {
         }
 
         if sample.is_sync {
-            metadata.flags = metadata.flags | BufferFlags::SYNC_POINT;
+            metadata.flags |= BufferFlags::SYNC_POINT;
         }
 
         Ok(Buffer::new(handle, metadata))

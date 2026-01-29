@@ -1,145 +1,128 @@
-//! Screen capture via XDG Desktop Portal.
+//! Screen capture to MP4 video file using Pipeline.
 //!
-//! This example captures screen content and saves it to a raw video file
-//! that can be played with ffplay or converted with ffmpeg.
+//! This example captures screen content and encodes it to an MP4 file
+//! that can be played in VLC, mpv, or any standard video player.
 //!
-//! Run with: cargo run --example 46_screen_capture --features screen-capture
-//!
-//! After capture, play with:
-//!   ffplay -f rawvideo -pixel_format bgra -video_size WIDTHxHEIGHT screen_capture.raw
-//!
-//! Or convert to MP4:
-//!   ffmpeg -f rawvideo -pixel_format bgra -video_size WIDTHxHEIGHT -framerate 30 \
-//!          -i screen_capture.raw -c:v libx264 -pix_fmt yuv420p screen_capture.mp4
+//! Run with:
+//!   cargo run --example 46_screen_capture --features "screen-capture,h264,mp4-demux"
 //!
 //! Requirements:
 //! - XDG Desktop Portal service running
 //! - PipeWire session manager
 //! - Portal backend (xdg-desktop-portal-gnome, xdg-desktop-portal-kde, etc.)
 
-use std::fs::File;
-use std::io::Write;
-use std::time::{Duration, Instant};
-
+use parallax::converters::PixelFormat;
+use parallax::elements::codec::{H264Encoder, H264EncoderConfig};
 use parallax::elements::device::{CaptureSourceType, ScreenCaptureConfig, ScreenCaptureSrc};
+use parallax::elements::io::FileSink;
+use parallax::elements::mux::{Mp4MuxTransform, Mp4MuxTransformConfig};
+use parallax::elements::transform::VideoConvertElement;
 use parallax::error::Result;
+use parallax::memory::SharedArena;
+use parallax::pipeline::Pipeline;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing for debug output
     tracing_subscriber::fmt()
-        .with_env_filter("parallax=info")
+        .with_env_filter("parallax=debug,warn")
         .init();
 
-    println!("Screen Capture Example");
-    println!("======================");
+    println!("Screen Capture to MP4 Pipeline Example");
+    println!("======================================");
     println!();
     println!("This will prompt you to select a screen or window to capture.");
     println!();
 
-    // Create screen capture configuration
-    let config = ScreenCaptureConfig {
-        source_type: CaptureSourceType::Any, // Let user choose monitor or window
+    // Capture settings
+    let capture_duration_seconds = 5;
+    let framerate = 30.0;
+    let max_frames = (capture_duration_seconds as f32 * framerate) as u32;
+
+    // Create screen capture configuration with frame limit
+    let capture_config = ScreenCaptureConfig {
+        source_type: CaptureSourceType::Any,
         show_cursor: true,
         persist_session: false,
+        max_frames: Some(max_frames),
     };
 
-    // Create the screen capture source
-    let mut capture = ScreenCaptureSrc::new(config);
+    // Create the pipeline elements
+    // 1. Screen capture source (BGRA format from PipeWire)
+    let capture = ScreenCaptureSrc::new(capture_config);
 
-    // Initialize the portal session (this shows the permission dialog)
-    println!("Requesting screen capture permission...");
-    let info = capture.initialize().await?;
+    // Screen capture typically returns 1920x1080 (full HD)
+    // Note: The actual size is determined at runtime by the portal/PipeWire
+    let capture_width = 1920;
+    let capture_height = 1080;
 
+    // 2. Video converter: BGRA -> I420 (YUV420) for H.264 encoding
+    // BGRx from PipeWire is treated as BGRA (alpha ignored)
+    let converter = VideoConvertElement::new()
+        .with_input_format(PixelFormat::Bgra)
+        .with_output_format(PixelFormat::I420)
+        .with_size(capture_width, capture_height);
+
+    // 3. H.264 encoder
+    let encoder_config = H264EncoderConfig::new(1920, 1080)
+        .frame_rate(framerate)
+        .bitrate(4_000_000); // 4 Mbps for good quality screen capture
+    let encoder = H264Encoder::new(encoder_config)?;
+
+    // 4. MP4 muxer (transform, not sink - outputs complete MP4 on flush)
+    let mp4_config = Mp4MuxTransformConfig::new(1920, 1080).with_framerate(framerate);
+    let mp4_mux = Mp4MuxTransform::new(mp4_config);
+
+    // 5. File sink to write the MP4 data
+    let output_filename = "screen_capture.mp4";
+    let file_sink = FileSink::new(output_filename);
+
+    // Build the pipeline with a large enough arena for 1920x1080 BGRA frames
+    // BGRA = 4 bytes per pixel, 1920x1080 = ~8.3 MB per frame
+    let frame_size = 1920 * 1080 * 4;
+    let arena = SharedArena::new(frame_size, 8)?; // 8 frame slots
+
+    let mut pipeline = Pipeline::new();
+
+    let src = pipeline.add_source_with_arena("screen_capture", capture, arena);
+    let convert = pipeline.add_filter("videoconvert", converter);
+    let enc = pipeline.add_filter("h264enc", encoder);
+    let mux = pipeline.add_filter("mp4mux", mp4_mux);
+    let sink = pipeline.add_sink("filesink", file_sink);
+
+    pipeline.link(src, convert)?;
+    pipeline.link(convert, enc)?;
+    pipeline.link(enc, mux)?;
+    pipeline.link(mux, sink)?;
+
+    println!("Pipeline: ScreenCapture -> VideoConvert -> H264Encoder -> Mp4Mux -> FileSink");
     println!();
-    println!("Screen capture initialized:");
-    println!("  Resolution: {}x{}", info.width, info.height);
-    println!("  PipeWire node ID: {}", info.node_id);
+    println!(
+        "Capturing {} seconds ({} frames at {} fps)...",
+        capture_duration_seconds, max_frames, framerate
+    );
+    println!("(Permission dialog will appear)");
     println!();
 
-    // Open output file
-    let output_filename = "screen_capture.raw";
-    let mut output_file = File::create(output_filename)?;
-
-    // Capture frames
-    let capture_duration = Duration::from_secs(5);
-    let mut frame_count = 0;
-    let mut total_bytes = 0usize;
-    let start = Instant::now();
-
-    // Track actual frame dimensions (may differ from info)
-    let mut actual_width = 0u32;
-    let mut actual_height = 0u32;
-
-    println!("Capturing for {} seconds...", capture_duration.as_secs());
-    println!("(Select a window/screen in the portal dialog that appears)");
-    println!();
-
-    while start.elapsed() < capture_duration {
-        // Try to receive a frame with timeout
-        if let Some(frame) = capture.recv_frame_timeout(Duration::from_millis(100)) {
-            frame_count += 1;
-            total_bytes += frame.data.len();
-
-            // Track dimensions from first frame
-            if frame_count == 1 {
-                actual_width = frame.width;
-                actual_height = frame.height;
-                println!(
-                    "First frame: {}x{}, stride={}, {} bytes",
-                    frame.width,
-                    frame.height,
-                    frame.stride,
-                    frame.data.len()
-                );
-            }
-
-            // Write raw frame data to file
-            output_file.write_all(&frame.data)?;
-
-            // Progress update every 10 frames
-            if frame_count % 10 == 0 {
-                println!(
-                    "  Captured {} frames ({:.1} MB)...",
-                    frame_count,
-                    total_bytes as f64 / 1_000_000.0
-                );
-            }
+    // Run the pipeline - it will stop when max_frames is reached
+    match pipeline.run().await {
+        Ok(()) => {
+            println!();
+            println!("Capture complete!");
+        }
+        Err(e) => {
+            println!();
+            println!("Pipeline error: {}", e);
         }
     }
 
     println!();
-    println!("Capture complete!");
-    println!("  Frames: {}", frame_count);
-    println!("  Duration: {:.1}s", start.elapsed().as_secs_f64());
-    println!(
-        "  FPS: {:.1}",
-        frame_count as f64 / start.elapsed().as_secs_f64()
-    );
-    println!("  Total size: {:.1} MB", total_bytes as f64 / 1_000_000.0);
-    println!();
     println!("Output saved to: {}", output_filename);
     println!();
-
-    if actual_width > 0 && actual_height > 0 {
-        println!("To play the raw video:");
-        println!(
-            "  ffplay -f rawvideo -pixel_format bgra -video_size {}x{} {}",
-            actual_width, actual_height, output_filename
-        );
-        println!();
-        println!("To convert to MP4:");
-        println!(
-            "  ffmpeg -f rawvideo -pixel_format bgra -video_size {}x{} -framerate {:.0} \\",
-            actual_width,
-            actual_height,
-            frame_count as f64 / start.elapsed().as_secs_f64()
-        );
-        println!(
-            "         -i {} -c:v libx264 -pix_fmt yuv420p screen_capture.mp4",
-            output_filename
-        );
-    }
+    println!("To play:");
+    println!("  mpv {}", output_filename);
+    println!("  vlc {}", output_filename);
+    println!("  ffplay {}", output_filename);
 
     Ok(())
 }

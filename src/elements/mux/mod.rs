@@ -34,8 +34,8 @@ mod ts_element;
 
 #[cfg(feature = "mp4-demux")]
 pub use mp4::{
-    AudioCodecConfig, Mp4AudioTrackConfig, Mp4Mux, Mp4MuxConfig, Mp4MuxStats, Mp4VideoTrackConfig,
-    VideoCodecConfig,
+    AudioCodecConfig, Mp4AudioTrackConfig, Mp4FileSink, Mp4FileSinkConfig, Mp4Mux, Mp4MuxConfig,
+    Mp4MuxStats, Mp4MuxTransform, Mp4MuxTransformConfig, Mp4VideoTrackConfig, VideoCodecConfig,
 };
 
 #[cfg(feature = "mpeg-ts")]

@@ -145,6 +145,7 @@ pub use traits::{
     SinkAdapter,
     Source,
     SourceAdapter,
+    SourceResult,
     Transform,
     TransformAdapter,
     TrustLevel,

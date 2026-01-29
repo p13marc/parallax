@@ -36,8 +36,9 @@ use crate::error::{Error, Result};
 use crate::memory::SharedArena;
 use crate::metadata::Metadata;
 
+use openh264::OpenH264API;
 use openh264::decoder::{DecodedYUV, Decoder};
-use openh264::encoder::{EncodedBitStream, Encoder, EncoderConfig};
+use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate};
 use openh264::formats::YUVSource;
 
 // ============================================================================
@@ -153,18 +154,19 @@ pub struct H264Encoder {
 impl H264Encoder {
     /// Create a new H.264 encoder with the given configuration.
     pub fn new(config: H264EncoderConfig) -> Result<Self> {
-        let mut encoder_config = EncoderConfig::default();
+        let mut encoder_config = EncoderConfig::new();
 
         if config.bitrate_bps > 0 {
-            encoder_config = encoder_config.bitrate(config.bitrate_bps);
+            encoder_config = encoder_config.bitrate(BitRate::from_bps(config.bitrate_bps));
         }
 
         encoder_config = encoder_config
-            .max_frame_rate(config.max_frame_rate)
+            .max_frame_rate(FrameRate::from_hz(config.max_frame_rate))
             .scene_change_detect(config.scene_change_detect)
-            .num_threads(config.num_threads);
+            .num_threads(config.num_threads as u16);
 
-        let encoder = Encoder::with_config(encoder_config)
+        let api = OpenH264API::from_source();
+        let encoder = Encoder::with_api_config(api, encoder_config)
             .map_err(|e| Error::Config(format!("Failed to create H.264 encoder: {:?}", e)))?;
 
         // Create arena for encoded output buffers (typically < 1MB per frame)
@@ -209,7 +211,7 @@ impl H264Encoder {
             .encode(&yuv)
             .map_err(|e| Error::Config(format!("H.264 encode failed: {:?}", e)))?;
 
-        let encoded = bitstream_to_vec(&bitstream);
+        let encoded = bitstream.to_vec();
         self.frame_count += 1;
         self.bytes_encoded += encoded.len() as u64;
 
@@ -269,6 +271,74 @@ impl Element for H264Encoder {
         let handle = crate::buffer::MemoryHandle::with_len(slot, encoded.len());
         let metadata = Metadata::from_sequence(self.frame_count - 1);
         Ok(Some(Buffer::new(handle, metadata)))
+    }
+
+    fn input_media_caps(&self) -> crate::format::ElementMediaCaps {
+        // Accept I420 (YUV420) video of any size
+        use crate::format::{
+            CapsValue, ElementMediaCaps, FormatCaps, FormatMemoryCap, MemoryCaps, PixelFormat,
+            VideoFormatCaps,
+        };
+
+        let format = VideoFormatCaps {
+            width: CapsValue::Any,
+            height: CapsValue::Any,
+            pixel_format: CapsValue::Fixed(PixelFormat::I420),
+            framerate: CapsValue::Any,
+        };
+
+        ElementMediaCaps::new(vec![FormatMemoryCap::new(
+            FormatCaps::VideoRaw(format),
+            MemoryCaps::cpu_only(),
+        )])
+    }
+
+    fn output_media_caps(&self) -> crate::format::ElementMediaCaps {
+        // Output is H.264 encoded video
+        use crate::format::{
+            ElementMediaCaps, FormatCaps, FormatMemoryCap, MemoryCaps, VideoCodec,
+        };
+
+        ElementMediaCaps::new(vec![FormatMemoryCap::new(
+            FormatCaps::Video(VideoCodec::H264),
+            MemoryCaps::cpu_only(),
+        )])
+    }
+}
+
+/// VideoEncoder trait implementation for H264Encoder.
+///
+/// This allows H264Encoder to be used with `EncoderElement` for pipeline integration.
+impl super::traits::VideoEncoder for H264Encoder {
+    type Packet = Vec<u8>;
+
+    fn encode(&mut self, frame: &super::common::VideoFrame) -> Result<Vec<Self::Packet>> {
+        // Validate frame dimensions match encoder config
+        if frame.width != self.config.width || frame.height != self.config.height {
+            return Err(Error::Config(format!(
+                "Frame dimensions {}x{} don't match encoder config {}x{}",
+                frame.width, frame.height, self.config.width, self.config.height
+            )));
+        }
+
+        let encoded = self.encode_yuv420(&frame.data)?;
+
+        if encoded.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Ok(vec![encoded])
+        }
+    }
+
+    fn flush(&mut self) -> Result<Vec<Self::Packet>> {
+        // OpenH264 doesn't buffer frames, so flush is a no-op
+        Ok(Vec::new())
+    }
+
+    fn codec_data(&self) -> Option<Vec<u8>> {
+        // H.264 codec data (SPS/PPS) would be extracted from the first encoded frame
+        // For now, return None - the first keyframe contains the headers inline
+        None
     }
 }
 
@@ -416,10 +486,11 @@ pub struct DecodedFrame {
 
 impl DecodedFrame {
     fn from_decoded_yuv(yuv: DecodedYUV) -> Self {
-        let (width, height) = yuv.dimension_rgb();
+        let (width, height) = yuv.dimensions();
         let y_data = yuv.y().to_vec();
         let u_data = yuv.u().to_vec();
         let v_data = yuv.v().to_vec();
+        let (y_stride, u_stride, v_stride) = yuv.strides();
 
         Self {
             y_data,
@@ -427,9 +498,9 @@ impl DecodedFrame {
             v_data,
             width,
             height,
-            y_stride: yuv.strides_yuv().0,
-            u_stride: yuv.strides_yuv().1,
-            v_stride: yuv.strides_yuv().2,
+            y_stride,
+            u_stride,
+            v_stride,
         }
     }
 
@@ -518,12 +589,12 @@ struct YuvFrame<'a> {
 }
 
 impl<'a> YUVSource for YuvFrame<'a> {
-    fn width(&self) -> i32 {
-        self.width as i32
+    fn dimensions(&self) -> (usize, usize) {
+        (self.width, self.height)
     }
 
-    fn height(&self) -> i32 {
-        self.height as i32
+    fn strides(&self) -> (usize, usize, usize) {
+        (self.width, self.width / 2, self.width / 2)
     }
 
     fn y(&self) -> &[u8] {
@@ -541,29 +612,6 @@ impl<'a> YUVSource for YuvFrame<'a> {
         let u_size = (self.width / 2) * (self.height / 2);
         &self.data[y_size + u_size..]
     }
-
-    fn y_stride(&self) -> i32 {
-        self.width as i32
-    }
-
-    fn u_stride(&self) -> i32 {
-        (self.width / 2) as i32
-    }
-
-    fn v_stride(&self) -> i32 {
-        (self.width / 2) as i32
-    }
-}
-
-/// Convert EncodedBitStream to Vec<u8>.
-fn bitstream_to_vec(bitstream: &EncodedBitStream) -> Vec<u8> {
-    let mut output = Vec::new();
-    for layer in bitstream.into_iter() {
-        for nal in layer.nal_units() {
-            output.extend_from_slice(nal);
-        }
-    }
-    output
 }
 
 // ============================================================================

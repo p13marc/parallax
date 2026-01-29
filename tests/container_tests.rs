@@ -51,7 +51,8 @@ mod mp4_demux_tests {
 
 #[cfg(feature = "mp4-demux")]
 mod mp4_mux_tests {
-    use super::*;
+    use std::io::Cursor;
+
     use parallax::elements::mux::{
         AudioCodecConfig, Mp4AudioTrackConfig, Mp4Mux, Mp4MuxConfig, Mp4VideoTrackConfig,
         VideoCodecConfig,
@@ -286,7 +287,8 @@ mod mp4_mux_tests {
 
 #[cfg(feature = "mp4-demux")]
 mod mp4_roundtrip_tests {
-    use super::*;
+    use std::io::Cursor;
+
     use parallax::elements::demux::{Mp4Codec, Mp4Demux, Mp4TrackType};
     use parallax::elements::mux::{Mp4AudioTrackConfig, Mp4Mux, Mp4MuxConfig, Mp4VideoTrackConfig};
 

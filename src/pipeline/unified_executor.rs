@@ -33,7 +33,7 @@
 use crate::buffer::Buffer;
 use crate::element::{
     Affinity, AsyncElementDyn, DynAsyncElement, ElementType, ExecutionHints, LatencyHint, Output,
-    ProcessingHint, TrustLevel,
+    ProcessingHint, SourceResult, TrustLevel,
 };
 use crate::error::{Error, Result};
 use crate::execution::ExecutionMode;
@@ -1006,11 +1006,20 @@ fn spawn_source_task(
         events.send_node_started(&name);
 
         let mut count: u64 = 0;
+        let mut would_block_count: u64 = 0;
 
         loop {
-            match element.process(None).await {
-                Ok(Some(buffer)) => {
+            tracing::trace!("source '{}': calling process_source", name);
+            match element.process_source().await {
+                Ok(SourceResult::Buffer(buffer)) => {
                     count += 1;
+                    would_block_count = 0; // Reset
+                    tracing::debug!(
+                        "source '{}': produced buffer {} ({} bytes)",
+                        name,
+                        count,
+                        buffer.len()
+                    );
                     for tx in &outputs {
                         let _ = tx.send(Message::Buffer(buffer.clone())).await;
                     }
@@ -1018,13 +1027,27 @@ fn spawn_source_task(
                         let _ = bridge.push_async(buffer.clone()).await;
                     }
                 }
-                Ok(None) => {
+                Ok(SourceResult::WouldBlock) => {
+                    would_block_count += 1;
+                    if would_block_count == 1 || would_block_count % 1000 == 0 {
+                        tracing::debug!(
+                            "source '{}': WouldBlock (count: {})",
+                            name,
+                            would_block_count
+                        );
+                    }
+                    // No data available yet, sleep briefly and retry
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                Ok(SourceResult::Eos) => {
+                    tracing::info!("source '{}': EOS after {} buffers", name, count);
                     for tx in &outputs {
                         let _ = tx.send(Message::Eos).await;
                     }
                     break;
                 }
                 Err(e) => {
+                    tracing::error!("source '{}': error: {}", name, e);
                     events.send_error(e.to_string(), Some(name.clone()));
                     return Err(e);
                 }
@@ -1081,23 +1104,48 @@ fn spawn_transform_task(
 
         if let Some(rx) = inputs.into_iter().next() {
             loop {
+                tracing::trace!("transform '{}': waiting for input", name);
                 match rx.recv().await {
                     Ok(Message::Buffer(buffer)) => {
                         count += 1;
+                        let input_len = buffer.len();
+                        tracing::debug!(
+                            "transform '{}': received buffer {} ({} bytes)",
+                            name,
+                            count,
+                            input_len
+                        );
                         match element.process(Some(buffer)).await {
                             Ok(Some(out)) => {
+                                tracing::debug!(
+                                    "transform '{}': produced output ({} bytes)",
+                                    name,
+                                    out.len()
+                                );
                                 for tx in &outputs {
                                     let _ = tx.send(Message::Buffer(out.clone())).await;
                                 }
                             }
-                            Ok(None) => {}
+                            Ok(None) => {
+                                tracing::debug!(
+                                    "transform '{}': no output for buffer {}",
+                                    name,
+                                    count
+                                );
+                            }
                             Err(e) => {
+                                tracing::error!("transform '{}': error: {}", name, e);
                                 events.send_error(e.to_string(), Some(name.clone()));
                                 return Err(e);
                             }
                         }
                     }
                     Ok(Message::Eos) => {
+                        tracing::info!(
+                            "transform '{}': received EOS after {} buffers, flushing",
+                            name,
+                            count
+                        );
                         // Flush any buffered data before propagating EOS
                         match element.flush().await {
                             Ok(output) => {
@@ -1106,6 +1154,11 @@ fn spawn_transform_task(
                                     Output::Single(b) => vec![b],
                                     Output::Multiple(v) => v,
                                 };
+                                tracing::info!(
+                                    "transform '{}': flush produced {} buffers",
+                                    name,
+                                    buffers.len()
+                                );
                                 for buffer in buffers {
                                     for tx in &outputs {
                                         let _ = tx.send(Message::Buffer(buffer.clone())).await;

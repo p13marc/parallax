@@ -424,6 +424,25 @@ impl Iterator for OutputIter {
 impl ExactSizeIterator for OutputIter {}
 
 // ============================================================================
+// Source Result (for proper WouldBlock handling)
+// ============================================================================
+
+/// Result of a source producing data.
+///
+/// This enum allows sources to properly signal when no data is available
+/// yet (WouldBlock) vs end of stream (Eos), which the executor handles
+/// differently.
+#[derive(Debug)]
+pub enum SourceResult {
+    /// A buffer was produced.
+    Buffer(Buffer),
+    /// No data available yet, try again later.
+    WouldBlock,
+    /// End of stream reached.
+    Eos,
+}
+
+// ============================================================================
 // Source Trait
 // ============================================================================
 
@@ -1588,6 +1607,18 @@ pub trait AsyncElementDyn {
     fn handle_upstream_event(&mut self, _event: &Event) -> EventResult {
         EventResult::NotHandled
     }
+
+    /// Process a source element, properly distinguishing WouldBlock from Eos.
+    ///
+    /// This method is used by the executor for source elements to handle
+    /// the case where no data is available yet (WouldBlock) differently
+    /// from end of stream (Eos).
+    ///
+    /// Default implementation returns `Eos`. Source adapters must override
+    /// this to properly handle buffer production and `WouldBlock`.
+    fn process_source(&mut self) -> impl std::future::Future<Output = Result<SourceResult>> + Send {
+        async { Ok(SourceResult::Eos) }
+    }
 }
 
 // ============================================================================
@@ -1786,6 +1817,91 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
 
     fn execution_hints(&self) -> ExecutionHints {
         self.inner.execution_hints()
+    }
+
+    async fn process_source(&mut self) -> Result<SourceResult> {
+        // This implementation properly distinguishes WouldBlock from Eos
+        if let Some(pool) = &self.pool {
+            if let Some(arena) = &self.arena {
+                if let Some(slot) = arena.acquire() {
+                    let mut ctx = ProduceContext::with_pool(slot, pool.as_ref());
+                    match self.inner.produce(&mut ctx)? {
+                        ProduceResult::Produced(n) => Ok(SourceResult::Buffer(ctx.finalize(n))),
+                        ProduceResult::Eos => Ok(SourceResult::Eos),
+                        ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(buffer)),
+                        ProduceResult::OwnDmaBuf(dmabuf) => {
+                            Ok(SourceResult::Buffer(dmabuf.to_buffer(arena)?))
+                        }
+                        ProduceResult::WouldBlock => Ok(SourceResult::WouldBlock),
+                    }
+                } else {
+                    let mut ctx = ProduceContext::with_pool_only(pool.as_ref());
+                    match self.inner.produce(&mut ctx)? {
+                        ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(buffer)),
+                        ProduceResult::OwnDmaBuf(_) => Err(crate::error::Error::BufferPool(
+                            "arena exhausted, cannot convert DmaBuf to Buffer".into(),
+                        )),
+                        ProduceResult::Eos => Ok(SourceResult::Eos),
+                        ProduceResult::WouldBlock => Ok(SourceResult::WouldBlock),
+                        ProduceResult::Produced(_) => Err(crate::error::Error::BufferPool(
+                            "arena exhausted and source doesn't provide own buffer".into(),
+                        )),
+                    }
+                }
+            } else {
+                let mut ctx = ProduceContext::with_pool_only(pool.as_ref());
+                match self.inner.produce(&mut ctx)? {
+                    ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(buffer)),
+                    ProduceResult::OwnDmaBuf(_) => Err(crate::error::Error::BufferPool(
+                        "no arena configured, cannot convert DmaBuf to Buffer".into(),
+                    )),
+                    ProduceResult::Eos => Ok(SourceResult::Eos),
+                    ProduceResult::WouldBlock => Ok(SourceResult::WouldBlock),
+                    ProduceResult::Produced(_) => Err(crate::error::Error::BufferPool(
+                        "no arena configured and source doesn't provide own buffer".into(),
+                    )),
+                }
+            }
+        } else if let Some(arena) = &self.arena {
+            if let Some(slot) = arena.acquire() {
+                let mut ctx = ProduceContext::new(slot);
+                match self.inner.produce(&mut ctx)? {
+                    ProduceResult::Produced(n) => Ok(SourceResult::Buffer(ctx.finalize(n))),
+                    ProduceResult::Eos => Ok(SourceResult::Eos),
+                    ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(buffer)),
+                    ProduceResult::OwnDmaBuf(dmabuf) => {
+                        Ok(SourceResult::Buffer(dmabuf.to_buffer(arena)?))
+                    }
+                    ProduceResult::WouldBlock => Ok(SourceResult::WouldBlock),
+                }
+            } else {
+                let mut ctx = ProduceContext::without_buffer();
+                match self.inner.produce(&mut ctx)? {
+                    ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(buffer)),
+                    ProduceResult::OwnDmaBuf(_) => Err(crate::error::Error::BufferPool(
+                        "arena exhausted, cannot convert DmaBuf to Buffer".into(),
+                    )),
+                    ProduceResult::Eos => Ok(SourceResult::Eos),
+                    ProduceResult::WouldBlock => Ok(SourceResult::WouldBlock),
+                    ProduceResult::Produced(_) => Err(crate::error::Error::BufferPool(
+                        "arena exhausted and source doesn't provide own buffer".into(),
+                    )),
+                }
+            }
+        } else {
+            let mut ctx = ProduceContext::without_buffer();
+            match self.inner.produce(&mut ctx)? {
+                ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(buffer)),
+                ProduceResult::OwnDmaBuf(_) => Err(crate::error::Error::BufferPool(
+                    "no arena configured, cannot convert DmaBuf to Buffer".into(),
+                )),
+                ProduceResult::Eos => Ok(SourceResult::Eos),
+                ProduceResult::WouldBlock => Ok(SourceResult::WouldBlock),
+                ProduceResult::Produced(_) => Err(crate::error::Error::BufferPool(
+                    "no arena configured and source doesn't provide own buffer".into(),
+                )),
+            }
+        }
     }
 }
 
@@ -2229,6 +2345,50 @@ impl<S: AsyncSource + Send + 'static> SendAsyncElementDyn for AsyncSourceAdapter
 
     fn execution_hints(&self) -> ExecutionHints {
         self.inner.execution_hints()
+    }
+
+    async fn process_source(&mut self) -> Result<SourceResult> {
+        // This implementation properly distinguishes WouldBlock from Eos
+        if let Some(arena) = &self.arena {
+            if let Some(slot) = arena.acquire() {
+                let mut ctx = ProduceContext::new(slot);
+                match self.inner.produce(&mut ctx).await? {
+                    ProduceResult::Produced(n) => Ok(SourceResult::Buffer(ctx.finalize(n))),
+                    ProduceResult::Eos => Ok(SourceResult::Eos),
+                    ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(buffer)),
+                    ProduceResult::OwnDmaBuf(dmabuf) => {
+                        Ok(SourceResult::Buffer(dmabuf.to_buffer(arena)?))
+                    }
+                    ProduceResult::WouldBlock => Ok(SourceResult::WouldBlock),
+                }
+            } else {
+                let mut ctx = ProduceContext::without_buffer();
+                match self.inner.produce(&mut ctx).await? {
+                    ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(buffer)),
+                    ProduceResult::OwnDmaBuf(_) => Err(crate::error::Error::BufferPool(
+                        "arena exhausted, cannot convert DmaBuf to Buffer".into(),
+                    )),
+                    ProduceResult::Eos => Ok(SourceResult::Eos),
+                    ProduceResult::WouldBlock => Ok(SourceResult::WouldBlock),
+                    ProduceResult::Produced(_) => Err(crate::error::Error::BufferPool(
+                        "arena exhausted and source doesn't provide own buffer".into(),
+                    )),
+                }
+            }
+        } else {
+            let mut ctx = ProduceContext::without_buffer();
+            match self.inner.produce(&mut ctx).await? {
+                ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(buffer)),
+                ProduceResult::OwnDmaBuf(_) => Err(crate::error::Error::BufferPool(
+                    "no arena configured, cannot convert DmaBuf to Buffer".into(),
+                )),
+                ProduceResult::Eos => Ok(SourceResult::Eos),
+                ProduceResult::WouldBlock => Ok(SourceResult::WouldBlock),
+                ProduceResult::Produced(_) => Err(crate::error::Error::BufferPool(
+                    "no arena configured and source doesn't provide own buffer".into(),
+                )),
+            }
+        }
     }
 }
 

@@ -476,9 +476,7 @@ impl DmaBufBuffer {
     ///
     /// Returns an error if the arena is exhausted.
     pub fn to_buffer(&self, arena: &crate::memory::SharedArena) -> crate::error::Result<Buffer> {
-        let mut slot = arena
-            .acquire()
-            .ok_or_else(|| crate::error::Error::PoolExhausted)?;
+        let mut slot = arena.acquire().ok_or(crate::error::Error::PoolExhausted)?;
 
         let data = self.as_bytes();
         if data.len() > slot.len() {

@@ -508,7 +508,7 @@ impl Pipeline {
                     match policy {
                         ConverterPolicy::Deny => {
                             // Build a helpful error message
-                            return Err(self.build_converter_needed_error(&pending));
+                            return Err(self.build_converter_needed_error(pending));
                         }
                         ConverterPolicy::Warn => {
                             // Log warnings for each converter

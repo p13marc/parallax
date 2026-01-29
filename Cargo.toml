@@ -263,4 +263,4 @@ required-features = ["v4l2"]
 
 [[example]]
 name = "46_screen_capture"
-required-features = ["screen-capture"]
+required-features = ["screen-capture", "h264", "mp4-demux"]

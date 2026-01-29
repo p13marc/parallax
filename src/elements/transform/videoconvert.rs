@@ -241,6 +241,44 @@ impl Element for VideoConvertElement {
         // Use 0x0 dimensions since we don't know them until we process the first frame
         Caps::video_raw_any_resolution(convert_pixel_format(self.output_format))
     }
+
+    fn input_media_caps(&self) -> crate::format::ElementMediaCaps {
+        // Accept any raw video format - truly any dimensions and pixel format
+        use crate::format::{
+            CapsValue, ElementMediaCaps, FormatCaps, FormatMemoryCap, MemoryCaps, VideoFormatCaps,
+        };
+
+        let format = VideoFormatCaps {
+            width: CapsValue::Any,
+            height: CapsValue::Any,
+            pixel_format: CapsValue::Any,
+            framerate: CapsValue::Any,
+        };
+
+        ElementMediaCaps::new(vec![FormatMemoryCap::new(
+            FormatCaps::VideoRaw(format),
+            MemoryCaps::cpu_only(),
+        )])
+    }
+
+    fn output_media_caps(&self) -> crate::format::ElementMediaCaps {
+        // Output is the configured output format with any dimensions
+        use crate::format::{
+            CapsValue, ElementMediaCaps, FormatCaps, FormatMemoryCap, MemoryCaps, VideoFormatCaps,
+        };
+
+        let format = VideoFormatCaps {
+            width: CapsValue::Any,
+            height: CapsValue::Any,
+            pixel_format: CapsValue::Fixed(convert_pixel_format(self.output_format)),
+            framerate: CapsValue::Any,
+        };
+
+        ElementMediaCaps::new(vec![FormatMemoryCap::new(
+            FormatCaps::VideoRaw(format),
+            MemoryCaps::cpu_only(),
+        )])
+    }
 }
 
 /// Convert from converters::PixelFormat to format::PixelFormat

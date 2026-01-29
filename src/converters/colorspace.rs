@@ -238,6 +238,9 @@ impl VideoConvert {
             (PixelFormat::Rgba, PixelFormat::I420) => {
                 self.rgba_to_i420(input, output);
             }
+            (PixelFormat::Bgra, PixelFormat::I420) => {
+                self.bgra_to_i420(input, output);
+            }
 
             // RGB swizzle conversions
             (PixelFormat::Rgb24, PixelFormat::Bgr24) => {
@@ -711,6 +714,52 @@ impl VideoConvert {
                         let r = input[src_idx];
                         let g = input[src_idx + 1];
                         let b = input[src_idx + 2];
+                        let (_, u, v) = self.rgb_to_yuv(r, g, b);
+                        u_sum += u as u32;
+                        v_sum += v as u32;
+                    }
+                }
+
+                let uv_idx = (row / 2) * (w / 2) + (col / 2);
+                output[y_size + uv_idx] = (u_sum / 4) as u8;
+                output[y_size + uv_size + uv_idx] = (v_sum / 4) as u8;
+            }
+        }
+    }
+
+    fn bgra_to_i420(&self, input: &[u8], output: &mut [u8]) {
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let y_size = w * h;
+        let uv_size = (w / 2) * (h / 2);
+
+        // Compute Y for all pixels
+        // BGRA layout: B=0, G=1, R=2, A=3
+        for row in 0..h {
+            for col in 0..w {
+                let src_idx = (row * w + col) * 4;
+                let b = input[src_idx];
+                let g = input[src_idx + 1];
+                let r = input[src_idx + 2];
+                // Alpha ignored
+
+                let (y, _, _) = self.rgb_to_yuv(r, g, b);
+                output[row * w + col] = y;
+            }
+        }
+
+        // Average U/V in 2x2 blocks
+        for row in (0..h).step_by(2) {
+            for col in (0..w).step_by(2) {
+                let mut u_sum = 0u32;
+                let mut v_sum = 0u32;
+
+                for dy in 0..2 {
+                    for dx in 0..2 {
+                        let src_idx = ((row + dy) * w + (col + dx)) * 4;
+                        let b = input[src_idx];
+                        let g = input[src_idx + 1];
+                        let r = input[src_idx + 2];
                         let (_, u, v) = self.rgb_to_yuv(r, g, b);
                         u_sum += u as u32;
                         v_sum += v as u32;

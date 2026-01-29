@@ -8,7 +8,7 @@
 //!
 //! Run: `cargo run --example 14_h264 --features h264`
 
-use parallax::elements::codec::OpenH264Encoder;
+use parallax::elements::codec::{H264Encoder, H264EncoderConfig};
 use parallax::elements::{FileSink, VideoTestSrc};
 use parallax::error::Result;
 use parallax::pipeline::Pipeline;
@@ -26,11 +26,14 @@ async fn main() -> Result<()> {
     // Video test source: 320x240, 30 frames
     let src = pipeline.add_source(
         "videotestsrc",
-        VideoTestSrc::new().with_size(320, 240).with_num_frames(30),
+        VideoTestSrc::new()
+            .with_resolution(320, 240)
+            .with_num_frames(30),
     );
 
     // H.264 encoder
-    let encoder = pipeline.add_filter("h264enc", OpenH264Encoder::new(320, 240)?);
+    let encoder_config = H264EncoderConfig::new(320, 240);
+    let encoder = pipeline.add_filter("h264enc", H264Encoder::new(encoder_config)?);
 
     // File sink
     let sink = pipeline.add_sink("filesink", FileSink::new(&output_path));

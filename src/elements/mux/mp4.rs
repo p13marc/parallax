@@ -555,8 +555,667 @@ impl<W: Write + Seek> std::fmt::Debug for Mp4Mux<W> {
 }
 
 // ============================================================================
+// MP4 File Sink Element
+// ============================================================================
+
+use crate::element::{ConsumeContext, Sink};
+use std::fs::File;
+use std::io::BufWriter;
+use std::path::{Path, PathBuf};
+
+/// Configuration for the MP4 file sink.
+#[derive(Debug, Clone)]
+pub struct Mp4FileSinkConfig {
+    /// Video width in pixels.
+    pub width: u16,
+    /// Video height in pixels.
+    pub height: u16,
+    /// Frame rate (frames per second).
+    pub framerate: f32,
+    /// H.264 SPS data (extracted from first keyframe if not provided).
+    pub sps: Option<Vec<u8>>,
+    /// H.264 PPS data (extracted from first keyframe if not provided).
+    pub pps: Option<Vec<u8>>,
+}
+
+impl Mp4FileSinkConfig {
+    /// Create a new MP4 file sink configuration.
+    pub fn new(width: u16, height: u16) -> Self {
+        Self {
+            width,
+            height,
+            framerate: 30.0,
+            sps: None,
+            pps: None,
+        }
+    }
+
+    /// Set the frame rate.
+    pub fn with_framerate(mut self, fps: f32) -> Self {
+        self.framerate = fps;
+        self
+    }
+
+    /// Set the H.264 SPS/PPS data.
+    pub fn with_codec_data(mut self, sps: Vec<u8>, pps: Vec<u8>) -> Self {
+        self.sps = Some(sps);
+        self.pps = Some(pps);
+        self
+    }
+}
+
+/// MP4 file sink element for H.264 video.
+///
+/// This element writes H.264 encoded video frames to an MP4 file.
+/// It automatically extracts SPS/PPS from the first keyframe and
+/// creates a properly formatted MP4 file.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use parallax::elements::mux::{Mp4FileSink, Mp4FileSinkConfig};
+///
+/// let config = Mp4FileSinkConfig::new(1920, 1080).with_framerate(30.0);
+/// let sink = Mp4FileSink::new("output.mp4", config)?;
+///
+/// // Use in pipeline
+/// pipeline.add_sink("mp4sink", sink);
+/// ```
+pub struct Mp4FileSink {
+    path: PathBuf,
+    config: Mp4FileSinkConfig,
+    muxer: Option<Mp4Mux<BufWriter<File>>>,
+    video_track: Option<u32>,
+    frame_count: u64,
+    frame_duration_ms: u64,
+    /// Extracted SPS from first keyframe
+    sps: Option<Vec<u8>>,
+    /// Extracted PPS from first keyframe
+    pps: Option<Vec<u8>>,
+}
+
+impl Mp4FileSink {
+    /// Create a new MP4 file sink.
+    pub fn new<P: AsRef<Path>>(path: P, config: Mp4FileSinkConfig) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let frame_duration_ms = (1000.0 / config.framerate) as u64;
+
+        Ok(Self {
+            path,
+            config,
+            muxer: None,
+            video_track: None,
+            frame_count: 0,
+            frame_duration_ms,
+            sps: None,
+            pps: None,
+        })
+    }
+
+    /// Extract SPS and PPS from H.264 NAL units.
+    ///
+    /// Scans the data for NAL units and extracts SPS (type 7) and PPS (type 8).
+    pub fn extract_sps_pps(data: &[u8]) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+        let mut sps = None;
+        let mut pps = None;
+        let mut i = 0;
+
+        while i + 4 < data.len() {
+            // Look for start code (0x00 0x00 0x00 0x01 or 0x00 0x00 0x01)
+            let start_code_len = if i + 4 <= data.len()
+                && data[i] == 0
+                && data[i + 1] == 0
+                && data[i + 2] == 0
+                && data[i + 3] == 1
+            {
+                4
+            } else if i + 3 <= data.len() && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+                3
+            } else {
+                i += 1;
+                continue;
+            };
+
+            let nal_start = i + start_code_len;
+            if nal_start >= data.len() {
+                break;
+            }
+
+            let nal_type = data[nal_start] & 0x1F;
+
+            // Find end of this NAL unit (next start code or end of data)
+            let mut nal_end = data.len();
+            for j in (nal_start + 1)..(data.len().saturating_sub(2)) {
+                if (data[j] == 0 && data[j + 1] == 0 && data[j + 2] == 1)
+                    || (j + 3 < data.len()
+                        && data[j] == 0
+                        && data[j + 1] == 0
+                        && data[j + 2] == 0
+                        && data[j + 3] == 1)
+                {
+                    nal_end = j;
+                    break;
+                }
+            }
+
+            let nal_data = &data[nal_start..nal_end];
+
+            match nal_type {
+                7 => {
+                    // SPS
+                    sps = Some(nal_data.to_vec());
+                }
+                8 => {
+                    // PPS
+                    pps = Some(nal_data.to_vec());
+                }
+                _ => {}
+            }
+
+            i = nal_end;
+        }
+
+        (sps, pps)
+    }
+
+    /// Convert Annex-B format to AVCC format.
+    ///
+    /// Replaces start codes (0x00 0x00 0x00 0x01) with 4-byte length prefixes.
+    pub fn annex_b_to_avcc(data: &[u8]) -> Vec<u8> {
+        let mut result = Vec::with_capacity(data.len());
+        let mut i = 0;
+
+        while i < data.len() {
+            // Find start code
+            let start_code_len = if i + 4 <= data.len()
+                && data[i] == 0
+                && data[i + 1] == 0
+                && data[i + 2] == 0
+                && data[i + 3] == 1
+            {
+                4
+            } else if i + 3 <= data.len() && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+                3
+            } else {
+                // No start code at this position, just copy byte
+                result.push(data[i]);
+                i += 1;
+                continue;
+            };
+
+            let nal_start = i + start_code_len;
+            if nal_start >= data.len() {
+                break;
+            }
+
+            // Find end of this NAL unit
+            let mut nal_end = data.len();
+            for j in (nal_start + 1)..(data.len().saturating_sub(2)) {
+                if (data[j] == 0 && data[j + 1] == 0 && data[j + 2] == 1)
+                    || (j + 3 < data.len()
+                        && data[j] == 0
+                        && data[j + 1] == 0
+                        && data[j + 2] == 0
+                        && data[j + 3] == 1)
+                {
+                    nal_end = j;
+                    break;
+                }
+            }
+
+            let nal_data = &data[nal_start..nal_end];
+            let nal_len = nal_data.len() as u32;
+
+            // Write 4-byte length prefix (big-endian)
+            result.extend_from_slice(&nal_len.to_be_bytes());
+            result.extend_from_slice(nal_data);
+
+            i = nal_end;
+        }
+
+        result
+    }
+
+    /// Initialize the muxer with the given SPS/PPS.
+    fn initialize_muxer(&mut self, sps: &[u8], pps: &[u8]) -> Result<()> {
+        let file = File::create(&self.path)?;
+        let writer = BufWriter::new(file);
+
+        let mut muxer = Mp4Mux::new(writer, Mp4MuxConfig::h264())?;
+
+        let video_config =
+            Mp4VideoTrackConfig::h264(self.config.width, self.config.height, sps, pps);
+        let track_id = muxer.add_video_track(video_config)?;
+
+        self.muxer = Some(muxer);
+        self.video_track = Some(track_id);
+
+        tracing::info!(
+            "MP4 muxer initialized: {}x{} @ {} fps",
+            self.config.width,
+            self.config.height,
+            self.config.framerate
+        );
+
+        Ok(())
+    }
+
+    /// Get the number of frames written.
+    pub fn frame_count(&self) -> u64 {
+        self.frame_count
+    }
+
+    /// Finalize and close the MP4 file.
+    pub fn finish(mut self) -> Result<()> {
+        if let Some(muxer) = self.muxer.take() {
+            muxer.finish()?;
+            tracing::info!(
+                "MP4 file finalized: {} frames written to {:?}",
+                self.frame_count,
+                self.path
+            );
+        }
+        Ok(())
+    }
+}
+
+impl Sink for Mp4FileSink {
+    fn input_media_caps(&self) -> crate::format::ElementMediaCaps {
+        // Accept H.264 encoded video
+        use crate::format::{
+            ElementMediaCaps, FormatCaps, FormatMemoryCap, MemoryCaps, VideoCodec,
+        };
+
+        ElementMediaCaps::new(vec![FormatMemoryCap::new(
+            FormatCaps::Video(VideoCodec::H264),
+            MemoryCaps::cpu_only(),
+        )])
+    }
+
+    fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
+        let data = ctx.buffer().as_bytes();
+
+        // Check if this is a keyframe (contains SPS/PPS or IDR NAL)
+        let is_keyframe = data.len() > 4 && {
+            // Look for IDR NAL unit (type 5) or SPS (type 7)
+            let mut found_idr = false;
+            let mut i = 0;
+            while i + 4 < data.len() {
+                if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1 {
+                    let nal_type = data[i + 4] & 0x1F;
+                    if nal_type == 5 || nal_type == 7 {
+                        found_idr = true;
+                        break;
+                    }
+                    i += 4;
+                } else {
+                    i += 1;
+                }
+            }
+            found_idr
+        };
+
+        // If muxer not initialized, try to extract SPS/PPS from this frame
+        if self.muxer.is_none() {
+            // Try config first
+            let (sps, pps) = if self.config.sps.is_some() && self.config.pps.is_some() {
+                (
+                    self.config.sps.clone().unwrap(),
+                    self.config.pps.clone().unwrap(),
+                )
+            } else {
+                // Extract from frame data
+                let (extracted_sps, extracted_pps) = Self::extract_sps_pps(data);
+                match (extracted_sps, extracted_pps) {
+                    (Some(s), Some(p)) => (s, p),
+                    _ => {
+                        // Can't initialize yet, skip this frame
+                        tracing::debug!("Waiting for keyframe with SPS/PPS...");
+                        return Ok(());
+                    }
+                }
+            };
+
+            self.sps = Some(sps.clone());
+            self.pps = Some(pps.clone());
+            self.initialize_muxer(&sps, &pps)?;
+        }
+
+        let muxer = self.muxer.as_mut().unwrap();
+        let track_id = self.video_track.unwrap();
+
+        // Convert from Annex-B to AVCC format
+        let avcc_data = Self::annex_b_to_avcc(data);
+
+        // Calculate PTS
+        let pts_ms = self.frame_count * self.frame_duration_ms;
+
+        // Write sample
+        muxer.write_video_sample(track_id, &avcc_data, pts_ms, is_keyframe)?;
+        self.frame_count += 1;
+
+        if self.frame_count % 30 == 0 {
+            tracing::debug!("MP4: {} frames written", self.frame_count);
+        }
+
+        Ok(())
+    }
+}
+
+impl Drop for Mp4FileSink {
+    fn drop(&mut self) {
+        if let Some(muxer) = self.muxer.take() {
+            if let Err(e) = muxer.finish() {
+                tracing::error!("Failed to finalize MP4 file: {}", e);
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for Mp4FileSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Mp4FileSink")
+            .field("path", &self.path)
+            .field("config", &self.config)
+            .field("frame_count", &self.frame_count)
+            .field("initialized", &self.muxer.is_some())
+            .finish()
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
+
+// ============================================================================
+// MP4 Mux Transform Element
+// ============================================================================
+
+use crate::buffer::{Buffer, MemoryHandle};
+use crate::element::Element;
+use crate::memory::SharedArena;
+use crate::metadata::Metadata;
+use std::io::Cursor;
+
+/// Configuration for the MP4 mux transform.
+#[derive(Debug, Clone)]
+pub struct Mp4MuxTransformConfig {
+    /// Video width in pixels.
+    pub width: u16,
+    /// Video height in pixels.
+    pub height: u16,
+    /// Frame rate (frames per second).
+    pub framerate: f32,
+    /// H.264 SPS data (extracted from first keyframe if not provided).
+    pub sps: Option<Vec<u8>>,
+    /// H.264 PPS data (extracted from first keyframe if not provided).
+    pub pps: Option<Vec<u8>>,
+}
+
+impl Mp4MuxTransformConfig {
+    /// Create a new MP4 mux transform configuration.
+    pub fn new(width: u16, height: u16) -> Self {
+        Self {
+            width,
+            height,
+            framerate: 30.0,
+            sps: None,
+            pps: None,
+        }
+    }
+
+    /// Set the frame rate.
+    pub fn with_framerate(mut self, fps: f32) -> Self {
+        self.framerate = fps;
+        self
+    }
+
+    /// Set the H.264 SPS/PPS data.
+    pub fn with_codec_data(mut self, sps: Vec<u8>, pps: Vec<u8>) -> Self {
+        self.sps = Some(sps);
+        self.pps = Some(pps);
+        self
+    }
+}
+
+/// MP4 mux transform element for H.264 video.
+///
+/// This element muxes H.264 encoded video frames into MP4 container format.
+/// Unlike `Mp4FileSink`, this element does NOT write to disk - it outputs
+/// the MP4 data as buffers that can be sent to any sink (file, network, etc.).
+///
+/// **Important**: MP4 format requires seeking, so this element buffers all
+/// input frames in memory and outputs the complete MP4 file on `flush()`.
+/// For streaming use cases, consider using fragmented MP4 (fMP4) or MPEG-TS.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use parallax::elements::mux::{Mp4MuxTransform, Mp4MuxTransformConfig};
+/// use parallax::elements::io::FileSink;
+///
+/// let config = Mp4MuxTransformConfig::new(1920, 1080).with_framerate(30.0);
+/// let mux = Mp4MuxTransform::new(config);
+/// let sink = FileSink::new("output.mp4");
+///
+/// // Pipeline: ... -> H264Encoder -> Mp4MuxTransform -> FileSink
+/// ```
+pub struct Mp4MuxTransform {
+    config: Mp4MuxTransformConfig,
+    /// In-memory buffer for MP4 data
+    buffer: Cursor<Vec<u8>>,
+    /// The muxer (initialized when SPS/PPS is available)
+    muxer: Option<Mp4Mux<Cursor<Vec<u8>>>>,
+    video_track: Option<u32>,
+    frame_count: u64,
+    frame_duration_ms: u64,
+    /// Extracted SPS from first keyframe
+    sps: Option<Vec<u8>>,
+    /// Extracted PPS from first keyframe
+    pps: Option<Vec<u8>>,
+    /// Whether we've already flushed
+    flushed: bool,
+}
+
+impl Mp4MuxTransform {
+    /// Create a new MP4 mux transform.
+    pub fn new(config: Mp4MuxTransformConfig) -> Self {
+        let frame_duration_ms = (1000.0 / config.framerate) as u64;
+
+        Self {
+            config,
+            buffer: Cursor::new(Vec::new()),
+            muxer: None,
+            video_track: None,
+            frame_count: 0,
+            frame_duration_ms,
+            sps: None,
+            pps: None,
+            flushed: false,
+        }
+    }
+
+    /// Initialize the muxer with the given SPS/PPS.
+    fn initialize_muxer(&mut self, sps: &[u8], pps: &[u8]) -> Result<()> {
+        // Take the current buffer and create a fresh one
+        let buffer = std::mem::replace(&mut self.buffer, Cursor::new(Vec::new()));
+        self.buffer = buffer;
+
+        let mut muxer = Mp4Mux::new(
+            Cursor::new(Vec::with_capacity(1024 * 1024)), // Pre-allocate 1MB
+            Mp4MuxConfig::h264(),
+        )?;
+
+        let video_config =
+            Mp4VideoTrackConfig::h264(self.config.width, self.config.height, sps, pps);
+        let track_id = muxer.add_video_track(video_config)?;
+
+        self.muxer = Some(muxer);
+        self.video_track = Some(track_id);
+
+        tracing::info!(
+            "MP4 mux transform initialized: {}x{} @ {} fps",
+            self.config.width,
+            self.config.height,
+            self.config.framerate
+        );
+
+        Ok(())
+    }
+
+    /// Get the number of frames muxed.
+    pub fn frame_count(&self) -> u64 {
+        self.frame_count
+    }
+
+    /// Check if a NAL unit is a keyframe (contains SPS, PPS, or IDR).
+    fn is_keyframe(data: &[u8]) -> bool {
+        if data.len() <= 4 {
+            return false;
+        }
+
+        let mut i = 0;
+        while i + 4 < data.len() {
+            if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1 {
+                let nal_type = data[i + 4] & 0x1F;
+                if nal_type == 5 || nal_type == 7 {
+                    // IDR or SPS
+                    return true;
+                }
+                i += 4;
+            } else {
+                i += 1;
+            }
+        }
+        false
+    }
+}
+
+impl Element for Mp4MuxTransform {
+    fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
+        let data = buffer.as_bytes();
+
+        let is_keyframe = Self::is_keyframe(data);
+
+        // If muxer not initialized, try to extract SPS/PPS from this frame
+        if self.muxer.is_none() {
+            // Try config first
+            let (sps, pps) = if self.config.sps.is_some() && self.config.pps.is_some() {
+                (
+                    self.config.sps.clone().unwrap(),
+                    self.config.pps.clone().unwrap(),
+                )
+            } else {
+                // Extract from frame data
+                let (extracted_sps, extracted_pps) = Mp4FileSink::extract_sps_pps(data);
+                match (extracted_sps, extracted_pps) {
+                    (Some(s), Some(p)) => (s, p),
+                    _ => {
+                        // Can't initialize yet, skip this frame
+                        tracing::debug!("MP4 mux: waiting for keyframe with SPS/PPS...");
+                        return Ok(None);
+                    }
+                }
+            };
+
+            self.sps = Some(sps.clone());
+            self.pps = Some(pps.clone());
+            self.initialize_muxer(&sps, &pps)?;
+        }
+
+        let muxer = self.muxer.as_mut().unwrap();
+        let track_id = self.video_track.unwrap();
+
+        // Convert from Annex-B to AVCC format
+        let avcc_data = Mp4FileSink::annex_b_to_avcc(data);
+
+        // Calculate PTS
+        let pts_ms = self.frame_count * self.frame_duration_ms;
+
+        // Write sample
+        muxer.write_video_sample(track_id, &avcc_data, pts_ms, is_keyframe)?;
+        self.frame_count += 1;
+
+        if self.frame_count % 30 == 0 {
+            tracing::debug!("MP4 mux: {} frames buffered", self.frame_count);
+        }
+
+        // Don't output anything during processing - MP4 requires all data for moov
+        Ok(None)
+    }
+
+    fn flush(&mut self) -> Result<Option<Buffer>> {
+        if self.flushed {
+            return Ok(None);
+        }
+        self.flushed = true;
+
+        if let Some(muxer) = self.muxer.take() {
+            // Finalize the muxer and get the complete MP4 data
+            let cursor = muxer.finish()?;
+            let mp4_data = cursor.into_inner();
+
+            tracing::info!(
+                "MP4 mux: finalized {} frames, {} bytes",
+                self.frame_count,
+                mp4_data.len()
+            );
+
+            if mp4_data.is_empty() {
+                return Ok(None);
+            }
+
+            // Create an arena for the output buffer
+            let arena = SharedArena::new(mp4_data.len(), 1)
+                .map_err(|e| Error::AllocationFailed(format!("Failed to create arena: {}", e)))?;
+
+            let mut slot = arena.acquire().ok_or(Error::PoolExhausted)?;
+
+            slot.data_mut()[..mp4_data.len()].copy_from_slice(&mp4_data);
+
+            let handle = MemoryHandle::with_len(slot, mp4_data.len());
+            let buffer = Buffer::new(handle, Metadata::new());
+
+            Ok(Some(buffer))
+        } else {
+            tracing::warn!("MP4 mux: no muxer initialized, no output");
+            Ok(None)
+        }
+    }
+
+    fn input_media_caps(&self) -> crate::format::ElementMediaCaps {
+        // Accept H.264 encoded video
+        use crate::format::{
+            ElementMediaCaps, FormatCaps, FormatMemoryCap, MemoryCaps, VideoCodec,
+        };
+
+        ElementMediaCaps::new(vec![FormatMemoryCap::new(
+            FormatCaps::Video(VideoCodec::H264),
+            MemoryCaps::cpu_only(),
+        )])
+    }
+
+    fn output_media_caps(&self) -> crate::format::ElementMediaCaps {
+        // Output MP4 as raw bytes (container format)
+        use crate::format::{ElementMediaCaps, FormatCaps, FormatMemoryCap, MemoryCaps};
+
+        ElementMediaCaps::new(vec![FormatMemoryCap::new(
+            FormatCaps::Bytes,
+            MemoryCaps::cpu_only(),
+        )])
+    }
+}
+
+impl std::fmt::Debug for Mp4MuxTransform {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Mp4MuxTransform")
+            .field("config", &self.config)
+            .field("frame_count", &self.frame_count)
+            .field("initialized", &self.muxer.is_some())
+            .field("flushed", &self.flushed)
+            .finish()
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -612,5 +1271,18 @@ mod tests {
         let config = Mp4AudioTrackConfig::aac(44100, 2);
         assert_eq!(config.sample_rate, 44100);
         assert_eq!(config.channels, 2);
+    }
+
+    #[test]
+    fn test_mp4_mux_transform_config() {
+        let config = Mp4MuxTransformConfig::new(1920, 1080)
+            .with_framerate(60.0)
+            .with_codec_data(vec![1, 2, 3], vec![4, 5, 6]);
+
+        assert_eq!(config.width, 1920);
+        assert_eq!(config.height, 1080);
+        assert_eq!(config.framerate, 60.0);
+        assert_eq!(config.sps, Some(vec![1, 2, 3]));
+        assert_eq!(config.pps, Some(vec![4, 5, 6]));
     }
 }

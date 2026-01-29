@@ -86,8 +86,6 @@ pub fn enumerate_audio_nodes() -> Result<Vec<PipeWireNodeInfo>> {
     // Initialize PipeWire
     pw::init();
 
-    let nodes;
-
     // Create main loop and context in a thread
     // PipeWire requires its own main loop
     let (tx, rx) = bounded::<Vec<PipeWireNodeInfo>>(1);
@@ -183,7 +181,7 @@ pub fn enumerate_audio_nodes() -> Result<Vec<PipeWireNodeInfo>> {
     });
 
     // Wait for enumeration with timeout
-    nodes = rx
+    let nodes = rx
         .recv_timeout(std::time::Duration::from_secs(2))
         .unwrap_or_default();
 
