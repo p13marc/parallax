@@ -3240,6 +3240,7 @@ dependencies = [
  "webrtc-util 0.12.0",
  "winit",
  "winnow 0.7.14",
+ "yuv",
  "zenoh",
  "zune-jpeg",
 ]
@@ -6757,6 +6758,15 @@ dependencies = [
  "quote",
  "syn 2.0.114",
  "synstructure",
+]
+
+[[package]]
+name = "yuv"
+version = "0.8.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "447d8234fba933a5198401c673607dd75758bab32136766da61711cc362294e9"
+dependencies = [
+ "num-traits",
 ]
 
 [[package]]

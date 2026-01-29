@@ -804,7 +804,7 @@ impl Source for ScreenCaptureSrc {
                 PixelFormat::Rgba,
                 PixelFormat::Rgb24,
             ]),
-            framerate: CapsValue::Any,
+            ..VideoFormatCaps::any()
         };
 
         ElementMediaCaps::new(vec![FormatMemoryCap::new(

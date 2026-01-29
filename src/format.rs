@@ -738,6 +738,162 @@ impl From<&[u8]> for CodecData {
 }
 
 // ============================================================================
+// Memory Layout - alignment requirements for SIMD optimization
+// ============================================================================
+
+/// Memory layout requirements for video buffers.
+///
+/// SIMD operations require specific memory alignment for optimal performance:
+/// - SSE: 16-byte alignment
+/// - AVX/AVX2: 32-byte alignment
+/// - AVX-512: 64-byte alignment
+///
+/// Stride padding ensures each row starts at an aligned address.
+///
+/// # Example
+///
+/// ```rust
+/// use parallax::format::MemoryLayout;
+///
+/// // Request AVX-optimized alignment
+/// let layout = MemoryLayout::AVX;
+///
+/// // Calculate padded stride for 1920-wide RGBA image
+/// let stride = layout.padded_stride(1920, 4); // 7680 bytes, already aligned
+///
+/// // For 1921-wide image, stride would be padded to 7712 (next 32-byte boundary)
+/// let stride2 = layout.padded_stride(1921, 4);
+/// assert_eq!(stride2, 7712);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MemoryLayout {
+    /// Required alignment for buffer start address (in bytes).
+    /// Common values: 1 (none), 16 (SSE), 32 (AVX), 64 (AVX-512/cache line).
+    pub alignment: u32,
+
+    /// Stride alignment for each row (in bytes).
+    /// If > 1, stride = align_up(width * bytes_per_pixel, stride_alignment).
+    /// Common values: 1 (none), 16, 32, 64.
+    pub stride_alignment: u32,
+
+    /// Extra padding at end of each plane (in bytes).
+    /// Useful for SIMD that may read past the end of a row.
+    pub plane_padding: u32,
+}
+
+impl MemoryLayout {
+    /// No alignment requirements (any alignment acceptable).
+    pub const NONE: Self = Self {
+        alignment: 1,
+        stride_alignment: 1,
+        plane_padding: 0,
+    };
+
+    /// SSE-optimized: 16-byte alignment.
+    pub const SSE: Self = Self {
+        alignment: 16,
+        stride_alignment: 16,
+        plane_padding: 0,
+    };
+
+    /// AVX/AVX2-optimized: 32-byte alignment.
+    pub const AVX: Self = Self {
+        alignment: 32,
+        stride_alignment: 32,
+        plane_padding: 0,
+    };
+
+    /// AVX-512 / cache-line optimized: 64-byte alignment.
+    pub const AVX512: Self = Self {
+        alignment: 64,
+        stride_alignment: 64,
+        plane_padding: 0,
+    };
+
+    /// Create a custom layout.
+    pub const fn new(alignment: u32, stride_alignment: u32, plane_padding: u32) -> Self {
+        Self {
+            alignment,
+            stride_alignment,
+            plane_padding,
+        }
+    }
+
+    /// Calculate padded stride for given width and bytes per pixel.
+    ///
+    /// Returns the smallest stride >= width * bytes_per_pixel that
+    /// satisfies the stride_alignment requirement.
+    #[inline]
+    pub const fn padded_stride(&self, width: u32, bytes_per_pixel: u32) -> u32 {
+        let raw_stride = width * bytes_per_pixel;
+        if self.stride_alignment <= 1 {
+            raw_stride
+        } else {
+            let align = self.stride_alignment;
+            (raw_stride + align - 1) / align * align
+        }
+    }
+
+    /// Calculate total buffer size for a single plane with alignment padding.
+    #[inline]
+    pub const fn plane_size(&self, width: u32, height: u32, bytes_per_pixel: u32) -> usize {
+        let stride = self.padded_stride(width, bytes_per_pixel);
+        (stride as usize * height as usize) + self.plane_padding as usize
+    }
+
+    /// Merge with another layout, taking the stricter requirements.
+    ///
+    /// This is used during caps negotiation to find a layout that
+    /// satisfies both upstream and downstream requirements.
+    #[inline]
+    pub const fn merge(&self, other: &Self) -> Self {
+        Self {
+            alignment: if self.alignment > other.alignment {
+                self.alignment
+            } else {
+                other.alignment
+            },
+            stride_alignment: if self.stride_alignment > other.stride_alignment {
+                self.stride_alignment
+            } else {
+                other.stride_alignment
+            },
+            plane_padding: if self.plane_padding > other.plane_padding {
+                self.plane_padding
+            } else {
+                other.plane_padding
+            },
+        }
+    }
+
+    /// Check if a pointer is properly aligned for this layout.
+    #[inline]
+    pub fn is_aligned(&self, ptr: *const u8) -> bool {
+        if self.alignment <= 1 {
+            true
+        } else {
+            (ptr as usize) % (self.alignment as usize) == 0
+        }
+    }
+
+    /// Check if a stride satisfies the alignment requirement.
+    #[inline]
+    pub const fn is_stride_aligned(&self, stride: u32) -> bool {
+        if self.stride_alignment <= 1 {
+            true
+        } else {
+            stride % self.stride_alignment == 0
+        }
+    }
+}
+
+impl Default for MemoryLayout {
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
+// ============================================================================
 // Format Caps - constraint-based format negotiation
 // ============================================================================
 
@@ -745,6 +901,12 @@ impl From<&[u8]> for CodecData {
 ///
 /// Each field can be fixed, a range, a list of options, or any value.
 /// Used during caps negotiation to find compatible formats.
+///
+/// # Memory Layout
+///
+/// The `layout` field specifies memory alignment requirements for SIMD
+/// optimization. During negotiation, layouts are merged by taking the
+/// stricter requirements from both sides.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VideoFormatCaps {
     /// Width constraint.
@@ -755,6 +917,8 @@ pub struct VideoFormatCaps {
     pub pixel_format: CapsValue<PixelFormat>,
     /// Framerate constraint.
     pub framerate: CapsValue<Framerate>,
+    /// Memory layout requirements for SIMD optimization.
+    pub layout: MemoryLayout,
 }
 
 impl VideoFormatCaps {
@@ -765,6 +929,7 @@ impl VideoFormatCaps {
             height: CapsValue::Any,
             pixel_format: CapsValue::Any,
             framerate: CapsValue::Any,
+            layout: MemoryLayout::NONE,
         }
     }
 
@@ -775,6 +940,7 @@ impl VideoFormatCaps {
             height: CapsValue::Fixed(format.height),
             pixel_format: CapsValue::Fixed(format.pixel_format),
             framerate: CapsValue::Fixed(format.framerate),
+            layout: MemoryLayout::NONE,
         }
     }
 
@@ -799,6 +965,7 @@ impl VideoFormatCaps {
             height: CapsValue::Fixed(height),
             pixel_format: CapsValue::Fixed(PixelFormat::I420),
             framerate: CapsValue::Any,
+            layout: MemoryLayout::NONE,
         }
     }
 
@@ -857,13 +1024,33 @@ impl VideoFormatCaps {
         self
     }
 
+    /// Create caps with specific memory layout requirements.
+    ///
+    /// Use this to request aligned memory for SIMD optimization.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use parallax::format::{VideoFormatCaps, MemoryLayout};
+    ///
+    /// // Request AVX-aligned buffers for SIMD conversion
+    /// let caps = VideoFormatCaps::any().with_layout(MemoryLayout::AVX);
+    /// ```
+    pub fn with_layout(mut self, layout: MemoryLayout) -> Self {
+        self.layout = layout;
+        self
+    }
+
     /// Intersect with another video caps.
+    ///
+    /// Memory layouts are merged by taking the stricter requirements.
     pub fn intersect(&self, other: &Self) -> Option<Self> {
         Some(Self {
             width: self.width.intersect(&other.width)?,
             height: self.height.intersect(&other.height)?,
             pixel_format: self.pixel_format.intersect(&other.pixel_format)?,
             framerate: self.framerate.intersect(&other.framerate)?,
+            layout: self.layout.merge(&other.layout),
         })
     }
 
@@ -2238,7 +2425,7 @@ mod tests {
             width: CapsValue::List(vec![1920, 1280]),
             height: CapsValue::List(vec![1080, 720]),
             pixel_format: CapsValue::List(vec![PixelFormat::I420, PixelFormat::Nv12]),
-            framerate: CapsValue::Any,
+            ..VideoFormatCaps::any()
         };
 
         let consumer = VideoFormatCaps {
@@ -2249,6 +2436,7 @@ mod tests {
             height: CapsValue::Fixed(720),
             pixel_format: CapsValue::Fixed(PixelFormat::I420),
             framerate: CapsValue::Fixed(Framerate::FPS_30),
+            ..VideoFormatCaps::any()
         };
 
         let result = producer.intersect(&consumer).unwrap();

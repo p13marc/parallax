@@ -104,6 +104,9 @@ symphonia = { version = "0.5", optional = true, default-features = false }
 zune-jpeg = { version = "0.4", optional = true }
 png = { version = "0.17", optional = true }
 
+# Color space conversion (SIMD-accelerated, pure Rust)
+yuv = { version = "0.8", optional = true }
+
 # Container formats (pure Rust)
 mp4 = { version = "0.14", optional = true }
 
@@ -156,6 +159,8 @@ audio-vorbis = ["dep:symphonia", "symphonia/vorbis"]
 image-codecs = ["image-jpeg", "image-png"]
 image-jpeg = ["dep:zune-jpeg"]
 image-png = ["dep:png"]
+# Color space conversion (SIMD-accelerated)
+simd-colorspace = ["dep:yuv"]
 http = ["ureq"]       # HTTP source/sink elements
 websocket = ["tungstenite"]  # WebSocket source/sink elements
 zenoh = ["dep:zenoh"] # Zenoh pub/sub elements

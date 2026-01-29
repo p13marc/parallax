@@ -499,15 +499,43 @@ Note: `yuvutils-rs` mentions "Some paths have multi-threading support" but recom
 
 ## Summary
 
-| Phase | Description | Effort |
-|-------|-------------|--------|
-| 1 | Add MemoryLayout to caps system | 1-2 days |
-| 2 | Integrate yuvutils-rs | 1 day |
-| 3 | Aligned buffer allocation | 0.5 days |
-| 4 | Update VideoConvertElement | 0.5 days |
-| 5 | Multi-threading (optional) | 0.5-1 day |
+| Phase | Description | Effort | Status |
+|-------|-------------|--------|--------|
+| 1 | Add MemoryLayout to caps system | 1-2 days | ✅ Complete |
+| 2 | Integrate yuvutils-rs (yuv crate) | 1 day | ✅ Complete |
+| 3 | Aligned buffer allocation | 0.5 days | ✅ Complete |
+| 4 | Update VideoConvertElement | 0.5 days | ✅ Complete |
+| 5 | Multi-threading (optional) | 0.5-1 day | Deferred |
 
 **Total: 3-5 days**
+
+---
+
+## Implementation Notes
+
+### What Was Implemented
+
+1. **MemoryLayout struct** in `src/format.rs`:
+   - Constants: `NONE`, `SSE` (16-byte), `AVX` (32-byte), `AVX512` (64-byte)
+   - Methods: `padded_stride()`, `plane_size()`, `merge()`, `is_aligned()`
+   - Integrated into `VideoFormatCaps` with layout negotiation via `merge()`
+
+2. **SIMD conversions** in `src/converters/colorspace.rs`:
+   - Feature flag: `simd-colorspace`
+   - Uses `yuv` crate (v0.8) for accelerated conversions
+   - SIMD paths for: I420→RGB/RGBA/BGR/BGRA, YUYV→RGB/RGBA/BGR/BGRA, UYVY→RGB/RGBA
+   - Automatic fallback to pure Rust when feature disabled
+   - Runtime CPU detection (AVX2, AVX-512, SSE4.1, NEON)
+
+3. **Aligned arena allocation** in `src/memory/shared_refcount.rs`:
+   - New field `slot_stride` tracks aligned spacing between slots
+   - `with_alignment(name, slot_size, slot_count, alignment)` for custom alignment
+   - `new_avx(slot_size, slot_count)` for 32-byte aligned arenas
+   - `new_avx512(slot_size, slot_count)` for 64-byte aligned arenas
+
+4. **VideoConvertElement updates**:
+   - Declares `MemoryLayout::AVX` in input/output caps
+   - Uses `SharedArena::new_avx()` for aligned output buffers
 
 ---
 
@@ -517,7 +545,7 @@ Note: `yuvutils-rs` mentions "Some paths have multi-threading support" but recom
 
 ```bash
 # Run conversion benchmarks
-cargo bench --features simd-convert -- videoconvert
+cargo bench --features simd-colorspace -- videoconvert
 
 # Compare with scalar baseline
 cargo bench -- videoconvert
@@ -526,22 +554,22 @@ cargo bench -- videoconvert
 ### Tests
 
 ```bash
-# Unit tests for aligned allocation
-cargo test aligned_buffer
+# Run all tests without SIMD
+cargo nextest run
 
-# Integration tests for SIMD conversion
-cargo test --features simd-convert simd_convert
+# Run all tests with SIMD enabled
+cargo nextest run --features simd-colorspace
 
-# Verify alignment negotiation
-cargo test layout_negotiation
+# Test aligned layout calculation
+cargo nextest run test_layout_calculation
 ```
 
 ### Performance Targets
 
-Based on yuvutils-rs benchmarks for 1997×1331 images:
+Based on yuv crate benchmarks for 1997×1331 images:
 
-| Conversion | Target (AVX2) | Current Scalar |
-|------------|---------------|----------------|
+| Conversion | Target (AVX2) | Pure Rust Scalar |
+|------------|---------------|------------------|
 | I420 → RGBA | ~1ms | ~5-10ms |
 | YUYV → RGBA | ~0.8ms | ~4-8ms |
 | RGBA → I420 | ~1.2ms | ~6-12ms |
@@ -550,10 +578,45 @@ Based on yuvutils-rs benchmarks for 1997×1331 images:
 
 ## Future Enhancements
 
-1. **GPU Conversion**: Add Vulkan compute shader path for GPU-resident buffers
-2. **10-bit HDR**: Support P010, I010 formats with yuvutils-rs
-3. **Dynamic Layout Detection**: Query CPU features at runtime to select optimal alignment
-4. **Zero-Copy with DMA-BUF**: When both sides support DMA-BUF, negotiate GPU-friendly layout
+### Short Term (Next Release)
+
+1. **RGB to YUV SIMD paths**: Add SIMD-accelerated `rgb_to_yuv420`, `rgba_to_yuv420`, `bgra_to_yuv420`
+2. **NV12 SIMD support**: Use `YuvBiPlanarImage` for NV12↔RGB SIMD conversions
+3. **Store alignment in ArenaHeader**: Add `alignment` field to header for proper cross-process stride calculation
+
+### Medium Term
+
+4. **10-bit HDR support**: 
+   - Add `PixelFormat::P010`, `PixelFormat::I010` for HDR video
+   - Integrate `yuv` crate's 10-bit/12-bit conversion functions
+   - Extend `MemoryLayout` for wider pixel types
+
+5. **Dynamic layout detection**:
+   - Query CPU features at runtime (`std::is_x86_feature_detected!`)
+   - Auto-select `MemoryLayout::AVX512` on supported CPUs
+   - Fall back gracefully on older hardware
+
+6. **Pipeline-level alignment propagation**:
+   - Solver considers layout requirements during negotiation
+   - Auto-insert conversion elements when layouts incompatible
+   - Upstream sources receive negotiated layout hints
+
+### Long Term
+
+7. **GPU conversion path**:
+   - Vulkan compute shader for GPU-resident buffers
+   - DMA-BUF import/export for zero-copy GPU↔CPU
+   - Automatic path selection based on buffer location
+
+8. **Zero-copy DMA-BUF chain**:
+   - When both sides support DMA-BUF, negotiate GPU-friendly tiled layouts
+   - V4L2 → GPU encoder without CPU copy
+   - Hardware-specific modifiers for optimal memory layout
+
+9. **Multi-threaded conversion for 4K+**:
+   - Use rayon for horizontal strip parallelism on very large frames
+   - Benchmark to determine crossover point (likely 4K or higher)
+   - Note: SIMD already saturates memory bandwidth for most cases
 
 ---
 

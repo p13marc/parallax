@@ -288,7 +288,7 @@ impl Element for H264Encoder {
             width: CapsValue::Any,
             height: CapsValue::Any,
             pixel_format: CapsValue::Fixed(PixelFormat::I420),
-            framerate: CapsValue::Any,
+            ..VideoFormatCaps::any()
         };
 
         ElementMediaCaps::new(vec![FormatMemoryCap::new(

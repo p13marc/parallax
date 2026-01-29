@@ -603,19 +603,19 @@ mod tests {
             width: CapsValue::Fixed(640),
             height: CapsValue::Fixed(480),
             pixel_format: CapsValue::Fixed(PixelFormat::Yuyv),
-            framerate: CapsValue::Any,
+            ..VideoFormatCaps::any()
         };
         let rgb_caps = VideoFormatCaps {
             width: CapsValue::Fixed(640),
             height: CapsValue::Fixed(480),
             pixel_format: CapsValue::Fixed(PixelFormat::Rgb24),
-            framerate: CapsValue::Any,
+            ..VideoFormatCaps::any()
         };
         let i420_caps = VideoFormatCaps {
             width: CapsValue::Fixed(640),
             height: CapsValue::Fixed(480),
             pixel_format: CapsValue::Fixed(PixelFormat::I420),
-            framerate: CapsValue::Any,
+            ..VideoFormatCaps::any()
         };
 
         let source_multi_caps = ElementMediaCaps::new(vec![
@@ -630,10 +630,8 @@ mod tests {
 
         // Sink only accepts RGB
         let rgb_only = VideoFormatCaps {
-            width: CapsValue::Any,
-            height: CapsValue::Any,
             pixel_format: CapsValue::Fixed(PixelFormat::Rgb24),
-            framerate: CapsValue::Any,
+            ..VideoFormatCaps::any()
         };
         let mut sink_caps = ElementCaps::new("display");
         sink_caps.add_sink_pad(
@@ -676,13 +674,13 @@ mod tests {
             width: CapsValue::Fixed(1920),
             height: CapsValue::Fixed(1080),
             pixel_format: CapsValue::Fixed(PixelFormat::Rgb24),
-            framerate: CapsValue::Any,
+            ..VideoFormatCaps::any()
         };
         let i420_caps = VideoFormatCaps {
             width: CapsValue::Fixed(1920),
             height: CapsValue::Fixed(1080),
             pixel_format: CapsValue::Fixed(PixelFormat::I420),
-            framerate: CapsValue::Any,
+            ..VideoFormatCaps::any()
         };
 
         let source_multi_caps = ElementMediaCaps::new(vec![
@@ -733,7 +731,7 @@ mod tests {
             width: CapsValue::Fixed(640),
             height: CapsValue::Fixed(480),
             pixel_format: CapsValue::Fixed(PixelFormat::Yuyv),
-            framerate: CapsValue::Any,
+            ..VideoFormatCaps::any()
         };
 
         let source_multi_caps = ElementMediaCaps::new(vec![FormatMemoryCap::new(
@@ -747,10 +745,8 @@ mod tests {
 
         // Sink only accepts RGBA
         let rgba_caps = VideoFormatCaps {
-            width: CapsValue::Any,
-            height: CapsValue::Any,
             pixel_format: CapsValue::Fixed(PixelFormat::Rgba),
-            framerate: CapsValue::Any,
+            ..VideoFormatCaps::any()
         };
 
         let mut sink_caps = ElementCaps::new("display");

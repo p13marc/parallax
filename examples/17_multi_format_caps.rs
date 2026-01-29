@@ -68,21 +68,21 @@ impl Source for MultiFormatVideoSource {
             width: CapsValue::Fixed(640),
             height: CapsValue::Fixed(480),
             pixel_format: CapsValue::Fixed(PixelFormat::Yuyv),
-            framerate: CapsValue::Any,
+            ..VideoFormatCaps::any()
         };
 
         let rgb24 = VideoFormatCaps {
             width: CapsValue::Fixed(640),
             height: CapsValue::Fixed(480),
             pixel_format: CapsValue::Fixed(PixelFormat::Rgb24),
-            framerate: CapsValue::Any,
+            ..VideoFormatCaps::any()
         };
 
         let i420 = VideoFormatCaps {
             width: CapsValue::Fixed(640),
             height: CapsValue::Fixed(480),
             pixel_format: CapsValue::Fixed(PixelFormat::I420),
-            framerate: CapsValue::Any,
+            ..VideoFormatCaps::any()
         };
 
         ElementMediaCaps::new(vec![
@@ -121,10 +121,8 @@ impl Sink for I420Sink {
 
     fn input_media_caps(&self) -> ElementMediaCaps {
         let i420 = VideoFormatCaps {
-            width: CapsValue::Any,
-            height: CapsValue::Any,
             pixel_format: CapsValue::Fixed(PixelFormat::I420),
-            framerate: CapsValue::Any,
+            ..VideoFormatCaps::any()
         };
 
         ElementMediaCaps::new(vec![FormatMemoryCap::new(
@@ -158,17 +156,13 @@ impl Sink for RgbSink {
 
     fn input_media_caps(&self) -> ElementMediaCaps {
         let rgb24 = VideoFormatCaps {
-            width: CapsValue::Any,
-            height: CapsValue::Any,
             pixel_format: CapsValue::Fixed(PixelFormat::Rgb24),
-            framerate: CapsValue::Any,
+            ..VideoFormatCaps::any()
         };
 
         let rgba = VideoFormatCaps {
-            width: CapsValue::Any,
-            height: CapsValue::Any,
             pixel_format: CapsValue::Fixed(PixelFormat::Rgba),
-            framerate: CapsValue::Any,
+            ..VideoFormatCaps::any()
         };
 
         ElementMediaCaps::new(vec![

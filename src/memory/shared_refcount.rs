@@ -472,10 +472,14 @@ fn next_arena_id() -> u64 {
     ARENA_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Calculate arena layout parameters.
+/// Calculate memory layout for arena with custom alignment.
 ///
-/// Returns (total_size, queue_offset, slot_headers_offset, data_offset).
-fn calculate_layout(slot_size: usize, slot_count: usize) -> (usize, usize, usize, usize) {
+/// Returns (total_size, queue_offset, slot_headers_offset, data_offset, slot_stride).
+fn calculate_layout_aligned(
+    slot_size: usize,
+    slot_count: usize,
+    alignment: usize,
+) -> (usize, usize, usize, usize, usize) {
     let arena_header_size = std::mem::size_of::<ArenaHeader>();
     let queue_size = std::mem::size_of::<ReleaseQueue>();
     let slot_header_size = std::mem::size_of::<SlotHeader>();
@@ -485,14 +489,22 @@ fn calculate_layout(slot_size: usize, slot_count: usize) -> (usize, usize, usize
     let queue_offset = arena_header_size;
     let slot_headers_offset = queue_offset + queue_size;
 
-    // Align data offset to 64 bytes for cache efficiency
+    // Align data offset to requested alignment for SIMD efficiency
     let header_region_size = slot_headers_offset + all_slot_headers_size;
-    let data_offset = (header_region_size + 63) & !63;
+    let data_offset = (header_region_size + alignment - 1) & !(alignment - 1);
 
-    let data_region_size = slot_size * slot_count;
+    // Round up slot_size to alignment so each slot starts aligned
+    let slot_stride = (slot_size + alignment - 1) & !(alignment - 1);
+    let data_region_size = slot_stride * slot_count;
     let total_size = data_offset + data_region_size;
 
-    (total_size, queue_offset, slot_headers_offset, data_offset)
+    (
+        total_size,
+        queue_offset,
+        slot_headers_offset,
+        data_offset,
+        slot_stride,
+    )
 }
 
 /// Arena with shared-memory reference counting and lock-free release queue.
@@ -529,8 +541,10 @@ pub struct SharedArena {
     slot_headers: NonNull<SlotHeader>,
     /// Offset from base to data region.
     data_offset: usize,
-    /// Size of each slot's data.
+    /// Logical size of each slot's data (usable bytes).
     slot_size: usize,
+    /// Stride between slots (may be larger than slot_size for alignment).
+    slot_stride: usize,
     /// Number of slots.
     slot_count: usize,
     /// Unique arena ID.
@@ -552,15 +566,39 @@ impl SharedArena {
 
     /// Create a new arena with a debug name.
     pub fn with_name(name: &str, slot_size: usize, slot_count: usize) -> Result<Self> {
+        Self::with_alignment(name, slot_size, slot_count, 64)
+    }
+
+    /// Create a new arena with custom alignment.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Debug name for the memfd.
+    /// * `slot_size` - Logical size of each slot's data region in bytes.
+    /// * `slot_count` - Number of slots in the arena.
+    /// * `alignment` - Alignment for slot data (e.g., 32 for AVX, 64 for AVX-512).
+    ///
+    /// The actual stride between slots will be rounded up to `alignment`.
+    pub fn with_alignment(
+        name: &str,
+        slot_size: usize,
+        slot_count: usize,
+        alignment: usize,
+    ) -> Result<Self> {
         if slot_size == 0 {
             return Err(Error::AllocationFailed("slot_size must be > 0".into()));
         }
         if slot_count == 0 {
             return Err(Error::AllocationFailed("slot_count must be > 0".into()));
         }
+        if alignment == 0 || !alignment.is_power_of_two() {
+            return Err(Error::AllocationFailed(
+                "alignment must be a positive power of 2".into(),
+            ));
+        }
 
-        let (total_size, queue_offset, slot_headers_offset, data_offset) =
-            calculate_layout(slot_size, slot_count);
+        let (total_size, queue_offset, slot_headers_offset, data_offset, slot_stride) =
+            calculate_layout_aligned(slot_size, slot_count, alignment);
 
         // Create memfd
         let cname = CString::new(name).map_err(|e| Error::AllocationFailed(e.to_string()))?;
@@ -630,10 +668,25 @@ impl SharedArena {
             slot_headers,
             data_offset,
             slot_size,
+            slot_stride,
             slot_count,
             arena_id,
             is_owner: true,
         })
+    }
+
+    /// Create a new arena aligned for AVX2 SIMD (32-byte alignment).
+    ///
+    /// This is the recommended alignment for most modern SIMD operations.
+    pub fn new_avx(slot_size: usize, slot_count: usize) -> Result<Self> {
+        Self::with_alignment("parallax-shared-arena-avx", slot_size, slot_count, 32)
+    }
+
+    /// Create a new arena aligned for AVX-512 SIMD (64-byte alignment).
+    ///
+    /// Use this when targeting systems with AVX-512 support.
+    pub fn new_avx512(slot_size: usize, slot_count: usize) -> Result<Self> {
+        Self::with_alignment("parallax-shared-arena-avx512", slot_size, slot_count, 64)
     }
 
     /// Map an existing arena from a received file descriptor (client process).
@@ -701,6 +754,10 @@ impl SharedArena {
             NonNull::new_unchecked(base.as_ptr().add(slot_headers_offset).cast::<SlotHeader>())
         };
 
+        // Calculate slot stride assuming 64-byte alignment (default for new arenas)
+        // This ensures each slot starts at a 64-byte aligned offset
+        let slot_stride = (slot_size + 63) & !63;
+
         Ok(Self {
             fd,
             base,
@@ -710,6 +767,7 @@ impl SharedArena {
             slot_headers,
             data_offset,
             slot_size,
+            slot_stride,
             slot_count,
             arena_id,
             is_owner: false, // Client cannot acquire new slots
@@ -737,12 +795,12 @@ impl SharedArena {
                         NonNull::new_unchecked(
                             self.base
                                 .as_ptr()
-                                .add(self.data_offset + i * self.slot_size),
+                                .add(self.data_offset + i * self.slot_stride),
                         )
                     },
-                    data_len: self.slot_size,
+                    data_len: self.slot_size, // Usable data size (not stride)
                     slot_index: i as u32,
-                    data_offset: self.data_offset + i * self.slot_size,
+                    data_offset: self.data_offset + i * self.slot_stride,
                 });
             }
         }
@@ -978,6 +1036,7 @@ impl Clone for SharedArena {
             slot_headers: self.slot_headers,
             data_offset: self.data_offset,
             slot_size: self.slot_size,
+            slot_stride: self.slot_stride,
             slot_count: self.slot_count,
             arena_id: self.arena_id,
             is_owner: self.is_owner,
@@ -1543,7 +1602,8 @@ mod tests {
 
     #[test]
     fn test_layout_calculation() {
-        let (total, queue_offset, slot_headers_offset, data_offset) = calculate_layout(4096, 16);
+        let (total, queue_offset, slot_headers_offset, data_offset, slot_stride) =
+            calculate_layout_aligned(4096, 16, 64);
 
         // ArenaHeader = 64 bytes
         // ReleaseQueue = 64 + 4096 = ~4160 bytes (64 for head/tail/pad, 4096 for slots)
@@ -1554,7 +1614,20 @@ mod tests {
         assert!(slot_headers_offset > queue_offset);
         assert!(data_offset >= slot_headers_offset + 128);
         assert_eq!(data_offset % 64, 0); // Cache-line aligned
-        assert_eq!(total, data_offset + 16 * 4096);
+        assert_eq!(slot_stride, 4096); // Already aligned to 64
+        assert_eq!(total, data_offset + 16 * slot_stride);
+    }
+
+    #[test]
+    fn test_layout_calculation_unaligned_slot() {
+        // Slot size that's not a multiple of alignment
+        let (total, _queue_offset, _slot_headers_offset, data_offset, slot_stride) =
+            calculate_layout_aligned(1000, 10, 32);
+
+        // Slot stride should be rounded up to 32-byte alignment
+        assert_eq!(slot_stride, 1024); // ceil(1000/32)*32 = 1024
+        assert_eq!(data_offset % 32, 0); // Data region aligned
+        assert_eq!(total, data_offset + 10 * slot_stride);
     }
 
     #[test]

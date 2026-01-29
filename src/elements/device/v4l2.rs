@@ -682,7 +682,7 @@ impl Source for V4l2Src {
                     width: width_caps,
                     height: height_caps,
                     pixel_format: CapsValue::Fixed(pixel_format),
-                    framerate: CapsValue::Any,
+                    ..VideoFormatCaps::any()
                 };
 
                 if self.dmabuf_export {
@@ -722,7 +722,7 @@ impl Source for V4l2Src {
                     width: CapsValue::Fixed(self.width),
                     height: CapsValue::Fixed(self.height),
                     pixel_format: CapsValue::Fixed(pixel_format),
-                    framerate: CapsValue::Any,
+                    ..VideoFormatCaps::any()
                 };
 
                 if self.dmabuf_export {

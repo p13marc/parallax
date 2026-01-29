@@ -1,9 +1,33 @@
 //! Pixel format conversion (colorspace conversion).
 //!
-//! Provides pure Rust implementations of YUV ↔ RGB conversions using
-//! standard color matrices (BT.601, BT.709).
+//! Provides YUV ↔ RGB conversions using standard color matrices (BT.601, BT.709).
+//!
+//! When the `simd-colorspace` feature is enabled, this module uses the `yuv` crate
+//! for SIMD-accelerated conversions (AVX2, AVX-512, SSE4.1, NEON). Without the
+//! feature, a pure Rust implementation is used as fallback.
 
 use crate::error::{Error, Result};
+
+#[cfg(feature = "simd-colorspace")]
+use yuv::{
+    YuvPackedImage,
+    YuvPlanarImage,
+    YuvRange,
+    YuvStandardMatrix,
+    // UYVY (packed YUV 4:2:2) -> RGB
+    uyvy422_to_rgb,
+    uyvy422_to_rgba,
+    // I420 (planar YUV 4:2:0) -> RGB
+    yuv420_to_bgr,
+    yuv420_to_bgra,
+    yuv420_to_rgb,
+    yuv420_to_rgba,
+    // YUYV (packed YUV 4:2:2) -> RGB
+    yuyv422_to_bgr,
+    yuyv422_to_bgra,
+    yuyv422_to_rgb,
+    yuyv422_to_rgba,
+};
 
 /// Pixel format enumeration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -97,6 +121,17 @@ pub enum ColorMatrix {
     Bt601,
     /// BT.709 (HD video)
     Bt709,
+}
+
+#[cfg(feature = "simd-colorspace")]
+impl ColorMatrix {
+    /// Convert to yuv crate's YuvStandardMatrix.
+    fn to_yuv_matrix(self) -> YuvStandardMatrix {
+        match self {
+            ColorMatrix::Bt601 => YuvStandardMatrix::Bt601,
+            ColorMatrix::Bt709 => YuvStandardMatrix::Bt709,
+        }
+    }
 }
 
 /// Video format converter.
@@ -290,9 +325,40 @@ impl VideoConvert {
     }
 
     // -------------------------------------------------------------------------
-    // YUV to RGB conversions
+    // YUV to RGB conversions (SIMD-accelerated when simd-colorspace feature enabled)
     // -------------------------------------------------------------------------
 
+    #[cfg(feature = "simd-colorspace")]
+    fn i420_to_rgb24(&self, input: &[u8], output: &mut [u8]) {
+        let w = self.width as usize;
+        let h = self.height as usize;
+
+        let y_plane = &input[0..w * h];
+        let u_plane = &input[w * h..w * h + (w / 2) * (h / 2)];
+        let v_plane = &input[w * h + (w / 2) * (h / 2)..];
+
+        let planar = YuvPlanarImage {
+            y_plane,
+            y_stride: w as u32,
+            u_plane,
+            u_stride: (w / 2) as u32,
+            v_plane,
+            v_stride: (w / 2) as u32,
+            width: self.width,
+            height: self.height,
+        };
+
+        yuv420_to_rgb(
+            &planar,
+            output,
+            (w * 3) as u32,
+            YuvRange::Limited,
+            self.color_matrix.to_yuv_matrix(),
+        )
+        .expect("SIMD i420_to_rgb24 conversion failed");
+    }
+
+    #[cfg(not(feature = "simd-colorspace"))]
     fn i420_to_rgb24(&self, input: &[u8], output: &mut [u8]) {
         let w = self.width as usize;
         let h = self.height as usize;
@@ -317,6 +383,37 @@ impl VideoConvert {
         }
     }
 
+    #[cfg(feature = "simd-colorspace")]
+    fn i420_to_rgba(&self, input: &[u8], output: &mut [u8]) {
+        let w = self.width as usize;
+        let h = self.height as usize;
+
+        let y_plane = &input[0..w * h];
+        let u_plane = &input[w * h..w * h + (w / 2) * (h / 2)];
+        let v_plane = &input[w * h + (w / 2) * (h / 2)..];
+
+        let planar = YuvPlanarImage {
+            y_plane,
+            y_stride: w as u32,
+            u_plane,
+            u_stride: (w / 2) as u32,
+            v_plane,
+            v_stride: (w / 2) as u32,
+            width: self.width,
+            height: self.height,
+        };
+
+        yuv420_to_rgba(
+            &planar,
+            output,
+            (w * 4) as u32,
+            YuvRange::Limited,
+            self.color_matrix.to_yuv_matrix(),
+        )
+        .expect("SIMD i420_to_rgba conversion failed");
+    }
+
+    #[cfg(not(feature = "simd-colorspace"))]
     fn i420_to_rgba(&self, input: &[u8], output: &mut [u8]) {
         let w = self.width as usize;
         let h = self.height as usize;
@@ -342,6 +439,37 @@ impl VideoConvert {
         }
     }
 
+    #[cfg(feature = "simd-colorspace")]
+    fn i420_to_bgr24(&self, input: &[u8], output: &mut [u8]) {
+        let w = self.width as usize;
+        let h = self.height as usize;
+
+        let y_plane = &input[0..w * h];
+        let u_plane = &input[w * h..w * h + (w / 2) * (h / 2)];
+        let v_plane = &input[w * h + (w / 2) * (h / 2)..];
+
+        let planar = YuvPlanarImage {
+            y_plane,
+            y_stride: w as u32,
+            u_plane,
+            u_stride: (w / 2) as u32,
+            v_plane,
+            v_stride: (w / 2) as u32,
+            width: self.width,
+            height: self.height,
+        };
+
+        yuv420_to_bgr(
+            &planar,
+            output,
+            (w * 3) as u32,
+            YuvRange::Limited,
+            self.color_matrix.to_yuv_matrix(),
+        )
+        .expect("SIMD i420_to_bgr24 conversion failed");
+    }
+
+    #[cfg(not(feature = "simd-colorspace"))]
     fn i420_to_bgr24(&self, input: &[u8], output: &mut [u8]) {
         let w = self.width as usize;
         let h = self.height as usize;
@@ -366,6 +494,37 @@ impl VideoConvert {
         }
     }
 
+    #[cfg(feature = "simd-colorspace")]
+    fn i420_to_bgra(&self, input: &[u8], output: &mut [u8]) {
+        let w = self.width as usize;
+        let h = self.height as usize;
+
+        let y_plane = &input[0..w * h];
+        let u_plane = &input[w * h..w * h + (w / 2) * (h / 2)];
+        let v_plane = &input[w * h + (w / 2) * (h / 2)..];
+
+        let planar = YuvPlanarImage {
+            y_plane,
+            y_stride: w as u32,
+            u_plane,
+            u_stride: (w / 2) as u32,
+            v_plane,
+            v_stride: (w / 2) as u32,
+            width: self.width,
+            height: self.height,
+        };
+
+        yuv420_to_bgra(
+            &planar,
+            output,
+            (w * 4) as u32,
+            YuvRange::Limited,
+            self.color_matrix.to_yuv_matrix(),
+        )
+        .expect("SIMD i420_to_bgra conversion failed");
+    }
+
+    #[cfg(not(feature = "simd-colorspace"))]
     fn i420_to_bgra(&self, input: &[u8], output: &mut [u8]) {
         let w = self.width as usize;
         let h = self.height as usize;
@@ -391,6 +550,7 @@ impl VideoConvert {
         }
     }
 
+    // NV12 conversions - fallback only for now (yuv crate uses YuvBiPlanarImage)
     fn nv12_to_rgb24(&self, input: &[u8], output: &mut [u8]) {
         let w = self.width as usize;
         let h = self.height as usize;
@@ -441,11 +601,33 @@ impl VideoConvert {
     }
 
     // -------------------------------------------------------------------------
-    // YUYV/UYVY (packed YUV 4:2:2) to RGB conversions
+    // YUYV/UYVY (packed YUV 4:2:2) to RGB conversions (SIMD when available)
     // -------------------------------------------------------------------------
 
     /// Convert YUYV (YUY2) to RGB24.
     /// YUYV layout: Y0 U0 Y1 V0 (4 bytes encode 2 pixels)
+    #[cfg(feature = "simd-colorspace")]
+    fn yuyv_to_rgb24(&self, input: &[u8], output: &mut [u8]) {
+        let w = self.width as usize;
+
+        let packed = YuvPackedImage {
+            yuy: input,
+            yuy_stride: (w * 2) as u32,
+            width: self.width,
+            height: self.height,
+        };
+
+        yuyv422_to_rgb(
+            &packed,
+            output,
+            (w * 3) as u32,
+            YuvRange::Limited,
+            self.color_matrix.to_yuv_matrix(),
+        )
+        .expect("SIMD yuyv_to_rgb24 conversion failed");
+    }
+
+    #[cfg(not(feature = "simd-colorspace"))]
     fn yuyv_to_rgb24(&self, input: &[u8], output: &mut [u8]) {
         let w = self.width as usize;
         let h = self.height as usize;
@@ -477,6 +659,28 @@ impl VideoConvert {
     }
 
     /// Convert YUYV (YUY2) to RGBA.
+    #[cfg(feature = "simd-colorspace")]
+    fn yuyv_to_rgba(&self, input: &[u8], output: &mut [u8]) {
+        let w = self.width as usize;
+
+        let packed = YuvPackedImage {
+            yuy: input,
+            yuy_stride: (w * 2) as u32,
+            width: self.width,
+            height: self.height,
+        };
+
+        yuyv422_to_rgba(
+            &packed,
+            output,
+            (w * 4) as u32,
+            YuvRange::Limited,
+            self.color_matrix.to_yuv_matrix(),
+        )
+        .expect("SIMD yuyv_to_rgba conversion failed");
+    }
+
+    #[cfg(not(feature = "simd-colorspace"))]
     fn yuyv_to_rgba(&self, input: &[u8], output: &mut [u8]) {
         let w = self.width as usize;
         let h = self.height as usize;
@@ -509,6 +713,28 @@ impl VideoConvert {
     }
 
     /// Convert YUYV (YUY2) to BGR24.
+    #[cfg(feature = "simd-colorspace")]
+    fn yuyv_to_bgr24(&self, input: &[u8], output: &mut [u8]) {
+        let w = self.width as usize;
+
+        let packed = YuvPackedImage {
+            yuy: input,
+            yuy_stride: (w * 2) as u32,
+            width: self.width,
+            height: self.height,
+        };
+
+        yuyv422_to_bgr(
+            &packed,
+            output,
+            (w * 3) as u32,
+            YuvRange::Limited,
+            self.color_matrix.to_yuv_matrix(),
+        )
+        .expect("SIMD yuyv_to_bgr24 conversion failed");
+    }
+
+    #[cfg(not(feature = "simd-colorspace"))]
     fn yuyv_to_bgr24(&self, input: &[u8], output: &mut [u8]) {
         let w = self.width as usize;
         let h = self.height as usize;
@@ -539,6 +765,28 @@ impl VideoConvert {
     }
 
     /// Convert YUYV (YUY2) to BGRA.
+    #[cfg(feature = "simd-colorspace")]
+    fn yuyv_to_bgra(&self, input: &[u8], output: &mut [u8]) {
+        let w = self.width as usize;
+
+        let packed = YuvPackedImage {
+            yuy: input,
+            yuy_stride: (w * 2) as u32,
+            width: self.width,
+            height: self.height,
+        };
+
+        yuyv422_to_bgra(
+            &packed,
+            output,
+            (w * 4) as u32,
+            YuvRange::Limited,
+            self.color_matrix.to_yuv_matrix(),
+        )
+        .expect("SIMD yuyv_to_bgra conversion failed");
+    }
+
+    #[cfg(not(feature = "simd-colorspace"))]
     fn yuyv_to_bgra(&self, input: &[u8], output: &mut [u8]) {
         let w = self.width as usize;
         let h = self.height as usize;
@@ -572,6 +820,28 @@ impl VideoConvert {
 
     /// Convert UYVY to RGB24.
     /// UYVY layout: U0 Y0 V0 Y1 (4 bytes encode 2 pixels)
+    #[cfg(feature = "simd-colorspace")]
+    fn uyvy_to_rgb24(&self, input: &[u8], output: &mut [u8]) {
+        let w = self.width as usize;
+
+        let packed = YuvPackedImage {
+            yuy: input,
+            yuy_stride: (w * 2) as u32,
+            width: self.width,
+            height: self.height,
+        };
+
+        uyvy422_to_rgb(
+            &packed,
+            output,
+            (w * 3) as u32,
+            YuvRange::Limited,
+            self.color_matrix.to_yuv_matrix(),
+        )
+        .expect("SIMD uyvy_to_rgb24 conversion failed");
+    }
+
+    #[cfg(not(feature = "simd-colorspace"))]
     fn uyvy_to_rgb24(&self, input: &[u8], output: &mut [u8]) {
         let w = self.width as usize;
         let h = self.height as usize;
@@ -603,6 +873,28 @@ impl VideoConvert {
     }
 
     /// Convert UYVY to RGBA.
+    #[cfg(feature = "simd-colorspace")]
+    fn uyvy_to_rgba(&self, input: &[u8], output: &mut [u8]) {
+        let w = self.width as usize;
+
+        let packed = YuvPackedImage {
+            yuy: input,
+            yuy_stride: (w * 2) as u32,
+            width: self.width,
+            height: self.height,
+        };
+
+        uyvy422_to_rgba(
+            &packed,
+            output,
+            (w * 4) as u32,
+            YuvRange::Limited,
+            self.color_matrix.to_yuv_matrix(),
+        )
+        .expect("SIMD uyvy_to_rgba conversion failed");
+    }
+
+    #[cfg(not(feature = "simd-colorspace"))]
     fn uyvy_to_rgba(&self, input: &[u8], output: &mut [u8]) {
         let w = self.width as usize;
         let h = self.height as usize;

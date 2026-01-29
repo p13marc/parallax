@@ -2947,19 +2947,19 @@ mod tests {
                 width: CapsValue::Fixed(640),
                 height: CapsValue::Fixed(480),
                 pixel_format: CapsValue::Fixed(PixelFormat::Yuyv),
-                framerate: CapsValue::Any,
+                ..VideoFormatCaps::any()
             };
             let rgb = VideoFormatCaps {
                 width: CapsValue::Fixed(640),
                 height: CapsValue::Fixed(480),
                 pixel_format: CapsValue::Fixed(PixelFormat::Rgb24),
-                framerate: CapsValue::Any,
+                ..VideoFormatCaps::any()
             };
             let i420 = VideoFormatCaps {
                 width: CapsValue::Fixed(640),
                 height: CapsValue::Fixed(480),
                 pixel_format: CapsValue::Fixed(PixelFormat::I420),
-                framerate: CapsValue::Any,
+                ..VideoFormatCaps::any()
             };
 
             ElementMediaCaps::new(vec![
@@ -2983,7 +2983,7 @@ mod tests {
                 width: CapsValue::Any,
                 height: CapsValue::Any,
                 pixel_format: CapsValue::Fixed(PixelFormat::I420),
-                framerate: CapsValue::Any,
+                ..VideoFormatCaps::any()
             };
             ElementMediaCaps::new(vec![FormatMemoryCap::new(
                 i420.into(),
@@ -3005,7 +3005,7 @@ mod tests {
                 width: CapsValue::Any,
                 height: CapsValue::Any,
                 pixel_format: CapsValue::Fixed(PixelFormat::Rgba),
-                framerate: CapsValue::Any,
+                ..VideoFormatCaps::any()
             };
             ElementMediaCaps::new(vec![FormatMemoryCap::new(
                 rgba.into(),

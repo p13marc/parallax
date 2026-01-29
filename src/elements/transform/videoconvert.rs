@@ -201,11 +201,12 @@ impl Element for VideoConvertElement {
         // Convert
         converter.convert(input_data, &mut self.output_buffer)?;
 
-        // Create output buffer
+        // Create output buffer with AVX-aligned arena for SIMD efficiency
         let output_size = self.output_buffer.len();
 
         if self.arena.is_none() || self.arena.as_ref().unwrap().slot_size() < output_size {
-            self.arena = Some(SharedArena::new(output_size, 32)?);
+            // Use AVX-aligned arena (32-byte alignment) for SIMD operations
+            self.arena = Some(SharedArena::new_avx(output_size, 32)?);
         }
 
         let arena = self.arena.as_mut().unwrap();
@@ -244,8 +245,10 @@ impl Element for VideoConvertElement {
 
     fn input_media_caps(&self) -> crate::format::ElementMediaCaps {
         // Accept any raw video format - truly any dimensions and pixel format
+        // Request AVX-aligned memory for SIMD optimization
         use crate::format::{
-            CapsValue, ElementMediaCaps, FormatCaps, FormatMemoryCap, MemoryCaps, VideoFormatCaps,
+            CapsValue, ElementMediaCaps, FormatCaps, FormatMemoryCap, MemoryCaps, MemoryLayout,
+            VideoFormatCaps,
         };
 
         let format = VideoFormatCaps {
@@ -253,6 +256,7 @@ impl Element for VideoConvertElement {
             height: CapsValue::Any,
             pixel_format: CapsValue::Any,
             framerate: CapsValue::Any,
+            layout: MemoryLayout::AVX, // Request aligned memory for SIMD
         };
 
         ElementMediaCaps::new(vec![FormatMemoryCap::new(
@@ -263,8 +267,10 @@ impl Element for VideoConvertElement {
 
     fn output_media_caps(&self) -> crate::format::ElementMediaCaps {
         // Output is the configured output format with any dimensions
+        // Produce AVX-aligned output for downstream SIMD elements
         use crate::format::{
-            CapsValue, ElementMediaCaps, FormatCaps, FormatMemoryCap, MemoryCaps, VideoFormatCaps,
+            CapsValue, ElementMediaCaps, FormatCaps, FormatMemoryCap, MemoryCaps, MemoryLayout,
+            VideoFormatCaps,
         };
 
         let format = VideoFormatCaps {
@@ -272,6 +278,7 @@ impl Element for VideoConvertElement {
             height: CapsValue::Any,
             pixel_format: CapsValue::Fixed(convert_pixel_format(self.output_format)),
             framerate: CapsValue::Any,
+            layout: MemoryLayout::AVX, // Produce aligned output
         };
 
         ElementMediaCaps::new(vec![FormatMemoryCap::new(
