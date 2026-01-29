@@ -589,6 +589,59 @@ pub trait Source: Send {
     fn handle_upstream_event(&mut self, _event: &Event) -> EventResult {
         EventResult::NotHandled
     }
+
+    /// Handle a flow control signal from downstream.
+    ///
+    /// This is called when downstream elements signal backpressure
+    /// (Busy, Drop) or other flow control events. Sources should
+    /// respond according to their `flow_policy()`.
+    ///
+    /// Default implementation ignores the signal (backward compatible).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// impl Source for LiveCameraSource {
+    ///     fn handle_flow_signal(&mut self, signal: FlowSignal) {
+    ///         self.current_signal = signal;
+    ///     }
+    ///
+    ///     fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
+    ///         if self.current_signal == FlowSignal::Drop {
+    ///             // Skip frame production
+    ///             return Ok(ProduceResult::WouldBlock);
+    ///         }
+    ///         // ... normal production
+    ///     }
+    /// }
+    /// ```
+    fn handle_flow_signal(&mut self, _signal: crate::pipeline::flow::FlowSignal) {
+        // Default: ignore (backward compatibility)
+    }
+
+    /// Get the flow control policy for this source.
+    ///
+    /// This determines how the source responds to backpressure:
+    /// - `Block`: Wait until downstream is ready (default, safe for files)
+    /// - `Drop`: Drop frames when busy (best for live sources)
+    /// - `RingBuffer`: Buffer frames, drop oldest when full
+    /// - `Adaptive`: Start blocking, switch to dropping after timeout
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// impl Source for ScreenCaptureSource {
+    ///     fn flow_policy(&self) -> FlowPolicy {
+    ///         FlowPolicy::Drop {
+    ///             log_drops: true,
+    ///             max_consecutive: Some(30), // Error after 1s at 30fps
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    fn flow_policy(&self) -> crate::pipeline::flow::FlowPolicy {
+        crate::pipeline::flow::FlowPolicy::Block // Safe default
+    }
 }
 
 /// An async source element that produces buffers asynchronously.
@@ -676,6 +729,21 @@ pub trait AsyncSource: Send {
     /// Default implementation does not handle any events.
     fn handle_upstream_event(&mut self, _event: &Event) -> EventResult {
         EventResult::NotHandled
+    }
+
+    /// Handle a flow control signal from downstream.
+    ///
+    /// This is called when downstream elements signal backpressure.
+    /// Default implementation ignores the signal (backward compatible).
+    fn handle_flow_signal(&mut self, _signal: crate::pipeline::flow::FlowSignal) {
+        // Default: ignore (backward compatibility)
+    }
+
+    /// Get the flow control policy for this source.
+    ///
+    /// Default is `Block` which waits when downstream is busy.
+    fn flow_policy(&self) -> crate::pipeline::flow::FlowPolicy {
+        crate::pipeline::flow::FlowPolicy::Block
     }
 }
 
