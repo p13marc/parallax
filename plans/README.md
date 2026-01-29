@@ -49,7 +49,7 @@ Key architectural decisions have been researched and documented in **[00_DESIGN_
 |---|------|----------|--------|----------|
 | 09 | [Format Converters](09_FORMAT_CONVERTERS.md) | High | Medium | ✅ Complete |
 | 10 | [Code Cleanup](10_CODE_CLEANUP.md) | Low | Small | ✅ Complete |
-| 11 | [GPU Codec Framework](11_GPU_CODEC_FRAMEWORK.md) | High | Large | ⬜ Not Started |
+| 11 | [GPU Codec Framework](11_GPU_CODEC_FRAMEWORK.md) | High | Large | 🟡 In Progress |
 | 12 | [Additional Codecs](12_ADDITIONAL_CODECS.md) | Medium | Medium | ✅ Complete |
 | 13 | [Device Elements](13_DEVICE_ELEMENTS.md) | Medium | Medium | ✅ Complete |
 | 14 | [Streaming Protocols](14_STREAMING_PROTOCOLS.md) | Medium | Medium | ⬜ Not Started |
@@ -327,18 +327,23 @@ Adaptive bitrate streaming support:
 - [x] Run `cargo doc --no-deps` and fix warnings
 - [x] Remove dead code
 
-### Plan 11: GPU Codec Framework ⬜
-- [ ] Add `ash`, `gpu-allocator` dependencies
-- [ ] Create `src/gpu/mod.rs` module structure
-- [ ] Implement Vulkan instance/device creation
-- [ ] Implement DMA-BUF import/export
-- [ ] Implement H.264 decode
+### Plan 11: GPU Codec Framework 🟡
+- [x] Add `ash`, `gpu-allocator`, `h264-reader` dependencies
+- [x] Create `src/gpu/mod.rs` module structure
+- [x] Implement Vulkan instance/device creation (`VulkanContext`)
+- [x] Query video decode/encode capabilities
+- [x] Implement `GpuMemory` trait for Vulkan (`VulkanGpuMemory`)
+- [x] Implement DMA-BUF import/export
+- [x] Implement `VulkanH264Decoder` skeleton (NAL parsing, session structure)
+- [x] Create `HwDecoderElement` wrapper
+- [x] Create example: `18_gpu_decode.rs`
+- [ ] Complete H.264 decode (video session, DPB, command recording)
 - [ ] Implement H.265 decode
 - [ ] Implement AV1 decode
 - [ ] Implement H.264 encode
 - [ ] Implement H.265 encode
-- [ ] Create `HwDecoderElement`/`HwEncoderElement`
-- [ ] Create examples: `18_gpu_decode.rs`, `19_gpu_transcode.rs`
+- [ ] Create `HwEncoderElement`
+- [ ] Create example: `19_gpu_transcode.rs`
 - [ ] Update documentation
 
 ### Plan 12: Additional Codecs ✅

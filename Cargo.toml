@@ -262,6 +262,10 @@ name = "16_mpegts"
 required-features = ["mpeg-ts"]
 
 [[example]]
+name = "18_gpu_decode"
+required-features = ["vulkan-video"]
+
+[[example]]
 name = "20_opus_audio"
 required-features = ["opus"]
 

@@ -117,6 +117,12 @@ mod encoder_element;
 pub use decoder_element::DecoderElement;
 pub use encoder_element::EncoderElement;
 
+// Hardware decoder element wrapper (Vulkan Video)
+#[cfg(feature = "vulkan-video")]
+mod hw_decoder;
+#[cfg(feature = "vulkan-video")]
+pub use hw_decoder::HwDecoderElement;
+
 // Audio element wrappers
 mod audio_decoder_element;
 mod audio_encoder_element;
