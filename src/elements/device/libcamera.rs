@@ -46,6 +46,7 @@ use libcamera::{
 
 use crate::element::{Affinity, AsyncSource, ExecutionHints, ProduceContext, ProduceResult};
 use crate::error::Result;
+use crate::pipeline::flow::{FlowPolicy, FlowSignal, FlowStateHandle};
 
 use super::{CameraLocation, DeviceError};
 
@@ -151,6 +152,10 @@ pub struct LibCameraSrc {
     config: LibCameraConfig,
     /// Camera ID being used.
     camera_id: String,
+    /// Flow state handle for downstream backpressure monitoring.
+    flow_state: Option<FlowStateHandle>,
+    /// Frames dropped due to backpressure.
+    frames_dropped: u64,
 }
 
 impl LibCameraSrc {
@@ -196,6 +201,8 @@ impl LibCameraSrc {
             thread: Some(thread),
             config,
             camera_id: camera_id.to_string(),
+            flow_state: None,
+            frames_dropped: 0,
         })
     }
 
@@ -338,6 +345,20 @@ impl LibCameraSrc {
     pub fn config(&self) -> &LibCameraConfig {
         &self.config
     }
+
+    /// Set the flow state handle for downstream backpressure monitoring.
+    ///
+    /// When set, the source will check this handle before producing frames.
+    /// If downstream signals backpressure (Busy), frames will be dropped
+    /// to prevent lag buildup.
+    pub fn set_flow_state(&mut self, handle: FlowStateHandle) {
+        self.flow_state = Some(handle);
+    }
+
+    /// Get the number of frames dropped due to backpressure.
+    pub fn frames_dropped(&self) -> u64 {
+        self.frames_dropped
+    }
 }
 
 impl Drop for LibCameraSrc {
@@ -354,6 +375,28 @@ impl Drop for LibCameraSrc {
 
 impl AsyncSource for LibCameraSrc {
     async fn produce(&mut self, ctx: &mut ProduceContext<'_>) -> Result<ProduceResult> {
+        // Check for downstream backpressure before receiving
+        // libcamera is a live source - dropping frames is better than accumulating lag
+        if let Some(ref flow_state) = self.flow_state {
+            if !flow_state.should_produce() {
+                // Drop this frame due to backpressure
+                self.frames_dropped += 1;
+                flow_state.record_drop();
+
+                if self.frames_dropped == 1 || self.frames_dropped % 30 == 0 {
+                    tracing::warn!(
+                        "libcamera: dropping frame due to backpressure (total dropped: {})",
+                        self.frames_dropped
+                    );
+                }
+
+                // Drain one frame from the receiver to keep the capture thread running
+                let _ = self.receiver.as_async().recv().await;
+
+                return Ok(ProduceResult::WouldBlock);
+            }
+        }
+
         match self.receiver.as_async().recv().await {
             Ok(frame) => {
                 let len = frame.data.len();
@@ -404,6 +447,21 @@ impl AsyncSource for LibCameraSrc {
 
     fn execution_hints(&self) -> ExecutionHints {
         ExecutionHints::io_bound()
+    }
+
+    fn handle_flow_signal(&mut self, signal: FlowSignal) {
+        // Update our internal state based on downstream signal
+        if let Some(ref flow_state) = self.flow_state {
+            flow_state.set_signal(signal);
+        }
+    }
+
+    fn flow_policy(&self) -> FlowPolicy {
+        // libcamera is a live source - always use Drop policy to prevent lag
+        FlowPolicy::Drop {
+            log_drops: true,
+            max_consecutive: None,
+        }
     }
 }
 

@@ -36,6 +36,7 @@ use crate::element::{
     Affinity, AsyncSink, AsyncSource, ExecutionHints, ProduceContext, ProduceResult,
 };
 use crate::error::Result;
+use crate::pipeline::flow::{FlowPolicy, FlowSignal, FlowStateHandle};
 
 use super::DeviceError;
 
@@ -198,6 +199,10 @@ pub struct PipeWireSrc {
     _thread: Option<thread::JoinHandle<()>>,
     /// Target being captured.
     target: PipeWireTarget,
+    /// Flow state handle for downstream backpressure monitoring.
+    flow_state: Option<FlowStateHandle>,
+    /// Frames/samples dropped due to backpressure.
+    frames_dropped: u64,
 }
 
 impl PipeWireSrc {
@@ -292,7 +297,23 @@ impl PipeWireSrc {
             _shutdown: shutdown_tx,
             _thread: Some(thread),
             target,
+            flow_state: None,
+            frames_dropped: 0,
         })
+    }
+
+    /// Set the flow state handle for downstream backpressure monitoring.
+    ///
+    /// When set, the source will check this handle before producing data.
+    /// If downstream signals backpressure (Busy), data will be dropped
+    /// to prevent lag buildup.
+    pub fn set_flow_state(&mut self, handle: FlowStateHandle) {
+        self.flow_state = Some(handle);
+    }
+
+    /// Get the number of frames/samples dropped due to backpressure.
+    pub fn frames_dropped(&self) -> u64 {
+        self.frames_dropped
     }
 
     /// Main capture thread.
@@ -400,6 +421,28 @@ impl PipeWireSrc {
 
 impl AsyncSource for PipeWireSrc {
     async fn produce(&mut self, ctx: &mut ProduceContext<'_>) -> Result<ProduceResult> {
+        // Check for downstream backpressure before receiving
+        // PipeWire is a live source - dropping data is better than accumulating lag
+        if let Some(ref flow_state) = self.flow_state {
+            if !flow_state.should_produce() {
+                // Drop this buffer due to backpressure
+                self.frames_dropped += 1;
+                flow_state.record_drop();
+
+                if self.frames_dropped == 1 || self.frames_dropped % 30 == 0 {
+                    tracing::warn!(
+                        "PipeWire: dropping data due to backpressure (total dropped: {})",
+                        self.frames_dropped
+                    );
+                }
+
+                // Drain one buffer from the receiver to keep the capture thread running
+                let _ = self.receiver.as_async().recv().await;
+
+                return Ok(ProduceResult::WouldBlock);
+            }
+        }
+
         match self.receiver.as_async().recv().await {
             Ok(data) => {
                 let len = data.len();
@@ -433,6 +476,21 @@ impl AsyncSource for PipeWireSrc {
 
     fn execution_hints(&self) -> ExecutionHints {
         ExecutionHints::io_bound()
+    }
+
+    fn handle_flow_signal(&mut self, signal: FlowSignal) {
+        // Update our internal state based on downstream signal
+        if let Some(ref flow_state) = self.flow_state {
+            flow_state.set_signal(signal);
+        }
+    }
+
+    fn flow_policy(&self) -> FlowPolicy {
+        // PipeWire is a live source - always use Drop policy to prevent lag
+        FlowPolicy::Drop {
+            log_drops: true,
+            max_consecutive: None,
+        }
     }
 }
 

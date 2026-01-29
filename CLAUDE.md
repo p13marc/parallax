@@ -284,6 +284,119 @@ fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
 }
 ```
 
+### Backpressure and Flow Control
+
+Parallax provides a comprehensive backpressure system for handling situations where downstream elements are slower than upstream sources. This is critical for live capture sources (cameras, screen capture, audio) where frames arrive at a fixed rate regardless of downstream processing speed.
+
+**Key types:**
+- `FlowSignal` - Signals between elements (Ready, Busy, Drop, EosAck, Pausing, Stopping)
+- `FlowPolicy` - How sources respond to backpressure (Block, Drop, RingBuffer, Adaptive)
+- `FlowStateHandle` - Thread-safe handle for sharing flow state between elements
+- `WaterMarks` - High/low thresholds for Queue-based flow control
+
+**Flow signals:**
+| Signal | Meaning |
+|--------|---------|
+| `Ready` | Downstream can accept data |
+| `Busy` | Downstream is congested, slow down or drop |
+| `Drop` | Downstream requests frame dropping |
+| `EosAck` | End-of-stream acknowledged |
+| `Pausing` | Pipeline is pausing |
+| `Stopping` | Pipeline is stopping |
+
+**Flow policies:**
+| Policy | Behavior | Use Case |
+|--------|----------|----------|
+| `Block` | Wait for downstream (default) | File sources, non-live |
+| `Drop { log_drops }` | Drop frames when busy | Live video capture |
+| `RingBuffer { capacity }` | Overwrite oldest frames | Fixed-latency scenarios |
+| `Adaptive` | Switch between block/drop | Variable network conditions |
+
+**Queue water marks:**
+```rust
+use parallax::elements::flow::Queue;
+use parallax::pipeline::flow::WaterMarks;
+
+// Queue with default water marks (80% high, 20% low)
+let queue = Queue::new(100).with_flow_control();
+
+// Queue with custom water marks
+let wm = WaterMarks::with_percentages(100, 90, 10);  // 90% high, 10% low
+let queue = Queue::new(100).with_water_marks(wm);
+
+// Check queue state
+println!("Fill level: {:.1}%", queue.fill_level());
+println!("Is busy: {}", queue.is_busy());
+println!("Flow signal: {:?}", queue.flow_signal());
+```
+
+**Connecting sources to downstream backpressure:**
+```rust
+use parallax::elements::device::ScreenCaptureSrc;
+use parallax::elements::flow::Queue;
+
+// Create queue with flow control
+let queue = Queue::new(100).with_flow_control();
+let flow_state = queue.flow_state_handle();
+
+// Connect source to queue's flow state
+let mut capture = ScreenCaptureSrc::default_config();
+capture.set_flow_state(flow_state);
+
+// Now when queue reaches high water mark:
+// 1. Queue signals Busy via flow_state
+// 2. Source checks should_produce() -> false
+// 3. Source drops frame according to its flow_policy()
+// 4. When queue drains to low water mark, source resumes
+```
+
+**Implementing flow control in custom sources:**
+```rust
+use parallax::element::{Source, ProduceContext, ProduceResult};
+use parallax::pipeline::flow::{FlowPolicy, FlowSignal, FlowStateHandle};
+
+struct MyLiveSource {
+    flow_state: Option<FlowStateHandle>,
+    frames_dropped: u64,
+}
+
+impl Source for MyLiveSource {
+    fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
+        // Check backpressure before producing
+        if let Some(ref flow_state) = self.flow_state {
+            if !flow_state.should_produce() {
+                self.frames_dropped += 1;
+                flow_state.record_drop();
+                return Ok(ProduceResult::WouldBlock);
+            }
+        }
+        
+        // Produce frame normally...
+        Ok(ProduceResult::OwnBuffer(buffer))
+    }
+    
+    fn flow_policy(&self) -> FlowPolicy {
+        // Live sources should drop frames to avoid lag
+        FlowPolicy::drop_with_logging()
+    }
+    
+    fn handle_flow_signal(&mut self, signal: FlowSignal) {
+        if let Some(ref flow_state) = self.flow_state {
+            flow_state.set_signal(signal);
+        }
+    }
+}
+```
+
+**Built-in sources with flow control:**
+- `ScreenCaptureSrc` - Default: Drop policy (prevents capture lag)
+- `V4l2Src` - Default: Drop policy (camera capture)
+- `LibCameraSrc` - Default: Drop policy (camera capture)
+- `PipeWireSrc` - Default: Drop policy (audio/video capture)
+- `AlsaSrc` - Default: Drop policy (audio capture)
+
+See `examples/47_flow_control.rs` for a complete example.
+
 ### Muxer Synchronization (N-to-1)
 
 Parallax provides PTS-based synchronization for N-to-1 muxer elements:

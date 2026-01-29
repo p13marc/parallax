@@ -31,6 +31,7 @@ use crate::element::{
     Affinity, AsyncSink, AsyncSource, ConsumeContext, ExecutionHints, ProduceContext, ProduceResult,
 };
 use crate::error::Result;
+use crate::pipeline::flow::{FlowPolicy, FlowSignal, FlowStateHandle};
 
 use super::DeviceError;
 
@@ -165,6 +166,10 @@ pub struct AlsaSrc {
     format: AlsaFormat,
     /// Frame size in bytes.
     frame_size: usize,
+    /// Flow state handle for downstream backpressure monitoring.
+    flow_state: Option<FlowStateHandle>,
+    /// Samples dropped due to backpressure.
+    samples_dropped: u64,
 }
 
 impl AlsaSrc {
@@ -218,6 +223,8 @@ impl AlsaSrc {
             pcm,
             format,
             frame_size,
+            flow_state: None,
+            samples_dropped: 0,
         })
     }
 
@@ -230,6 +237,20 @@ impl AlsaSrc {
     pub fn enumerate_devices() -> Result<Vec<AlsaDeviceInfo>> {
         let all = enumerate_devices()?;
         Ok(all.into_iter().filter(|d| d.is_capture).collect())
+    }
+
+    /// Set the flow state handle for downstream backpressure monitoring.
+    ///
+    /// When set, the source will check this handle before producing data.
+    /// If downstream signals backpressure (Busy), audio samples will be dropped
+    /// to prevent lag buildup.
+    pub fn set_flow_state(&mut self, handle: FlowStateHandle) {
+        self.flow_state = Some(handle);
+    }
+
+    /// Get the number of samples dropped due to backpressure.
+    pub fn samples_dropped(&self) -> u64 {
+        self.samples_dropped
     }
 
     /// Get poll descriptors for async waiting.
@@ -257,6 +278,34 @@ impl AsyncSource for AlsaSrc {
         let max_frames = ctx.output().len() / self.frame_size;
         if max_frames == 0 {
             return Ok(ProduceResult::WouldBlock);
+        }
+
+        // Check for downstream backpressure before reading
+        // ALSA is a live source - dropping samples is better than accumulating lag
+        if let Some(ref flow_state) = self.flow_state {
+            if !flow_state.should_produce() {
+                // Drop audio samples due to backpressure
+                self.samples_dropped += 1;
+                flow_state.record_drop();
+
+                if self.samples_dropped == 1 || self.samples_dropped % 100 == 0 {
+                    tracing::warn!(
+                        "ALSA: dropping audio due to backpressure (total dropped: {})",
+                        self.samples_dropped
+                    );
+                }
+
+                // Still need to drain the ALSA buffer to prevent overrun
+                // Read and discard
+                let io = self
+                    .pcm
+                    .io_i16()
+                    .map_err(|e| DeviceError::Alsa(e.to_string()))?;
+                let mut discard_buf = vec![0i16; max_frames * self.format.channels as usize];
+                let _ = io.readi(&mut discard_buf);
+
+                return Ok(ProduceResult::WouldBlock);
+            }
         }
 
         // Wait for data using poll
@@ -317,6 +366,21 @@ impl AsyncSource for AlsaSrc {
 
     fn execution_hints(&self) -> ExecutionHints {
         ExecutionHints::io_bound()
+    }
+
+    fn handle_flow_signal(&mut self, signal: FlowSignal) {
+        // Update our internal state based on downstream signal
+        if let Some(ref flow_state) = self.flow_state {
+            flow_state.set_signal(signal);
+        }
+    }
+
+    fn flow_policy(&self) -> FlowPolicy {
+        // ALSA is a live source - always use Drop policy to prevent lag
+        FlowPolicy::Drop {
+            log_drops: true,
+            max_consecutive: None,
+        }
     }
 }
 
