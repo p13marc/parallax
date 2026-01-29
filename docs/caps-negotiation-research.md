@@ -1,5 +1,9 @@
 # Plan: Caps Negotiation System for Parallax
 
+> **Note:** This is a research document exploring design options. The final implementation
+> uses **explicit converters by default** (GStreamer-style), with opt-in auto-insertion.
+> See `docs/auto-converter-research.md` for the rationale and `ConverterPolicy` for the API.
+
 ## Overview
 
 This plan adds format negotiation to Parallax, enabling automatic format compatibility checking, supporting both push and pull modes, and learning from the strengths and weaknesses of existing systems (GStreamer, FFmpeg, DirectShow, PipeWire).

@@ -419,7 +419,7 @@ impl NegotiationSolver {
 **Benefits**:
 - Finds globally optimal format (not just locally compatible)
 - Minimizes memory copies across entire pipeline
-- Inserts converters only where truly needed
+- Explicit converters by default (no hidden costs), with opt-in auto-insertion
 - Rich error messages showing full path and suggestions
 
 ### 5. Unified Format + Memory Negotiation
@@ -964,7 +964,7 @@ For H.264/H.265 without GPU: accept that pure Rust options are limited. Users ne
 │  ┌──────────────────────────────────────────────────────────────┐  │
 │  │                    NEGOTIATION SOLVER                         │  │
 │  │  • Global constraint solving (format + memory)               │  │
-│  │  • Automatic converter insertion                             │  │
+│  │  • Explicit converters (opt-in auto-insertion)               │  │
 │  │  • Rich error messages with suggestions                      │  │
 │  └──────────────────────────────────────────────────────────────┘  │
 │                             │                                       │
@@ -1033,7 +1033,7 @@ For H.264/H.265 without GPU: accept that pure Rust options are limited. Users ne
 - [ ] CapsValue with ranges/lists
 - [ ] MediaCaps (format + memory unified)
 - [ ] Global constraint solver
-- [ ] Converter registry with cost model
+- [ ] Converter registry with explicit policy (default: Deny)
 - [ ] Rich error messages with suggestions
 
 ### Phase 3: Cross-Process IPC (Q3)

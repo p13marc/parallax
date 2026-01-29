@@ -497,6 +497,7 @@ parallax/
 │   ├── security.md         # Security model and sandboxing
 │   ├── getting-started.md  # Quick start guide
 │   │   # Design documents
+│   ├── auto-converter-research.md    # GStreamer vs PipeWire converter approaches
 │   ├── caps-negotiation-research.md  # Caps negotiation research
 │   ├── vulkan-video-design.md        # Vulkan Video integration design
 │   ├── iced-integration-design.md    # Iced GUI integration design
@@ -771,10 +772,28 @@ impl Sink for MyDisplay {
 **Negotiation behavior:**
 - The solver iterates source formats against sink formats
 - Returns the first (highest preference) intersection
-- If no direct match, looks for converters in the registry
-- Error messages list all attempted format combinations
+- If no direct match, fails with helpful error message (default policy)
+- Error messages list all attempted format combinations and suggest adding explicit converters
 
-See `examples/17_multi_format_caps.rs` for a complete example.
+**Converter policy** (GStreamer-inspired explicit converters):
+```rust
+use parallax::pipeline::{Pipeline, ConverterPolicy};
+
+// Default: Deny - fails if formats don't match (recommended)
+pipeline.prepare()?;  // Error if converter needed
+
+// Option 1: Add explicit converters to your pipeline
+let pipeline = Pipeline::parse("camera ! videoconvert ! display")?;
+
+// Option 2: Allow auto-insertion for this prepare() call only
+pipeline.prepare_with_auto_converters()?;
+
+// Option 3: Change policy to allow auto-insertion
+pipeline.set_converter_policy(ConverterPolicy::Allow);
+pipeline.prepare()?;
+```
+
+See `examples/17_multi_format_caps.rs` and `examples/41_format_converters.rs` for examples.
 
 ## Implementation Roadmap
 
