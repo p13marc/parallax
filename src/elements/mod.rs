@@ -43,6 +43,9 @@
 //!
 //! ## `device` - Device Capture (feature-gated)
 //! PipeWire, libcamera, V4L2, ALSA - hardware device capture and playback
+//!
+//! ## `streaming` - Streaming Protocols (feature-gated)
+//! HLS, DASH - adaptive bitrate streaming output
 
 pub mod app;
 
@@ -76,6 +79,7 @@ pub mod metadata;
 pub mod mux;
 pub mod network;
 pub mod rtp;
+pub mod streaming;
 pub mod testing;
 pub mod timing;
 pub mod transform;
@@ -283,3 +287,8 @@ pub use device::{V4l2DeviceInfo, V4l2Src};
 // Device capture - ALSA
 #[cfg(feature = "alsa")]
 pub use device::{AlsaDeviceInfo, AlsaFormat, AlsaSampleFormat, AlsaSink, AlsaSrc};
+
+// Streaming protocols
+pub use streaming::{
+    HlsConfig, HlsSink, HlsVariant, SegmentBoundaryDetector, SegmentInfo, SegmentWriter,
+};

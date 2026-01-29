@@ -134,6 +134,9 @@ ashpd = { version = "0.10", optional = true, default-features = false, features 
 # Regex (for RegexFilter)
 regex = "1"
 
+# XML generation (for DASH MPD)
+quick-xml = "0.37"
+
 # Object-safe async traits
 dynosaur = "0.3"
 trait-variant = "0.1"
@@ -289,3 +292,10 @@ required-features = ["v4l2"]
 [[example]]
 name = "46_screen_capture"
 required-features = ["screen-capture", "h264", "mp4-demux"]
+
+# Streaming protocol examples (25-26): no special features required
+[[example]]
+name = "25_hls_output"
+
+[[example]]
+name = "26_dash_output"
