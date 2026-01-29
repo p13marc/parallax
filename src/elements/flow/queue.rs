@@ -2,13 +2,39 @@
 //!
 //! Provides a buffer queue between pipeline elements, enabling:
 //! - Decoupling of producer and consumer rates
-//! - Backpressure handling
+//! - Backpressure handling via flow signals
 //! - Thread boundary crossing
+//!
+//! # Flow Control
+//!
+//! The queue supports flow control via water marks:
+//! - When fill level reaches **high water mark** (default 80%), emits `FlowSignal::Busy`
+//! - When fill level drops to **low water mark** (default 20%), emits `FlowSignal::Ready`
+//!
+//! This hysteresis prevents oscillation between busy and ready states.
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use parallax::elements::Queue;
+//! use parallax::pipeline::flow::{FlowSignal, WaterMarks};
+//!
+//! let queue = Queue::new(100)
+//!     .with_water_marks(WaterMarks::from_capacity(100));
+//!
+//! // Check flow state
+//! let signal = queue.flow_signal();
+//! if signal == FlowSignal::Busy {
+//!     // Upstream should slow down or drop frames
+//! }
+//! ```
 
 use crate::buffer::Buffer;
 use crate::element::Element;
 use crate::error::{Error, Result};
+use crate::pipeline::flow::{FlowSignal, WaterMarks};
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -33,12 +59,15 @@ pub struct Queue {
     name: String,
     inner: Arc<QueueInner>,
     leaky: LeakyMode,
+    water_marks: Option<WaterMarks>,
 }
 
 struct QueueInner {
     state: Mutex<QueueState>,
     not_empty: Condvar,
     not_full: Condvar,
+    /// Current flow signal (atomic for lock-free reads)
+    flow_signal: AtomicU8,
 }
 
 struct QueueState {
@@ -50,6 +79,8 @@ struct QueueState {
     total_popped: u64,
     total_dropped: u64,
     flushing: bool,
+    /// Number of times high water mark was reached
+    high_water_events: u64,
 }
 
 /// Leaky mode determines what happens when the queue is full.
@@ -79,11 +110,14 @@ impl Queue {
                     total_popped: 0,
                     total_dropped: 0,
                     flushing: false,
+                    high_water_events: 0,
                 }),
                 not_empty: Condvar::new(),
                 not_full: Condvar::new(),
+                flow_signal: AtomicU8::new(FlowSignal::Ready as u8),
             }),
             leaky: LeakyMode::None,
+            water_marks: None,
         }
     }
 
@@ -101,12 +135,33 @@ impl Queue {
                     total_popped: 0,
                     total_dropped: 0,
                     flushing: false,
+                    high_water_events: 0,
                 }),
                 not_empty: Condvar::new(),
                 not_full: Condvar::new(),
+                flow_signal: AtomicU8::new(FlowSignal::Ready as u8),
             }),
             leaky: LeakyMode::None,
+            water_marks: None,
         }
+    }
+
+    /// Set water marks for flow control.
+    ///
+    /// When the queue level reaches the high water mark, `flow_signal()` returns `Busy`.
+    /// When it drops to the low water mark, `flow_signal()` returns `Ready`.
+    pub fn with_water_marks(mut self, water_marks: WaterMarks) -> Self {
+        self.water_marks = Some(water_marks);
+        self
+    }
+
+    /// Enable default water marks (80% high, 20% low).
+    pub fn with_flow_control(mut self) -> Self {
+        let state = self.inner.state.lock().unwrap();
+        let capacity = state.max_buffers;
+        drop(state);
+        self.water_marks = Some(WaterMarks::from_capacity(capacity));
+        self
     }
 
     /// Set the leaky mode.
@@ -142,10 +197,63 @@ impl Queue {
         QueueStats {
             current_buffers: state.buffers.len(),
             current_bytes: state.current_bytes,
+            max_buffers: state.max_buffers,
             total_pushed: state.total_pushed,
             total_popped: state.total_popped,
             total_dropped: state.total_dropped,
+            high_water_events: state.high_water_events,
         }
+    }
+
+    /// Get the current flow signal.
+    ///
+    /// This is a lock-free read suitable for frequent polling.
+    /// Returns `Ready` if flow control is disabled.
+    #[inline]
+    pub fn flow_signal(&self) -> FlowSignal {
+        FlowSignal::from(self.inner.flow_signal.load(Ordering::Acquire) as u8)
+    }
+
+    /// Check if the queue is signaling backpressure.
+    #[inline]
+    pub fn is_busy(&self) -> bool {
+        self.flow_signal() == FlowSignal::Busy
+    }
+
+    /// Get the current fill level as a percentage (0.0 to 100.0).
+    pub fn fill_level(&self) -> f64 {
+        let state = self.inner.state.lock().unwrap();
+        if state.max_buffers == 0 {
+            return 0.0;
+        }
+        (state.buffers.len() as f64 / state.max_buffers as f64) * 100.0
+    }
+
+    /// Update flow signal based on current fill level.
+    fn update_flow_signal(&self, level: usize) {
+        let Some(wm) = &self.water_marks else {
+            return; // Flow control disabled
+        };
+
+        let current = self.inner.flow_signal.load(Ordering::Acquire);
+        let current_signal = FlowSignal::from(current as u8);
+
+        let new_signal = if wm.is_high(level) && current_signal == FlowSignal::Ready {
+            // Transition to Busy
+            let mut state = self.inner.state.lock().unwrap();
+            state.high_water_events += 1;
+            drop(state);
+            FlowSignal::Busy
+        } else if wm.is_low(level) && current_signal == FlowSignal::Busy {
+            // Transition to Ready
+            FlowSignal::Ready
+        } else {
+            return; // No change
+        };
+
+        self.inner
+            .flow_signal
+            .store(new_signal as u8, Ordering::Release);
     }
 
     /// Flush all buffers from the queue.
@@ -219,7 +327,10 @@ impl Queue {
         state.buffers.push_back(buffer);
         state.current_bytes += buffer_len;
         state.total_pushed += 1;
+        let level = state.buffers.len();
+        drop(state);
 
+        self.update_flow_signal(level);
         self.inner.not_empty.notify_one();
         Ok(())
     }
@@ -254,6 +365,10 @@ impl Queue {
         if let Some(buffer) = state.buffers.pop_front() {
             state.current_bytes = state.current_bytes.saturating_sub(buffer.len());
             state.total_popped += 1;
+            let level = state.buffers.len();
+            drop(state);
+
+            self.update_flow_signal(level);
             self.inner.not_full.notify_one();
             Ok(Some(buffer))
         } else {
@@ -281,12 +396,16 @@ pub struct QueueStats {
     pub current_buffers: usize,
     /// Current total bytes in the queue.
     pub current_bytes: usize,
+    /// Maximum buffer capacity.
+    pub max_buffers: usize,
     /// Total buffers pushed to the queue.
     pub total_pushed: u64,
     /// Total buffers popped from the queue.
     pub total_popped: u64,
     /// Total buffers dropped (due to leaky mode).
     pub total_dropped: u64,
+    /// Number of times high water mark was reached.
+    pub high_water_events: u64,
 }
 
 impl Element for Queue {
@@ -308,6 +427,7 @@ impl Clone for Queue {
             name: self.name.clone(),
             inner: Arc::clone(&self.inner),
             leaky: self.leaky,
+            water_marks: self.water_marks.clone(),
         }
     }
 }
@@ -479,5 +599,131 @@ mod tests {
         assert_eq!(stats.total_pushed, 2);
         assert_eq!(stats.total_popped, 1);
         assert_eq!(stats.current_buffers, 1);
+        assert_eq!(stats.max_buffers, 10);
+    }
+
+    #[test]
+    fn test_queue_flow_control_disabled() {
+        // Without water marks, flow signal is always Ready
+        let queue = Queue::new(10);
+
+        for i in 0..10 {
+            queue.push(create_test_buffer(10, i)).unwrap();
+        }
+
+        // Even at full capacity, signal should be Ready (flow control disabled)
+        assert_eq!(queue.flow_signal(), FlowSignal::Ready);
+        assert!(!queue.is_busy());
+    }
+
+    #[test]
+    fn test_queue_flow_control_high_water() {
+        // With water marks (80% high, 20% low), 10 buffers means:
+        // - High water at 8 buffers
+        // - Low water at 2 buffers
+        let queue = Queue::new(10).with_flow_control();
+
+        // Push 7 buffers - still below high water
+        for i in 0..7 {
+            queue.push(create_test_buffer(10, i)).unwrap();
+        }
+        assert_eq!(queue.flow_signal(), FlowSignal::Ready);
+        assert!(!queue.is_busy());
+
+        // Push 8th buffer - reaches high water mark
+        queue.push(create_test_buffer(10, 7)).unwrap();
+        assert_eq!(queue.flow_signal(), FlowSignal::Busy);
+        assert!(queue.is_busy());
+
+        // Stats should show high water event
+        assert_eq!(queue.stats().high_water_events, 1);
+    }
+
+    #[test]
+    fn test_queue_flow_control_low_water() {
+        let queue = Queue::new(10).with_flow_control();
+
+        // Fill to high water
+        for i in 0..8 {
+            queue.push(create_test_buffer(10, i)).unwrap();
+        }
+        assert_eq!(queue.flow_signal(), FlowSignal::Busy);
+
+        // Pop down to 3 - still above low water (2), should stay Busy
+        for _ in 0..5 {
+            queue.pop_timeout(Some(Duration::from_millis(100))).unwrap();
+        }
+        assert_eq!(queue.len(), 3);
+        assert_eq!(queue.flow_signal(), FlowSignal::Busy);
+
+        // Pop one more to reach 2 - at low water, should become Ready
+        queue.pop_timeout(Some(Duration::from_millis(100))).unwrap();
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue.flow_signal(), FlowSignal::Ready);
+    }
+
+    #[test]
+    fn test_queue_flow_control_hysteresis() {
+        // Test that hysteresis prevents oscillation
+        let queue = Queue::new(10).with_flow_control();
+
+        // Fill to high water (8)
+        for i in 0..8 {
+            queue.push(create_test_buffer(10, i)).unwrap();
+        }
+        assert_eq!(queue.flow_signal(), FlowSignal::Busy);
+
+        // Pop one to 7 - still Busy (not at low water yet)
+        queue.pop_timeout(Some(Duration::from_millis(100))).unwrap();
+        assert_eq!(queue.flow_signal(), FlowSignal::Busy);
+
+        // Push back to 8 - still Busy (already was Busy)
+        queue.push(create_test_buffer(10, 8)).unwrap();
+        assert_eq!(queue.flow_signal(), FlowSignal::Busy);
+
+        // Should only have one high water event (first time reaching 8)
+        assert_eq!(queue.stats().high_water_events, 1);
+    }
+
+    #[test]
+    fn test_queue_fill_level() {
+        let queue = Queue::new(10);
+
+        assert_eq!(queue.fill_level(), 0.0);
+
+        queue.push(create_test_buffer(10, 0)).unwrap();
+        assert!((queue.fill_level() - 10.0).abs() < 0.01);
+
+        for i in 1..5 {
+            queue.push(create_test_buffer(10, i)).unwrap();
+        }
+        assert!((queue.fill_level() - 50.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_queue_custom_water_marks() {
+        // Custom water marks: 50% high, 10% low
+        let wm = WaterMarks::new(5, 1); // 5 high, 1 low for 10-buffer queue
+        let queue = Queue::new(10).with_water_marks(wm);
+
+        // Push 4 - below high water
+        for i in 0..4 {
+            queue.push(create_test_buffer(10, i)).unwrap();
+        }
+        assert_eq!(queue.flow_signal(), FlowSignal::Ready);
+
+        // Push 5th - at high water
+        queue.push(create_test_buffer(10, 4)).unwrap();
+        assert_eq!(queue.flow_signal(), FlowSignal::Busy);
+
+        // Pop to 2 - still above low water (1)
+        for _ in 0..3 {
+            queue.pop_timeout(Some(Duration::from_millis(100))).unwrap();
+        }
+        assert_eq!(queue.flow_signal(), FlowSignal::Busy);
+
+        // Pop to 1 - at low water
+        queue.pop_timeout(Some(Duration::from_millis(100))).unwrap();
+        assert_eq!(queue.flow_signal(), FlowSignal::Ready);
     }
 }

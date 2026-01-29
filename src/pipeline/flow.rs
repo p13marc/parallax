@@ -337,6 +337,11 @@ pub struct WaterMarks {
 }
 
 impl WaterMarks {
+    /// Create water marks with explicit high and low values.
+    pub fn new(high: usize, low: usize) -> Self {
+        Self { high, low }
+    }
+
     /// Create water marks from a capacity.
     ///
     /// High = 80% of capacity, Low = 20% of capacity.
