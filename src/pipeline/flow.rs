@@ -200,6 +200,15 @@ impl FlowPolicy {
             FlowPolicy::Drop { .. } | FlowPolicy::RingBuffer { .. } | FlowPolicy::Adaptive { .. }
         )
     }
+
+    /// Check if drops should be logged.
+    pub fn should_log_drops(&self) -> bool {
+        match self {
+            FlowPolicy::Drop { log_drops, .. } => *log_drops,
+            FlowPolicy::Adaptive { log_switches, .. } => *log_switches,
+            _ => false,
+        }
+    }
 }
 
 /// Statistics about flow control behavior.

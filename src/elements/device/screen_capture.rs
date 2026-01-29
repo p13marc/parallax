@@ -50,6 +50,7 @@ use crate::format::{
 };
 use crate::memory::SharedArena;
 use crate::metadata::Metadata;
+use crate::pipeline::flow::{FlowPolicy, FlowSignal, FlowStateHandle};
 
 use super::DeviceError;
 
@@ -88,6 +89,9 @@ pub struct ScreenCaptureConfig {
     /// Maximum number of frames to capture before EOS.
     /// None means unlimited (capture until manually stopped).
     pub max_frames: Option<u32>,
+    /// Flow policy for handling downstream backpressure.
+    /// Default: Drop frames when downstream is busy (prevents capture lag).
+    pub flow_policy: FlowPolicy,
 }
 
 impl Default for ScreenCaptureConfig {
@@ -97,6 +101,10 @@ impl Default for ScreenCaptureConfig {
             show_cursor: true,
             persist_session: false,
             max_frames: None,
+            // Screen capture should drop frames when downstream is busy
+            // to prevent building up lag. This is the standard behavior
+            // for live video sources.
+            flow_policy: FlowPolicy::drop_with_logging(),
         }
     }
 }
@@ -154,6 +162,10 @@ pub struct ScreenCaptureSrc {
     frame_count: Arc<AtomicU32>,
     /// Frames output by produce() - used for max_frames limit.
     frames_produced: u32,
+    /// Flow state handle for downstream backpressure monitoring.
+    flow_state: Option<FlowStateHandle>,
+    /// Frames dropped due to backpressure.
+    frames_dropped: u64,
 }
 
 impl std::fmt::Debug for ScreenCaptureSrc {
@@ -163,6 +175,8 @@ impl std::fmt::Debug for ScreenCaptureSrc {
             .field("info", &self.info)
             .field("initialized", &self.initialized)
             .field("frame_count", &self.frame_count.load(Ordering::Relaxed))
+            .field("frames_produced", &self.frames_produced)
+            .field("frames_dropped", &self.frames_dropped)
             .finish()
     }
 }
@@ -180,6 +194,8 @@ impl ScreenCaptureSrc {
             initialized: false,
             frame_count: Arc::new(AtomicU32::new(0)),
             frames_produced: 0,
+            flow_state: None,
+            frames_dropped: 0,
         }
     }
 
@@ -620,6 +636,35 @@ impl ScreenCaptureSrc {
         self.frame_count.load(Ordering::Relaxed)
     }
 
+    /// Get the number of frames dropped due to backpressure.
+    pub fn frames_dropped(&self) -> u64 {
+        self.frames_dropped
+    }
+
+    /// Get the number of frames successfully produced.
+    pub fn frames_produced(&self) -> u32 {
+        self.frames_produced
+    }
+
+    /// Set the flow state handle for downstream backpressure monitoring.
+    ///
+    /// When set, the source will check this handle before producing frames.
+    /// If downstream signals backpressure (Busy), frames will be dropped
+    /// according to the configured flow policy.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let queue = Queue::new(100).with_flow_control();
+    /// let flow_state = queue.flow_state_handle();
+    ///
+    /// let mut capture = ScreenCaptureSrc::default_config();
+    /// capture.set_flow_state(flow_state);
+    /// ```
+    pub fn set_flow_state(&mut self, handle: FlowStateHandle) {
+        self.flow_state = Some(handle);
+    }
+
     /// Try to receive a frame without blocking.
     pub fn try_recv_frame(&mut self) -> Option<CapturedFrame> {
         self.frame_receiver
@@ -665,6 +710,27 @@ impl Source for ScreenCaptureSrc {
             Some(f) => f,
             None => return Ok(ProduceResult::WouldBlock),
         };
+
+        // Check for downstream backpressure
+        if let Some(ref flow_state) = self.flow_state {
+            if !flow_state.should_produce() && self.config.flow_policy.allows_dropping() {
+                // Drop this frame due to backpressure
+                self.frames_dropped += 1;
+                flow_state.record_drop();
+
+                if self.config.flow_policy.should_log_drops() {
+                    if self.frames_dropped == 1 || self.frames_dropped % 30 == 0 {
+                        tracing::warn!(
+                            "Screen capture: dropping frame due to backpressure (total dropped: {})",
+                            self.frames_dropped
+                        );
+                    }
+                }
+
+                // Return WouldBlock to signal we didn't produce, but aren't at EOS
+                return Ok(ProduceResult::WouldBlock);
+            }
+        }
 
         // Ensure we have an arena large enough for this frame
         // The actual frame size may differ from portal-reported dimensions
@@ -757,6 +823,17 @@ impl Source for ScreenCaptureSrc {
 
     fn execution_hints(&self) -> ExecutionHints {
         ExecutionHints::io_bound()
+    }
+
+    fn handle_flow_signal(&mut self, signal: FlowSignal) {
+        // Update our internal state based on downstream signal
+        if let Some(ref flow_state) = self.flow_state {
+            flow_state.set_signal(signal);
+        }
+    }
+
+    fn flow_policy(&self) -> FlowPolicy {
+        self.config.flow_policy.clone()
     }
 }
 
