@@ -59,7 +59,9 @@ pub use driver::{
 };
 pub use events::{EventReceiver, EventSender, EventStream, PipelineEvent};
 pub use factory::ElementFactory;
-pub use graph::{DotOptions, Link, LinkId, LinkInfo, Node, NodeId, Pipeline, PipelineState};
+pub use graph::{
+    ConverterPolicy, DotOptions, Link, LinkId, LinkInfo, Node, NodeId, Pipeline, PipelineState,
+};
 pub use parser::{ParsedElement, ParsedPipeline, PropertyValue, parse_pipeline};
 pub use rt_bridge::{AsyncRtBridge, BridgeConfig, EventFd, SharedBridge, shared_bridge};
 pub use rt_scheduler::{

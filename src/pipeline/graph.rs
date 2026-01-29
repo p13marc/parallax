@@ -63,6 +63,60 @@ pub struct LinkInfo {
     pub negotiated_memory: Option<MemoryType>,
 }
 
+/// Policy for automatic converter insertion during negotiation.
+///
+/// When pipeline elements have incompatible formats (e.g., YUYV camera → RGB display),
+/// converters may be needed. This policy controls whether converters are inserted
+/// automatically or if the user must add them explicitly.
+///
+/// # GStreamer-Inspired Design
+///
+/// Following GStreamer's philosophy, the default is to **fail** when formats don't
+/// match. This ensures users are aware of conversion costs (CPU, memory, latency,
+/// quality loss). Users can opt-in to auto-insertion when convenient.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use parallax::pipeline::{Pipeline, ConverterPolicy};
+///
+/// let mut pipeline = Pipeline::new();
+/// // ... add elements ...
+///
+/// // Default: fail if formats don't match
+/// pipeline.prepare()?;  // Error if conversion needed
+///
+/// // Opt-in: allow auto-insertion with warnings
+/// pipeline.set_converter_policy(ConverterPolicy::Warn);
+/// pipeline.prepare()?;  // Inserts converters, logs warnings
+///
+/// // Or use convenience method
+/// pipeline.prepare_with_auto_converters()?;
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConverterPolicy {
+    /// Fail negotiation if formats don't match (default).
+    ///
+    /// User must explicitly add converter elements to the pipeline.
+    /// This is the safest option as it ensures users are aware of
+    /// conversion costs.
+    #[default]
+    Deny,
+
+    /// Auto-insert converters but log warnings.
+    ///
+    /// Good for development and debugging. Warnings include:
+    /// - Which converter was inserted
+    /// - Estimated performance cost
+    /// - Suggestion to add explicit converter
+    Warn,
+
+    /// Auto-insert converters silently.
+    ///
+    /// Use with caution in production. Conversion costs may be hidden.
+    Allow,
+}
+
 /// State of the pipeline (PipeWire-inspired 3-state model).
 ///
 /// This follows PipeWire's state machine:
@@ -349,6 +403,8 @@ pub struct Pipeline {
     negotiation: Option<NegotiationResult>,
     /// Pipeline-level buffer pool for sources.
     pool: Option<Arc<dyn BufferPool>>,
+    /// Policy for automatic converter insertion.
+    converter_policy: ConverterPolicy,
 }
 
 impl Pipeline {
@@ -361,7 +417,30 @@ impl Pipeline {
             name_counter: 0,
             negotiation: None,
             pool: None,
+            converter_policy: ConverterPolicy::default(),
         }
+    }
+
+    /// Set the converter insertion policy.
+    ///
+    /// This controls what happens when pipeline elements have incompatible formats:
+    /// - `Deny` (default): Fail with an error suggesting explicit converters
+    /// - `Warn`: Auto-insert converters but log warnings
+    /// - `Allow`: Auto-insert converters silently
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// pipeline.set_converter_policy(ConverterPolicy::Warn);
+    /// pipeline.prepare()?;  // Will auto-insert with warnings
+    /// ```
+    pub fn set_converter_policy(&mut self, policy: ConverterPolicy) {
+        self.converter_policy = policy;
+    }
+
+    /// Get the current converter policy.
+    pub fn converter_policy(&self) -> ConverterPolicy {
+        self.converter_policy
     }
 
     /// Get the current pipeline state.
@@ -377,26 +456,77 @@ impl Pipeline {
     /// Transition from Suspended to Idle (allocate resources).
     ///
     /// This prepares the pipeline for execution by:
-    /// - Running caps negotiation if needed
-    /// - Automatically inserting converters if formats don't match
+    /// - Running caps negotiation
     /// - Validating the pipeline structure
+    /// - Handling format mismatches according to the converter policy
+    ///
+    /// By default (`ConverterPolicy::Deny`), this will fail if formats don't match
+    /// and converters would be needed. Use `set_converter_policy()` or
+    /// `prepare_with_auto_converters()` to allow automatic converter insertion.
     ///
     /// Returns an error if the transition is invalid or negotiation fails.
     pub fn prepare(&mut self) -> Result<()> {
+        self.prepare_internal(self.converter_policy)
+    }
+
+    /// Prepare the pipeline with automatic converter insertion.
+    ///
+    /// This is a convenience method that temporarily allows converter insertion
+    /// regardless of the current policy. Converters are inserted with warnings.
+    ///
+    /// Equivalent to:
+    /// ```rust,ignore
+    /// pipeline.set_converter_policy(ConverterPolicy::Warn);
+    /// pipeline.prepare()?;
+    /// ```
+    pub fn prepare_with_auto_converters(&mut self) -> Result<()> {
+        self.prepare_internal(ConverterPolicy::Warn)
+    }
+
+    /// Internal prepare implementation that respects the given policy.
+    fn prepare_internal(&mut self, policy: ConverterPolicy) -> Result<()> {
         match self.state {
             PipelineState::Suspended => {
                 // Validate pipeline structure
                 self.validate()?;
 
-                // Run caps negotiation with builtin converter registry
+                // Run caps negotiation
+                // Only provide converter registry if policy allows insertion
                 if !self.is_negotiated() {
-                    let registry = crate::negotiation::builtin_registry();
-                    self.negotiate_with_registry(Some(registry))?;
+                    let registry = match policy {
+                        ConverterPolicy::Deny => None,
+                        ConverterPolicy::Warn | ConverterPolicy::Allow => {
+                            Some(crate::negotiation::builtin_registry())
+                        }
+                    };
+                    self.negotiate_with_registry(registry)?;
                 }
 
-                // Insert any converters that negotiation identified
-                if !self.pending_converters().is_empty() {
-                    self.insert_pending_converters()?;
+                // Handle pending converters based on policy
+                let pending = self.pending_converters();
+                if !pending.is_empty() {
+                    match policy {
+                        ConverterPolicy::Deny => {
+                            // Build a helpful error message
+                            return Err(self.build_converter_needed_error(&pending));
+                        }
+                        ConverterPolicy::Warn => {
+                            // Log warnings for each converter
+                            for conv in pending {
+                                tracing::warn!(
+                                    "Auto-inserting converter for link {}: {}. \
+                                     Consider adding an explicit converter element to avoid hidden costs.",
+                                    conv.link_id,
+                                    conv.reason
+                                );
+                            }
+                            self.insert_pending_converters()?;
+                        }
+                        ConverterPolicy::Allow => {
+                            // Insert silently
+                            self.insert_pending_converters()?;
+                        }
+                    }
                 }
 
                 self.state = PipelineState::Idle;
@@ -413,6 +543,26 @@ impl Pipeline {
                 "cannot prepare from error state, reset first".into(),
             )),
         }
+    }
+
+    /// Build a helpful error message when converters are needed but policy is Deny.
+    fn build_converter_needed_error(&self, pending: &[ConverterInsertion]) -> Error {
+        let mut msg = String::from(
+            "Format negotiation failed: converters are needed but policy is Deny.\n\n",
+        );
+
+        for conv in pending {
+            writeln!(msg, "  - Link {}: {}", conv.link_id, conv.reason).unwrap();
+        }
+
+        msg.push_str("\nSuggestions:\n");
+        msg.push_str("  1. Add explicit converter elements to your pipeline\n");
+        msg.push_str("  2. Use pipeline.set_converter_policy(ConverterPolicy::Warn) to allow auto-insertion\n");
+        msg.push_str(
+            "  3. Use pipeline.prepare_with_auto_converters() for one-time auto-insertion\n",
+        );
+
+        Error::InvalidSegment(msg)
     }
 
     /// Transition from Idle to Running (start processing).

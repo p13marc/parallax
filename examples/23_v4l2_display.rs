@@ -3,8 +3,13 @@
 //! This example demonstrates capturing video frames from a V4L2 device
 //! (webcam) and displaying them in a native window using AutoVideoSink.
 //!
-//! The pipeline uses caps negotiation to automatically insert a videoconvert
-//! element when the source format (YUYV) doesn't match the sink format (RGBA).
+//! The pipeline uses `prepare_with_auto_converters()` to automatically insert
+//! a videoconvert element when the source format (YUYV) doesn't match the
+//! sink format (RGBA).
+//!
+//! Note: By default, Parallax does NOT auto-insert converters (following
+//! GStreamer's philosophy of explicit control). Use `prepare_with_auto_converters()`
+//! or `set_converter_policy(ConverterPolicy::Warn)` to enable auto-insertion.
 //!
 //! Run with: `cargo run --example 23_v4l2_display --features "v4l2,display"`
 //!
@@ -65,8 +70,9 @@ async fn main() -> Result<()> {
 
     let mut pipeline = Pipeline::parse(&pipeline_str)?;
 
-    // Prepare the pipeline (runs negotiation and inserts converters)
-    pipeline.prepare()?;
+    // Prepare the pipeline with auto-converters enabled
+    // This will auto-insert videoconvert if needed (YUYV -> RGBA)
+    pipeline.prepare_with_auto_converters()?;
 
     // Show the final pipeline with any auto-inserted converters
     println!("\nFinal pipeline after negotiation:");
