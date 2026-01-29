@@ -63,4 +63,6 @@ pub use dmabuf::DmaBufSegment;
 pub use huge_pages::{HugePageSegment, HugePageSize};
 pub use mapped_file::MappedFileSegment;
 pub use segment::{IpcHandle, MemorySegment, MemoryType};
-pub use shared_refcount::{SharedArena, SharedArenaCache, SharedIpcSlotRef, SharedSlotRef};
+pub use shared_refcount::{
+    ArenaMetrics, SharedArena, SharedArenaCache, SharedIpcSlotRef, SharedSlotRef,
+};

@@ -99,6 +99,91 @@ const RELEASE_QUEUE_SIZE: usize = 1024;
 /// Sentinel value indicating an empty queue slot.
 const QUEUE_EMPTY: u32 = u32::MAX;
 
+/// Comprehensive arena metrics for monitoring and debugging.
+///
+/// This struct provides a snapshot of arena state at a point in time.
+/// Use `SharedArena::metrics()` to obtain these metrics.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use parallax::memory::SharedArena;
+///
+/// let arena = SharedArena::new(4096, 100)?;
+///
+/// // Acquire some slots...
+/// let slots: Vec<_> = (0..50).filter_map(|_| arena.acquire()).collect();
+///
+/// let metrics = arena.metrics();
+/// println!("Arena {} utilization: {:.1}%", metrics.arena_id, metrics.utilization_percent);
+/// println!("Slots: {} allocated, {} free, {} pending",
+///     metrics.allocated_slots, metrics.free_slots, metrics.pending_release);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ArenaMetrics {
+    /// Unique arena identifier.
+    pub arena_id: u64,
+    /// Total number of slots in the arena.
+    pub slot_count: usize,
+    /// Size of each slot in bytes.
+    pub slot_size: usize,
+    /// Number of currently allocated slots.
+    pub allocated_slots: usize,
+    /// Number of free slots available for acquisition.
+    pub free_slots: usize,
+    /// Number of slots pending release (in the release queue).
+    pub pending_release: usize,
+    /// Total arena memory in bytes (including headers).
+    pub total_bytes: usize,
+    /// Bytes used by allocated slots (allocated_slots * slot_size).
+    pub used_bytes: usize,
+    /// Utilization as a percentage (0.0 to 100.0).
+    pub utilization_percent: f64,
+    /// Whether this is the owner process (can acquire/reclaim).
+    pub is_owner: bool,
+}
+
+impl ArenaMetrics {
+    /// Check if utilization is above a threshold.
+    #[inline]
+    pub fn is_above_threshold(&self, threshold_percent: f64) -> bool {
+        self.utilization_percent > threshold_percent
+    }
+
+    /// Check if the arena is nearly full (>90% utilization).
+    #[inline]
+    pub fn is_nearly_full(&self) -> bool {
+        self.is_above_threshold(90.0)
+    }
+
+    /// Check if the arena is completely exhausted.
+    #[inline]
+    pub fn is_exhausted(&self) -> bool {
+        self.free_slots == 0
+    }
+
+    /// Get available slots (free + pending that can be reclaimed).
+    #[inline]
+    pub fn available_after_reclaim(&self) -> usize {
+        self.free_slots + self.pending_release
+    }
+}
+
+impl std::fmt::Display for ArenaMetrics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Arena[{}]: {}/{} slots ({:.1}%), {} pending, {} bytes",
+            self.arena_id,
+            self.allocated_slots,
+            self.slot_count,
+            self.utilization_percent,
+            self.pending_release,
+            self.total_bytes
+        )
+    }
+}
+
 /// Slot states (stored in shared memory).
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -762,6 +847,64 @@ impl SharedArena {
     #[inline]
     pub fn total_size(&self) -> usize {
         self.total_size
+    }
+
+    /// Get utilization as a percentage (0.0 to 100.0).
+    ///
+    /// Utilization = allocated_count / slot_count * 100
+    #[inline]
+    pub fn utilization(&self) -> f64 {
+        if self.slot_count == 0 {
+            return 0.0;
+        }
+        (self.allocated_count() as f64 / self.slot_count as f64) * 100.0
+    }
+
+    /// Get comprehensive arena metrics.
+    ///
+    /// This provides a snapshot of arena state including slot counts,
+    /// memory usage, and utilization. Useful for monitoring and debugging.
+    pub fn metrics(&self) -> ArenaMetrics {
+        let allocated = self.allocated_count();
+        let free = self.slot_count - allocated;
+        let pending = self.pending_count();
+
+        ArenaMetrics {
+            arena_id: self.arena_id,
+            slot_count: self.slot_count,
+            slot_size: self.slot_size,
+            allocated_slots: allocated,
+            free_slots: free,
+            pending_release: pending,
+            total_bytes: self.total_size,
+            used_bytes: allocated * self.slot_size,
+            utilization_percent: if self.slot_count > 0 {
+                (allocated as f64 / self.slot_count as f64) * 100.0
+            } else {
+                0.0
+            },
+            is_owner: self.is_owner,
+        }
+    }
+
+    /// Check if the arena is nearly exhausted (utilization > threshold).
+    ///
+    /// Default threshold is 90%. Use this to trigger backpressure.
+    #[inline]
+    pub fn is_nearly_exhausted(&self) -> bool {
+        self.is_nearly_exhausted_threshold(90.0)
+    }
+
+    /// Check if the arena is nearly exhausted with custom threshold.
+    #[inline]
+    pub fn is_nearly_exhausted_threshold(&self, threshold_percent: f64) -> bool {
+        self.utilization() > threshold_percent
+    }
+
+    /// Check if the arena is completely exhausted (no free slots).
+    #[inline]
+    pub fn is_exhausted(&self) -> bool {
+        self.free_count() == 0
     }
 
     /// Reconstruct a slot reference from an IPC reference.
@@ -1491,6 +1634,89 @@ mod tests {
         assert_eq!(reclaimed, 64);
         assert_eq!(arena.free_count(), 64);
         assert_eq!(arena.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_arena_metrics() {
+        let arena = SharedArena::new(4096, 100).unwrap();
+
+        // Initial metrics
+        let m = arena.metrics();
+        assert_eq!(m.slot_count, 100);
+        assert_eq!(m.slot_size, 4096);
+        assert_eq!(m.allocated_slots, 0);
+        assert_eq!(m.free_slots, 100);
+        assert_eq!(m.pending_release, 0);
+        assert!((m.utilization_percent - 0.0).abs() < 0.01);
+        assert!(!m.is_nearly_full());
+        assert!(!m.is_exhausted());
+        assert!(m.is_owner);
+
+        // Acquire 50 slots (50% utilization)
+        let slots: Vec<_> = (0..50).filter_map(|_| arena.acquire()).collect();
+        assert_eq!(slots.len(), 50);
+
+        let m = arena.metrics();
+        assert_eq!(m.allocated_slots, 50);
+        assert_eq!(m.free_slots, 50);
+        assert!((m.utilization_percent - 50.0).abs() < 0.01);
+        assert!(!m.is_nearly_full());
+        assert!(!m.is_exhausted());
+        assert_eq!(m.used_bytes, 50 * 4096);
+
+        // Acquire 45 more (95% utilization)
+        let more_slots: Vec<_> = (0..45).filter_map(|_| arena.acquire()).collect();
+        assert_eq!(more_slots.len(), 45);
+
+        let m = arena.metrics();
+        assert_eq!(m.allocated_slots, 95);
+        assert_eq!(m.free_slots, 5);
+        assert!((m.utilization_percent - 95.0).abs() < 0.01);
+        assert!(m.is_nearly_full()); // > 90%
+        assert!(!m.is_exhausted());
+
+        // Test threshold methods
+        assert!(arena.is_nearly_exhausted()); // > 90%
+        assert!(arena.is_nearly_exhausted_threshold(90.0));
+        assert!(!arena.is_nearly_exhausted_threshold(96.0));
+        assert!(!arena.is_exhausted());
+
+        // Test Display trait
+        let display = format!("{}", m);
+        assert!(display.contains("95/100"));
+        assert!(display.contains("95.0%"));
+
+        // Drop some slots, check pending
+        drop(slots);
+        let m = arena.metrics();
+        assert_eq!(m.pending_release, 50);
+        assert_eq!(m.available_after_reclaim(), 5 + 50); // free + pending
+
+        // Reclaim and verify
+        arena.reclaim();
+        let m = arena.metrics();
+        assert_eq!(m.pending_release, 0);
+        assert_eq!(m.free_slots, 55);
+        assert_eq!(m.allocated_slots, 45);
+    }
+
+    #[test]
+    fn test_utilization_methods() {
+        let arena = SharedArena::new(1024, 10).unwrap();
+
+        assert!((arena.utilization() - 0.0).abs() < 0.01);
+        assert!(!arena.is_exhausted());
+
+        // Acquire all slots
+        let slots: Vec<_> = (0..10).filter_map(|_| arena.acquire()).collect();
+        assert_eq!(slots.len(), 10);
+
+        assert!((arena.utilization() - 100.0).abs() < 0.01);
+        assert!(arena.is_exhausted());
+        assert!(arena.is_nearly_exhausted());
+
+        // Can't acquire more
+        assert!(arena.acquire().is_none());
     }
 }
 
