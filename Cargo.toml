@@ -192,6 +192,10 @@ harness = false
 name = "isolation"
 harness = false
 
+[[bench]]
+name = "colorspace"
+harness = false
+
 # Examples - one concept per file, numbered for learning order
 # Run with: cargo run --example <name> [--features <feature>]
 

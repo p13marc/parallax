@@ -10,13 +10,33 @@ use crate::error::{Error, Result};
 
 #[cfg(feature = "simd-colorspace")]
 use yuv::{
+    BufferStoreMut,
+    YuvBiPlanarImage,
+    YuvBiPlanarImageMut,
+    YuvConversionMode,
     YuvPackedImage,
     YuvPlanarImage,
+    YuvPlanarImageMut,
     YuvRange,
     YuvStandardMatrix,
+    // RGB -> NV12 (bi-planar YUV 4:2:0)
+    bgr_to_yuv_nv12,
+    // RGB -> I420 (planar YUV 4:2:0)
+    bgr_to_yuv420,
+    bgra_to_yuv_nv12,
+    bgra_to_yuv420,
+    rgb_to_yuv_nv12,
+    rgb_to_yuv420,
+    rgba_to_yuv_nv12,
+    rgba_to_yuv420,
     // UYVY (packed YUV 4:2:2) -> RGB
     uyvy422_to_rgb,
     uyvy422_to_rgba,
+    // NV12 (bi-planar YUV 4:2:0) -> RGB
+    yuv_nv12_to_bgr,
+    yuv_nv12_to_bgra,
+    yuv_nv12_to_rgb,
+    yuv_nv12_to_rgba,
     // I420 (planar YUV 4:2:0) -> RGB
     yuv420_to_bgr,
     yuv420_to_bgra,
@@ -243,6 +263,12 @@ impl VideoConvert {
             (PixelFormat::Nv12, PixelFormat::Rgba) => {
                 self.nv12_to_rgba(input, output);
             }
+            (PixelFormat::Nv12, PixelFormat::Bgr24) => {
+                self.nv12_to_bgr24(input, output);
+            }
+            (PixelFormat::Nv12, PixelFormat::Bgra) => {
+                self.nv12_to_bgra(input, output);
+            }
 
             // YUYV (packed YUV 4:2:2) to RGB conversions
             (PixelFormat::Yuyv, PixelFormat::Rgb24) => {
@@ -275,6 +301,23 @@ impl VideoConvert {
             }
             (PixelFormat::Bgra, PixelFormat::I420) => {
                 self.bgra_to_i420(input, output);
+            }
+            (PixelFormat::Bgr24, PixelFormat::I420) => {
+                self.bgr24_to_i420(input, output);
+            }
+
+            // RGB to NV12 conversions
+            (PixelFormat::Rgb24, PixelFormat::Nv12) => {
+                self.rgb24_to_nv12(input, output);
+            }
+            (PixelFormat::Rgba, PixelFormat::Nv12) => {
+                self.rgba_to_nv12(input, output);
+            }
+            (PixelFormat::Bgr24, PixelFormat::Nv12) => {
+                self.bgr24_to_nv12(input, output);
+            }
+            (PixelFormat::Bgra, PixelFormat::Nv12) => {
+                self.bgra_to_nv12(input, output);
             }
 
             // RGB swizzle conversions
@@ -550,7 +593,39 @@ impl VideoConvert {
         }
     }
 
-    // NV12 conversions - fallback only for now (yuv crate uses YuvBiPlanarImage)
+    // -------------------------------------------------------------------------
+    // NV12 conversions (SIMD-accelerated when simd-colorspace feature enabled)
+    // -------------------------------------------------------------------------
+
+    #[cfg(feature = "simd-colorspace")]
+    fn nv12_to_rgb24(&self, input: &[u8], output: &mut [u8]) {
+        let w = self.width as usize;
+        let h = self.height as usize;
+
+        let y_plane = &input[0..w * h];
+        let uv_plane = &input[w * h..];
+
+        let bi_planar = YuvBiPlanarImage {
+            y_plane,
+            y_stride: w as u32,
+            uv_plane,
+            uv_stride: w as u32,
+            width: self.width,
+            height: self.height,
+        };
+
+        yuv_nv12_to_rgb(
+            &bi_planar,
+            output,
+            (w * 3) as u32,
+            YuvRange::Limited,
+            self.color_matrix.to_yuv_matrix(),
+            YuvConversionMode::Balanced,
+        )
+        .expect("SIMD nv12_to_rgb24 conversion failed");
+    }
+
+    #[cfg(not(feature = "simd-colorspace"))]
     fn nv12_to_rgb24(&self, input: &[u8], output: &mut [u8]) {
         let w = self.width as usize;
         let h = self.height as usize;
@@ -575,6 +650,35 @@ impl VideoConvert {
         }
     }
 
+    #[cfg(feature = "simd-colorspace")]
+    fn nv12_to_rgba(&self, input: &[u8], output: &mut [u8]) {
+        let w = self.width as usize;
+        let h = self.height as usize;
+
+        let y_plane = &input[0..w * h];
+        let uv_plane = &input[w * h..];
+
+        let bi_planar = YuvBiPlanarImage {
+            y_plane,
+            y_stride: w as u32,
+            uv_plane,
+            uv_stride: w as u32,
+            width: self.width,
+            height: self.height,
+        };
+
+        yuv_nv12_to_rgba(
+            &bi_planar,
+            output,
+            (w * 4) as u32,
+            YuvRange::Limited,
+            self.color_matrix.to_yuv_matrix(),
+            YuvConversionMode::Balanced,
+        )
+        .expect("SIMD nv12_to_rgba conversion failed");
+    }
+
+    #[cfg(not(feature = "simd-colorspace"))]
     fn nv12_to_rgba(&self, input: &[u8], output: &mut [u8]) {
         let w = self.width as usize;
         let h = self.height as usize;
@@ -595,6 +699,115 @@ impl VideoConvert {
                 output[dst_idx] = r;
                 output[dst_idx + 1] = g;
                 output[dst_idx + 2] = b;
+                output[dst_idx + 3] = 255;
+            }
+        }
+    }
+
+    /// Convert NV12 to BGR24 (SIMD-accelerated when available).
+    #[cfg(feature = "simd-colorspace")]
+    fn nv12_to_bgr24(&self, input: &[u8], output: &mut [u8]) {
+        let w = self.width as usize;
+        let h = self.height as usize;
+
+        let y_plane = &input[0..w * h];
+        let uv_plane = &input[w * h..];
+
+        let bi_planar = YuvBiPlanarImage {
+            y_plane,
+            y_stride: w as u32,
+            uv_plane,
+            uv_stride: w as u32,
+            width: self.width,
+            height: self.height,
+        };
+
+        yuv_nv12_to_bgr(
+            &bi_planar,
+            output,
+            (w * 3) as u32,
+            YuvRange::Limited,
+            self.color_matrix.to_yuv_matrix(),
+            YuvConversionMode::Balanced,
+        )
+        .expect("SIMD nv12_to_bgr24 conversion failed");
+    }
+
+    #[cfg(not(feature = "simd-colorspace"))]
+    fn nv12_to_bgr24(&self, input: &[u8], output: &mut [u8]) {
+        let w = self.width as usize;
+        let h = self.height as usize;
+
+        let y_plane = &input[0..w * h];
+        let uv_plane = &input[w * h..];
+
+        for row in 0..h {
+            for col in 0..w {
+                let y = y_plane[row * w + col];
+                let uv_idx = (row / 2) * w + (col / 2) * 2;
+                let u = uv_plane[uv_idx];
+                let v = uv_plane[uv_idx + 1];
+
+                let (r, g, b) = self.yuv_to_rgb(y, u, v);
+
+                let dst_idx = (row * w + col) * 3;
+                output[dst_idx] = b;
+                output[dst_idx + 1] = g;
+                output[dst_idx + 2] = r;
+            }
+        }
+    }
+
+    /// Convert NV12 to BGRA (SIMD-accelerated when available).
+    #[cfg(feature = "simd-colorspace")]
+    fn nv12_to_bgra(&self, input: &[u8], output: &mut [u8]) {
+        let w = self.width as usize;
+        let h = self.height as usize;
+
+        let y_plane = &input[0..w * h];
+        let uv_plane = &input[w * h..];
+
+        let bi_planar = YuvBiPlanarImage {
+            y_plane,
+            y_stride: w as u32,
+            uv_plane,
+            uv_stride: w as u32,
+            width: self.width,
+            height: self.height,
+        };
+
+        yuv_nv12_to_bgra(
+            &bi_planar,
+            output,
+            (w * 4) as u32,
+            YuvRange::Limited,
+            self.color_matrix.to_yuv_matrix(),
+            YuvConversionMode::Balanced,
+        )
+        .expect("SIMD nv12_to_bgra conversion failed");
+    }
+
+    #[cfg(not(feature = "simd-colorspace"))]
+    fn nv12_to_bgra(&self, input: &[u8], output: &mut [u8]) {
+        let w = self.width as usize;
+        let h = self.height as usize;
+
+        let y_plane = &input[0..w * h];
+        let uv_plane = &input[w * h..];
+
+        for row in 0..h {
+            for col in 0..w {
+                let y = y_plane[row * w + col];
+                let uv_idx = (row / 2) * w + (col / 2) * 2;
+                let u = uv_plane[uv_idx];
+                let v = uv_plane[uv_idx + 1];
+
+                let (r, g, b) = self.yuv_to_rgb(y, u, v);
+
+                let dst_idx = (row * w + col) * 4;
+                output[dst_idx] = b;
+                output[dst_idx + 1] = g;
+                output[dst_idx + 2] = r;
                 output[dst_idx + 3] = 255;
             }
         }
@@ -927,9 +1140,43 @@ impl VideoConvert {
     }
 
     // -------------------------------------------------------------------------
-    // RGB to YUV conversions
+    // RGB to YUV conversions (SIMD-accelerated when simd-colorspace feature enabled)
     // -------------------------------------------------------------------------
 
+    #[cfg(feature = "simd-colorspace")]
+    fn rgb24_to_i420(&self, input: &[u8], output: &mut [u8]) {
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let y_size = w * h;
+        let uv_stride = w / 2;
+
+        // Split output into Y, U, V planes
+        let (y_plane, uv_planes) = output.split_at_mut(y_size);
+        let (u_plane, v_plane) = uv_planes.split_at_mut(uv_stride * (h / 2));
+
+        let mut planar = YuvPlanarImageMut {
+            y_plane: BufferStoreMut::Borrowed(y_plane),
+            y_stride: w as u32,
+            u_plane: BufferStoreMut::Borrowed(u_plane),
+            u_stride: uv_stride as u32,
+            v_plane: BufferStoreMut::Borrowed(v_plane),
+            v_stride: uv_stride as u32,
+            width: self.width,
+            height: self.height,
+        };
+
+        rgb_to_yuv420(
+            &mut planar,
+            input,
+            (w * 3) as u32,
+            YuvRange::Limited,
+            self.color_matrix.to_yuv_matrix(),
+            YuvConversionMode::Balanced,
+        )
+        .expect("SIMD rgb24_to_i420 conversion failed");
+    }
+
+    #[cfg(not(feature = "simd-colorspace"))]
     fn rgb24_to_i420(&self, input: &[u8], output: &mut [u8]) {
         let w = self.width as usize;
         let h = self.height as usize;
@@ -974,6 +1221,40 @@ impl VideoConvert {
         }
     }
 
+    #[cfg(feature = "simd-colorspace")]
+    fn rgba_to_i420(&self, input: &[u8], output: &mut [u8]) {
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let y_size = w * h;
+        let uv_stride = w / 2;
+
+        // Split output into Y, U, V planes
+        let (y_plane, uv_planes) = output.split_at_mut(y_size);
+        let (u_plane, v_plane) = uv_planes.split_at_mut(uv_stride * (h / 2));
+
+        let mut planar = YuvPlanarImageMut {
+            y_plane: BufferStoreMut::Borrowed(y_plane),
+            y_stride: w as u32,
+            u_plane: BufferStoreMut::Borrowed(u_plane),
+            u_stride: uv_stride as u32,
+            v_plane: BufferStoreMut::Borrowed(v_plane),
+            v_stride: uv_stride as u32,
+            width: self.width,
+            height: self.height,
+        };
+
+        rgba_to_yuv420(
+            &mut planar,
+            input,
+            (w * 4) as u32,
+            YuvRange::Limited,
+            self.color_matrix.to_yuv_matrix(),
+            YuvConversionMode::Balanced,
+        )
+        .expect("SIMD rgba_to_i420 conversion failed");
+    }
+
+    #[cfg(not(feature = "simd-colorspace"))]
     fn rgba_to_i420(&self, input: &[u8], output: &mut [u8]) {
         let w = self.width as usize;
         let h = self.height as usize;
@@ -1019,6 +1300,40 @@ impl VideoConvert {
         }
     }
 
+    #[cfg(feature = "simd-colorspace")]
+    fn bgra_to_i420(&self, input: &[u8], output: &mut [u8]) {
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let y_size = w * h;
+        let uv_stride = w / 2;
+
+        // Split output into Y, U, V planes
+        let (y_plane, uv_planes) = output.split_at_mut(y_size);
+        let (u_plane, v_plane) = uv_planes.split_at_mut(uv_stride * (h / 2));
+
+        let mut planar = YuvPlanarImageMut {
+            y_plane: BufferStoreMut::Borrowed(y_plane),
+            y_stride: w as u32,
+            u_plane: BufferStoreMut::Borrowed(u_plane),
+            u_stride: uv_stride as u32,
+            v_plane: BufferStoreMut::Borrowed(v_plane),
+            v_stride: uv_stride as u32,
+            width: self.width,
+            height: self.height,
+        };
+
+        bgra_to_yuv420(
+            &mut planar,
+            input,
+            (w * 4) as u32,
+            YuvRange::Limited,
+            self.color_matrix.to_yuv_matrix(),
+            YuvConversionMode::Balanced,
+        )
+        .expect("SIMD bgra_to_i420 conversion failed");
+    }
+
+    #[cfg(not(feature = "simd-colorspace"))]
     fn bgra_to_i420(&self, input: &[u8], output: &mut [u8]) {
         let w = self.width as usize;
         let h = self.height as usize;
@@ -1061,6 +1376,374 @@ impl VideoConvert {
                 let uv_idx = (row / 2) * (w / 2) + (col / 2);
                 output[y_size + uv_idx] = (u_sum / 4) as u8;
                 output[y_size + uv_size + uv_idx] = (v_sum / 4) as u8;
+            }
+        }
+    }
+
+    /// Convert BGR24 to I420 (SIMD-accelerated when available).
+    #[cfg(feature = "simd-colorspace")]
+    fn bgr24_to_i420(&self, input: &[u8], output: &mut [u8]) {
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let y_size = w * h;
+        let uv_stride = w / 2;
+
+        // Split output into Y, U, V planes
+        let (y_plane, uv_planes) = output.split_at_mut(y_size);
+        let (u_plane, v_plane) = uv_planes.split_at_mut(uv_stride * (h / 2));
+
+        let mut planar = YuvPlanarImageMut {
+            y_plane: BufferStoreMut::Borrowed(y_plane),
+            y_stride: w as u32,
+            u_plane: BufferStoreMut::Borrowed(u_plane),
+            u_stride: uv_stride as u32,
+            v_plane: BufferStoreMut::Borrowed(v_plane),
+            v_stride: uv_stride as u32,
+            width: self.width,
+            height: self.height,
+        };
+
+        bgr_to_yuv420(
+            &mut planar,
+            input,
+            (w * 3) as u32,
+            YuvRange::Limited,
+            self.color_matrix.to_yuv_matrix(),
+            YuvConversionMode::Balanced,
+        )
+        .expect("SIMD bgr24_to_i420 conversion failed");
+    }
+
+    #[cfg(not(feature = "simd-colorspace"))]
+    fn bgr24_to_i420(&self, input: &[u8], output: &mut [u8]) {
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let y_size = w * h;
+        let uv_size = (w / 2) * (h / 2);
+
+        // BGR layout: B=0, G=1, R=2
+        for row in 0..h {
+            for col in 0..w {
+                let src_idx = (row * w + col) * 3;
+                let b = input[src_idx];
+                let g = input[src_idx + 1];
+                let r = input[src_idx + 2];
+
+                let (y, _, _) = self.rgb_to_yuv(r, g, b);
+                output[row * w + col] = y;
+            }
+        }
+
+        for row in (0..h).step_by(2) {
+            for col in (0..w).step_by(2) {
+                let mut u_sum = 0u32;
+                let mut v_sum = 0u32;
+
+                for dy in 0..2 {
+                    for dx in 0..2 {
+                        let src_idx = ((row + dy) * w + (col + dx)) * 3;
+                        let b = input[src_idx];
+                        let g = input[src_idx + 1];
+                        let r = input[src_idx + 2];
+                        let (_, u, v) = self.rgb_to_yuv(r, g, b);
+                        u_sum += u as u32;
+                        v_sum += v as u32;
+                    }
+                }
+
+                let uv_idx = (row / 2) * (w / 2) + (col / 2);
+                output[y_size + uv_idx] = (u_sum / 4) as u8;
+                output[y_size + uv_size + uv_idx] = (v_sum / 4) as u8;
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // RGB to NV12 conversions (SIMD-accelerated when simd-colorspace feature enabled)
+    // -------------------------------------------------------------------------
+
+    /// Convert RGB24 to NV12 (SIMD-accelerated when available).
+    #[cfg(feature = "simd-colorspace")]
+    fn rgb24_to_nv12(&self, input: &[u8], output: &mut [u8]) {
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let y_size = w * h;
+
+        let (y_plane, uv_plane) = output.split_at_mut(y_size);
+
+        let mut bi_planar = YuvBiPlanarImageMut {
+            y_plane: BufferStoreMut::Borrowed(y_plane),
+            y_stride: w as u32,
+            uv_plane: BufferStoreMut::Borrowed(uv_plane),
+            uv_stride: w as u32,
+            width: self.width,
+            height: self.height,
+        };
+
+        rgb_to_yuv_nv12(
+            &mut bi_planar,
+            input,
+            (w * 3) as u32,
+            YuvRange::Limited,
+            self.color_matrix.to_yuv_matrix(),
+            YuvConversionMode::Balanced,
+        )
+        .expect("SIMD rgb24_to_nv12 conversion failed");
+    }
+
+    #[cfg(not(feature = "simd-colorspace"))]
+    fn rgb24_to_nv12(&self, input: &[u8], output: &mut [u8]) {
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let y_size = w * h;
+
+        // Compute Y for all pixels
+        for row in 0..h {
+            for col in 0..w {
+                let src_idx = (row * w + col) * 3;
+                let r = input[src_idx];
+                let g = input[src_idx + 1];
+                let b = input[src_idx + 2];
+
+                let (y, _, _) = self.rgb_to_yuv(r, g, b);
+                output[row * w + col] = y;
+            }
+        }
+
+        // Compute interleaved UV (average 2x2 blocks)
+        for row in (0..h).step_by(2) {
+            for col in (0..w).step_by(2) {
+                let mut u_sum = 0u32;
+                let mut v_sum = 0u32;
+
+                for dy in 0..2 {
+                    for dx in 0..2 {
+                        let src_idx = ((row + dy) * w + (col + dx)) * 3;
+                        let r = input[src_idx];
+                        let g = input[src_idx + 1];
+                        let b = input[src_idx + 2];
+                        let (_, u, v) = self.rgb_to_yuv(r, g, b);
+                        u_sum += u as u32;
+                        v_sum += v as u32;
+                    }
+                }
+
+                let uv_idx = y_size + (row / 2) * w + col;
+                output[uv_idx] = (u_sum / 4) as u8;
+                output[uv_idx + 1] = (v_sum / 4) as u8;
+            }
+        }
+    }
+
+    /// Convert RGBA to NV12 (SIMD-accelerated when available).
+    #[cfg(feature = "simd-colorspace")]
+    fn rgba_to_nv12(&self, input: &[u8], output: &mut [u8]) {
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let y_size = w * h;
+
+        let (y_plane, uv_plane) = output.split_at_mut(y_size);
+
+        let mut bi_planar = YuvBiPlanarImageMut {
+            y_plane: BufferStoreMut::Borrowed(y_plane),
+            y_stride: w as u32,
+            uv_plane: BufferStoreMut::Borrowed(uv_plane),
+            uv_stride: w as u32,
+            width: self.width,
+            height: self.height,
+        };
+
+        rgba_to_yuv_nv12(
+            &mut bi_planar,
+            input,
+            (w * 4) as u32,
+            YuvRange::Limited,
+            self.color_matrix.to_yuv_matrix(),
+            YuvConversionMode::Balanced,
+        )
+        .expect("SIMD rgba_to_nv12 conversion failed");
+    }
+
+    #[cfg(not(feature = "simd-colorspace"))]
+    fn rgba_to_nv12(&self, input: &[u8], output: &mut [u8]) {
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let y_size = w * h;
+
+        for row in 0..h {
+            for col in 0..w {
+                let src_idx = (row * w + col) * 4;
+                let r = input[src_idx];
+                let g = input[src_idx + 1];
+                let b = input[src_idx + 2];
+
+                let (y, _, _) = self.rgb_to_yuv(r, g, b);
+                output[row * w + col] = y;
+            }
+        }
+
+        for row in (0..h).step_by(2) {
+            for col in (0..w).step_by(2) {
+                let mut u_sum = 0u32;
+                let mut v_sum = 0u32;
+
+                for dy in 0..2 {
+                    for dx in 0..2 {
+                        let src_idx = ((row + dy) * w + (col + dx)) * 4;
+                        let r = input[src_idx];
+                        let g = input[src_idx + 1];
+                        let b = input[src_idx + 2];
+                        let (_, u, v) = self.rgb_to_yuv(r, g, b);
+                        u_sum += u as u32;
+                        v_sum += v as u32;
+                    }
+                }
+
+                let uv_idx = y_size + (row / 2) * w + col;
+                output[uv_idx] = (u_sum / 4) as u8;
+                output[uv_idx + 1] = (v_sum / 4) as u8;
+            }
+        }
+    }
+
+    /// Convert BGR24 to NV12 (SIMD-accelerated when available).
+    #[cfg(feature = "simd-colorspace")]
+    fn bgr24_to_nv12(&self, input: &[u8], output: &mut [u8]) {
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let y_size = w * h;
+
+        let (y_plane, uv_plane) = output.split_at_mut(y_size);
+
+        let mut bi_planar = YuvBiPlanarImageMut {
+            y_plane: BufferStoreMut::Borrowed(y_plane),
+            y_stride: w as u32,
+            uv_plane: BufferStoreMut::Borrowed(uv_plane),
+            uv_stride: w as u32,
+            width: self.width,
+            height: self.height,
+        };
+
+        bgr_to_yuv_nv12(
+            &mut bi_planar,
+            input,
+            (w * 3) as u32,
+            YuvRange::Limited,
+            self.color_matrix.to_yuv_matrix(),
+            YuvConversionMode::Balanced,
+        )
+        .expect("SIMD bgr24_to_nv12 conversion failed");
+    }
+
+    #[cfg(not(feature = "simd-colorspace"))]
+    fn bgr24_to_nv12(&self, input: &[u8], output: &mut [u8]) {
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let y_size = w * h;
+
+        for row in 0..h {
+            for col in 0..w {
+                let src_idx = (row * w + col) * 3;
+                let b = input[src_idx];
+                let g = input[src_idx + 1];
+                let r = input[src_idx + 2];
+
+                let (y, _, _) = self.rgb_to_yuv(r, g, b);
+                output[row * w + col] = y;
+            }
+        }
+
+        for row in (0..h).step_by(2) {
+            for col in (0..w).step_by(2) {
+                let mut u_sum = 0u32;
+                let mut v_sum = 0u32;
+
+                for dy in 0..2 {
+                    for dx in 0..2 {
+                        let src_idx = ((row + dy) * w + (col + dx)) * 3;
+                        let b = input[src_idx];
+                        let g = input[src_idx + 1];
+                        let r = input[src_idx + 2];
+                        let (_, u, v) = self.rgb_to_yuv(r, g, b);
+                        u_sum += u as u32;
+                        v_sum += v as u32;
+                    }
+                }
+
+                let uv_idx = y_size + (row / 2) * w + col;
+                output[uv_idx] = (u_sum / 4) as u8;
+                output[uv_idx + 1] = (v_sum / 4) as u8;
+            }
+        }
+    }
+
+    /// Convert BGRA to NV12 (SIMD-accelerated when available).
+    #[cfg(feature = "simd-colorspace")]
+    fn bgra_to_nv12(&self, input: &[u8], output: &mut [u8]) {
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let y_size = w * h;
+
+        let (y_plane, uv_plane) = output.split_at_mut(y_size);
+
+        let mut bi_planar = YuvBiPlanarImageMut {
+            y_plane: BufferStoreMut::Borrowed(y_plane),
+            y_stride: w as u32,
+            uv_plane: BufferStoreMut::Borrowed(uv_plane),
+            uv_stride: w as u32,
+            width: self.width,
+            height: self.height,
+        };
+
+        bgra_to_yuv_nv12(
+            &mut bi_planar,
+            input,
+            (w * 4) as u32,
+            YuvRange::Limited,
+            self.color_matrix.to_yuv_matrix(),
+            YuvConversionMode::Balanced,
+        )
+        .expect("SIMD bgra_to_nv12 conversion failed");
+    }
+
+    #[cfg(not(feature = "simd-colorspace"))]
+    fn bgra_to_nv12(&self, input: &[u8], output: &mut [u8]) {
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let y_size = w * h;
+
+        for row in 0..h {
+            for col in 0..w {
+                let src_idx = (row * w + col) * 4;
+                let b = input[src_idx];
+                let g = input[src_idx + 1];
+                let r = input[src_idx + 2];
+
+                let (y, _, _) = self.rgb_to_yuv(r, g, b);
+                output[row * w + col] = y;
+            }
+        }
+
+        for row in (0..h).step_by(2) {
+            for col in (0..w).step_by(2) {
+                let mut u_sum = 0u32;
+                let mut v_sum = 0u32;
+
+                for dy in 0..2 {
+                    for dx in 0..2 {
+                        let src_idx = ((row + dy) * w + (col + dx)) * 4;
+                        let b = input[src_idx];
+                        let g = input[src_idx + 1];
+                        let r = input[src_idx + 2];
+                        let (_, u, v) = self.rgb_to_yuv(r, g, b);
+                        u_sum += u as u32;
+                        v_sum += v as u32;
+                    }
+                }
+
+                let uv_idx = y_size + (row / 2) * w + col;
+                output[uv_idx] = (u_sum / 4) as u8;
+                output[uv_idx + 1] = (v_sum / 4) as u8;
             }
         }
     }

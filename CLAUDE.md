@@ -1043,6 +1043,82 @@ Most codecs are pure Rust with no external dependencies. Exceptions:
 - **av1-encode**: Optionally install `nasm` for x86_64 SIMD optimizations
 - **av1-decode**: Requires `libdav1d-devel` (Fedora) / `libdav1d-dev` (Debian)
 
+## SIMD Color Conversion
+
+Parallax provides SIMD-accelerated colorspace conversion via the `simd-colorspace` feature.
+
+### Feature Flag
+
+```toml
+[dependencies]
+parallax = { version = "0.1", features = ["simd-colorspace"] }
+```
+
+### Performance
+
+When enabled, the `yuv` crate provides AVX-512, AVX2, SSE4.1, and NEON acceleration
+for YUV ↔ RGB conversions. Performance matches or exceeds libyuv. Runtime CPU
+feature detection selects the optimal path automatically.
+
+| Conversion | 1080p SIMD | Notes |
+|------------|------------|-------|
+| I420 → RGBA | ~0.9ms | ~3.3 GiB/s throughput |
+| RGBA → I420 | ~1.1ms | Balanced quality mode |
+| NV12 → RGBA | ~0.9ms | Hardware decoder output |
+| YUYV → RGBA | ~0.8ms | Common webcam format |
+
+### Supported Conversions
+
+**YUV → RGB (SIMD-accelerated):**
+- I420 → RGB24, RGBA, BGR24, BGRA
+- NV12 → RGB24, RGBA, BGR24, BGRA  
+- YUYV → RGB24, RGBA, BGR24, BGRA
+- UYVY → RGB24, RGBA
+
+**RGB → YUV (SIMD-accelerated):**
+- RGB24, RGBA, BGR24, BGRA → I420
+- RGB24, RGBA, BGR24, BGRA → NV12
+
+### Usage
+
+```rust
+use parallax::converters::{VideoConvert, PixelFormat};
+
+// SIMD is used automatically when the feature is enabled
+let converter = VideoConvert::new(
+    PixelFormat::I420,
+    PixelFormat::Rgba,
+    1920, 1080
+)?;
+
+converter.convert(&yuv_input, &mut rgba_output)?;
+```
+
+### Memory Alignment
+
+For optimal SIMD performance, buffers should be aligned:
+- SSE: 16-byte alignment
+- AVX/AVX2: 32-byte alignment
+- AVX-512: 64-byte alignment
+
+Use `MemoryLayout::AVX` in caps negotiation to request aligned buffers:
+
+```rust
+use parallax::format::{VideoFormatCaps, MemoryLayout};
+
+let caps = VideoFormatCaps::any().with_layout(MemoryLayout::AVX);
+```
+
+### Benchmarking
+
+```bash
+# Run SIMD benchmarks
+cargo bench --features simd-colorspace --bench colorspace
+
+# Compare with scalar (no feature)
+cargo bench --bench colorspace
+```
+
 ## Device Support
 
 Parallax provides feature-gated device elements for hardware capture and output.

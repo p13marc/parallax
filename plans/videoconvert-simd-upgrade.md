@@ -523,9 +523,18 @@ Note: `yuvutils-rs` mentions "Some paths have multi-threading support" but recom
 2. **SIMD conversions** in `src/converters/colorspace.rs`:
    - Feature flag: `simd-colorspace`
    - Uses `yuv` crate (v0.8) for accelerated conversions
-   - SIMD paths for: I420→RGB/RGBA/BGR/BGRA, YUYV→RGB/RGBA/BGR/BGRA, UYVY→RGB/RGBA
    - Automatic fallback to pure Rust when feature disabled
    - Runtime CPU detection (AVX2, AVX-512, SSE4.1, NEON)
+   
+   **YUV → RGB (SIMD-accelerated):**
+   - I420 → RGB24, RGBA, BGR24, BGRA
+   - NV12 → RGB24, RGBA, BGR24, BGRA
+   - YUYV → RGB24, RGBA, BGR24, BGRA
+   - UYVY → RGB24, RGBA
+   
+   **RGB → YUV (SIMD-accelerated):**
+   - RGB24, RGBA, BGR24, BGRA → I420
+   - RGB24, RGBA, BGR24, BGRA → NV12
 
 3. **Aligned arena allocation** in `src/memory/shared_refcount.rs`:
    - New field `slot_stride` tracks aligned spacing between slots
@@ -537,6 +546,15 @@ Note: `yuvutils-rs` mentions "Some paths have multi-threading support" but recom
    - Declares `MemoryLayout::AVX` in input/output caps
    - Uses `SharedArena::new_avx()` for aligned output buffers
 
+5. **Benchmarks** in `benches/colorspace.rs`:
+   - Criterion benchmarks for I420↔RGBA, YUYV→RGBA, NV12↔RGBA conversions
+   - Tests VGA, 720p, 1080p, and 4K resolutions
+   - Measures throughput in GiB/s
+
+6. **Documentation** in `CLAUDE.md`:
+   - Added "SIMD Color Conversion" section
+   - Documents feature flag, supported conversions, performance, and usage
+
 ---
 
 ## Verification
@@ -544,11 +562,14 @@ Note: `yuvutils-rs` mentions "Some paths have multi-threading support" but recom
 ### Benchmarks
 
 ```bash
-# Run conversion benchmarks
-cargo bench --features simd-colorspace -- videoconvert
+# Run conversion benchmarks with SIMD
+cargo bench --features simd-colorspace --bench colorspace
 
-# Compare with scalar baseline
-cargo bench -- videoconvert
+# Compare with scalar baseline (no simd-colorspace feature)
+cargo bench --bench colorspace
+
+# Run specific benchmark
+cargo bench --features simd-colorspace --bench colorspace -- "i420_to_rgba/convert/1080p"
 ```
 
 ### Tests
@@ -580,18 +601,18 @@ Based on yuv crate benchmarks for 1997×1331 images:
 
 ### Short Term (Next Release)
 
-1. **RGB to YUV SIMD paths**: Add SIMD-accelerated `rgb_to_yuv420`, `rgba_to_yuv420`, `bgra_to_yuv420`
-2. **NV12 SIMD support**: Use `YuvBiPlanarImage` for NV12↔RGB SIMD conversions
+1. ~~**RGB to YUV SIMD paths**: Add SIMD-accelerated `rgb_to_yuv420`, `rgba_to_yuv420`, `bgra_to_yuv420`~~ ✅ Done
+2. ~~**NV12 SIMD support**: Use `YuvBiPlanarImage` for NV12↔RGB SIMD conversions~~ ✅ Done
 3. **Store alignment in ArenaHeader**: Add `alignment` field to header for proper cross-process stride calculation
-4. **Benchmarks**: Add criterion benchmarks comparing SIMD vs scalar conversion performance
-5. **Documentation updates**:
-   - Update `CLAUDE.md` with simd-colorspace feature documentation
+4. ~~**Benchmarks**: Add criterion benchmarks comparing SIMD vs scalar conversion performance~~ ✅ Done
+5. ~~**Documentation updates**:~~ ✅ Done
+   - ~~Update `CLAUDE.md` with simd-colorspace feature documentation~~
    - Update `README.md` with SIMD feature flag and performance notes
    - Add `docs/simd-conversion.md` with detailed usage guide
 
 ### Medium Term
 
-4. **10-bit HDR support**: 
+1. **10-bit HDR support**: 
    - Add `PixelFormat::P010`, `PixelFormat::I010` for HDR video
    - Integrate `yuv` crate's 10-bit/12-bit conversion functions
    - Extend `MemoryLayout` for wider pixel types
