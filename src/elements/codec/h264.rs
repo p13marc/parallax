@@ -170,7 +170,8 @@ impl H264Encoder {
             .map_err(|e| Error::Config(format!("Failed to create H.264 encoder: {:?}", e)))?;
 
         // Create arena for encoded output buffers (typically < 1MB per frame)
-        let arena = SharedArena::new(1024 * 1024, 16)
+        // Use 64 slots to handle buffering when downstream is slower than encoding
+        let arena = SharedArena::new(1024 * 1024, 64)
             .map_err(|e| Error::Config(format!("Failed to create arena: {}", e)))?;
 
         Ok(Self {
@@ -258,6 +259,9 @@ impl Element for H264Encoder {
         if encoded.is_empty() {
             return Ok(None);
         }
+
+        // Reclaim any released slots before acquiring
+        self.arena.reclaim();
 
         // Acquire slot from arena and copy encoded data
         let mut slot = self

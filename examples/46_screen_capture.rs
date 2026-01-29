@@ -35,6 +35,8 @@ async fn main() -> Result<()> {
     println!();
 
     // Capture settings
+    // Note: OpenH264 (pure Rust) is slow for 1080p - encoding takes longer than capture
+    // The pipeline buffers captured frames and encodes them after capture completes
     let capture_duration_seconds = 5;
     let framerate = 30.0;
     let max_frames = (capture_duration_seconds as f32 * framerate) as u32;
@@ -79,8 +81,15 @@ async fn main() -> Result<()> {
 
     // Build the pipeline with a large enough arena for 1920x1080 BGRA frames
     // BGRA = 4 bytes per pixel, 1920x1080 = ~8.3 MB per frame
+    //
+    // IMPORTANT: OpenH264 (pure Rust) encodes at ~1-2 fps for 1080p
+    // PipeWire captures at 30fps, so we need a large buffer to hold
+    // captured frames while waiting for encoding.
+    //
+    // For 5 seconds at 30fps = 150 frames = ~1.2GB buffer needed
+    // The pipeline will capture all frames quickly, then spend time encoding.
     let frame_size = 1920 * 1080 * 4;
-    let arena = SharedArena::new(frame_size, 8)?; // 8 frame slots
+    let arena = SharedArena::new(frame_size, 200)?; // 200 frame slots (~1.6GB)
 
     let mut pipeline = Pipeline::new();
 

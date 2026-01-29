@@ -678,7 +678,10 @@ impl Source for ScreenCaptureSrc {
                 frame.width,
                 frame.height
             );
-            let arena = SharedArena::new(frame_size, 8)
+            // Default to 200 slots to buffer ~6 seconds at 30fps
+            // This is needed because downstream elements (encoders) may be slower
+            // than capture rate. For production, use set_arena() with appropriate size.
+            let arena = SharedArena::new(frame_size, 200)
                 .map_err(|e| Error::AllocationFailed(format!("Failed to create arena: {}", e)))?;
             self.arena = Some(arena);
         }
