@@ -49,9 +49,17 @@ pub mod v4l2;
 #[cfg(feature = "alsa")]
 pub mod alsa;
 
+#[cfg(feature = "screen-capture")]
+pub mod screen_capture;
+
 // Re-exports
 #[cfg(feature = "pipewire")]
 pub use self::pipewire::{PipeWireSink, PipeWireSrc, PipeWireTarget};
+
+#[cfg(feature = "screen-capture")]
+pub use self::screen_capture::{
+    CaptureSourceType, ScreenCaptureConfig, ScreenCaptureInfo, ScreenCaptureSrc,
+};
 
 #[cfg(feature = "libcamera")]
 pub use self::libcamera::{LibCameraConfig, LibCameraInfo, LibCameraSrc};

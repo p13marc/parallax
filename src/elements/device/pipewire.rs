@@ -232,7 +232,8 @@ impl PipeWireSrc {
     #[cfg(feature = "screen-capture")]
     pub async fn screen_capture() -> Result<Self> {
         // Use ashpd to request screen capture permission
-        use ashpd::desktop::screencast::{CaptureType, Screencast};
+        use ashpd::desktop::PersistMode;
+        use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
 
         let proxy = Screencast::new()
             .await
@@ -246,11 +247,11 @@ impl PipeWireSrc {
         proxy
             .select_sources(
                 &session,
-                CaptureType::Monitor | CaptureType::Window,
-                true,  // multiple
-                None,  // cursor_mode
-                None,  // restore_token
-                false, // persist_mode
+                CursorMode::Embedded,
+                SourceType::Monitor | SourceType::Window,
+                true, // multiple
+                None, // restore_token
+                PersistMode::DoNot,
             )
             .await
             .map_err(|e| DeviceError::PipeWire(e.to_string()))?;
@@ -258,7 +259,9 @@ impl PipeWireSrc {
         let response = proxy
             .start(&session, None)
             .await
-            .map_err(|e| DeviceError::PipeWire(e.to_string()))?;
+            .map_err(|e| DeviceError::PipeWire(e.to_string()))?
+            .response()
+            .map_err(|_| DeviceError::PortalDenied)?;
 
         let streams = response.streams();
         if streams.is_empty() {

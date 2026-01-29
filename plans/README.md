@@ -364,8 +364,8 @@ Adaptive bitrate streaming support:
 - [x] Create examples: `22_v4l2_capture.rs`, `23_v4l2_display.rs`
 - [x] Create documentation examples: `42_pipewire_audio.rs`, `43_alsa_audio.rs`, `44_libcamera_capture.rs`
 - [x] Update documentation
-- [ ] Add DMA-BUF export mode (future enhancement)
-- [ ] Screen capture via portal (future enhancement)
+- [x] Add DMA-BUF export mode for V4L2 (`V4l2Config::dmabuf_export`)
+- [x] Screen capture via XDG portal (`ScreenCaptureSrc`, example `46_screen_capture.rs`)
 
 ### Plan 14: Streaming Protocols ⬜
 - [ ] Implement `HlsSink` with M3U8 generation

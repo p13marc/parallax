@@ -56,6 +56,7 @@ pub enum Error {
     #[cfg(any(
         feature = "pipewire",
         feature = "libcamera",
+        feature = "screen-capture",
         feature = "v4l2",
         feature = "alsa"
     ))]

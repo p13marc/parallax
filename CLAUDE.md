@@ -939,20 +939,22 @@ Parallax provides feature-gated device elements for hardware capture and output.
 ```toml
 [dependencies]
 # Video capture
-parallax = { version = "0.1", features = ["v4l2"] }       # V4L2 camera capture (Linux)
-parallax = { version = "0.1", features = ["libcamera"] }  # libcamera capture (Linux)
+parallax = { version = "0.1", features = ["v4l2"] }           # V4L2 camera capture (Linux)
+parallax = { version = "0.1", features = ["libcamera"] }      # libcamera capture (Linux)
+parallax = { version = "0.1", features = ["screen-capture"] } # Screen capture via XDG portal
 
 # Audio capture/playback
-parallax = { version = "0.1", features = ["pipewire"] }   # PipeWire audio (Linux)
-parallax = { version = "0.1", features = ["alsa"] }       # ALSA audio (Linux)
+parallax = { version = "0.1", features = ["pipewire"] }       # PipeWire audio (Linux)
+parallax = { version = "0.1", features = ["alsa"] }           # ALSA audio (Linux)
 ```
 
 ### Device Summary
 
 | Type | Device | Feature | Crate | Notes |
 |------|--------|---------|-------|-------|
-| Video | V4L2 | `v4l2` | v4l | Linux video capture |
+| Video | V4L2 | `v4l2` | v4l | Linux video capture, DMA-BUF export |
 | Video | libcamera | `libcamera` | libcamera | Modern camera API |
+| Video | Screen | `screen-capture` | ashpd | XDG portal screen capture |
 | Audio | PipeWire | `pipewire` | pipewire-rs | Modern Linux audio |
 | Audio | ALSA | `alsa` | alsa-rs | Direct ALSA access |
 

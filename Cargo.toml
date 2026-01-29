@@ -256,3 +256,11 @@ required-features = ["v4l2", "display"]
 [[example]]
 name = "24_autovideosink"
 required-features = ["display"]
+
+[[example]]
+name = "45_dmabuf_negotiation"
+required-features = ["v4l2"]
+
+[[example]]
+name = "46_screen_capture"
+required-features = ["screen-capture"]
