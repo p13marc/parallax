@@ -583,6 +583,11 @@ Based on yuv crate benchmarks for 1997×1331 images:
 1. **RGB to YUV SIMD paths**: Add SIMD-accelerated `rgb_to_yuv420`, `rgba_to_yuv420`, `bgra_to_yuv420`
 2. **NV12 SIMD support**: Use `YuvBiPlanarImage` for NV12↔RGB SIMD conversions
 3. **Store alignment in ArenaHeader**: Add `alignment` field to header for proper cross-process stride calculation
+4. **Benchmarks**: Add criterion benchmarks comparing SIMD vs scalar conversion performance
+5. **Documentation updates**:
+   - Update `CLAUDE.md` with simd-colorspace feature documentation
+   - Update `README.md` with SIMD feature flag and performance notes
+   - Add `docs/simd-conversion.md` with detailed usage guide
 
 ### Medium Term
 
