@@ -13,8 +13,11 @@
 //! 1. Checking for Vulkan Video availability
 //! 2. Creating a VulkanContext
 //! 3. Querying decode capabilities
-//! 4. Creating an H.264 decoder
-//! 5. Wrapping the decoder in HwDecoderElement for pipeline use
+//! 4. Creating an H.264 decoder with full Vulkan Video setup:
+//!    - VideoSession creation with memory bindings
+//!    - DPB (Decoded Picture Buffer) management
+//!    - H.264 SPS/PPS parsing
+//!    - Decode command buffer recording
 //!
 //! # Run
 //!
@@ -23,8 +26,8 @@
 //! ```
 
 use parallax::gpu::{
-    Codec, VideoSession, VideoSessionConfig, VulkanContext, VulkanH264Decoder,
-    vulkan_video_available,
+    Codec, Dpb, H264ParameterSets, VideoSession, VideoSessionConfig, VideoSessionParameters,
+    VulkanContext, VulkanH264Decoder, parse_annexb, vulkan_video_available,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -120,9 +123,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _decoder = VulkanH264Decoder::new(&ctx, 1920, 1080)?;
         println!("H.264 decoder created successfully!");
 
-        // Try to create a VideoSession (the core Vulkan Video object)
+        // Demonstrate VideoSession creation
         println!();
-        println!("Creating VideoSession for H.264 decode...");
+        println!("=== VideoSession Creation ===");
         let config = VideoSessionConfig {
             profile: parallax::gpu::VideoProfile {
                 codec: Codec::H264,
@@ -146,10 +149,117 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 println!("  Max DPB slots: {}", session.max_dpb_slots());
                 println!("  Max active refs: {}", session.max_active_refs());
+                println!("  Picture format: {:?}", session.picture_format());
+
+                // Show capabilities
+                let caps = session.capabilities();
+                println!("  Decode caps: {:?}", caps.decode_caps);
+
+                // Create DPB (Decoded Picture Buffer)
+                println!();
+                println!("=== DPB Management ===");
+                match Dpb::new(&session, None) {
+                    Ok(mut dpb) => {
+                        println!("DPB created with {} slots", dpb.max_slots());
+                        println!("  Format: {:?}", dpb.format());
+                        println!("  Extent: {}x{}", dpb.extent().width, dpb.extent().height);
+
+                        // Demonstrate DPB slot management
+                        if let Some(slot_idx) = dpb.acquire_slot() {
+                            println!("  Acquired slot {} for output", slot_idx);
+                            dpb.mark_as_reference(slot_idx, 0, 0, false);
+                            println!("  Marked as short-term reference (POC=0)");
+                            println!("  Active refs: {}", dpb.active_count());
+                            dpb.release_slot(slot_idx);
+                            println!("  Released slot {}", slot_idx);
+                        }
+                    }
+                    Err(e) => {
+                        println!("DPB creation failed: {}", e);
+                    }
+                }
+
+                // Create session parameters
+                println!();
+                println!("=== Session Parameters ===");
+                match VideoSessionParameters::new_empty(&session) {
+                    Ok(_params) => {
+                        println!("Session parameters created successfully!");
+                        // In a real decode, we'd update with SPS/PPS via
+                        // vkUpdateVideoSessionParametersKHR
+                    }
+                    Err(e) => {
+                        println!("Session parameters creation failed: {}", e);
+                    }
+                }
             }
             Err(e) => {
                 println!("VideoSession creation failed: {}", e);
                 println!("(This is expected if the driver doesn't fully support Vulkan Video)");
+            }
+        }
+
+        // Demonstrate H.264 SPS/PPS parsing
+        println!();
+        println!("=== H.264 Parameter Parsing ===");
+
+        // Example H.264 bitstream with SPS and PPS
+        // This is a minimal baseline profile 320x240 SPS/PPS
+        let example_bitstream = [
+            // Start code + SPS NAL
+            0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0xc0, 0x1e, 0xd9, 0x00, 0x50, 0x05, 0xb8, 0x10,
+            0x00, 0x00, 0x3e, 0x90, 0x00, 0x0b, 0xb8, 0x08, 0xf1, 0x83, 0x19, 0x60,
+            // Start code + PPS NAL
+            0x00, 0x00, 0x00, 0x01, 0x68, 0xce, 0x38, 0x80,
+        ];
+
+        // Parse NAL units
+        let nals = parse_annexb(&example_bitstream);
+        println!("Found {} NAL units in bitstream", nals.len());
+
+        for (i, nal) in nals.iter().enumerate() {
+            let nal_type = nal[0] & 0x1F;
+            let nal_type_name = match nal_type {
+                1 => "Non-IDR Slice",
+                5 => "IDR Slice",
+                6 => "SEI",
+                7 => "SPS",
+                8 => "PPS",
+                9 => "AUD",
+                _ => "Other",
+            };
+            println!(
+                "  NAL {}: type={} ({}), {} bytes",
+                i,
+                nal_type,
+                nal_type_name,
+                nal.len()
+            );
+        }
+
+        // Parse into H264ParameterSets
+        let mut param_sets = H264ParameterSets::new();
+        for nal in &nals {
+            match param_sets.parse_nal(nal) {
+                Ok(unit_type) => {
+                    println!("  Parsed NAL unit: {:?}", unit_type);
+                }
+                Err(e) => {
+                    println!("  Parse error: {}", e);
+                }
+            }
+        }
+
+        if param_sets.has_parameters() {
+            println!("Successfully parsed SPS and PPS!");
+            if let Some(sps) = param_sets.get_sps(0) {
+                println!(
+                    "  SPS[0]: profile_idc={}, level_idc={}",
+                    sps.profile_idc, sps.level_idc
+                );
+                if let Some((w, h)) = param_sets.picture_dimensions(0) {
+                    println!("  Dimensions: {}x{}", w, h);
+                }
             }
         }
 
@@ -159,7 +269,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 3. Feed H.264 NAL units to decode
 
         println!();
-        println!("Example usage in pipeline:");
+        println!("=== Pipeline Integration ===");
+        println!("Example usage:");
         println!("  use parallax::elements::codec::HwDecoderElement;");
         println!("  let element = HwDecoderElement::new(decoder);");
         println!(
@@ -170,17 +281,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!();
-    println!("Note: This example demonstrates GPU decode capabilities.");
-    println!("The implementation includes:");
-    println!("  + VulkanContext for device/instance management");
-    println!("  + VideoSession for Vulkan Video session creation");
-    println!("  + DPB (Decoded Picture Buffer) management");
-    println!("  + HwDecoderElement for pipeline integration");
+    println!("=== Implementation Status ===");
+    println!("Complete:");
+    println!("  ✓ VulkanContext for device/instance management");
+    println!("  ✓ VideoSession creation with memory bindings");
+    println!("  ✓ DPB (Decoded Picture Buffer) management");
+    println!("  ✓ H.264 SPS/PPS parsing");
+    println!("  ✓ Decode command buffer recording");
+    println!("  ✓ HwDecoderElement pipeline wrapper");
+    println!("  ✓ HwEncoderElement pipeline wrapper");
     println!();
-    println!("Remaining work for full decode:");
-    println!("  - H.264 SPS/PPS parsing and session parameters");
-    println!("  - Decode command buffer recording");
-    println!("  - Output frame handling");
+    println!("In Progress:");
+    println!("  - Slice header parsing");
+    println!("  - Reference list construction");
+    println!("  - Output frame readback");
+    println!("  - VulkanH264Encoder implementation");
 
     Ok(())
 }

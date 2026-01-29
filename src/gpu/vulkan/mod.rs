@@ -19,15 +19,19 @@
 
 mod context;
 mod decode;
+mod decode_commands;
 mod dpb;
 mod error;
+mod h264_parser;
 mod memory;
 mod session;
 
 pub use context::VulkanContext;
 pub use decode::VulkanH264Decoder;
+pub use decode_commands::{DecodeCommandRecorder, DecodeOperation, H264DecodeParams};
 pub use dpb::{Dpb, DpbReference, DpbSlot};
 pub use error::VulkanError;
+pub use h264_parser::{H264ParameterSets, ParsedPps, ParsedSps, parse_annexb};
 pub use memory::VulkanGpuMemory;
 pub use session::{SessionCapabilities, VideoSession, VideoSessionConfig, VideoSessionParameters};
 

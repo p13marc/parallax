@@ -53,8 +53,10 @@ pub mod vulkan;
 
 #[cfg(feature = "vulkan-video")]
 pub use vulkan::{
-    Dpb, DpbReference, DpbSlot, SessionCapabilities, VideoSession, VideoSessionConfig,
+    DecodeCommandRecorder, DecodeOperation, Dpb, DpbReference, DpbSlot, H264DecodeParams,
+    H264ParameterSets, ParsedPps, ParsedSps, SessionCapabilities, VideoSession, VideoSessionConfig,
     VideoSessionParameters, VulkanContext, VulkanError, VulkanGpuMemory, VulkanH264Decoder,
+    parse_annexb,
 };
 
 /// Video codec types.
