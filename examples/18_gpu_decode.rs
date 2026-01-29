@@ -22,7 +22,10 @@
 //! cargo run --example 18_gpu_decode --features vulkan-video
 //! ```
 
-use parallax::gpu::{Codec, VulkanContext, VulkanH264Decoder, vulkan_video_available};
+use parallax::gpu::{
+    Codec, VideoSession, VideoSessionConfig, VulkanContext, VulkanH264Decoder,
+    vulkan_video_available,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Check if Vulkan Video is available
@@ -117,6 +120,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _decoder = VulkanH264Decoder::new(&ctx, 1920, 1080)?;
         println!("H.264 decoder created successfully!");
 
+        // Try to create a VideoSession (the core Vulkan Video object)
+        println!();
+        println!("Creating VideoSession for H.264 decode...");
+        let config = VideoSessionConfig {
+            profile: parallax::gpu::VideoProfile {
+                codec: Codec::H264,
+                profile: 100, // High profile
+                level: 51,    // Level 5.1
+                chroma_format: parallax::gpu::ChromaFormat::Yuv420,
+                bit_depth: 8,
+            },
+            max_width: 1920,
+            max_height: 1080,
+            ..Default::default()
+        };
+
+        match VideoSession::new_decode(&ctx, config) {
+            Ok(session) => {
+                println!("VideoSession created successfully!");
+                println!(
+                    "  Coded extent: {}x{}",
+                    session.coded_extent().width,
+                    session.coded_extent().height
+                );
+                println!("  Max DPB slots: {}", session.max_dpb_slots());
+                println!("  Max active refs: {}", session.max_active_refs());
+            }
+            Err(e) => {
+                println!("VideoSession creation failed: {}", e);
+                println!("(This is expected if the driver doesn't fully support Vulkan Video)");
+            }
+        }
+
         // In a real application, you would:
         // 1. Wrap the decoder in HwDecoderElement
         // 2. Add it to a pipeline
@@ -134,13 +170,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!();
-    println!("Note: This is a demonstration of GPU decode capabilities.");
-    println!("The VulkanH264Decoder skeleton is implemented but the full");
-    println!("Vulkan Video decode path requires additional work:");
-    println!("  - Video session creation with proper memory bindings");
-    println!("  - SPS/PPS parameter set handling");
-    println!("  - DPB (Decoded Picture Buffer) management");
-    println!("  - Command buffer recording for decode operations");
+    println!("Note: This example demonstrates GPU decode capabilities.");
+    println!("The implementation includes:");
+    println!("  + VulkanContext for device/instance management");
+    println!("  + VideoSession for Vulkan Video session creation");
+    println!("  + DPB (Decoded Picture Buffer) management");
+    println!("  + HwDecoderElement for pipeline integration");
+    println!();
+    println!("Remaining work for full decode:");
+    println!("  - H.264 SPS/PPS parsing and session parameters");
+    println!("  - Decode command buffer recording");
+    println!("  - Output frame handling");
 
     Ok(())
 }

@@ -19,13 +19,17 @@
 
 mod context;
 mod decode;
+mod dpb;
 mod error;
 mod memory;
+mod session;
 
 pub use context::VulkanContext;
 pub use decode::VulkanH264Decoder;
+pub use dpb::{Dpb, DpbReference, DpbSlot};
 pub use error::VulkanError;
 pub use memory::VulkanGpuMemory;
+pub use session::{SessionCapabilities, VideoSession, VideoSessionConfig, VideoSessionParameters};
 
 use ash::vk;
 

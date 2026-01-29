@@ -52,7 +52,10 @@ pub use traits::*;
 pub mod vulkan;
 
 #[cfg(feature = "vulkan-video")]
-pub use vulkan::{VulkanContext, VulkanError, VulkanGpuMemory, VulkanH264Decoder};
+pub use vulkan::{
+    Dpb, DpbReference, DpbSlot, SessionCapabilities, VideoSession, VideoSessionConfig,
+    VideoSessionParameters, VulkanContext, VulkanError, VulkanGpuMemory, VulkanH264Decoder,
+};
 
 /// Video codec types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
