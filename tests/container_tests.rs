@@ -176,13 +176,13 @@ mod mp4_mux_tests {
             .add_video_track(video_config)
             .expect("Should add video track");
 
-        // Write some video samples
+        // Write some video samples (30fps = 33ms per frame)
         let frame_data = vec![0u8; 1000]; // Dummy frame data
-        mux.write_video_sample(video_track, &frame_data, 0, true)
+        mux.write_video_sample(video_track, &frame_data, 0, 33, true)
             .expect("Should write keyframe");
-        mux.write_video_sample(video_track, &frame_data, 33, false)
+        mux.write_video_sample(video_track, &frame_data, 33, 33, false)
             .expect("Should write P-frame");
-        mux.write_video_sample(video_track, &frame_data, 66, false)
+        mux.write_video_sample(video_track, &frame_data, 66, 33, false)
             .expect("Should write P-frame");
 
         // Check stats
@@ -204,10 +204,10 @@ mod mp4_mux_tests {
             .add_audio_track(audio_config)
             .expect("Should add audio track");
 
-        // Write some audio samples
+        // Write some audio samples (AAC frame ~23ms at 44100Hz)
         let audio_data = vec![0u8; 512]; // Dummy AAC frame
         for i in 0..10 {
-            mux.write_audio_sample(audio_track, &audio_data, i * 23)
+            mux.write_audio_sample(audio_track, &audio_data, i * 23, 23)
                 .expect("Should write audio sample");
         }
 
@@ -233,7 +233,7 @@ mod mp4_mux_tests {
             .expect("Should add video track");
 
         let frame_data = vec![0u8; 100];
-        mux.write_video_sample(video_track, &frame_data, 0, true)
+        mux.write_video_sample(video_track, &frame_data, 0, 33, true)
             .expect("Should write frame");
 
         // Finish the file
@@ -310,11 +310,11 @@ mod mp4_roundtrip_tests {
         let frame2 = vec![0x00, 0x00, 0x00, 0x01, 0x41]; // P frame marker
         let frame3 = vec![0x00, 0x00, 0x00, 0x01, 0x41]; // P frame marker
 
-        mux.write_video_sample(video_track, &frame1, 0, true)
+        mux.write_video_sample(video_track, &frame1, 0, 33, true)
             .unwrap();
-        mux.write_video_sample(video_track, &frame2, 33, false)
+        mux.write_video_sample(video_track, &frame2, 33, 33, false)
             .unwrap();
-        mux.write_video_sample(video_track, &frame3, 66, false)
+        mux.write_video_sample(video_track, &frame3, 66, 33, false)
             .unwrap();
 
         let output = mux.finish().expect("Should finalize");
@@ -365,10 +365,10 @@ mod mp4_roundtrip_tests {
             .add_audio_track(audio_config)
             .expect("Should add audio track");
 
-        // Write some audio frames (dummy AAC data)
+        // Write some audio frames (dummy AAC data, ~23ms each)
         for i in 0..5 {
             let audio_data = vec![0xFF, 0xF1, 0x50, 0x80]; // AAC ADTS header start
-            mux.write_audio_sample(audio_track, &audio_data, i * 23)
+            mux.write_audio_sample(audio_track, &audio_data, i * 23, 23)
                 .unwrap();
         }
 
@@ -423,16 +423,17 @@ mod mp4_roundtrip_tests {
         let video_data = vec![0u8; 100];
         let audio_data = vec![0u8; 50];
 
-        mux.write_video_sample(video_track, &video_data, 0, true)
+        mux.write_video_sample(video_track, &video_data, 0, 33, true)
             .unwrap();
-        mux.write_audio_sample(audio_track, &audio_data, 0).unwrap();
-        mux.write_video_sample(video_track, &video_data, 33, false)
+        mux.write_audio_sample(audio_track, &audio_data, 0, 21)
             .unwrap();
-        mux.write_audio_sample(audio_track, &audio_data, 21)
+        mux.write_video_sample(video_track, &video_data, 33, 33, false)
             .unwrap();
-        mux.write_video_sample(video_track, &video_data, 66, false)
+        mux.write_audio_sample(audio_track, &audio_data, 21, 21)
             .unwrap();
-        mux.write_audio_sample(audio_track, &audio_data, 42)
+        mux.write_video_sample(video_track, &video_data, 66, 33, false)
+            .unwrap();
+        mux.write_audio_sample(audio_track, &audio_data, 42, 21)
             .unwrap();
 
         let output = mux.finish().expect("Should finalize");

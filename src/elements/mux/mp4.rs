@@ -461,6 +461,7 @@ impl<W: Write + Seek> Mp4Mux<W> {
     /// * `data` - The sample data (encoded frame).
     /// * `pts_ms` - Presentation timestamp in milliseconds.
     /// * `dts_ms` - Decode timestamp in milliseconds (use same as PTS if no B-frames).
+    /// * `duration_ms` - Duration of this sample in milliseconds.
     /// * `is_sync` - Whether this is a sync point (keyframe for video, always true for audio).
     pub fn write_sample(
         &mut self,
@@ -468,11 +469,12 @@ impl<W: Write + Seek> Mp4Mux<W> {
         data: &[u8],
         pts_ms: u64,
         dts_ms: u64,
+        duration_ms: u32,
         is_sync: bool,
     ) -> Result<()> {
         let sample = Mp4Sample {
             start_time: dts_ms,
-            duration: 0, // Will be calculated from next sample
+            duration: duration_ms,
             rendering_offset: (pts_ms as i64 - dts_ms as i64) as i32,
             is_sync,
             bytes: bytes::Bytes::copy_from_slice(data),
@@ -499,15 +501,17 @@ impl<W: Write + Seek> Mp4Mux<W> {
     /// * `track_id` - The video track ID.
     /// * `data` - The encoded video frame data.
     /// * `pts_ms` - Presentation timestamp in milliseconds.
+    /// * `duration_ms` - Duration of this frame in milliseconds.
     /// * `is_keyframe` - Whether this is a keyframe (IDR frame).
     pub fn write_video_sample(
         &mut self,
         track_id: u32,
         data: &[u8],
         pts_ms: u64,
+        duration_ms: u32,
         is_keyframe: bool,
     ) -> Result<()> {
-        self.write_sample(track_id, data, pts_ms, pts_ms, is_keyframe)?;
+        self.write_sample(track_id, data, pts_ms, pts_ms, duration_ms, is_keyframe)?;
         self.stats.video_samples += 1;
         Ok(())
     }
@@ -521,8 +525,15 @@ impl<W: Write + Seek> Mp4Mux<W> {
     /// * `track_id` - The audio track ID.
     /// * `data` - The encoded audio frame data.
     /// * `pts_ms` - Presentation timestamp in milliseconds.
-    pub fn write_audio_sample(&mut self, track_id: u32, data: &[u8], pts_ms: u64) -> Result<()> {
-        self.write_sample(track_id, data, pts_ms, pts_ms, true)?;
+    /// * `duration_ms` - Duration of this audio frame in milliseconds.
+    pub fn write_audio_sample(
+        &mut self,
+        track_id: u32,
+        data: &[u8],
+        pts_ms: u64,
+        duration_ms: u32,
+    ) -> Result<()> {
+        self.write_sample(track_id, data, pts_ms, pts_ms, duration_ms, true)?;
         self.stats.audio_samples += 1;
         Ok(())
     }
@@ -887,11 +898,12 @@ impl Sink for Mp4FileSink {
         // Convert from Annex-B to AVCC format
         let avcc_data = Self::annex_b_to_avcc(data);
 
-        // Calculate PTS
+        // Calculate PTS and duration
         let pts_ms = self.frame_count * self.frame_duration_ms;
+        let duration_ms = self.frame_duration_ms as u32;
 
         // Write sample
-        muxer.write_video_sample(track_id, &avcc_data, pts_ms, is_keyframe)?;
+        muxer.write_video_sample(track_id, &avcc_data, pts_ms, duration_ms, is_keyframe)?;
         self.frame_count += 1;
 
         if self.frame_count % 30 == 0 {
@@ -1129,11 +1141,12 @@ impl Element for Mp4MuxTransform {
         // Convert from Annex-B to AVCC format
         let avcc_data = Mp4FileSink::annex_b_to_avcc(data);
 
-        // Calculate PTS
+        // Calculate PTS and duration
         let pts_ms = self.frame_count * self.frame_duration_ms;
+        let duration_ms = self.frame_duration_ms as u32;
 
         // Write sample
-        muxer.write_video_sample(track_id, &avcc_data, pts_ms, is_keyframe)?;
+        muxer.write_video_sample(track_id, &avcc_data, pts_ms, duration_ms, is_keyframe)?;
         self.frame_count += 1;
 
         if self.frame_count % 30 == 0 {
