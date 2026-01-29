@@ -48,6 +48,7 @@ mod builder;
 mod driver;
 mod events;
 pub mod factory;
+pub mod flow;
 mod graph;
 pub mod parser;
 pub mod rt_bridge;
