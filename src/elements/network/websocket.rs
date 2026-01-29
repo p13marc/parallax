@@ -160,6 +160,7 @@ impl Source for WebSocketSrc {
                         })?);
                     }
                     let arena = self.arena.as_ref().unwrap();
+                    arena.reclaim();
 
                     let mut slot = arena.acquire().ok_or_else(|| {
                         Error::Element("Failed to acquire buffer slot".to_string())
@@ -183,6 +184,7 @@ impl Source for WebSocketSrc {
                         })?);
                     }
                     let arena = self.arena.as_ref().unwrap();
+                    arena.reclaim();
 
                     let mut slot = arena.acquire().ok_or_else(|| {
                         Error::Element("Failed to acquire buffer slot".to_string())

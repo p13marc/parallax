@@ -187,6 +187,8 @@ impl Source for ZenohSrc {
                         })?);
                     }
                     let arena = self.arena.as_ref().unwrap();
+                    arena.reclaim();
+
                     let slot = arena.acquire().ok_or_else(|| {
                         Error::Element("Failed to acquire buffer slot".to_string())
                     })?;
@@ -637,6 +639,7 @@ impl ZenohQuerier {
                     let payload = sample.payload();
                     let data: Vec<u8> = payload.to_bytes().to_vec();
 
+                    arena.reclaim();
                     let mut slot = arena.acquire().ok_or_else(|| {
                         Error::Element("Failed to acquire buffer slot".to_string())
                     })?;
@@ -686,6 +689,7 @@ impl ZenohQuerier {
                     let payload = sample.payload();
                     let data: Vec<u8> = payload.to_bytes().to_vec();
 
+                    arena.reclaim();
                     let mut slot = arena.acquire().ok_or_else(|| {
                         Error::Element("Failed to acquire buffer slot".to_string())
                     })?;

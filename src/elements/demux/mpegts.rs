@@ -260,7 +260,10 @@ impl FrameCollector {
             return Err(Error::Element("Empty buffer data".into()));
         }
 
-        let mut slot = ts_demux_arena()
+        let arena = ts_demux_arena();
+        arena.reclaim();
+
+        let mut slot = arena
             .acquire()
             .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
 

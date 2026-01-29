@@ -600,6 +600,7 @@ fn create_klv_buffer(data: Vec<u8>) -> Result<Buffer> {
     }
 
     let arena = klv_arena();
+    arena.reclaim();
 
     let mut slot = arena
         .acquire()

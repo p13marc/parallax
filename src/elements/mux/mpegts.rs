@@ -889,7 +889,10 @@ impl TsMux {
             return Err(Error::Element("Empty TS data".into()));
         }
 
-        let mut slot = ts_mux_arena()
+        let arena = ts_mux_arena();
+        arena.reclaim();
+
+        let mut slot = arena
             .acquire()
             .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
 

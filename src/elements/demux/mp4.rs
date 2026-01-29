@@ -520,7 +520,10 @@ impl<R: Read + Seek> Mp4Demux<R> {
         sample: &mp4::Mp4Sample,
         track: &Mp4Track,
     ) -> Result<Buffer> {
-        let mut slot = mp4_demux_arena()
+        let arena = mp4_demux_arena();
+        arena.reclaim();
+
+        let mut slot = arena
             .acquire()
             .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
 

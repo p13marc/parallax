@@ -688,6 +688,9 @@ impl Source for ScreenCaptureSrc {
 
         let arena = self.arena.as_ref().unwrap();
 
+        // Reclaim any slots that have been released by downstream elements
+        arena.reclaim();
+
         let frame_size = frame.data.len();
         let mut slot = arena.acquire().ok_or_else(|| {
             Error::AllocationFailed(format!(

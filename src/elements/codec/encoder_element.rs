@@ -139,6 +139,7 @@ impl<E: VideoEncoder> EncoderElement<E> {
 
     /// Convert encoded packet to output buffer.
     fn packet_to_buffer(&self, data: Vec<u8>, pts: i64) -> Result<Buffer> {
+        self.arena.reclaim();
         let mut slot = self
             .arena
             .acquire()

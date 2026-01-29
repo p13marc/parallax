@@ -90,6 +90,8 @@ impl Timeout {
     fn create_fallback(&self) -> Result<Option<Buffer>> {
         let len = self.fallback_data.len();
         let arena = timeout_arena();
+        arena.reclaim();
+
         let mut slot = arena
             .acquire()
             .ok_or_else(|| Error::Element("arena exhausted".into()))?;

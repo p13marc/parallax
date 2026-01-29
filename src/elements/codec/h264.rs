@@ -443,7 +443,8 @@ impl Element for H264Decoder {
             Some(frame) => {
                 let yuv_data = frame.to_yuv420_planar();
 
-                // Acquire slot from arena and copy YUV data
+                // Reclaim released slots and acquire new one
+                self.arena.reclaim();
                 let mut slot = self
                     .arena
                     .acquire()
