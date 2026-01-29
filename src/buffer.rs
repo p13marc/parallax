@@ -337,6 +337,178 @@ impl<T> std::fmt::Debug for Buffer<T> {
 unsafe impl<T: Send> Send for Buffer<T> {}
 unsafe impl<T: Sync> Sync for Buffer<T> {}
 
+// ============================================================================
+// DmaBufBuffer - buffer backed by DMA-BUF segment
+// ============================================================================
+
+use crate::memory::DmaBufSegment;
+use rustix::fd::BorrowedFd;
+
+/// A buffer backed by a DMA-BUF file descriptor.
+///
+/// Unlike [`Buffer`] which uses [`SharedArena`](crate::memory::SharedArena),
+/// this buffer directly owns a [`DmaBufSegment`] for zero-copy GPU integration.
+///
+/// # Use Cases
+///
+/// - V4L2 camera capture with `VIDIOC_EXPBUF`
+/// - libcamera DMA-BUF frame buffers
+/// - GPU encoder/decoder pipelines
+/// - Zero-copy video processing
+///
+/// # Memory Type
+///
+/// Always reports [`MemoryType::DmaBuf`].
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use parallax::buffer::DmaBufBuffer;
+/// use parallax::memory::DmaBufSegment;
+/// use parallax::metadata::Metadata;
+///
+/// // From V4L2 exported buffer
+/// let segment = DmaBufSegment::from_fd(dmabuf_fd, buffer_size)?;
+/// let buffer = DmaBufBuffer::new(segment, Metadata::from_sequence(0));
+///
+/// // Access data
+/// let data = buffer.as_bytes();
+///
+/// // Get fd for GPU import
+/// let fd = buffer.as_fd();
+/// ```
+pub struct DmaBufBuffer {
+    /// The DMA-BUF segment.
+    segment: DmaBufSegment,
+    /// Buffer metadata.
+    metadata: Metadata,
+}
+
+impl DmaBufBuffer {
+    /// Create a new DMA-BUF buffer.
+    pub fn new(segment: DmaBufSegment, metadata: Metadata) -> Self {
+        Self { segment, metadata }
+    }
+
+    /// Get the buffer data as a byte slice.
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        DmaBufSegment::as_slice(&self.segment)
+    }
+
+    /// Get the buffer data as a mutable byte slice.
+    ///
+    /// Returns `None` if the segment is read-only.
+    #[inline]
+    pub fn as_bytes_mut(&mut self) -> Option<&mut [u8]> {
+        DmaBufSegment::as_mut_slice(&mut self.segment)
+    }
+
+    /// Get the length of the buffer data.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.segment.size()
+    }
+
+    /// Check if the buffer is empty.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.segment.size() == 0
+    }
+
+    /// Get the memory type (always DmaBuf).
+    #[inline]
+    pub fn memory_type(&self) -> MemoryType {
+        MemoryType::DmaBuf
+    }
+
+    /// Get a reference to the buffer's metadata.
+    #[inline]
+    pub fn metadata(&self) -> &Metadata {
+        &self.metadata
+    }
+
+    /// Get a mutable reference to the buffer's metadata.
+    #[inline]
+    pub fn metadata_mut(&mut self) -> &mut Metadata {
+        &mut self.metadata
+    }
+
+    /// Get the DMA-BUF file descriptor.
+    ///
+    /// Use this for:
+    /// - GPU import operations (Vulkan, VA-API)
+    /// - IPC fd passing via `send_fds()`
+    /// - Duplicating the fd with `try_clone()`
+    #[inline]
+    pub fn as_fd(&self) -> BorrowedFd<'_> {
+        self.segment.as_fd()
+    }
+
+    /// Check if this buffer is read-only.
+    #[inline]
+    pub fn is_read_only(&self) -> bool {
+        self.segment.is_read_only()
+    }
+
+    /// Get a reference to the underlying segment.
+    #[inline]
+    pub fn segment(&self) -> &DmaBufSegment {
+        &self.segment
+    }
+
+    /// Consume the buffer and return the segment.
+    #[inline]
+    pub fn into_segment(self) -> DmaBufSegment {
+        self.segment
+    }
+
+    /// Convert to a regular `Buffer` by copying data to an arena.
+    ///
+    /// Use this when you need to pass DMA-BUF data to an element that only
+    /// accepts arena-backed buffers.
+    ///
+    /// # Arguments
+    ///
+    /// * `arena` - The arena to copy data into.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the arena is exhausted.
+    pub fn to_buffer(&self, arena: &crate::memory::SharedArena) -> crate::error::Result<Buffer> {
+        let mut slot = arena
+            .acquire()
+            .ok_or_else(|| crate::error::Error::PoolExhausted)?;
+
+        let data = self.as_bytes();
+        if data.len() > slot.len() {
+            return Err(crate::error::Error::InvalidSegment(format!(
+                "DMA-BUF buffer ({} bytes) exceeds arena slot size ({} bytes)",
+                data.len(),
+                slot.len()
+            )));
+        }
+
+        slot.data_mut()[..data.len()].copy_from_slice(data);
+
+        let handle = MemoryHandle::with_len(slot, data.len());
+        Ok(Buffer::new(handle, self.metadata.clone()))
+    }
+}
+
+impl std::fmt::Debug for DmaBufBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DmaBufBuffer")
+            .field("segment", &self.segment)
+            .field("metadata", &self.metadata)
+            .finish()
+    }
+}
+
+// DmaBufBuffer is Send + Sync because DmaBufSegment is
+unsafe impl Send for DmaBufBuffer {}
+unsafe impl Sync for DmaBufBuffer {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

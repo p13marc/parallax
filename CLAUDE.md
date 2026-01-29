@@ -944,6 +944,62 @@ parallax = { version = "0.1", features = ["alsa"] }       # ALSA audio (Linux)
 - **pipewire**: Requires `pipewire-devel` (Fedora) / `libpipewire-0.3-dev` (Debian)
 - **alsa**: Requires `alsa-lib-devel` (Fedora) / `libasound2-dev` (Debian)
 
+### DMA-BUF Export (Zero-Copy GPU Path)
+
+V4L2 sources can export buffers as DMA-BUF file descriptors for zero-copy
+integration with GPU pipelines:
+
+```rust
+use parallax::elements::device::{V4l2Src, V4l2Config};
+
+let config = V4l2Config {
+    dmabuf_export: true,  // Export via VIDIOC_EXPBUF
+    ..Default::default()
+};
+let camera = V4l2Src::with_config("/dev/video0", config)?;
+
+// Camera now declares DmaBuf as preferred memory type
+// Pipeline will automatically select DMA-BUF path when downstream supports it
+```
+
+The caps negotiation system automatically selects the best memory type:
+- If sink prefers DmaBuf and source offers it -> zero-copy DMA-BUF path
+- If sink only accepts CPU -> fallback to mmap with copy
+
+**Key types for DMA-BUF support:**
+
+| Type | Description |
+|------|-------------|
+| `DmaBufSegment` | Memory segment backed by DMA-BUF file descriptor |
+| `DmaBufBuffer` | Buffer wrapping a DmaBufSegment with metadata |
+| `MemoryCaps::dmabuf_only()` | Accept only DMA-BUF memory |
+| `MemoryCaps::dmabuf_preferred()` | Prefer DMA-BUF, fall back to CPU |
+| `ProduceResult::OwnDmaBuf` | Return a DmaBufBuffer from a source |
+
+**Example: DMA-BUF negotiation**
+
+```rust
+// Source declares multiple memory types (DmaBuf preferred)
+fn output_media_caps(&self) -> ElementMediaCaps {
+    ElementMediaCaps::new(vec![
+        FormatMemoryCap::new(format.into(), MemoryCaps::dmabuf_only()),  // Preferred
+        FormatMemoryCap::new(format.into(), MemoryCaps::cpu_only()),     // Fallback
+    ])
+}
+
+// Sink declares what it accepts
+fn input_media_caps(&self) -> ElementMediaCaps {
+    ElementMediaCaps::new(vec![
+        FormatMemoryCap::new(VideoFormatCaps::any().into(), MemoryCaps::dmabuf_only()),
+        FormatMemoryCap::new(VideoFormatCaps::any().into(), MemoryCaps::cpu_only()),
+    ])
+}
+
+// Pipeline negotiation picks DmaBuf (first common match)
+```
+
+See `examples/45_dmabuf_negotiation.rs` for a complete example.
+
 ## Performance Notes
 
 - Buffer cloning is O(1) (Arc increment)

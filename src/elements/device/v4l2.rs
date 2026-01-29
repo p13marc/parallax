@@ -18,7 +18,25 @@
 //! // Open default camera
 //! let camera = V4l2Src::new("/dev/video0")?;
 //! ```
+//!
+//! ## DMA-BUF Export
+//!
+//! For zero-copy GPU pipelines, enable DMA-BUF export mode:
+//!
+//! ```rust,ignore
+//! use parallax::elements::device::v4l2::{V4l2Src, V4l2Config};
+//!
+//! let config = V4l2Config {
+//!     dmabuf_export: true,  // Export via VIDIOC_EXPBUF
+//!     ..Default::default()
+//! };
+//! let camera = V4l2Src::with_config("/dev/video0", config)?;
+//!
+//! // Camera now declares DmaBuf as preferred memory type
+//! // Pipeline will automatically select DMA-BUF path when downstream supports it
+//! ```
 
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::PathBuf;
 
 use v4l::buffer::Type;
@@ -27,13 +45,13 @@ use v4l::io::traits::CaptureStream;
 use v4l::prelude::*;
 use v4l::video::Capture;
 
-use crate::buffer::{Buffer, MemoryHandle};
+use crate::buffer::{Buffer, DmaBufBuffer, MemoryHandle};
 use crate::element::{Affinity, ExecutionHints, ProduceContext, ProduceResult, Source};
 use crate::error::Result;
 use crate::format::{
     Caps, CapsValue, ElementMediaCaps, FormatMemoryCap, MemoryCaps, PixelFormat, VideoFormatCaps,
 };
-use crate::memory::SharedArena;
+use crate::memory::{DmaBufSegment, SharedArena};
 use crate::metadata::Metadata;
 
 use super::DeviceError;
@@ -105,6 +123,17 @@ pub struct V4l2Config {
     pub fourcc: Option<String>,
     /// Number of buffers.
     pub buffer_count: u32,
+    /// Export buffers as DMA-BUF file descriptors.
+    ///
+    /// When enabled:
+    /// - Buffers are exported via VIDIOC_EXPBUF
+    /// - Zero-copy path to GPU or other processes
+    /// - `output_media_caps()` declares DmaBuf as preferred memory type
+    ///
+    /// When disabled (default):
+    /// - Standard mmap capture with copy to arena
+    /// - Compatible with any downstream element
+    pub dmabuf_export: bool,
 }
 
 impl Default for V4l2Config {
@@ -114,6 +143,7 @@ impl Default for V4l2Config {
             height: 480,
             fourcc: None,
             buffer_count: 4,
+            dmabuf_export: false,
         }
     }
 }
@@ -127,6 +157,33 @@ pub struct V4l2SupportedFormat {
     pub resolutions: Vec<(u32, u32)>,
 }
 
+// VIDIOC_EXPBUF ioctl for exporting V4L2 buffers as DMA-BUF fds.
+// The v4l crate doesn't expose this directly, so we use raw ioctls.
+// See: https://www.kernel.org/doc/html/latest/userspace-api/media/v4l/vidioc-expbuf.html
+
+/// VIDIOC_EXPBUF ioctl number: _IOWR('V', 16, struct v4l2_exportbuffer)
+const VIDIOC_EXPBUF: libc::c_ulong = 0xc040_5610;
+
+/// V4L2 buffer type for video capture.
+const V4L2_BUF_TYPE_VIDEO_CAPTURE: u32 = 1;
+
+/// v4l2_exportbuffer structure for VIDIOC_EXPBUF ioctl.
+#[repr(C)]
+struct V4l2ExportBuffer {
+    /// Buffer type (V4L2_BUF_TYPE_VIDEO_CAPTURE).
+    type_: u32,
+    /// Buffer index to export.
+    index: u32,
+    /// Plane index (0 for single-planar formats).
+    plane: u32,
+    /// Flags (O_CLOEXEC, O_RDONLY, etc.).
+    flags: u32,
+    /// OUTPUT: Exported DMA-BUF file descriptor.
+    fd: i32,
+    /// Reserved for future use.
+    reserved: [u32; 11],
+}
+
 /// V4L2 video capture source.
 ///
 /// This source captures video frames from a V4L2 device using memory-mapped
@@ -136,6 +193,12 @@ pub struct V4l2SupportedFormat {
 ///
 /// The device is properly released when V4l2Src is dropped. The stream
 /// buffers are unmapped and streaming is stopped before the device is closed.
+///
+/// # DMA-BUF Export Mode
+///
+/// When `dmabuf_export` is enabled in the config, buffers are exported as
+/// DMA-BUF file descriptors using VIDIOC_EXPBUF. This enables zero-copy
+/// sharing with GPU pipelines or other processes.
 pub struct V4l2Src {
     /// The V4L2 device - must be kept alive for the stream to work.
     /// Option allows us to control drop order (stream first, then device).
@@ -152,6 +215,12 @@ pub struct V4l2Src {
     supported_formats: Vec<V4l2SupportedFormat>,
     /// Arena for buffer allocation (per-source to avoid contention).
     arena: Option<SharedArena>,
+    /// Whether to export buffers as DMA-BUF file descriptors.
+    dmabuf_export: bool,
+    /// Exported DMA-BUF file descriptors (one per buffer, when dmabuf_export is true).
+    exported_fds: Vec<OwnedFd>,
+    /// Frame sizes for each exported buffer (needed to create DmaBufSegment).
+    exported_sizes: Vec<usize>,
 }
 
 impl V4l2Src {
@@ -208,6 +277,13 @@ impl V4l2Src {
         // Drop implementation, then the device.
         let stream: MmapStream<'static> = unsafe { std::mem::transmute(stream) };
 
+        // Export buffers as DMA-BUF fds if requested
+        let (exported_fds, exported_sizes) = if config.dmabuf_export {
+            Self::export_buffers(&dev, config.buffer_count, width, height, &actual_fourcc)?
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
         Ok(Self {
             device: Some(dev),
             stream: Some(stream),
@@ -217,7 +293,65 @@ impl V4l2Src {
             fourcc: actual_fourcc,
             supported_formats,
             arena: None,
+            dmabuf_export: config.dmabuf_export,
+            exported_fds,
+            exported_sizes,
         })
+    }
+
+    /// Export V4L2 buffers as DMA-BUF file descriptors using VIDIOC_EXPBUF.
+    fn export_buffers(
+        dev: &Device,
+        buffer_count: u32,
+        width: u32,
+        height: u32,
+        fourcc: &[u8; 4],
+    ) -> Result<(Vec<OwnedFd>, Vec<usize>)> {
+        let device_fd = dev.handle().fd();
+
+        // Calculate frame size for this format
+        let fourcc_str = std::str::from_utf8(fourcc).unwrap_or("????");
+        let frame_size = match fourcc_str {
+            "MJPG" | "JPEG" => (width * height) as usize, // Estimate for compressed
+            "YUYV" | "UYVY" => (width * height * 2) as usize,
+            "NV12" | "NV21" => (width * height * 3 / 2) as usize,
+            "I420" | "YU12" => (width * height * 3 / 2) as usize,
+            "RGB3" | "BGR3" => (width * height * 3) as usize,
+            "RGBP" | "RGB4" | "BA24" => (width * height * 4) as usize,
+            "GREY" | "Y800" => (width * height) as usize,
+            _ => (width * height * 4) as usize, // Worst case
+        };
+
+        let mut fds = Vec::with_capacity(buffer_count as usize);
+        let mut sizes = Vec::with_capacity(buffer_count as usize);
+
+        for i in 0..buffer_count {
+            let mut expbuf = V4l2ExportBuffer {
+                type_: V4L2_BUF_TYPE_VIDEO_CAPTURE,
+                index: i,
+                plane: 0,
+                flags: libc::O_CLOEXEC as u32 | libc::O_RDWR as u32,
+                fd: 0,
+                reserved: [0; 11],
+            };
+
+            // SAFETY: VIDIOC_EXPBUF is a standard V4L2 ioctl that exports a buffer
+            // as a DMA-BUF fd. The device fd is valid and the struct is properly
+            // initialized.
+            let ret = unsafe { libc::ioctl(device_fd, VIDIOC_EXPBUF, &mut expbuf) };
+
+            if ret < 0 {
+                let err = std::io::Error::last_os_error();
+                return Err(DeviceError::V4l2(err).into());
+            }
+
+            // SAFETY: On success, VIDIOC_EXPBUF returns a valid DMA-BUF fd in expbuf.fd
+            let owned_fd = unsafe { OwnedFd::from_raw_fd(expbuf.fd) };
+            fds.push(owned_fd);
+            sizes.push(frame_size);
+        }
+
+        Ok((fds, sizes))
     }
 
     /// Query supported formats from the device.
@@ -325,9 +459,32 @@ impl Drop for V4l2Src {
 
 impl Source for V4l2Src {
     fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
-        // Lazily initialize per-source arena before borrowing stream
+        // DMA-BUF export path: capture frame and return DmaBufBuffer
+        if self.dmabuf_export && !self.exported_fds.is_empty() {
+            let stream = self
+                .stream
+                .as_mut()
+                .ok_or_else(|| DeviceError::NotFound("device closed".to_string()))?;
+
+            let (_buffer, meta) = stream.next().map_err(DeviceError::V4l2)?;
+            let buffer_index = (meta.sequence as usize) % self.exported_fds.len();
+
+            // Clone the fd so the segment owns it (we keep the original for reuse)
+            let fd = self.exported_fds[buffer_index]
+                .try_clone()
+                .map_err(DeviceError::V4l2)?;
+
+            let size = self.exported_sizes[buffer_index];
+            let segment = DmaBufSegment::from_fd(fd, size)?;
+
+            return Ok(ProduceResult::OwnDmaBuf(DmaBufBuffer::new(
+                segment,
+                Metadata::new(),
+            )));
+        }
+
+        // Standard mmap path: lazily initialize per-source arena if needed
         if self.arena.is_none() {
-            // Use preferred_buffer_size or estimated max frame size
             let slot_size = self
                 .preferred_buffer_size()
                 .unwrap_or(self.width as usize * self.height as usize * 4);
@@ -341,8 +498,8 @@ impl Source for V4l2Src {
 
         // Capture a frame
         let (buffer, _meta) = stream.next().map_err(DeviceError::V4l2)?;
-
         let len = buffer.len();
+
         if !ctx.has_buffer() || len > ctx.capacity() {
             // No buffer provided or buffer too small, return our own buffer from arena
             let arena = self.arena.as_mut().unwrap();
@@ -483,7 +640,15 @@ impl Source for V4l2Src {
                     framerate: CapsValue::Any,
                 };
 
-                // V4L2 produces CPU memory (mmap'd but accessible as CPU)
+                if self.dmabuf_export {
+                    // DMA-BUF preferred when export is enabled
+                    caps.push(FormatMemoryCap::new(
+                        format_caps.clone().into(),
+                        MemoryCaps::dmabuf_only(),
+                    ));
+                }
+
+                // CPU memory always available (fallback or primary)
                 caps.push(FormatMemoryCap::new(
                     format_caps.into(),
                     MemoryCaps::cpu_only(),
@@ -514,6 +679,14 @@ impl Source for V4l2Src {
                     pixel_format: CapsValue::Fixed(pixel_format),
                     framerate: CapsValue::Any,
                 };
+
+                if self.dmabuf_export {
+                    caps.push(FormatMemoryCap::new(
+                        format_caps.clone().into(),
+                        MemoryCaps::dmabuf_only(),
+                    ));
+                }
+
                 caps.push(FormatMemoryCap::new(
                     format_caps.into(),
                     MemoryCaps::cpu_only(),
@@ -527,6 +700,13 @@ impl Source for V4l2Src {
         } else {
             ElementMediaCaps::new(caps)
         }
+    }
+}
+
+impl V4l2Src {
+    /// Whether DMA-BUF export is enabled.
+    pub fn is_dmabuf_export(&self) -> bool {
+        self.dmabuf_export
     }
 }
 

@@ -16,6 +16,7 @@
 //! | [`SharedArena`] | **Primary**: Cross-process zero-copy buffers |
 //! | [`HugePageSegment`] | Large allocations, reduced TLB misses |
 //! | [`MappedFileSegment`] | Persistent storage, file I/O |
+//! | [`DmaBufSegment`] | GPU-importable buffers, zero-copy capture |
 //!
 //! # Design Rationale
 //!
@@ -48,6 +49,7 @@
 
 mod bitmap;
 mod buffer_pool;
+mod dmabuf;
 mod huge_pages;
 pub mod ipc;
 mod mapped_file;
@@ -56,6 +58,7 @@ mod shared_refcount;
 
 pub use bitmap::AtomicBitmap;
 pub use buffer_pool::{BufferPool, FixedBufferPool, PoolStats, PooledBuffer};
+pub use dmabuf::DmaBufSegment;
 pub use huge_pages::{HugePageSegment, HugePageSize};
 pub use mapped_file::MappedFileSegment;
 pub use segment::{IpcHandle, MemorySegment, MemoryType};

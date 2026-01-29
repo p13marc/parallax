@@ -303,11 +303,17 @@ fn create_v4l2src(props: &HashMap<String, PropertyValue>) -> Result<Box<DynAsync
         .and_then(|v| v.as_u64())
         .unwrap_or(4) as u32;
 
+    let dmabuf_export = props
+        .get("dmabuf_export")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     let config = V4l2Config {
         width,
         height,
         fourcc,
         buffer_count,
+        dmabuf_export,
     };
 
     let src = V4l2Src::with_config(&device, config)?;

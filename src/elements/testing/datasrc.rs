@@ -193,12 +193,14 @@ mod tests {
     }
 
     fn produce_with_arena(src: &mut DataSrc) -> Result<Option<crate::buffer::Buffer>> {
-        let slot = test_arena().acquire().expect("arena slot available");
+        let arena = test_arena();
+        let slot = arena.acquire().expect("arena slot available");
         let mut ctx = ProduceContext::new(slot);
         match src.produce(&mut ctx)? {
             ProduceResult::Produced(n) => Ok(Some(ctx.finalize(n))),
             ProduceResult::Eos => Ok(None),
             ProduceResult::OwnBuffer(buf) => Ok(Some(buf)),
+            ProduceResult::OwnDmaBuf(dmabuf) => Ok(Some(dmabuf.to_buffer(arena)?)),
             ProduceResult::WouldBlock => Ok(None),
         }
     }

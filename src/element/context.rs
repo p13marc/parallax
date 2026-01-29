@@ -37,7 +37,7 @@
 //! }
 //! ```
 
-use crate::buffer::{Buffer, MemoryHandle};
+use crate::buffer::{Buffer, DmaBufBuffer, MemoryHandle};
 use crate::error::{Error, Result};
 use crate::memory::{BufferPool, PooledBuffer, SharedSlotRef};
 use crate::metadata::Metadata;
@@ -72,6 +72,16 @@ pub enum ProduceResult {
     /// - Integration with legacy APIs that provide their own buffers
     OwnBuffer(Buffer),
 
+    /// Source provides a DMA-BUF buffer.
+    ///
+    /// Use this when the source exports buffers as DMA-BUF file descriptors:
+    /// - V4L2 camera capture with `VIDIOC_EXPBUF`
+    /// - libcamera DMA-BUF frame buffers
+    /// - GPU-produced frames
+    ///
+    /// DMA-BUF buffers enable zero-copy paths to GPU encoders/decoders.
+    OwnDmaBuf(DmaBufBuffer),
+
     /// No data available yet (for non-blocking sources).
     ///
     /// The framework should retry later.
@@ -88,7 +98,10 @@ impl ProduceResult {
     /// Check if data was produced.
     #[inline]
     pub fn is_produced(&self) -> bool {
-        matches!(self, Self::Produced(_) | Self::OwnBuffer(_))
+        matches!(
+            self,
+            Self::Produced(_) | Self::OwnBuffer(_) | Self::OwnDmaBuf(_)
+        )
     }
 
     /// Check if the source would block.

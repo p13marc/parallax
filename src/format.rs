@@ -1207,6 +1207,36 @@ impl MemoryCaps {
         }
     }
 
+    /// Accept only DMA-BUF memory.
+    ///
+    /// DMA-BUF is the Linux kernel's buffer sharing mechanism, enabling:
+    /// - Zero-copy sharing between processes (via SCM_RIGHTS fd passing)
+    /// - Direct GPU import (Vulkan, VA-API, etc.)
+    /// - Efficient camera/video capture pipelines
+    ///
+    /// Use this when the element requires DMA-BUF buffers (e.g., GPU encoder).
+    pub fn dmabuf_only() -> Self {
+        Self {
+            types: CapsValue::Fixed(MemoryType::DmaBuf),
+            can_import: vec![MemoryType::DmaBuf],
+            can_export: vec![MemoryType::DmaBuf],
+        }
+    }
+
+    /// Prefer DMA-BUF but fall back to CPU.
+    ///
+    /// Use this for elements that work best with DMA-BUF (for GPU integration
+    /// or zero-copy device capture) but can also handle CPU memory.
+    ///
+    /// The preference order is: DMA-BUF first, CPU second.
+    pub fn dmabuf_preferred() -> Self {
+        Self {
+            types: CapsValue::List(vec![MemoryType::DmaBuf, MemoryType::Cpu]),
+            can_import: vec![MemoryType::DmaBuf, MemoryType::Cpu],
+            can_export: vec![MemoryType::DmaBuf, MemoryType::Cpu],
+        }
+    }
+
     /// Intersect with another memory caps.
     pub fn intersect(&self, other: &Self) -> Option<Self> {
         Some(Self {
@@ -2562,5 +2592,98 @@ mod tests {
         // First match should be RGBA (source's first preference matched against sink)
         let first = source.intersect(&sink).unwrap();
         assert!(matches!(first.format, FormatCaps::VideoRaw(_)));
+    }
+
+    // ========================================================================
+    // DMA-BUF negotiation tests
+    // ========================================================================
+
+    #[test]
+    fn test_dmabuf_negotiation_prefers_dmabuf() {
+        // Source offers [DmaBuf, Cpu] (DmaBuf preferred)
+        let source = ElementMediaCaps::new(vec![
+            FormatMemoryCap::new(VideoFormatCaps::yuv420().into(), MemoryCaps::dmabuf_only()),
+            FormatMemoryCap::new(VideoFormatCaps::yuv420().into(), MemoryCaps::cpu_only()),
+        ]);
+
+        // Sink accepts [DmaBuf, Cpu] (DmaBuf preferred)
+        let sink = ElementMediaCaps::new(vec![
+            FormatMemoryCap::new(VideoFormatCaps::any().into(), MemoryCaps::dmabuf_only()),
+            FormatMemoryCap::new(VideoFormatCaps::any().into(), MemoryCaps::cpu_only()),
+        ]);
+
+        // Negotiation should select DmaBuf (first common match)
+        let negotiated = source.intersect(&sink).unwrap();
+        assert_eq!(negotiated.memory.types.fixate(), Some(MemoryType::DmaBuf));
+    }
+
+    #[test]
+    fn test_dmabuf_negotiation_falls_back_to_cpu() {
+        // Source offers [DmaBuf, Cpu] (DmaBuf preferred)
+        let source = ElementMediaCaps::new(vec![
+            FormatMemoryCap::new(VideoFormatCaps::yuv420().into(), MemoryCaps::dmabuf_only()),
+            FormatMemoryCap::new(VideoFormatCaps::yuv420().into(), MemoryCaps::cpu_only()),
+        ]);
+
+        // Sink only accepts Cpu
+        let sink = ElementMediaCaps::new(vec![FormatMemoryCap::new(
+            VideoFormatCaps::any().into(),
+            MemoryCaps::cpu_only(),
+        )]);
+
+        // Negotiation should fall back to CPU (only common option)
+        let negotiated = source.intersect(&sink).unwrap();
+        assert_eq!(negotiated.memory.types.fixate(), Some(MemoryType::Cpu));
+    }
+
+    #[test]
+    fn test_dmabuf_negotiation_no_common_memory() {
+        // Source only offers DmaBuf
+        let source = ElementMediaCaps::new(vec![FormatMemoryCap::new(
+            VideoFormatCaps::yuv420().into(),
+            MemoryCaps::dmabuf_only(),
+        )]);
+
+        // Sink only accepts GpuDevice (not DmaBuf)
+        let sink = ElementMediaCaps::new(vec![FormatMemoryCap::new(
+            VideoFormatCaps::any().into(),
+            MemoryCaps {
+                types: CapsValue::Fixed(MemoryType::GpuDevice),
+                can_import: vec![MemoryType::GpuDevice],
+                can_export: vec![MemoryType::GpuDevice],
+            },
+        )]);
+
+        // Negotiation should fail (no common memory type)
+        let negotiated = source.intersect(&sink);
+        assert!(negotiated.is_none());
+    }
+
+    #[test]
+    fn test_dmabuf_preferred_caps() {
+        let caps = MemoryCaps::dmabuf_preferred();
+
+        // Should list DmaBuf first, then Cpu
+        assert!(matches!(
+            &caps.types,
+            CapsValue::List(list) if list.len() == 2
+                && list[0] == MemoryType::DmaBuf
+                && list[1] == MemoryType::Cpu
+        ));
+
+        // Should be able to import/export both
+        assert!(caps.can_import.contains(&MemoryType::DmaBuf));
+        assert!(caps.can_import.contains(&MemoryType::Cpu));
+        assert!(caps.can_export.contains(&MemoryType::DmaBuf));
+        assert!(caps.can_export.contains(&MemoryType::Cpu));
+    }
+
+    #[test]
+    fn test_dmabuf_only_caps() {
+        let caps = MemoryCaps::dmabuf_only();
+
+        assert_eq!(caps.types, CapsValue::Fixed(MemoryType::DmaBuf));
+        assert_eq!(caps.can_import, vec![MemoryType::DmaBuf]);
+        assert_eq!(caps.can_export, vec![MemoryType::DmaBuf]);
     }
 }

@@ -325,6 +325,7 @@ mod tests {
         let mut ctx = ProduceContext::without_buffer();
         match src.produce(&mut ctx)? {
             ProduceResult::OwnBuffer(buf) => Ok(Some(buf)),
+            ProduceResult::OwnDmaBuf(_) => panic!("MemorySrc should not return OwnDmaBuf"),
             ProduceResult::Eos => Ok(None),
             ProduceResult::Produced(_) => panic!("MemorySrc should return OwnBuffer"),
             ProduceResult::WouldBlock => Ok(None),

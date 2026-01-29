@@ -57,7 +57,7 @@ pub use self::pipewire::{PipeWireSink, PipeWireSrc, PipeWireTarget};
 pub use self::libcamera::{LibCameraConfig, LibCameraInfo, LibCameraSrc};
 
 #[cfg(feature = "v4l2")]
-pub use self::v4l2::{V4l2DeviceInfo, V4l2Src};
+pub use self::v4l2::{V4l2Config, V4l2DeviceInfo, V4l2Src};
 
 #[cfg(feature = "alsa")]
 pub use self::alsa::{AlsaDeviceInfo, AlsaFormat, AlsaSampleFormat, AlsaSink, AlsaSrc};
