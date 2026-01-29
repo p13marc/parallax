@@ -15,11 +15,12 @@
 //!
 //! | Codec | Feature | Decoder | Encoder | Pure Rust |
 //! |-------|---------|---------|---------|-----------|
+//! | Opus | `opus` | [`OpusDecoder`] | [`OpusEncoder`] | No (libopus) |
+//! | AAC | `aac-encode` | - | [`AacEncoder`] | No (FDK-AAC) |
 //! | FLAC | `audio-flac` | [`SymphoniaDecoder`] | - | Yes |
 //! | MP3 | `audio-mp3` | [`SymphoniaDecoder`] | - | Yes |
 //! | AAC | `audio-aac` | [`SymphoniaDecoder`] | - | Yes |
 //! | Vorbis | `audio-vorbis` | [`SymphoniaDecoder`] | - | Yes |
-
 //!
 //! # Image Codecs
 //!
@@ -36,11 +37,12 @@
 //! parallax = { version = "0.1", features = ["av1-encode"] }  # AV1 encoder
 //! parallax = { version = "0.1", features = ["av1-decode"] }  # AV1 decoder (needs libdav1d)
 //!
-//! # Audio codecs (all pure Rust)
-//! parallax = { version = "0.1", features = ["audio-codecs"] }  # All audio codecs
-//! parallax = { version = "0.1", features = ["audio-flac"] }    # FLAC only
-//! parallax = { version = "0.1", features = ["audio-mp3"] }     # MP3 only
-
+//! # Audio codecs
+//! parallax = { version = "0.1", features = ["opus"] }          # Opus encoder/decoder (needs libopus)
+//! parallax = { version = "0.1", features = ["aac-encode"] }    # AAC encoder (FDK-AAC, license restrictions)
+//! parallax = { version = "0.1", features = ["audio-codecs"] }  # All Symphonia decoders
+//! parallax = { version = "0.1", features = ["audio-flac"] }    # FLAC decoder only
+//! parallax = { version = "0.1", features = ["audio-mp3"] }     # MP3 decoder only
 //!
 //! # Image codecs (all pure Rust)
 //! parallax = { version = "0.1", features = ["image-codecs"] }  # All image codecs
@@ -51,6 +53,24 @@
 //! # Build Dependencies
 //!
 //! Most codecs are pure Rust and require no external dependencies.
+//!
+//! ## opus
+//!
+//! Requires the **libopus** system library:
+//!
+//! - **Fedora/RHEL**: `sudo dnf install opus-devel`
+//! - **Debian/Ubuntu**: `sudo apt install libopus-dev`
+//! - **Arch**: `sudo pacman -S opus`
+//! - **macOS**: `brew install opus`
+//!
+//! ## aac-encode (FDK-AAC)
+//!
+//! Requires **FDK-AAC** library. **Note: License restrictions for commercial use.**
+//!
+//! - **Fedora/RHEL**: `sudo dnf install fdk-aac-devel` (from RPM Fusion)
+//! - **Debian/Ubuntu**: `sudo apt install libfdk-aac-dev`
+//! - **Arch**: `sudo pacman -S libfdk-aac`
+//! - **macOS**: `brew install fdk-aac`
 //!
 //! ## av1-encode (rav1e)
 //!
@@ -83,15 +103,25 @@
 mod common;
 pub use common::{PixelFormat, VideoFrame};
 
-// Codec traits
+// Video codec traits
 mod traits;
 pub use traits::{FrameType, VideoDecoder, VideoEncoder};
 
-// Element wrappers
+// Audio codec traits
+mod audio_traits;
+pub use audio_traits::{AudioDecoder, AudioEncoder, AudioSampleFormat, AudioSamples};
+
+// Video element wrappers
 mod decoder_element;
 mod encoder_element;
 pub use decoder_element::DecoderElement;
 pub use encoder_element::EncoderElement;
+
+// Audio element wrappers
+mod audio_decoder_element;
+mod audio_encoder_element;
+pub use audio_decoder_element::AudioDecoderElement;
+pub use audio_encoder_element::AudioEncoderElement;
 
 // H.264 video codec
 #[cfg(feature = "h264")]
@@ -110,7 +140,7 @@ mod encoder;
 #[cfg(feature = "av1-encode")]
 pub use encoder::{Rav1eConfig, Rav1eEncoder};
 
-// Audio codecs
+// Audio codecs - Symphonia (decode only)
 #[cfg(any(
     feature = "audio-flac",
     feature = "audio-mp3",
@@ -126,6 +156,18 @@ mod audio;
     feature = "audio-vorbis"
 ))]
 pub use audio::{AudioFormat, AudioFrameInfo, SampleFormat, SymphoniaDecoder};
+
+// Opus audio codec (encode + decode)
+#[cfg(feature = "opus")]
+mod opus;
+#[cfg(feature = "opus")]
+pub use opus::{OpusApplication, OpusDecoder, OpusEncoder};
+
+// AAC audio encoder (FDK-AAC)
+#[cfg(feature = "aac-encode")]
+mod aac;
+#[cfg(feature = "aac-encode")]
+pub use aac::AacEncoder;
 
 // Image codecs
 #[cfg(any(feature = "image-jpeg", feature = "image-png"))]

@@ -110,6 +110,12 @@ yuv = { version = "0.8", optional = true }
 # Container formats (pure Rust)
 mp4 = { version = "0.14", optional = true }
 
+# Opus audio codec (bindings to libopus)
+opus = { version = "0.3", optional = true }
+
+# AAC audio encoder (bindings to FDK-AAC - note license restrictions)
+fdk-aac = { version = "0.6", optional = true }
+
 # PipeWire (audio/video capture and playback)
 pipewire = { version = "0.8", optional = true }
 
@@ -155,6 +161,8 @@ audio-flac = ["dep:symphonia", "symphonia/flac"]
 audio-mp3 = ["dep:symphonia", "symphonia/mp3"]
 audio-aac = ["dep:symphonia", "symphonia/aac"]
 audio-vorbis = ["dep:symphonia", "symphonia/vorbis"]
+opus = ["dep:opus"]  # Opus audio encoder/decoder (requires libopus)
+aac-encode = ["dep:fdk-aac"]  # AAC audio encoder (note: FDK-AAC license restrictions)
 # Image codecs (all pure Rust)
 image-codecs = ["image-jpeg", "image-png"]
 image-jpeg = ["dep:zune-jpeg"]
@@ -252,6 +260,10 @@ required-features = ["av1-encode"]
 [[example]]
 name = "16_mpegts"
 required-features = ["mpeg-ts"]
+
+[[example]]
+name = "20_opus_audio"
+required-features = ["opus"]
 
 # Device capture examples (22-26): require device feature flags
 [[example]]

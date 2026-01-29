@@ -54,6 +54,8 @@ pub mod app;
     feature = "audio-mp3",
     feature = "audio-aac",
     feature = "audio-vorbis",
+    feature = "opus",
+    feature = "aac-encode",
     feature = "image-jpeg",
     feature = "image-png"
 ))]
@@ -219,6 +221,28 @@ pub use codec::{Rav1eConfig, Rav1eEncoder};
     feature = "audio-vorbis"
 ))]
 pub use codec::{AudioFormat, AudioFrameInfo, SampleFormat, SymphoniaDecoder};
+
+// Audio codecs - Opus
+#[cfg(feature = "opus")]
+pub use codec::{OpusApplication, OpusDecoder, OpusEncoder};
+
+// Audio codecs - AAC encoder
+#[cfg(feature = "aac-encode")]
+pub use codec::AacEncoder;
+
+// Audio codec traits and wrappers (always available when any audio codec is enabled)
+#[cfg(any(
+    feature = "audio-flac",
+    feature = "audio-mp3",
+    feature = "audio-aac",
+    feature = "audio-vorbis",
+    feature = "opus",
+    feature = "aac-encode"
+))]
+pub use codec::{
+    AudioDecoder, AudioDecoderElement, AudioEncoder, AudioEncoderElement, AudioSampleFormat,
+    AudioSamples,
+};
 
 // Image codecs - common types
 #[cfg(any(feature = "image-jpeg", feature = "image-png"))]

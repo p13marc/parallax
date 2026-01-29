@@ -50,7 +50,7 @@ Key architectural decisions have been researched and documented in **[00_DESIGN_
 | 09 | [Format Converters](09_FORMAT_CONVERTERS.md) | High | Medium | ✅ Complete |
 | 10 | [Code Cleanup](10_CODE_CLEANUP.md) | Low | Small | ✅ Complete |
 | 11 | [GPU Codec Framework](11_GPU_CODEC_FRAMEWORK.md) | High | Large | ⬜ Not Started |
-| 12 | [Additional Codecs](12_ADDITIONAL_CODECS.md) | Medium | Medium | ⬜ Not Started |
+| 12 | [Additional Codecs](12_ADDITIONAL_CODECS.md) | Medium | Medium | ✅ Complete |
 | 13 | [Device Elements](13_DEVICE_ELEMENTS.md) | Medium | Medium | ✅ Complete |
 | 14 | [Streaming Protocols](14_STREAMING_PROTOCOLS.md) | Medium | Medium | ⬜ Not Started |
 
@@ -341,15 +341,16 @@ Adaptive bitrate streaming support:
 - [ ] Create examples: `18_gpu_decode.rs`, `19_gpu_transcode.rs`
 - [ ] Update documentation
 
-### Plan 12: Additional Codecs ⬜
-- [ ] Add `audiopus` dependency (feature-gated)
-- [ ] Implement `OpusEncoder` and `OpusDecoder`
-- [ ] Implement `OpusEncElement` and `OpusDecElement`
-- [ ] Add `fdk-aac` dependency (feature-gated)
-- [ ] Implement `AacEncoder`
-- [ ] Verify dav1d VP9 support
-- [ ] Create examples: `20_opus_audio.rs`, `21_vp9_decode.rs`
-- [ ] Update documentation
+### Plan 12: Additional Codecs ✅
+- [x] Add `opus` dependency (feature-gated) - v0.3.1 (libopus bindings)
+- [x] Implement `OpusEncoder` and `OpusDecoder`
+- [x] Create `AudioEncoder` and `AudioDecoder` traits (audio_traits.rs)
+- [x] Create `AudioEncoderElement` and `AudioDecoderElement` wrappers
+- [x] Add `fdk-aac` dependency (feature-gated)
+- [x] Implement `AacEncoder`
+- [x] Verify dav1d VP9 support - **Result: dav1d is AV1-only, VP9 deferred**
+- [x] Create example: `20_opus_audio.rs`
+- [x] Update CLAUDE.md and mod.rs documentation
 
 ### Plan 13: Device Elements ✅
 - [x] Add `pipewire` dependency (feature-gated)

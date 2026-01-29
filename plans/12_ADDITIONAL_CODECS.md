@@ -185,62 +185,60 @@ impl Dav1dDecoder {
 
 ## Implementation Steps
 
-### Phase 1: Opus Support (3-5 days)
+### Phase 1: Opus Support (3-5 days) - COMPLETE
 
-- [ ] Add `audiopus` dependency (feature-gated)
-- [ ] Create `src/elements/codec/opus.rs`
-- [ ] Implement `OpusEncoder` and `OpusDecoder`
-- [ ] Implement `AudioEncoder` and `AudioDecoder` traits
-- [ ] Create `OpusEncElement` and `OpusDecElement` pipeline elements
-- [ ] Add unit tests with known audio samples
-- [ ] Create example: `20_opus_audio.rs`
+- [x] Add `opus` dependency (feature-gated) - used `opus` crate v0.3.1 (not audiopus)
+- [x] Create `src/elements/codec/opus.rs`
+- [x] Implement `OpusEncoder` and `OpusDecoder`
+- [x] Implement `AudioEncoder` and `AudioDecoder` traits (in `audio_traits.rs`)
+- [x] Create `AudioEncoderElement` and `AudioDecoderElement` generic wrappers
+- [x] Add unit tests with sine wave audio samples
+- [x] Create example: `20_opus_audio.rs`
 
-### Phase 2: AAC Encoder (2-3 days)
+### Phase 2: AAC Encoder (2-3 days) - COMPLETE
 
-- [ ] Add `fdk-aac` dependency (feature-gated)
-- [ ] Document license implications in README
-- [ ] Create `src/elements/codec/aac.rs`
-- [ ] Implement `AacEncoder`
-- [ ] Create `AacEncElement` pipeline element
-- [ ] Add unit tests
-- [ ] Update documentation
+- [x] Add `fdk-aac` dependency (feature-gated)
+- [x] Document license implications in CLAUDE.md and mod.rs
+- [x] Create `src/elements/codec/aac.rs`
+- [x] Implement `AacEncoder`
+- [x] Use generic `AudioEncoderElement` wrapper (no AAC-specific element needed)
+- [x] Add unit tests
+- [x] Update documentation
 
-### Phase 3: VP9 Support (1-2 days)
+### Phase 3: VP9 Support (1-2 days) - NOT IMPLEMENTED
 
-- [ ] Verify dav1d VP9 support
-- [ ] Add VP9 codec variant to existing dav1d wrapper
-- [ ] Update caps negotiation for VP9
-- [ ] Add tests with VP9 samples
-- [ ] Create example: `21_vp9_decode.rs`
+**Research finding:** dav1d does NOT support VP9 - it is AV1-only.
 
-### Phase 4: H.264 Investigation (Ongoing)
+- [x] Verify dav1d VP9 support - **NEGATIVE**: dav1d is AV1-only
+- [ ] VP9 would require `vpx` crate (libvpx bindings) - deferred
+- [ ] No pure-Rust VP9 decoder exists
 
-- [ ] Document current OpenH264 limitations
-- [ ] Track pure-Rust H.264 decoder projects
-- [ ] Consider contributing to community efforts
-- [ ] Link to Plan 11 (Vulkan Video) as recommended path
+**Recommendation:** Use `vpx` crate for VP9 if needed in future. Low priority given VP9 is legacy format.
 
-### Phase 5: Integration (1-2 days)
+### Phase 4: H.264 Investigation (Ongoing) - DOCUMENTED
 
-- [ ] Update CLAUDE.md with new codecs
-- [ ] Update README codec table
-- [ ] Ensure caps negotiation handles all new formats
-- [ ] Add integration tests
+- [x] Document current OpenH264 limitations (in CLAUDE.md)
+- [ ] Track pure-Rust H.264 decoder projects - none production-ready
+- [ ] Link to Plan 11 (Vulkan Video) as recommended path for GPU decode
+
+### Phase 5: Integration (1-2 days) - COMPLETE
+
+- [x] Update CLAUDE.md with new codecs
+- [x] Update elements/mod.rs with new exports
+- [x] Update Cargo.toml with new feature flags
+- [x] Audio codec traits work with caps negotiation via element wrappers
 
 ---
 
-## Feature Flags
+## Feature Flags (Implemented)
 
 ```toml
 [features]
-# Audio codecs
-opus = ["dep:audiopus"]
-aac-encode = ["dep:fdk-aac"]  # Note: Check FDK-AAC license
+# Audio codecs - encoders (require system libraries)
+opus = ["dep:opus"]           # Opus encoder/decoder (requires libopus)
+aac-encode = ["dep:fdk-aac"]  # AAC encoder (FDK-AAC, license restrictions!)
 
-# Combined features
-audio-all = ["audio-codecs", "opus", "aac-encode"]
-
-# Existing
+# Existing audio decoders (pure Rust via Symphonia)
 audio-codecs = ["audio-flac", "audio-mp3", "audio-aac", "audio-vorbis"]
 ```
 

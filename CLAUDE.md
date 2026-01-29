@@ -30,7 +30,7 @@ This file provides guidance to Claude Code when working with code in this reposi
 | Plugin ABI | stabby (stable Rust ABI) |
 | GPU | Vulkan Video + rust-gpu (planned) |
 | Video Codecs | OpenH264 (H.264), rav1e (AV1 encode), dav1d (AV1 decode) |
-| Audio Codecs | Symphonia (pure Rust: FLAC, MP3, AAC, Vorbis) |
+| Audio Codecs | Opus (libopus), AAC (FDK-AAC), Symphonia (FLAC, MP3, AAC, Vorbis decode) |
 | Image Codecs | zune-jpeg, png crate (pure Rust) |
 | Container Formats | mp4 crate (pure Rust: MP4 demux/mux) |
 
@@ -1003,12 +1003,16 @@ parallax = { version = "0.1", features = ["h264"] }        # H.264 encoder/decod
 parallax = { version = "0.1", features = ["av1-encode"] }  # AV1 encoder (rav1e, pure Rust)
 parallax = { version = "0.1", features = ["av1-decode"] }  # AV1 decoder (dav1d, C library)
 
-# Audio codecs (all pure Rust via Symphonia)
+# Audio codecs - Decoders (pure Rust via Symphonia)
 parallax = { version = "0.1", features = ["audio-codecs"] }  # All: FLAC, MP3, AAC, Vorbis
 parallax = { version = "0.1", features = ["audio-flac"] }    # FLAC only
 parallax = { version = "0.1", features = ["audio-mp3"] }     # MP3 only
-parallax = { version = "0.1", features = ["audio-aac"] }     # AAC only
+parallax = { version = "0.1", features = ["audio-aac"] }     # AAC decoder only
 parallax = { version = "0.1", features = ["audio-vorbis"] }  # Vorbis only
+
+# Audio codecs - Encoders (requires system libraries)
+parallax = { version = "0.1", features = ["opus"] }          # Opus encoder/decoder (needs libopus)
+parallax = { version = "0.1", features = ["aac-encode"] }    # AAC encoder (FDK-AAC, license restrictions)
 
 # Image codecs (all pure Rust)
 parallax = { version = "0.1", features = ["image-codecs"] }  # All: JPEG, PNG
@@ -1027,10 +1031,12 @@ parallax = { version = "0.1", features = ["mpeg-ts"] }       # MPEG-TS demuxer
 | Video | H.264 | `h264` | openh264 | No | Requires C++ compiler (g++) |
 | Video | AV1 encode | `av1-encode` | rav1e | Yes | Install nasm for SIMD optimizations |
 | Video | AV1 decode | `av1-decode` | dav1d | No | Requires libdav1d system library |
-| Audio | FLAC | `audio-flac` | symphonia | Yes | Lossless audio |
-| Audio | MP3 | `audio-mp3` | symphonia | Yes | Common lossy format |
-| Audio | AAC | `audio-aac` | symphonia | Yes | Common in video containers |
-| Audio | Vorbis | `audio-vorbis` | symphonia | Yes | Open source lossy format |
+| Audio | Opus | `opus` | opus | No | Enc/Dec, requires libopus |
+| Audio | AAC encode | `aac-encode` | fdk-aac | No | **License restrictions** |
+| Audio | FLAC | `audio-flac` | symphonia | Yes | Decoder, lossless audio |
+| Audio | MP3 | `audio-mp3` | symphonia | Yes | Decoder, common lossy format |
+| Audio | AAC decode | `audio-aac` | symphonia | Yes | Decoder, common in video containers |
+| Audio | Vorbis | `audio-vorbis` | symphonia | Yes | Decoder, open source lossy format |
 | Image | JPEG | `image-jpeg` | zune-jpeg | Yes | Decoder only |
 | Image | PNG | `image-png` | png | Yes | Encoder and decoder |
 | Container | MP4 | `mp4-demux` | mp4 | Yes | Demuxer and muxer |
@@ -1040,8 +1046,62 @@ parallax = { version = "0.1", features = ["mpeg-ts"] }       # MPEG-TS demuxer
 
 Most codecs are pure Rust with no external dependencies. Exceptions:
 
+- **opus**: Requires `opus-devel` (Fedora) / `libopus-dev` (Debian)
+- **aac-encode**: Requires `fdk-aac-devel` (Fedora, from RPM Fusion) / `libfdk-aac-dev` (Debian). **Note: FDK-AAC has license restrictions for commercial use.**
 - **av1-encode**: Optionally install `nasm` for x86_64 SIMD optimizations
 - **av1-decode**: Requires `libdav1d-devel` (Fedora) / `libdav1d-dev` (Debian)
+
+### Audio Codec Traits
+
+Parallax provides generic traits for audio encoding/decoding:
+
+```rust
+use parallax::elements::codec::{AudioEncoder, AudioDecoder, AudioSamples};
+
+// AudioEncoder trait
+pub trait AudioEncoder: Send {
+    type Packet: AsRef<[u8]> + Send;
+    fn encode(&mut self, samples: &AudioSamples) -> Result<Vec<Self::Packet>>;
+    fn flush(&mut self) -> Result<Vec<Self::Packet>>;
+    fn frame_size(&self) -> Option<usize>;
+    fn output_sample_rate(&self) -> u32;
+    fn output_channels(&self) -> u32;
+}
+
+// AudioDecoder trait
+pub trait AudioDecoder: Send {
+    fn decode(&mut self, packet: &[u8]) -> Result<AudioSamples>;
+    fn flush(&mut self) -> Result<Option<AudioSamples>>;
+    fn output_sample_rate(&self) -> u32;
+    fn output_channels(&self) -> u32;
+}
+```
+
+### Opus Codec Example
+
+```rust
+use parallax::elements::codec::{
+    AudioEncoder, AudioDecoder, AudioSamples, 
+    OpusEncoder, OpusDecoder, OpusApplication
+};
+
+// Create encoder for music at 128 kbps
+let mut encoder = OpusEncoder::new(48000, 2, 128000, OpusApplication::Audio)?;
+
+// Create decoder
+let mut decoder = OpusDecoder::new(48000, 2)?;
+
+// Encode samples (must be 960 samples per channel for 20ms frames at 48kHz)
+let samples = AudioSamples::from_s16(&pcm_data, 2, 48000);
+let packets = encoder.encode(&samples)?;
+
+// Decode packets
+for packet in packets {
+    let decoded = decoder.decode(packet.as_ref())?;
+}
+```
+
+**Opus frame sizes at 48kHz:** 120 (2.5ms), 240 (5ms), 480 (10ms), 960 (20ms), 1920 (40ms), 2880 (60ms)
 
 ## SIMD Color Conversion
 
