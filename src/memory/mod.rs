@@ -49,6 +49,7 @@
 
 mod bitmap;
 mod buffer_pool;
+pub mod defaults;
 mod dmabuf;
 mod huge_pages;
 pub mod ipc;
