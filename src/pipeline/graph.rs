@@ -2007,7 +2007,15 @@ impl Pipeline {
 
         for (i, elem) in parsed.elements.iter().enumerate() {
             let element = factory.create(elem)?;
-            let name = format!("{}_{}", elem.name, i);
+
+            // Use the "name" property if provided, otherwise generate a name
+            let name = elem
+                .properties
+                .iter()
+                .find(|(k, _)| k == "name")
+                .map(|(_, v)| v.as_string())
+                .unwrap_or_else(|| format!("{}_{}", elem.name, i));
+
             let node_id = pipeline.add_node(name, element);
 
             // Link to previous element
@@ -3299,6 +3307,68 @@ mod tests {
         assert!(
             wrong_type.is_none(),
             "Should fail to downcast to wrong type"
+        );
+    }
+
+    #[test]
+    fn test_get_element_from_parse() {
+        // Test that get_element works with pipelines created via parse()
+        use crate::elements::io::{FileSink, FileSrc};
+
+        let pipeline =
+            Pipeline::parse("filesrc location=test.bin ! passthrough ! filesink location=out.bin")
+                .unwrap();
+
+        // Element names are: filesrc_0, passthrough_1, filesink_2
+        // (type name + underscore + index)
+
+        // Should be able to get the filesrc element
+        let filesrc = pipeline.get_element::<FileSrc>("filesrc_0");
+        assert!(
+            filesrc.is_some(),
+            "Should be able to get FileSrc from parsed pipeline"
+        );
+
+        // Should be able to get the filesink element
+        let filesink = pipeline.get_element::<FileSink>("filesink_2");
+        assert!(
+            filesink.is_some(),
+            "Should be able to get FileSink from parsed pipeline"
+        );
+
+        // Wrong type should return None
+        let wrong = pipeline.get_element::<FileSrc>("filesink_2");
+        assert!(wrong.is_none(), "Wrong type should return None");
+    }
+
+    #[test]
+    fn test_get_element_with_custom_name() {
+        // Test that the "name" property can be used to give elements custom names
+        use crate::elements::io::{FileSink, FileSrc};
+
+        let pipeline = Pipeline::parse(
+            "filesrc name=mysource location=test.bin ! passthrough ! filesink name=mysink location=out.bin",
+        )
+        .unwrap();
+
+        // Should be able to get elements by their custom names
+        let filesrc = pipeline.get_element::<FileSrc>("mysource");
+        assert!(
+            filesrc.is_some(),
+            "Should be able to get FileSrc by custom name 'mysource'"
+        );
+
+        let filesink = pipeline.get_element::<FileSink>("mysink");
+        assert!(
+            filesink.is_some(),
+            "Should be able to get FileSink by custom name 'mysink'"
+        );
+
+        // Auto-generated names should not exist
+        let auto_name = pipeline.get_element::<FileSrc>("filesrc_0");
+        assert!(
+            auto_name.is_none(),
+            "Auto-generated name should not exist when custom name is provided"
         );
     }
 }

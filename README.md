@@ -33,12 +33,11 @@ use parallax::pipeline::Pipeline;
 
 #[tokio::main]
 async fn main() -> parallax::Result<()> {
-    let mut pipeline = Pipeline::new();
-    
     // Parse pipeline from string
-    pipeline.parse("filesrc location=input.bin ! passthrough ! nullsink")?;
+    let mut pipeline = Pipeline::parse("filesrc location=input.bin ! passthrough ! nullsink")?;
     
     // Or build programmatically
+    let mut pipeline = Pipeline::new();
     let src = pipeline.add_source("src", source);
     let sink = pipeline.add_sink("sink", sink);
     pipeline.link(src, sink)?;
@@ -48,6 +47,32 @@ async fn main() -> parallax::Result<()> {
     
     Ok(())
 }
+```
+
+### Element Retrieval (GStreamer-like)
+
+Retrieve and modify elements after pipeline creation:
+
+```rust
+use parallax::pipeline::Pipeline;
+use parallax::elements::io::FileSrc;
+
+// Use name= property to give elements predictable names
+let mut pipeline = Pipeline::parse(
+    "filesrc name=source location=input.bin ! passthrough ! nullsink"
+)?;
+
+// Retrieve element by name and downcast to concrete type
+if let Some(src) = pipeline.get_element::<FileSrc>("source") {
+    println!("Reading from: {}", src.path());
+}
+
+// Mutable access for modifying properties
+if let Some(src) = pipeline.get_element_mut::<FileSrc>("source") {
+    *src = FileSrc::new("different.bin");
+}
+
+// Without name=, elements get auto-generated names: filesrc_0, passthrough_1, etc.
 ```
 
 ### Typed Pipeline

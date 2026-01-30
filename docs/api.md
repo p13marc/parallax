@@ -978,25 +978,48 @@ impl Pipeline {
     pub fn new() -> Self;
     
     /// Parse a pipeline from string
-    pub fn parse(&mut self, description: &str) -> Result<()>;
+    /// Element names default to {type}_{index} (e.g., filesrc_0)
+    /// Use name=myname property for custom names
+    pub fn parse(description: &str) -> Result<Self>;
     
-    /// Add a node
-    pub fn add_node(&mut self, name: &str, element: Box<dyn ElementDyn>) -> NodeId;
+    /// Add elements to the pipeline
+    pub fn add_source<S: Source + 'static>(&mut self, name: &str, source: S) -> NodeId;
+    pub fn add_sink<S: Sink + 'static>(&mut self, name: &str, sink: S) -> NodeId;
+    pub fn add_filter<E: Element + 'static>(&mut self, name: &str, element: E) -> NodeId;
     
     /// Link two nodes
     pub fn link(&mut self, from: NodeId, to: NodeId) -> Result<()>;
     
+    /// Get element by name with type-safe downcasting
+    pub fn get_element<T: 'static>(&self, name: &str) -> Option<&T>;
+    pub fn get_element_mut<T: 'static>(&mut self, name: &str) -> Option<&mut T>;
+    
     /// Get current state
     pub fn state(&self) -> PipelineState;
     
-    /// Validate the pipeline
-    pub fn validate(&self) -> Result<()>;
+    /// Run the pipeline
+    pub async fn run(&mut self) -> Result<()>;
     
     /// Export to DOT format
     pub fn to_dot(&self) -> String;
     
     /// Export to JSON
     pub fn to_json(&self) -> String;
+}
+```
+
+**Element Retrieval Example:**
+
+```rust
+use parallax::pipeline::Pipeline;
+use parallax::elements::io::FileSrc;
+
+// Parse with custom name
+let mut pipeline = Pipeline::parse("filesrc name=src location=test.bin ! nullsink")?;
+
+// Retrieve and modify element
+if let Some(src) = pipeline.get_element_mut::<FileSrc>("src") {
+    *src = FileSrc::new("other.bin");
 }
 ```
 

@@ -897,6 +897,40 @@ let mut pipeline = Pipeline::parse("videotestsrc ! h264enc ! filesink location=o
 pipeline.run().await?;
 ```
 
+### Element Retrieval and Downcasting
+
+Like GStreamer's `gst_bin_get_by_name()`, Parallax supports retrieving and modifying elements after pipeline creation:
+
+```rust
+use parallax::pipeline::Pipeline;
+use parallax::elements::io::FileSrc;
+
+// Parse a pipeline with custom element names using name= property
+let mut pipeline = Pipeline::parse(
+    "filesrc name=source location=input.bin ! passthrough ! filesink name=output location=out.bin"
+)?;
+
+// Retrieve element by name and downcast to concrete type
+if let Some(source) = pipeline.get_element::<FileSrc>("source") {
+    println!("Reading from: {}", source.path());
+}
+
+// Mutable access for modifying properties
+if let Some(source) = pipeline.get_element_mut::<FileSrc>("source") {
+    *source = FileSrc::new("different_file.bin");
+}
+
+// Type-safe: wrong type returns None (no panic)
+let wrong = pipeline.get_element::<FileSrc>("output");  // Returns None (it's a FileSink)
+```
+
+**Element naming:**
+- Auto-generated: `{element_type}_{index}` (e.g., `filesrc_0`, `passthrough_1`)
+- Custom: Use `name=myname` property in pipeline string
+- Programmatic: Name is the first argument to `add_source()`, `add_filter()`, `add_sink()`
+
+See `examples/49_element_retrieval.rs` for a complete example.
+
 ### Custom Metadata API
 
 Buffers can carry extensible typed metadata for domain-specific data like KLV, SEI NALUs, closed captions, or application-specific values.
