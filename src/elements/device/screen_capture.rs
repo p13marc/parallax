@@ -32,7 +32,7 @@
 
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::thread;
 
 use ashpd::desktop::PersistMode;
@@ -41,8 +41,10 @@ use ashpd::enumflags2::BitFlags;
 use kanal::{Receiver, Sender, bounded};
 use pipewire as pw;
 use pw::spa;
+use spa::sys as spa_sys;
 
 use crate::buffer::Buffer;
+use crate::clock::ClockTime;
 use crate::element::{Affinity, ExecutionHints, ProduceContext, ProduceResult, Source};
 use crate::error::{Error, Result};
 use crate::format::{
@@ -141,6 +143,8 @@ pub struct CapturedFrame {
     pub stride: u32,
     /// Pixel format.
     pub format: PixelFormat,
+    /// Timestamp when this frame was captured (monotonic, relative to capture start).
+    pub pts: ClockTime,
 }
 
 /// Screen capture source element.
@@ -179,6 +183,63 @@ impl std::fmt::Debug for ScreenCaptureSrc {
             .field("frames_dropped", &self.frames_dropped)
             .finish()
     }
+}
+
+/// Extract the presentation timestamp (PTS) from a PipeWire spa_buffer.
+///
+/// PipeWire provides timestamps via `spa_meta_header` attached to buffers.
+/// This function searches the buffer's metadata array for `SPA_META_Header`
+/// and extracts the `pts` field (nanoseconds since an unspecified epoch).
+///
+/// # Safety
+///
+/// The caller must ensure that `spa_buffer` is a valid pointer obtained from
+/// a PipeWire buffer that is currently dequeued and mapped.
+///
+/// # Returns
+///
+/// - `Some(pts)` if the buffer has a valid `spa_meta_header` with a non-negative PTS
+/// - `None` if no header metadata is present or PTS is invalid (-1 indicates no timestamp)
+/// # Safety
+/// The caller must ensure that `spa_buffer` is a valid pointer obtained from
+/// a PipeWire buffer that is currently dequeued and mapped.
+unsafe fn extract_pipewire_pts(spa_buffer: *const spa_sys::spa_buffer) -> Option<i64> {
+    if spa_buffer.is_null() {
+        return None;
+    }
+
+    // SAFETY: We've checked that spa_buffer is non-null, and the caller guarantees
+    // it points to a valid spa_buffer from a dequeued PipeWire buffer.
+    let buffer = unsafe { &*spa_buffer };
+    let n_metas = buffer.n_metas as usize;
+    let metas = buffer.metas;
+
+    if metas.is_null() || n_metas == 0 {
+        return None;
+    }
+
+    // Iterate through all metadata looking for SPA_META_Header
+    for i in 0..n_metas {
+        // SAFETY: metas is non-null and we're iterating within n_metas bounds
+        let meta = unsafe { &*metas.add(i) };
+
+        // Check if this is a header metadata (type == SPA_META_Header == 1)
+        if meta.type_ == spa_sys::SPA_META_Header {
+            // The data pointer points to spa_meta_header when type is SPA_META_Header
+            let header = meta.data as *const spa_sys::spa_meta_header;
+            if !header.is_null() {
+                // SAFETY: header is non-null and type is SPA_META_Header,
+                // so data points to a valid spa_meta_header
+                let pts = unsafe { (*header).pts };
+                // PipeWire uses -1 to indicate "no timestamp"
+                if pts >= 0 {
+                    return Some(pts);
+                }
+            }
+        }
+    }
+
+    None
 }
 
 impl ScreenCaptureSrc {
@@ -327,7 +388,17 @@ impl ScreenCaptureSrc {
         shutdown_rx: Receiver<()>,
         frame_count: Arc<AtomicU32>,
     ) -> std::result::Result<(), String> {
+        use std::time::Instant;
+
         pw::init();
+
+        // Track capture start time for PTS calculation (fallback when PipeWire PTS unavailable)
+        let capture_start = Arc::new(std::sync::Mutex::new(None::<Instant>));
+
+        // Track first PipeWire PTS for relative timestamp calculation
+        // We use i64::MIN as sentinel for "not yet set"
+        const PTS_NOT_SET: i64 = i64::MIN;
+        let first_pipewire_pts = Arc::new(AtomicI64::new(PTS_NOT_SET));
 
         // Use ThreadLoop instead of MainLoop - it runs in its own thread
         // and is what OBS and other applications use for portal screen capture
@@ -374,6 +445,8 @@ impl ScreenCaptureSrc {
 
         let frame_tx_clone = frame_tx.clone();
         let frame_count_clone = frame_count.clone();
+        let capture_start_clone = capture_start.clone();
+        let first_pipewire_pts_clone = first_pipewire_pts.clone();
 
         let _listener = stream
             .add_local_listener_with_user_data(())
@@ -419,29 +492,65 @@ impl ScreenCaptureSrc {
             .process(move |stream, _user_data| {
                 tracing::trace!("Process callback entered");
 
-                let Some(mut buffer) = stream.dequeue_buffer() else {
+                // Use dequeue_raw_buffer to get access to the underlying pw_buffer
+                // so we can extract PipeWire timestamps from spa_meta_header
+                let raw_pw_buffer = unsafe { stream.dequeue_raw_buffer() };
+                if raw_pw_buffer.is_null() {
                     tracing::trace!("No buffer available to dequeue");
                     return;
+                }
+
+                // SAFETY: raw_pw_buffer is non-null and was just dequeued from the stream
+                let (pipewire_pts_nanos, spa_buffer) = unsafe {
+                    let pw_buf = &*raw_pw_buffer;
+                    let pts = extract_pipewire_pts(pw_buf.buffer);
+                    (pts, pw_buf.buffer)
                 };
 
-                let datas = buffer.datas_mut();
-                if datas.is_empty() {
-                    tracing::trace!("Buffer has no data planes");
-                    return;
-                }
+                // Access the spa_buffer data directly since Buffer::from_raw is private
+                // SAFETY: spa_buffer comes from a valid dequeued pw_buffer
+                let (size, stride, slice_data) = unsafe {
+                    if spa_buffer.is_null() {
+                        tracing::trace!("spa_buffer is null");
+                        stream.queue_raw_buffer(raw_pw_buffer);
+                        return;
+                    }
 
-                let data = &mut datas[0];
-                let chunk = data.chunk();
-                let size = chunk.size() as usize;
-                let stride = chunk.stride() as u32;
+                    let buf = &*spa_buffer;
+                    if buf.n_datas == 0 || buf.datas.is_null() {
+                        tracing::trace!("Buffer has no data planes");
+                        stream.queue_raw_buffer(raw_pw_buffer);
+                        return;
+                    }
 
-                if size == 0 {
-                    tracing::trace!("Buffer chunk size is 0");
-                    return;
-                }
+                    let data = &mut *buf.datas;
+                    if data.chunk.is_null() {
+                        tracing::trace!("Data chunk is null");
+                        stream.queue_raw_buffer(raw_pw_buffer);
+                        return;
+                    }
 
-                let Some(slice) = data.data() else {
-                    return;
+                    let chunk = &*data.chunk;
+                    let size = chunk.size as usize;
+                    let stride = chunk.stride as u32;
+
+                    if size == 0 {
+                        tracing::trace!("Buffer chunk size is 0");
+                        stream.queue_raw_buffer(raw_pw_buffer);
+                        return;
+                    }
+
+                    if data.data.is_null() {
+                        tracing::trace!("Data pointer is null");
+                        stream.queue_raw_buffer(raw_pw_buffer);
+                        return;
+                    }
+
+                    // Copy the data before we queue the buffer back
+                    let slice = std::slice::from_raw_parts(data.data as *const u8, size);
+                    let data_copy = slice.to_vec();
+
+                    (size, stride, data_copy)
                 };
 
                 // Get dimensions from parsed format or calculate from stride
@@ -466,27 +575,76 @@ impl ScreenCaptureSrc {
                         size,
                         stride
                     );
+                    // Queue buffer back before returning
+                    unsafe { stream.queue_raw_buffer(raw_pw_buffer) };
                     return;
                 }
 
-                let bytes = slice[..size].to_vec();
+                // Calculate PTS: prefer PipeWire hardware timestamp, fall back to system time
+                let pts = if let Some(pw_pts) = pipewire_pts_nanos {
+                    // PipeWire provides absolute timestamps in nanoseconds.
+                    // We need to convert to relative time from the first frame.
+
+                    // Try to set the first PTS atomically (compare_exchange ensures only first frame sets it)
+                    let _ = first_pipewire_pts_clone.compare_exchange(
+                        PTS_NOT_SET,
+                        pw_pts,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    );
+
+                    let first_pts = first_pipewire_pts_clone.load(Ordering::SeqCst);
+                    let relative_pts = (pw_pts - first_pts).max(0) as u64;
+
+                    tracing::trace!(
+                        "Using PipeWire PTS: raw={}, first={}, relative={}ns",
+                        pw_pts,
+                        first_pts,
+                        relative_pts
+                    );
+                    ClockTime::from_nanos(relative_pts)
+                } else {
+                    // Fallback: use system monotonic clock (less accurate)
+                    let now = Instant::now();
+                    let mut start_guard = capture_start_clone.lock().unwrap();
+                    if start_guard.is_none() {
+                        *start_guard = Some(now);
+                    }
+                    let start = start_guard.unwrap();
+                    let elapsed = now.duration_since(start);
+                    tracing::trace!(
+                        "Fallback to system clock: elapsed={}ns (no PipeWire PTS available)",
+                        elapsed.as_nanos()
+                    );
+                    ClockTime::from_nanos(elapsed.as_nanos() as u64)
+                };
+
+                // Data was already copied in the unsafe block above
                 let frame = CapturedFrame {
-                    data: bytes,
+                    data: slice_data,
                     width,
                     height,
                     stride,
                     format: PixelFormat::Bgra, // Most common for screen capture
+                    pts,
                 };
+
+                // Queue buffer back to PipeWire now that we've copied the data
+                unsafe { stream.queue_raw_buffer(raw_pw_buffer) };
 
                 let count = frame_count_clone.fetch_add(1, Ordering::Relaxed) + 1;
 
                 if count <= 5 || count % 30 == 0 {
                     tracing::debug!(
-                        "Captured frame {}: {}x{}, {} bytes",
+                        "Captured frame {}: {}x{}, {} bytes, pts={} (pw_ts={})",
                         count,
                         width,
                         height,
-                        frame.data.len()
+                        frame.data.len(),
+                        pts,
+                        pipewire_pts_nanos
+                            .map(|p| p.to_string())
+                            .unwrap_or_else(|| "none".to_string())
                     );
                 }
 
@@ -776,7 +934,7 @@ impl Source for ScreenCaptureSrc {
         slot.data_mut()[..frame_size].copy_from_slice(&frame.data);
 
         let handle = crate::buffer::MemoryHandle::with_len(slot, frame_size);
-        let mut metadata = Metadata::new();
+        let mut metadata = Metadata::new().with_pts(frame.pts);
         metadata.set("video/width", frame.width);
         metadata.set("video/height", frame.height);
         metadata.set("video/stride", frame.stride);

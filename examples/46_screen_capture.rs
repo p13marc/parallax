@@ -4,12 +4,14 @@
 //! that can be played in VLC, mpv, or any standard video player.
 //!
 //! Run with:
-//!   cargo run --example 46_screen_capture --features "screen-capture,h264,mp4-demux"
+//!   cargo run --example 46_screen_capture --features "screen-capture,h264,mp4-demux,simd-colorspace"
 //!
 //! Requirements:
 //! - XDG Desktop Portal service running
 //! - PipeWire session manager
 //! - Portal backend (xdg-desktop-portal-gnome, xdg-desktop-portal-kde, etc.)
+
+use std::time::Instant;
 
 use parallax::converters::PixelFormat;
 use parallax::elements::codec::{H264Encoder, H264EncoderConfig};
@@ -36,8 +38,6 @@ async fn main() -> Result<()> {
     println!();
 
     // Capture settings
-    // Note: OpenH264 (pure Rust) is slow for 1080p - encoding takes longer than capture
-    // The pipeline buffers captured frames and encodes them after capture completes
     let capture_duration_seconds = 5;
     let framerate = 30.0;
     let max_frames = (capture_duration_seconds as f32 * framerate) as u32;
@@ -70,10 +70,11 @@ async fn main() -> Result<()> {
         .with_output_format(PixelFormat::I420)
         .with_size(capture_width, capture_height);
 
-    // 3. H.264 encoder
+    // 3. H.264 encoder with multi-threading enabled
     let encoder_config = H264EncoderConfig::new(1920, 1080)
         .frame_rate(framerate)
-        .bitrate(4_000_000); // 4 Mbps for good quality screen capture
+        .bitrate(4_000_000) // 4 Mbps for good quality screen capture
+        .threads(0); // 0 = auto-detect (uses all available cores)
     let encoder = H264Encoder::new(encoder_config)?;
 
     // 4. MP4 muxer (transform, not sink - outputs complete MP4 on flush)
@@ -84,17 +85,11 @@ async fn main() -> Result<()> {
     let output_filename = "screen_capture.mp4";
     let file_sink = FileSink::new(output_filename);
 
-    // Build the pipeline with a large enough arena for 1920x1080 BGRA frames
+    // Build the pipeline with arena for 1920x1080 BGRA frames
     // BGRA = 4 bytes per pixel, 1920x1080 = ~8.3 MB per frame
-    //
-    // IMPORTANT: OpenH264 (pure Rust) encodes at ~1-2 fps for 1080p
-    // PipeWire captures at 30fps, so we need a large buffer to hold
-    // captured frames while waiting for encoding.
-    //
-    // For 5 seconds at 30fps = 150 frames = ~1.2GB buffer needed
-    // The pipeline will capture all frames quickly, then spend time encoding.
+    // 200 slots provides headroom for capture/encode rate differences
     let frame_size = 1920 * 1080 * 4;
-    let arena = SharedArena::new(frame_size, 200)?; // 200 frame slots (~1.6GB)
+    let arena = SharedArena::new(frame_size, 200)?;
 
     let mut pipeline = Pipeline::new();
 
@@ -111,6 +106,13 @@ async fn main() -> Result<()> {
 
     println!("Pipeline: ScreenCapture -> VideoConvert -> H264Encoder -> Mp4Mux -> FileSink");
     println!();
+    println!("Acceleration enabled:");
+    #[cfg(feature = "simd-colorspace")]
+    println!("  - VideoConvert: SIMD (AVX2/SSE4.1/NEON)");
+    #[cfg(not(feature = "simd-colorspace"))]
+    println!("  - VideoConvert: Scalar (enable simd-colorspace for acceleration)");
+    println!("  - H264Encoder: OpenH264 multi-threaded (auto-detect cores)");
+    println!();
     println!(
         "Capturing {} seconds ({} frames at {} fps)...",
         capture_duration_seconds, max_frames, framerate
@@ -119,10 +121,17 @@ async fn main() -> Result<()> {
     println!();
 
     // Run the pipeline - it will stop when max_frames is reached
+    let start = Instant::now();
     match pipeline.run().await {
         Ok(()) => {
+            let elapsed = start.elapsed();
             println!();
             println!("Capture complete!");
+            println!(
+                "Total time: {:.2}s ({:.1} fps effective)",
+                elapsed.as_secs_f64(),
+                max_frames as f64 / elapsed.as_secs_f64()
+            );
         }
         Err(e) => {
             println!();

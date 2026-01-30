@@ -137,8 +137,10 @@ impl<D: AudioDecoder + 'static> Transform for AudioDecoderElement<D> {
             .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
         slot.data_mut()[..samples.data.len()].copy_from_slice(&samples.data);
 
-        let mut metadata = crate::metadata::Metadata::new();
+        // Preserve input metadata and update PTS/duration
+        let mut metadata = buffer.metadata().clone();
         metadata.pts = crate::clock::ClockTime::from_nanos(samples.pts as u64);
+        metadata.duration = crate::clock::ClockTime::from_nanos(samples.duration_nanos() as u64);
 
         Ok(Output::single(Buffer::new(
             MemoryHandle::with_len(slot, samples.data.len()),

@@ -273,7 +273,9 @@ impl Element for H264Encoder {
         slot.data_mut()[..encoded.len()].copy_from_slice(&encoded);
 
         let handle = crate::buffer::MemoryHandle::with_len(slot, encoded.len());
-        let metadata = Metadata::from_sequence(self.frame_count - 1);
+        // Preserve input buffer's PTS for proper timing, update sequence number
+        let mut metadata = buffer.metadata().clone();
+        metadata.sequence = self.frame_count - 1;
         Ok(Some(Buffer::new(handle, metadata)))
     }
 

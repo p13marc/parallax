@@ -31,6 +31,7 @@
 //! ```
 
 use crate::buffer::Buffer;
+use crate::clock::{Clock, ClockTime};
 use crate::element::{
     Affinity, AsyncElementDyn, DynAsyncElement, ElementType, ExecutionHints, LatencyHint, Output,
     ProcessingHint, SourceResult, TrustLevel,
@@ -552,19 +553,34 @@ impl Executor {
             effective_scheduling
         );
 
+        // Start pipeline clock and get clock info for sources
+        pipeline.start_clock();
+        let pipeline_clock = pipeline.clock();
+        let clock_info: Option<(Arc<dyn Clock>, ClockTime)> = if pipeline_clock.is_started() {
+            Some((pipeline_clock.clock(), pipeline_clock.base_time()))
+        } else {
+            None
+        };
+
         // Execute based on scheduling mode
         let (tasks, rt_handles, bridges) = match effective_scheduling {
             SchedulingMode::Async => {
-                let tasks = self.run_async(pipeline, &events)?;
+                let tasks = self.run_async(pipeline, clock_info.as_ref(), &events)?;
                 (tasks, Vec::new(), Vec::new())
             }
             SchedulingMode::Hybrid | SchedulingMode::RealTime => {
                 if partition.rt_nodes.is_empty() {
                     // No RT nodes, fall back to async
-                    let tasks = self.run_async(pipeline, &events)?;
+                    let tasks = self.run_async(pipeline, clock_info.as_ref(), &events)?;
                     (tasks, Vec::new(), Vec::new())
                 } else {
-                    self.run_hybrid(pipeline, &partition, &mut scheduler, &events)?
+                    self.run_hybrid(
+                        pipeline,
+                        &partition,
+                        &mut scheduler,
+                        clock_info.as_ref(),
+                        &events,
+                    )?
                 }
             }
         };
@@ -594,6 +610,7 @@ impl Executor {
     fn run_async(
         &self,
         pipeline: &mut Pipeline,
+        clock_info: Option<&(Arc<dyn Clock>, ClockTime)>,
         events: &EventSender,
     ) -> Result<Vec<JoinHandle<Result<()>>>> {
         let mut channels = ChannelNetwork::new();
@@ -604,7 +621,7 @@ impl Executor {
         }
 
         // Spawn tasks
-        self.spawn_tasks(pipeline, channels, events)
+        self.spawn_tasks(pipeline, channels, clock_info, events)
     }
 
     /// Run with hybrid async + RT execution.
@@ -613,6 +630,7 @@ impl Executor {
         pipeline: &mut Pipeline,
         partition: &GraphPartition,
         scheduler: &mut RtScheduler,
+        clock_info: Option<&(Arc<dyn Clock>, ClockTime)>,
         events: &EventSender,
     ) -> Result<(
         Vec<JoinHandle<Result<()>>>,
@@ -645,8 +663,9 @@ impl Executor {
         }
 
         // Spawn async tasks
-        let tasks =
-            self.spawn_tasks_for_partition(pipeline, partition, channels, scheduler, events)?;
+        let tasks = self.spawn_tasks_for_partition(
+            pipeline, partition, channels, scheduler, clock_info, events,
+        )?;
 
         // Collect bridges
         let bridges: Vec<_> = partition
@@ -724,6 +743,7 @@ impl Executor {
         &self,
         pipeline: &mut Pipeline,
         mut channels: ChannelNetwork,
+        clock_info: Option<&(Arc<dyn Clock>, ClockTime)>,
         events: &EventSender,
     ) -> Result<Vec<JoinHandle<Result<()>>>> {
         let mut tasks = Vec::new();
@@ -738,7 +758,8 @@ impl Executor {
         let node_ids: Vec<NodeId> = node_ids.into_iter().filter(|id| seen.insert(*id)).collect();
 
         for node_id in node_ids {
-            let task = self.spawn_node_task(pipeline, node_id, &mut channels, events)?;
+            let task =
+                self.spawn_node_task(pipeline, node_id, &mut channels, clock_info, events)?;
             tasks.push(task);
         }
 
@@ -752,6 +773,7 @@ impl Executor {
         partition: &GraphPartition,
         mut channels: ChannelNetwork,
         scheduler: &RtScheduler,
+        clock_info: Option<&(Arc<dyn Clock>, ClockTime)>,
         events: &EventSender,
     ) -> Result<Vec<JoinHandle<Result<()>>>> {
         let mut tasks = Vec::new();
@@ -777,6 +799,7 @@ impl Executor {
                 &mut channels,
                 output_bridges,
                 input_bridges,
+                clock_info,
                 events,
             )?;
             tasks.push(task);
@@ -791,6 +814,7 @@ impl Executor {
         pipeline: &mut Pipeline,
         node_id: NodeId,
         channels: &mut ChannelNetwork,
+        clock_info: Option<&(Arc<dyn Clock>, ClockTime)>,
         events: &EventSender,
     ) -> Result<JoinHandle<Result<()>>> {
         self.spawn_node_task_with_bridges(
@@ -799,6 +823,7 @@ impl Executor {
             channels,
             Vec::new(),
             Vec::new(),
+            clock_info,
             events,
         )
     }
@@ -811,6 +836,7 @@ impl Executor {
         channels: &mut ChannelNetwork,
         output_bridges: Vec<Arc<AsyncRtBridge>>,
         input_bridges: Vec<Arc<AsyncRtBridge>>,
+        clock_info: Option<&(Arc<dyn Clock>, ClockTime)>,
         events: &EventSender,
     ) -> Result<JoinHandle<Result<()>>> {
         let node = pipeline
@@ -820,9 +846,16 @@ impl Executor {
         let element_type = node.element_type();
         let node_name = node.name().to_string();
 
-        let element = node.take_element().ok_or_else(|| {
+        let mut element = node.take_element().ok_or_else(|| {
             Error::InvalidSegment(format!("element '{}' already taken", node_name))
         })?;
+
+        // Set clock on source elements so they can provide it to ProduceContext
+        if element_type == ElementType::Source {
+            if let Some((clock, base_time)) = clock_info {
+                element.set_clock(clock.clone(), *base_time);
+            }
+        }
 
         let inputs = channels.take_inputs(node_id);
         let outputs = channels.take_outputs(node_id);

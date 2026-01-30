@@ -22,11 +22,13 @@
 //! ```
 
 use std::ffi::CString;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use alsa::pcm::{Access, Format, HwParams, PCM};
 use alsa::{Direction, PollDescriptors, ValueOr};
 use tokio::io::unix::AsyncFd;
 
+use crate::clock::ClockTime;
 use crate::element::{
     Affinity, AsyncSink, AsyncSource, ConsumeContext, ExecutionHints, ProduceContext, ProduceResult,
 };
@@ -170,6 +172,11 @@ pub struct AlsaSrc {
     flow_state: Option<FlowStateHandle>,
     /// Samples dropped due to backpressure.
     samples_dropped: u64,
+    /// First ALSA timestamp in nanoseconds (for relative PTS calculation).
+    /// i64::MIN indicates "not yet set".
+    first_timestamp_nanos: AtomicI64,
+    /// Number of frames produced (for calculating PTS from sample count).
+    frames_produced: u64,
 }
 
 impl AlsaSrc {
@@ -225,6 +232,8 @@ impl AlsaSrc {
             frame_size,
             flow_state: None,
             samples_dropped: 0,
+            first_timestamp_nanos: AtomicI64::new(i64::MIN),
+            frames_produced: 0,
         })
     }
 
@@ -251,6 +260,39 @@ impl AlsaSrc {
     /// Get the number of samples dropped due to backpressure.
     pub fn samples_dropped(&self) -> u64 {
         self.samples_dropped
+    }
+
+    /// Calculate relative PTS from ALSA timestamp or sample count.
+    ///
+    /// Tries to use hardware timestamps from ALSA status. Falls back to
+    /// calculating PTS from sample count if hardware timestamps aren't available.
+    fn calculate_pts(&self, frames_read: usize) -> ClockTime {
+        // Try to get hardware timestamp from ALSA status
+        if let Ok(status) = self.pcm.status() {
+            let htstamp = status.get_htstamp();
+            let current_nanos = htstamp.tv_sec as i64 * 1_000_000_000 + htstamp.tv_nsec as i64;
+
+            // Only use hardware timestamp if it's valid (non-zero)
+            if current_nanos > 0 {
+                // Try to set the first timestamp atomically
+                let _ = self.first_timestamp_nanos.compare_exchange(
+                    i64::MIN,
+                    current_nanos,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+
+                let first_nanos = self.first_timestamp_nanos.load(Ordering::SeqCst);
+                let relative_nanos = (current_nanos - first_nanos).max(0) as u64;
+                return ClockTime::from_nanos(relative_nanos);
+            }
+        }
+
+        // Fallback: calculate PTS from sample count
+        // PTS = (frames_produced * 1_000_000_000) / sample_rate
+        let total_frames = self.frames_produced + frames_read as u64;
+        let nanos = total_frames * 1_000_000_000 / self.format.sample_rate as u64;
+        ClockTime::from_nanos(nanos)
     }
 
     /// Get poll descriptors for async waiting.
@@ -335,6 +377,13 @@ impl AsyncSource for AlsaSrc {
 
         match io.readi(output_i16) {
             Ok(frames_read) => {
+                // Calculate PTS from ALSA timestamp or sample count
+                let pts = self.calculate_pts(frames_read);
+                ctx.set_pts(pts);
+
+                // Update frames produced count
+                self.frames_produced += frames_read as u64;
+
                 let bytes = frames_read * self.frame_size;
                 Ok(ProduceResult::Produced(bytes))
             }

@@ -37,7 +37,10 @@
 //! }
 //! ```
 
+use std::sync::Arc;
+
 use crate::buffer::{Buffer, DmaBufBuffer, MemoryHandle};
+use crate::clock::{Clock, ClockTime};
 use crate::error::{Error, Result};
 use crate::memory::{BufferPool, PooledBuffer, SharedSlotRef};
 use crate::metadata::Metadata;
@@ -164,6 +167,10 @@ pub struct ProduceContext<'a> {
     capacity: usize,
     /// Optional buffer pool for acquiring additional buffers.
     pool: Option<&'a dyn BufferPool>,
+    /// Optional pipeline clock for timing.
+    clock: Option<Arc<dyn Clock>>,
+    /// Base time (clock time when pipeline started).
+    base_time: ClockTime,
 }
 
 impl<'a> ProduceContext<'a> {
@@ -186,6 +193,8 @@ impl<'a> ProduceContext<'a> {
             metadata: Metadata::new(),
             capacity,
             pool: None,
+            clock: None,
+            base_time: ClockTime::NONE,
         }
     }
 
@@ -208,6 +217,8 @@ impl<'a> ProduceContext<'a> {
             metadata: Metadata::new(),
             capacity,
             pool: Some(pool),
+            clock: None,
+            base_time: ClockTime::NONE,
         }
     }
 
@@ -221,6 +232,8 @@ impl<'a> ProduceContext<'a> {
             metadata: Metadata::new(),
             capacity: 0,
             pool: None,
+            clock: None,
+            base_time: ClockTime::NONE,
         }
     }
 
@@ -234,7 +247,49 @@ impl<'a> ProduceContext<'a> {
             metadata: Metadata::new(),
             capacity: 0,
             pool: Some(pool),
+            clock: None,
+            base_time: ClockTime::NONE,
         }
+    }
+
+    /// Set the pipeline clock for this context.
+    ///
+    /// This allows sources to access the pipeline clock for timing decisions.
+    pub fn set_clock(&mut self, clock: Arc<dyn Clock>, base_time: ClockTime) {
+        self.clock = Some(clock);
+        self.base_time = base_time;
+    }
+
+    /// Get the pipeline clock, if available.
+    pub fn clock(&self) -> Option<&Arc<dyn Clock>> {
+        self.clock.as_ref()
+    }
+
+    /// Get the current running time (time since pipeline started).
+    ///
+    /// Returns `ClockTime::NONE` if no clock is configured or pipeline hasn't started.
+    pub fn running_time(&self) -> ClockTime {
+        if let Some(clock) = &self.clock {
+            if self.base_time.is_some() {
+                return clock.now().saturating_sub(self.base_time);
+            }
+        }
+        ClockTime::NONE
+    }
+
+    /// Get the current clock time.
+    ///
+    /// Returns `ClockTime::NONE` if no clock is configured.
+    pub fn clock_time(&self) -> ClockTime {
+        self.clock
+            .as_ref()
+            .map(|c| c.now())
+            .unwrap_or(ClockTime::NONE)
+    }
+
+    /// Get the base time (when pipeline started).
+    pub fn base_time(&self) -> ClockTime {
+        self.base_time
     }
 
     /// Get the output buffer to write into.

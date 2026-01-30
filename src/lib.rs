@@ -71,7 +71,9 @@ pub mod typed;
 /// Prelude for convenient imports
 pub mod prelude {
     pub use crate::buffer::Buffer;
-    pub use crate::clock::{Clock, ClockTime, PipelineClock};
+    pub use crate::clock::{
+        Clock, ClockFlags, ClockProvider, ClockTime, PipelineClock, SystemClock,
+    };
     pub use crate::element::{
         AsyncElementDyn, AsyncSink, AsyncSource, AsyncTransform, DynAsyncElement, Element, Output,
         Sink, Source, Transform,

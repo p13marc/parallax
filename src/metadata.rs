@@ -435,6 +435,14 @@ impl Metadata {
         }
     }
 
+    /// Create metadata with a PTS (presentation timestamp).
+    pub fn from_pts(pts: crate::clock::ClockTime) -> Self {
+        Self {
+            pts,
+            ..Default::default()
+        }
+    }
+
     // Builder methods
 
     /// Set the sequence number (builder).

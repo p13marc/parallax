@@ -276,15 +276,131 @@ impl std::fmt::Display for ClockTime {
 }
 
 // ============================================================================
+// Clock Capabilities
+// ============================================================================
+
+/// Capabilities and characteristics of a clock.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct ClockFlags(u32);
+
+impl ClockFlags {
+    /// No flags set.
+    pub const NONE: Self = Self(0);
+    /// Clock can be used as pipeline master (provides timing reference).
+    pub const CAN_BE_MASTER: Self = Self(1 << 0);
+    /// Clock can slave to another clock (adjust its rate).
+    pub const CAN_SET_MASTER: Self = Self(1 << 1);
+    /// Clock provides hardware timestamps (more accurate than software).
+    pub const HARDWARE: Self = Self(1 << 2);
+    /// Clock is from a network source (PTP, NTP).
+    pub const NETWORK: Self = Self(1 << 3);
+    /// Clock is real-time (audio device, maintains constant rate).
+    pub const REALTIME: Self = Self(1 << 4);
+
+    /// Check if a flag is set.
+    #[inline]
+    pub const fn contains(self, flag: Self) -> bool {
+        (self.0 & flag.0) != 0
+    }
+
+    /// Set a flag.
+    #[inline]
+    pub const fn insert(self, flag: Self) -> Self {
+        Self(self.0 | flag.0)
+    }
+
+    /// Clear a flag.
+    #[inline]
+    pub const fn remove(self, flag: Self) -> Self {
+        Self(self.0 & !flag.0)
+    }
+
+    /// Combine flags using bitwise OR.
+    #[inline]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
+// ============================================================================
 // Clock Trait
 // ============================================================================
 
 /// A clock that provides the current time.
 ///
 /// Implementations should provide monotonic time (never goes backwards).
+/// Clocks are used to synchronize media playback and capture.
+///
+/// # Clock Selection Priority
+///
+/// When multiple clocks are available, the pipeline selects one based on
+/// priority (see `ClockProvider::clock_priority()`):
+/// - 0-99: Software clocks (system monotonic)
+/// - 100-199: Hardware clocks (audio devices)
+/// - 200-299: Network clocks (NTP)
+/// - 300+: Precision clocks (PTP)
 pub trait Clock: Send + Sync {
     /// Get the current time.
     fn now(&self) -> ClockTime;
+
+    /// Get clock capabilities.
+    fn flags(&self) -> ClockFlags {
+        ClockFlags::CAN_BE_MASTER
+    }
+
+    /// Get clock resolution in nanoseconds.
+    ///
+    /// Returns 0 if resolution is unknown.
+    fn resolution(&self) -> u64 {
+        0
+    }
+
+    /// Get a human-readable name for the clock.
+    fn name(&self) -> &str {
+        "unknown"
+    }
+}
+
+// ============================================================================
+// Clock Provider Trait
+// ============================================================================
+
+/// Elements that can provide a clock for pipeline synchronization.
+///
+/// Some elements (particularly audio sinks) can provide a clock that
+/// represents the rate at which media is being consumed. This clock
+/// can be used as the pipeline's master clock for synchronization.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// impl ClockProvider for AlsaSink {
+///     fn provide_clock(&self) -> Option<Arc<dyn Clock>> {
+///         Some(Arc::new(AlsaClock::new(&self.pcm, self.sample_rate)))
+///     }
+///
+///     fn clock_priority(&self) -> u32 {
+///         100 // Hardware audio clock
+///     }
+/// }
+/// ```
+pub trait ClockProvider: Send + Sync {
+    /// Return a clock if this element can provide one.
+    ///
+    /// Returns `None` if this element cannot provide a clock.
+    fn provide_clock(&self) -> Option<Arc<dyn Clock>>;
+
+    /// Priority for clock selection (higher = preferred).
+    ///
+    /// Priority ranges:
+    /// - 0-99: Software clocks (system monotonic) - default
+    /// - 100-199: Hardware clocks (audio devices)
+    /// - 200-299: Network clocks (NTP)
+    /// - 300+: Precision clocks (PTP)
+    fn clock_priority(&self) -> u32 {
+        0
+    }
 }
 
 // ============================================================================
@@ -297,6 +413,7 @@ pub trait Clock: Send + Sync {
 /// Time is relative to when the clock was created.
 pub struct SystemClock {
     epoch: Instant,
+    name: String,
 }
 
 impl SystemClock {
@@ -304,6 +421,15 @@ impl SystemClock {
     pub fn new() -> Self {
         Self {
             epoch: Instant::now(),
+            name: "system-monotonic".to_string(),
+        }
+    }
+
+    /// Create a system clock with a custom name.
+    pub fn with_name(name: impl Into<String>) -> Self {
+        Self {
+            epoch: Instant::now(),
+            name: name.into(),
         }
     }
 }
@@ -318,6 +444,14 @@ impl Clock for SystemClock {
     #[inline]
     fn now(&self) -> ClockTime {
         ClockTime::from_nanos(self.epoch.elapsed().as_nanos() as u64)
+    }
+
+    fn flags(&self) -> ClockFlags {
+        ClockFlags::CAN_BE_MASTER
+    }
+
+    fn name(&self) -> &str {
+        &self.name
     }
 }
 
@@ -392,6 +526,12 @@ impl PipelineClock {
     #[inline]
     pub fn base_time(&self) -> ClockTime {
         ClockTime(self.base_time.load(Ordering::Acquire))
+    }
+
+    /// Get a reference to the underlying clock.
+    #[inline]
+    pub fn clock(&self) -> Arc<dyn Clock> {
+        self.clock.clone()
     }
 
     /// Get the current clock time.

@@ -309,6 +309,329 @@ impl Element for MetadataInject {
     }
 }
 
+/// Debug element that logs timestamp information flowing through the pipeline.
+///
+/// This is useful for debugging timing issues, verifying PTS/DTS propagation,
+/// and understanding pipeline timing characteristics.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use parallax::elements::TimestampDebug;
+///
+/// // Basic logging to stderr
+/// let debug = TimestampDebug::new();
+///
+/// // Custom prefix and format
+/// let debug = TimestampDebug::new()
+///     .with_prefix("video:")
+///     .with_format(TimestampFormat::Detailed);
+///
+/// // Verbose mode shows all fields
+/// let debug = TimestampDebug::verbose();
+///
+/// // Get statistics
+/// println!("Stats: {:?}", debug.stats());
+/// ```
+pub struct TimestampDebug {
+    name: String,
+    prefix: String,
+    format: TimestampFormat,
+    log_level: TimestampDebugLevel,
+    stats: TimestampDebugStats,
+    start_instant: Instant,
+}
+
+/// Output format for timestamp debug information.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TimestampFormat {
+    /// Just PTS value: `[00:00:01.234]`
+    #[default]
+    Simple,
+    /// PTS and DTS: `PTS=00:00:01.234 DTS=00:00:01.200`
+    Standard,
+    /// Full timing info including duration and sequence
+    Detailed,
+    /// Machine-readable nanosecond values
+    Raw,
+}
+
+/// Log level for timestamp debug output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TimestampDebugLevel {
+    /// Log every buffer
+    #[default]
+    All,
+    /// Log every Nth buffer
+    Sample(u64),
+    /// Only log warnings/anomalies (gaps, backwards PTS)
+    Warnings,
+    /// Silent (stats only)
+    Silent,
+}
+
+/// Statistics collected by TimestampDebug.
+#[derive(Debug, Clone, Default)]
+pub struct TimestampDebugStats {
+    /// Number of buffers processed
+    pub buffer_count: u64,
+    /// Number of buffers with no PTS
+    pub missing_pts_count: u64,
+    /// Number of buffers with backwards PTS (PTS decreased)
+    pub backwards_pts_count: u64,
+    /// Number of PTS discontinuities (gaps larger than expected)
+    pub discontinuity_count: u64,
+    /// Minimum PTS seen
+    pub min_pts: Option<ClockTime>,
+    /// Maximum PTS seen
+    pub max_pts: Option<ClockTime>,
+    /// Last PTS seen
+    pub last_pts: Option<ClockTime>,
+    /// Average inter-frame interval
+    pub avg_interval_ns: Option<f64>,
+}
+
+impl TimestampDebug {
+    /// Create a new timestamp debug element with default settings.
+    pub fn new() -> Self {
+        Self {
+            name: "timestamp-debug".to_string(),
+            prefix: String::new(),
+            format: TimestampFormat::default(),
+            log_level: TimestampDebugLevel::default(),
+            stats: TimestampDebugStats::default(),
+            start_instant: Instant::now(),
+        }
+    }
+
+    /// Create a verbose timestamp debug element that logs all fields.
+    pub fn verbose() -> Self {
+        Self {
+            format: TimestampFormat::Detailed,
+            ..Self::new()
+        }
+    }
+
+    /// Create a silent timestamp debug element that only collects stats.
+    pub fn silent() -> Self {
+        Self {
+            log_level: TimestampDebugLevel::Silent,
+            ..Self::new()
+        }
+    }
+
+    /// Set a custom name.
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
+    }
+
+    /// Set a prefix for log messages.
+    pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.prefix = prefix.into();
+        self
+    }
+
+    /// Set the output format.
+    pub fn with_format(mut self, format: TimestampFormat) -> Self {
+        self.format = format;
+        self
+    }
+
+    /// Set the log level.
+    pub fn with_log_level(mut self, level: TimestampDebugLevel) -> Self {
+        self.log_level = level;
+        self
+    }
+
+    /// Get the collected statistics.
+    pub fn stats(&self) -> &TimestampDebugStats {
+        &self.stats
+    }
+
+    /// Reset the statistics.
+    pub fn reset_stats(&mut self) {
+        self.stats = TimestampDebugStats::default();
+        self.start_instant = Instant::now();
+    }
+
+    /// Format a ClockTime for display.
+    fn format_time(&self, time: ClockTime) -> String {
+        if time == ClockTime::NONE {
+            return "NONE".to_string();
+        }
+
+        match self.format {
+            TimestampFormat::Raw => format!("{}ns", time.nanos()),
+            TimestampFormat::Simple | TimestampFormat::Standard | TimestampFormat::Detailed => {
+                let nanos = time.nanos();
+                let hours = nanos / 3_600_000_000_000;
+                let minutes = (nanos % 3_600_000_000_000) / 60_000_000_000;
+                let seconds = (nanos % 60_000_000_000) / 1_000_000_000;
+                let millis = (nanos % 1_000_000_000) / 1_000_000;
+                format!("{:02}:{:02}:{:02}.{:03}", hours, minutes, seconds, millis)
+            }
+        }
+    }
+
+    /// Log a buffer's timestamp information.
+    fn log_buffer(&self, buffer: &Buffer, warning: Option<&str>) {
+        let meta = buffer.metadata();
+        let prefix = if self.prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{} ", self.prefix)
+        };
+
+        let wall_time = self.format_time(ClockTime::from(self.start_instant.elapsed()));
+
+        match self.format {
+            TimestampFormat::Simple => {
+                let warning_str = warning.map(|w| format!(" [{}]", w)).unwrap_or_default();
+                eprintln!(
+                    "{}[{}] seq={}{warning_str}",
+                    prefix,
+                    self.format_time(meta.pts),
+                    meta.sequence
+                );
+            }
+            TimestampFormat::Standard => {
+                let warning_str = warning.map(|w| format!(" [{}]", w)).unwrap_or_default();
+                eprintln!(
+                    "{}PTS={} DTS={} seq={}{warning_str}",
+                    prefix,
+                    self.format_time(meta.pts),
+                    self.format_time(meta.dts),
+                    meta.sequence
+                );
+            }
+            TimestampFormat::Detailed => {
+                let warning_str = warning.map(|w| format!(" [{}]", w)).unwrap_or_default();
+                eprintln!(
+                    "{}@{wall_time} seq={} PTS={} DTS={} dur={} len={} stream={} flags={:?}{warning_str}",
+                    prefix,
+                    meta.sequence,
+                    self.format_time(meta.pts),
+                    self.format_time(meta.dts),
+                    self.format_time(meta.duration),
+                    buffer.len(),
+                    meta.stream_id,
+                    meta.flags
+                );
+            }
+            TimestampFormat::Raw => {
+                let warning_str = warning
+                    .map(|w| format!(" warning={}", w))
+                    .unwrap_or_default();
+                eprintln!(
+                    "{}seq={} pts={} dts={} dur={} len={} stream={}{warning_str}",
+                    prefix,
+                    meta.sequence,
+                    meta.pts.nanos(),
+                    meta.dts.nanos(),
+                    meta.duration.nanos(),
+                    buffer.len(),
+                    meta.stream_id
+                );
+            }
+        }
+    }
+
+    /// Update statistics with a buffer's timing info.
+    fn update_stats(&mut self, buffer: &Buffer) -> Option<&'static str> {
+        let pts = buffer.metadata().pts;
+        self.stats.buffer_count += 1;
+
+        // Track missing PTS
+        if pts == ClockTime::NONE {
+            self.stats.missing_pts_count += 1;
+            return Some("MISSING_PTS");
+        }
+
+        let mut warning = None;
+
+        // Track backwards PTS
+        if let Some(last) = self.stats.last_pts {
+            if last != ClockTime::NONE && pts < last {
+                self.stats.backwards_pts_count += 1;
+                warning = Some("BACKWARDS_PTS");
+            }
+
+            // Track discontinuities (more than 2x expected interval)
+            if let Some(avg) = self.stats.avg_interval_ns {
+                if last != ClockTime::NONE {
+                    let gap = pts.nanos().saturating_sub(last.nanos()) as f64;
+                    if gap > avg * 2.0 {
+                        self.stats.discontinuity_count += 1;
+                        warning = Some("DISCONTINUITY");
+                    }
+                }
+            }
+
+            // Update average interval
+            if last != ClockTime::NONE {
+                let interval = pts.nanos().saturating_sub(last.nanos()) as f64;
+                if let Some(avg) = self.stats.avg_interval_ns {
+                    // Running average
+                    self.stats.avg_interval_ns =
+                        Some(avg + (interval - avg) / self.stats.buffer_count as f64);
+                } else {
+                    self.stats.avg_interval_ns = Some(interval);
+                }
+            }
+        }
+
+        // Update min/max
+        match self.stats.min_pts {
+            None => self.stats.min_pts = Some(pts),
+            Some(min) if pts < min => self.stats.min_pts = Some(pts),
+            _ => {}
+        }
+        match self.stats.max_pts {
+            None => self.stats.max_pts = Some(pts),
+            Some(max) if pts > max => self.stats.max_pts = Some(pts),
+            _ => {}
+        }
+
+        // Update last PTS
+        self.stats.last_pts = Some(pts);
+
+        warning
+    }
+}
+
+impl Default for TimestampDebug {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Element for TimestampDebug {
+    fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
+        // Update stats and check for warnings
+        let warning = self.update_stats(&buffer);
+
+        // Determine if we should log
+        let should_log = match self.log_level {
+            TimestampDebugLevel::All => true,
+            TimestampDebugLevel::Sample(n) => self.stats.buffer_count % n == 0,
+            TimestampDebugLevel::Warnings => warning.is_some(),
+            TimestampDebugLevel::Silent => false,
+        };
+
+        if should_log {
+            self.log_buffer(&buffer, warning);
+        }
+
+        // Pass through unchanged
+        Ok(Some(buffer))
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,5 +804,167 @@ mod tests {
         inject.process(create_test_buffer(1)).unwrap();
 
         assert_eq!(inject.buffer_count(), 2);
+    }
+
+    // TimestampDebug tests
+
+    fn create_timestamped_buffer(seq: u64, pts_nanos: u64) -> Buffer {
+        let arena = test_arena();
+        let slot = arena.acquire().unwrap();
+        let handle = MemoryHandle::with_len(slot, 64);
+        let mut meta = Metadata::from_sequence(seq);
+        meta.pts = ClockTime::from_nanos(pts_nanos);
+        Buffer::new(handle, meta)
+    }
+
+    #[test]
+    fn test_timestamp_debug_basic() {
+        let mut debug = TimestampDebug::silent(); // Silent to avoid noise in tests
+
+        let buf = create_timestamped_buffer(0, 1_000_000_000); // 1 second
+        let result = debug.process(buf).unwrap();
+
+        assert!(result.is_some()); // Should pass through
+        assert_eq!(debug.stats().buffer_count, 1);
+    }
+
+    #[test]
+    fn test_timestamp_debug_stats_min_max() {
+        let mut debug = TimestampDebug::silent();
+
+        debug
+            .process(create_timestamped_buffer(0, 100_000_000))
+            .unwrap(); // 100ms
+        debug
+            .process(create_timestamped_buffer(1, 200_000_000))
+            .unwrap(); // 200ms
+        debug
+            .process(create_timestamped_buffer(2, 150_000_000))
+            .unwrap(); // 150ms
+
+        let stats = debug.stats();
+        assert_eq!(stats.buffer_count, 3);
+        assert_eq!(stats.min_pts, Some(ClockTime::from_nanos(100_000_000)));
+        assert_eq!(stats.max_pts, Some(ClockTime::from_nanos(200_000_000)));
+        assert_eq!(stats.last_pts, Some(ClockTime::from_nanos(150_000_000)));
+    }
+
+    #[test]
+    fn test_timestamp_debug_backwards_pts() {
+        let mut debug = TimestampDebug::silent();
+
+        debug
+            .process(create_timestamped_buffer(0, 200_000_000))
+            .unwrap(); // 200ms
+        debug
+            .process(create_timestamped_buffer(1, 100_000_000))
+            .unwrap(); // 100ms (backwards!)
+
+        let stats = debug.stats();
+        assert_eq!(stats.backwards_pts_count, 1);
+    }
+
+    #[test]
+    fn test_timestamp_debug_missing_pts() {
+        let mut debug = TimestampDebug::silent();
+
+        // Buffer with NONE PTS
+        let arena = test_arena();
+        let slot = arena.acquire().unwrap();
+        let handle = MemoryHandle::with_len(slot, 64);
+        let mut meta = Metadata::from_sequence(0);
+        meta.pts = ClockTime::NONE;
+        let buf = Buffer::new(handle, meta);
+
+        debug.process(buf).unwrap();
+
+        assert_eq!(debug.stats().missing_pts_count, 1);
+    }
+
+    #[test]
+    fn test_timestamp_debug_average_interval() {
+        let mut debug = TimestampDebug::silent();
+
+        // 33ms intervals (30fps)
+        debug.process(create_timestamped_buffer(0, 0)).unwrap();
+        debug
+            .process(create_timestamped_buffer(1, 33_000_000))
+            .unwrap();
+        debug
+            .process(create_timestamped_buffer(2, 66_000_000))
+            .unwrap();
+        debug
+            .process(create_timestamped_buffer(3, 99_000_000))
+            .unwrap();
+
+        let stats = debug.stats();
+        // Average should be around 33ms
+        let avg = stats.avg_interval_ns.unwrap();
+        assert!(avg > 30_000_000.0 && avg < 36_000_000.0);
+    }
+
+    #[test]
+    fn test_timestamp_debug_reset() {
+        let mut debug = TimestampDebug::silent();
+
+        debug
+            .process(create_timestamped_buffer(0, 100_000_000))
+            .unwrap();
+        debug
+            .process(create_timestamped_buffer(1, 200_000_000))
+            .unwrap();
+
+        assert_eq!(debug.stats().buffer_count, 2);
+
+        debug.reset_stats();
+
+        assert_eq!(debug.stats().buffer_count, 0);
+        assert!(debug.stats().min_pts.is_none());
+        assert!(debug.stats().max_pts.is_none());
+    }
+
+    #[test]
+    fn test_timestamp_debug_format_time() {
+        let debug = TimestampDebug::new();
+
+        // 1h 23m 45s 678ms
+        let time = ClockTime::from_nanos(
+            1 * 3_600_000_000_000 + 23 * 60_000_000_000 + 45 * 1_000_000_000 + 678_000_000,
+        );
+        let formatted = debug.format_time(time);
+        assert_eq!(formatted, "01:23:45.678");
+
+        // NONE
+        let formatted_none = debug.format_time(ClockTime::NONE);
+        assert_eq!(formatted_none, "NONE");
+    }
+
+    #[test]
+    fn test_timestamp_debug_format_raw() {
+        let debug = TimestampDebug::new().with_format(TimestampFormat::Raw);
+
+        let time = ClockTime::from_nanos(1_234_567_890);
+        let formatted = debug.format_time(time);
+        assert_eq!(formatted, "1234567890ns");
+    }
+
+    #[test]
+    fn test_timestamp_debug_verbose() {
+        let debug = TimestampDebug::verbose();
+        assert_eq!(debug.format, TimestampFormat::Detailed);
+    }
+
+    #[test]
+    fn test_timestamp_debug_builder() {
+        let debug = TimestampDebug::new()
+            .with_name("video-debug")
+            .with_prefix("video:")
+            .with_format(TimestampFormat::Standard)
+            .with_log_level(TimestampDebugLevel::Sample(10));
+
+        assert_eq!(debug.name(), "video-debug");
+        assert_eq!(debug.prefix, "video:");
+        assert_eq!(debug.format, TimestampFormat::Standard);
+        assert!(matches!(debug.log_level, TimestampDebugLevel::Sample(10)));
     }
 }

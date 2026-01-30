@@ -139,8 +139,13 @@ impl<E: AudioEncoder> AudioEncoderElement<E> {
         }
     }
 
-    /// Convert encoded packet to output buffer.
-    fn packet_to_buffer(&self, data: Vec<u8>, pts: i64) -> Result<Buffer> {
+    /// Convert encoded packet to output buffer, preserving input metadata.
+    fn packet_to_buffer(
+        &self,
+        data: Vec<u8>,
+        pts: i64,
+        input_metadata: &crate::metadata::Metadata,
+    ) -> Result<Buffer> {
         self.arena.reclaim();
         let mut slot = self
             .arena
@@ -148,8 +153,27 @@ impl<E: AudioEncoder> AudioEncoderElement<E> {
             .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
         slot.data_mut()[..data.len()].copy_from_slice(&data);
 
-        let mut metadata = crate::metadata::Metadata::new();
+        // Preserve input metadata and update PTS
+        let mut metadata = input_metadata.clone();
         metadata.pts = crate::clock::ClockTime::from_nanos(pts as u64);
+
+        Ok(Buffer::new(
+            MemoryHandle::with_len(slot, data.len()),
+            metadata,
+        ))
+    }
+
+    /// Convert encoded packet to output buffer during flush (no input metadata).
+    fn packet_to_buffer_flush(&self, data: Vec<u8>, pts: i64) -> Result<Buffer> {
+        self.arena.reclaim();
+        let mut slot = self
+            .arena
+            .acquire()
+            .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+        slot.data_mut()[..data.len()].copy_from_slice(&data);
+
+        let metadata =
+            crate::metadata::Metadata::from_pts(crate::clock::ClockTime::from_nanos(pts as u64));
 
         Ok(Buffer::new(
             MemoryHandle::with_len(slot, data.len()),
@@ -162,6 +186,7 @@ impl<E: AudioEncoder + 'static> Transform for AudioEncoderElement<E> {
     fn transform(&mut self, buffer: Buffer) -> Result<Output> {
         // Convert buffer to samples
         let samples = self.buffer_to_samples(&buffer);
+        let input_metadata = buffer.metadata();
         let pts = if samples.pts != 0 {
             samples.pts
         } else {
@@ -181,11 +206,11 @@ impl<E: AudioEncoder + 'static> Transform for AudioEncoderElement<E> {
             return Ok(Output::None);
         }
 
-        // Convert packets to buffers
+        // Convert packets to buffers, preserving input metadata
         let mut buffers = Vec::with_capacity(packets.len());
         for packet in packets {
             let data = packet.as_ref().to_vec();
-            buffers.push(self.packet_to_buffer(data, pts)?);
+            buffers.push(self.packet_to_buffer(data, pts, input_metadata)?);
             self.packets_out += 1;
         }
 
@@ -200,7 +225,7 @@ impl<E: AudioEncoder + 'static> Transform for AudioEncoderElement<E> {
         // Check for pending packets from previous flush call
         if let Some((data, pts)) = self.pending_packets.pop_front() {
             self.packets_out += 1;
-            return Ok(Output::single(self.packet_to_buffer(data, pts)?));
+            return Ok(Output::single(self.packet_to_buffer_flush(data, pts)?));
         }
 
         // First flush call: get all remaining packets
@@ -218,7 +243,7 @@ impl<E: AudioEncoder + 'static> Transform for AudioEncoderElement<E> {
         match self.pending_packets.pop_front() {
             Some((data, pts)) => {
                 self.packets_out += 1;
-                Ok(Output::single(self.packet_to_buffer(data, pts)?))
+                Ok(Output::single(self.packet_to_buffer_flush(data, pts)?))
             }
             None => {
                 self.flushed = true;

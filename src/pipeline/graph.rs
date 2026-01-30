@@ -1,5 +1,6 @@
 //! Pipeline graph structure using daggy.
 
+use crate::clock::{Clock, ClockTime, PipelineClock};
 use crate::element::{
     AsyncElementDyn, DynAsyncElement, Element, ElementAdapter, ElementType, Pad,
     PipelineElementAdapter, SendPipelineElement, Sink, SinkAdapter, Source, SourceAdapter,
@@ -405,6 +406,8 @@ pub struct Pipeline {
     pool: Option<Arc<dyn BufferPool>>,
     /// Policy for automatic converter insertion.
     converter_policy: ConverterPolicy,
+    /// Pipeline clock for timing and synchronization.
+    clock: PipelineClock,
 }
 
 impl Pipeline {
@@ -418,7 +421,49 @@ impl Pipeline {
             negotiation: None,
             pool: None,
             converter_policy: ConverterPolicy::default(),
+            clock: PipelineClock::system(),
         }
+    }
+
+    /// Create a pipeline with a custom clock.
+    pub fn with_clock(clock: Arc<dyn Clock>) -> Self {
+        Self {
+            graph: Dag::new(),
+            nodes_by_name: HashMap::new(),
+            state: PipelineState::Suspended,
+            name_counter: 0,
+            negotiation: None,
+            pool: None,
+            converter_policy: ConverterPolicy::default(),
+            clock: PipelineClock::new(clock),
+        }
+    }
+
+    /// Get the pipeline clock.
+    pub fn clock(&self) -> &PipelineClock {
+        &self.clock
+    }
+
+    /// Get the current running time (time since pipeline started).
+    ///
+    /// Returns `ClockTime::NONE` if the pipeline has not been started.
+    pub fn running_time(&self) -> ClockTime {
+        self.clock.running_time()
+    }
+
+    /// Start the pipeline clock.
+    ///
+    /// This sets the base time to the current clock time.
+    /// Called automatically when the pipeline transitions to Running state.
+    pub fn start_clock(&self) {
+        self.clock.start();
+    }
+
+    /// Reset the pipeline clock.
+    ///
+    /// This clears the base time. Called when the pipeline is stopped.
+    pub fn reset_clock(&self) {
+        self.clock.reset();
     }
 
     /// Set the converter insertion policy.

@@ -104,8 +104,12 @@ impl<D: VideoDecoder> DecoderElement<D> {
         &mut self.decoder
     }
 
-    /// Convert VideoFrame to output buffer.
-    fn frame_to_buffer(&mut self, frame: VideoFrame) -> Result<Buffer> {
+    /// Convert VideoFrame to output buffer, preserving input metadata.
+    fn frame_to_buffer(
+        &mut self,
+        frame: VideoFrame,
+        input_metadata: &crate::metadata::Metadata,
+    ) -> Result<Buffer> {
         // Initialize arena on first use with frame size
         if self.arena.is_none() {
             self.arena = Some(
@@ -121,8 +125,55 @@ impl<D: VideoDecoder> DecoderElement<D> {
             .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
         slot.data_mut()[..frame.data.len()].copy_from_slice(&frame.data);
 
-        let mut metadata = crate::metadata::Metadata::new();
+        // Preserve input metadata and update PTS
+        let mut metadata = input_metadata.clone();
         metadata.pts = ClockTime::from_nanos(frame.pts as u64);
+        if frame.duration > 0 {
+            metadata.duration = ClockTime::from_nanos(frame.duration as u64);
+        }
+
+        // Store frame dimensions in metadata for downstream elements
+        metadata.set("video/width", frame.width);
+        metadata.set("video/height", frame.height);
+        metadata.set("video/format", format!("{:?}", frame.format));
+
+        Ok(Buffer::new(
+            MemoryHandle::with_len(slot, frame.data.len()),
+            metadata,
+        ))
+    }
+
+    /// Convert VideoFrame to output buffer during flush (no input metadata available).
+    fn frame_to_buffer_flush(&mut self, frame: VideoFrame) -> Result<Buffer> {
+        // During flush, we don't have input metadata, create minimal metadata
+        let metadata = crate::metadata::Metadata::from_pts(ClockTime::from_nanos(frame.pts as u64));
+        self.frame_to_buffer_with_metadata(frame, metadata)
+    }
+
+    /// Internal helper to convert frame with given metadata.
+    fn frame_to_buffer_with_metadata(
+        &mut self,
+        frame: VideoFrame,
+        mut metadata: crate::metadata::Metadata,
+    ) -> Result<Buffer> {
+        // Initialize arena on first use with frame size
+        if self.arena.is_none() {
+            self.arena = Some(
+                SharedArena::new(frame.data.len(), 16)
+                    .map_err(|e| Error::Element(format!("Failed to create arena: {}", e)))?,
+            );
+        }
+
+        let arena = self.arena.as_mut().unwrap();
+        arena.reclaim();
+        let mut slot = arena
+            .acquire()
+            .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+        slot.data_mut()[..frame.data.len()].copy_from_slice(&frame.data);
+
+        if frame.duration > 0 {
+            metadata.duration = ClockTime::from_nanos(frame.duration as u64);
+        }
 
         // Store frame dimensions in metadata for downstream elements
         metadata.set("video/width", frame.width);
@@ -139,6 +190,7 @@ impl<D: VideoDecoder> DecoderElement<D> {
 impl<D: VideoDecoder + 'static> Transform for DecoderElement<D> {
     fn transform(&mut self, buffer: Buffer) -> Result<Output> {
         let packet = buffer.as_bytes();
+        let input_metadata = buffer.metadata();
         self.packets_in += 1;
 
         // Decode packet
@@ -149,10 +201,10 @@ impl<D: VideoDecoder + 'static> Transform for DecoderElement<D> {
             return Ok(Output::None);
         }
 
-        // Convert frames to buffers
+        // Convert frames to buffers, preserving input metadata
         let mut buffers = Vec::with_capacity(frames.len());
         for frame in frames {
-            buffers.push(self.frame_to_buffer(frame)?);
+            buffers.push(self.frame_to_buffer(frame, input_metadata)?);
             self.frames_out += 1;
         }
 
@@ -167,7 +219,7 @@ impl<D: VideoDecoder + 'static> Transform for DecoderElement<D> {
         // Check for pending frames from previous flush call
         if let Some(frame) = self.pending_frames.pop_front() {
             self.frames_out += 1;
-            return Ok(Output::single(self.frame_to_buffer(frame)?));
+            return Ok(Output::single(self.frame_to_buffer_flush(frame)?));
         }
 
         // First flush call: get all remaining frames
@@ -184,7 +236,7 @@ impl<D: VideoDecoder + 'static> Transform for DecoderElement<D> {
         match self.pending_frames.pop_front() {
             Some(frame) => {
                 self.frames_out += 1;
-                Ok(Output::single(self.frame_to_buffer(frame)?))
+                Ok(Output::single(self.frame_to_buffer_flush(frame)?))
             }
             None => {
                 self.flushed = true;

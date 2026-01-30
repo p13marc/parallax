@@ -39,6 +39,8 @@
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::PathBuf;
 
+use std::sync::atomic::{AtomicI64, Ordering};
+
 use v4l::buffer::Type;
 use v4l::io::mmap::Stream as MmapStream;
 use v4l::io::traits::CaptureStream;
@@ -46,6 +48,7 @@ use v4l::prelude::*;
 use v4l::video::Capture;
 
 use crate::buffer::{Buffer, DmaBufBuffer, MemoryHandle};
+use crate::clock::ClockTime;
 use crate::element::{Affinity, ExecutionHints, ProduceContext, ProduceResult, Source};
 use crate::error::Result;
 use crate::format::{
@@ -226,9 +229,39 @@ pub struct V4l2Src {
     flow_state: Option<FlowStateHandle>,
     /// Frames dropped due to backpressure.
     frames_dropped: u64,
+    /// First V4L2 timestamp in microseconds (for relative PTS calculation).
+    /// i64::MIN indicates "not yet set".
+    first_timestamp_usec: AtomicI64,
+}
+
+/// Convert a V4L2 timestamp to microseconds since epoch.
+fn v4l2_timestamp_to_usec(ts: &v4l::timestamp::Timestamp) -> i64 {
+    ts.sec as i64 * 1_000_000 + ts.usec as i64
 }
 
 impl V4l2Src {
+    /// Calculate relative PTS from a V4L2 timestamp.
+    ///
+    /// V4L2 provides absolute timestamps (usually CLOCK_MONOTONIC).
+    /// We convert to relative time from the first captured frame.
+    fn calculate_pts(&self, ts: &v4l::timestamp::Timestamp) -> ClockTime {
+        let current_usec = v4l2_timestamp_to_usec(ts);
+
+        // Try to set the first timestamp atomically (only first frame sets it)
+        let _ = self.first_timestamp_usec.compare_exchange(
+            i64::MIN,
+            current_usec,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+
+        let first_usec = self.first_timestamp_usec.load(Ordering::SeqCst);
+        let relative_usec = (current_usec - first_usec).max(0) as u64;
+
+        // Convert microseconds to nanoseconds
+        ClockTime::from_nanos(relative_usec * 1000)
+    }
+
     /// Create a capture source for the given device path.
     pub fn new(device_path: &str) -> Result<Self> {
         Self::with_config(device_path, V4l2Config::default())
@@ -303,6 +336,7 @@ impl V4l2Src {
             exported_sizes,
             flow_state: None,
             frames_dropped: 0,
+            first_timestamp_usec: AtomicI64::new(i64::MIN),
         })
     }
 
@@ -514,6 +548,13 @@ impl Source for V4l2Src {
             let (_buffer, meta) = stream.next().map_err(DeviceError::V4l2)?;
             let buffer_index = (meta.sequence as usize) % self.exported_fds.len();
 
+            // Copy timestamp info before releasing the borrow
+            let timestamp = meta.timestamp;
+            let sequence = meta.sequence;
+
+            // Calculate PTS from V4L2 timestamp
+            let pts = self.calculate_pts(&timestamp);
+
             // Clone the fd so the segment owns it (we keep the original for reuse)
             let fd = self.exported_fds[buffer_index]
                 .try_clone()
@@ -522,9 +563,11 @@ impl Source for V4l2Src {
             let size = self.exported_sizes[buffer_index];
             let segment = DmaBufSegment::from_fd(fd, size)?;
 
+            let mut metadata = Metadata::new().with_pts(pts);
+            metadata.sequence = sequence as u64;
+
             return Ok(ProduceResult::OwnDmaBuf(DmaBufBuffer::new(
-                segment,
-                Metadata::new(),
+                segment, metadata,
             )));
         }
 
@@ -542,8 +585,16 @@ impl Source for V4l2Src {
             .ok_or_else(|| DeviceError::NotFound("device closed".to_string()))?;
 
         // Capture a frame
-        let (buffer, _meta) = stream.next().map_err(DeviceError::V4l2)?;
+        let (buffer, meta) = stream.next().map_err(DeviceError::V4l2)?;
         let len = buffer.len();
+
+        // Copy timestamp info and frame data before releasing the borrow
+        let timestamp = meta.timestamp;
+        let sequence = meta.sequence;
+        let frame_data: Vec<u8> = buffer.to_vec();
+
+        // Calculate PTS from V4L2 timestamp (after releasing stream borrow)
+        let pts = self.calculate_pts(&timestamp);
 
         if !ctx.has_buffer() || len > ctx.capacity() {
             // No buffer provided or buffer too small, return our own buffer from arena
@@ -554,17 +605,19 @@ impl Source for V4l2Src {
                 .acquire()
                 .ok_or_else(|| crate::error::Error::Element("V4L2 arena exhausted".to_string()))?;
 
-            slot.data_mut()[..len].copy_from_slice(buffer);
+            slot.data_mut()[..len].copy_from_slice(&frame_data);
 
             let handle = MemoryHandle::with_len(slot, len);
 
-            return Ok(ProduceResult::OwnBuffer(Buffer::new(
-                handle,
-                Metadata::new(),
-            )));
+            let mut metadata = Metadata::new().with_pts(pts);
+            metadata.sequence = sequence as u64;
+
+            return Ok(ProduceResult::OwnBuffer(Buffer::new(handle, metadata)));
         }
 
-        ctx.output()[..len].copy_from_slice(buffer);
+        ctx.output()[..len].copy_from_slice(&frame_data);
+        ctx.set_pts(pts);
+        ctx.set_sequence(sequence as u64);
 
         Ok(ProduceResult::Produced(len))
     }

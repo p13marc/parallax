@@ -397,6 +397,118 @@ impl Source for MyLiveSource {
 
 See `examples/47_flow_control.rs` for a complete example.
 
+### Clock System and Timestamps
+
+Parallax provides a clock system for accurate timing and A/V synchronization, inspired by GStreamer and PipeWire.
+
+**Key types:**
+- `ClockTime` - Nanosecond-precision timestamp with `NONE` sentinel for unset values
+- `Clock` trait - Time source providing `now()`, `flags()`, `resolution()`, `name()`
+- `ClockProvider` trait - Elements that can provide clocks (e.g., audio sinks)
+- `PipelineClock` - Pipeline-level clock with base time for running time calculation
+
+**ClockTime usage:**
+```rust
+use parallax::clock::ClockTime;
+
+// Create timestamps
+let pts = ClockTime::from_nanos(1_000_000_000);  // 1 second
+let pts = ClockTime::from_millis(1000);          // 1 second
+let pts = ClockTime::from_secs(1);               // 1 second
+
+// Special values
+let none = ClockTime::NONE;  // Unset/invalid timestamp
+let zero = ClockTime::ZERO;  // Valid zero timestamp
+
+// Arithmetic (saturating)
+let later = pts + ClockTime::from_millis(500);
+let earlier = pts - ClockTime::from_millis(500);
+
+// Conversions
+let nanos: u64 = pts.nanos();
+let millis: u64 = pts.millis();
+let duration: std::time::Duration = pts.into();
+```
+
+**Hardware timestamp extraction:**
+
+Device sources automatically extract hardware timestamps when available:
+
+| Source | Timestamp Source | Fallback |
+|--------|-----------------|----------|
+| `ScreenCaptureSrc` | PipeWire `spa_meta_header.pts` | System monotonic clock |
+| `V4l2Src` | V4L2 `v4l2_buffer.timestamp` | None (always available) |
+| `AlsaSrc` | ALSA `pcm.status().get_htstamp()` | Sample count calculation |
+
+**Timestamp flow through pipeline:**
+
+Buffers carry PTS (Presentation Timestamp) in their metadata:
+```rust
+use parallax::metadata::Metadata;
+use parallax::clock::ClockTime;
+
+// Source sets PTS
+let mut metadata = Metadata::new();
+metadata.pts = ClockTime::from_nanos(hardware_timestamp);
+
+// Transforms MUST preserve metadata
+impl Element for MyTransform {
+    fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
+        // Clone metadata to preserve PTS, flags, custom data
+        let metadata = buffer.metadata().clone();
+        
+        // ... transform data ...
+        
+        Ok(Some(Buffer::new(new_handle, metadata)))
+    }
+}
+```
+
+**Timestamp debugging:**
+
+Use `TimestampDebug` to inspect timestamp flow:
+```rust
+use parallax::elements::TimestampDebug;
+use parallax::elements::transform::{TimestampFormat, TimestampDebugLevel};
+
+// Basic logging to stderr
+let debug = TimestampDebug::new();
+
+// Verbose with all fields
+let debug = TimestampDebug::verbose();
+
+// Only log anomalies (backwards PTS, discontinuities)
+let debug = TimestampDebug::new()
+    .with_log_level(TimestampDebugLevel::Warnings);
+
+// Silent stats collection
+let debug = TimestampDebug::silent();
+
+// After pipeline run, check stats
+let stats = debug.stats();
+println!("Buffers: {}", stats.buffer_count);
+println!("Missing PTS: {}", stats.missing_pts_count);
+println!("Backwards PTS: {}", stats.backwards_pts_count);
+println!("Avg interval: {:?}ns", stats.avg_interval_ns);
+```
+
+**Clock access in sources:**
+
+Sources can access the pipeline clock via `ProduceContext`:
+```rust
+impl Source for MySource {
+    fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
+        // Get pipeline clock (if started)
+        if let Some(clock) = ctx.clock() {
+            let now = clock.now();
+            // Use clock for timing decisions
+        }
+        
+        // ... produce buffer ...
+    }
+}
+```
+
 ### Muxer Synchronization (N-to-1)
 
 Parallax provides PTS-based synchronization for N-to-1 muxer elements:

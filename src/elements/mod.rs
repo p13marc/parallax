@@ -154,7 +154,8 @@ pub use transform::{
     DuplicateFilter, DuplicateFilterStats, ExtractedMetadata, Filter, FilterMap, FilterStats,
     FlatMap, Map, MetadataExtract, MetadataFilter, MetadataInject, RangeFilter, RangeFilterStats,
     RegexFilter, RegexFilterStats, SampleFilter, SampleMode, ScaleMode, SequenceNumber,
-    TimestampMode, Timestamper, Unbatch, UnbatchStats, VideoScale,
+    TimestampDebug, TimestampDebugLevel, TimestampDebugStats, TimestampFormat, TimestampMode,
+    Timestamper, Unbatch, UnbatchStats, VideoScale,
 };
 
 // App integration

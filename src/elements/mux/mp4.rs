@@ -1141,8 +1141,17 @@ impl Element for Mp4MuxTransform {
         // Convert from Annex-B to AVCC format
         let avcc_data = Mp4FileSink::annex_b_to_avcc(data);
 
-        // Calculate PTS and duration
-        let pts_ms = self.frame_count * self.frame_duration_ms;
+        // Use buffer PTS if available, otherwise calculate from frame count
+        // This ensures proper timing when frames are dropped or arrive at variable rate
+        let pts_ms = {
+            let buffer_pts = buffer.metadata().pts;
+            if buffer_pts.is_some() && buffer_pts.millis() > 0 {
+                buffer_pts.millis()
+            } else {
+                // Fallback: calculate from frame count (for sources without PTS)
+                self.frame_count * self.frame_duration_ms
+            }
+        };
         let duration_ms = self.frame_duration_ms as u32;
 
         // Write sample
@@ -1150,7 +1159,11 @@ impl Element for Mp4MuxTransform {
         self.frame_count += 1;
 
         if self.frame_count % 30 == 0 {
-            tracing::debug!("MP4 mux: {} frames buffered", self.frame_count);
+            tracing::debug!(
+                "MP4 mux: {} frames buffered, last pts={}ms",
+                self.frame_count,
+                pts_ms
+            );
         }
 
         // Don't output anything during processing - MP4 requires all data for moov

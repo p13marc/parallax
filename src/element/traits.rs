@@ -4,12 +4,14 @@
 #![allow(missing_docs)]
 
 use crate::buffer::Buffer;
+use crate::clock::{Clock, ClockTime};
 use crate::element::context::{ConsumeContext, ProduceContext, ProduceResult};
 use crate::error::Result;
 use crate::event::{Event, EventResult};
 use crate::format::{Caps, ElementMediaCaps};
 use dynosaur::dynosaur;
 use smallvec::SmallVec;
+use std::sync::Arc;
 
 // ============================================================================
 // Scheduling Affinity
@@ -1687,6 +1689,18 @@ pub trait AsyncElementDyn {
     fn process_source(&mut self) -> impl std::future::Future<Output = Result<SourceResult>> + Send {
         async { Ok(SourceResult::Eos) }
     }
+
+    /// Set the pipeline clock for this element.
+    ///
+    /// Called by the executor when starting the pipeline to provide
+    /// source elements with access to the pipeline clock. Sources can
+    /// use this to calculate running time from their hardware timestamps.
+    ///
+    /// Default implementation does nothing. Source adapters override this
+    /// to pass the clock to `ProduceContext`.
+    fn set_clock(&mut self, _clock: Arc<dyn Clock>, _base_time: ClockTime) {
+        // Default: do nothing
+    }
 }
 
 // ============================================================================
@@ -1708,6 +1722,10 @@ pub struct SourceAdapter<S: Source> {
     arena: Option<crate::memory::SharedArena>,
     /// Buffer pool for high-level pool API with backpressure.
     pool: Option<std::sync::Arc<dyn crate::memory::BufferPool>>,
+    /// Pipeline clock for timestamp calculation.
+    clock: Option<Arc<dyn Clock>>,
+    /// Base time for running time calculation.
+    base_time: ClockTime,
 }
 
 impl<S: Source> SourceAdapter<S> {
@@ -1717,6 +1735,8 @@ impl<S: Source> SourceAdapter<S> {
             inner: source,
             arena: None,
             pool: None,
+            clock: None,
+            base_time: ClockTime::ZERO,
         }
     }
 
@@ -1726,6 +1746,8 @@ impl<S: Source> SourceAdapter<S> {
             inner: source,
             arena: Some(arena),
             pool: None,
+            clock: None,
+            base_time: ClockTime::ZERO,
         }
     }
 
@@ -1735,6 +1757,8 @@ impl<S: Source> SourceAdapter<S> {
             inner: source,
             arena: None,
             pool: Some(pool),
+            clock: None,
+            base_time: ClockTime::ZERO,
         }
     }
 
@@ -1888,11 +1912,19 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
     }
 
     async fn process_source(&mut self) -> Result<SourceResult> {
+        // Helper to configure clock on context
+        let configure_clock = |ctx: &mut ProduceContext| {
+            if let Some(ref clock) = self.clock {
+                ctx.set_clock(clock.clone(), self.base_time);
+            }
+        };
+
         // This implementation properly distinguishes WouldBlock from Eos
         if let Some(pool) = &self.pool {
             if let Some(arena) = &self.arena {
                 if let Some(slot) = arena.acquire() {
                     let mut ctx = ProduceContext::with_pool(slot, pool.as_ref());
+                    configure_clock(&mut ctx);
                     match self.inner.produce(&mut ctx)? {
                         ProduceResult::Produced(n) => Ok(SourceResult::Buffer(ctx.finalize(n))),
                         ProduceResult::Eos => Ok(SourceResult::Eos),
@@ -1904,6 +1936,7 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
                     }
                 } else {
                     let mut ctx = ProduceContext::with_pool_only(pool.as_ref());
+                    configure_clock(&mut ctx);
                     match self.inner.produce(&mut ctx)? {
                         ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(buffer)),
                         ProduceResult::OwnDmaBuf(_) => Err(crate::error::Error::BufferPool(
@@ -1918,6 +1951,7 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
                 }
             } else {
                 let mut ctx = ProduceContext::with_pool_only(pool.as_ref());
+                configure_clock(&mut ctx);
                 match self.inner.produce(&mut ctx)? {
                     ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(buffer)),
                     ProduceResult::OwnDmaBuf(_) => Err(crate::error::Error::BufferPool(
@@ -1933,6 +1967,7 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
         } else if let Some(arena) = &self.arena {
             if let Some(slot) = arena.acquire() {
                 let mut ctx = ProduceContext::new(slot);
+                configure_clock(&mut ctx);
                 match self.inner.produce(&mut ctx)? {
                     ProduceResult::Produced(n) => Ok(SourceResult::Buffer(ctx.finalize(n))),
                     ProduceResult::Eos => Ok(SourceResult::Eos),
@@ -1944,6 +1979,7 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
                 }
             } else {
                 let mut ctx = ProduceContext::without_buffer();
+                configure_clock(&mut ctx);
                 match self.inner.produce(&mut ctx)? {
                     ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(buffer)),
                     ProduceResult::OwnDmaBuf(_) => Err(crate::error::Error::BufferPool(
@@ -1958,6 +1994,7 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
             }
         } else {
             let mut ctx = ProduceContext::without_buffer();
+            configure_clock(&mut ctx);
             match self.inner.produce(&mut ctx)? {
                 ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(buffer)),
                 ProduceResult::OwnDmaBuf(_) => Err(crate::error::Error::BufferPool(
@@ -1970,6 +2007,11 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
                 )),
             }
         }
+    }
+
+    fn set_clock(&mut self, clock: Arc<dyn Clock>, base_time: ClockTime) {
+        self.clock = Some(clock);
+        self.base_time = base_time;
     }
 }
 
@@ -2301,6 +2343,10 @@ pub struct AsyncSourceAdapter<S: AsyncSource> {
     inner: S,
     /// Arena for pre-allocated buffers (uses SharedArena for cross-process support).
     arena: Option<crate::memory::SharedArena>,
+    /// Pipeline clock for timestamp calculation.
+    clock: Option<Arc<dyn Clock>>,
+    /// Base time for running time calculation.
+    base_time: ClockTime,
 }
 
 impl<S: AsyncSource> AsyncSourceAdapter<S> {
@@ -2309,6 +2355,8 @@ impl<S: AsyncSource> AsyncSourceAdapter<S> {
         Self {
             inner: source,
             arena: None,
+            clock: None,
+            base_time: ClockTime::ZERO,
         }
     }
 
@@ -2317,6 +2365,8 @@ impl<S: AsyncSource> AsyncSourceAdapter<S> {
         Self {
             inner: source,
             arena: Some(arena),
+            clock: None,
+            base_time: ClockTime::ZERO,
         }
     }
 
@@ -2416,10 +2466,18 @@ impl<S: AsyncSource + Send + 'static> SendAsyncElementDyn for AsyncSourceAdapter
     }
 
     async fn process_source(&mut self) -> Result<SourceResult> {
+        // Helper to configure clock on context
+        let configure_clock = |ctx: &mut ProduceContext| {
+            if let Some(ref clock) = self.clock {
+                ctx.set_clock(clock.clone(), self.base_time);
+            }
+        };
+
         // This implementation properly distinguishes WouldBlock from Eos
         if let Some(arena) = &self.arena {
             if let Some(slot) = arena.acquire() {
                 let mut ctx = ProduceContext::new(slot);
+                configure_clock(&mut ctx);
                 match self.inner.produce(&mut ctx).await? {
                     ProduceResult::Produced(n) => Ok(SourceResult::Buffer(ctx.finalize(n))),
                     ProduceResult::Eos => Ok(SourceResult::Eos),
@@ -2431,6 +2489,7 @@ impl<S: AsyncSource + Send + 'static> SendAsyncElementDyn for AsyncSourceAdapter
                 }
             } else {
                 let mut ctx = ProduceContext::without_buffer();
+                configure_clock(&mut ctx);
                 match self.inner.produce(&mut ctx).await? {
                     ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(buffer)),
                     ProduceResult::OwnDmaBuf(_) => Err(crate::error::Error::BufferPool(
@@ -2445,6 +2504,7 @@ impl<S: AsyncSource + Send + 'static> SendAsyncElementDyn for AsyncSourceAdapter
             }
         } else {
             let mut ctx = ProduceContext::without_buffer();
+            configure_clock(&mut ctx);
             match self.inner.produce(&mut ctx).await? {
                 ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(buffer)),
                 ProduceResult::OwnDmaBuf(_) => Err(crate::error::Error::BufferPool(
@@ -2457,6 +2517,11 @@ impl<S: AsyncSource + Send + 'static> SendAsyncElementDyn for AsyncSourceAdapter
                 )),
             }
         }
+    }
+
+    fn set_clock(&mut self, clock: Arc<dyn Clock>, base_time: ClockTime) {
+        self.clock = Some(clock);
+        self.base_time = base_time;
     }
 }
 

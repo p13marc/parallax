@@ -74,7 +74,10 @@ pub use filter::{Filter, FilterStats, MetadataFilter, SampleFilter, SampleMode};
 pub use buffer_ops::{BufferPad, BufferPadStats, BufferSlice, BufferTrim, BufferTrimStats};
 
 // Metadata operations
-pub use metadata_ops::{MetadataInject, SequenceNumber, TimestampMode, Timestamper};
+pub use metadata_ops::{
+    MetadataInject, SequenceNumber, TimestampDebug, TimestampDebugLevel, TimestampDebugStats,
+    TimestampFormat, TimestampMode, Timestamper,
+};
 
 // Data processing
 pub use data_processing::{
