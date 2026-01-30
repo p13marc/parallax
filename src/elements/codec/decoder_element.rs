@@ -128,9 +128,7 @@ impl<D: VideoDecoder> DecoderElement<D> {
         // Preserve input metadata and update PTS
         let mut metadata = input_metadata.clone();
         metadata.pts = ClockTime::from_nanos(frame.pts as u64);
-        if frame.duration > 0 {
-            metadata.duration = ClockTime::from_nanos(frame.duration as u64);
-        }
+        // Note: VideoFrame doesn't have duration, it's preserved from input metadata
 
         // Store frame dimensions in metadata for downstream elements
         metadata.set("video/width", frame.width);
@@ -171,9 +169,7 @@ impl<D: VideoDecoder> DecoderElement<D> {
             .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
         slot.data_mut()[..frame.data.len()].copy_from_slice(&frame.data);
 
-        if frame.duration > 0 {
-            metadata.duration = ClockTime::from_nanos(frame.duration as u64);
-        }
+        // Note: VideoFrame doesn't have duration, it's preserved from input metadata
 
         // Store frame dimensions in metadata for downstream elements
         metadata.set("video/width", frame.width);
