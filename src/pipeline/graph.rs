@@ -1133,6 +1133,60 @@ impl Pipeline {
         self.nodes_by_name.get(name).copied()
     }
 
+    /// Get a reference to an element by name, downcasting to the concrete type.
+    ///
+    /// This enables GStreamer-like element retrieval after pipeline creation:
+    ///
+    /// ```rust,ignore
+    /// use parallax::pipeline::Pipeline;
+    /// use parallax::elements::io::FileSrc;
+    ///
+    /// let mut pipeline = Pipeline::new();
+    /// let src = pipeline.add_source("filesrc", FileSrc::new("input.bin"));
+    /// // ... later ...
+    /// if let Some(filesrc) = pipeline.get_element::<FileSrc>("filesrc") {
+    ///     println!("Reading from: {}", filesrc.path());
+    /// }
+    /// ```
+    ///
+    /// Returns `None` if:
+    /// - No element with that name exists
+    /// - The element has been taken for execution
+    /// - The element type doesn't match `T`
+    pub fn get_element<T: 'static>(&self, name: &str) -> Option<&T> {
+        let node_id = self.get_node_id(name)?;
+        let node = self.get_node(node_id)?;
+        let element = node.element.as_ref()?;
+        element.as_any().downcast_ref::<T>()
+    }
+
+    /// Get a mutable reference to an element by name, downcasting to the concrete type.
+    ///
+    /// This enables modifying element properties after pipeline creation:
+    ///
+    /// ```rust,ignore
+    /// use parallax::pipeline::Pipeline;
+    /// use parallax::elements::io::FileSrc;
+    ///
+    /// let mut pipeline = Pipeline::new();
+    /// let src = pipeline.add_source("filesrc", FileSrc::new("input.bin"));
+    /// // ... later ...
+    /// if let Some(filesrc) = pipeline.get_element_mut::<FileSrc>("filesrc") {
+    ///     filesrc.set_path("other.bin");
+    /// }
+    /// ```
+    ///
+    /// Returns `None` if:
+    /// - No element with that name exists
+    /// - The element has been taken for execution
+    /// - The element type doesn't match `T`
+    pub fn get_element_mut<T: 'static>(&mut self, name: &str) -> Option<&mut T> {
+        let node_id = self.get_node_id(name)?;
+        let node = self.get_node_mut(node_id)?;
+        let element = node.element.as_mut()?;
+        element.as_any_mut().downcast_mut::<T>()
+    }
+
     /// Link two nodes with default pad names.
     ///
     /// Creates an edge from `src` to `sink` using the default "src" and "sink" pads.
@@ -3195,6 +3249,56 @@ mod tests {
         assert_eq!(
             formats,
             vec![PixelFormat::Yuyv, PixelFormat::Rgb24, PixelFormat::I420]
+        );
+    }
+
+    #[test]
+    fn test_get_element_downcast() {
+        // Test that we can retrieve and downcast elements by name
+        let mut pipeline = Pipeline::new();
+
+        // Add a source element
+        let _src = pipeline.add_source("testsrc", TestSource);
+
+        // Test successful downcast
+        let element = pipeline.get_element::<TestSource>("testsrc");
+        assert!(
+            element.is_some(),
+            "Should be able to get TestSource element"
+        );
+
+        // Test failed downcast (wrong type)
+        let wrong_type = pipeline.get_element::<TestSink>("testsrc");
+        assert!(
+            wrong_type.is_none(),
+            "Should fail to downcast to wrong type"
+        );
+
+        // Test non-existent element
+        let missing = pipeline.get_element::<TestSource>("nonexistent");
+        assert!(missing.is_none(), "Should return None for missing element");
+    }
+
+    #[test]
+    fn test_get_element_mut_downcast() {
+        // Test mutable element retrieval
+        let mut pipeline = Pipeline::new();
+
+        // Add a sink element
+        let _sink = pipeline.add_sink("testsink", TestSink);
+
+        // Get mutable reference
+        let element = pipeline.get_element_mut::<TestSink>("testsink");
+        assert!(
+            element.is_some(),
+            "Should be able to get mutable TestSink element"
+        );
+
+        // Test failed downcast (wrong type)
+        let wrong_type = pipeline.get_element_mut::<TestSource>("testsink");
+        assert!(
+            wrong_type.is_none(),
+            "Should fail to downcast to wrong type"
         );
     }
 }

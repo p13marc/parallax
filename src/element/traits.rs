@@ -11,6 +11,7 @@ use crate::event::{Event, EventResult};
 use crate::format::{Caps, ElementMediaCaps};
 use dynosaur::dynosaur;
 use smallvec::SmallVec;
+use std::any::Any;
 use std::sync::Arc;
 
 // ============================================================================
@@ -1701,6 +1702,23 @@ pub trait AsyncElementDyn {
     fn set_clock(&mut self, _clock: Arc<dyn Clock>, _base_time: ClockTime) {
         // Default: do nothing
     }
+
+    /// Get the inner element as `&dyn Any` for downcasting.
+    ///
+    /// This enables GStreamer-like element retrieval after pipeline creation:
+    ///
+    /// ```rust,ignore
+    /// let pipeline = Pipeline::parse("filesrc location=test.bin ! sink")?;
+    /// if let Some(filesrc) = pipeline.get_element::<FileSrc>("filesrc0") {
+    ///     filesrc.set_location("other.bin");
+    /// }
+    /// ```
+    ///
+    /// Adapters must implement this to return the inner element type.
+    fn as_any(&self) -> &dyn Any;
+
+    /// Get the inner element as `&mut dyn Any` for mutable downcasting.
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
 // ============================================================================
@@ -2013,6 +2031,14 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
         self.clock = Some(clock);
         self.base_time = base_time;
     }
+
+    fn as_any(&self) -> &dyn Any {
+        &self.inner
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        &mut self.inner
+    }
 }
 
 /// Wrapper to adapt a sync [`Sink`] to [`AsyncElementDyn`].
@@ -2078,6 +2104,14 @@ impl<S: Sink + Send + 'static> SendAsyncElementDyn for SinkAdapter<S> {
 
     fn execution_hints(&self) -> ExecutionHints {
         self.inner.execution_hints()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        &self.inner
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        &mut self.inner
     }
 }
 
@@ -2146,6 +2180,14 @@ impl<E: Element + Send + 'static> SendAsyncElementDyn for ElementAdapter<E> {
     async fn flush(&mut self) -> Result<Output> {
         self.inner.flush().map(Output::from)
     }
+
+    fn as_any(&self) -> &dyn Any {
+        &self.inner
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        &mut self.inner
+    }
 }
 
 /// Wrapper to adapt a boxed [`Element`] trait object to [`AsyncElementDyn`].
@@ -2207,6 +2249,16 @@ impl SendAsyncElementDyn for BoxedElementAdapter {
 
     async fn flush(&mut self) -> Result<Output> {
         self.inner.flush().map(Output::from)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        // BoxedElementAdapter contains a trait object, not a concrete type.
+        // We return self since the original type is not recoverable.
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 
@@ -2315,6 +2367,14 @@ impl<T: Transform + Send + 'static> SendAsyncElementDyn for TransformAdapter<T> 
             Output::Multiple(v) => all.extend(v),
         }
         Ok(Output::from(all))
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        &self.inner
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        &mut self.inner
     }
 }
 
@@ -2523,6 +2583,14 @@ impl<S: AsyncSource + Send + 'static> SendAsyncElementDyn for AsyncSourceAdapter
         self.clock = Some(clock);
         self.base_time = base_time;
     }
+
+    fn as_any(&self) -> &dyn Any {
+        &self.inner
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        &mut self.inner
+    }
 }
 
 /// Wrapper to adapt an [`AsyncSink`] to [`AsyncElementDyn`].
@@ -2588,6 +2656,14 @@ impl<S: AsyncSink + Send + 'static> SendAsyncElementDyn for AsyncSinkAdapter<S> 
 
     fn execution_hints(&self) -> ExecutionHints {
         self.inner.execution_hints()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        &self.inner
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        &mut self.inner
     }
 }
 
@@ -2686,6 +2762,14 @@ impl<T: AsyncTransform + Send + 'static> SendAsyncElementDyn for AsyncTransformA
             Output::Multiple(v) => all.extend(v),
         }
         Ok(Output::from(all))
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        &self.inner
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        &mut self.inner
     }
 }
 
@@ -2809,6 +2893,14 @@ impl<D: Demuxer + Send + 'static> SendAsyncElementDyn for DemuxerAdapter<D> {
     fn execution_hints(&self) -> ExecutionHints {
         self.inner.execution_hints()
     }
+
+    fn as_any(&self) -> &dyn Any {
+        &self.inner
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        &mut self.inner
+    }
 }
 
 /// Wrapper to adapt a [`Muxer`] to [`AsyncElementDyn`].
@@ -2911,6 +3003,14 @@ impl<M: Muxer + Send + 'static> SendAsyncElementDyn for MuxerAdapter<M> {
 
     fn execution_hints(&self) -> ExecutionHints {
         self.inner.execution_hints()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        &self.inner
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        &mut self.inner
     }
 }
 

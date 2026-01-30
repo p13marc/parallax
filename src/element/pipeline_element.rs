@@ -48,6 +48,7 @@ use crate::buffer::Buffer;
 use crate::error::Result;
 use crate::event::{Event, EventResult};
 use crate::format::Caps;
+use std::any::Any;
 
 use super::traits::{Affinity, ElementType, ExecutionHints};
 
@@ -906,6 +907,14 @@ impl<T: SendPipelineElement + 'static> super::traits::SendAsyncElementDyn
 
     fn handle_upstream_event(&mut self, event: &Event) -> EventResult {
         self.inner.handle_upstream_event(event)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        &self.inner
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        &mut self.inner
     }
 }
 
