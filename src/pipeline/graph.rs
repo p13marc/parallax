@@ -1,6 +1,6 @@
 //! Pipeline graph structure using daggy.
 
-use crate::clock::{Clock, ClockTime, PipelineClock};
+use crate::clock::{Clock, ClockProvider, ClockTime, PipelineClock};
 use crate::element::{
     AsyncElementDyn, DynAsyncElement, Element, ElementAdapter, ElementType, Pad,
     PipelineElementAdapter, SendPipelineElement, Sink, SinkAdapter, Source, SourceAdapter,
@@ -464,6 +464,49 @@ impl Pipeline {
     /// This clears the base time. Called when the pipeline is stopped.
     pub fn reset_clock(&self) {
         self.clock.reset();
+    }
+
+    /// Set the pipeline clock from a clock provider.
+    ///
+    /// This allows using a hardware clock (e.g., from an audio device) as the
+    /// pipeline's time base for accurate A/V synchronization.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use parallax::clock::ClockProvider;
+    ///
+    /// let audio_sink = AlsaSink::new("default", format)?;
+    /// if let Some(clock) = audio_sink.provide_clock() {
+    ///     pipeline.set_clock(clock);
+    /// }
+    /// ```
+    ///
+    /// # Note
+    ///
+    /// The clock should be set before starting the pipeline. Setting the clock
+    /// while the pipeline is running may cause timing discontinuities.
+    pub fn set_clock(&mut self, clock: Arc<dyn Clock>) {
+        self.clock = PipelineClock::new(clock);
+    }
+
+    /// Use the clock from a clock provider if available.
+    ///
+    /// Returns `true` if a clock was provided and set, `false` otherwise.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let audio_sink = AlsaSink::new("default", format)?;
+    /// pipeline.use_clock_from(&audio_sink);
+    /// ```
+    pub fn use_clock_from(&mut self, provider: &dyn ClockProvider) -> bool {
+        if let Some(clock) = provider.provide_clock() {
+            self.clock = PipelineClock::new(clock);
+            true
+        } else {
+            false
+        }
     }
 
     /// Set the converter insertion policy.

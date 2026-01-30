@@ -268,3 +268,151 @@ async fn test_clock_provided_to_source() {
         "Clock should be available in ProduceContext"
     );
 }
+
+/// Test that a custom clock can be set on a pipeline.
+#[tokio::test]
+async fn test_custom_clock_on_pipeline() {
+    use parallax::clock::{Clock, ClockFlags};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A test clock with controllable time.
+    struct TestClock {
+        time_nanos: AtomicU64,
+    }
+
+    impl TestClock {
+        fn new() -> Self {
+            Self {
+                time_nanos: AtomicU64::new(0),
+            }
+        }
+
+        fn advance(&self, nanos: u64) {
+            self.time_nanos.fetch_add(nanos, Ordering::SeqCst);
+        }
+    }
+
+    impl Clock for TestClock {
+        fn now(&self) -> ClockTime {
+            ClockTime::from_nanos(self.time_nanos.load(Ordering::SeqCst))
+        }
+
+        fn flags(&self) -> ClockFlags {
+            ClockFlags::CAN_BE_MASTER
+        }
+
+        fn resolution(&self) -> u64 {
+            1 // 1 nanosecond resolution
+        }
+
+        fn name(&self) -> &str {
+            "test-clock"
+        }
+    }
+
+    let clock = Arc::new(TestClock::new());
+    let clock_clone = clock.clone();
+
+    // Verify clock starts at 0
+    assert_eq!(clock.now(), ClockTime::ZERO);
+
+    // Advance clock
+    clock.advance(1_000_000_000); // 1 second
+    assert_eq!(clock.now(), ClockTime::from_secs(1));
+
+    // Use custom clock in pipeline
+    let mut pipeline = Pipeline::with_clock(clock_clone);
+
+    let src = pipeline.add_source("src", parallax::elements::NullSource::new(5));
+    let sink = pipeline.add_sink("sink", parallax::elements::NullSink::new());
+    pipeline.link(src, sink).unwrap();
+
+    let executor = Executor::new();
+    executor.run(&mut pipeline).await.unwrap();
+
+    // Clock should still be accessible after pipeline run
+    assert!(clock.now().nanos() >= 1_000_000_000);
+}
+
+/// Test ClockFlags bitwise operations.
+#[test]
+fn test_clock_flags_operations() {
+    use parallax::clock::ClockFlags;
+
+    // Test individual flags
+    assert!(ClockFlags::CAN_BE_MASTER.contains(ClockFlags::CAN_BE_MASTER));
+    assert!(!ClockFlags::CAN_BE_MASTER.contains(ClockFlags::HARDWARE));
+
+    // Test combining flags with |
+    let combined = ClockFlags::CAN_BE_MASTER | ClockFlags::HARDWARE;
+    assert!(combined.contains(ClockFlags::CAN_BE_MASTER));
+    assert!(combined.contains(ClockFlags::HARDWARE));
+    assert!(!combined.contains(ClockFlags::NETWORK));
+
+    // Test union method
+    let union = ClockFlags::REALTIME.union(ClockFlags::NETWORK);
+    assert!(union.contains(ClockFlags::REALTIME));
+    assert!(union.contains(ClockFlags::NETWORK));
+
+    // Test insert
+    let inserted = ClockFlags::NONE.insert(ClockFlags::CAN_BE_MASTER);
+    assert!(inserted.contains(ClockFlags::CAN_BE_MASTER));
+
+    // Test remove
+    let removed = combined.remove(ClockFlags::HARDWARE);
+    assert!(removed.contains(ClockFlags::CAN_BE_MASTER));
+    assert!(!removed.contains(ClockFlags::HARDWARE));
+}
+
+/// Test ClockTime arithmetic operations.
+#[test]
+fn test_clock_time_arithmetic() {
+    let t1 = ClockTime::from_millis(100);
+    let t2 = ClockTime::from_millis(50);
+
+    // Addition
+    let sum = t1 + t2;
+    assert_eq!(sum, ClockTime::from_millis(150));
+
+    // Subtraction
+    let diff = t1 - t2;
+    assert_eq!(diff, ClockTime::from_millis(50));
+
+    // Saturating subtraction (no underflow)
+    let sat_diff = t2 - t1;
+    assert_eq!(sat_diff, ClockTime::ZERO);
+
+    // Comparison
+    assert!(t1 > t2);
+    assert!(t2 < t1);
+    assert_eq!(t1, ClockTime::from_nanos(100_000_000));
+
+    // Conversions
+    assert_eq!(ClockTime::from_secs(1).millis(), 1000);
+    assert_eq!(ClockTime::from_millis(1000).secs(), 1);
+    assert_eq!(ClockTime::from_nanos(1_000_000).micros(), 1000);
+}
+
+/// Test NONE sentinel value behavior.
+#[test]
+fn test_clock_time_none() {
+    let none = ClockTime::NONE;
+    let zero = ClockTime::ZERO;
+    let some_time = ClockTime::from_millis(100);
+
+    // NONE is distinct from ZERO
+    assert_ne!(none, zero);
+
+    // NONE has special u64::MAX value
+    assert_eq!(none.nanos(), u64::MAX);
+
+    // is_none() check
+    assert!(none.is_none());
+    assert!(!zero.is_none());
+    assert!(!some_time.is_none());
+
+    // is_some() check
+    assert!(!none.is_some());
+    assert!(zero.is_some());
+    assert!(some_time.is_some());
+}

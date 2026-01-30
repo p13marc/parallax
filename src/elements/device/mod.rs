@@ -68,7 +68,7 @@ pub use self::libcamera::{LibCameraConfig, LibCameraInfo, LibCameraSrc};
 pub use self::v4l2::{V4l2Config, V4l2DeviceInfo, V4l2Src};
 
 #[cfg(feature = "alsa")]
-pub use self::alsa::{AlsaDeviceInfo, AlsaFormat, AlsaSampleFormat, AlsaSink, AlsaSrc};
+pub use self::alsa::{AlsaClock, AlsaDeviceInfo, AlsaFormat, AlsaSampleFormat, AlsaSink, AlsaSrc};
 
 /// Device capture/playback errors.
 #[derive(Debug, Error)]
