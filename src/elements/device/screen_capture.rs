@@ -86,8 +86,15 @@ pub struct ScreenCaptureConfig {
     pub source_type: CaptureSourceType,
     /// Whether to show the cursor in the capture.
     pub show_cursor: bool,
-    /// Whether to persist the session across restarts.
-    pub persist_session: bool,
+    /// Restore token from a previous session for non-interactive capture.
+    ///
+    /// When set, the portal will attempt to restore the previous session
+    /// without showing a user dialog. The token is obtained from
+    /// `ScreenCaptureSrc::restore_token()` after a successful capture session.
+    ///
+    /// If the token is invalid or expired, the portal will fall back to
+    /// showing the selection dialog.
+    pub restore_token: Option<String>,
     /// Maximum number of frames to capture before EOS.
     /// None means unlimited (capture until manually stopped).
     pub max_frames: Option<u32>,
@@ -101,7 +108,7 @@ impl Default for ScreenCaptureConfig {
         Self {
             source_type: CaptureSourceType::Monitor,
             show_cursor: true,
-            persist_session: false,
+            restore_token: None,
             max_frames: None,
             // Screen capture should drop frames when downstream is busy
             // to prevent building up lag. This is the standard behavior
@@ -112,9 +119,41 @@ impl Default for ScreenCaptureConfig {
 }
 
 impl ScreenCaptureConfig {
+    /// Create a new config with default settings.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     /// Set the maximum number of frames to capture.
     pub fn with_max_frames(mut self, max_frames: u32) -> Self {
         self.max_frames = Some(max_frames);
+        self
+    }
+
+    /// Set a restore token for non-interactive capture.
+    ///
+    /// The token is obtained from a previous session via `ScreenCaptureSrc::restore_token()`.
+    /// When a valid token is provided, the capture can start without user interaction.
+    pub fn with_restore_token(mut self, token: impl Into<String>) -> Self {
+        self.restore_token = Some(token.into());
+        self
+    }
+
+    /// Set the capture source type.
+    pub fn with_source_type(mut self, source_type: CaptureSourceType) -> Self {
+        self.source_type = source_type;
+        self
+    }
+
+    /// Set whether to show the cursor.
+    pub fn with_cursor(mut self, show: bool) -> Self {
+        self.show_cursor = show;
+        self
+    }
+
+    /// Set the flow policy for handling downstream backpressure.
+    pub fn with_flow_policy(mut self, policy: FlowPolicy) -> Self {
+        self.flow_policy = policy;
         self
     }
 }
@@ -170,6 +209,8 @@ pub struct ScreenCaptureSrc {
     flow_state: Option<FlowStateHandle>,
     /// Frames dropped due to backpressure.
     frames_dropped: u64,
+    /// Restore token from the portal session (for future non-interactive capture).
+    restore_token: Option<String>,
 }
 
 impl std::fmt::Debug for ScreenCaptureSrc {
@@ -257,12 +298,24 @@ impl ScreenCaptureSrc {
             frames_produced: 0,
             flow_state: None,
             frames_dropped: 0,
+            restore_token: None,
         }
     }
 
     /// Create a screen capture source with default configuration.
     pub fn default_config() -> Self {
         Self::new(ScreenCaptureConfig::default())
+    }
+
+    /// Get the restore token from the current session.
+    ///
+    /// This token can be saved and passed to `ScreenCaptureConfig::with_restore_token()`
+    /// in future sessions to enable non-interactive capture (no user dialog).
+    ///
+    /// Returns `None` if no session has been initialized or the portal didn't
+    /// provide a restore token.
+    pub fn restore_token(&self) -> Option<&str> {
+        self.restore_token.as_deref()
     }
 
     /// Initialize the portal session and start capturing.
@@ -292,15 +345,23 @@ impl ScreenCaptureSrc {
             CursorMode::Hidden
         };
 
-        // Select sources (this will show the portal dialog)
+        // Determine persist mode and restore token
+        // If we have a restore token, use it to avoid user interaction
+        // Otherwise, request a token for future use (PersistMode::Application)
+        let (restore_token, persist_mode) = match &self.config.restore_token {
+            Some(token) => (Some(token.clone()), PersistMode::Application),
+            None => (None, PersistMode::Application),
+        };
+
+        // Select sources (shows portal dialog unless restore_token is valid)
         screencast
             .select_sources(
                 &session,
                 cursor_mode,
                 self.config.source_type.to_source_type(),
                 false, // multiple sources
-                None,  // restore token
-                PersistMode::DoNot,
+                restore_token.as_deref(),
+                persist_mode,
             )
             .await
             .map_err(|e| {
@@ -310,13 +371,22 @@ impl ScreenCaptureSrc {
                 )))
             })?;
 
-        // Start the screencast (this shows the permission dialog)
+        // Start the screencast
         let response = screencast
             .start(&session, None)
             .await
             .map_err(|e| Error::Device(DeviceError::PipeWire(format!("Start error: {}", e))))?
             .response()
             .map_err(|_| Error::Device(DeviceError::PortalDenied))?;
+
+        // Save the restore token for future non-interactive sessions
+        if let Some(token) = response.restore_token() {
+            self.restore_token = Some(token.to_string());
+            tracing::info!(
+                "Screen capture restore token (save for non-interactive capture): {}",
+                token
+            );
+        }
 
         // Get the streams
         let streams = response.streams();
@@ -1015,7 +1085,7 @@ mod tests {
         let config = ScreenCaptureConfig::default();
         assert_eq!(config.source_type, CaptureSourceType::Monitor);
         assert!(config.show_cursor);
-        assert!(!config.persist_session);
+        assert!(config.restore_token.is_none());
     }
 
     #[test]
@@ -1039,5 +1109,28 @@ mod tests {
         assert!(!src.is_initialized());
         assert!(src.info().is_none());
         assert_eq!(src.frame_count(), 0);
+    }
+
+    #[test]
+    fn test_config_builder_methods() {
+        let config = ScreenCaptureConfig::default()
+            .with_source_type(CaptureSourceType::Window)
+            .with_cursor(false)
+            .with_restore_token("test_token_123")
+            .with_max_frames(100)
+            .with_flow_policy(FlowPolicy::Block);
+
+        assert_eq!(config.source_type, CaptureSourceType::Window);
+        assert!(!config.show_cursor);
+        assert_eq!(config.restore_token, Some("test_token_123".to_string()));
+        assert_eq!(config.max_frames, Some(100));
+        assert!(matches!(config.flow_policy, FlowPolicy::Block));
+    }
+
+    #[test]
+    fn test_restore_token_getter() {
+        let src = ScreenCaptureSrc::default_config();
+        // Before initialization, restore_token should be None
+        assert!(src.restore_token().is_none());
     }
 }

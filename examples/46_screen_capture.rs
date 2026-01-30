@@ -6,10 +6,32 @@
 //! Run with:
 //!   cargo run --example 46_screen_capture --features "screen-capture,h264,mp4-demux,simd-colorspace"
 //!
+//! For non-interactive capture (using restore token from previous session):
+//!   cargo run --example 46_screen_capture --features "screen-capture,h264,mp4-demux,simd-colorspace" -- --token "<your-token>"
+//!
 //! Requirements:
 //! - XDG Desktop Portal service running
 //! - PipeWire session manager
 //! - Portal backend (xdg-desktop-portal-gnome, xdg-desktop-portal-kde, etc.)
+//!
+//! ## How Restore Tokens Work
+//!
+//! When you first capture, the portal prompts you to select a screen/window.
+//! After capture completes, this example prints a "restore token" - a string that
+//! grants permission to capture the same source again without prompting.
+//!
+//! Save that token and pass it with `--token` to skip the permission dialog:
+//!
+//! ```bash
+//! # First run - shows permission dialog, prints token at the end
+//! cargo run --example 46_screen_capture --features "screen-capture,h264,mp4-demux,simd-colorspace"
+//!
+//! # Subsequent runs - no dialog (if token is still valid)
+//! cargo run --example 46_screen_capture --features "screen-capture,h264,mp4-demux,simd-colorspace" -- --token "your_token_here"
+//! ```
+//!
+//! Note: Tokens may expire or become invalid when the captured window closes,
+//! the system reboots, or the portal revokes permission.
 
 use std::time::Instant;
 
@@ -24,6 +46,18 @@ use parallax::memory::SharedArena;
 use parallax::pipeline::Pipeline;
 use parallax::pipeline::flow::FlowPolicy;
 
+fn parse_args() -> Option<String> {
+    let args: Vec<String> = std::env::args().collect();
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--token" && i + 1 < args.len() {
+            return Some(args[i + 1].clone());
+        }
+        i += 1;
+    }
+    None
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing for debug output
@@ -31,10 +65,22 @@ async fn main() -> Result<()> {
         .with_env_filter("parallax=debug,warn")
         .init();
 
+    let restore_token = parse_args();
+
     println!("Screen Capture to MP4 Pipeline Example");
     println!("======================================");
     println!();
-    println!("This will prompt you to select a screen or window to capture.");
+
+    if let Some(ref token) = restore_token {
+        println!("Using restore token: {}...", &token[..token.len().min(20)]);
+        println!("(Will attempt non-interactive capture)");
+    } else {
+        println!("No restore token provided.");
+        println!("This will prompt you to select a screen or window to capture.");
+        println!();
+        println!("Tip: After capture, a restore token will be printed.");
+        println!("     Use --token <token> to capture without prompting next time.");
+    }
     println!();
 
     // Capture settings
@@ -42,17 +88,20 @@ async fn main() -> Result<()> {
     let framerate = 30.0;
     let max_frames = (capture_duration_seconds as f32 * framerate) as u32;
 
-    // Create screen capture configuration with frame limit
-    let capture_config = ScreenCaptureConfig {
-        source_type: CaptureSourceType::Any,
-        show_cursor: true,
-        persist_session: false,
-        max_frames: Some(max_frames),
-        flow_policy: FlowPolicy::Drop {
+    // Create screen capture configuration with optional restore token
+    let mut capture_config = ScreenCaptureConfig::default()
+        .with_source_type(CaptureSourceType::Any)
+        .with_cursor(true)
+        .with_max_frames(max_frames)
+        .with_flow_policy(FlowPolicy::Drop {
             log_drops: true,
             max_consecutive: None,
-        },
-    };
+        });
+
+    // If we have a restore token, use it for non-interactive capture
+    if let Some(token) = restore_token {
+        capture_config = capture_config.with_restore_token(token);
+    }
 
     // Create the pipeline elements
     // 1. Screen capture source (BGRA format from PipeWire)
@@ -117,11 +166,11 @@ async fn main() -> Result<()> {
         "Capturing {} seconds ({} frames at {} fps)...",
         capture_duration_seconds, max_frames, framerate
     );
-    println!("(Permission dialog will appear)");
     println!();
 
     // Run the pipeline - it will stop when max_frames is reached
     let start = Instant::now();
+
     match pipeline.run().await {
         Ok(()) => {
             let elapsed = start.elapsed();
@@ -132,6 +181,11 @@ async fn main() -> Result<()> {
                 elapsed.as_secs_f64(),
                 max_frames as f64 / elapsed.as_secs_f64()
             );
+            println!();
+            println!(
+                "Note: The restore token was logged above (look for 'Screen capture restore token')."
+            );
+            println!("      Copy that token and use --token <token> for non-interactive capture.");
         }
         Err(e) => {
             println!();
