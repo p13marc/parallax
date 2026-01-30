@@ -20,6 +20,7 @@ use parallax::elements::transform::VideoConvertElement;
 use parallax::error::Result;
 use parallax::memory::SharedArena;
 use parallax::pipeline::Pipeline;
+use parallax::pipeline::flow::FlowPolicy;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -47,6 +48,10 @@ async fn main() -> Result<()> {
         show_cursor: true,
         persist_session: false,
         max_frames: Some(max_frames),
+        flow_policy: FlowPolicy::Drop {
+            log_drops: true,
+            max_consecutive: None,
+        },
     };
 
     // Create the pipeline elements

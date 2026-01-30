@@ -34,7 +34,6 @@
 //! ```
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 use parallax::buffer::{Buffer, MemoryHandle};
 use parallax::clock::ClockTime;
@@ -75,7 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut hls_sink = HlsSink::new(config)?;
 
     // Create a shared arena for test data
-    let mut arena = SharedArena::new(188 * 100, 64)?; // TS packet size * count
+    let arena = SharedArena::new(188 * 100, 64)?; // TS packet size * count
 
     // Simulate TS packets with timing
     // In a real pipeline, this would come from TsMux
