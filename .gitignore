@@ -1,1 +1,13 @@
 /target
+
+# Temporary test outputs
+*.mp4
+*.m3u8
+*.ts
+log.txt
+
+# Editor files
+*.swp
+*~
+.idea/
+.vscode/
