@@ -405,7 +405,8 @@ impl RtScheduler {
                 Affinity::RealTime => partition.rt_nodes.push(node_id),
                 Affinity::Auto => {
                     // Auto: prefer RT if element is RT-safe, else async
-                    if node.is_rt_safe() {
+                    let hints = node.execution_hints();
+                    if hints.is_rt_safe() {
                         partition.rt_nodes.push(node_id)
                     } else {
                         partition.async_nodes.push(node_id)
@@ -446,19 +447,20 @@ impl RtScheduler {
         node: &crate::pipeline::Node,
         _pipeline: &Pipeline,
     ) -> Affinity {
+        let hints = node.execution_hints();
         // Check scheduling mode
         match self.config.mode {
             SchedulingMode::Async => Affinity::Async,
             SchedulingMode::RealTime => {
-                if node.is_rt_safe() {
+                if hints.is_rt_safe() {
                     Affinity::RealTime
                 } else {
                     // In RealTime mode, non-RT-safe nodes are an error
                     // For now, fall back to their declared affinity
-                    node.affinity()
+                    hints.affinity
                 }
             }
-            SchedulingMode::Hybrid => node.affinity(),
+            SchedulingMode::Hybrid => hints.affinity,
         }
     }
 

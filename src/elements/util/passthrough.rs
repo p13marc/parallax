@@ -1,7 +1,7 @@
 //! PassThrough element - passes buffers unchanged.
 
 use crate::buffer::Buffer;
-use crate::element::Element;
+use crate::element::{Element, ExecutionHints};
 use crate::error::Result;
 
 /// An element that passes buffers through unchanged.
@@ -65,8 +65,8 @@ impl Element for PassThrough {
         &self.name
     }
 
-    fn is_rt_safe(&self) -> bool {
-        true
+    fn execution_hints(&self) -> ExecutionHints {
+        ExecutionHints::rt_safe()
     }
 }
 

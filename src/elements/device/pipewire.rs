@@ -32,9 +32,7 @@ use std::thread;
 use kanal::{Receiver, Sender, bounded};
 use pipewire as pw;
 
-use crate::element::{
-    Affinity, AsyncSink, AsyncSource, ExecutionHints, ProduceContext, ProduceResult,
-};
+use crate::element::{AsyncSink, AsyncSource, ExecutionHints, ProduceContext, ProduceResult};
 use crate::error::Result;
 use crate::pipeline::flow::{FlowPolicy, FlowSignal, FlowStateHandle};
 
@@ -466,14 +464,6 @@ impl AsyncSource for PipeWireSrc {
         }
     }
 
-    fn affinity(&self) -> Affinity {
-        Affinity::Async
-    }
-
-    fn is_rt_safe(&self) -> bool {
-        false
-    }
-
     fn execution_hints(&self) -> ExecutionHints {
         ExecutionHints::io_bound()
     }
@@ -627,14 +617,6 @@ impl AsyncSink for PipeWireSink {
             .await
             .map_err(|e| DeviceError::PipeWire(e.to_string()))?;
         Ok(())
-    }
-
-    fn affinity(&self) -> Affinity {
-        Affinity::Async
-    }
-
-    fn is_rt_safe(&self) -> bool {
-        false
     }
 
     fn execution_hints(&self) -> ExecutionHints {

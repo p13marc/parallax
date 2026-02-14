@@ -45,7 +45,7 @@ use spa::sys as spa_sys;
 
 use crate::buffer::Buffer;
 use crate::clock::ClockTime;
-use crate::element::{Affinity, ExecutionHints, ProduceContext, ProduceResult, Source};
+use crate::element::{ExecutionHints, ProduceContext, ProduceResult, Source};
 use crate::error::{Error, Result};
 use crate::format::{
     CapsValue, ElementMediaCaps, FormatMemoryCap, MemoryCaps, PixelFormat, VideoFormatCaps,
@@ -1039,14 +1039,6 @@ impl Source for ScreenCaptureSrc {
             format.into(),
             MemoryCaps::cpu_only(),
         )])
-    }
-
-    fn affinity(&self) -> Affinity {
-        Affinity::Async
-    }
-
-    fn is_rt_safe(&self) -> bool {
-        false
     }
 
     fn execution_hints(&self) -> ExecutionHints {

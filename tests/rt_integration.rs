@@ -99,16 +99,10 @@ impl Element for RtDoubler {
         &self.name
     }
 
-    fn is_rt_safe(&self) -> bool {
-        true
-    }
-
-    fn affinity(&self) -> Affinity {
-        Affinity::RealTime
-    }
-
     fn execution_hints(&self) -> ExecutionHints {
         ExecutionHints {
+            rt_safe: true,
+            affinity: Affinity::RealTime,
             processing: ProcessingHint::CpuBound,
             latency: LatencyHint::Low,
             ..ExecutionHints::trusted()
@@ -141,12 +135,8 @@ impl Element for AsyncCounter {
         &self.name
     }
 
-    fn is_rt_safe(&self) -> bool {
-        false
-    }
-
-    fn affinity(&self) -> Affinity {
-        Affinity::Async
+    fn execution_hints(&self) -> ExecutionHints {
+        ExecutionHints::default().with_affinity(Affinity::Async)
     }
 }
 

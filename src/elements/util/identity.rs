@@ -3,7 +3,7 @@
 //! A pass-through element that allows inspection of buffers via callbacks.
 
 use crate::buffer::Buffer;
-use crate::element::Element;
+use crate::element::{Element, ExecutionHints};
 use crate::error::Result;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -108,10 +108,10 @@ impl Element for Identity {
         &self.name
     }
 
-    fn is_rt_safe(&self) -> bool {
+    fn execution_hints(&self) -> ExecutionHints {
         // RT-safe when no callback is set (only atomic increments).
         // With a callback, RT-safety depends on the callback itself.
-        self.callback.is_none()
+        ExecutionHints::default().with_rt_safe(self.callback.is_none())
     }
 }
 

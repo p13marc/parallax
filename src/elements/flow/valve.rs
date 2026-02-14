@@ -3,7 +3,7 @@
 //! A simple on/off switch for buffer flow through a pipeline.
 
 use crate::buffer::Buffer;
-use crate::element::Element;
+use crate::element::{Element, ExecutionHints};
 use crate::error::Result;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -130,8 +130,8 @@ impl Element for Valve {
         &self.name
     }
 
-    fn is_rt_safe(&self) -> bool {
-        true
+    fn execution_hints(&self) -> ExecutionHints {
+        ExecutionHints::rt_safe()
     }
 }
 

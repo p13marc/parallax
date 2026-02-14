@@ -315,26 +315,6 @@ impl Node {
         self.input_pads.iter().find(|p| p.name() == name)
     }
 
-    /// Get the scheduling affinity for this node's element.
-    ///
-    /// Returns `Affinity::Auto` if the element has been taken.
-    pub fn affinity(&self) -> crate::element::Affinity {
-        self.element
-            .as_ref()
-            .map(|e| e.affinity())
-            .unwrap_or(crate::element::Affinity::Auto)
-    }
-
-    /// Check if this node's element is safe to run in a real-time context.
-    ///
-    /// Returns `false` if the element has been taken.
-    pub fn is_rt_safe(&self) -> bool {
-        self.element
-            .as_ref()
-            .map(|e| e.is_rt_safe())
-            .unwrap_or(false)
-    }
-
     /// Get execution hints for this node's element.
     ///
     /// Returns default hints if the element has been taken.

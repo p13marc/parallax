@@ -3,8 +3,7 @@
 //! Various filter implementations for different use cases.
 
 use crate::buffer::Buffer;
-use crate::element::Affinity;
-use crate::element::Element;
+use crate::element::{Element, ExecutionHints};
 use crate::error::Result;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -101,12 +100,8 @@ where
         &self.name
     }
 
-    fn is_rt_safe(&self) -> bool {
-        self.rt_safe
-    }
-
-    fn affinity(&self) -> Affinity {
-        Affinity::Auto
+    fn execution_hints(&self) -> ExecutionHints {
+        ExecutionHints::default().with_rt_safe(self.rt_safe)
     }
 }
 
@@ -255,12 +250,8 @@ impl Element for SampleFilter {
         &self.name
     }
 
-    fn is_rt_safe(&self) -> bool {
-        true
-    }
-
-    fn affinity(&self) -> Affinity {
-        Affinity::Auto
+    fn execution_hints(&self) -> ExecutionHints {
+        ExecutionHints::rt_safe()
     }
 }
 
@@ -383,12 +374,8 @@ impl Element for MetadataFilter {
         &self.name
     }
 
-    fn is_rt_safe(&self) -> bool {
-        true
-    }
-
-    fn affinity(&self) -> Affinity {
-        Affinity::Auto
+    fn execution_hints(&self) -> ExecutionHints {
+        ExecutionHints::rt_safe()
     }
 }
 

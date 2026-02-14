@@ -30,7 +30,7 @@ use tokio::io::unix::AsyncFd;
 
 use crate::clock::{Clock, ClockFlags, ClockTime};
 use crate::element::{
-    Affinity, AsyncSink, AsyncSource, ConsumeContext, ExecutionHints, ProduceContext, ProduceResult,
+    AsyncSink, AsyncSource, ConsumeContext, ExecutionHints, ProduceContext, ProduceResult,
 };
 use crate::error::Result;
 use crate::pipeline::flow::{FlowPolicy, FlowSignal, FlowStateHandle};
@@ -405,14 +405,6 @@ impl AsyncSource for AlsaSrc {
         Some(self.format.period_frames as usize * self.frame_size)
     }
 
-    fn affinity(&self) -> Affinity {
-        Affinity::Async
-    }
-
-    fn is_rt_safe(&self) -> bool {
-        false
-    }
-
     fn execution_hints(&self) -> ExecutionHints {
         ExecutionHints::io_bound()
     }
@@ -641,14 +633,6 @@ impl AsyncSink for AlsaSink {
                 }
             }
         }
-    }
-
-    fn affinity(&self) -> Affinity {
-        Affinity::Async
-    }
-
-    fn is_rt_safe(&self) -> bool {
-        false
     }
 
     fn execution_hints(&self) -> ExecutionHints {

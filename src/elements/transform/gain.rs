@@ -4,7 +4,7 @@
 //! No allocations, no blocking — safe for real-time threads.
 
 use crate::buffer::Buffer;
-use crate::element::{Affinity, Element, ExecutionHints, LatencyHint, ProcessingHint};
+use crate::element::{Element, ExecutionHints, LatencyHint, ProcessingHint};
 use crate::error::Result;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -112,16 +112,9 @@ impl Element for Gain {
         &self.name
     }
 
-    fn is_rt_safe(&self) -> bool {
-        true
-    }
-
-    fn affinity(&self) -> Affinity {
-        Affinity::Auto
-    }
-
     fn execution_hints(&self) -> ExecutionHints {
         ExecutionHints {
+            rt_safe: true,
             processing: ProcessingHint::CpuBound,
             latency: LatencyHint::Low,
             ..ExecutionHints::trusted()
@@ -201,7 +194,7 @@ mod tests {
     #[test]
     fn test_gain_is_rt_safe() {
         let gain = Gain::new(1.0);
-        assert!(gain.is_rt_safe());
+        assert!(gain.execution_hints().is_rt_safe());
     }
 
     #[test]

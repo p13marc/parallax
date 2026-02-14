@@ -253,10 +253,7 @@ fn analyze_pipeline(pipeline: &Pipeline) -> ExecutionPlan {
         if let Some(node) = pipeline.get_node(node_id) {
             // Get hints from node (which delegates to element if present)
             let hints = node.execution_hints();
-            let affinity = node.affinity();
-            let rt_safe = node.is_rt_safe();
-
-            let strategy = determine_element_strategy(&hints, affinity, rt_safe);
+            let strategy = determine_element_strategy(&hints);
 
             match strategy {
                 ElementStrategy::Isolated => {
@@ -287,59 +284,46 @@ fn analyze_pipeline(pipeline: &Pipeline) -> ExecutionPlan {
 }
 
 /// Determine the execution strategy for a single element based on its hints.
-fn determine_element_strategy(
-    hints: &ExecutionHints,
-    affinity: Affinity,
-    rt_safe: bool,
-) -> ElementStrategy {
-    // Rule 1: Untrusted elements should be isolated
+///
+/// All scheduling information is read from `ExecutionHints` — the single
+/// source of truth for scheduling decisions.
+///
+/// Priority order: isolation > explicit affinity > latency+rt_safe > default.
+fn determine_element_strategy(hints: &ExecutionHints) -> ElementStrategy {
+    // --- Validate and warn on conflicts ---
+    if hints.affinity == Affinity::RealTime && !hints.rt_safe {
+        tracing::warn!("Element requests RealTime affinity but rt_safe=false, using Async");
+    }
+    if hints.affinity == Affinity::RealTime && hints.processing == ProcessingHint::IoBound {
+        tracing::warn!("Element requests RealTime affinity but processing=IoBound, using Async");
+    }
+    if hints.affinity == Affinity::Async && hints.latency == LatencyHint::UltraLow {
+        tracing::warn!("Element requests Async affinity but latency=UltraLow");
+    }
+
+    // --- Decision rules (priority order) ---
+
+    // Rule 1: Isolation trumps everything
     if hints.trust_level == TrustLevel::Untrusted {
         return ElementStrategy::Isolated;
     }
-
-    // Rule 2: Elements using native code that might crash should be isolated
     if hints.uses_native_code && !hints.crash_safe {
         return ElementStrategy::Isolated;
     }
 
-    // Rule 3: Elements that explicitly request RT affinity
-    if affinity == Affinity::RealTime {
-        if rt_safe {
-            return ElementStrategy::RealTime;
-        } else {
-            // Requested RT but not RT-safe - log warning and use async
-            tracing::warn!(
-                "Element requested RealTime affinity but is_rt_safe() returned false, using Async"
-            );
-            return ElementStrategy::Async;
-        }
-    }
-
-    // Rule 4: Ultra-low latency requirements need RT
-    if hints.latency == LatencyHint::UltraLow && rt_safe {
+    // Rule 2: Explicit affinity (validated)
+    if hints.affinity == Affinity::RealTime && hints.rt_safe {
         return ElementStrategy::RealTime;
     }
-
-    // Rule 5: Low latency with RT-safe element can use RT
-    if hints.latency == LatencyHint::Low && rt_safe {
-        return ElementStrategy::RealTime;
-    }
-
-    // Rule 6: CPU-bound elements can benefit from RT if they're RT-safe
-    if hints.processing == ProcessingHint::CpuBound && rt_safe {
-        // Only use RT for CPU-bound if we also have low latency requirements
-        if matches!(hints.latency, LatencyHint::UltraLow | LatencyHint::Low) {
-            return ElementStrategy::RealTime;
-        }
-    }
-
-    // Rule 7: I/O-bound elements should always use async
-    if hints.processing == ProcessingHint::IoBound {
+    if hints.affinity == Affinity::Async {
         return ElementStrategy::Async;
     }
 
-    // Rule 8: Explicit async affinity
-    if affinity == Affinity::Async {
+    // Rule 3: Auto-detect from characteristics
+    if hints.rt_safe && matches!(hints.latency, LatencyHint::UltraLow | LatencyHint::Low) {
+        return ElementStrategy::RealTime;
+    }
+    if hints.processing == ProcessingHint::IoBound {
         return ElementStrategy::Async;
     }
 
@@ -1684,7 +1668,7 @@ mod tests {
         let hints = ExecutionHints::default();
 
         // Default hints with Auto affinity -> Async
-        let strategy = determine_element_strategy(&hints, Affinity::Auto, false);
+        let strategy = determine_element_strategy(&hints);
         assert_eq!(strategy, ElementStrategy::Async);
     }
 
@@ -1693,7 +1677,7 @@ mod tests {
         let hints = ExecutionHints::untrusted();
 
         // Untrusted -> Isolated
-        let strategy = determine_element_strategy(&hints, Affinity::Auto, false);
+        let strategy = determine_element_strategy(&hints);
         assert_eq!(strategy, ElementStrategy::Isolated);
     }
 
@@ -1702,33 +1686,37 @@ mod tests {
         let hints = ExecutionHints::native();
 
         // Native code that's not crash-safe -> Isolated
-        let strategy = determine_element_strategy(&hints, Affinity::Auto, false);
+        let strategy = determine_element_strategy(&hints);
         assert_eq!(strategy, ElementStrategy::Isolated);
     }
 
     #[test]
     fn test_determine_element_strategy_rt_affinity() {
-        let hints = ExecutionHints::default();
-
         // Explicit RT affinity with RT-safe -> RealTime
-        let strategy = determine_element_strategy(&hints, Affinity::RealTime, true);
+        let hints = ExecutionHints::default()
+            .with_affinity(Affinity::RealTime)
+            .with_rt_safe(true);
+        let strategy = determine_element_strategy(&hints);
         assert_eq!(strategy, ElementStrategy::RealTime);
 
         // Explicit RT affinity but NOT RT-safe -> Async (with warning)
-        let strategy = determine_element_strategy(&hints, Affinity::RealTime, false);
+        let hints = ExecutionHints::default()
+            .with_affinity(Affinity::RealTime)
+            .with_rt_safe(false);
+        let strategy = determine_element_strategy(&hints);
         assert_eq!(strategy, ElementStrategy::Async);
     }
 
     #[test]
     fn test_determine_element_strategy_low_latency() {
-        let hints = ExecutionHints::low_latency();
-
         // Low latency + RT-safe -> RealTime
-        let strategy = determine_element_strategy(&hints, Affinity::Auto, true);
+        let hints = ExecutionHints::low_latency().with_rt_safe(true);
+        let strategy = determine_element_strategy(&hints);
         assert_eq!(strategy, ElementStrategy::RealTime);
 
         // Low latency but NOT RT-safe -> Async
-        let strategy = determine_element_strategy(&hints, Affinity::Auto, false);
+        let hints = ExecutionHints::low_latency().with_rt_safe(false);
+        let strategy = determine_element_strategy(&hints);
         assert_eq!(strategy, ElementStrategy::Async);
     }
 
@@ -1736,8 +1724,8 @@ mod tests {
     fn test_determine_element_strategy_io_bound() {
         let hints = ExecutionHints::io_bound();
 
-        // I/O-bound -> always Async
-        let strategy = determine_element_strategy(&hints, Affinity::Auto, true);
+        // I/O-bound -> always Async (io_bound sets rt_safe=false)
+        let strategy = determine_element_strategy(&hints);
         assert_eq!(strategy, ElementStrategy::Async);
     }
 

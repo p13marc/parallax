@@ -70,11 +70,6 @@ impl Source for AudioSource {
         "audio_source"
     }
 
-    // I/O-bound: stays in Tokio
-    fn affinity(&self) -> Affinity {
-        Affinity::Async
-    }
-
     fn execution_hints(&self) -> ExecutionHints {
         ExecutionHints::io_bound()
     }
@@ -103,16 +98,10 @@ impl Element for RtGain {
         "rt_gain"
     }
 
-    fn is_rt_safe(&self) -> bool {
-        true // No allocations, no I/O, no locks
-    }
-
-    fn affinity(&self) -> Affinity {
-        Affinity::RealTime // Request RT scheduling
-    }
-
     fn execution_hints(&self) -> ExecutionHints {
         ExecutionHints {
+            rt_safe: true,
+            affinity: Affinity::RealTime,
             processing: ProcessingHint::CpuBound,
             latency: LatencyHint::Low,
             ..ExecutionHints::trusted()
@@ -159,10 +148,6 @@ impl Sink for VerifySink {
 
     fn name(&self) -> &str {
         "verify_sink"
-    }
-
-    fn affinity(&self) -> Affinity {
-        Affinity::Async
     }
 
     fn execution_hints(&self) -> ExecutionHints {

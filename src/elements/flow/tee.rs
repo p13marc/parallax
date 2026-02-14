@@ -1,8 +1,7 @@
 //! Tee element - duplicates buffers to multiple outputs.
 
 use crate::buffer::Buffer;
-use crate::element::Affinity;
-use crate::element::Element;
+use crate::element::{Element, ExecutionHints};
 use crate::error::Result;
 
 /// An element that passes buffers through while allowing inspection.
@@ -100,12 +99,8 @@ impl Element for Tee {
         &self.name
     }
 
-    fn is_rt_safe(&self) -> bool {
-        true
-    }
-
-    fn affinity(&self) -> Affinity {
-        Affinity::Auto
+    fn execution_hints(&self) -> ExecutionHints {
+        ExecutionHints::rt_safe()
     }
 }
 

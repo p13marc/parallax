@@ -50,7 +50,7 @@ use crate::event::{Event, EventResult};
 use crate::format::Caps;
 use std::any::Any;
 
-use super::traits::{Affinity, ElementType, ExecutionHints};
+use super::traits::{ElementType, ExecutionHints};
 
 // ============================================================================
 // ProcessOutput - Unified output type
@@ -416,22 +416,6 @@ pub trait PipelineElement {
         Caps::any()
     }
 
-    /// Get the scheduling affinity for this element.
-    fn affinity(&self) -> Affinity {
-        Affinity::Auto
-    }
-
-    /// Check if this element is safe to run in a real-time context.
-    ///
-    /// An RT-safe element must:
-    /// - Not allocate memory in the hot path
-    /// - Not perform blocking I/O
-    /// - Not take locks that could be held by non-RT threads
-    /// - Complete in bounded, deterministic time
-    fn is_rt_safe(&self) -> bool {
-        false
-    }
-
     /// Get execution hints for automatic scheduling decisions.
     fn execution_hints(&self) -> ExecutionHints {
         ExecutionHints::default()
@@ -493,16 +477,6 @@ pub trait SimpleSource: Send {
         Caps::any()
     }
 
-    /// Get scheduling affinity.
-    fn affinity(&self) -> Affinity {
-        Affinity::Auto
-    }
-
-    /// Check if RT-safe.
-    fn is_rt_safe(&self) -> bool {
-        false
-    }
-
     /// Get execution hints.
     fn execution_hints(&self) -> ExecutionHints {
         ExecutionHints::default()
@@ -544,16 +518,6 @@ pub trait SimpleSink: Send {
     /// Get input capabilities.
     fn input_caps(&self) -> Caps {
         Caps::any()
-    }
-
-    /// Get scheduling affinity.
-    fn affinity(&self) -> Affinity {
-        Affinity::Auto
-    }
-
-    /// Check if RT-safe.
-    fn is_rt_safe(&self) -> bool {
-        false
     }
 
     /// Get execution hints.
@@ -608,16 +572,6 @@ pub trait SimpleTransform: Send {
         Caps::any()
     }
 
-    /// Get scheduling affinity.
-    fn affinity(&self) -> Affinity {
-        Affinity::Auto
-    }
-
-    /// Check if RT-safe.
-    fn is_rt_safe(&self) -> bool {
-        false
-    }
-
     /// Get execution hints.
     fn execution_hints(&self) -> ExecutionHints {
         ExecutionHints::default()
@@ -669,14 +623,6 @@ impl<T: SimpleSource + 'static> SendPipelineElement for Src<T> {
         self.0.output_caps()
     }
 
-    fn affinity(&self) -> Affinity {
-        self.0.affinity()
-    }
-
-    fn is_rt_safe(&self) -> bool {
-        self.0.is_rt_safe()
-    }
-
     fn execution_hints(&self) -> ExecutionHints {
         self.0.execution_hints()
     }
@@ -721,14 +667,6 @@ impl<T: SimpleSink + 'static> SendPipelineElement for Snk<T> {
 
     fn input_caps(&self) -> Caps {
         self.0.input_caps()
-    }
-
-    fn affinity(&self) -> Affinity {
-        self.0.affinity()
-    }
-
-    fn is_rt_safe(&self) -> bool {
-        self.0.is_rt_safe()
     }
 
     fn execution_hints(&self) -> ExecutionHints {
@@ -776,14 +714,6 @@ impl<T: SimpleTransform + 'static> SendPipelineElement for Xfm<T> {
 
     fn output_caps(&self) -> Caps {
         self.0.output_caps()
-    }
-
-    fn affinity(&self) -> Affinity {
-        self.0.affinity()
-    }
-
-    fn is_rt_safe(&self) -> bool {
-        self.0.is_rt_safe()
     }
 
     fn execution_hints(&self) -> ExecutionHints {
@@ -882,14 +812,6 @@ impl<T: SendPipelineElement + 'static> super::traits::SendAsyncElementDyn
 
     fn output_caps(&self) -> Caps {
         self.inner.output_caps()
-    }
-
-    fn affinity(&self) -> Affinity {
-        self.inner.affinity()
-    }
-
-    fn is_rt_safe(&self) -> bool {
-        self.inner.is_rt_safe()
     }
 
     fn execution_hints(&self) -> ExecutionHints {

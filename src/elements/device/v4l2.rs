@@ -49,7 +49,7 @@ use v4l::video::Capture;
 
 use crate::buffer::{Buffer, DmaBufBuffer, MemoryHandle};
 use crate::clock::ClockTime;
-use crate::element::{Affinity, ExecutionHints, ProduceContext, ProduceResult, Source};
+use crate::element::{ExecutionHints, ProduceContext, ProduceResult, Source};
 use crate::error::Result;
 use crate::format::{
     Caps, CapsValue, ElementMediaCaps, FormatMemoryCap, MemoryCaps, PixelFormat, VideoFormatCaps,
@@ -648,15 +648,6 @@ impl Source for V4l2Src {
             }
         };
         Some(size)
-    }
-
-    fn affinity(&self) -> Affinity {
-        // V4L2 capture is blocking I/O
-        Affinity::Async
-    }
-
-    fn is_rt_safe(&self) -> bool {
-        false
     }
 
     fn execution_hints(&self) -> ExecutionHints {
