@@ -152,10 +152,10 @@ pub use transform::{
     Batch, BatchStats, BufferConcat, BufferConcatStats, BufferJoin, BufferJoinStats, BufferPad,
     BufferPadStats, BufferSlice, BufferSplit, BufferSplitStats, BufferTrim, BufferTrimStats, Chunk,
     DuplicateFilter, DuplicateFilterStats, ExtractedMetadata, Filter, FilterMap, FilterStats,
-    FlatMap, Map, MetadataExtract, MetadataFilter, MetadataInject, RangeFilter, RangeFilterStats,
-    RegexFilter, RegexFilterStats, SampleFilter, SampleMode, ScaleMode, SequenceNumber,
-    TimestampDebug, TimestampDebugLevel, TimestampDebugStats, TimestampFormat, TimestampMode,
-    Timestamper, Unbatch, UnbatchStats, VideoScale,
+    FlatMap, Gain, Map, MetadataExtract, MetadataFilter, MetadataInject, RangeFilter,
+    RangeFilterStats, RegexFilter, RegexFilterStats, SampleFilter, SampleMode, ScaleMode,
+    SequenceNumber, TimestampDebug, TimestampDebugLevel, TimestampDebugStats, TimestampFormat,
+    TimestampMode, Timestamper, Unbatch, UnbatchStats, VideoScale,
 };
 
 // App integration

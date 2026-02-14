@@ -408,6 +408,9 @@ pub struct AsyncRtBridge {
 
     /// Configuration.
     config: BridgeConfig,
+
+    /// End-of-stream flag. Set by producer when no more data will be pushed.
+    eos: std::sync::atomic::AtomicBool,
 }
 
 impl AsyncRtBridge {
@@ -421,6 +424,7 @@ impl AsyncRtBridge {
             data_available: EventFd::new()?,
             space_available: EventFd::new()?,
             config,
+            eos: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -523,6 +527,30 @@ impl AsyncRtBridge {
     pub fn drain_data_signal(&self) -> Result<()> {
         while self.data_available.try_wait()? {}
         Ok(())
+    }
+
+    // ========================================================================
+    // EOS Signaling
+    // ========================================================================
+
+    /// Signal that the producer is done and no more data will be pushed.
+    ///
+    /// After calling this, consumers should drain remaining data and then stop.
+    /// This also signals the data-available eventfd to wake up any waiters.
+    pub fn signal_eos(&self) {
+        self.eos.store(true, std::sync::atomic::Ordering::Release);
+        // Wake up consumer so it can notice the EOS flag
+        let _ = self.data_available.notify();
+    }
+
+    /// Check if the producer has signaled end-of-stream.
+    pub fn is_eos(&self) -> bool {
+        self.eos.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Check if the bridge is fully drained (EOS + empty).
+    pub fn is_done(&self) -> bool {
+        self.is_eos() && self.is_empty()
     }
 }
 

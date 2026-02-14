@@ -54,6 +54,13 @@ Key architectural decisions have been researched and documented in **[00_DESIGN_
 | 13 | [Device Elements](13_DEVICE_ELEMENTS.md) | Medium | Medium | ✅ Complete |
 | 14 | [Streaming Protocols](14_STREAMING_PROTOCOLS.md) | Medium | Medium | ✅ Complete |
 
+### Phase 3: Production Readiness
+
+| # | Plan | Priority | Effort | Progress |
+|---|------|----------|--------|----------|
+| 15 | [RT Scheduling](15_RT_SCHEDULING.md) | High | Large | ⬜ Not Started |
+| 16 | [Process Isolation](16_PROCESS_ISOLATION.md) | High | Large | ⬜ Not Started |
+
 **Legend:** ⬜ Not Started | 🟡 In Progress | ✅ Complete
 
 ---

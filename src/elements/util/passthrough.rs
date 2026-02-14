@@ -64,6 +64,10 @@ impl Element for PassThrough {
     fn name(&self) -> &str {
         &self.name
     }
+
+    fn is_rt_safe(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

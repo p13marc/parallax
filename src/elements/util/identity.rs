@@ -107,6 +107,12 @@ impl Element for Identity {
     fn name(&self) -> &str {
         &self.name
     }
+
+    fn is_rt_safe(&self) -> bool {
+        // RT-safe when no callback is set (only atomic increments).
+        // With a callback, RT-safety depends on the callback itself.
+        self.callback.is_none()
+    }
 }
 
 /// Statistics for Identity element.

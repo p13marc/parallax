@@ -1719,6 +1719,161 @@ pub trait AsyncElementDyn {
 
     /// Get the inner element as `&mut dyn Any` for mutable downcasting.
     fn as_any_mut(&mut self) -> &mut dyn Any;
+
+    /// Get a sync processing interface if this element supports it.
+    ///
+    /// Elements that implement [`SyncElement`] and are wrapped via
+    /// [`SyncElementAdapter`] return `Some`. All others return `None`.
+    ///
+    /// This is used by the RT data thread to dispatch processing without
+    /// going through the async `process()` method.
+    fn as_sync_element(&mut self) -> Option<&mut dyn SyncElement> {
+        None
+    }
+}
+
+// ============================================================================
+// Sync Element Trait (RT-safe)
+// ============================================================================
+
+/// Trait for RT-safe synchronous element processing.
+///
+/// Elements implementing this trait can run in the RT data thread
+/// without blocking on async operations. They must not:
+/// - Allocate memory (no `Vec::push`, no `Box::new`)
+/// - Block on I/O (no file/network operations)
+/// - Take locks that might be held by non-RT threads
+///
+/// The buffer is processed in-place or replaced.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use parallax::element::SyncElement;
+/// use parallax::buffer::Buffer;
+/// use parallax::error::Result;
+///
+/// struct Gain { factor: f32 }
+///
+/// impl SyncElement for Gain {
+///     fn process_sync(&mut self, mut buffer: Buffer) -> Result<Option<Buffer>> {
+///         let data = buffer.data_mut();
+///         for sample in data.chunks_exact_mut(4) {
+///             let val = f32::from_le_bytes(sample.try_into().unwrap());
+///             let out = val * self.factor;
+///             sample.copy_from_slice(&out.to_le_bytes());
+///         }
+///         Ok(Some(buffer))
+///     }
+/// }
+/// ```
+pub trait SyncElement: Send {
+    /// Process a buffer synchronously. Returns `None` for filtered/dropped buffers.
+    fn process_sync(&mut self, buffer: Buffer) -> Result<Option<Buffer>>;
+
+    /// Flush at EOS. Returns any buffered data.
+    fn flush_sync(&mut self) -> Result<Option<Buffer>> {
+        Ok(None)
+    }
+}
+
+// Blanket impl: every sync Element is also a SyncElement.
+// This allows ElementAdapter to return as_sync_element() for any Element,
+// but the RT thread only uses it when is_rt_safe() is true.
+impl<T: Element> SyncElement for T {
+    fn process_sync(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
+        self.process(buffer)
+    }
+
+    fn flush_sync(&mut self) -> Result<Option<Buffer>> {
+        self.flush()
+    }
+}
+
+/// Adapter: [`SyncElement`] → [`AsyncElementDyn`].
+///
+/// Wraps a `SyncElement` so it can be used in the pipeline graph
+/// (which requires `AsyncElementDyn`). In the RT data thread, the
+/// executor calls `as_sync_element()` to bypass the async path entirely.
+pub struct SyncElementAdapter<T: SyncElement> {
+    inner: T,
+    name: String,
+}
+
+impl<T: SyncElement> SyncElementAdapter<T> {
+    /// Create a new sync element adapter.
+    pub fn new(element: T, name: impl Into<String>) -> Self {
+        Self {
+            inner: element,
+            name: name.into(),
+        }
+    }
+
+    /// Get a reference to the inner element.
+    pub fn inner(&self) -> &T {
+        &self.inner
+    }
+
+    /// Get a mutable reference to the inner element.
+    pub fn inner_mut(&mut self) -> &mut T {
+        &mut self.inner
+    }
+}
+
+impl<T: SyncElement + 'static> SendAsyncElementDyn for SyncElementAdapter<T> {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn element_type(&self) -> ElementType {
+        ElementType::Transform
+    }
+
+    async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
+        match input {
+            Some(buffer) => self.inner.process_sync(buffer),
+            None => Ok(None),
+        }
+    }
+
+    async fn process_all(&mut self, input: Option<Buffer>) -> Result<Output> {
+        match input {
+            Some(buffer) => self.inner.process_sync(buffer).map(Output::from),
+            None => Ok(Output::None),
+        }
+    }
+
+    fn affinity(&self) -> Affinity {
+        Affinity::RealTime
+    }
+
+    fn is_rt_safe(&self) -> bool {
+        true
+    }
+
+    fn execution_hints(&self) -> ExecutionHints {
+        ExecutionHints {
+            processing: ProcessingHint::CpuBound,
+            latency: LatencyHint::Low,
+            ..ExecutionHints::trusted()
+        }
+    }
+
+    async fn flush(&mut self) -> Result<Output> {
+        self.inner.flush_sync().map(Output::from)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        &self.inner
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        &mut self.inner
+    }
+
+    fn as_sync_element(&mut self) -> Option<&mut dyn SyncElement> {
+        Some(&mut self.inner)
+    }
 }
 
 // ============================================================================
@@ -2187,6 +2342,14 @@ impl<E: Element + Send + 'static> SendAsyncElementDyn for ElementAdapter<E> {
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
         &mut self.inner
+    }
+
+    fn as_sync_element(&mut self) -> Option<&mut dyn SyncElement> {
+        if self.inner.is_rt_safe() {
+            Some(&mut self.inner)
+        } else {
+            None
+        }
     }
 }
 

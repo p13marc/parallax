@@ -527,17 +527,12 @@ impl RtScheduler {
         let rt_set: std::collections::HashSet<_> = partition.rt_nodes.iter().copied().collect();
 
         for &node_id in &partition.rt_nodes {
-            // Count RT dependencies
+            // Count only RT→RT dependencies (not bridges).
+            // Bridge inputs are polled directly via try_pop() in the data thread,
+            // so they don't need activation-based dependency tracking.
             let mut dep_count = 0u32;
             for (parent_id, _link) in pipeline.parents(node_id) {
                 if rt_set.contains(&parent_id) {
-                    dep_count += 1;
-                }
-            }
-
-            // Also count incoming bridges (async → RT)
-            for edge in &partition.boundary_edges {
-                if edge.sink == node_id && edge.direction == BoundaryDirection::AsyncToRt {
                     dep_count += 1;
                 }
             }
@@ -614,6 +609,41 @@ impl RtScheduler {
             self.driver = Some(last);
         }
     }
+
+    /// Build a map from each RT node to its downstream RT dependents.
+    ///
+    /// This is used by the data thread to signal downstream nodes
+    /// after processing completes.
+    pub fn build_downstream_map(
+        &self,
+        partition: &GraphPartition,
+        pipeline: &Pipeline,
+    ) -> HashMap<NodeId, Vec<NodeId>> {
+        let rt_set: std::collections::HashSet<_> = partition.rt_nodes.iter().copied().collect();
+        let mut map = HashMap::new();
+
+        for &node_id in &partition.rt_nodes {
+            let downstreams: Vec<NodeId> = pipeline
+                .children(node_id)
+                .into_iter()
+                .filter(|(child_id, _)| rt_set.contains(child_id))
+                .map(|(child_id, _)| child_id)
+                .collect();
+            map.insert(node_id, downstreams);
+        }
+
+        map
+    }
+
+    /// Get all activation records.
+    pub fn activations(&self) -> &HashMap<NodeId, Arc<ActivationRecord>> {
+        &self.activations
+    }
+
+    /// Get all bridges.
+    pub fn bridges(&self) -> &HashMap<(NodeId, NodeId), Arc<AsyncRtBridge>> {
+        &self.bridges
+    }
 }
 
 // ============================================================================
@@ -661,7 +691,9 @@ impl Drop for DataThreadHandle {
 
 /// Spawn a data thread for RT processing.
 ///
-/// The data thread runs a tight loop processing nodes in dependency order.
+/// The data thread runs a tight loop processing nodes in dependency order,
+/// using the sync `SyncElement` path when available and falling back to
+/// `block_on()` for non-RT-safe elements in hybrid mode.
 pub fn spawn_data_thread(
     name: String,
     config: RtConfig,
@@ -670,6 +702,7 @@ pub fn spawn_data_thread(
     mut elements: HashMap<NodeId, Box<DynAsyncElement<'static>>>,
     input_bridges: HashMap<NodeId, Arc<AsyncRtBridge>>,
     output_bridges: HashMap<NodeId, Arc<AsyncRtBridge>>,
+    downstream_map: HashMap<NodeId, Vec<NodeId>>,
     driver_trigger: Arc<EventFd>,
 ) -> Result<DataThreadHandle> {
     let stop_signal = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -688,6 +721,28 @@ pub fn spawn_data_thread(
 
             tracing::info!("data thread '{}' started", name);
 
+            // Track which elements have the sync path (log once at startup)
+            for &node_id in &processing_order {
+                if let Some(element) = elements.get_mut(&node_id) {
+                    if element.as_sync_element().is_some() {
+                        tracing::debug!(
+                            "node {:?} '{}': using sync RT path",
+                            node_id,
+                            element.name()
+                        );
+                    } else {
+                        tracing::warn!(
+                            "node {:?} '{}': no sync path, will use block_on fallback",
+                            node_id,
+                            element.name()
+                        );
+                    }
+                }
+            }
+
+            // Buffer passing between RT nodes (rt1 output → rt2 input)
+            let mut rt_buffers: HashMap<NodeId, crate::buffer::Buffer> = HashMap::new();
+
             // Main processing loop
             while !stop_signal_clone.load(std::sync::atomic::Ordering::Acquire) {
                 // Wait for driver signal (start of cycle)
@@ -704,6 +759,23 @@ pub fn spawn_data_thread(
                     }
                 }
 
+                // Check if all input bridges are done (EOS + drained)
+                let all_inputs_done = if input_bridges.is_empty() {
+                    false // No bridges means we rely on stop_signal
+                } else {
+                    input_bridges.values().all(|b| b.is_done())
+                };
+                if all_inputs_done {
+                    tracing::info!(
+                        "data thread '{}': all input bridges done, signaling EOS on output bridges",
+                        name
+                    );
+                    for bridge in output_bridges.values() {
+                        bridge.signal_eos();
+                    }
+                    break;
+                }
+
                 // Reset pending counts for all nodes
                 for activation in activations.values() {
                     activation.reset_pending();
@@ -713,67 +785,105 @@ pub fn spawn_data_thread(
                 for &node_id in &processing_order {
                     // Wait until this node's dependencies are satisfied
                     if let Some(activation) = activations.get(&node_id) {
+                        // Spin-wait for dependencies (bounded by graph depth)
                         while !activation.is_ready() {
                             std::hint::spin_loop();
                         }
-
                         activation.set_status(NodeStatus::Processing);
                     }
 
-                    // Get input from bridge if this is a boundary node
-                    let input = if let Some(bridge) = input_bridges.get(&node_id) {
+                    // Get input: first check RT-internal buffers, then bridges
+                    let input = if let Some(buffer) = rt_buffers.remove(&node_id) {
+                        Some(buffer)
+                    } else if let Some(bridge) = input_bridges.get(&node_id) {
                         bridge.try_pop()
                     } else {
                         None
                     };
 
-                    // Process the element synchronously
-                    // Note: We use a blocking approach here since RT threads
-                    // shouldn't use async
-                    if let Some(element) = elements.get_mut(&node_id) {
-                        // For now, we need to block on the async process
-                        // In a full implementation, RT elements would have a sync interface
-                        let rt = tokio::runtime::Handle::try_current();
-                        let result = if let Ok(handle) = rt {
-                            handle.block_on(element.process(input))
+                    // Process the element
+                    let output = if let Some(element) = elements.get_mut(&node_id) {
+                        // Try the sync RT-safe path first
+                        if let Some(sync_elem) = element.as_sync_element() {
+                            // True RT-safe path — no async, no blocking
+                            match input {
+                                Some(buffer) => sync_elem.process_sync(buffer),
+                                None => Ok(None),
+                            }
                         } else {
-                            // No Tokio runtime, create a minimal one
-                            let rt = tokio::runtime::Builder::new_current_thread()
-                                .build()
-                                .map_err(Error::Io)?;
-                            rt.block_on(element.process(input))
-                        };
-
-                        match result {
-                            Ok(Some(buffer)) => {
-                                // Send to output bridge if this is a boundary node
-                                if let Some(bridge) = output_bridges.get(&node_id) {
-                                    if let Err(buf) = bridge.try_push(buffer) {
-                                        tracing::warn!(
-                                            "node {:?}: output bridge full, dropping buffer",
-                                            node_id
-                                        );
-                                        drop(buf);
-                                    }
+                            // Fallback for non-RT-safe elements in Hybrid mode.
+                            // This is suboptimal but allows gradual migration.
+                            let rt = tokio::runtime::Handle::try_current();
+                            match rt {
+                                Ok(handle) => handle.block_on(element.process(input)),
+                                Err(_) => {
+                                    // Create a minimal runtime for this thread
+                                    let rt = tokio::runtime::Builder::new_current_thread()
+                                        .build()
+                                        .map_err(Error::Io)?;
+                                    rt.block_on(element.process(input))
                                 }
                             }
-                            Ok(None) => {
-                                // EOS or filtered
+                        }
+                    } else {
+                        Ok(None)
+                    };
+
+                    match output {
+                        Ok(Some(buffer)) => {
+                            // Route output to the appropriate destination
+                            if let Some(bridge) = output_bridges.get(&node_id) {
+                                if let Err(buf) = bridge.try_push(buffer) {
+                                    tracing::warn!(
+                                        "node {:?}: output bridge full, dropping buffer",
+                                        node_id
+                                    );
+                                    drop(buf);
+                                }
+                            } else if let Some(downstreams) = downstream_map.get(&node_id) {
+                                // RT→RT edge: store buffer for the downstream node
+                                // (supports single downstream; first downstream gets the buffer)
+                                if let Some(&downstream_id) = downstreams.first() {
+                                    rt_buffers.insert(downstream_id, buffer);
+                                }
                             }
-                            Err(e) => {
-                                tracing::error!("node {:?} error: {}", node_id, e);
-                            }
+                        }
+                        Ok(None) => {
+                            // Filtered/dropped — no output to propagate
+                        }
+                        Err(e) => {
+                            tracing::error!("node {:?} error: {}", node_id, e);
                         }
                     }
 
-                    // Signal downstream nodes
+                    // Mark this node as having data
                     if let Some(activation) = activations.get(&node_id) {
                         activation.set_status(NodeStatus::HaveData);
                     }
 
-                    // Decrement pending count of downstream RT nodes
-                    // (In a full implementation, we'd track the dependency graph)
+                    // Signal downstream RT nodes by decrementing their pending counts
+                    if let Some(downstreams) = downstream_map.get(&node_id) {
+                        for downstream_id in downstreams {
+                            if let Some(downstream_activation) = activations.get(downstream_id) {
+                                if downstream_activation.decrement_pending() {
+                                    // Node is now ready — signal it
+                                    if let Err(e) = downstream_activation.signal() {
+                                        tracing::error!(
+                                            "failed to signal node {:?}: {}",
+                                            downstream_id,
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
+            }
+
+            // On exit, signal EOS on all output bridges
+            for bridge in output_bridges.values() {
+                bridge.signal_eos();
             }
 
             tracing::info!("data thread '{}' stopped", name);

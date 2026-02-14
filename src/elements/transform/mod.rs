@@ -48,6 +48,7 @@ mod batch;
 mod buffer_ops;
 mod data_processing;
 mod filter;
+mod gain;
 mod generic;
 mod metadata_ops;
 mod scale;
@@ -63,6 +64,7 @@ pub use videoconvert::VideoConvertElement;
 // Audio processing
 pub use audioconvert::AudioConvertElement;
 pub use audioresample::AudioResampleElement;
+pub use gain::Gain;
 
 // Batching
 pub use batch::{Batch, BatchStats, Unbatch, UnbatchStats};

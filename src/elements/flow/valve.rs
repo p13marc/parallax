@@ -129,6 +129,10 @@ impl Element for Valve {
     fn name(&self) -> &str {
         &self.name
     }
+
+    fn is_rt_safe(&self) -> bool {
+        true
+    }
 }
 
 impl ValveControl {

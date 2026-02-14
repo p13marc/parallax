@@ -365,6 +365,10 @@ pub struct PipelineHandle {
     /// Driver handle (if any).
     #[allow(dead_code)]
     driver: Option<crate::pipeline::TimerDriverHandle>,
+    /// RT driver task (periodic trigger for RT data thread).
+    /// Stored separately because it runs indefinitely and must be
+    /// aborted when the pipeline finishes.
+    rt_driver_task: Option<JoinHandle<Result<()>>>,
 }
 
 impl PipelineHandle {
@@ -392,6 +396,12 @@ impl PipelineHandle {
             }
         }
 
+        // Abort the RT driver task (it runs indefinitely)
+        if let Some(task) = self.rt_driver_task.take() {
+            task.abort();
+            let _ = task.await; // Ignore JoinError from abort
+        }
+
         // Signal RT threads to stop and wait
         for handle in self.rt_handles.drain(..) {
             handle.signal_stop();
@@ -414,6 +424,9 @@ impl PipelineHandle {
 
     /// Abort all pipeline tasks.
     pub fn abort(mut self) {
+        if let Some(task) = self.rt_driver_task.take() {
+            task.abort();
+        }
         for task in self.tasks {
             task.abort();
         }
@@ -563,16 +576,16 @@ impl Executor {
         };
 
         // Execute based on scheduling mode
-        let (tasks, rt_handles, bridges) = match effective_scheduling {
+        let (tasks, rt_handles, bridges, rt_driver_task) = match effective_scheduling {
             SchedulingMode::Async => {
                 let tasks = self.run_async(pipeline, clock_info.as_ref(), &events)?;
-                (tasks, Vec::new(), Vec::new())
+                (tasks, Vec::new(), Vec::new(), None)
             }
             SchedulingMode::Hybrid | SchedulingMode::RealTime => {
                 if partition.rt_nodes.is_empty() {
                     // No RT nodes, fall back to async
                     let tasks = self.run_async(pipeline, clock_info.as_ref(), &events)?;
-                    (tasks, Vec::new(), Vec::new())
+                    (tasks, Vec::new(), Vec::new(), None)
                 } else {
                     self.run_hybrid(
                         pipeline,
@@ -603,6 +616,7 @@ impl Executor {
             events,
             bridges,
             driver,
+            rt_driver_task,
         })
     }
 
@@ -636,13 +650,20 @@ impl Executor {
         Vec<JoinHandle<Result<()>>>,
         Vec<crate::pipeline::rt_scheduler::DataThreadHandle>,
         Vec<Arc<AsyncRtBridge>>,
+        Option<JoinHandle<Result<()>>>,
     )> {
+        use crate::pipeline::rt_bridge::EventFd;
+        use crate::pipeline::rt_scheduler::{BoundaryDirection, spawn_data_thread};
+
         // Create bridges at boundaries
         scheduler.create_bridges(partition)?;
         scheduler.setup_activations(partition)?;
         scheduler.compute_processing_order(partition, pipeline)?;
         scheduler.setup_dependencies(partition, pipeline)?;
         scheduler.select_driver(partition, pipeline);
+
+        // Build downstream map for dependency signaling
+        let downstream_map = scheduler.build_downstream_map(partition, pipeline);
 
         // Build channels for async nodes
         let mut channels = ChannelNetwork::new();
@@ -662,23 +683,92 @@ impl Executor {
             }
         }
 
-        // Spawn async tasks
-        let tasks = self.spawn_tasks_for_partition(
+        // Spawn async tasks for the async portion of the graph
+        let mut tasks = self.spawn_tasks_for_partition(
             pipeline, partition, channels, scheduler, clock_info, events,
         )?;
 
-        // Collect bridges
+        // Collect bridges (keep alive)
         let bridges: Vec<_> = partition
             .boundary_edges
             .iter()
             .filter_map(|e| scheduler.get_bridge(e.source, e.sink))
             .collect();
 
-        // NOTE: RT thread spawning is handled by the RT scheduler when needed.
-        // This is a placeholder for future direct RT thread management.
-        let rt_handles = Vec::new();
+        // --- Spawn RT data thread ---
 
-        Ok((tasks, rt_handles, bridges))
+        // Extract RT elements from the pipeline graph
+        let mut rt_elements: HashMap<NodeId, Box<DynAsyncElement<'static>>> = HashMap::new();
+        for &node_id in &partition.rt_nodes {
+            if let Some(node) = pipeline.get_node_mut(node_id) {
+                if let Some(element) = node.take_element() {
+                    rt_elements.insert(node_id, element);
+                }
+            }
+        }
+
+        // Build input/output bridge maps for the RT data thread
+        let mut input_bridges: HashMap<NodeId, Arc<AsyncRtBridge>> = HashMap::new();
+        let mut output_bridges: HashMap<NodeId, Arc<AsyncRtBridge>> = HashMap::new();
+
+        for edge in &partition.boundary_edges {
+            if let Some(bridge) = scheduler.get_bridge(edge.source, edge.sink) {
+                match edge.direction {
+                    BoundaryDirection::AsyncToRt => {
+                        input_bridges.insert(edge.sink, bridge);
+                    }
+                    BoundaryDirection::RtToAsync => {
+                        output_bridges.insert(edge.source, bridge);
+                    }
+                }
+            }
+        }
+
+        // Create driver trigger (the data thread waits on this each cycle)
+        let driver_trigger = Arc::new(EventFd::new()?);
+
+        // Spawn the data thread
+        let rt_handle = spawn_data_thread(
+            "parallax-rt-0".to_string(),
+            self.config.rt.clone(),
+            scheduler.processing_order().to_vec(),
+            scheduler.activations().clone(),
+            rt_elements,
+            input_bridges,
+            output_bridges,
+            downstream_map,
+            driver_trigger.clone(),
+        )?;
+
+        // Spawn a driver task that triggers the RT thread periodically
+        let driver_period = self
+            .config
+            .driver
+            .as_ref()
+            .map(|d| d.period)
+            .unwrap_or(std::time::Duration::from_millis(5));
+
+        let driver_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(driver_period);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if let Err(e) = driver_trigger.notify() {
+                    tracing::error!("driver trigger notify error: {}", e);
+                    return Err(Error::Io(std::io::Error::other(format!(
+                        "driver trigger: {e}"
+                    ))));
+                }
+            }
+            #[allow(unreachable_code)]
+            Ok(())
+        });
+        // NOTE: driver_task is NOT pushed to `tasks` because it runs indefinitely.
+        // It is stored in PipelineHandle.rt_driver_task and aborted on shutdown.
+
+        let rt_handles = vec![rt_handle];
+
+        Ok((tasks, rt_handles, bridges, Some(driver_task)))
     }
 
     /// Build channel network recursively.
@@ -1077,6 +1167,9 @@ fn spawn_source_task(
                     for tx in &outputs {
                         let _ = tx.send(Message::Eos).await;
                     }
+                    for bridge in &output_bridges {
+                        bridge.signal_eos();
+                    }
                     break;
                 }
                 Err(e) => {
@@ -1096,7 +1189,7 @@ fn spawn_sink_task(
     name: String,
     mut element: Box<DynAsyncElement<'static>>,
     inputs: Vec<AsyncReceiver<Message>>,
-    _input_bridges: Vec<Arc<AsyncRtBridge>>,
+    input_bridges: Vec<Arc<AsyncRtBridge>>,
     events: EventSender,
 ) -> JoinHandle<Result<()>> {
     tokio::spawn(async move {
@@ -1106,11 +1199,37 @@ fn spawn_sink_task(
         let mut count: u64 = 0;
 
         if let Some(rx) = inputs.into_iter().next() {
+            // Standard path: read from kanal channel
             while let Ok(Message::Buffer(buffer)) = rx.recv().await {
                 count += 1;
                 if let Err(e) = element.process(Some(buffer)).await {
                     events.send_error(e.to_string(), Some(name.clone()));
                     return Err(e);
+                }
+            }
+        } else if let Some(bridge) = input_bridges.into_iter().next() {
+            // Bridge path: read from RT→Async bridge
+            loop {
+                // Drain all available buffers
+                while let Some(buffer) = bridge.try_pop() {
+                    count += 1;
+                    if let Err(e) = element.process(Some(buffer)).await {
+                        events.send_error(e.to_string(), Some(name.clone()));
+                        return Err(e);
+                    }
+                }
+                // Check if we're done (EOS + empty)
+                if bridge.is_done() {
+                    tracing::info!("sink '{}': bridge EOS after {} buffers", name, count);
+                    break;
+                }
+                // Wait for more data or EOS signal
+                match bridge.data_eventfd().wait_async().await {
+                    Ok(()) => {}
+                    Err(e) => {
+                        tracing::error!("sink '{}': bridge eventfd error: {}", name, e);
+                        break;
+                    }
                 }
             }
         }
@@ -1125,8 +1244,8 @@ fn spawn_transform_task(
     mut element: Box<DynAsyncElement<'static>>,
     inputs: Vec<AsyncReceiver<Message>>,
     outputs: Vec<AsyncSender<Message>>,
-    _input_bridges: Vec<Arc<AsyncRtBridge>>,
-    _output_bridges: Vec<Arc<AsyncRtBridge>>,
+    input_bridges: Vec<Arc<AsyncRtBridge>>,
+    output_bridges: Vec<Arc<AsyncRtBridge>>,
     events: EventSender,
 ) -> JoinHandle<Result<()>> {
     tokio::spawn(async move {
@@ -1135,18 +1254,42 @@ fn spawn_transform_task(
 
         let mut count: u64 = 0;
 
+        /// Helper to send output buffer to all downstream channels and bridges.
+        async fn send_output(
+            buffer: Buffer,
+            outputs: &[AsyncSender<Message>],
+            output_bridges: &[Arc<AsyncRtBridge>],
+        ) {
+            for tx in outputs {
+                let _ = tx.send(Message::Buffer(buffer.clone())).await;
+            }
+            for bridge in output_bridges {
+                let _ = bridge.push_async(buffer.clone()).await;
+            }
+        }
+
+        /// Helper to send EOS to all downstream channels and bridges.
+        async fn send_eos(outputs: &[AsyncSender<Message>], output_bridges: &[Arc<AsyncRtBridge>]) {
+            for tx in outputs {
+                let _ = tx.send(Message::Eos).await;
+            }
+            for bridge in output_bridges {
+                bridge.signal_eos();
+            }
+        }
+
         if let Some(rx) = inputs.into_iter().next() {
+            // Standard path: read from kanal channel
             loop {
                 tracing::trace!("transform '{}': waiting for input", name);
                 match rx.recv().await {
                     Ok(Message::Buffer(buffer)) => {
                         count += 1;
-                        let input_len = buffer.len();
                         tracing::debug!(
                             "transform '{}': received buffer {} ({} bytes)",
                             name,
                             count,
-                            input_len
+                            buffer.len()
                         );
                         match element.process(Some(buffer)).await {
                             Ok(Some(out)) => {
@@ -1155,9 +1298,7 @@ fn spawn_transform_task(
                                     name,
                                     out.len()
                                 );
-                                for tx in &outputs {
-                                    let _ = tx.send(Message::Buffer(out.clone())).await;
-                                }
+                                send_output(out, &outputs, &output_bridges).await;
                             }
                             Ok(None) => {
                                 tracing::debug!(
@@ -1193,24 +1334,62 @@ fn spawn_transform_task(
                                     buffers.len()
                                 );
                                 for buffer in buffers {
-                                    for tx in &outputs {
-                                        let _ = tx.send(Message::Buffer(buffer.clone())).await;
-                                    }
+                                    send_output(buffer, &outputs, &output_bridges).await;
                                 }
                             }
                             Err(e) => {
                                 tracing::warn!("flush error in '{}': {}", name, e);
                             }
                         }
-                        for tx in &outputs {
-                            let _ = tx.send(Message::Eos).await;
-                        }
+                        send_eos(&outputs, &output_bridges).await;
                         break;
                     }
                     Err(_) => {
-                        for tx in &outputs {
-                            let _ = tx.send(Message::Eos).await;
+                        send_eos(&outputs, &output_bridges).await;
+                        break;
+                    }
+                }
+            }
+        } else if let Some(bridge) = input_bridges.into_iter().next() {
+            // Bridge path: read from RT→Async bridge
+            loop {
+                while let Some(buffer) = bridge.try_pop() {
+                    count += 1;
+                    match element.process(Some(buffer)).await {
+                        Ok(Some(out)) => {
+                            send_output(out, &outputs, &output_bridges).await;
                         }
+                        Ok(None) => {}
+                        Err(e) => {
+                            events.send_error(e.to_string(), Some(name.clone()));
+                            return Err(e);
+                        }
+                    }
+                }
+                if bridge.is_done() {
+                    // Flush
+                    match element.flush().await {
+                        Ok(output) => {
+                            let buffers = match output {
+                                Output::None => vec![],
+                                Output::Single(b) => vec![b],
+                                Output::Multiple(v) => v,
+                            };
+                            for buffer in buffers {
+                                send_output(buffer, &outputs, &output_bridges).await;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("flush error in '{}': {}", name, e);
+                        }
+                    }
+                    send_eos(&outputs, &output_bridges).await;
+                    break;
+                }
+                match bridge.data_eventfd().wait_async().await {
+                    Ok(()) => {}
+                    Err(e) => {
+                        tracing::error!("transform '{}': bridge eventfd error: {}", name, e);
                         break;
                     }
                 }

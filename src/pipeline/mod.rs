@@ -67,7 +67,7 @@ pub use parser::{ParsedElement, ParsedPipeline, PropertyValue, parse_pipeline};
 pub use rt_bridge::{AsyncRtBridge, BridgeConfig, EventFd, SharedBridge, shared_bridge};
 pub use rt_scheduler::{
     ActivationRecord, BoundaryDirection, BoundaryEdge, DataThreadHandle, GraphPartition,
-    NodeStatus, RtConfig, RtScheduler, SchedulingMode,
+    NodeStatus, RtConfig, RtScheduler, SchedulingMode, spawn_data_thread,
 };
 // Unified executor (primary API)
 pub use unified_executor::{

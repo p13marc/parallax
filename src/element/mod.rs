@@ -146,6 +146,9 @@ pub use traits::{
     Source,
     SourceAdapter,
     SourceResult,
+    // RT-safe sync element support
+    SyncElement,
+    SyncElementAdapter,
     Transform,
     TransformAdapter,
     TrustLevel,

@@ -245,9 +245,25 @@ impl<T> Buffer<T> {
         &self.memory
     }
 
+    /// Get a mutable reference to the memory handle.
+    ///
+    /// This allows in-place modification of buffer data, which is
+    /// essential for RT-safe elements that must not allocate.
+    pub fn memory_mut(&mut self) -> &mut MemoryHandle {
+        &mut self.memory
+    }
+
     /// Get the buffer data as a byte slice.
     pub fn as_bytes(&self) -> &[u8] {
         self.memory.as_slice()
+    }
+
+    /// Get the buffer data as a mutable byte slice.
+    ///
+    /// This allows in-place modification of buffer data without
+    /// allocation, which is essential for RT-safe processing.
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        self.memory.as_mut_slice()
     }
 
     /// Get the length of the buffer data.
