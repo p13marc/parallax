@@ -4,6 +4,7 @@
 
 use crate::buffer::Buffer;
 use crate::clock::ClockTime;
+use crate::element::Affinity;
 use crate::element::Element;
 use crate::error::Result;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -81,6 +82,14 @@ impl Element for SequenceNumber {
 
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn is_rt_safe(&self) -> bool {
+        true
+    }
+
+    fn affinity(&self) -> Affinity {
+        Affinity::Auto
     }
 }
 
@@ -306,6 +315,14 @@ impl Element for MetadataInject {
 
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn is_rt_safe(&self) -> bool {
+        true
+    }
+
+    fn affinity(&self) -> Affinity {
+        Affinity::Auto
     }
 }
 

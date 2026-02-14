@@ -1,6 +1,7 @@
 //! Tee element - duplicates buffers to multiple outputs.
 
 use crate::buffer::Buffer;
+use crate::element::Affinity;
 use crate::element::Element;
 use crate::error::Result;
 
@@ -97,6 +98,14 @@ impl Element for Tee {
 
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn is_rt_safe(&self) -> bool {
+        true
+    }
+
+    fn affinity(&self) -> Affinity {
+        Affinity::Auto
     }
 }
 

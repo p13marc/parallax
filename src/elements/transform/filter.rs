@@ -3,6 +3,7 @@
 //! Various filter implementations for different use cases.
 
 use crate::buffer::Buffer;
+use crate::element::Affinity;
 use crate::element::Element;
 use crate::error::Result;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,6 +31,7 @@ where
     predicate: F,
     passed: AtomicU64,
     dropped: AtomicU64,
+    rt_safe: bool,
 }
 
 impl<F> Filter<F>
@@ -43,7 +45,17 @@ where
             predicate,
             passed: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
+            rt_safe: false,
         }
+    }
+
+    /// Mark this filter as RT-safe.
+    ///
+    /// Only set this if the predicate closure is guaranteed to not allocate,
+    /// not perform I/O, and complete in bounded time.
+    pub fn rt_safe(mut self) -> Self {
+        self.rt_safe = true;
+        self
     }
 
     /// Set a custom name.
@@ -87,6 +99,14 @@ where
 
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn is_rt_safe(&self) -> bool {
+        self.rt_safe
+    }
+
+    fn affinity(&self) -> Affinity {
+        Affinity::Auto
     }
 }
 
@@ -234,6 +254,14 @@ impl Element for SampleFilter {
     fn name(&self) -> &str {
         &self.name
     }
+
+    fn is_rt_safe(&self) -> bool {
+        true
+    }
+
+    fn affinity(&self) -> Affinity {
+        Affinity::Auto
+    }
 }
 
 /// Filter buffers by metadata values.
@@ -353,6 +381,14 @@ impl Element for MetadataFilter {
 
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn is_rt_safe(&self) -> bool {
+        true
+    }
+
+    fn affinity(&self) -> Affinity {
+        Affinity::Auto
     }
 }
 
