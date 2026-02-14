@@ -17,8 +17,7 @@
 
 use parallax::buffer::{Buffer, MemoryHandle};
 use parallax::element::{
-    Affinity, ConsumeContext, Element, ExecutionHints, LatencyHint, ProcessingHint, ProduceContext,
-    ProduceResult, Sink, Source,
+    ConsumeContext, Element, ExecutionHints, ProduceContext, ProduceResult, Sink, Source,
 };
 use parallax::error::Result;
 use parallax::memory::SharedArena;
@@ -99,13 +98,7 @@ impl Element for RtGain {
     }
 
     fn execution_hints(&self) -> ExecutionHints {
-        ExecutionHints {
-            rt_safe: true,
-            affinity: Affinity::RealTime,
-            processing: ProcessingHint::CpuBound,
-            latency: LatencyHint::Low,
-            ..ExecutionHints::trusted()
-        }
+        ExecutionHints::rt_safe()
     }
 }
 

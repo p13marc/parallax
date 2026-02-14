@@ -33,7 +33,7 @@
 use crate::buffer::Buffer;
 use crate::clock::{Clock, ClockTime};
 use crate::element::{
-    Affinity, AsyncElementDyn, DynAsyncElement, ElementType, ExecutionHints, LatencyHint, Output,
+    AsyncElementDyn, DynAsyncElement, ElementType, ExecutionHints, LatencyHint, Output,
     ProcessingHint, SourceResult, TrustLevel,
 };
 use crate::error::{Error, Result};
@@ -285,24 +285,12 @@ fn analyze_pipeline(pipeline: &Pipeline) -> ExecutionPlan {
 
 /// Determine the execution strategy for a single element based on its hints.
 ///
-/// All scheduling information is read from `ExecutionHints` — the single
-/// source of truth for scheduling decisions.
+/// Elements declare facts about their capabilities (rt_safe, processing type,
+/// trust level, etc.) and the executor derives the optimal strategy.
+/// No contradictions are possible — there are no preference fields to conflict.
 ///
-/// Priority order: isolation > explicit affinity > latency+rt_safe > default.
+/// Priority order: isolation > RT (rt_safe + low latency) > I/O-bound > default async.
 fn determine_element_strategy(hints: &ExecutionHints) -> ElementStrategy {
-    // --- Validate and warn on conflicts ---
-    if hints.affinity == Affinity::RealTime && !hints.rt_safe {
-        tracing::warn!("Element requests RealTime affinity but rt_safe=false, using Async");
-    }
-    if hints.affinity == Affinity::RealTime && hints.processing == ProcessingHint::IoBound {
-        tracing::warn!("Element requests RealTime affinity but processing=IoBound, using Async");
-    }
-    if hints.affinity == Affinity::Async && hints.latency == LatencyHint::UltraLow {
-        tracing::warn!("Element requests Async affinity but latency=UltraLow");
-    }
-
-    // --- Decision rules (priority order) ---
-
     // Rule 1: Isolation trumps everything
     if hints.trust_level == TrustLevel::Untrusted {
         return ElementStrategy::Isolated;
@@ -311,18 +299,12 @@ fn determine_element_strategy(hints: &ExecutionHints) -> ElementStrategy {
         return ElementStrategy::Isolated;
     }
 
-    // Rule 2: Explicit affinity (validated)
-    if hints.affinity == Affinity::RealTime && hints.rt_safe {
-        return ElementStrategy::RealTime;
-    }
-    if hints.affinity == Affinity::Async {
-        return ElementStrategy::Async;
-    }
-
-    // Rule 3: Auto-detect from characteristics
+    // Rule 2: RT-safe + low latency → RT thread
     if hints.rt_safe && matches!(hints.latency, LatencyHint::UltraLow | LatencyHint::Low) {
         return ElementStrategy::RealTime;
     }
+
+    // Rule 3: I/O-bound → async
     if hints.processing == ProcessingHint::IoBound {
         return ElementStrategy::Async;
     }
@@ -1667,7 +1649,7 @@ mod tests {
     fn test_determine_element_strategy_defaults() {
         let hints = ExecutionHints::default();
 
-        // Default hints with Auto affinity -> Async
+        // Default hints -> Async
         let strategy = determine_element_strategy(&hints);
         assert_eq!(strategy, ElementStrategy::Async);
     }
@@ -1691,18 +1673,14 @@ mod tests {
     }
 
     #[test]
-    fn test_determine_element_strategy_rt_affinity() {
-        // Explicit RT affinity with RT-safe -> RealTime
-        let hints = ExecutionHints::default()
-            .with_affinity(Affinity::RealTime)
-            .with_rt_safe(true);
+    fn test_determine_element_strategy_rt_safe() {
+        // RT-safe profile (rt_safe + low latency) -> RealTime
+        let hints = ExecutionHints::rt_safe();
         let strategy = determine_element_strategy(&hints);
         assert_eq!(strategy, ElementStrategy::RealTime);
 
-        // Explicit RT affinity but NOT RT-safe -> Async (with warning)
-        let hints = ExecutionHints::default()
-            .with_affinity(Affinity::RealTime)
-            .with_rt_safe(false);
+        // RT-safe but normal latency -> Async (RT needs low latency)
+        let hints = ExecutionHints::default().with_rt_safe(true);
         let strategy = determine_element_strategy(&hints);
         assert_eq!(strategy, ElementStrategy::Async);
     }
@@ -1724,7 +1702,7 @@ mod tests {
     fn test_determine_element_strategy_io_bound() {
         let hints = ExecutionHints::io_bound();
 
-        // I/O-bound -> always Async (io_bound sets rt_safe=false)
+        // I/O-bound -> always Async
         let strategy = determine_element_strategy(&hints);
         assert_eq!(strategy, ElementStrategy::Async);
     }

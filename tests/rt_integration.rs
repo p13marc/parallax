@@ -8,9 +8,7 @@
 //! elements do not allocate during processing.
 
 use parallax::buffer::Buffer;
-use parallax::element::{
-    Affinity, AsyncElementDyn, Element, ExecutionHints, LatencyHint, ProcessingHint,
-};
+use parallax::element::{AsyncElementDyn, Element, ExecutionHints};
 use parallax::elements::{Gain, NullSink, NullSource, PassThrough};
 use parallax::error::Result;
 use parallax::pipeline::rt_scheduler::{ActivationRecord, RtConfig, RtScheduler, SchedulingMode};
@@ -100,13 +98,7 @@ impl Element for RtDoubler {
     }
 
     fn execution_hints(&self) -> ExecutionHints {
-        ExecutionHints {
-            rt_safe: true,
-            affinity: Affinity::RealTime,
-            processing: ProcessingHint::CpuBound,
-            latency: LatencyHint::Low,
-            ..ExecutionHints::trusted()
-        }
+        ExecutionHints::rt_safe()
     }
 }
 
@@ -136,7 +128,7 @@ impl Element for AsyncCounter {
     }
 
     fn execution_hints(&self) -> ExecutionHints {
-        ExecutionHints::default().with_affinity(Affinity::Async)
+        ExecutionHints::default()
     }
 }
 
@@ -264,7 +256,7 @@ async fn test_partition_mixed_pipeline() {
         AsyncCounter::new("async_filter", Arc::new(AtomicU64::new(0))),
     );
     let rt_elem = pipeline.add_filter("rt", RtDoubler::new("rt", Arc::new(AtomicU64::new(0))));
-    let pt = pipeline.add_filter("pt", PassThrough::new()); // RT-safe with Auto affinity
+    let pt = pipeline.add_filter("pt", PassThrough::new()); // RT-safe + low latency
     let sink = pipeline.add_sink("sink", NullSink::new());
 
     pipeline.link(src, async_elem).unwrap();
@@ -275,8 +267,8 @@ async fn test_partition_mixed_pipeline() {
     let scheduler = RtScheduler::new(RtConfig::hybrid());
     let partition = scheduler.partition_graph(&pipeline).unwrap();
 
-    // rt_elem has RealTime affinity → RT
-    // PassThrough has Auto affinity + is_rt_safe → RT
+    // rt_elem is RT-safe + low latency → RT
+    // PassThrough is RT-safe + low latency → RT
     assert_eq!(partition.rt_nodes.len(), 2);
     // src + async_filter + sink → async
     assert_eq!(partition.async_nodes.len(), 3);
@@ -425,7 +417,7 @@ async fn test_hybrid_pipeline_data_flow() {
     }
 }
 
-/// Test that PassThrough (RT-safe with Auto affinity) runs in the RT thread
+/// Test that PassThrough (RT-safe + low latency) runs in the RT thread
 /// when the executor is in Hybrid mode.
 #[tokio::test]
 async fn test_passthrough_in_hybrid_mode() {

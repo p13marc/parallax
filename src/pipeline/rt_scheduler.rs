@@ -58,7 +58,7 @@
 //! let scheduler = RtScheduler::new(config)?;
 //! ```
 
-use crate::element::{Affinity, AsyncElementDyn, DynAsyncElement};
+use crate::element::{AsyncElementDyn, DynAsyncElement};
 use crate::error::{Error, Result};
 use crate::pipeline::rt_bridge::{AsyncRtBridge, BridgeConfig, EventFd};
 use crate::pipeline::{NodeId, Pipeline};
@@ -398,20 +398,10 @@ impl RtScheduler {
                 .get_node(node_id)
                 .ok_or_else(|| Error::InvalidSegment("node not found".into()))?;
 
-            let affinity = self.classify_node_affinity(node, pipeline);
-
-            match affinity {
-                Affinity::Async => partition.async_nodes.push(node_id),
-                Affinity::RealTime => partition.rt_nodes.push(node_id),
-                Affinity::Auto => {
-                    // Auto: prefer RT if element is RT-safe, else async
-                    let hints = node.execution_hints();
-                    if hints.is_rt_safe() {
-                        partition.rt_nodes.push(node_id)
-                    } else {
-                        partition.async_nodes.push(node_id)
-                    }
-                }
+            if self.should_run_rt(node) {
+                partition.rt_nodes.push(node_id);
+            } else {
+                partition.async_nodes.push(node_id);
             }
         }
 
@@ -441,26 +431,23 @@ impl RtScheduler {
         Ok(partition)
     }
 
-    /// Classify a node's affinity based on element and config.
-    fn classify_node_affinity(
-        &self,
-        node: &crate::pipeline::Node,
-        _pipeline: &Pipeline,
-    ) -> Affinity {
+    /// Determine if a node should run in the RT thread based on scheduling
+    /// mode and element capabilities (derived from ExecutionHints).
+    fn should_run_rt(&self, node: &crate::pipeline::Node) -> bool {
         let hints = node.execution_hints();
-        // Check scheduling mode
         match self.config.mode {
-            SchedulingMode::Async => Affinity::Async,
-            SchedulingMode::RealTime => {
-                if hints.is_rt_safe() {
-                    Affinity::RealTime
-                } else {
-                    // In RealTime mode, non-RT-safe nodes are an error
-                    // For now, fall back to their declared affinity
-                    hints.affinity
-                }
+            // All async: nothing runs in RT
+            SchedulingMode::Async => false,
+            // All RT: only RT-safe elements qualify
+            SchedulingMode::RealTime => hints.is_rt_safe(),
+            // Hybrid: RT-safe + low latency elements run in RT
+            SchedulingMode::Hybrid => {
+                hints.is_rt_safe()
+                    && matches!(
+                        hints.latency,
+                        crate::element::LatencyHint::UltraLow | crate::element::LatencyHint::Low
+                    )
             }
-            SchedulingMode::Hybrid => hints.affinity,
         }
     }
 

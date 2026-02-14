@@ -15,46 +15,21 @@ use std::any::Any;
 use std::sync::Arc;
 
 // ============================================================================
-// Scheduling Affinity
-// ============================================================================
-
-/// Scheduling affinity for elements in hybrid execution mode.
-///
-/// This determines whether an element runs in the Tokio async runtime
-/// (suitable for I/O-bound operations) or in a dedicated real-time thread
-/// (suitable for low-latency processing).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub enum Affinity {
-    /// Runs in Tokio async runtime.
-    ///
-    /// Use this for elements that perform async I/O (network, file),
-    /// or that may block. This is the default for async elements.
-    Async,
-
-    /// Runs in dedicated real-time thread(s).
-    ///
-    /// Use this for elements that need deterministic, low-latency execution.
-    /// Elements with this affinity should be RT-safe (no allocations,
-    /// no blocking syscalls in the hot path).
-    RealTime,
-
-    /// Let the executor decide based on element characteristics.
-    ///
-    /// The executor will check `rt_safe` and other hints to
-    /// determine the best scheduling strategy.
-    #[default]
-    Auto,
-}
-
-// ============================================================================
 // Execution Hints
 // ============================================================================
 
 /// Hints about an element's execution characteristics.
 ///
-/// This is the single source of truth for all scheduling decisions.
-/// The executor reads these hints to determine the best execution
-/// strategy (async, RT, isolated) for each element.
+/// Elements declare *facts* about their capabilities; the executor *decides*
+/// the scheduling strategy. This PipeWire-inspired design makes contradictions
+/// structurally impossible — there is no way for an element to request
+/// conflicting scheduling preferences.
+///
+/// The executor derives the strategy automatically:
+/// - `rt_safe + low latency` → RT thread
+/// - `io_bound` → Tokio async task
+/// - `untrusted / native` → isolated process
+/// - everything else → Tokio async task (default)
 ///
 /// Use the profile constructors for common patterns:
 /// - `ExecutionHints::rt_safe()` — RT-safe transforms (Gain, filters, PassThrough)
@@ -84,15 +59,6 @@ pub struct ExecutionHints {
     /// Default: `false` (conservative).
     pub rt_safe: bool,
 
-    /// Preferred scheduling strategy.
-    ///
-    /// - `Auto`: Let the executor decide based on other hints (default)
-    /// - `Async`: Must run in Tokio (I/O-bound elements)
-    /// - `RealTime`: Prefer RT thread (only honored if `rt_safe = true`)
-    ///
-    /// Default: `Auto`.
-    pub affinity: Affinity,
-
     // === Isolation ===
     /// Trust level of the data being processed.
     pub trust_level: TrustLevel,
@@ -114,7 +80,6 @@ impl Default for ExecutionHints {
     fn default() -> Self {
         Self {
             rt_safe: false,
-            affinity: Affinity::Auto,
             trust_level: TrustLevel::Trusted,
             processing: ProcessingHint::Unknown,
             latency: LatencyHint::Normal,
@@ -144,12 +109,12 @@ impl ExecutionHints {
         }
     }
 
-    /// I/O-bound element: async affinity, not RT-safe.
+    /// I/O-bound element: not RT-safe, will be scheduled in Tokio.
     ///
     /// For device sources/sinks (ALSA, PipeWire, V4L2, network).
+    /// The executor automatically assigns I/O-bound elements to async tasks.
     pub fn io_bound() -> Self {
         Self {
-            affinity: Affinity::Async,
             processing: ProcessingHint::IoBound,
             ..Self::default()
         }
@@ -204,12 +169,6 @@ impl ExecutionHints {
     /// Builder: set the RT-safe flag.
     pub fn with_rt_safe(mut self, rt_safe: bool) -> Self {
         self.rt_safe = rt_safe;
-        self
-    }
-
-    /// Builder: set the affinity.
-    pub fn with_affinity(mut self, affinity: Affinity) -> Self {
-        self.affinity = affinity;
         self
     }
 }
@@ -3289,33 +3248,36 @@ mod tests {
     }
 
     // ========================================================================
-    // Affinity and RT-safety tests
+    // ExecutionHints and RT-safety tests
     // ========================================================================
 
     #[test]
-    fn test_affinity_default() {
-        // Default affinity should be Auto
-        assert_eq!(Affinity::default(), Affinity::Auto);
+    fn test_default_hints() {
+        let hints = ExecutionHints::default();
+        assert!(!hints.is_rt_safe());
+        assert_eq!(hints.processing, ProcessingHint::Unknown);
+        assert_eq!(hints.latency, LatencyHint::Normal);
     }
 
     #[test]
-    fn test_affinity_variants() {
-        // Test all variants exist and are distinct
-        assert_ne!(Affinity::Async, Affinity::RealTime);
-        assert_ne!(Affinity::Async, Affinity::Auto);
-        assert_ne!(Affinity::RealTime, Affinity::Auto);
+    fn test_rt_safe_profile() {
+        let hints = ExecutionHints::rt_safe();
+        assert!(hints.is_rt_safe());
+        assert_eq!(hints.processing, ProcessingHint::CpuBound);
+        assert_eq!(hints.latency, LatencyHint::Low);
+    }
 
-        // Test debug formatting
-        assert_eq!(format!("{:?}", Affinity::Async), "Async");
-        assert_eq!(format!("{:?}", Affinity::RealTime), "RealTime");
-        assert_eq!(format!("{:?}", Affinity::Auto), "Auto");
+    #[test]
+    fn test_io_bound_profile() {
+        let hints = ExecutionHints::io_bound();
+        assert!(!hints.is_rt_safe());
+        assert_eq!(hints.processing, ProcessingHint::IoBound);
     }
 
     #[test]
     fn test_source_default_hints() {
         let source = TestSource { count: 0, max: 1 };
         let hints = source.execution_hints();
-        assert_eq!(hints.affinity, Affinity::Auto);
         assert!(!hints.is_rt_safe());
     }
 
@@ -3323,7 +3285,6 @@ mod tests {
     fn test_sink_default_hints() {
         let sink = TestSink { received: vec![] };
         let hints = sink.execution_hints();
-        assert_eq!(hints.affinity, Affinity::Auto);
         assert!(!hints.is_rt_safe());
     }
 
@@ -3331,7 +3292,6 @@ mod tests {
     fn test_element_default_hints() {
         let element = PassThrough;
         let hints = Element::execution_hints(&element);
-        assert_eq!(hints.affinity, Affinity::Auto);
         assert!(!hints.is_rt_safe());
     }
 
@@ -3345,7 +3305,7 @@ mod tests {
         }
 
         fn execution_hints(&self) -> ExecutionHints {
-            ExecutionHints::rt_safe().with_affinity(Affinity::RealTime)
+            ExecutionHints::rt_safe()
         }
     }
 
@@ -3353,8 +3313,8 @@ mod tests {
     fn test_custom_rt_safe_element() {
         let element = RtSafeProcessor;
         let hints = Element::execution_hints(&element);
-        assert_eq!(hints.affinity, Affinity::RealTime);
         assert!(hints.is_rt_safe());
+        assert_eq!(hints.latency, LatencyHint::Low);
     }
 
     #[tokio::test]
@@ -3364,11 +3324,10 @@ mod tests {
         let adapter = ElementAdapter::new(element);
 
         let hints = SendAsyncElementDyn::execution_hints(&adapter);
-        assert_eq!(hints.affinity, Affinity::RealTime);
         assert!(hints.is_rt_safe());
     }
 
-    // Test async source with Async affinity
+    // Test async source with I/O-bound hints
     struct TestAsyncSource;
 
     impl AsyncSource for TestAsyncSource {
@@ -3380,9 +3339,9 @@ mod tests {
     #[tokio::test]
     async fn test_async_source_default_hints() {
         let source = TestAsyncSource;
-        // Async sources default to io_bound hints (Async affinity, not RT-safe)
+        // Async sources default to io_bound hints
         let hints = source.execution_hints();
-        assert_eq!(hints.affinity, Affinity::Async);
+        assert_eq!(hints.processing, ProcessingHint::IoBound);
         assert!(!hints.is_rt_safe());
     }
 
@@ -3392,11 +3351,11 @@ mod tests {
         let adapter = AsyncSourceAdapter::new(source);
 
         let hints = SendAsyncElementDyn::execution_hints(&adapter);
-        assert_eq!(hints.affinity, Affinity::Async);
+        assert_eq!(hints.processing, ProcessingHint::IoBound);
         assert!(!hints.is_rt_safe());
     }
 
-    // Test async sink with Async affinity
+    // Test async sink with I/O-bound hints
     struct TestAsyncSink;
 
     impl AsyncSink for TestAsyncSink {
@@ -3409,7 +3368,7 @@ mod tests {
     async fn test_async_sink_default_hints() {
         let sink = TestAsyncSink;
         let hints = sink.execution_hints();
-        assert_eq!(hints.affinity, Affinity::Async);
+        assert_eq!(hints.processing, ProcessingHint::IoBound);
         assert!(!hints.is_rt_safe());
     }
 
@@ -3419,7 +3378,6 @@ mod tests {
             outputs: vec![(PadId(0), Caps::any())],
         };
         let hints = demuxer.execution_hints();
-        assert_eq!(hints.affinity, Affinity::Auto);
         assert!(!hints.is_rt_safe());
     }
 
@@ -3430,7 +3388,6 @@ mod tests {
             buffer_count: 0,
         };
         let hints = muxer.execution_hints();
-        assert_eq!(hints.affinity, Affinity::Auto);
         assert!(!hints.is_rt_safe());
     }
 }
