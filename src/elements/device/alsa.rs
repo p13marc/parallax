@@ -22,13 +22,14 @@
 //! ```
 
 use std::ffi::CString;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use alsa::pcm::{Access, Format, HwParams, PCM};
 use alsa::{Direction, PollDescriptors, ValueOr};
 use tokio::io::unix::AsyncFd;
 
-use crate::clock::{Clock, ClockFlags, ClockTime};
+use crate::clock::{Clock, ClockFlags, ClockProvider, ClockTime};
 use crate::element::{
     AsyncSink, AsyncSource, ConsumeContext, ExecutionHints, ProduceContext, ProduceResult,
 };
@@ -433,6 +434,28 @@ pub struct AlsaSink {
     format: AlsaFormat,
     /// Frame size in bytes.
     frame_size: usize,
+    /// Clock provider for automatic pipeline clock selection.
+    clock_provider: AlsaSinkClockProvider,
+}
+
+/// Clock provider wrapper for AlsaSink.
+///
+/// This is needed because `alsa::PCM` contains raw pointers and is `!Sync`,
+/// so AlsaSink can't implement `ClockProvider` directly. Instead, we create
+/// an `AlsaClock` at construction time (which only needs the sample rate)
+/// and wrap it in this `Sync`-safe provider.
+struct AlsaSinkClockProvider {
+    clock: Arc<AlsaClock>,
+}
+
+impl ClockProvider for AlsaSinkClockProvider {
+    fn provide_clock(&self) -> Option<Arc<dyn Clock>> {
+        Some(self.clock.clone())
+    }
+
+    fn clock_priority(&self) -> u32 {
+        150 // Hardware audio clock
+    }
 }
 
 impl AlsaSink {
@@ -482,10 +505,15 @@ impl AlsaSink {
 
         let frame_size = format.format.bytes_per_sample() * format.channels as usize;
 
+        let clock_provider = AlsaSinkClockProvider {
+            clock: Arc::new(AlsaClock::new(format.sample_rate)),
+        };
+
         Ok(Self {
             pcm,
             format,
             frame_size,
+            clock_provider,
         })
     }
 
@@ -577,16 +605,9 @@ impl Clock for AlsaClock {
     }
 }
 
-// Note: AlsaSink cannot implement ClockProvider directly because the PCM handle
-// (alsa::PCM) contains raw pointers and isn't Sync. Instead, use create_clock()
-// to get an AlsaClock that can be shared across threads.
-//
-// Example:
-// ```rust,ignore
-// let sink = AlsaSink::new("default", format)?;
-// let clock = Arc::new(sink.create_clock());
-// pipeline.set_clock(clock);
-// ```
+// Note: AlsaSink provides a clock automatically via `as_clock_provider()`.
+// The pipeline's `select_clock()` will discover it and use it as the master
+// clock. Manual clock setting is still possible via `pipeline.set_clock()`.
 
 impl AsyncSink for AlsaSink {
     async fn consume(&mut self, ctx: &ConsumeContext<'_>) -> Result<()> {
@@ -637,6 +658,10 @@ impl AsyncSink for AlsaSink {
 
     fn execution_hints(&self) -> ExecutionHints {
         ExecutionHints::io_bound()
+    }
+
+    fn as_clock_provider(&self) -> Option<&dyn ClockProvider> {
+        Some(&self.clock_provider)
     }
 }
 

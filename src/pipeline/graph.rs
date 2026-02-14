@@ -174,6 +174,8 @@ pub struct Node {
     input_pads: Vec<Pad>,
     /// Output pads.
     output_pads: Vec<Pad>,
+    /// Cached clock from clock provider (if element provides one).
+    provided_clock: Option<(Arc<dyn Clock>, u32)>,
 }
 
 impl Node {
@@ -185,6 +187,13 @@ impl Node {
         let output_caps = element.output_caps();
         let input_media_caps = element.input_media_caps();
         let output_media_caps = element.output_media_caps();
+
+        // Cache clock provider info (if element provides a clock)
+        let provided_clock = element.as_clock_provider().and_then(|provider| {
+            provider
+                .provide_clock()
+                .map(|clock| (clock, provider.clock_priority()))
+        });
 
         // Create default pads based on element type
         let (input_pads, output_pads) = match element_type {
@@ -207,6 +216,7 @@ impl Node {
             output_media_caps,
             input_pads,
             output_pads,
+            provided_clock,
         }
     }
 
@@ -486,6 +496,43 @@ impl Pipeline {
             true
         } else {
             false
+        }
+    }
+
+    /// Automatically select the best clock from pipeline elements.
+    ///
+    /// Enumerates all elements, finds those that implement [`ClockProvider`],
+    /// and selects the one with the highest priority. If no element provides
+    /// a clock, keeps the current clock (SystemClock by default).
+    ///
+    /// This is called automatically by the executor before starting the
+    /// pipeline. Manual [`set_clock()`](Self::set_clock) calls take precedence
+    /// if made after `select_clock()`.
+    ///
+    /// # Priority Ranges
+    ///
+    /// - 0-99: Software clocks (system monotonic)
+    /// - 100-199: Hardware clocks (audio devices)
+    /// - 200-299: Network clocks (NTP)
+    /// - 300+: Precision clocks (PTP)
+    pub fn select_clock(&mut self) {
+        let mut best: Option<(Arc<dyn Clock>, u32)> = None;
+
+        for (_id, node) in self.nodes() {
+            if let Some((clock, priority)) = &node.provided_clock {
+                if best.as_ref().map_or(true, |(_, p)| *priority > *p) {
+                    best = Some((clock.clone(), *priority));
+                }
+            }
+        }
+
+        if let Some((clock, priority)) = best {
+            tracing::info!(
+                "Auto-selected pipeline clock: {} (priority {})",
+                clock.name(),
+                priority
+            );
+            self.clock = PipelineClock::new(clock);
         }
     }
 

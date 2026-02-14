@@ -416,3 +416,154 @@ fn test_clock_time_none() {
     assert!(zero.is_some());
     assert!(some_time.is_some());
 }
+
+// ============================================================================
+// Auto Clock Selection Tests
+// ============================================================================
+
+/// A test clock provider with configurable priority.
+struct TestClockProviderSink {
+    provider: TestProvider,
+}
+
+struct TestProvider {
+    clock: Arc<dyn parallax::clock::Clock>,
+    priority: u32,
+}
+
+impl parallax::clock::ClockProvider for TestProvider {
+    fn provide_clock(&self) -> Option<Arc<dyn parallax::clock::Clock>> {
+        Some(self.clock.clone())
+    }
+
+    fn clock_priority(&self) -> u32 {
+        self.priority
+    }
+}
+
+impl TestClockProviderSink {
+    fn new(name: &'static str, priority: u32) -> Self {
+        use parallax::clock::{Clock, ClockFlags};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        struct NamedClock {
+            name: &'static str,
+            counter: AtomicU64,
+        }
+
+        impl Clock for NamedClock {
+            fn now(&self) -> ClockTime {
+                ClockTime::from_nanos(self.counter.fetch_add(1_000_000, Ordering::Relaxed))
+            }
+            fn flags(&self) -> ClockFlags {
+                ClockFlags::CAN_BE_MASTER | ClockFlags::HARDWARE
+            }
+            fn name(&self) -> &str {
+                self.name
+            }
+        }
+
+        Self {
+            provider: TestProvider {
+                clock: Arc::new(NamedClock {
+                    name,
+                    counter: AtomicU64::new(0),
+                }),
+                priority,
+            },
+        }
+    }
+}
+
+impl Sink for TestClockProviderSink {
+    fn consume(&mut self, _ctx: &ConsumeContext) -> Result<()> {
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "test-clock-provider-sink"
+    }
+
+    fn as_clock_provider(&self) -> Option<&dyn parallax::clock::ClockProvider> {
+        Some(&self.provider)
+    }
+}
+
+/// Pipeline without clock providers keeps SystemClock.
+#[test]
+fn test_select_clock_default_system() {
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_source("src", parallax::elements::NullSource::new(5));
+    let sink = pipeline.add_sink("sink", parallax::elements::NullSink::new());
+    pipeline.link(src, sink).unwrap();
+
+    pipeline.select_clock();
+
+    // Should still be the system clock (default)
+    assert_eq!(pipeline.clock().clock().name(), "system-monotonic");
+}
+
+/// Pipeline with a clock provider auto-selects it.
+#[test]
+fn test_select_clock_picks_provider() {
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_source("src", parallax::elements::NullSource::new(5));
+    let sink = pipeline.add_sink("sink", TestClockProviderSink::new("hw-audio", 150));
+    pipeline.link(src, sink).unwrap();
+
+    pipeline.select_clock();
+
+    assert_eq!(pipeline.clock().clock().name(), "hw-audio");
+}
+
+/// Pipeline with multiple clock providers picks highest priority.
+#[test]
+fn test_select_clock_highest_priority_wins() {
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_source("src", parallax::elements::NullSource::new(5));
+
+    // Add low-priority sink
+    let low = pipeline.add_sink("low", TestClockProviderSink::new("low-clock", 50));
+
+    // Add high-priority sink
+    let _high = pipeline.add_sink("high", TestClockProviderSink::new("high-clock", 200));
+
+    pipeline.link(src, low).unwrap();
+    // high is unlinked but still in the graph — select_clock iterates all nodes
+
+    pipeline.select_clock();
+
+    assert_eq!(pipeline.clock().clock().name(), "high-clock");
+}
+
+/// Manual set_clock() after select_clock() overrides auto-selection.
+#[test]
+fn test_manual_clock_overrides_auto() {
+    use parallax::clock::{Clock, ClockFlags};
+
+    struct ManualClock;
+    impl Clock for ManualClock {
+        fn now(&self) -> ClockTime {
+            ClockTime::ZERO
+        }
+        fn flags(&self) -> ClockFlags {
+            ClockFlags::CAN_BE_MASTER
+        }
+        fn name(&self) -> &str {
+            "manual-clock"
+        }
+    }
+
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_source("src", parallax::elements::NullSource::new(5));
+    let sink = pipeline.add_sink("sink", TestClockProviderSink::new("hw-audio", 150));
+    pipeline.link(src, sink).unwrap();
+
+    // Auto-select picks hw-audio
+    pipeline.select_clock();
+    assert_eq!(pipeline.clock().clock().name(), "hw-audio");
+
+    // Manual override
+    pipeline.set_clock(Arc::new(ManualClock));
+    assert_eq!(pipeline.clock().clock().name(), "manual-clock");
+}

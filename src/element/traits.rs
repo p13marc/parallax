@@ -4,7 +4,7 @@
 #![allow(missing_docs)]
 
 use crate::buffer::Buffer;
-use crate::clock::{Clock, ClockTime};
+use crate::clock::{Clock, ClockProvider, ClockTime};
 use crate::element::context::{ConsumeContext, ProduceContext, ProduceResult};
 use crate::error::Result;
 use crate::event::{Event, EventResult};
@@ -780,6 +780,14 @@ pub trait Sink: Send {
     fn handle_downstream_event(&mut self, event: Event) -> Option<Event> {
         Some(event)
     }
+
+    /// Get a clock provider if this sink can provide a clock.
+    ///
+    /// Audio sinks typically provide a hardware clock that can be used
+    /// as the pipeline's master clock for A/V synchronization.
+    fn as_clock_provider(&self) -> Option<&dyn ClockProvider> {
+        None
+    }
 }
 
 /// An async sink element that consumes buffers asynchronously.
@@ -842,6 +850,14 @@ pub trait AsyncSink: Send {
     /// Default implementation forwards all events.
     fn handle_downstream_event(&mut self, event: Event) -> Option<Event> {
         Some(event)
+    }
+
+    /// Get a clock provider if this sink can provide a clock.
+    ///
+    /// Audio sinks typically provide a hardware clock that can be used
+    /// as the pipeline's master clock for A/V synchronization.
+    fn as_clock_provider(&self) -> Option<&dyn ClockProvider> {
+        None
     }
 }
 
@@ -1544,6 +1560,16 @@ pub trait AsyncElementDyn {
     /// Get the inner element as `&mut dyn Any` for mutable downcasting.
     fn as_any_mut(&mut self) -> &mut dyn Any;
 
+    /// Get a clock provider interface if this element can provide a clock.
+    ///
+    /// Elements that implement [`ClockProvider`] (e.g., audio sinks with
+    /// hardware clocks) return `Some`. All others return `None`.
+    ///
+    /// Used by [`Pipeline::select_clock()`] to auto-select the best clock.
+    fn as_clock_provider(&self) -> Option<&dyn ClockProvider> {
+        None
+    }
+
     /// Get a sync processing interface if this element supports it.
     ///
     /// Elements that implement [`SyncElement`] and are wrapped via
@@ -2055,6 +2081,10 @@ impl<S: Sink + Send + 'static> SendAsyncElementDyn for SinkAdapter<S> {
 
     fn execution_hints(&self) -> ExecutionHints {
         self.inner.execution_hints()
+    }
+
+    fn as_clock_provider(&self) -> Option<&dyn ClockProvider> {
+        self.inner.as_clock_provider()
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -2575,6 +2605,10 @@ impl<S: AsyncSink + Send + 'static> SendAsyncElementDyn for AsyncSinkAdapter<S> 
 
     fn execution_hints(&self) -> ExecutionHints {
         self.inner.execution_hints()
+    }
+
+    fn as_clock_provider(&self) -> Option<&dyn ClockProvider> {
+        self.inner.as_clock_provider()
     }
 
     fn as_any(&self) -> &dyn Any {

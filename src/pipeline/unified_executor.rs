@@ -532,7 +532,8 @@ impl Executor {
             effective_scheduling
         );
 
-        // Start pipeline clock and get clock info for sources
+        // Auto-select the best clock from pipeline elements, then start it
+        pipeline.select_clock();
         pipeline.start_clock();
         let pipeline_clock = pipeline.clock();
         let clock_info: Option<(Arc<dyn Clock>, ClockTime)> = if pipeline_clock.is_started() {
