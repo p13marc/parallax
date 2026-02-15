@@ -4,16 +4,15 @@ This file provides guidance to Claude Code when working with code in this reposi
 
 ## Project Overview
 
-**Parallax** is a Rust-native streaming pipeline engine designed to compete with GStreamer, offering security-first process isolation, zero-copy memory management, and modern GPU integration.
+**Parallax** is a Rust-native streaming pipeline engine designed to compete with GStreamer, offering zero-copy memory management, hybrid scheduling, and modern GPU integration.
 
 ### Core Principles
 
-1. **Security-First**: Inter-process isolation by default, sandboxed elements with seccomp/namespaces
-2. **Shared Memory First**: All CPU buffers are memfd-backed (zero overhead, always IPC-ready)
-3. **Progressive Typing**: Dynamic pipelines (runtime flexibility) + Typed pipelines (compile-time safety)
-4. **Zero-Copy by Design**: Arena allocation, fd passing, rkyv serialization
-5. **Linux-Only**: Leverages memfd_create, SCM_RIGHTS, seccomp, namespaces, cgroups
-6. **Sync Processing, Async Orchestration**: Element processing is sync; pipeline orchestration is async (Tokio)
+1. **Shared Memory First**: All CPU buffers are memfd-backed (zero overhead, always IPC-ready)
+2. **Progressive Typing**: Dynamic pipelines (runtime flexibility) + Typed pipelines (compile-time safety)
+3. **Zero-Copy by Design**: Arena allocation, fd passing, rkyv serialization
+4. **Linux-Only**: Leverages memfd_create, SCM_RIGHTS
+5. **Sync Processing, Async Orchestration**: Element processing is sync; pipeline orchestration is async (Tokio)
 
 ### Key Design Decisions
 
@@ -34,31 +33,6 @@ This file provides guidance to Claude Code when working with code in this reposi
 | Image Codecs | zune-jpeg, png crate (pure Rust) |
 | Container Formats | mp4 crate (pure Rust: MP4 demux/mux) |
 
-### Execution Modes
-
-```rust
-pub enum ExecutionMode {
-    /// All elements as Tokio tasks in ONE runtime (fastest, no isolation)
-    InProcess,
-    
-    /// Each element in separate sandboxed process (max isolation)
-    Isolated { sandbox: ElementSandbox },
-    
-    /// Group elements to minimize processes while isolating untrusted code
-    Grouped {
-        isolated_patterns: Vec<String>,
-        sandbox: ElementSandbox,
-        groups: Option<HashMap<String, GroupId>>,
-    },
-}
-```
-
-| Mode | 20 elements | Tokio Runtimes | Processes |
-|------|-------------|----------------|-----------|
-| InProcess | All trusted | 1 | 1 |
-| Isolated | All untrusted | 21 | 21 |
-| Grouped | 2 codecs untrusted | 2-3 | 2-3 |
-
 ### Unified Executor with Automatic Strategy
 
 Parallax uses a unified `Executor` that automatically determines the optimal execution strategy for each element based on **ExecutionHints**. No developer insight required - just run your pipeline and the executor figures out the best approach.
@@ -66,7 +40,7 @@ Parallax uses a unified `Executor` that automatically determines the optimal exe
 ```rust
 // Simply run your pipeline - the executor auto-negotiates strategy
 let mut pipeline = Pipeline::parse("filesrc ! decoder ! videosink")?;
-pipeline.run().await?;  // Automatic: filesrc=async, decoder=isolated, videosink=async
+pipeline.run().await?;  // Automatic: filesrc=async, decoder=RT if low-latency
 ```
 
 #### Automatic Strategy Detection
@@ -86,7 +60,7 @@ pub struct ExecutionHints {
 // Elements provide hints (defaults are safe)
 impl Source for MyDecoder {
     fn execution_hints(&self) -> ExecutionHints {
-        ExecutionHints::native()  // Uses FFI -> will be isolated
+        ExecutionHints::default()
     }
 }
 ```
@@ -95,9 +69,7 @@ The executor analyzes all hints and chooses:
 
 | Element Characteristics | Strategy |
 |------------------------|----------|
-| Untrusted OR native+unsafe | **Isolated** (separate process) |
-| RT affinity + RT-safe | **RealTime** (dedicated RT thread) |
-| Low latency + RT-safe | **RealTime** |
+| RT-safe + low latency | **RealTime** (dedicated RT thread) |
 | I/O-bound OR async affinity | **Async** (Tokio task) |
 | Everything else | **Async** (default) |
 
@@ -126,7 +98,6 @@ executor.start(&mut pipeline).await?;
 Under the hood, the unified executor combines:
 - **Tokio async tasks** for I/O-bound elements (network, file I/O)
 - **Dedicated RT threads** for CPU-bound, real-time-safe elements (audio/video processing)
-- **Isolated processes** for untrusted or native code elements
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -153,13 +124,6 @@ Under the hood, the unified executor combines:
 │  Driver-based scheduling, deterministic latency                 │
 └─────────────────────────────────────────────────────────────────┘
 
-┌─────────────────────────────────────────────────────────────────┐
-│                    Isolated Process(es)                         │
-│  ┌──────────────┐                                               │
-│  │  FFmpeg      │  seccomp sandbox, IPC via shared memory       │
-│  │  (untrusted) │                                               │
-│  └──────────────┘                                               │
-└─────────────────────────────────────────────────────────────────┘
 ```
 
 **Key concepts:**
@@ -182,7 +146,6 @@ pub enum SchedulingMode {
 pub enum ElementStrategy {
     Async,     // Run as Tokio task
     RealTime,  // Run in RT thread
-    Isolated,  // Run in separate process
 }
 ```
 
@@ -598,25 +561,6 @@ cargo clippy -- -D warnings
 
 ## Architecture
 
-### Security Model
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                      SUPERVISOR PROCESS                         │
-│  • Spawns element processes    • Owns shared memory allocation  │
-│  • Routes control messages     • Handles crash recovery         │
-└─────────────────────────────────────────────────────────────────┘
-        │              │              │              │
-        ▼              ▼              ▼              ▼
-   ┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐
-   │ Element │    │ Element │    │ Element │    │ Element │
-   │  (src)  │───▶│ (codec) │───▶│(filter) │───▶│ (sink)  │
-   └─────────┘    └─────────┘    └─────────┘    └─────────┘
-   seccomp        seccomp        seccomp        seccomp
-```
-
-**Key principle**: Buffers are shared; authority is not.
-
 ### Current Implementation
 
 ```
@@ -645,18 +589,12 @@ parallax/
 │   │
 │   ├── pipeline/           # Pipeline execution
 │   │   ├── graph.rs        # Pipeline DAG (daggy-based)
-│   │   ├── unified_executor.rs # Unified Executor (async + RT + isolation)
+│   │   ├── unified_executor.rs # Unified Executor (async + RT)
 │   │   ├── rt_scheduler.rs # RT scheduler (graph partitioning, activation records)
 │   │   ├── rt_bridge.rs    # AsyncRtBridge (lock-free SPSC ring buffer + eventfd)
 │   │   ├── driver.rs       # TimerDriver, ManualDriver (PipeWire-style drivers)
 │   │   ├── parser.rs       # Pipeline string parser (winnow)
 │   │   └── factory.rs      # ElementFactory + PluginRegistry
-│   │
-│   ├── execution/          # Process isolation
-│   │   ├── mode.rs         # ExecutionMode (InProcess, Isolated, Grouped)
-│   │   ├── isolated_executor.rs  # Transparent IPC injection
-│   │   ├── supervisor.rs   # Process supervision
-│   │   └── protocol.rs     # Control message protocol
 │   │
 │   ├── elements/           # Built-in elements (organized by category)
 │   │   ├── network/        # TCP, UDP, Unix, multicast, HTTP, WebSocket, Zenoh
@@ -698,7 +636,6 @@ parallax/
 │   ├── 09_typed.rs               # Type-safe pipeline API
 │   ├── 10_builder.rs             # Fluent builder DSL with >> operator
 │   ├── 11_buffer_pool.rs         # Pre-allocated buffer pooling
-│   ├── 12_isolation.rs           # Process isolation modes
 │   │   # Codec examples (require feature flags)
 │   ├── 13_image.rs               # PNG codec (--features image-codecs)
 │   ├── 14_h264.rs                # H.264 encoding (--features h264)
@@ -1066,32 +1003,11 @@ See `docs/design.md` for full details.
 | 3 | Cross-Process IPC (IpcSrc/IpcSink) | Complete |
 | 4 | GPU Integration (Vulkan Video) | Planned |
 | 5 | Pure Rust Codecs | Partial (audio/image complete, video AV1 ready) |
-| 6 | Process Isolation (transparent auto-IPC) | Complete |
 | 7 | Plugin System (C-compatible ABI) | Complete |
 | 8 | Distribution (Zenoh) | Complete |
 | 9 | Hybrid Scheduling (PipeWire-inspired) | Complete |
 | 10 | Unified Executor (automatic strategy) | Complete |
 | 11 | Device Support (V4L2, PipeWire, ALSA, libcamera) | Complete |
-
-### Transparent Process Isolation
-
-Users write normal pipelines - isolation is automatic:
-
-```rust
-// Write a normal pipeline
-let pipeline = Pipeline::parse("filesrc ! h264dec ! displaysink")?;
-
-// Run with selective isolation (decoders in isolated processes)
-pipeline.run_isolating(vec!["*dec*"]).await?;
-
-// Or run fully isolated (each element in its own process)
-pipeline.run_isolated().await?;
-
-// Or run in-process (default, fastest)
-pipeline.run().await?;
-```
-
-The executor automatically injects IPC boundaries where needed.
 
 ## Code Style Guidelines
 
@@ -1434,5 +1350,5 @@ See `examples/45_dmabuf_negotiation.rs` for a complete example.
 - `docs/api.md` - API reference
 - `docs/memory.md` - Memory management details
 - `docs/plugins.md` - Plugin development guide
-- `docs/security.md` - Security model and sandboxing
+- `docs/security.md` - Security model
 - `docs/getting-started.md` - Quick start guide
