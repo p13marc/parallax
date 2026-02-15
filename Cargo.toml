@@ -200,10 +200,6 @@ name = "memory_pool"
 harness = false
 
 [[bench]]
-name = "isolation"
-harness = false
-
-[[bench]]
 name = "colorspace"
 harness = false
 
@@ -243,9 +239,6 @@ name = "10_builder"
 
 [[example]]
 name = "11_buffer_pool"
-
-[[example]]
-name = "12_isolation"
 
 # Codec examples (13-16): require feature flags
 [[example]]

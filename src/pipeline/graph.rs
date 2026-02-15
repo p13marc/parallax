@@ -176,6 +176,11 @@ pub struct Node {
     output_pads: Vec<Pad>,
     /// Cached clock from clock provider (if element provides one).
     provided_clock: Option<(Arc<dyn Clock>, u32)>,
+    /// Factory name used to create this element (for process isolation).
+    /// `None` if element was created programmatically.
+    factory_name: Option<String>,
+    /// Factory properties used to create this element (for process isolation).
+    factory_props: Vec<(String, crate::pipeline::parser::PropertyValue)>,
 }
 
 impl Node {
@@ -217,6 +222,8 @@ impl Node {
             input_pads,
             output_pads,
             provided_clock,
+            factory_name: None,
+            factory_props: Vec::new(),
         }
     }
 
@@ -333,6 +340,28 @@ impl Node {
             .as_ref()
             .map(|e| e.execution_hints())
             .unwrap_or_default()
+    }
+
+    /// Get the factory name used to create this element.
+    ///
+    /// Returns `None` if the element was created programmatically.
+    pub fn factory_name(&self) -> Option<&str> {
+        self.factory_name.as_deref()
+    }
+
+    /// Get the factory properties used to create this element.
+    pub fn factory_props(&self) -> &[(String, crate::pipeline::parser::PropertyValue)] {
+        &self.factory_props
+    }
+
+    /// Set factory info for process isolation support.
+    pub(crate) fn set_factory_info(
+        &mut self,
+        name: String,
+        props: Vec<(String, crate::pipeline::parser::PropertyValue)>,
+    ) {
+        self.factory_name = Some(name);
+        self.factory_props = props;
     }
 }
 
@@ -2045,6 +2074,18 @@ impl Pipeline {
 
             let node_id = pipeline.add_node(name, element);
 
+            // Store factory info for process isolation (element recreation in child)
+            // Filter out the "name" property since it's used for naming, not construction
+            let factory_props: Vec<_> = elem
+                .properties
+                .iter()
+                .filter(|(k, _)| k != "name")
+                .cloned()
+                .collect();
+            if let Some(node) = pipeline.get_node_mut(node_id) {
+                node.set_factory_info(elem.name.clone(), factory_props);
+            }
+
             // Link to previous element
             if let Some(prev) = prev_node {
                 pipeline.link(prev, node_id)?;
@@ -2327,78 +2368,6 @@ impl Pipeline {
     ) -> Result<crate::pipeline::UnifiedPipelineHandle> {
         let executor = crate::pipeline::Executor::with_config(config);
         executor.start(self)
-    }
-
-    /// Run the pipeline with a specific execution mode.
-    ///
-    /// This allows transparent process isolation without manually adding
-    /// IpcSrc/IpcSink elements. The executor automatically injects IPC
-    /// boundaries where needed.
-    ///
-    /// # Execution Modes
-    ///
-    /// - `InProcess`: All elements run in the current process (default, fastest)
-    /// - `Isolated`: Each element runs in its own sandboxed process (maximum isolation)
-    /// - `Grouped`: Selective isolation based on patterns (balance of safety and performance)
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// use parallax::pipeline::Pipeline;
-    /// use parallax::execution::ExecutionMode;
-    ///
-    /// let mut pipeline = Pipeline::parse("filesrc ! h264dec ! displaysink")?;
-    ///
-    /// // Isolate decoders (they process untrusted input)
-    /// pipeline.run_with_mode(ExecutionMode::grouped(vec!["*dec*".to_string()])).await?;
-    /// ```
-    pub async fn run_with_mode(self, mode: crate::execution::ExecutionMode) -> Result<()> {
-        let executor = crate::execution::IsolatedExecutor::new(mode);
-        executor.run(self).await
-    }
-
-    /// Run the pipeline with full isolation for all elements.
-    ///
-    /// Each element runs in its own sandboxed process. This provides
-    /// maximum security at the cost of IPC overhead.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// use parallax::pipeline::Pipeline;
-    ///
-    /// let mut pipeline = Pipeline::parse("filesrc ! decoder ! sink")?;
-    /// pipeline.run_isolated().await?;
-    /// ```
-    pub async fn run_isolated(self) -> Result<()> {
-        self.run_with_mode(crate::execution::ExecutionMode::isolated())
-            .await
-    }
-
-    /// Run the pipeline with selective isolation.
-    ///
-    /// Elements matching any of the patterns run in isolated processes.
-    /// Other elements run together in the main process.
-    ///
-    /// # Pattern Syntax
-    ///
-    /// - `*` matches any sequence of characters
-    /// - `?` matches any single character
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// use parallax::pipeline::Pipeline;
-    ///
-    /// let mut pipeline = Pipeline::parse("filesrc ! h264dec ! x264enc ! filesink")?;
-    ///
-    /// // Isolate all codecs (decoders and encoders)
-    /// pipeline.run_isolating(vec!["*dec*", "*enc*"]).await?;
-    /// ```
-    pub async fn run_isolating(self, patterns: Vec<&str>) -> Result<()> {
-        let patterns: Vec<String> = patterns.into_iter().map(|s| s.to_string()).collect();
-        self.run_with_mode(crate::execution::ExecutionMode::grouped(patterns))
-            .await
     }
 }
 

@@ -28,10 +28,10 @@
 //! let buffer = src.produce()?;
 //! ```
 
+use super::protocol::{ControlMessage, SerializableMetadata, frame_message, unframe_message};
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
 use crate::error::{Error, Result};
-use crate::execution::{ControlMessage, SerializableMetadata, frame_message, unframe_message};
 use crate::format::Caps;
 use crate::memory::{SharedArena, SharedIpcSlotRef};
 use std::collections::VecDeque;
@@ -158,7 +158,10 @@ impl IpcSink {
         Ok(())
     }
 
-    /// Send arena registration to the source.
+    /// Send arena registration to the source via SCM_RIGHTS.
+    ///
+    /// Sends both the control message and the arena file descriptor in a single
+    /// `sendmsg()` call using Unix domain socket ancillary data.
     fn send_arena_registration(&mut self) -> Result<()> {
         let arena = self
             .arena
@@ -172,12 +175,15 @@ impl IpcSink {
             slot_count: arena.slot_count(),
         };
 
-        self.send_message(&msg)?;
+        let msg_bytes = frame_message(&msg);
 
-        // NOTE: Arena fd should be sent via SCM_RIGHTS for true cross-process zero-copy.
-        // Currently relies on the arena being accessible via its ID within the same
-        // process group. Full SCM_RIGHTS implementation requires extending the IPC
-        // protocol with fd passing support from memory/ipc.rs (send_fds/recv_fds).
+        // Send arena fd + registration message via SCM_RIGHTS
+        let socket = self
+            .socket
+            .as_ref()
+            .ok_or_else(|| Error::Element("Not connected".into()))?;
+
+        crate::memory::ipc::send_fds(socket, &[arena.fd()], &msg_bytes)?;
 
         Ok(())
     }
@@ -311,12 +317,10 @@ pub struct IpcSrc {
     is_server: bool,
     /// Listener for incoming connections (server mode).
     listener: Option<UnixListener>,
-    /// Registered arenas (id -> slot_count). Used to track known arenas.
-    registered_arenas: std::collections::HashMap<u64, usize>,
+    /// Mapped arenas received via SCM_RIGHTS (id -> SharedArena).
+    arena_cache: std::collections::HashMap<u64, SharedArena>,
     /// Capabilities.
     caps: Caps,
-    /// Arena for creating placeholder buffers (when arena mapping not available).
-    arena: Option<SharedArena>,
 }
 
 impl IpcSrc {
@@ -329,9 +333,8 @@ impl IpcSrc {
             socket: None,
             is_server: false,
             listener: None,
-            registered_arenas: std::collections::HashMap::new(),
+            arena_cache: std::collections::HashMap::new(),
             caps: Caps::any(),
-            arena: None,
         }
     }
 
@@ -342,9 +345,8 @@ impl IpcSrc {
             socket: None,
             is_server: true,
             listener: None,
-            registered_arenas: std::collections::HashMap::new(),
+            arena_cache: std::collections::HashMap::new(),
             caps: Caps::any(),
-            arena: None,
         }
     }
 
@@ -447,20 +449,39 @@ impl IpcSrc {
         Ok(msg)
     }
 
-    /// Handle arena registration message.
-    fn handle_arena_registration(
-        &mut self,
-        arena_id: u64,
-        _size: usize,
-        _slot_size: usize,
-        slot_count: usize,
-    ) {
-        self.registered_arenas.insert(arena_id, slot_count);
-        // NOTE: Should receive arena fd via SCM_RIGHTS and mmap it for true zero-copy.
-        // Currently only tracks arena metadata. Full implementation requires:
-        // 1. Receive fd via recv_fds() from memory/ipc.rs
-        // 2. mmap the fd to local address space
-        // 3. Create a SharedArena from the mapped region
+    /// Receive arena registration with fd via SCM_RIGHTS.
+    ///
+    /// This receives both the control message and the arena fd in a single
+    /// `recvmsg()` call, then maps the arena into this process's address space.
+    fn receive_arena_registration(&mut self) -> Result<()> {
+        let socket = self
+            .socket
+            .as_ref()
+            .ok_or_else(|| Error::Element("Not connected".into()))?;
+
+        let mut data_buf = vec![0u8; 4096];
+        let (bytes_read, fds) = crate::memory::ipc::recv_fds(socket, &mut data_buf)?;
+
+        if fds.is_empty() {
+            return Err(Error::Element("No arena fd received".into()));
+        }
+
+        // Parse the control message
+        let (msg, _) = unframe_message(&data_buf[..bytes_read])
+            .ok_or_else(|| Error::Element("Invalid arena registration message".into()))?;
+
+        if let ControlMessage::RegisterArena { arena_id, .. } = msg {
+            // Map the arena from the received fd
+            let fd = fds.into_iter().next().unwrap();
+            let arena = unsafe { SharedArena::from_fd(fd)? };
+            self.arena_cache.insert(arena_id, arena);
+            Ok(())
+        } else {
+            Err(Error::Element(format!(
+                "Expected RegisterArena, got {:?}",
+                msg
+            )))
+        }
     }
 }
 
@@ -468,46 +489,37 @@ impl Source for IpcSrc {
     fn produce(&mut self, _ctx: &mut ProduceContext) -> Result<ProduceResult> {
         self.ensure_connected()?;
 
+        // If no arenas registered yet, receive the arena registration first
+        if self.arena_cache.is_empty() {
+            self.receive_arena_registration()?;
+        }
+
         loop {
             let msg = self.recv_message()?;
 
             match msg {
-                ControlMessage::RegisterArena {
-                    arena_id,
-                    size,
-                    slot_size,
-                    slot_count,
-                } => {
-                    self.handle_arena_registration(arena_id, size, slot_size, slot_count);
-                    continue;
-                }
-
                 ControlMessage::BufferReady { slot, metadata } => {
-                    // Send acknowledgment
-                    self.send_message(&ControlMessage::BufferDone { slot })?;
-
-                    // NOTE: With full SCM_RIGHTS support, we would look up the arena
-                    // in a local cache via SharedArenaCache and create a zero-copy buffer.
-                    // Currently creates a placeholder buffer since arena mapping
-                    // is not yet implemented.
                     let meta = metadata.to_metadata();
 
-                    // Create a buffer with allocated memory using SharedArena.
-                    // NOTE: For true zero-copy, use SharedArenaCache to map the
-                    // arena from the sender. Currently copies data for simplicity.
-                    if self.arena.is_none() {
-                        // Use 64KB slots by default, matching IpcSink
-                        self.arena = Some(SharedArena::new(64 * 1024, 64)?);
-                    }
-                    let arena = self.arena.as_mut().unwrap();
-                    arena.reclaim();
-                    let arena_slot = arena
-                        .acquire()
-                        .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+                    // Look up the arena by ID for true zero-copy access
+                    let arena = self.arena_cache.get(&slot.arena_id).ok_or_else(|| {
+                        Error::Element(format!("unknown arena {}", slot.arena_id))
+                    })?;
+
+                    // Get a reference to the same shared memory slot (zero-copy)
+                    let arena_slot = arena.slot_from_ipc(&slot).ok_or_else(|| {
+                        Error::Element(format!(
+                            "invalid slot {} in arena {}",
+                            slot.slot_index, slot.arena_id
+                        ))
+                    })?;
+
                     let handle = MemoryHandle::with_len(arena_slot, slot.len);
                     let buffer = Buffer::new(handle, meta);
 
-                    // IpcSrc receives buffers via IPC, so return OwnBuffer
+                    // Send acknowledgment after we have a reference to the slot
+                    self.send_message(&ControlMessage::BufferDone { slot })?;
+
                     return Ok(ProduceResult::OwnBuffer(buffer));
                 }
 

@@ -55,7 +55,6 @@ pub mod element;
 pub mod elements;
 pub mod error;
 pub mod event;
-pub mod execution;
 pub mod format;
 pub mod gpu;
 pub mod link;

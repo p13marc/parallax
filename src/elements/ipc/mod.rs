@@ -5,6 +5,7 @@
 
 mod ipc_elements;
 mod memory;
+pub(crate) mod protocol;
 
 pub use ipc_elements::{IpcSink, IpcSrc};
 pub use memory::{MemorySink, MemorySinkStats, MemorySrc, SharedMemorySink};

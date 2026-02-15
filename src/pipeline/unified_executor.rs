@@ -4,14 +4,12 @@
 //! - **Auto** (default): Automatically determines optimal strategy per element
 //! - Async: All elements run as Tokio tasks
 //! - Hybrid: Mix of async tasks and RT threads
-//! - Isolated: Process isolation for untrusted elements
 //!
 //! # Automatic Mode
 //!
 //! In automatic mode (default), the executor analyzes each element's
 //! [`ExecutionHints`] to determine the best execution strategy:
 //!
-//! - **Untrusted elements** (decoders, parsers) → Process isolation
 //! - **Low-latency elements** (audio processing) → RT threads
 //! - **I/O-bound elements** (network, file) → Async tasks
 //! - **CPU-bound elements** → Dedicated threads or RT threads
@@ -25,7 +23,7 @@
 //!
 //! // Automatic mode (default) - the executor will:
 //! // - Run filesrc as async (I/O-bound)
-//! // - Isolate h264dec (untrusted, native code)
+//! // - Run h264dec based on its hints
 //! // - Run display as async or RT based on latency needs
 //! pipeline.run().await?;
 //! ```
@@ -34,10 +32,9 @@ use crate::buffer::Buffer;
 use crate::clock::{Clock, ClockTime};
 use crate::element::{
     AsyncElementDyn, DynAsyncElement, ElementType, ExecutionHints, LatencyHint, Output,
-    ProcessingHint, SourceResult, TrustLevel,
+    ProcessingHint, SourceResult,
 };
 use crate::error::{Error, Result};
-use crate::execution::ExecutionMode;
 use crate::pipeline::rt_bridge::AsyncRtBridge;
 use crate::pipeline::rt_scheduler::{
     BoundaryDirection, GraphPartition, RtConfig, RtScheduler, SchedulingMode,
@@ -69,17 +66,12 @@ pub struct ExecutorConfig {
     /// RT scheduling configuration (for Hybrid/RealTime modes).
     pub rt: RtConfig,
 
-    /// Process isolation mode.
-    /// None = auto-detect based on element hints.
-    /// Some(mode) = use specified mode.
-    pub isolation: Option<ExecutionMode>,
-
     /// Driver configuration (for timed execution).
     pub driver: Option<DriverConfig>,
 
     /// Enable automatic strategy detection from element hints.
     /// When true (default), the executor analyzes ExecutionHints to determine
-    /// optimal scheduling and isolation per element.
+    /// optimal scheduling per element.
     pub auto_strategy: bool,
 }
 
@@ -89,7 +81,6 @@ impl Default for ExecutorConfig {
             scheduling: SchedulingMode::Async,
             channel_capacity: 16,
             rt: RtConfig::default(),
-            isolation: None,
             driver: None,
             auto_strategy: true, // Enable automatic by default
         }
@@ -100,7 +91,6 @@ impl ExecutorConfig {
     /// Create config for automatic strategy detection (default).
     ///
     /// The executor will analyze each element's `ExecutionHints` to determine:
-    /// - Which elements need process isolation (untrusted, native code)
     /// - Which elements should run in RT threads (low-latency)
     /// - Which elements are I/O-bound (async tasks)
     pub fn auto() -> Self {
@@ -147,15 +137,6 @@ impl ExecutorConfig {
         }
     }
 
-    /// Create config with process isolation for all elements.
-    pub fn isolated() -> Self {
-        Self {
-            isolation: Some(ExecutionMode::isolated()),
-            auto_strategy: false,
-            ..Default::default()
-        }
-    }
-
     /// Set scheduling mode.
     pub fn with_scheduling(mut self, mode: SchedulingMode) -> Self {
         self.scheduling = mode;
@@ -177,12 +158,6 @@ impl ExecutorConfig {
     /// Set quantum (samples per cycle).
     pub fn with_quantum(mut self, quantum: u32) -> Self {
         self.rt.quantum = quantum;
-        self
-    }
-
-    /// Set process isolation mode.
-    pub fn with_isolation(mut self, mode: ExecutionMode) -> Self {
-        self.isolation = Some(mode);
         self
     }
 
@@ -210,8 +185,6 @@ pub enum ElementStrategy {
     Async,
     /// Run in dedicated RT thread.
     RealTime,
-    /// Run in isolated process.
-    Isolated,
 }
 
 /// Analyzed execution plan for the entire pipeline.
@@ -219,14 +192,10 @@ pub enum ElementStrategy {
 pub struct ExecutionPlan {
     /// Strategy per node.
     pub strategies: HashMap<NodeId, ElementStrategy>,
-    /// Nodes that need isolation.
-    pub isolated_nodes: HashSet<NodeId>,
     /// Nodes that need RT scheduling.
     pub rt_nodes: HashSet<NodeId>,
     /// Nodes that can run async.
     pub async_nodes: HashSet<NodeId>,
-    /// Whether any isolation is needed.
-    pub needs_isolation: bool,
     /// Whether any RT scheduling is needed.
     pub needs_rt: bool,
 }
@@ -236,10 +205,8 @@ impl ExecutionPlan {
     pub fn all_async() -> Self {
         Self {
             strategies: HashMap::new(),
-            isolated_nodes: HashSet::new(),
             rt_nodes: HashSet::new(),
             async_nodes: HashSet::new(),
-            needs_isolation: false,
             needs_rt: false,
         }
     }
@@ -256,10 +223,6 @@ fn analyze_pipeline(pipeline: &Pipeline) -> ExecutionPlan {
             let strategy = determine_element_strategy(&hints);
 
             match strategy {
-                ElementStrategy::Isolated => {
-                    plan.isolated_nodes.insert(node_id);
-                    plan.needs_isolation = true;
-                }
                 ElementStrategy::RealTime => {
                     plan.rt_nodes.insert(node_id);
                     plan.needs_rt = true;
@@ -274,10 +237,9 @@ fn analyze_pipeline(pipeline: &Pipeline) -> ExecutionPlan {
     }
 
     tracing::debug!(
-        "Execution plan: {} async, {} RT, {} isolated",
+        "Execution plan: {} async, {} RT",
         plan.async_nodes.len(),
         plan.rt_nodes.len(),
-        plan.isolated_nodes.len()
     );
 
     plan
@@ -286,25 +248,16 @@ fn analyze_pipeline(pipeline: &Pipeline) -> ExecutionPlan {
 /// Determine the execution strategy for a single element based on its hints.
 ///
 /// Elements declare facts about their capabilities (rt_safe, processing type,
-/// trust level, etc.) and the executor derives the optimal strategy.
-/// No contradictions are possible — there are no preference fields to conflict.
+/// latency, etc.) and the executor derives the optimal strategy.
 ///
-/// Priority order: isolation > RT (rt_safe + low latency) > I/O-bound > default async.
+/// Priority order: RT (rt_safe + low latency) > I/O-bound > default async.
 fn determine_element_strategy(hints: &ExecutionHints) -> ElementStrategy {
-    // Rule 1: Isolation trumps everything
-    if hints.trust_level == TrustLevel::Untrusted {
-        return ElementStrategy::Isolated;
-    }
-    if hints.uses_native_code && !hints.crash_safe {
-        return ElementStrategy::Isolated;
-    }
-
-    // Rule 2: RT-safe + low latency → RT thread
+    // Rule 1: RT-safe + low latency → RT thread
     if hints.rt_safe && matches!(hints.latency, LatencyHint::UltraLow | LatencyHint::Low) {
         return ElementStrategy::RealTime;
     }
 
-    // Rule 3: I/O-bound → async
+    // Rule 2: I/O-bound → async
     if hints.processing == ProcessingHint::IoBound {
         return ElementStrategy::Async;
     }
@@ -460,34 +413,14 @@ impl Executor {
         let plan = if self.config.auto_strategy {
             let plan = analyze_pipeline(pipeline);
             tracing::info!(
-                "Auto-detected execution plan: {} async, {} RT, {} isolated",
+                "Auto-detected execution plan: {} async, {} RT",
                 plan.async_nodes.len(),
                 plan.rt_nodes.len(),
-                plan.isolated_nodes.len()
             );
             Some(plan)
         } else {
             None
         };
-
-        // Handle process isolation
-        let needs_isolation =
-            plan.as_ref().is_some_and(|p| p.needs_isolation) || self.config.isolation.is_some();
-
-        if needs_isolation {
-            // NOTE: Isolation logging only - full process isolation via IsolatedExecutor
-            // Use pipeline.run_isolated() for actual process isolation
-            if let Some(ref plan) = plan {
-                for node_id in &plan.isolated_nodes {
-                    if let Some(node) = pipeline.get_node(*node_id) {
-                        tracing::warn!(
-                            "Element '{}' should be isolated (untrusted/native), but isolation not yet implemented",
-                            node.name()
-                        );
-                    }
-                }
-            }
-        }
 
         // State transitions
         let old_state = pipeline.state();
@@ -1581,7 +1514,6 @@ mod tests {
         let config = ExecutorConfig::default();
         assert_eq!(config.scheduling, SchedulingMode::Async);
         assert_eq!(config.channel_capacity, 16);
-        assert!(config.isolation.is_none());
         assert!(config.driver.is_none());
     }
 
@@ -1656,24 +1588,6 @@ mod tests {
     }
 
     #[test]
-    fn test_determine_element_strategy_untrusted() {
-        let hints = ExecutionHints::untrusted();
-
-        // Untrusted -> Isolated
-        let strategy = determine_element_strategy(&hints);
-        assert_eq!(strategy, ElementStrategy::Isolated);
-    }
-
-    #[test]
-    fn test_determine_element_strategy_native_unsafe() {
-        let hints = ExecutionHints::native();
-
-        // Native code that's not crash-safe -> Isolated
-        let strategy = determine_element_strategy(&hints);
-        assert_eq!(strategy, ElementStrategy::Isolated);
-    }
-
-    #[test]
     fn test_determine_element_strategy_rt_safe() {
         // RT-safe profile (rt_safe + low latency) -> RealTime
         let hints = ExecutionHints::rt_safe();
@@ -1729,11 +1643,9 @@ mod tests {
         let plan = analyze_pipeline(&pipeline);
 
         // Default elements should be async
-        assert!(!plan.needs_isolation);
         assert!(!plan.needs_rt);
         assert_eq!(plan.async_nodes.len(), 2);
         assert_eq!(plan.rt_nodes.len(), 0);
-        assert_eq!(plan.isolated_nodes.len(), 0);
     }
 
     #[test]
