@@ -64,7 +64,9 @@ mod unified_executor;
 pub use driver::{
     DriverConfig, DriverStats, ManualDriver, RtTimerDriverHandle, TimerDriver, TimerDriverHandle,
 };
-pub use bus::{BufferingMode, Bus, BusHandle, Message, MessageKind, MessageValue, StreamInfo};
+pub use bus::{
+    BufferingMode, Bus, BusHandle, BusStream, Message, MessageKind, MessageValue, StreamInfo,
+};
 pub use events::{EventReceiver, EventSender, EventStream, PipelineEvent};
 pub use probe::{PadDirection, PadRef, ProbeData, ProbeId, ProbeRegistry, ProbeReturn, ProbeType};
 pub use seek::{DurationQuery, PositionQuery, SeekRequest, SeekableQuery, SeekableSource};

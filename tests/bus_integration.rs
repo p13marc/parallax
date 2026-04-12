@@ -202,3 +202,60 @@ fn test_message_display() {
     assert!(display.contains("decoder"));
     assert!(display.contains("codec failure"));
 }
+
+/// Test that Bus implements Stream for use with select! and StreamExt.
+#[tokio::test]
+async fn test_bus_stream() {
+    use futures::StreamExt;
+
+    let (bus, handle) = Bus::new();
+
+    tokio::spawn(async move {
+        handle.post(MessageKind::Info {
+            info: "first".into(),
+        });
+        handle.post(MessageKind::Info {
+            info: "second".into(),
+        });
+        handle.post(MessageKind::Eos);
+    });
+
+    let mut stream = bus.into_stream();
+    let mut messages = Vec::new();
+
+    while let Some(msg) = stream.next().await {
+        let is_eos = matches!(msg.kind, MessageKind::Eos);
+        messages.push(msg);
+        if is_eos {
+            break;
+        }
+    }
+
+    assert_eq!(messages.len(), 3);
+    assert!(matches!(messages[0].kind, MessageKind::Info { .. }));
+    assert!(matches!(messages[2].kind, MessageKind::Eos));
+}
+
+/// Test Bus stream with tokio::select!
+#[tokio::test]
+async fn test_bus_stream_select() {
+    use futures::StreamExt;
+
+    let (bus, handle) = Bus::new();
+
+    handle.post(MessageKind::Eos);
+
+    let mut stream = bus.into_stream();
+    let timeout = tokio::time::sleep(std::time::Duration::from_secs(1));
+    tokio::pin!(timeout);
+
+    tokio::select! {
+        msg = stream.next() => {
+            let msg = msg.unwrap();
+            assert!(matches!(msg.kind, MessageKind::Eos));
+        }
+        _ = &mut timeout => {
+            panic!("Timed out waiting for bus message");
+        }
+    }
+}

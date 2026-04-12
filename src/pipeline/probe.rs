@@ -8,6 +8,17 @@
 //!
 //! Modeled after GStreamer's pad probe system.
 //!
+//! # Important: Callback Requirements
+//!
+//! Probe callbacks run **synchronously on the data path** — they execute
+//! inline during buffer processing. Callbacks must be:
+//!
+//! - **Non-blocking**: No I/O, no sleeps, no mutex waits
+//! - **Fast**: Keep processing time minimal (microseconds, not milliseconds)
+//! - **Panic-safe**: A panic in a callback will abort the pipeline task
+//!
+//! For expensive operations, send data to a separate task via a channel.
+//!
 //! # Example
 //!
 //! ```rust,ignore

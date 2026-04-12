@@ -477,6 +477,59 @@ impl Bus {
     pub(crate) fn broadcast_sender(&self) -> &broadcast::Sender<Message> {
         &self.broadcast_tx
     }
+
+    /// Convert the bus into an async `Stream` for use with `select!`
+    /// and stream combinators.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use futures::StreamExt;
+    ///
+    /// let mut stream = bus.into_stream();
+    /// while let Some(msg) = stream.next().await {
+    ///     println!("{}", msg);
+    /// }
+    /// ```
+    pub fn into_stream(self) -> BusStream {
+        BusStream { bus: self }
+    }
+}
+
+/// Async `Stream` adapter for [`Bus`].
+///
+/// Created by [`Bus::into_stream()`]. Enables use with `select!`,
+/// `StreamExt` combinators, and other async stream patterns.
+pub struct BusStream {
+    bus: Bus,
+}
+
+impl BusStream {
+    /// Get a mutable reference to the underlying bus.
+    pub fn bus_mut(&mut self) -> &mut Bus {
+        &mut self.bus
+    }
+
+    /// Consume the stream and get the bus back.
+    pub fn into_inner(self) -> Bus {
+        self.bus
+    }
+}
+
+impl futures::Stream for BusStream {
+    type Item = Message;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        // Return peeked message first
+        if let Some(msg) = self.bus.peeked.take() {
+            return std::task::Poll::Ready(Some(msg));
+        }
+        // Poll the underlying mpsc receiver
+        self.bus.receiver.poll_recv(cx)
+    }
 }
 
 impl BusHandle {

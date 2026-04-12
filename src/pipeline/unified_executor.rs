@@ -328,13 +328,24 @@ impl PipelineHandle {
             let _ = task.await; // Ignore JoinError from abort
         }
 
-        // Signal RT threads to stop and wait
+        // Signal RT threads to stop and join (via spawn_blocking to avoid
+        // blocking the async executor)
         for handle in self.rt_handles.drain(..) {
             handle.signal_stop();
-            if let Err(e) = handle.join() {
-                if first_error.is_none() {
-                    first_error = Some(e);
+            let join_result = tokio::task::spawn_blocking(move || handle.join()).await;
+            match join_result {
+                Ok(Err(e)) => {
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
                 }
+                Err(e) => {
+                    if first_error.is_none() {
+                        first_error =
+                            Some(Error::InvalidSegment(format!("RT join task panicked: {e}")));
+                    }
+                }
+                Ok(Ok(())) => {}
             }
         }
 
