@@ -360,6 +360,28 @@ impl Source for MyLiveSource {
 
 See `examples/47_flow_control.rs` for a complete example.
 
+### Media Type Detection (TypeFind)
+
+Parallax can detect media formats from the first bytes of a stream:
+
+```rust
+use parallax::pipeline::typefind::{TypeFindRegistry, MediaType};
+
+let registry = TypeFindRegistry::with_builtins();
+
+// Detect from bytes
+let result = registry.detect(b"\x00\x00\x00\x20ftypisom").unwrap();
+assert_eq!(result.media_type, MediaType::Mp4);
+
+// Detect from extension (fallback)
+let media_type = registry.detect_from_extension("mkv").unwrap();
+
+// Both with fallback
+let result = registry.detect_with_fallback(&data, Some("mp4"));
+```
+
+**Built-in detectors** (14 formats): MP4, Matroska/WebM, MPEG-TS, FLV, AVI, WAV, Ogg, FLAC, PNG, JPEG, H.264 (Annex B), MP3 (ID3 + frame sync).
+
 ### Network Buffering (Queue2)
 
 `Queue2` extends the basic `Queue` with buffering strategies for network streaming:
@@ -625,7 +647,8 @@ parallax/
 │   │   ├── tags.rs         # TagList, TagValue for stream metadata
 │   │   ├── seek.rs         # Seeking, position queries, SeekableSource
 │   │   ├── probe.rs        # Pad probes (ProbeRegistry, ProbeType, PadRef)
-│   │   └── tracer.rs       # Tracer framework (LatencyTracer, FramerateTracer, DropTracer)
+│   │   ├── tracer.rs       # Tracer framework (LatencyTracer, FramerateTracer, DropTracer)
+│   │   └── typefind.rs     # Media type detection (TypeFindRegistry, 14 built-in detectors)
 │   │
 │   ├── elements/           # Built-in elements (organized by category)
 │   │   ├── network/        # TCP, UDP, Unix, multicast, HTTP, WebSocket, Zenoh
@@ -1191,6 +1214,7 @@ See `docs/design.md` for full details.
 | 19 | Seeking, Position Queries & Trick Modes | Complete |
 | 20 | Pad Probes & Dynamic Reconfiguration | Complete |
 | 21 | Debugging & Inspection Tools (Tracers) | Complete |
+| 22 | Auto-Plugging & Typefinding | Complete |
 | 23 | Network Buffering Strategies (Queue2) | Complete |
 
 ## Code Style Guidelines

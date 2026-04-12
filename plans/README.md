@@ -15,7 +15,7 @@ These are media-independent features that make the pipeline engine complete.
 | # | Plan | Priority | Effort | Progress |
 |---|------|----------|--------|----------|
 | 21 | [Debugging & Inspection Tools](21_DEBUGGING_INSPECTION_TOOLS.md) | High | Medium | ✅ Complete |
-| 22 | [Auto-Plugging & Typefinding](22_AUTO_PLUGGING_TYPEFINDING.md) | High | Large | ⬜ Not Started |
+| 22 | [Auto-Plugging & Typefinding](22_AUTO_PLUGGING_TYPEFINDING.md) | High | Large | ✅ Complete |
 | 23 | [Network Buffering Strategies](23_NETWORK_BUFFERING_STRATEGIES.md) | High | Medium | ✅ Complete |
 
 ### Tier 2: Media Processing Elements
@@ -122,6 +122,7 @@ Plans 00-10, 12-15, 17-20, Clock Provider, and Pipeline Robustness have been com
 - **Plan 19**: Seeking & Position Queries — segment timestamp mapping, SeekableSource trait, FileSrc byte-seeking, Pipeline query API (position, duration, seekable)
 - **Plan 20**: Pad Probes — buffer/event interception (ProbeType, ProbeReturn, ProbeData), ProbeRegistry, executor integration with Drop/Remove semantics
 - **Plan 21**: Debugging & Inspection Tools — Tracer framework (LatencyTracer, FramerateTracer, DropTracer), TracerRegistry, PARALLAX_TRACERS env var, Pipeline stats snapshot, PARALLAX_DOT_DIR auto-dump
+- **Plan 22**: Auto-Plugging & Typefinding — TypeFindRegistry with 14 built-in detectors (MP4, MKV, MPEG-TS, FLV, AVI, WAV, Ogg, FLAC, PNG, JPEG, H.264, MP3), byte-based and extension-based detection
 - **Plan 23**: Network Buffering Strategies — Queue2 element with stream (watermark pause/resume), download (file-backed with range tracking), and timeshift (circular ring buffer) modes; rate estimation; bus buffering messages
 - **Clock Provider**: Hardware timestamp extraction (PipeWire, V4L2, ALSA), Clock/ClockProvider traits, PipelineClock, TimestampDebug element
 - **Auto Clock Selection**: `as_clock_provider()` on element traits, `Pipeline::select_clock()`, AlsaSink auto-provides clock

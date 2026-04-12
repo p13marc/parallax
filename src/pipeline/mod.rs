@@ -58,6 +58,7 @@ pub mod rt_scheduler;
 pub mod seek;
 pub mod tags;
 pub mod tracer;
+pub mod typefind;
 mod unified_executor;
 
 pub use driver::{
@@ -67,6 +68,7 @@ pub use bus::{BufferingMode, Bus, BusHandle, Message, MessageKind, MessageValue,
 pub use events::{EventReceiver, EventSender, EventStream, PipelineEvent};
 pub use probe::{PadDirection, PadRef, ProbeData, ProbeId, ProbeRegistry, ProbeReturn, ProbeType};
 pub use seek::{DurationQuery, PositionQuery, SeekRequest, SeekableQuery, SeekableSource};
+pub use typefind::{MediaType, TypeFindProbability, TypeFindRegistry, TypeFindResult};
 pub use tracer::{
     DropTracer, ElementStats, FramerateTracer, LatencyTracer, PipelineStats, Tracer,
     TracerRegistry,
