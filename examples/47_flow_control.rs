@@ -195,8 +195,9 @@ fn main() -> Result<()> {
             match camera.produce(&mut ctx) {
                 Ok(ProduceResult::OwnBuffer(buffer)) => {
                     // Try to push to queue (non-blocking for this example)
-                    if let Err(_) =
-                        producer_queue.push_timeout(buffer, Some(Duration::from_millis(1)))
+                    if producer_queue
+                        .push_timeout(buffer, Some(Duration::from_millis(1)))
+                        .is_err()
                     {
                         // Queue full - this shouldn't happen often with flow control
                         camera.frames_dropped += 1;

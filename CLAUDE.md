@@ -382,6 +382,8 @@ let result = registry.detect_with_fallback(&data, Some("mp4"));
 
 **Built-in detectors** (14 formats): MP4, Matroska/WebM, MPEG-TS, FLV, AVI, WAV, Ogg, FLAC, PNG, JPEG, H.264 (Annex B), MP3 (ID3 + frame sync).
 
+See `examples/56_typefind.rs` for a complete example.
+
 ### Network Buffering (Queue2)
 
 `Queue2` extends the basic `Queue` with buffering strategies for network streaming:
@@ -407,6 +409,8 @@ let queue = Queue2::timeshift("/tmp/timeshift.tmp", 60 * 1024 * 1024);
 ```
 
 Buffering progress (0-100%) is reported via bus `MessageKind::Buffering` messages with rate estimates.
+
+See `examples/55_queue2_buffering.rs` for a complete example.
 
 ### Clock System and Timestamps
 
@@ -703,7 +707,14 @@ parallax/
 │   ├── 41_format_converters.rs   # Format conversion elements
 │   ├── 42_pipewire_audio.rs      # PipeWire audio (--features pipewire)
 │   ├── 43_alsa_audio.rs          # ALSA audio (--features alsa)
-│   └── 44_libcamera_capture.rs   # libcamera capture (--features libcamera)
+│   ├── 44_libcamera_capture.rs   # libcamera capture (--features libcamera)
+│   │   # Infrastructure examples (no features required)
+│   ├── 51_bus_messages.rs        # Pipeline bus message polling
+│   ├── 52_seeking.rs             # File seeking and position queries
+│   ├── 53_pad_probes.rs          # Buffer interception with pad probes
+│   ├── 54_tracers.rs             # Latency/framerate tracer framework
+│   ├── 55_queue2_buffering.rs    # Network buffering with Queue2
+│   └── 56_typefind.rs            # Media type detection from bytes
 │
 ├── docs/                   # Documentation
 │   ├── design.md           # Complete design document and competitive analysis
@@ -1081,6 +1092,8 @@ bus.wait_for_eos_or_error().await?;
 
 **Context integration:** `ProduceContext` and `ConsumeContext` carry an optional `BusHandle` with `post_message()` convenience method. Elements receive their handle via `set_bus()` during pipeline startup.
 
+See `examples/51_bus_messages.rs` for a complete example.
+
 ### Seeking & Position Queries
 
 Parallax supports seeking, position/duration queries, and segment-based timestamp mapping.
@@ -1121,6 +1134,8 @@ let stream_time = seg.to_stream_time(ClockTime::from_secs(12));    // → 12s
 
 **FileSrc** implements byte-based seeking via `Source::handle_upstream_event()`, `is_seekable()`, `query_position()`, and `query_duration()`.
 
+See `examples/52_seeking.rs` for a complete example.
+
 ### Pad Probes
 
 Pad probes allow intercepting buffers and events at any point in the pipeline for inspection, filtering, or blocking.
@@ -1156,6 +1171,8 @@ pipeline.remove_probe(probe_id);
 ```
 
 **Executor integration:** The executor invokes buffer probes before forwarding data downstream. Drop/Handled returns prevent the buffer from reaching downstream elements.
+
+See `examples/53_pad_probes.rs` for a complete example.
 
 ### Tracer Framework
 
@@ -1193,6 +1210,8 @@ for (name, report) in registry.reports() {
 let stats = pipeline.stats_snapshot();
 println!("{} elements, {} links", stats.element_count, stats.link_count);
 ```
+
+See `examples/54_tracers.rs` for a complete example.
 
 ## Implementation Roadmap
 

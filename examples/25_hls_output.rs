@@ -97,8 +97,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let data = slot.data_mut();
 
             // Fill with fake TS sync bytes and padding
-            for i in 0..(188 * 10) {
-                data[i] = if i % 188 == 0 { 0x47 } else { 0xFF }; // TS sync byte
+            for (i, byte) in data[..(188 * 10)].iter_mut().enumerate() {
+                *byte = if i % 188 == 0 { 0x47 } else { 0xFF }; // TS sync byte
             }
 
             // Create buffer with PTS
