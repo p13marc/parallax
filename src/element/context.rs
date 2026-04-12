@@ -44,6 +44,7 @@ use crate::clock::{Clock, ClockTime};
 use crate::error::{Error, Result};
 use crate::memory::{BufferPool, PooledBuffer, SharedSlotRef};
 use crate::metadata::Metadata;
+use crate::pipeline::bus::{BusHandle, MessageKind};
 
 // ============================================================================
 // ProduceResult - return type for source produce()
@@ -171,6 +172,8 @@ pub struct ProduceContext<'a> {
     clock: Option<Arc<dyn Clock>>,
     /// Base time (clock time when pipeline started).
     base_time: ClockTime,
+    /// Optional bus handle for posting messages.
+    bus: Option<BusHandle>,
 }
 
 impl<'a> ProduceContext<'a> {
@@ -195,6 +198,7 @@ impl<'a> ProduceContext<'a> {
             pool: None,
             clock: None,
             base_time: ClockTime::NONE,
+            bus: None,
         }
     }
 
@@ -219,6 +223,7 @@ impl<'a> ProduceContext<'a> {
             pool: Some(pool),
             clock: None,
             base_time: ClockTime::NONE,
+            bus: None,
         }
     }
 
@@ -234,6 +239,7 @@ impl<'a> ProduceContext<'a> {
             pool: None,
             clock: None,
             base_time: ClockTime::NONE,
+            bus: None,
         }
     }
 
@@ -249,6 +255,7 @@ impl<'a> ProduceContext<'a> {
             pool: Some(pool),
             clock: None,
             base_time: ClockTime::NONE,
+            bus: None,
         }
     }
 
@@ -258,6 +265,25 @@ impl<'a> ProduceContext<'a> {
     pub fn set_clock(&mut self, clock: Arc<dyn Clock>, base_time: ClockTime) {
         self.clock = Some(clock);
         self.base_time = base_time;
+    }
+
+    /// Set the bus handle for this context.
+    pub fn set_bus(&mut self, bus: BusHandle) {
+        self.bus = Some(bus);
+    }
+
+    /// Get the bus handle, if available.
+    pub fn bus(&self) -> Option<&BusHandle> {
+        self.bus.as_ref()
+    }
+
+    /// Post a message to the pipeline bus.
+    ///
+    /// No-op if no bus handle is configured.
+    pub fn post_message(&self, kind: MessageKind) {
+        if let Some(bus) = &self.bus {
+            bus.post(kind);
+        }
     }
 
     /// Get the pipeline clock, if available.
@@ -470,12 +496,36 @@ impl std::fmt::Debug for ProduceContext<'_> {
 pub struct ConsumeContext<'a> {
     /// The buffer being consumed.
     buffer: &'a Buffer,
+    /// Optional bus handle for posting messages.
+    bus: Option<&'a BusHandle>,
 }
 
 impl<'a> ConsumeContext<'a> {
     /// Create a new consume context.
     pub fn new(buffer: &'a Buffer) -> Self {
-        Self { buffer }
+        Self { buffer, bus: None }
+    }
+
+    /// Create a new consume context with a bus handle.
+    pub fn with_bus(buffer: &'a Buffer, bus: &'a BusHandle) -> Self {
+        Self {
+            buffer,
+            bus: Some(bus),
+        }
+    }
+
+    /// Get the bus handle, if available.
+    pub fn bus(&self) -> Option<&BusHandle> {
+        self.bus
+    }
+
+    /// Post a message to the pipeline bus.
+    ///
+    /// No-op if no bus handle is configured.
+    pub fn post_message(&self, kind: MessageKind) {
+        if let Some(bus) = self.bus {
+            bus.post(kind);
+        }
     }
 
     /// Get the input data.

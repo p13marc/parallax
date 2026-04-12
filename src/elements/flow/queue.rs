@@ -38,6 +38,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use crate::pipeline::bus::BusHandle;
+
 /// A queue element that buffers data between pipeline stages.
 ///
 /// The queue provides asynchronous decoupling between upstream and downstream
@@ -60,6 +62,8 @@ pub struct Queue {
     inner: Arc<QueueInner>,
     leaky: LeakyMode,
     water_marks: Option<WaterMarks>,
+    /// Bus handle for posting QoS messages on buffer drops.
+    bus: Option<BusHandle>,
 }
 
 struct QueueInner {
@@ -121,6 +125,7 @@ impl Queue {
             }),
             leaky: LeakyMode::None,
             water_marks: None,
+            bus: None,
         }
     }
 
@@ -147,6 +152,7 @@ impl Queue {
             }),
             leaky: LeakyMode::None,
             water_marks: None,
+            bus: None,
         }
     }
 
@@ -335,6 +341,17 @@ impl Queue {
                 LeakyMode::Upstream => {
                     // Drop the incoming buffer
                     state.total_dropped += 1;
+                    if let Some(ref bus) = self.bus {
+                        let dropped = state.total_dropped;
+                        let total = state.total_pushed + 1; // +1 for this push
+                        let proportion = dropped as f64 / total.max(1) as f64;
+                        bus.post_qos(
+                            false,
+                            crate::clock::ClockTime::NONE,
+                            crate::clock::ClockTime::NONE,
+                            proportion,
+                        );
+                    }
                     return Ok(());
                 }
                 LeakyMode::Downstream => {
@@ -342,6 +359,17 @@ impl Queue {
                     if let Some(old) = state.buffers.pop_front() {
                         state.current_bytes = state.current_bytes.saturating_sub(old.len());
                         state.total_dropped += 1;
+                        if let Some(ref bus) = self.bus {
+                            let dropped = state.total_dropped;
+                            let total = state.total_pushed;
+                            let proportion = dropped as f64 / total.max(1) as f64;
+                            bus.post_qos(
+                                false,
+                                crate::clock::ClockTime::NONE,
+                                crate::clock::ClockTime::NONE,
+                                proportion,
+                            );
+                        }
                     }
                     break;
                 }
@@ -447,6 +475,10 @@ impl Element for Queue {
     fn name(&self) -> &str {
         &self.name
     }
+
+    fn set_bus(&mut self, bus: BusHandle) {
+        self.bus = Some(bus);
+    }
 }
 
 impl Clone for Queue {
@@ -456,6 +488,7 @@ impl Clone for Queue {
             inner: Arc::clone(&self.inner),
             leaky: self.leaky,
             water_marks: self.water_marks,
+            bus: self.bus.clone(),
         }
     }
 }

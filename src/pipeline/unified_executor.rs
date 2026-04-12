@@ -39,6 +39,7 @@ use crate::pipeline::rt_bridge::AsyncRtBridge;
 use crate::pipeline::rt_scheduler::{
     BoundaryDirection, GraphPartition, RtConfig, RtScheduler, SchedulingMode,
 };
+use crate::pipeline::bus::{Bus, BusHandle};
 use crate::pipeline::{
     DriverConfig, EventReceiver, EventSender, NodeId, Pipeline, PipelineEvent, PipelineState,
     TimerDriver,
@@ -288,6 +289,10 @@ pub struct PipelineHandle {
     /// Stored separately because it runs indefinitely and must be
     /// aborted when the pipeline finishes.
     rt_driver_task: Option<JoinHandle<Result<()>>>,
+    /// Pipeline message bus (moved from Pipeline on start).
+    bus: Option<Bus>,
+    /// Bus handle for posting pipeline-level messages.
+    bus_handle: Option<BusHandle>,
 }
 
 impl PipelineHandle {
@@ -367,6 +372,23 @@ impl PipelineHandle {
     pub fn event_sender(&self) -> &EventSender {
         &self.events
     }
+
+    /// Get a mutable reference to the pipeline bus for polling messages.
+    ///
+    /// Returns `None` if the bus was already taken via [`take_bus`](Self::take_bus).
+    pub fn bus_mut(&mut self) -> Option<&mut Bus> {
+        self.bus.as_mut()
+    }
+
+    /// Take the bus out of the handle (for moving to another task).
+    pub fn take_bus(&mut self) -> Option<Bus> {
+        self.bus.take()
+    }
+
+    /// Get the bus handle for posting pipeline-level messages.
+    pub fn bus_handle(&self) -> Option<&BusHandle> {
+        self.bus_handle.as_ref()
+    }
 }
 
 // ============================================================================
@@ -424,9 +446,11 @@ impl Executor {
 
         // State transitions
         let old_state = pipeline.state();
+        let bus_handle = pipeline.bus_handle().clone();
         if old_state == PipelineState::Suspended {
             pipeline.prepare()?;
             events.send_state_changed(old_state, PipelineState::Idle);
+            bus_handle.post_state_changed(old_state, PipelineState::Idle);
         }
 
         // Determine effective scheduling mode
@@ -508,7 +532,12 @@ impl Executor {
         let idle_state = pipeline.state();
         pipeline.activate()?;
         events.send_state_changed(idle_state, PipelineState::Running);
+        bus_handle.post_state_changed(idle_state, PipelineState::Running);
         events.send(PipelineEvent::Started);
+
+        // Take the bus from the pipeline and store it on the handle.
+        let bus = pipeline.take_bus();
+        let bus_handle = Some(pipeline.bus_handle().clone());
 
         Ok(PipelineHandle {
             tasks,
@@ -517,6 +546,8 @@ impl Executor {
             bridges,
             driver,
             rt_driver_task,
+            bus,
+            bus_handle,
         })
     }
 
@@ -846,6 +877,9 @@ impl Executor {
                 element.set_clock(clock.clone(), *base_time);
             }
         }
+
+        // Set bus handle so elements can post messages
+        element.set_bus(pipeline.bus_handle().for_element(&node_name));
 
         let inputs = channels.take_inputs(node_id);
         let outputs = channels.take_outputs(node_id);

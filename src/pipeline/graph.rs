@@ -13,6 +13,7 @@ use crate::negotiation::{
     ConverterInsertion, ConverterRegistry, ElementCaps, LinkInfo as NegLinkInfo, NegotiationResult,
     NegotiationSolver,
 };
+use crate::pipeline::bus::{Bus, BusHandle};
 use daggy::petgraph::visit::EdgeRef;
 use daggy::{Dag, EdgeIndex, NodeIndex, Walker};
 use std::collections::HashMap;
@@ -427,11 +428,16 @@ pub struct Pipeline {
     converter_policy: ConverterPolicy,
     /// Pipeline clock for timing and synchronization.
     clock: PipelineClock,
+    /// Pipeline message bus (taken by executor on start).
+    bus: Option<Bus>,
+    /// Bus handle for creating element-specific handles.
+    bus_handle: BusHandle,
 }
 
 impl Pipeline {
     /// Create a new empty pipeline.
     pub fn new() -> Self {
+        let (bus, bus_handle) = Bus::new();
         Self {
             graph: Dag::new(),
             nodes_by_name: HashMap::new(),
@@ -441,11 +447,14 @@ impl Pipeline {
             pool: None,
             converter_policy: ConverterPolicy::default(),
             clock: PipelineClock::system(),
+            bus: Some(bus),
+            bus_handle,
         }
     }
 
     /// Create a pipeline with a custom clock.
     pub fn with_clock(clock: Arc<dyn Clock>) -> Self {
+        let (bus, bus_handle) = Bus::new();
         Self {
             graph: Dag::new(),
             nodes_by_name: HashMap::new(),
@@ -455,6 +464,8 @@ impl Pipeline {
             pool: None,
             converter_policy: ConverterPolicy::default(),
             clock: PipelineClock::new(clock),
+            bus: Some(bus),
+            bus_handle,
         }
     }
 
@@ -507,6 +518,22 @@ impl Pipeline {
     /// while the pipeline is running may cause timing discontinuities.
     pub fn set_clock(&mut self, clock: Arc<dyn Clock>) {
         self.clock = PipelineClock::new(clock);
+    }
+
+    /// Get the pipeline's bus handle for posting messages.
+    ///
+    /// Use [`BusHandle::for_element`] to create element-specific handles.
+    pub fn bus_handle(&self) -> &BusHandle {
+        &self.bus_handle
+    }
+
+    /// Take the bus out of the pipeline (used by the executor).
+    ///
+    /// Returns `None` if the bus was already taken. The bus is moved
+    /// to [`PipelineHandle`](super::UnifiedPipelineHandle) during execution
+    /// so the application can poll messages while the pipeline runs.
+    pub fn take_bus(&mut self) -> Option<Bus> {
+        self.bus.take()
     }
 
     /// Use the clock from a clock provider if available.

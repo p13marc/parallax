@@ -44,6 +44,7 @@
 //! pipeline.run().await?;
 //! ```
 
+pub mod bus;
 mod builder;
 mod driver;
 mod events;
@@ -53,12 +54,15 @@ mod graph;
 pub mod parser;
 pub mod rt_bridge;
 pub mod rt_scheduler;
+pub mod tags;
 mod unified_executor;
 
 pub use driver::{
     DriverConfig, DriverStats, ManualDriver, RtTimerDriverHandle, TimerDriver, TimerDriverHandle,
 };
+pub use bus::{BufferingMode, Bus, BusHandle, Message, MessageKind, MessageValue, StreamInfo};
 pub use events::{EventReceiver, EventSender, EventStream, PipelineEvent};
+pub use tags::{TagList, TagMergeMode, TagValue};
 pub use factory::ElementFactory;
 pub use graph::{
     ConverterPolicy, DotOptions, Link, LinkId, LinkInfo, Node, NodeId, Pipeline, PipelineState,

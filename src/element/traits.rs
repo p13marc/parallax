@@ -913,6 +913,14 @@ pub trait Element: Send {
         Ok(None)
     }
 
+    /// Set the bus handle for posting messages.
+    ///
+    /// Called by the adapter before pipeline execution. Override this
+    /// to receive a bus handle for posting QoS, error, or other messages.
+    fn set_bus(&mut self, _bus: crate::pipeline::bus::BusHandle) {
+        // Default: ignore
+    }
+
     /// Get the name of this element (for debugging/logging).
     fn name(&self) -> &str {
         std::any::type_name::<Self>()
@@ -1543,6 +1551,17 @@ pub trait AsyncElementDyn {
         // Default: do nothing
     }
 
+    /// Set the bus handle for this element.
+    ///
+    /// Called by the executor when starting the pipeline so elements
+    /// can post messages (errors, warnings, tags, QoS) to the bus.
+    ///
+    /// Default implementation does nothing. Adapters override this to
+    /// store the handle and pass it to element contexts.
+    fn set_bus(&mut self, _bus: crate::pipeline::bus::BusHandle) {
+        // Default: do nothing
+    }
+
     /// Get the inner element as `&dyn Any` for downcasting.
     ///
     /// This enables GStreamer-like element retrieval after pipeline creation:
@@ -1737,6 +1756,8 @@ pub struct SourceAdapter<S: Source> {
     clock: Option<Arc<dyn Clock>>,
     /// Base time for running time calculation.
     base_time: ClockTime,
+    /// Bus handle for posting messages.
+    bus: Option<crate::pipeline::bus::BusHandle>,
 }
 
 impl<S: Source> SourceAdapter<S> {
@@ -1748,6 +1769,7 @@ impl<S: Source> SourceAdapter<S> {
             pool: None,
             clock: None,
             base_time: ClockTime::ZERO,
+            bus: None,
         }
     }
 
@@ -1759,6 +1781,7 @@ impl<S: Source> SourceAdapter<S> {
             pool: None,
             clock: None,
             base_time: ClockTime::ZERO,
+            bus: None,
         }
     }
 
@@ -1770,6 +1793,7 @@ impl<S: Source> SourceAdapter<S> {
             pool: Some(pool),
             clock: None,
             base_time: ClockTime::ZERO,
+            bus: None,
         }
     }
 
@@ -1915,10 +1939,13 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
     }
 
     async fn process_source(&mut self) -> Result<SourceResult> {
-        // Helper to configure clock on context
+        // Helper to configure clock and bus on context
         let configure_clock = |ctx: &mut ProduceContext| {
             if let Some(ref clock) = self.clock {
                 ctx.set_clock(clock.clone(), self.base_time);
+            }
+            if let Some(ref bus) = self.bus {
+                ctx.set_bus(bus.clone());
             }
         };
 
@@ -2015,6 +2042,10 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
     fn set_clock(&mut self, clock: Arc<dyn Clock>, base_time: ClockTime) {
         self.clock = Some(clock);
         self.base_time = base_time;
+    }
+
+    fn set_bus(&mut self, bus: crate::pipeline::bus::BusHandle) {
+        self.bus = Some(bus);
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -2117,6 +2148,10 @@ impl<E: Element + Send + 'static> SendAsyncElementDyn for ElementAdapter<E> {
         ElementType::Transform
     }
 
+    fn set_bus(&mut self, bus: crate::pipeline::bus::BusHandle) {
+        self.inner.set_bus(bus);
+    }
+
     async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
         match input {
             Some(buffer) => self.inner.process(buffer),
@@ -2193,6 +2228,10 @@ impl SendAsyncElementDyn for BoxedElementAdapter {
 
     fn element_type(&self) -> ElementType {
         ElementType::Transform
+    }
+
+    fn set_bus(&mut self, bus: crate::pipeline::bus::BusHandle) {
+        self.inner.set_bus(bus);
     }
 
     async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
@@ -2372,6 +2411,8 @@ pub struct AsyncSourceAdapter<S: AsyncSource> {
     clock: Option<Arc<dyn Clock>>,
     /// Base time for running time calculation.
     base_time: ClockTime,
+    /// Bus handle for posting messages.
+    bus: Option<crate::pipeline::bus::BusHandle>,
 }
 
 impl<S: AsyncSource> AsyncSourceAdapter<S> {
@@ -2382,6 +2423,7 @@ impl<S: AsyncSource> AsyncSourceAdapter<S> {
             arena: None,
             clock: None,
             base_time: ClockTime::ZERO,
+            bus: None,
         }
     }
 
@@ -2392,6 +2434,7 @@ impl<S: AsyncSource> AsyncSourceAdapter<S> {
             arena: Some(arena),
             clock: None,
             base_time: ClockTime::ZERO,
+            bus: None,
         }
     }
 
@@ -2483,10 +2526,13 @@ impl<S: AsyncSource + Send + 'static> SendAsyncElementDyn for AsyncSourceAdapter
     }
 
     async fn process_source(&mut self) -> Result<SourceResult> {
-        // Helper to configure clock on context
+        // Helper to configure clock and bus on context
         let configure_clock = |ctx: &mut ProduceContext| {
             if let Some(ref clock) = self.clock {
                 ctx.set_clock(clock.clone(), self.base_time);
+            }
+            if let Some(ref bus) = self.bus {
+                ctx.set_bus(bus.clone());
             }
         };
 
@@ -2539,6 +2585,10 @@ impl<S: AsyncSource + Send + 'static> SendAsyncElementDyn for AsyncSourceAdapter
     fn set_clock(&mut self, clock: Arc<dyn Clock>, base_time: ClockTime) {
         self.clock = Some(clock);
         self.base_time = base_time;
+    }
+
+    fn set_bus(&mut self, bus: crate::pipeline::bus::BusHandle) {
+        self.bus = Some(bus);
     }
 
     fn as_any(&self) -> &dyn Any {
