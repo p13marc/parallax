@@ -327,7 +327,7 @@ mod tests {
             ProduceResult::Produced(n) => {
                 let buf = ctx.finalize(n);
                 // Might read both chunks at once or separately
-                assert!(buf.len() > 0);
+                assert!(!buf.is_empty());
             }
             _ => panic!("Expected Produced result"),
         }

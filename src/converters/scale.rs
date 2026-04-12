@@ -550,8 +550,8 @@ mod tests {
         // Create a simple I420 frame (4x4)
         // Y plane: 16 bytes, U plane: 4 bytes, V plane: 4 bytes
         let mut input = vec![0u8; 4 * 4 + 2 * 2 + 2 * 2]; // 24 bytes total
-        for i in 0..16 {
-            input[i] = (i * 16) as u8; // Y gradient
+        for (i, pixel) in input.iter_mut().enumerate().take(16) {
+            *pixel = (i * 16) as u8; // Y gradient
         }
         for i in 0..4 {
             input[16 + i] = 128; // U neutral

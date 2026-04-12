@@ -413,8 +413,8 @@ mod tests {
         assert_eq!(int_val.as_f64(), Some(42.0));
         assert_eq!(int_val.as_string(), "42");
 
-        let float_val = PropertyValue::Float(3.14);
-        assert_eq!(float_val.as_f64(), Some(3.14));
+        let float_val = PropertyValue::Float(2.72);
+        assert_eq!(float_val.as_f64(), Some(2.72));
         assert_eq!(float_val.as_i64(), None);
 
         let bool_val = PropertyValue::Bool(true);

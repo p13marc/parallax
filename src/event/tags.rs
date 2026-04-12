@@ -526,8 +526,8 @@ mod tests {
         let v: TagValue = 42u64.into();
         assert_eq!(v.as_uint(), Some(42));
 
-        let v: TagValue = 3.14f64.into();
-        assert!((v.as_double().unwrap() - 3.14).abs() < 0.001);
+        let v: TagValue = 2.72f64.into();
+        assert!((v.as_double().unwrap() - 2.72).abs() < 0.001);
 
         let v: TagValue = true.into();
         assert_eq!(v.as_bool(), Some(true));

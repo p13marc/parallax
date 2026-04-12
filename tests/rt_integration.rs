@@ -850,7 +850,7 @@ fn test_manual_driver_gated_processing() {
     // Should have ~3 buffers in output (one per cycle)
     let output_count = output_bridge.len();
     assert!(
-        output_count >= 2 && output_count <= 4,
+        (2..=4).contains(&output_count),
         "Expected ~3 buffers in output after 3 driver cycles, got {output_count}"
     );
 

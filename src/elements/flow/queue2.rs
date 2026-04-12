@@ -41,7 +41,7 @@ use crate::pipeline::bus::{BufferingMode, BusHandle, MessageKind};
 // ============================================================================
 
 /// Buffering configuration for Queue2.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BufferingConfig {
     /// Buffering mode.
     pub mode: BufferingMode,
@@ -92,7 +92,7 @@ pub enum BufferingAction {
 // ============================================================================
 
 /// Tracks non-contiguous downloaded byte ranges for seek UI.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DownloadedRanges {
     ranges: Vec<(u64, u64)>,
 }
@@ -147,7 +147,7 @@ impl DownloadedRanges {
 // ============================================================================
 
 /// Statistics for Queue2.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Queue2Stats {
     /// Current buffering percentage (0-100).
     pub percent: u32,
@@ -167,6 +167,20 @@ pub struct Queue2Stats {
     pub buffers_in: u64,
     /// Total buffers forwarded.
     pub buffers_out: u64,
+}
+
+impl std::fmt::Display for Queue2Stats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}% ({}B in, {}B out, {} bufs, buffering={})",
+            self.percent,
+            self.bytes_in,
+            self.bytes_out,
+            self.buffers_in,
+            self.is_buffering,
+        )
+    }
 }
 
 // ============================================================================

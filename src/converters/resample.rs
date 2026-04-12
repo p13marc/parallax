@@ -435,7 +435,7 @@ mod tests {
         let written = resampler.resample(&input, &mut output).unwrap();
 
         // Should have written 2 samples (4 bytes)
-        assert!(written >= 2 && written <= 6, "wrote {} bytes", written);
+        assert!((2..=6).contains(&written), "wrote {} bytes", written);
     }
 
     #[test]
@@ -454,7 +454,7 @@ mod tests {
         let written = resampler.resample(&input, &mut output).unwrap();
 
         // Should produce approximately 4 samples
-        assert!(written >= 6 && written <= 10, "wrote {} bytes", written);
+        assert!((6..=10).contains(&written), "wrote {} bytes", written);
     }
 
     #[test]

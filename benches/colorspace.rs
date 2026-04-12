@@ -29,8 +29,9 @@ fn bench_i420_to_rgba(c: &mut Criterion) {
         // Create test input with realistic YUV values
         let mut input = vec![0u8; input_size];
         // Fill Y plane with gradient
-        for i in 0..(width * height) as usize {
-            input[i] = ((i * 255) / (width * height) as usize) as u8;
+        let pixel_count = (width * height) as usize;
+        for (i, pixel) in input.iter_mut().enumerate().take(pixel_count) {
+            *pixel = ((i * 255) / pixel_count) as u8;
         }
         // Fill U and V planes with neutral chroma
         let y_size = (width * height) as usize;
@@ -69,9 +70,9 @@ fn bench_rgba_to_i420(c: &mut Criterion) {
         let mut input = vec![0u8; input_size];
         for i in 0..(width * height) as usize {
             let idx = i * 4;
-            input[idx] = ((i % 256) as u8); // R
-            input[idx + 1] = ((i / 256 % 256) as u8); // G
-            input[idx + 2] = ((i / 65536 % 256) as u8); // B
+            input[idx] = (i % 256) as u8; // R
+            input[idx + 1] = (i / 256 % 256) as u8; // G
+            input[idx + 2] = (i / 65536 % 256) as u8; // B
             input[idx + 3] = 255; // A
         }
 
@@ -139,12 +140,12 @@ fn bench_nv12_to_rgba(c: &mut Criterion) {
         let mut input = vec![0u8; input_size];
         let y_size = (width * height) as usize;
         // Fill Y with gradient
-        for i in 0..y_size {
-            input[i] = ((i * 255) / y_size) as u8;
+        for (i, pixel) in input.iter_mut().enumerate().take(y_size) {
+            *pixel = ((i * 255) / y_size) as u8;
         }
         // Fill UV with neutral chroma
-        for i in y_size..input_size {
-            input[i] = 128;
+        for pixel in input.iter_mut().take(input_size).skip(y_size) {
+            *pixel = 128;
         }
 
         let mut output = vec![0u8; output_size];
@@ -176,9 +177,9 @@ fn bench_rgba_to_nv12(c: &mut Criterion) {
         let mut input = vec![0u8; input_size];
         for i in 0..(width * height) as usize {
             let idx = i * 4;
-            input[idx] = ((i % 256) as u8); // R
-            input[idx + 1] = ((i / 256 % 256) as u8); // G
-            input[idx + 2] = ((i / 65536 % 256) as u8); // B
+            input[idx] = (i % 256) as u8; // R
+            input[idx + 1] = (i / 256 % 256) as u8; // G
+            input[idx + 2] = (i / 65536 % 256) as u8; // B
             input[idx + 3] = 255; // A
         }
 

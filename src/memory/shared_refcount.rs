@@ -1642,7 +1642,6 @@ mod tests {
         let handles: Vec<_> = (0..10)
             .map(|_| {
                 let arena = arena.clone();
-                let ipc_ref = ipc_ref;
                 thread::spawn(move || {
                     for _ in 0..100 {
                         let dup_fd = rustix::io::fcntl_dupfd_cloexec(&arena.fd, 0).unwrap();

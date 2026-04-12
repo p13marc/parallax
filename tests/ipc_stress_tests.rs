@@ -147,11 +147,10 @@ fn test_cross_process_refcount_stress() {
     let handles: Vec<_> = (0..num_clients)
         .map(|_| {
             let arena = Arc::clone(&arena);
-            let ipc_ref = ipc_ref;
             thread::spawn(move || {
                 for _ in 0..iterations {
                     // Simulate receiving fd in another process
-                    let dup_fd = rustix::io::fcntl_dupfd_cloexec(&arena.fd(), 0).unwrap();
+                    let dup_fd = rustix::io::fcntl_dupfd_cloexec(arena.fd(), 0).unwrap();
                     let client_arena = unsafe { SharedArena::from_fd(dup_fd).unwrap() };
 
                     // Get the slot reference
@@ -206,14 +205,12 @@ fn test_arena_cache_concurrent() {
         .map(|thread_id| {
             let arena1 = Arc::clone(&arena1);
             let arena2 = Arc::clone(&arena2);
-            let ipc_ref1 = ipc_ref1;
-            let ipc_ref2 = ipc_ref2;
             thread::spawn(move || {
                 let mut cache = SharedArenaCache::new();
 
                 // Map both arenas
-                let fd1 = rustix::io::fcntl_dupfd_cloexec(&arena1.fd(), 0).unwrap();
-                let fd2 = rustix::io::fcntl_dupfd_cloexec(&arena2.fd(), 0).unwrap();
+                let fd1 = rustix::io::fcntl_dupfd_cloexec(arena1.fd(), 0).unwrap();
+                let fd2 = rustix::io::fcntl_dupfd_cloexec(arena2.fd(), 0).unwrap();
                 unsafe {
                     cache.map_arena(fd1).unwrap();
                     cache.map_arena(fd2).unwrap();

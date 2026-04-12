@@ -42,7 +42,7 @@ use crate::event::SegmentFormat;
 // ============================================================================
 
 /// Result of a position query.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PositionQuery {
     /// Format of the position value.
     pub format: SegmentFormat,
@@ -51,7 +51,7 @@ pub struct PositionQuery {
 }
 
 /// Result of a duration query.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DurationQuery {
     /// Format of the duration value.
     pub format: SegmentFormat,
@@ -60,7 +60,7 @@ pub struct DurationQuery {
 }
 
 /// Result of a seekable range query.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeekableQuery {
     /// Whether seeking is supported.
     pub seekable: bool,

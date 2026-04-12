@@ -412,7 +412,7 @@ pub fn init_tracers_from_env() -> TracerRegistry {
 // ============================================================================
 
 /// Snapshot of pipeline statistics at a point in time.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipelineStats {
     /// Current pipeline state.
     pub state: crate::pipeline::PipelineState,
@@ -424,8 +424,18 @@ pub struct PipelineStats {
     pub elements: Vec<ElementStats>,
 }
 
+impl std::fmt::Display for PipelineStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Pipeline({:?}): {} elements, {} links",
+            self.state, self.element_count, self.link_count
+        )
+    }
+}
+
 /// Statistics for a single element.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ElementStats {
     /// Element name.
     pub name: String,

@@ -2552,6 +2552,49 @@ impl Pipeline {
         executor.run(self).await
     }
 
+    /// Run the pipeline with a bus message handler callback.
+    ///
+    /// The callback is called for each bus message. Return `true` to continue,
+    /// `false` to stop the pipeline. EOS and Error are handled automatically.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// pipeline.run_with_bus(|msg| {
+    ///     println!("[{}] {}", msg.source, msg.kind);
+    ///     true // continue
+    /// }).await?;
+    /// ```
+    pub async fn run_with_bus<F>(&mut self, mut handler: F) -> Result<()>
+    where
+        F: FnMut(&crate::pipeline::bus::Message) -> bool,
+    {
+        let mut bus = self.take_bus().unwrap_or_else(|| crate::pipeline::bus::Bus::new().0);
+        let executor = crate::pipeline::Executor::new();
+        let handle = executor.start(self)?;
+        handle.wait().await?;
+
+        // Drain bus messages through the handler
+        while let Some(msg) = bus.poll() {
+            match &msg.kind {
+                crate::pipeline::bus::MessageKind::Eos => {
+                    handler(&msg);
+                    break;
+                }
+                crate::pipeline::bus::MessageKind::Error { error, .. } => {
+                    handler(&msg);
+                    return Err(Error::Pipeline(error.clone()));
+                }
+                _ => {
+                    if !handler(&msg) {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Run the pipeline with custom executor configuration.
     ///
     /// # Example

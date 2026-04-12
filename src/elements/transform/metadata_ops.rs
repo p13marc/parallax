@@ -937,7 +937,7 @@ mod tests {
 
         // 1h 23m 45s 678ms
         let time = ClockTime::from_nanos(
-            1 * 3_600_000_000_000 + 23 * 60_000_000_000 + 45 * 1_000_000_000 + 678_000_000,
+            3_600_000_000_000 + 23 * 60_000_000_000 + 45 * 1_000_000_000 + 678_000_000,
         );
         let formatted = debug.format_time(time);
         assert_eq!(formatted, "01:23:45.678");

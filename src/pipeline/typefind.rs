@@ -123,7 +123,7 @@ pub enum TypeFindProbability {
 }
 
 /// Result of type detection.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeFindResult {
     /// Detected media type.
     pub media_type: MediaType,

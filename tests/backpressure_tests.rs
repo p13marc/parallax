@@ -60,7 +60,7 @@ impl FlowAwareSource {
         self
     }
 
-    fn produced(&self) -> u64 {
+    fn _produced(&self) -> u64 {
         self.produced
     }
 
@@ -224,13 +224,7 @@ fn test_flow_state_handle_thread_safety() {
     // Consumer thread - drains queue
     let consumer = thread::spawn(move || {
         let mut consumed = 0u64;
-        loop {
-            match consumer_handle.signal() {
-                FlowSignal::Ready | FlowSignal::Busy => {
-                    // Keep draining
-                }
-                _ => break,
-            }
+        while let FlowSignal::Ready | FlowSignal::Busy = consumer_handle.signal() {
             consumed += 1;
             if consumed > 100 {
                 break; // Prevent infinite loop

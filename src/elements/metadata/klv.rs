@@ -778,7 +778,7 @@ mod tests {
     fn test_klv_encoder_st0601() {
         let mut encoder = KlvEncoder::new();
         encoder
-            .add_timestamp(1234567890_000_000)
+            .add_timestamp(1_234_567_890_000_000)
             .add_sensor_latitude(37.2350)
             .add_sensor_longitude(-115.8111);
 

@@ -530,7 +530,7 @@ mod tests {
         for i in 0..15 {
             let buf = create_test_buffer(64, i);
             let result = filter.process(buf).unwrap();
-            if i >= 5 && i <= 10 {
+            if (5..=10).contains(&i) {
                 assert!(result.is_some(), "seq {} should pass", i);
             } else {
                 assert!(result.is_none(), "seq {} should be dropped", i);

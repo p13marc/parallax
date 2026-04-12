@@ -454,13 +454,13 @@ mod tests {
         assert_eq!(received.len(), 10);
 
         // First 5 should be from stream0
-        for i in 0..5 {
-            assert_eq!(received[i], i as u64);
+        for (i, val) in received.iter().enumerate().take(5) {
+            assert_eq!(*val, i as u64);
         }
 
         // Next 5 should be from stream1
-        for i in 0..5 {
-            assert_eq!(received[5 + i], 10 + i as u64);
+        for (i, val) in received.iter().enumerate().skip(5).take(5) {
+            assert_eq!(*val, 10 + (i - 5) as u64);
         }
     }
 

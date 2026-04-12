@@ -252,7 +252,7 @@ impl fmt::Display for MessageKind {
 // ============================================================================
 
 /// Typed value for structured message fields.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum MessageValue {
     /// Boolean value.
     Bool(bool),
@@ -270,6 +270,40 @@ pub enum MessageValue {
     ClockTime(ClockTime),
     /// Nested list of values.
     List(Vec<MessageValue>),
+}
+
+impl fmt::Display for MessageValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MessageValue::Bool(v) => write!(f, "{v}"),
+            MessageValue::Int(v) => write!(f, "{v}"),
+            MessageValue::Uint(v) => write!(f, "{v}"),
+            MessageValue::Float(v) => write!(f, "{v}"),
+            MessageValue::String(v) => write!(f, "{v}"),
+            MessageValue::Bytes(v) => write!(f, "[{} bytes]", v.len()),
+            MessageValue::ClockTime(v) => write!(f, "{v}"),
+            MessageValue::List(v) => write!(f, "[{} items]", v.len()),
+        }
+    }
+}
+
+impl From<bool> for MessageValue {
+    fn from(v: bool) -> Self { Self::Bool(v) }
+}
+impl From<i64> for MessageValue {
+    fn from(v: i64) -> Self { Self::Int(v) }
+}
+impl From<u64> for MessageValue {
+    fn from(v: u64) -> Self { Self::Uint(v) }
+}
+impl From<f64> for MessageValue {
+    fn from(v: f64) -> Self { Self::Float(v) }
+}
+impl From<String> for MessageValue {
+    fn from(v: String) -> Self { Self::String(v) }
+}
+impl From<&str> for MessageValue {
+    fn from(v: &str) -> Self { Self::String(v.to_string()) }
 }
 
 // ============================================================================
@@ -294,7 +328,7 @@ pub enum BufferingMode {
 // ============================================================================
 
 /// Information about a stream within a multi-stream source.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StreamInfo {
     /// Unique stream identifier.
     pub stream_id: String,

@@ -271,7 +271,7 @@ mod tests {
         // Allow some variance due to resampling algorithm
         let output_samples = result.len() / 4;
         assert!(
-            output_samples >= 438 && output_samples <= 448,
+            (438..=448).contains(&output_samples),
             "Expected ~441 samples, got {}",
             output_samples
         );
