@@ -14,6 +14,7 @@ use crate::negotiation::{
     NegotiationSolver,
 };
 use crate::pipeline::bus::{Bus, BusHandle};
+use crate::pipeline::probe::{PadRef, ProbeData, ProbeId, ProbeRegistry, ProbeReturn, ProbeType};
 use daggy::petgraph::visit::EdgeRef;
 use daggy::{Dag, EdgeIndex, NodeIndex, Walker};
 use std::collections::HashMap;
@@ -432,6 +433,8 @@ pub struct Pipeline {
     bus: Option<Bus>,
     /// Bus handle for creating element-specific handles.
     bus_handle: BusHandle,
+    /// Probe registry for pad probes.
+    probe_registry: ProbeRegistry,
 }
 
 impl Pipeline {
@@ -449,6 +452,7 @@ impl Pipeline {
             clock: PipelineClock::system(),
             bus: Some(bus),
             bus_handle,
+            probe_registry: ProbeRegistry::new(),
         }
     }
 
@@ -466,6 +470,7 @@ impl Pipeline {
             clock: PipelineClock::new(clock),
             bus: Some(bus),
             bus_handle,
+            probe_registry: ProbeRegistry::new(),
         }
     }
 
@@ -1355,6 +1360,52 @@ impl Pipeline {
             })
             .map(NodeId)
             .collect()
+    }
+
+    // ========================================================================
+    // Pad Probes
+    // ========================================================================
+
+    /// Add a probe to a pad.
+    ///
+    /// The callback will be invoked whenever matching data flows through the pad.
+    /// Returns a [`ProbeId`] for later removal.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use parallax::pipeline::probe::{PadRef, ProbeType, ProbeReturn, ProbeData};
+    ///
+    /// let pad = PadRef::src(src_id);
+    /// let probe_id = pipeline.add_probe(pad, ProbeType::BUFFER, |data| {
+    ///     if let ProbeData::Buffer(buf) = data {
+    ///         println!("Buffer: {} bytes", buf.len());
+    ///     }
+    ///     ProbeReturn::Ok
+    /// });
+    /// ```
+    pub fn add_probe<F>(
+        &self,
+        pad: PadRef,
+        probe_type: ProbeType,
+        callback: F,
+    ) -> ProbeId
+    where
+        F: FnMut(ProbeData<'_>) -> ProbeReturn + Send + 'static,
+    {
+        self.probe_registry.add(pad, probe_type, callback)
+    }
+
+    /// Remove a probe by ID.
+    ///
+    /// Returns `true` if the probe was found and removed.
+    pub fn remove_probe(&self, id: ProbeId) -> bool {
+        self.probe_registry.remove(id)
+    }
+
+    /// Get the probe registry (for executor access).
+    pub fn probe_registry(&self) -> &ProbeRegistry {
+        &self.probe_registry
     }
 
     // ========================================================================

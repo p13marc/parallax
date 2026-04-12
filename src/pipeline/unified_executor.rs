@@ -40,6 +40,7 @@ use crate::pipeline::rt_scheduler::{
     BoundaryDirection, GraphPartition, RtConfig, RtScheduler, SchedulingMode,
 };
 use crate::pipeline::bus::{Bus, BusHandle};
+use crate::pipeline::probe::{ProbeRegistry, ProbeReturn};
 use crate::pipeline::{
     DriverConfig, EventReceiver, EventSender, NodeId, Pipeline, PipelineEvent, PipelineState,
     TimerDriver,
@@ -884,10 +885,11 @@ impl Executor {
         let inputs = channels.take_inputs(node_id);
         let outputs = channels.take_outputs(node_id);
         let events_clone = events.clone();
+        let probes = pipeline.probe_registry().clone();
 
         let task = match element_type {
             ElementType::Source => {
-                spawn_source_task(node_name, element, outputs, output_bridges, events_clone)
+                spawn_source_task(node_name, node_id, element, outputs, output_bridges, events_clone, probes)
             }
             ElementType::Sink => {
                 spawn_sink_task(node_name, element, inputs, input_bridges, events_clone)
@@ -1053,15 +1055,18 @@ impl ChannelNetwork {
 
 fn spawn_source_task(
     name: String,
+    node_id: NodeId,
     mut element: Box<DynAsyncElement<'static>>,
     outputs: Vec<AsyncSender<Message>>,
     output_bridges: Vec<Arc<AsyncRtBridge>>,
     events: EventSender,
+    probe_registry: ProbeRegistry,
 ) -> JoinHandle<Result<()>> {
     tokio::spawn(async move {
         tracing::debug!("source '{}' started", name);
         events.send_node_started(&name);
 
+        let src_pad = crate::pipeline::probe::PadRef::src(node_id);
         let mut count: u64 = 0;
         let mut would_block_count: u64 = 0;
 
@@ -1072,6 +1077,13 @@ fn spawn_source_task(
                     let buffer = *buffer;
                     count += 1;
                     would_block_count = 0; // Reset
+
+                    // Invoke buffer probes
+                    match probe_registry.invoke_buffer(&src_pad, &buffer) {
+                        ProbeReturn::Drop | ProbeReturn::Handled => continue,
+                        _ => {}
+                    }
+
                     tracing::debug!(
                         "source '{}': produced buffer {} ({} bytes)",
                         name,

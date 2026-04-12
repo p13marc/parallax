@@ -52,6 +52,7 @@ pub mod factory;
 pub mod flow;
 mod graph;
 pub mod parser;
+pub mod probe;
 pub mod rt_bridge;
 pub mod rt_scheduler;
 pub mod seek;
@@ -63,6 +64,7 @@ pub use driver::{
 };
 pub use bus::{BufferingMode, Bus, BusHandle, Message, MessageKind, MessageValue, StreamInfo};
 pub use events::{EventReceiver, EventSender, EventStream, PipelineEvent};
+pub use probe::{PadDirection, PadRef, ProbeData, ProbeId, ProbeRegistry, ProbeReturn, ProbeType};
 pub use seek::{DurationQuery, PositionQuery, SeekRequest, SeekableQuery, SeekableSource};
 pub use tags::{TagList, TagMergeMode, TagValue};
 pub use factory::ElementFactory;

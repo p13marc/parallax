@@ -14,8 +14,8 @@ These are media-independent features that make the pipeline engine complete.
 
 | # | Plan | Priority | Effort | Progress |
 |---|------|----------|--------|----------|
-| 18 | [Pipeline Bus & Messaging](18_PIPELINE_BUS_MESSAGING.md) | Critical | Medium | ⬜ Not Started |
-| 19 | [Seeking, Position Queries & Trick Modes](19_SEEKING_POSITION_QUERIES.md) | Critical | Large | ⬜ Not Started |
+| 18 | [Pipeline Bus & Messaging](18_PIPELINE_BUS_MESSAGING.md) | Critical | Medium | ✅ Complete |
+| 19 | [Seeking, Position Queries & Trick Modes](19_SEEKING_POSITION_QUERIES.md) | Critical | Large | ✅ Complete |
 | 20 | [Pad Probes & Dynamic Reconfiguration](20_PAD_PROBES_DYNAMIC_RECONFIGURATION.md) | High | Medium | ⬜ Not Started |
 | 21 | [Debugging & Inspection Tools](21_DEBUGGING_INSPECTION_TOOLS.md) | High | Medium | ⬜ Not Started |
 | 22 | [Auto-Plugging & Typefinding](22_AUTO_PLUGGING_TYPEFINDING.md) | High | Large | ⬜ Not Started |
