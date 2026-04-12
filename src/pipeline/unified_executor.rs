@@ -41,6 +41,7 @@ use crate::pipeline::rt_scheduler::{
 };
 use crate::pipeline::bus::{Bus, BusHandle};
 use crate::pipeline::probe::{ProbeRegistry, ProbeReturn};
+use crate::pipeline::tracer::TracerRegistry;
 use crate::pipeline::{
     DriverConfig, EventReceiver, EventSender, NodeId, Pipeline, PipelineEvent, PipelineState,
     TimerDriver,
@@ -535,6 +536,7 @@ impl Executor {
         events.send_state_changed(idle_state, PipelineState::Running);
         bus_handle.post_state_changed(idle_state, PipelineState::Running);
         events.send(PipelineEvent::Started);
+        pipeline.tracer_registry().notify_start();
 
         // Take the bus from the pipeline and store it on the handle.
         let bus = pipeline.take_bus();
@@ -886,13 +888,14 @@ impl Executor {
         let outputs = channels.take_outputs(node_id);
         let events_clone = events.clone();
         let probes = pipeline.probe_registry().clone();
+        let tracers = pipeline.tracer_registry().clone();
 
         let task = match element_type {
             ElementType::Source => {
-                spawn_source_task(node_name, node_id, element, outputs, output_bridges, events_clone, probes)
+                spawn_source_task(node_name, node_id, element, outputs, output_bridges, events_clone, probes, tracers)
             }
             ElementType::Sink => {
-                spawn_sink_task(node_name, element, inputs, input_bridges, events_clone)
+                spawn_sink_task(node_name, element, inputs, input_bridges, events_clone, tracers)
             }
             ElementType::Transform => spawn_transform_task(
                 node_name,
@@ -1061,6 +1064,7 @@ fn spawn_source_task(
     output_bridges: Vec<Arc<AsyncRtBridge>>,
     events: EventSender,
     probe_registry: ProbeRegistry,
+    tracers: TracerRegistry,
 ) -> JoinHandle<Result<()>> {
     tokio::spawn(async move {
         tracing::debug!("source '{}' started", name);
@@ -1083,6 +1087,9 @@ fn spawn_source_task(
                         ProbeReturn::Drop | ProbeReturn::Handled => continue,
                         _ => {}
                     }
+
+                    // Notify tracers
+                    tracers.notify_buffer(&name, &buffer);
 
                     tracing::debug!(
                         "source '{}': produced buffer {} ({} bytes)",
@@ -1138,6 +1145,7 @@ fn spawn_sink_task(
     inputs: Vec<AsyncReceiver<Message>>,
     input_bridges: Vec<Arc<AsyncRtBridge>>,
     events: EventSender,
+    tracers: TracerRegistry,
 ) -> JoinHandle<Result<()>> {
     tokio::spawn(async move {
         tracing::debug!("sink '{}' started", name);
@@ -1149,10 +1157,12 @@ fn spawn_sink_task(
             // Standard path: read from kanal channel
             while let Ok(Message::Buffer(buffer)) = rx.recv().await {
                 count += 1;
+                tracers.notify_buffer(&name, &buffer);
                 if let Err(e) = element.process(Some(buffer)).await {
                     events.send_error(e.to_string(), Some(name.clone()));
                     return Err(e);
                 }
+                tracers.notify_buffer_processed(&name);
             }
         } else if let Some(bridge) = input_bridges.into_iter().next() {
             // Bridge path: read from RT→Async bridge

@@ -15,6 +15,7 @@ use crate::negotiation::{
 };
 use crate::pipeline::bus::{Bus, BusHandle};
 use crate::pipeline::probe::{PadRef, ProbeData, ProbeId, ProbeRegistry, ProbeReturn, ProbeType};
+use crate::pipeline::tracer::{ElementStats, PipelineStats, TracerRegistry};
 use daggy::petgraph::visit::EdgeRef;
 use daggy::{Dag, EdgeIndex, NodeIndex, Walker};
 use std::collections::HashMap;
@@ -435,6 +436,8 @@ pub struct Pipeline {
     bus_handle: BusHandle,
     /// Probe registry for pad probes.
     probe_registry: ProbeRegistry,
+    /// Tracer registry for debugging/profiling.
+    tracer_registry: TracerRegistry,
 }
 
 impl Pipeline {
@@ -453,6 +456,7 @@ impl Pipeline {
             bus: Some(bus),
             bus_handle,
             probe_registry: ProbeRegistry::new(),
+            tracer_registry: crate::pipeline::tracer::init_tracers_from_env(),
         }
     }
 
@@ -471,6 +475,7 @@ impl Pipeline {
             bus: Some(bus),
             bus_handle,
             probe_registry: ProbeRegistry::new(),
+            tracer_registry: crate::pipeline::tracer::init_tracers_from_env(),
         }
     }
 
@@ -706,6 +711,7 @@ impl Pipeline {
                 }
 
                 self.state = PipelineState::Idle;
+                self.dump_dot_if_env("idle");
                 Ok(())
             }
             PipelineState::Idle => {
@@ -748,6 +754,7 @@ impl Pipeline {
         match self.state {
             PipelineState::Idle => {
                 self.state = PipelineState::Running;
+                self.dump_dot_if_env("running");
                 Ok(())
             }
             PipelineState::Running => {
@@ -1406,6 +1413,58 @@ impl Pipeline {
     /// Get the probe registry (for executor access).
     pub fn probe_registry(&self) -> &ProbeRegistry {
         &self.probe_registry
+    }
+
+    // ========================================================================
+    // Tracers
+    // ========================================================================
+
+    /// Get the tracer registry.
+    pub fn tracer_registry(&self) -> &TracerRegistry {
+        &self.tracer_registry
+    }
+
+    /// Set a custom tracer registry (replaces the env-var-initialized one).
+    pub fn set_tracer_registry(&mut self, registry: TracerRegistry) {
+        self.tracer_registry = registry;
+    }
+
+    /// Get a snapshot of pipeline statistics.
+    pub fn stats_snapshot(&self) -> PipelineStats {
+        let elements = self
+            .graph
+            .graph()
+            .node_indices()
+            .map(|idx| {
+                let node = self.graph.node_weight(idx).unwrap();
+                ElementStats {
+                    name: node.name().to_string(),
+                    element_type: format!("{:?}", node.element_type()),
+                }
+            })
+            .collect();
+
+        PipelineStats {
+            state: self.state,
+            element_count: self.graph.graph().node_count(),
+            link_count: self.graph.graph().edge_count(),
+            elements,
+        }
+    }
+
+    /// Dump DOT graph to `PARALLAX_DOT_DIR` if the env var is set.
+    ///
+    /// Called automatically during state transitions. The filename includes
+    /// the state name for easy chronological inspection.
+    pub fn dump_dot_if_env(&self, state_label: &str) {
+        if let Ok(dir) = std::env::var("PARALLAX_DOT_DIR") {
+            let filename = format!("{}/pipeline_{}.dot", dir, state_label);
+            if let Err(e) = std::fs::write(&filename, self.to_dot()) {
+                tracing::warn!("Failed to write DOT file {}: {}", filename, e);
+            } else {
+                tracing::debug!("DOT graph written to {}", filename);
+            }
+        }
     }
 
     // ========================================================================

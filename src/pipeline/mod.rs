@@ -57,6 +57,7 @@ pub mod rt_bridge;
 pub mod rt_scheduler;
 pub mod seek;
 pub mod tags;
+pub mod tracer;
 mod unified_executor;
 
 pub use driver::{
@@ -66,6 +67,10 @@ pub use bus::{BufferingMode, Bus, BusHandle, Message, MessageKind, MessageValue,
 pub use events::{EventReceiver, EventSender, EventStream, PipelineEvent};
 pub use probe::{PadDirection, PadRef, ProbeData, ProbeId, ProbeRegistry, ProbeReturn, ProbeType};
 pub use seek::{DurationQuery, PositionQuery, SeekRequest, SeekableQuery, SeekableSource};
+pub use tracer::{
+    DropTracer, ElementStats, FramerateTracer, LatencyTracer, PipelineStats, Tracer,
+    TracerRegistry,
+};
 pub use tags::{TagList, TagMergeMode, TagValue};
 pub use factory::ElementFactory;
 pub use graph::{
