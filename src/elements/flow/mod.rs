@@ -2,6 +2,7 @@
 //!
 //! ## Buffering
 //! - [`Queue`]: Async buffer queue with backpressure
+//! - [`Queue2`]: Advanced network buffering (stream/download/timeshift)
 //!
 //! ## Routing
 //! - [`Tee`]: 1-to-N fanout (duplicates buffers)
@@ -16,6 +17,7 @@
 mod concat;
 mod funnel;
 mod queue;
+mod queue2;
 mod selector;
 mod tee;
 mod valve;
@@ -23,6 +25,7 @@ mod valve;
 pub use concat::{Concat, ConcatStats, ConcatStream};
 pub use funnel::{Funnel, FunnelInput, FunnelStats};
 pub use queue::{LeakyMode, Queue, QueueStats};
+pub use queue2::{BufferingAction, BufferingConfig, DownloadedRanges, Queue2, Queue2Stats};
 pub use selector::{
     InputSelector, InputSelectorStats, OutputSelector, OutputSelectorStats, SelectorInput,
     SelectorOutput,

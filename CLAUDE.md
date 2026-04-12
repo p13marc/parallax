@@ -360,6 +360,32 @@ impl Source for MyLiveSource {
 
 See `examples/47_flow_control.rs` for a complete example.
 
+### Network Buffering (Queue2)
+
+`Queue2` extends the basic `Queue` with buffering strategies for network streaming:
+
+| Mode | Description | Use Case |
+|------|-------------|----------|
+| `Stream` | In-memory ring buffer with watermarks | HTTP streaming, variable network |
+| `Download` | File-backed progressive download | File download with seek |
+| `Timeshift` | Circular file buffer | DVR rewind of live streams |
+
+```rust
+use parallax::elements::flow::Queue2;
+
+// Stream mode: pause at 10% fill, resume at 95%
+let queue = Queue2::stream(10 * 1024 * 1024)
+    .with_watermarks(10, 95);
+
+// Download mode: progressive download to disk
+let queue = Queue2::download("/tmp/video.tmp", Some(file_size));
+
+// Timeshift mode: 60 MB ring buffer for rewind
+let queue = Queue2::timeshift("/tmp/timeshift.tmp", 60 * 1024 * 1024);
+```
+
+Buffering progress (0-100%) is reported via bus `MessageKind::Buffering` messages with rate estimates.
+
 ### Clock System and Timestamps
 
 Parallax provides a clock system for accurate timing and A/V synchronization, inspired by GStreamer and PipeWire.
@@ -1165,6 +1191,7 @@ See `docs/design.md` for full details.
 | 19 | Seeking, Position Queries & Trick Modes | Complete |
 | 20 | Pad Probes & Dynamic Reconfiguration | Complete |
 | 21 | Debugging & Inspection Tools (Tracers) | Complete |
+| 23 | Network Buffering Strategies (Queue2) | Complete |
 
 ## Code Style Guidelines
 

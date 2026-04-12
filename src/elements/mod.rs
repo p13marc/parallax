@@ -143,8 +143,8 @@ pub use testing::{
 // Flow control
 pub use flow::{
     Concat, ConcatStats, ConcatStream, Funnel, FunnelInput, FunnelStats, InputSelector,
-    InputSelectorStats, LeakyMode, OutputSelector, OutputSelectorStats, Queue, QueueStats,
-    SelectorInput, SelectorOutput, Tee, Valve, ValveControl, ValveStats,
+    InputSelectorStats, LeakyMode, OutputSelector, OutputSelectorStats, Queue, Queue2,
+    Queue2Stats, QueueStats, SelectorInput, SelectorOutput, Tee, Valve, ValveControl, ValveStats,
 };
 
 // Transform
