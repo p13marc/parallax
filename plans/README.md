@@ -14,9 +14,6 @@ These are media-independent features that make the pipeline engine complete.
 
 | # | Plan | Priority | Effort | Progress |
 |---|------|----------|--------|----------|
-| 18 | [Pipeline Bus & Messaging](18_PIPELINE_BUS_MESSAGING.md) | Critical | Medium | ✅ Complete |
-| 19 | [Seeking, Position Queries & Trick Modes](19_SEEKING_POSITION_QUERIES.md) | Critical | Large | ✅ Complete |
-| 20 | [Pad Probes & Dynamic Reconfiguration](20_PAD_PROBES_DYNAMIC_RECONFIGURATION.md) | High | Medium | ⬜ Not Started |
 | 21 | [Debugging & Inspection Tools](21_DEBUGGING_INSPECTION_TOOLS.md) | High | Medium | ⬜ Not Started |
 | 22 | [Auto-Plugging & Typefinding](22_AUTO_PLUGGING_TYPEFINDING.md) | High | Large | ⬜ Not Started |
 | 23 | [Network Buffering Strategies](23_NETWORK_BUFFERING_STRATEGIES.md) | High | Medium | ⬜ Not Started |
@@ -55,17 +52,13 @@ Complex features for specialized use cases.
 
 ## Recommended Implementation Order
 
-The dependency graph and priority suggests this order:
-
 ```
-Phase A (Foundation):
-  18 → 19 → 20
-  ↓         ↓
-  21        23
-  ↓
-  22
+Phase A (Foundation — remaining):
+  21 (Debugging)
+  22 (Auto-Plugging)
+  23 (Network Buffering)
 
-Phase B (Media — can start in parallel with Phase A):
+Phase B (Media — can start in parallel):
   26 → 27 → 28
   24
   25
@@ -75,7 +68,7 @@ Phase C (Advanced):
   16
 ```
 
-**Phase A** focuses on generic pipeline infrastructure. Plan 18 (Bus) is the foundation for Plans 19, 21, 22, and 23. Plan 19 (Seeking) is required for Plan 22 (Auto-plugging). Plan 20 (Pad Probes) enables dynamic reconfiguration.
+**Phase A** remaining plans are independent of each other. Plan 21 (Debugging) is high-value developer experience. Plan 22 (Auto-Plugging) requires the now-complete seeking (Plan 19) and bus (Plan 18). Plan 23 (Network Buffering) requires the bus for progress reporting.
 
 **Phase B** focuses on media format coverage. Plans 24/25 (filters) and Plan 26 (codecs) can start independently. Plan 27 (containers) is needed before Plan 28 (RTMP needs FLV, WebRTC needs VP8/VP9 from Plan 26).
 
@@ -90,15 +83,6 @@ Hardware-accelerated video encoding/decoding via Vulkan Video. Skeleton and NAL 
 
 ### Plan 16: Process Isolation
 Production-ready process isolation with seccomp/namespace sandboxing. Scaffolding exists (IPC, supervisor protocol) but needs full sandbox implementation.
-
-### Plan 18: Pipeline Bus & Messaging System
-Thread-safe message bus for element-to-application communication. Typed messages (error, warning, tag, QoS, buffering, state change). Sync polling and async stream consumption. Foundation for Plans 19, 22, 23.
-
-### Plan 19: Seeking, Position Queries & Trick Modes
-Seek event propagation (upstream), flush events, position/duration queries, playback rate control (fast forward, slow motion), segment events for timestamp mapping. Required for media player use cases.
-
-### Plan 20: Pad Probes & Dynamic Pipeline Reconfiguration
-Buffer/event interception at pads with DROP/PASS/BLOCK semantics. Safe dynamic reconfiguration (block pad, relink, unblock). Add/remove elements while running. Enables recording triggers, stream switching.
 
 ### Plan 21: Debugging & Inspection Tools
 `parallax-inspect` CLI (browse elements), DOT graph dumps, tracer framework (latency/framerate/queue level), `parallax-top` TUI monitor. Essential developer experience.
@@ -128,12 +112,15 @@ WebRTC (str0m, WHIP/WHEP), SRT (srt-rs), RTMP (rml-rtmp). Highest-demand streami
 
 ## Completed Plans (removed)
 
-Plans 00-10, 12-15, 17, Clock Provider, and Pipeline Robustness have been completed and their files removed. Key completed work:
+Plans 00-10, 12-15, 17-20, Clock Provider, and Pipeline Robustness have been completed and their files removed. Key completed work:
 
 - **Phase 1** (Plans 00-08): Metadata API, codec wrappers, muxer sync, buffer pool, element trait consolidation, caps negotiation, builder DSL, events/tagging
 - **Phase 2** (Plans 09-10, 12-14): Format converters, code cleanup, additional codecs (Opus, AAC, Symphonia), device elements (V4L2, PipeWire, ALSA, libcamera, screen capture), streaming protocols (HLS, DASH)
 - **Plan 15**: RT scheduling (SyncElement trait, RT thread spawning, driver integration, hybrid async/RT pipelines)
 - **Plan 17**: Consolidated `affinity()`, `is_rt_safe()`, and `execution_hints()` into single `execution_hints()` method; removed `Affinity` enum (PipeWire-inspired capability-based scheduling)
+- **Plan 18**: Pipeline Bus & Messaging — thread-safe message bus (Bus, BusHandle), typed messages (MessageKind), TagList, sync polling and async stream consumption
+- **Plan 19**: Seeking & Position Queries — segment timestamp mapping, SeekableSource trait, FileSrc byte-seeking, Pipeline query API (position, duration, seekable)
+- **Plan 20**: Pad Probes — buffer/event interception (ProbeType, ProbeReturn, ProbeData), ProbeRegistry, executor integration with Drop/Remove semantics
 - **Clock Provider**: Hardware timestamp extraction (PipeWire, V4L2, ALSA), Clock/ClockProvider traits, PipelineClock, TimestampDebug element
 - **Auto Clock Selection**: `as_clock_provider()` on element traits, `Pipeline::select_clock()`, AlsaSink auto-provides clock
 - **Pipeline Robustness**: Arena reclaim hygiene, backpressure system (FlowSignal, FlowPolicy, Queue water marks), video scaler

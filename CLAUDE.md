@@ -594,7 +594,11 @@ parallax/
 │   │   ├── rt_bridge.rs    # AsyncRtBridge (lock-free SPSC ring buffer + eventfd)
 │   │   ├── driver.rs       # TimerDriver, ManualDriver (PipeWire-style drivers)
 │   │   ├── parser.rs       # Pipeline string parser (winnow)
-│   │   └── factory.rs      # ElementFactory + PluginRegistry
+│   │   ├── factory.rs      # ElementFactory + PluginRegistry
+│   │   ├── bus.rs          # Pipeline message bus (Bus, BusHandle, Message)
+│   │   ├── tags.rs         # TagList, TagValue for stream metadata
+│   │   ├── seek.rs         # Seeking, position queries, SeekableSource
+│   │   └── probe.rs        # Pad probes (ProbeRegistry, ProbeType, PadRef)
 │   │
 │   ├── elements/           # Built-in elements (organized by category)
 │   │   ├── network/        # TCP, UDP, Unix, multicast, HTTP, WebSocket, Zenoh
@@ -992,6 +996,117 @@ pipeline.prepare()?;
 
 See `examples/17_multi_format_caps.rs` and `examples/41_format_converters.rs` for examples.
 
+### Pipeline Bus & Messaging
+
+Parallax provides a GStreamer-inspired message bus for element-to-application communication.
+
+**Key types:**
+- `Bus` - Thread-safe message bus (MPSC + broadcast)
+- `BusHandle` - Cloneable sender for elements to post messages
+- `Message` - Timestamped message with source name and payload
+- `MessageKind` - Typed message variants (Error, Warning, Tag, QoS, Buffering, StateChanged, etc.)
+- `TagList` - Stream metadata (title, artist, bitrate, duration)
+
+```rust
+use parallax::pipeline::bus::{Bus, MessageKind};
+
+// Bus is created automatically with Pipeline
+let mut pipeline = Pipeline::new();
+
+// Elements post messages via BusHandle (set automatically by executor)
+// Application polls messages:
+if let Some(msg) = pipeline.take_bus().unwrap().poll() {
+    match msg.kind {
+        MessageKind::Eos => println!("End of stream"),
+        MessageKind::Error { error, .. } => eprintln!("Error: {error}"),
+        MessageKind::Tag { tags } => println!("Tags: {tags}"),
+        _ => {}
+    }
+}
+
+// Or wait asynchronously:
+let mut bus = pipeline.take_bus().unwrap();
+bus.wait_for_eos_or_error().await?;
+```
+
+**Context integration:** `ProduceContext` and `ConsumeContext` carry an optional `BusHandle` with `post_message()` convenience method. Elements receive their handle via `set_bus()` during pipeline startup.
+
+### Seeking & Position Queries
+
+Parallax supports seeking, position/duration queries, and segment-based timestamp mapping.
+
+**Key types:**
+- `SeekEvent` - Seek request with rate, format, flags, position
+- `SegmentEvent` - Defines timestamp mapping after seek (rate, start, base)
+- `SeekableSource` - Trait for sources that support seeking
+- `PositionQuery`, `DurationQuery`, `SeekableQuery` - Query result types
+
+```rust
+use parallax::pipeline::Pipeline;
+use parallax::event::SegmentFormat;
+
+// Query whether seeking is supported
+let seekable = pipeline.query_seekable();
+if seekable.seekable {
+    // Seek to byte position
+    pipeline.seek_bytes(1024)?;
+
+    // Query current position
+    if let Some(pos) = pipeline.query_position() {
+        println!("Position: {:?} = {:?}", pos.format, pos.position);
+    }
+}
+```
+
+**Segment timestamp mapping:**
+```rust
+use parallax::event::SegmentEvent;
+use parallax::clock::ClockTime;
+
+// After seeking to 10s with 5s already played:
+let seg = SegmentEvent { start: 10_000_000_000, base: 5_000_000_000, rate: 1.0, .. };
+let running_time = seg.to_running_time(ClockTime::from_secs(12));  // → 7s
+let stream_time = seg.to_stream_time(ClockTime::from_secs(12));    // → 12s
+```
+
+**FileSrc** implements byte-based seeking via `Source::handle_upstream_event()`, `is_seekable()`, `query_position()`, and `query_duration()`.
+
+### Pad Probes
+
+Pad probes allow intercepting buffers and events at any point in the pipeline for inspection, filtering, or blocking.
+
+**Key types:**
+- `ProbeType` - What to intercept (BUFFER, EVENT_DOWN, EVENT_UP, BLOCK, IDLE)
+- `ProbeReturn` - What to do (Ok, Drop, Remove, Handled)
+- `ProbeData` - Data passed to callback (Buffer, Event, Idle)
+- `PadRef` - Reference to a specific pad on a node
+- `ProbeRegistry` - Thread-safe probe storage shared with executor
+
+```rust
+use parallax::pipeline::probe::{PadRef, ProbeType, ProbeReturn, ProbeData};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+let count = Arc::new(AtomicU64::new(0));
+let count_clone = count.clone();
+
+// Add buffer inspection probe on source's output pad
+let pad = PadRef::src(src_node_id);
+let probe_id = pipeline.add_probe(pad, ProbeType::BUFFER, move |data| {
+    if let ProbeData::Buffer(buf) = data {
+        count_clone.fetch_add(buf.len() as u64, Ordering::Relaxed);
+    }
+    ProbeReturn::Ok  // Pass through
+    // ProbeReturn::Drop    — drop this buffer
+    // ProbeReturn::Remove  — remove probe (one-shot)
+});
+
+// Remove probe when done
+pipeline.remove_probe(probe_id);
+```
+
+**Executor integration:** The executor invokes buffer probes before forwarding data downstream. Drop/Handled returns prevent the buffer from reaching downstream elements.
+
 ## Implementation Roadmap
 
 See `docs/design.md` for full details.
@@ -1008,6 +1123,9 @@ See `docs/design.md` for full details.
 | 9 | Hybrid Scheduling (PipeWire-inspired) | Complete |
 | 10 | Unified Executor (automatic strategy) | Complete |
 | 11 | Device Support (V4L2, PipeWire, ALSA, libcamera) | Complete |
+| 18 | Pipeline Bus & Messaging | Complete |
+| 19 | Seeking, Position Queries & Trick Modes | Complete |
+| 20 | Pad Probes & Dynamic Reconfiguration | Complete |
 
 ## Code Style Guidelines
 
