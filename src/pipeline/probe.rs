@@ -220,6 +220,7 @@ impl ProbeRegistry {
     /// Add a probe to a pad.
     ///
     /// Returns the probe ID for later removal.
+    #[must_use]
     pub fn add<F>(
         &self,
         pad: PadRef,
@@ -459,7 +460,7 @@ mod tests {
         let pad = make_pad_ref();
         let buffer = make_test_buffer();
 
-        registry.add(pad, ProbeType::BUFFER, |_| ProbeReturn::Ok);
+        let _ = registry.add(pad, ProbeType::BUFFER, |_| ProbeReturn::Ok);
 
         let result = registry.invoke_buffer(&pad, &buffer);
         assert_eq!(result, ProbeReturn::Ok);
@@ -471,7 +472,7 @@ mod tests {
         let pad = make_pad_ref();
         let buffer = make_test_buffer();
 
-        registry.add(pad, ProbeType::BUFFER, |_| ProbeReturn::Drop);
+        let _ = registry.add(pad, ProbeType::BUFFER, |_| ProbeReturn::Drop);
 
         let result = registry.invoke_buffer(&pad, &buffer);
         assert_eq!(result, ProbeReturn::Drop);
@@ -483,7 +484,7 @@ mod tests {
         let pad = make_pad_ref();
         let buffer = make_test_buffer();
 
-        registry.add(pad, ProbeType::BUFFER, |_| ProbeReturn::Remove);
+        let _ = registry.add(pad, ProbeType::BUFFER, |_| ProbeReturn::Remove);
 
         // First invocation triggers and removes
         let result = registry.invoke_buffer(&pad, &buffer);
@@ -502,7 +503,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let count_clone = count.clone();
 
-        registry.add(pad, ProbeType::BUFFER, move |data| {
+        let _ = registry.add(pad, ProbeType::BUFFER, move |data| {
             if let ProbeData::Buffer(buf) = data {
                 count_clone.fetch_add(buf.len(), Ordering::Relaxed);
             }
@@ -523,7 +524,7 @@ mod tests {
 
         assert!(!registry.is_blocked(&pad));
 
-        registry.add(pad, ProbeType::BLOCK, |_| ProbeReturn::Ok);
+        let _ = registry.add(pad, ProbeType::BLOCK, |_| ProbeReturn::Ok);
         assert!(registry.is_blocked(&pad));
     }
 
@@ -548,11 +549,11 @@ mod tests {
         let c1 = count.clone();
         let c2 = count.clone();
 
-        registry.add(pad, ProbeType::BUFFER, move |_| {
+        let _ = registry.add(pad, ProbeType::BUFFER, move |_| {
             c1.fetch_add(1, Ordering::Relaxed);
             ProbeReturn::Ok
         });
-        registry.add(pad, ProbeType::BUFFER, move |_| {
+        let _ = registry.add(pad, ProbeType::BUFFER, move |_| {
             c2.fetch_add(1, Ordering::Relaxed);
             ProbeReturn::Ok
         });

@@ -283,6 +283,20 @@ impl fmt::Display for TagList {
     }
 }
 
+impl<'a> IntoIterator for &'a TagList {
+    type Item = (&'a str, &'a TagValue);
+    type IntoIter = std::iter::Map<
+        std::collections::hash_map::Iter<'a, String, TagValue>,
+        fn((&'a String, &'a TagValue)) -> (&'a str, &'a TagValue),
+    >;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.tags
+            .iter()
+            .map(|(k, v)| (k.as_str(), v) as (&str, &TagValue))
+    }
+}
+
 // ============================================================================
 // Tests
 // ============================================================================

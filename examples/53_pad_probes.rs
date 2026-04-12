@@ -28,7 +28,7 @@ async fn main() -> parallax::error::Result<()> {
     let count_clone = buffer_count.clone();
 
     let pad = PadRef::src(src);
-    pipeline.add_probe(pad, ProbeType::BUFFER, move |data| {
+    let _ = pipeline.add_probe(pad, ProbeType::BUFFER, move |data| {
         if let ProbeData::Buffer(buf) = data {
             let n = count_clone.fetch_add(1, Ordering::Relaxed) + 1;
             if n <= 3 || n == 20 {
@@ -44,7 +44,7 @@ async fn main() -> parallax::error::Result<()> {
     let total_bytes = Arc::new(AtomicU64::new(0));
     let bytes_clone = total_bytes.clone();
 
-    pipeline.add_probe(pad, ProbeType::BUFFER, move |data| {
+    let _ = pipeline.add_probe(pad, ProbeType::BUFFER, move |data| {
         if let ProbeData::Buffer(buf) = data {
             bytes_clone.fetch_add(buf.len() as u64, Ordering::Relaxed);
         }

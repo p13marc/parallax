@@ -7,6 +7,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Main error type for Parallax operations.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// Memory pool is exhausted (no slots available).
     #[error("memory pool exhausted: no slots available")]

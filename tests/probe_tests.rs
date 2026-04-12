@@ -19,7 +19,7 @@ async fn test_buffer_probe_counts_buffers() {
 
     // Add probe on source's output pad
     let pad = PadRef::src(src);
-    pipeline.add_probe(pad, ProbeType::BUFFER, move |data| {
+    let _ = pipeline.add_probe(pad, ProbeType::BUFFER, move |data| {
         if let ProbeData::Buffer(_) = data {
             count_clone.fetch_add(1, Ordering::Relaxed);
         }
@@ -45,7 +45,7 @@ async fn test_buffer_probe_drop() {
 
     // Drop every other buffer
     let pad = PadRef::src(src);
-    pipeline.add_probe(pad, ProbeType::BUFFER, move |_| {
+    let _ = pipeline.add_probe(pad, ProbeType::BUFFER, move |_| {
         let n = count_clone.fetch_add(1, Ordering::Relaxed);
         if n % 2 == 0 {
             ProbeReturn::Drop
@@ -73,7 +73,7 @@ async fn test_buffer_probe_one_shot() {
     let count_clone = count.clone();
 
     let pad = PadRef::src(src);
-    pipeline.add_probe(pad, ProbeType::BUFFER, move |_| {
+    let _ = pipeline.add_probe(pad, ProbeType::BUFFER, move |_| {
         count_clone.fetch_add(1, Ordering::Relaxed);
         ProbeReturn::Remove // Remove after first invocation
     });
@@ -97,7 +97,7 @@ async fn test_buffer_probe_byte_counter() {
     let total_clone = total_bytes.clone();
 
     let pad = PadRef::src(src);
-    pipeline.add_probe(pad, ProbeType::BUFFER, move |data| {
+    let _ = pipeline.add_probe(pad, ProbeType::BUFFER, move |data| {
         if let ProbeData::Buffer(buf) = data {
             total_clone.fetch_add(buf.len() as u64, Ordering::Relaxed);
         }
@@ -140,11 +140,11 @@ async fn test_multiple_probes_same_pad() {
     let cb = count_b.clone();
 
     let pad = PadRef::src(src);
-    pipeline.add_probe(pad, ProbeType::BUFFER, move |_| {
+    let _ = pipeline.add_probe(pad, ProbeType::BUFFER, move |_| {
         ca.fetch_add(1, Ordering::Relaxed);
         ProbeReturn::Ok
     });
-    pipeline.add_probe(pad, ProbeType::BUFFER, move |_| {
+    let _ = pipeline.add_probe(pad, ProbeType::BUFFER, move |_| {
         cb.fetch_add(1, Ordering::Relaxed);
         ProbeReturn::Ok
     });

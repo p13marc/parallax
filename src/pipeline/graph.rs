@@ -1391,6 +1391,7 @@ impl Pipeline {
     ///     ProbeReturn::Ok
     /// });
     /// ```
+    #[must_use]
     pub fn add_probe<F>(
         &self,
         pad: PadRef,
