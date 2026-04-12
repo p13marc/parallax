@@ -709,7 +709,7 @@ parallax/
 │   ├── 43_alsa_audio.rs          # ALSA audio (--features alsa)
 │   ├── 44_libcamera_capture.rs   # libcamera capture (--features libcamera)
 │   │   # Infrastructure examples (no features required)
-│   ├── 51_bus_messages.rs        # Pipeline bus message polling
+│   ├── 51_bus_messages.rs        # Pipeline bus: polling, Stream, select!
 │   ├── 52_seeking.rs             # File seeking and position queries
 │   ├── 53_pad_probes.rs          # Buffer interception with pad probes
 │   ├── 54_tracers.rs             # Latency/framerate tracer framework
@@ -1088,6 +1088,25 @@ if let Some(msg) = pipeline.take_bus().unwrap().poll() {
 // Or wait asynchronously:
 let mut bus = pipeline.take_bus().unwrap();
 bus.wait_for_eos_or_error().await?;
+```
+
+**Async Stream support:** `Bus::into_stream()` returns a `BusStream` implementing `futures::Stream`, enabling `select!` and stream combinators:
+
+```rust
+use futures::StreamExt;
+
+// As a Stream (for select!, combinators)
+let mut stream = bus.into_stream();
+tokio::select! {
+    msg = stream.next() => { /* handle message */ }
+    _ = tokio::signal::ctrl_c() => { /* shutdown */ }
+}
+
+// Message-driven run loop (convenience)
+pipeline.run_with_bus(|msg| {
+    println!("[{}] {}", msg.source, msg.kind);
+    true // continue
+}).await?;
 ```
 
 **Context integration:** `ProduceContext` and `ConsumeContext` carry an optional `BusHandle` with `post_message()` convenience method. Elements receive their handle via `set_bus()` during pipeline startup.
