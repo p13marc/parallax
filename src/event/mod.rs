@@ -296,6 +296,77 @@ impl Default for SegmentEvent {
     }
 }
 
+impl SegmentEvent {
+    /// Convert a buffer PTS to running time using this segment.
+    ///
+    /// Running time is the monotonic time since pipeline start, used for
+    /// synchronization. After a seek, running time continues from where it
+    /// left off (accumulated in `base`).
+    ///
+    /// Formula: `running_time = (pts - start) / |rate| + base`
+    pub fn to_running_time(&self, pts: ClockTime) -> ClockTime {
+        if pts == ClockTime::NONE || self.format != SegmentFormat::Time {
+            return ClockTime::NONE;
+        }
+        let pts_ns = pts.nanos() as i64;
+        if pts_ns < self.start {
+            return ClockTime::NONE;
+        }
+        let elapsed = (pts_ns - self.start) as f64;
+        let scaled = (elapsed / self.rate.abs()) as i64;
+        let result = scaled + self.base;
+        if result < 0 {
+            ClockTime::NONE
+        } else {
+            ClockTime::from_nanos(result as u64)
+        }
+    }
+
+    /// Convert a buffer PTS to stream time using this segment.
+    ///
+    /// Stream time represents the position in the media content.
+    ///
+    /// Formula: `stream_time = (pts - start) * applied_rate + position`
+    pub fn to_stream_time(&self, pts: ClockTime) -> ClockTime {
+        if pts == ClockTime::NONE || self.format != SegmentFormat::Time {
+            return ClockTime::NONE;
+        }
+        let pts_ns = pts.nanos() as i64;
+        if pts_ns < self.start {
+            return ClockTime::NONE;
+        }
+        let elapsed = (pts_ns - self.start) as f64;
+        let scaled = (elapsed * self.applied_rate) as i64;
+        let result = scaled + self.position;
+        if result < 0 {
+            ClockTime::NONE
+        } else {
+            ClockTime::from_nanos(result as u64)
+        }
+    }
+
+    /// Convert running time back to buffer PTS using this segment.
+    ///
+    /// Inverse of [`to_running_time`](Self::to_running_time).
+    pub fn running_time_to_pts(&self, running_time: ClockTime) -> ClockTime {
+        if running_time == ClockTime::NONE || self.format != SegmentFormat::Time {
+            return ClockTime::NONE;
+        }
+        let rt = running_time.nanos() as i64;
+        if rt < self.base {
+            return ClockTime::NONE;
+        }
+        let elapsed = (rt - self.base) as f64;
+        let scaled = (elapsed * self.rate.abs()) as i64;
+        let result = scaled + self.start;
+        if result < 0 {
+            ClockTime::NONE
+        } else {
+            ClockTime::from_nanos(result as u64)
+        }
+    }
+}
+
 /// Format of segment positions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum SegmentFormat {

@@ -2,9 +2,11 @@
 
 use crate::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
 use crate::error::{Error, Result};
+use crate::event::{Event, EventResult, SeekEvent, SeekType, SegmentFormat};
 use crate::memory::SharedArena;
+use crate::pipeline::seek::{DurationQuery, PositionQuery};
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 /// A source element that reads from a file.
@@ -42,6 +44,8 @@ pub struct FileSrc {
     sequence: u64,
     bytes_read: u64,
     arena: Option<SharedArena>,
+    /// Cached file size (set on first open).
+    file_size: Option<u64>,
 }
 
 impl FileSrc {
@@ -62,6 +66,7 @@ impl FileSrc {
             sequence: 0,
             bytes_read: 0,
             arena: None,
+            file_size: None,
         }
     }
 
@@ -71,6 +76,7 @@ impl FileSrc {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = File::open(&path)?;
+        let file_size = file.metadata().ok().map(|m| m.len());
         let name = format!("filesrc:{}", path.display());
         Ok(Self {
             name,
@@ -80,6 +86,7 @@ impl FileSrc {
             sequence: 0,
             bytes_read: 0,
             arena: None,
+            file_size,
         })
     }
 
@@ -102,7 +109,9 @@ impl FileSrc {
     /// Ensure the file is open.
     fn ensure_open(&mut self) -> Result<&mut File> {
         if self.file.is_none() {
-            self.file = Some(File::open(&self.path)?);
+            let file = File::open(&self.path)?;
+            self.file_size = file.metadata().ok().map(|m| m.len());
+            self.file = Some(file);
         }
         Ok(self.file.as_mut().unwrap())
     }
@@ -170,6 +179,65 @@ impl Source for FileSrc {
 
     fn preferred_buffer_size(&self) -> Option<usize> {
         Some(self.chunk_size)
+    }
+
+    fn is_seekable(&self) -> bool {
+        true
+    }
+
+    fn handle_upstream_event(&mut self, event: &Event) -> EventResult {
+        match event {
+            Event::Seek(seek) => self.handle_seek(seek),
+            _ => EventResult::NotHandled,
+        }
+    }
+
+    fn query_position(&self) -> Option<PositionQuery> {
+        Some(PositionQuery {
+            format: SegmentFormat::Bytes,
+            position: Some(self.bytes_read),
+        })
+    }
+
+    fn query_duration(&self) -> Option<DurationQuery> {
+        Some(DurationQuery {
+            format: SegmentFormat::Bytes,
+            duration: self.file_size,
+        })
+    }
+}
+
+impl FileSrc {
+    /// Handle a seek event by repositioning the file.
+    fn handle_seek(&mut self, seek: &SeekEvent) -> EventResult {
+        if seek.format != SegmentFormat::Bytes {
+            return EventResult::NotHandled;
+        }
+
+        let file = match &mut self.file {
+            Some(f) => f,
+            None => return EventResult::Error,
+        };
+
+        let seek_pos = match seek.start.seek_type {
+            SeekType::Set => {
+                if seek.start.position < 0 {
+                    return EventResult::Error;
+                }
+                std::io::SeekFrom::Start(seek.start.position as u64)
+            }
+            SeekType::Current => std::io::SeekFrom::Current(seek.start.position),
+            SeekType::End => std::io::SeekFrom::End(seek.start.position),
+            SeekType::None => return EventResult::Handled, // No position change
+        };
+
+        match file.seek(seek_pos) {
+            Ok(new_pos) => {
+                self.bytes_read = new_pos;
+                EventResult::Handled
+            }
+            Err(_) => EventResult::Error,
+        }
     }
 }
 

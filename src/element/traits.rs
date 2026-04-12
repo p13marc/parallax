@@ -571,6 +571,28 @@ pub trait Source: Send {
         EventResult::NotHandled
     }
 
+    /// Whether this source supports seeking.
+    ///
+    /// Override this to return `true` if the source can handle seek events.
+    fn is_seekable(&self) -> bool {
+        false
+    }
+
+    /// Query the current position.
+    ///
+    /// Returns the current read position in the source's native format
+    /// (typically bytes for file sources, time for demuxers).
+    fn query_position(&self) -> Option<crate::pipeline::seek::PositionQuery> {
+        None
+    }
+
+    /// Query the total duration.
+    ///
+    /// Returns the total duration/size of the source if known.
+    fn query_duration(&self) -> Option<crate::pipeline::seek::DurationQuery> {
+        None
+    }
+
     /// Handle a flow control signal from downstream.
     ///
     /// This is called when downstream elements signal backpressure
@@ -694,6 +716,21 @@ pub trait AsyncSource: Send {
     /// Default implementation does not handle any events.
     fn handle_upstream_event(&mut self, _event: &Event) -> EventResult {
         EventResult::NotHandled
+    }
+
+    /// Whether this async source supports seeking.
+    fn is_seekable(&self) -> bool {
+        false
+    }
+
+    /// Query the current position.
+    fn query_position(&self) -> Option<crate::pipeline::seek::PositionQuery> {
+        None
+    }
+
+    /// Query the total duration.
+    fn query_duration(&self) -> Option<crate::pipeline::seek::DurationQuery> {
+        None
     }
 
     /// Handle a flow control signal from downstream.
@@ -1527,6 +1564,21 @@ pub trait AsyncElementDyn {
         EventResult::NotHandled
     }
 
+    /// Whether this element's underlying source supports seeking.
+    fn is_seekable(&self) -> bool {
+        false
+    }
+
+    /// Query the current position from the underlying source.
+    fn source_query_position(&self) -> Option<crate::pipeline::seek::PositionQuery> {
+        None
+    }
+
+    /// Query the total duration from the underlying source.
+    fn source_query_duration(&self) -> Option<crate::pipeline::seek::DurationQuery> {
+        None
+    }
+
     /// Process a source element, properly distinguishing WouldBlock from Eos.
     ///
     /// This method is used by the executor for source elements to handle
@@ -2046,6 +2098,22 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
 
     fn set_bus(&mut self, bus: crate::pipeline::bus::BusHandle) {
         self.bus = Some(bus);
+    }
+
+    fn handle_upstream_event(&mut self, event: &Event) -> EventResult {
+        self.inner.handle_upstream_event(event)
+    }
+
+    fn is_seekable(&self) -> bool {
+        self.inner.is_seekable()
+    }
+
+    fn source_query_position(&self) -> Option<crate::pipeline::seek::PositionQuery> {
+        self.inner.query_position()
+    }
+
+    fn source_query_duration(&self) -> Option<crate::pipeline::seek::DurationQuery> {
+        self.inner.query_duration()
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -2589,6 +2657,22 @@ impl<S: AsyncSource + Send + 'static> SendAsyncElementDyn for AsyncSourceAdapter
 
     fn set_bus(&mut self, bus: crate::pipeline::bus::BusHandle) {
         self.bus = Some(bus);
+    }
+
+    fn handle_upstream_event(&mut self, event: &Event) -> EventResult {
+        self.inner.handle_upstream_event(event)
+    }
+
+    fn is_seekable(&self) -> bool {
+        self.inner.is_seekable()
+    }
+
+    fn source_query_position(&self) -> Option<crate::pipeline::seek::PositionQuery> {
+        self.inner.query_position()
+    }
+
+    fn source_query_duration(&self) -> Option<crate::pipeline::seek::DurationQuery> {
+        self.inner.query_duration()
     }
 
     fn as_any(&self) -> &dyn Any {

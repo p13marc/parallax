@@ -54,6 +54,7 @@ mod graph;
 pub mod parser;
 pub mod rt_bridge;
 pub mod rt_scheduler;
+pub mod seek;
 pub mod tags;
 mod unified_executor;
 
@@ -62,6 +63,7 @@ pub use driver::{
 };
 pub use bus::{BufferingMode, Bus, BusHandle, Message, MessageKind, MessageValue, StreamInfo};
 pub use events::{EventReceiver, EventSender, EventStream, PipelineEvent};
+pub use seek::{DurationQuery, PositionQuery, SeekRequest, SeekableQuery, SeekableSource};
 pub use tags::{TagList, TagMergeMode, TagValue};
 pub use factory::ElementFactory;
 pub use graph::{

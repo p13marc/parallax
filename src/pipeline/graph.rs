@@ -1357,6 +1357,109 @@ impl Pipeline {
             .collect()
     }
 
+    // ========================================================================
+    // Seeking and Queries
+    // ========================================================================
+
+    /// Query whether any source in the pipeline supports seeking.
+    pub fn query_seekable(&self) -> crate::pipeline::seek::SeekableQuery {
+        for src_id in self.sources() {
+            if let Some(node) = self.get_node(src_id) {
+                if let Some(ref element) = node.element {
+                    if element.is_seekable() {
+                        let duration = element
+                            .source_query_duration()
+                            .and_then(|d| d.duration)
+                            .unwrap_or(0);
+                        return crate::pipeline::seek::SeekableQuery {
+                            seekable: true,
+                            start: 0,
+                            stop: duration,
+                        };
+                    }
+                }
+            }
+        }
+        crate::pipeline::seek::SeekableQuery::not_seekable()
+    }
+
+    /// Query the current position from source elements.
+    ///
+    /// Returns the position from the first source that reports one.
+    /// Only works when the pipeline is not running (elements not yet taken).
+    pub fn query_position(&self) -> Option<crate::pipeline::seek::PositionQuery> {
+        for src_id in self.sources() {
+            if let Some(node) = self.get_node(src_id) {
+                if let Some(ref element) = node.element {
+                    if let Some(pos) = element.source_query_position() {
+                        return Some(pos);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Query the total duration from source elements.
+    ///
+    /// Returns the duration from the first source that reports one.
+    /// Only works when the pipeline is not running (elements not yet taken).
+    pub fn query_duration(&self) -> Option<crate::pipeline::seek::DurationQuery> {
+        for src_id in self.sources() {
+            if let Some(node) = self.get_node(src_id) {
+                if let Some(ref element) = node.element {
+                    if let Some(dur) = element.source_query_duration() {
+                        return Some(dur);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Send an upstream event to all source elements.
+    ///
+    /// Returns `true` if any source handled the event.
+    /// Only works when the pipeline is not running (elements not yet taken).
+    pub fn send_event_upstream(&mut self, event: &crate::event::Event) -> bool {
+        let source_ids = self.sources();
+        let mut handled = false;
+        for src_id in source_ids {
+            if let Some(node) = self.get_node_mut(src_id) {
+                if let Some(ref mut element) = node.element {
+                    if element
+                        .handle_upstream_event(event)
+                        .is_handled()
+                    {
+                        handled = true;
+                    }
+                }
+            }
+        }
+        handled
+    }
+
+    /// Perform a seek operation on a stopped pipeline.
+    ///
+    /// Sends the seek event upstream to source elements. For seeking on
+    /// a running pipeline, use [`PipelineHandle`](super::UnifiedPipelineHandle).
+    pub fn seek(&mut self, event: &crate::event::SeekEvent) -> Result<bool> {
+        let seek_event = crate::event::Event::Seek(event.clone());
+        Ok(self.send_event_upstream(&seek_event))
+    }
+
+    /// Simple seek to a byte position.
+    pub fn seek_bytes(&mut self, position: u64) -> Result<bool> {
+        let event = crate::event::SeekEvent::new_bytes(position);
+        self.seek(&event)
+    }
+
+    /// Simple seek to a time position.
+    pub fn seek_time(&mut self, position: crate::clock::ClockTime) -> Result<bool> {
+        let event = crate::event::SeekEvent::new_time(position);
+        self.seek(&event)
+    }
+
     /// Get the children (downstream nodes) of a node.
     pub fn children(&self, id: NodeId) -> Vec<(NodeId, &Link)> {
         self.graph
