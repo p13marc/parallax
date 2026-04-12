@@ -584,7 +584,7 @@ impl Executor {
         }
 
         // Spawn async tasks for the async portion of the graph
-        let mut tasks = self.spawn_tasks_for_partition(
+        let tasks = self.spawn_tasks_for_partition(
             pipeline, partition, channels, scheduler, clock_info, events,
         )?;
 

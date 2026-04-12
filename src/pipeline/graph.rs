@@ -549,7 +549,7 @@ impl Pipeline {
 
         for (_id, node) in self.nodes() {
             if let Some((clock, priority)) = &node.provided_clock {
-                if best.as_ref().map_or(true, |(_, p)| *priority > *p) {
+                if best.as_ref().is_none_or(|(_, p)| *priority > *p) {
                     best = Some((clock.clone(), *priority));
                 }
             }

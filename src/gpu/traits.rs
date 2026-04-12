@@ -25,8 +25,10 @@ pub struct GpuBuffer {
 
 /// Backend-specific buffer handle.
 #[derive(Debug)]
+#[derive(Default)]
 pub(crate) enum GpuBufferHandle {
     /// Placeholder for when no backend is available.
+    #[default]
     None,
     /// Vulkan memory handle.
     #[cfg(feature = "vulkan-video")]
@@ -36,11 +38,6 @@ pub(crate) enum GpuBufferHandle {
     },
 }
 
-impl Default for GpuBufferHandle {
-    fn default() -> Self {
-        Self::None
-    }
-}
 
 /// GPU video frame.
 ///

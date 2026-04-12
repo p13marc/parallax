@@ -830,7 +830,7 @@ impl MemoryLayout {
             raw_stride
         } else {
             let align = self.stride_alignment;
-            (raw_stride + align - 1) / align * align
+            raw_stride.div_ceil(align) * align
         }
     }
 

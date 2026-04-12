@@ -126,11 +126,13 @@ impl From<FlowSignal> for u8 {
 ///
 /// Determines how a source responds to backpressure signals.
 #[derive(Debug, Clone, PartialEq)]
+#[derive(Default)]
 pub enum FlowPolicy {
     /// Block production when downstream is busy.
     ///
     /// This is the safest policy - no data is lost, but the source
     /// may fall behind real-time. Best for file sources.
+    #[default]
     Block,
 
     /// Drop frames when downstream is busy.
@@ -165,11 +167,6 @@ pub enum FlowPolicy {
     },
 }
 
-impl Default for FlowPolicy {
-    fn default() -> Self {
-        FlowPolicy::Block
-    }
-}
 
 impl FlowPolicy {
     /// Create a drop policy with default settings.

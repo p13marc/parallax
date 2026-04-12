@@ -215,7 +215,7 @@ impl Queue {
     /// Returns `Ready` if flow control is disabled.
     #[inline]
     pub fn flow_signal(&self) -> FlowSignal {
-        FlowSignal::from(self.inner.flow_signal.load(Ordering::Acquire) as u8)
+        FlowSignal::from(self.inner.flow_signal.load(Ordering::Acquire))
     }
 
     /// Check if the queue is signaling backpressure.
@@ -262,7 +262,7 @@ impl Queue {
         };
 
         let current = self.inner.flow_signal.load(Ordering::Acquire);
-        let current_signal = FlowSignal::from(current as u8);
+        let current_signal = FlowSignal::from(current);
 
         let new_signal = if wm.is_high(level) && current_signal == FlowSignal::Ready {
             // Transition to Busy
@@ -455,7 +455,7 @@ impl Clone for Queue {
             name: self.name.clone(),
             inner: Arc::clone(&self.inner),
             leaky: self.leaky,
-            water_marks: self.water_marks.clone(),
+            water_marks: self.water_marks,
         }
     }
 }
