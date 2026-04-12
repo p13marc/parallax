@@ -598,7 +598,8 @@ parallax/
 │   │   ├── bus.rs          # Pipeline message bus (Bus, BusHandle, Message)
 │   │   ├── tags.rs         # TagList, TagValue for stream metadata
 │   │   ├── seek.rs         # Seeking, position queries, SeekableSource
-│   │   └── probe.rs        # Pad probes (ProbeRegistry, ProbeType, PadRef)
+│   │   ├── probe.rs        # Pad probes (ProbeRegistry, ProbeType, PadRef)
+│   │   └── tracer.rs       # Tracer framework (LatencyTracer, FramerateTracer, DropTracer)
 │   │
 │   ├── elements/           # Built-in elements (organized by category)
 │   │   ├── network/        # TCP, UDP, Unix, multicast, HTTP, WebSocket, Zenoh
@@ -1107,6 +1108,43 @@ pipeline.remove_probe(probe_id);
 
 **Executor integration:** The executor invokes buffer probes before forwarding data downstream. Drop/Handled returns prevent the buffer from reaching downstream elements.
 
+### Tracer Framework
+
+Parallax provides a pluggable tracer framework for pipeline debugging and performance analysis, inspired by GStreamer's tracer subsystem.
+
+**Key types:**
+- `Tracer` trait — hook points for observing pipeline behavior
+- `TracerRegistry` — thread-safe registry shared with executor
+- `LatencyTracer` — per-element processing time (min/avg/max)
+- `FramerateTracer` — actual buffers/sec at each element
+- `DropTracer` — counts dropped buffers per element
+
+```bash
+# Activate tracers via environment variable
+PARALLAX_TRACERS="latency;framerate;drops" ./my_pipeline
+
+# Auto-dump DOT graphs on state transitions
+PARALLAX_DOT_DIR=/tmp/dots ./my_pipeline
+```
+
+```rust
+use parallax::pipeline::tracer::{TracerRegistry, LatencyTracer};
+
+// Programmatic activation
+let registry = TracerRegistry::new();
+registry.add(Box::new(LatencyTracer::new()));
+pipeline.set_tracer_registry(registry.clone());
+
+// After pipeline run, collect reports
+for (name, report) in registry.reports() {
+    println!("{name}:\n{report}");
+}
+
+// Pipeline stats snapshot
+let stats = pipeline.stats_snapshot();
+println!("{} elements, {} links", stats.element_count, stats.link_count);
+```
+
 ## Implementation Roadmap
 
 See `docs/design.md` for full details.
@@ -1126,6 +1164,7 @@ See `docs/design.md` for full details.
 | 18 | Pipeline Bus & Messaging | Complete |
 | 19 | Seeking, Position Queries & Trick Modes | Complete |
 | 20 | Pad Probes & Dynamic Reconfiguration | Complete |
+| 21 | Debugging & Inspection Tools (Tracers) | Complete |
 
 ## Code Style Guidelines
 

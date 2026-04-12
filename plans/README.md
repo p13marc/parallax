@@ -14,7 +14,7 @@ These are media-independent features that make the pipeline engine complete.
 
 | # | Plan | Priority | Effort | Progress |
 |---|------|----------|--------|----------|
-| 21 | [Debugging & Inspection Tools](21_DEBUGGING_INSPECTION_TOOLS.md) | High | Medium | ⬜ Not Started |
+| 21 | [Debugging & Inspection Tools](21_DEBUGGING_INSPECTION_TOOLS.md) | High | Medium | ✅ Complete |
 | 22 | [Auto-Plugging & Typefinding](22_AUTO_PLUGGING_TYPEFINDING.md) | High | Large | ⬜ Not Started |
 | 23 | [Network Buffering Strategies](23_NETWORK_BUFFERING_STRATEGIES.md) | High | Medium | ⬜ Not Started |
 
@@ -121,6 +121,7 @@ Plans 00-10, 12-15, 17-20, Clock Provider, and Pipeline Robustness have been com
 - **Plan 18**: Pipeline Bus & Messaging — thread-safe message bus (Bus, BusHandle), typed messages (MessageKind), TagList, sync polling and async stream consumption
 - **Plan 19**: Seeking & Position Queries — segment timestamp mapping, SeekableSource trait, FileSrc byte-seeking, Pipeline query API (position, duration, seekable)
 - **Plan 20**: Pad Probes — buffer/event interception (ProbeType, ProbeReturn, ProbeData), ProbeRegistry, executor integration with Drop/Remove semantics
+- **Plan 21**: Debugging & Inspection Tools — Tracer framework (LatencyTracer, FramerateTracer, DropTracer), TracerRegistry, PARALLAX_TRACERS env var, Pipeline stats snapshot, PARALLAX_DOT_DIR auto-dump
 - **Clock Provider**: Hardware timestamp extraction (PipeWire, V4L2, ALSA), Clock/ClockProvider traits, PipelineClock, TimestampDebug element
 - **Auto Clock Selection**: `as_clock_provider()` on element traits, `Pipeline::select_clock()`, AlsaSink auto-provides clock
 - **Pipeline Robustness**: Arena reclaim hygiene, backpressure system (FlowSignal, FlowPolicy, Queue water marks), video scaler
