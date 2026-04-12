@@ -192,6 +192,7 @@ pub fn vulkan_video_available() -> bool {
 }
 
 #[cfg(not(feature = "vulkan-video"))]
+/// Check whether Vulkan Video hardware acceleration is available on this system.
 pub fn vulkan_video_available() -> bool {
     false
 }

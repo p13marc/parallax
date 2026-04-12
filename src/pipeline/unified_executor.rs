@@ -1035,6 +1035,7 @@ fn spawn_source_task(
             tracing::trace!("source '{}': calling process_source", name);
             match element.process_source().await {
                 Ok(SourceResult::Buffer(buffer)) => {
+                    let buffer = *buffer;
                     count += 1;
                     would_block_count = 0; // Reset
                     tracing::debug!(

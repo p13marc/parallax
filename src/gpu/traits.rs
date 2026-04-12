@@ -14,6 +14,7 @@ use super::{Codec, GpuUsage, VideoProfile};
 /// This is an opaque handle to GPU memory. The actual implementation
 /// depends on the backend (Vulkan, VA-API, etc.).
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct GpuBuffer {
     /// Backend-specific handle.
     pub(crate) handle: GpuBufferHandle,

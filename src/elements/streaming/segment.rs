@@ -315,6 +315,7 @@ impl SegmentBoundaryDetector {
 /// Delete old segments beyond a retention count.
 ///
 /// Used for live streams to limit disk usage.
+#[allow(dead_code)]
 pub fn cleanup_old_segments(
     output_dir: &Path,
     prefix: &str,
