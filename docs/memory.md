@@ -1,342 +1,169 @@
 # Memory Model
 
-Parallax's memory model is designed for zero-copy data passing, both within a process and across process boundaries.
+Parallax's memory model is designed for zero-copy data passing, both within a process and across process boundaries. The central idea: **all CPU buffers are memfd-backed from the start**, so sharing with another process never requires a copy or a conversion step — only passing a file descriptor.
 
-## Core Concepts
+## Why memfd-first
 
-### Memory Segments
+A conventional design allocates on the heap and copies into shared memory when IPC is needed. Parallax inverts this: `memfd_create` + `MAP_SHARED` memory costs the same as heap memory (it's the same anonymous pages), but it can always be mapped by another process. One fd is created per *arena* (pool), not per buffer, so fd limits are never a concern.
 
-A memory segment is a contiguous region of memory:
+## SharedArena
 
-```rust
-pub trait MemorySegment: Send + Sync {
-    /// Get a raw pointer to the start of the segment
-    unsafe fn as_ptr(&self) -> *const u8;
-    
-    /// Get a mutable pointer (if supported)
-    unsafe fn as_mut_ptr(&self) -> Option<*mut u8>;
-    
-    /// Get the total size of the segment
-    fn len(&self) -> usize;
-    
-    /// Get the memory type for capability checking
-    fn memory_type(&self) -> MemoryType;
-    
-    /// Get an IPC handle for cross-process sharing
-    fn ipc_handle(&self) -> Option<IpcHandle>;
-}
-```
-
-### Memory Types
+`SharedArena` is the primary allocator: a fixed number of fixed-size slots in one memfd.
 
 ```rust
-pub enum MemoryType {
-    Heap,           // Regular heap allocation
-    SharedMemory,   // POSIX shared memory
-    HugePages,      // 2MB or 1GB pages
-    MappedFile,     // Memory-mapped file
-}
+use parallax::memory::SharedArena;
+
+let arena = SharedArena::new(4096, 64)?;        // 64 slots × 4 KiB
+let mut slot = arena.acquire().expect("free");  // owner-only; returns Option<SharedSlotRef>
+slot.data_mut()[..5].copy_from_slice(b"hello");
 ```
 
-## Memory Backends
+Constructors: `new(slot_size, slot_count)`, `with_name(...)` (debugging), `new_avx`/`new_avx512` (32/64-byte aligned slot data for SIMD), `with_alignment(...)`.
 
-### HeapSegment (Default)
+### Layout
 
-Simple heap-allocated memory for single-process use:
+Everything — including the bookkeeping — lives inside the shared mapping:
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│ ArenaHeader (64 B, cache-line aligned)                       │
+│   magic "PLX_AREN", version, slot_count, slot_size,          │
+│   data_offset, arena_id, arena refcount                      │
+├──────────────────────────────────────────────────────────────┤
+│ ReleaseQueue — lock-free MPSC ring (1024 entries)            │
+│   head: AtomicU32   ← owner pops (single consumer)           │
+│   tail: AtomicU32   ← any process pushes (multi producer)    │
+│   slots: [AtomicU32; 1024]                                   │
+├──────────────────────────────────────────────────────────────┤
+│ SlotHeader[0..N] — 8 B each                                  │
+│   refcount: AtomicU32   ← shared across processes            │
+│   state:    AtomicU32   (Free | Allocated)                   │
+├──────────────────────────────────────────────────────────────┤
+│ SlotData[0..N] — user data, aligned to the arena alignment   │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Cross-process reference counting
+
+`Arc<T>` cannot work across processes: its refcount lives on one process's heap. Parallax's refcounts are atomics **in the shared mapping**, so the same increment/decrement works from every process that maps the arena:
+
+- **Clone** (`SharedSlotRef::clone`, `slice()`, `slot_from_ipc`) → `fetch_add` on the slot refcount.
+- **Drop** → `fetch_sub`; the process that drops the last reference pushes the slot index onto the `ReleaseQueue` (lock-free, O(1)).
+- **Reclaim** — the owner calls `arena.reclaim()` (done automatically by pools before acquiring) and pops released indices, marking slots free: O(k) in released slots, never O(n) in pool size.
+
+Refcount overflow is guarded (panics past `i32::MAX`); reconstruction from IPC validates arena id, slot bounds, and `Allocated` state, so a peer cannot resurrect a freed slot.
+
+### Sending buffers to another process
 
 ```rust
-use parallax::memory::HeapSegment;
+use parallax::memory::{SharedArena, SharedArenaCache};
+use parallax::memory::ipc::{send_segment_handle, recv_segment_handle};
 
-let segment = HeapSegment::new(4096)?;  // 4KB segment
+// ── Process A (owner) ─────────────────────────────────────────
+let arena = SharedArena::new(4096, 16)?;
+send_segment_handle(&socket, arena.fd(), arena.total_size() as u64)?; // fd, once
+
+let mut slot = arena.acquire().expect("free slot");
+slot.data_mut()[..5].copy_from_slice(b"hello");
+let ipc_ref = slot.ipc_ref();   // SharedIpcSlotRef: arena_id + slot index + offset + len
+// serialize ipc_ref (rkyv) over the socket — a few bytes per buffer
+
+// ── Process B (client) ────────────────────────────────────────
+let (fd, _size) = recv_segment_handle(&socket)?;
+let mut cache = SharedArenaCache::new();
+unsafe { cache.map_arena(fd)? };                 // mmap once, cached by arena_id
+
+let slot = cache.get_slot(&ipc_ref).expect("live slot");
+assert_eq!(&slot.data()[..5], b"hello");
+// slot shares the refcount with process A — drop from either side is correct
 ```
 
-**Properties:**
-- Fast allocation
-- No IPC support
-- Suitable for most single-process pipelines
+The `IpcSrc`/`IpcSink` elements (and `link::IpcPublisher`/`IpcSubscriber`) implement this protocol for you, including EOS and error signaling.
 
-### SharedMemorySegment
+`memory::ipc` primitives: `send_fds`/`recv_fds` (up to 4 fds per message via `SCM_RIGHTS`), `send_segment_handle`/`recv_segment_handle` (fd + size pair).
 
-POSIX shared memory using `memfd_create`:
+> **Caveat:** `SharedArena::from_fd` currently reconstructs slot positions assuming the default 64-byte stride. Arenas created with `new_avx` (32-byte alignment) should not be shared cross-process until this is fixed.
+
+## Buffers and metadata
+
+### `Buffer<T = ()>`
+
+A `Buffer` is a `MemoryHandle` (slot reference + offset + length) plus `Metadata`:
+
+- `Clone` is an atomic refcount increment — O(1), no data copy.
+- `slice(offset, len)` produces a zero-copy sub-buffer (shares the slot).
+- `as_bytes()` / `as_bytes_mut()` access the data directly in the mapped arena.
+- `Buffer<()>` is the dynamic form used by pipelines; `Buffer<T>` adds a compile-time type tag (`into_dynamic()` erases it).
+
+### `Metadata`
+
+Carried by every buffer:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `pts`, `dts`, `duration` | `ClockTime` | presentation/decode timestamps (`ClockTime::NONE` = unset) |
+| `sequence` | `u64` | monotonic sequence number |
+| `stream_id` | `u32` | for demuxed/multi-stream flows |
+| `flags` | `BufferFlags` | `SYNC_POINT` (keyframe), `EOS`, `DISCONT`, `DELTA`, `HEADER`, `CORRUPTED`, `DECODE_ONLY`, `TIMEOUT` |
+| `rtp` | `Option<RtpMeta>` | RTP seq/ts/ssrc/pt/marker |
+| `format` | `Option<MediaFormat>` | negotiated format snapshot |
+| `offset` | `Option<u64>` | byte offset (e.g. file position) |
+
+Plus a **typed custom map** for domain metadata — any `Clone + Send + Sync + Debug + 'static` value under a `&'static str` key (`"domain/type"` convention):
 
 ```rust
-use parallax::memory::SharedMemorySegment;
+let mut meta = Metadata::new();
+meta.set("app/frame_id", 12345u64);
+meta.set("sensor/gps", GpsPosition { lat: 37.0, lon: -122.0 });
+assert_eq!(meta.get::<u64>("app/frame_id"), Some(&12345));
 
-// Create a new segment
-let segment = SharedMemorySegment::new("my-segment", 1024 * 1024)?;
-
-// Open an existing segment from a file descriptor
-let segment = SharedMemorySegment::from_raw_fd(fd, size)?;
+meta.set_bytes("h264/sei", vec![0x06, 0x05, 0x10]);   // raw-bytes helpers
+meta.set_klv(klv_bytes);                              // STANAG/MISB ("stanag/klv")
 ```
 
-**Properties:**
-- Supports IPC via file descriptor passing
-- Anonymous (no filesystem footprint)
-- Automatically cleaned up when all references closed
+Namespaces in use: `stanag/*`, `h264/*`/`h265/*`/`av1/*`, `caption/*`, `audio/*`, `sensor/*`, `app/*`.
 
-### HugePageSegment
+**Transforms must clone/propagate metadata** when they construct new buffers, or PTS and custom data are silently lost.
 
-Large pages for reduced TLB pressure:
+## Buffer pools
+
+`FixedBufferPool` layers pipeline-friendly behavior over an arena:
 
 ```rust
-use parallax::memory::{HugePageSegment, HugePageSize};
+use parallax::memory::{BufferPool, FixedBufferPool};
 
-// Request 2MB huge pages
-let segment = HugePageSegment::new(HugePageSize::MB2, 64 * 1024 * 1024)?;
+let pool = FixedBufferPool::new(1024 * 1024, 10)?;  // 10 × 1 MiB → Arc<FixedBufferPool>
 
-// Or 1GB huge pages
-let segment = HugePageSegment::new(HugePageSize::GB1, 1024 * 1024 * 1024)?;
-
-// Graceful fallback if huge pages unavailable
-let segment = HugePageSegment::new_or_fallback(HugePageSize::MB2, size)?;
+let pooled = pool.acquire()?;        // blocks when exhausted = natural backpressure
+let pooled = pool.try_acquire();     // non-blocking
+let stats  = pool.stats();           // acquisitions, waits, availability
 ```
 
-**Properties:**
-- Requires huge pages configured on the system
-- Reduces TLB misses for large working sets
-- Best for high-throughput pipelines
+- `PooledBuffer` returns its slot on drop, or `into_buffer()` detaches it into a free-standing `Buffer`.
+- Attach to sources with `pipeline.add_source_with_pool(...)` or let the pipeline size a pool from negotiated caps: `pipeline.create_pool_from_caps(count)`.
+- Inside `Source::produce`, `ctx.acquire_buffer()` uses the attached pool.
 
-### MappedFileSegment
+Sensible slot sizes/counts for common media (1080p YUV, encoded video, audio periods, TS/MP4 mux buffers, …) are provided as constants in `parallax::memory::defaults`.
 
-Memory-mapped files for persistent storage:
+## Other segment types
 
-```rust
-use parallax::memory::MappedFileSegment;
+All implement the `MemorySegment` trait (`as_ptr`, `len`, `memory_type`, `ipc_handle`, …):
 
-// Create a new mapped file
-let segment = MappedFileSegment::create("/path/to/file", 1024 * 1024)?;
+| Type | Backing | IPC | Notes |
+|------|---------|-----|-------|
+| `DmaBufSegment` | DMA-BUF fd (V4L2 `VIDIOC_EXPBUF`, DRM, GPU export) | fd | `DmaBufBuffer` wraps it with metadata; `into_fd()` recovers the fd; `to_buffer(arena)` copies into CPU memory when needed |
+| `MappedFileSegment` | file `MAP_SHARED` | by path | persistent buffers; `sync()`/`resize()` |
+| `HugePageSegment` | anonymous `MAP_HUGETLB` (2 MB / 1 GB) | **not currently** — `ipc_handle()` returns `None` | `new_or_fallback()` degrades to normal pages |
 
-// Open an existing file
-let segment = MappedFileSegment::open("/path/to/file")?;
+`MemoryType` (`Cpu`, `HugePages`, `MappedFile`, `DmaBuf`, `GpuAccessible`, `GpuDevice`, `RdmaRegistered`) participates in caps negotiation, so pipelines can select DMA-BUF vs CPU paths per link — see [formats.md](formats.md).
 
-// Open read-only
-let segment = MappedFileSegment::open_readonly("/path/to/file")?;
-```
+## Performance characteristics
 
-**Properties:**
-- Data persists to disk
-- Kernel handles I/O automatically
-- Can be shared via file path
-
-## Memory Pools
-
-Pools provide efficient buffer allocation from a segment:
-
-```rust
-use parallax::memory::{MemoryPool, HeapSegment};
-
-// Create a pool with 64KB slots
-let segment = HeapSegment::new(1024 * 1024)?;  // 1MB total
-let pool = MemoryPool::new(segment, 64 * 1024)?;
-
-println!("Pool capacity: {} slots", pool.capacity());
-println!("Available: {} slots", pool.available());
-
-// Loan a slot
-if let Some(mut slot) = pool.loan() {
-    // Write data to the slot
-    slot.as_mut_slice()[..data.len()].copy_from_slice(&data);
-    
-    // Slot automatically returns to pool when dropped
-}
-```
-
-### Pool Design
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Memory Segment (1MB)                         │
-├─────────────────┬─────────────────┬─────────────────┬───────────┤
-│  Slot 0 (64KB)  │  Slot 1 (64KB)  │  Slot 2 (64KB)  │    ...    │
-│     [used]      │     [free]      │     [used]      │           │
-└─────────────────┴─────────────────┴─────────────────┴───────────┘
-        │                                     │
-        ▼                                     ▼
-   AtomicBitmap: [1, 0, 1, 0, 0, 0, ...]
-```
-
-### Atomic Bitmap
-
-Slot allocation uses a lock-free bitmap:
-
-```rust
-// Internally:
-pub struct AtomicBitmap {
-    bits: Box<[AtomicU64]>,
-    num_bits: usize,
-}
-
-impl AtomicBitmap {
-    pub fn acquire_slot(&self) -> Option<usize>;  // Find and set a free bit
-    pub fn release_slot(&self, index: usize);      // Clear a bit
-}
-```
-
-**Performance:**
-- O(1) amortized acquisition
-- O(1) release
-- Lock-free (uses atomic CAS)
-
-## Buffers and Memory Handles
-
-Buffers reference memory through handles:
-
-```rust
-pub struct Buffer<T = ()> {
-    memory: MemoryHandle,
-    metadata: Metadata,
-    // ...
-}
-
-pub struct MemoryHandle {
-    segment: Arc<dyn MemorySegment>,
-    offset: usize,
-    len: usize,
-}
-```
-
-### Creating Buffers
-
-```rust
-use parallax::buffer::{Buffer, MemoryHandle};
-use parallax::memory::HeapSegment;
-
-// From a segment
-let segment = Arc::new(HeapSegment::new(1024)?);
-let handle = MemoryHandle::from_segment(segment);
-let buffer = Buffer::<()>::new(handle, Metadata::default());
-
-// With specific length
-let handle = MemoryHandle::from_segment_with_len(segment, 512);
-
-// With offset and length
-let handle = MemoryHandle::new(segment, 256, 256);  // offset=256, len=256
-```
-
-### Zero-Copy Cloning
-
-```rust
-let buffer1 = Buffer::new(handle, metadata);
-let buffer2 = buffer1.clone();  // O(1) - just Arc increment
-
-// Both buffers reference the same memory
-assert_eq!(buffer1.memory().as_ptr(), buffer2.memory().as_ptr());
-```
-
-## IPC Memory Sharing
-
-### Sending Memory Across Processes
-
-```rust
-use parallax::memory::{SharedMemorySegment, IpcHandle};
-
-// Process A: Create shared memory
-let segment = SharedMemorySegment::new("pipeline", 1024 * 1024)?;
-
-// Get IPC handle (contains file descriptor)
-if let Some(IpcHandle::Fd { fd, size }) = segment.ipc_handle() {
-    // Send fd to Process B via Unix socket (SCM_RIGHTS)
-}
-
-// Process B: Receive and map
-let segment = SharedMemorySegment::from_raw_fd(received_fd, size)?;
-// Now both processes share the same memory!
-```
-
-### IPC Protocol
-
-```
-Process A                                    Process B
-    │                                            │
-    │ 1. Create SharedMemorySegment              │
-    │    (memfd_create)                          │
-    │                                            │
-    │ 2. Send fd via Unix socket ──────────────▶ │
-    │    (SCM_RIGHTS)                            │
-    │                                            │
-    │                              3. mmap fd ◀──│
-    │                                            │
-    │ 4. Write buffer to segment                 │
-    │    └─▶ Send buffer header ──────────────▶ │
-    │        (offset, len, metadata)             │
-    │                                            │
-    │                              5. Read from  │
-    │                                 shared mem │
-    │                                 (no copy!) │
-```
-
-## Best Practices
-
-### Choosing a Memory Backend
-
-| Use Case | Recommended Backend |
-|----------|---------------------|
-| Single process, small buffers | `HeapSegment` |
-| Single process, large buffers | `HugePageSegment` |
-| Multi-process pipelines | `SharedMemorySegment` |
-| Persistent data | `MappedFileSegment` |
-
-### Pool Sizing
-
-```rust
-// For streaming: many small slots
-let pool = MemoryPool::new(segment, 4096)?;  // 4KB slots
-
-// For video frames: fewer large slots
-let pool = MemoryPool::new(segment, 8 * 1024 * 1024)?;  // 8MB slots
-```
-
-**Guidelines:**
-- Slot size should match typical buffer size
-- More slots = more concurrency
-- Total size = slot_size * expected_concurrent_buffers * 2
-
-### Avoiding Copies
-
-```rust
-// Good: Pass buffer by reference
-fn process_buffer(buffer: &Buffer) { ... }
-
-// Good: Clone buffer (O(1), just Arc increment)
-let buffer2 = buffer.clone();
-
-// Avoid: Copying data out of buffer
-let data = buffer.as_slice().to_vec();  // Allocates and copies!
-```
-
-## Troubleshooting
-
-### Pool Exhaustion
-
-```rust
-match pool.loan() {
-    Some(slot) => { /* use slot */ }
-    None => {
-        // Pool exhausted - all slots in use
-        // Options:
-        // 1. Wait and retry
-        // 2. Create a larger pool
-        // 3. Apply backpressure upstream
-    }
-}
-```
-
-### Huge Page Failures
-
-```bash
-# Check available huge pages
-cat /proc/meminfo | grep Huge
-
-# Allocate huge pages (requires root)
-echo 512 > /proc/sys/vm/nr_hugepages
-```
-
-### Shared Memory Limits
-
-```bash
-# Check shared memory limits
-cat /proc/sys/kernel/shmmax
-
-# Increase if needed (requires root)
-echo 1073741824 > /proc/sys/kernel/shmmax  # 1GB
-```
+| Operation | Cost |
+|-----------|------|
+| `Buffer::clone` (any process) | O(1) atomic increment |
+| Slot acquire | O(n) scan over slot headers (n = pool size; pools pre-reclaim) |
+| Slot release | O(1) lock-free queue push |
+| Owner reclaim | O(k), k = released slots |
+| Cross-process send | O(1) after one-time arena fd pass |
+| `Buffer::slice` | O(1), zero-copy |

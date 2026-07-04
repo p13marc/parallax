@@ -4,1597 +4,274 @@ This file provides guidance to Claude Code when working with code in this reposi
 
 ## Project Overview
 
-**Parallax** is a Rust-native streaming pipeline engine designed to compete with GStreamer, offering zero-copy memory management, hybrid scheduling, and modern GPU integration.
+**Parallax** is a Rust-native streaming pipeline engine (a GStreamer alternative) built on zero-copy shared memory, hybrid async+realtime scheduling, and progressive typing. Linux-only. Workspace: the `parallax` crate (root), `parallax-macros` (proc macros), `examples/example-plugin` (cdylib plugin demo).
+
+- Edition **2024**, MSRV **1.85** (do not claim 1.75 — that's stale).
+- Default features are empty; most media functionality is feature-gated.
+- ~61k lines of Rust; 1100+ tests, all passing with default features.
 
 ### Core Principles
 
-1. **Shared Memory First**: All CPU buffers are memfd-backed (zero overhead, always IPC-ready)
-2. **Progressive Typing**: Dynamic pipelines (runtime flexibility) + Typed pipelines (compile-time safety)
-3. **Zero-Copy by Design**: Arena allocation, fd passing, rkyv serialization
-4. **Linux-Only**: Leverages memfd_create, SCM_RIGHTS
-5. **Sync Processing, Async Orchestration**: Element processing is sync; pipeline orchestration is async (Tokio)
+1. **Shared memory first**: all CPU buffers are memfd-backed (always IPC-ready, one fd per arena)
+2. **Cross-process refcounting**: refcounts live *inside* shared memory (atomics), release via lock-free MPSC queue
+3. **Progressive typing**: dynamic pipelines (string/programmatic) + typed pipelines (compile-time checked)
+4. **Sync processing, async orchestration**: element hot paths are sync; orchestration is Tokio; RT-safe elements can run on dedicated RT threads
+5. **Pure Rust codecs where possible**; C libraries only when unavoidable
 
 ### Key Design Decisions
 
 | Aspect | Choice |
 |--------|--------|
-| Async runtime | Tokio (shared within process) |
-| Channels | Kanal (MPMC, sync+async) |
+| Async runtime | Tokio |
+| Channels | kanal (MPMC sync+async) for local links; SPSC ring + eventfd for async↔RT bridges |
+| Graph | daggy (enforces DAG) |
 | Parser | winnow |
-| Graph structure | daggy (enforces DAG) |
-| Serialization | rkyv (zero-copy) |
-| Error handling | thiserror (library) |
-| Metrics | metrics-rs + tracing |
-| Linux APIs | rustix |
-| Plugin ABI | stabby (stable Rust ABI) |
-| GPU | Vulkan Video + rust-gpu (planned) |
-| Video Codecs | OpenH264 (H.264), rav1e (AV1 encode), dav1d (AV1 decode) |
-| Audio Codecs | Opus (libopus), AAC (FDK-AAC), Symphonia (FLAC, MP3, AAC, Vorbis decode) |
-| Image Codecs | zune-jpeg, png crate (pure Rust) |
-| Container Formats | mp4 crate (pure Rust: MP4 demux/mux) |
-
-### Unified Executor with Automatic Strategy
-
-Parallax uses a unified `Executor` that automatically determines the optimal execution strategy for each element based on **ExecutionHints**. No developer insight required - just run your pipeline and the executor figures out the best approach.
-
-```rust
-// Simply run your pipeline - the executor auto-negotiates strategy
-let mut pipeline = Pipeline::parse("filesrc ! decoder ! videosink")?;
-pipeline.run().await?;  // Automatic: filesrc=async, decoder=RT if low-latency
-```
-
-#### Automatic Strategy Detection
-
-Each element declares `ExecutionHints` describing its characteristics:
-
-```rust
-pub struct ExecutionHints {
-    pub trust_level: TrustLevel,      // Trusted, SemiTrusted, Untrusted
-    pub processing: ProcessingHint,    // CpuBound, IoBound, MemoryBound, Unknown
-    pub latency: LatencyHint,          // UltraLow, Low, Normal, Relaxed
-    pub crash_safe: bool,              // Can recover from crashes?
-    pub uses_native_code: bool,        // FFI, unsafe, external libs?
-    pub memory: MemoryHint,            // Normal, Low, High, Streaming
-}
-
-// Elements provide hints (defaults are safe)
-impl Source for MyDecoder {
-    fn execution_hints(&self) -> ExecutionHints {
-        ExecutionHints::default()
-    }
-}
-```
-
-The executor analyzes all hints and chooses:
-
-| Element Characteristics | Strategy |
-|------------------------|----------|
-| RT-safe + low latency | **RealTime** (dedicated RT thread) |
-| I/O-bound OR async affinity | **Async** (Tokio task) |
-| Everything else | **Async** (default) |
-
-#### Manual Override
-
-You can still configure manually if needed:
-
-```rust
-let config = ExecutorConfig {
-    auto_strategy: false,  // Disable auto-detection
-    scheduling: SchedulingMode::Hybrid,
-    rt: RtConfig {
-        quantum: 256,
-        rt_priority: Some(50),
-        ..Default::default()
-    },
-    ..Default::default()
-};
-
-let executor = Executor::with_config(config);
-executor.start(&mut pipeline).await?;
-```
-
-### Hybrid Scheduling (PipeWire-inspired)
-
-Under the hood, the unified executor combines:
-- **Tokio async tasks** for I/O-bound elements (network, file I/O)
-- **Dedicated RT threads** for CPU-bound, real-time-safe elements (audio/video processing)
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Tokio Runtime                            │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
-│  │  TcpSrc      │  │  FileSrc     │  │  HttpSrc     │          │
-│  │  (async I/O) │  │  (async I/O) │  │  (async I/O) │          │
-│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘          │
-│         │                 │                 │                   │
-│         ▼                 ▼                 ▼                   │
-│  ┌─────────────────────────────────────────────────────────────┐│
-│  │              AsyncRtBridge (lock-free ring buffer)          ││
-│  └─────────────────────────────────────────────────────────────┘│
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    RT Data Thread(s)                            │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
-│  │  Decoder     │──│  Mixer       │──│  AudioSink   │          │
-│  │  (RT-safe)   │  │  (RT-safe)   │  │  (RT-safe)   │          │
-│  └──────────────┘  └──────────────┘  └──────────────┘          │
-│                                                                 │
-│  Driver-based scheduling, deterministic latency                 │
-└─────────────────────────────────────────────────────────────────┘
-
-```
-
-**Key concepts:**
-
-- **ExecutionHints**: Each element declares its characteristics for automatic strategy detection
-- **Element Affinity**: Elements can declare scheduling affinity (`Async`, `RealTime`, or `Auto`)
-- **RT-Safety**: Elements declare `is_rt_safe()` - no allocations, no blocking in hot path
-- **Graph Partitioning**: The scheduler automatically partitions the graph and inserts bridges
-- **Driver-based Scheduling**: A driver node (timer or hardware) initiates each processing cycle
-
-```rust
-// Scheduling modes (used when auto_strategy is false)
-pub enum SchedulingMode {
-    Async,    // All in Tokio (default)
-    Hybrid,   // RT-safe nodes in RT threads, rest in Tokio
-    RealTime, // All RT-safe nodes in RT threads
-}
-
-// Per-element execution strategy (determined automatically)
-pub enum ElementStrategy {
-    Async,     // Run as Tokio task
-    RealTime,  // Run in RT thread
-}
-```
-
-### Pipeline State Model (PipeWire-inspired)
-
-Parallax uses a 3-state model inspired by PipeWire:
-
-```
-Suspended <──> Idle <──> Running
-    │                        │
-    └────── Error ◄──────────┘
-```
-
-| State | Description | Resources |
-|-------|-------------|-----------|
-| **Suspended** | Minimal memory footprint | Deallocated |
-| **Idle** | Ready to process (paused) | Allocated |
-| **Running** | Actively processing data | Allocated |
-| **Error** | Unrecoverable error | Varies |
-
-**State transitions:**
-- `prepare()`: Suspended → Idle (validate, negotiate caps, allocate)
-- `activate()`: Idle → Running (start processing)
-- `pause()`: Running → Idle (stop processing, keep resources)
-- `suspend()`: Idle → Suspended (release resources)
-
-The key insight from PipeWire: "paused" and "stopped" are the same state (Idle) - the difference is just intent.
-
-### Shared-Memory Reference Counting (SharedArena)
-
-Parallax implements true cross-process reference counting by storing refcounts in shared memory (memfd), not on the heap like `Arc`. This avoids the double-allocation problem and enables zero-copy buffer sharing across processes.
-
-```
-SharedArena Memory Layout:
-┌─────────────────────────────────────────────────────────────────┐
-│ ArenaHeader (64 bytes, cache-aligned)                           │
-│   magic, version, slot_count, slot_size, arena_id               │
-├─────────────────────────────────────────────────────────────────┤
-│ ReleaseQueue (MPSC lock-free queue in shared memory)            │
-│   head: AtomicU32     ← Owner reads here (single consumer)      │
-│   tail: AtomicU32     ← Any process writes here (multi producer)│
-│   slots: [AtomicU32; 1024]  ← Ring buffer of slot indices       │
-├─────────────────────────────────────────────────────────────────┤
-│ SlotHeader[0..N] (8 bytes each)                                 │
-│   refcount: AtomicU32  ← Works across processes!                │
-│   state: AtomicU32     ← Free or Allocated                      │
-├─────────────────────────────────────────────────────────────────┤
-│ SlotData[0..N] (user data)                                      │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-**Key types:**
-- `SharedArena` - Arena with refcounts in shared memory
-- `SharedSlotRef` - Zero-allocation slot reference (no Arc needed)
-- `SharedIpcSlotRef` - Serializable IPC reference (rkyv-compatible)
-- `SharedArenaCache` - Cache for client processes to map arenas
-
-**Cross-process semantics:**
-- **Clone**: Atomic increment in shared memory (works across processes)
-- **Drop**: Atomic decrement; if 0, push slot index to release queue
-- **Reclaim**: Owner drains queue in O(k) where k = released slots
-
-This improves on PipeWire's approach which uses per-process refcounting with message-based coordination.
-
-### Pipeline Buffer Pool
-
-Parallax provides a pipeline-level buffer pool for efficient buffer management:
-
-```rust
-// Create a pool with 10 buffers of 1MB each
-let pool = FixedBufferPool::new(1024 * 1024, 10)?;
-
-// Attach pool to source
-let src = SourceAdapter::with_pool(my_source, pool.clone());
-
-// Or set on pipeline for auto-sizing based on caps
-pipeline.create_pool_from_caps(10)?;
-```
-
-**Key types:**
-- `BufferPool` - Trait for buffer pool implementations
-- `FixedBufferPool` - Fixed-size pool backed by SharedArena
-- `PooledBuffer` - RAII buffer that returns to pool on drop
-- `PoolStats` - Statistics (acquisitions, waits, availability)
-
-**Features:**
-- **Backpressure**: `acquire()` blocks when pool is exhausted
-- **Zero-allocation**: Pre-allocated buffers, no malloc during processing
-- **Statistics**: Track acquisitions, wait events, and availability
-- **ProduceContext integration**: Sources can use `ctx.acquire_buffer()`
-
-```rust
-// In a Source::produce() implementation
-fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
-    let mut pooled = ctx.acquire_buffer()?;  // Blocks if pool exhausted
-    pooled.data_mut()[..n].copy_from_slice(&data);
-    pooled.set_len(n);
-    Ok(ProduceResult::OwnBuffer(pooled.into_buffer()))
-}
-```
-
-### Backpressure and Flow Control
-
-Parallax provides a comprehensive backpressure system for handling situations where downstream elements are slower than upstream sources. This is critical for live capture sources (cameras, screen capture, audio) where frames arrive at a fixed rate regardless of downstream processing speed.
-
-**Key types:**
-- `FlowSignal` - Signals between elements (Ready, Busy, Drop, EosAck, Pausing, Stopping)
-- `FlowPolicy` - How sources respond to backpressure (Block, Drop, RingBuffer, Adaptive)
-- `FlowStateHandle` - Thread-safe handle for sharing flow state between elements
-- `WaterMarks` - High/low thresholds for Queue-based flow control
-
-**Flow signals:**
-| Signal | Meaning |
-|--------|---------|
-| `Ready` | Downstream can accept data |
-| `Busy` | Downstream is congested, slow down or drop |
-| `Drop` | Downstream requests frame dropping |
-| `EosAck` | End-of-stream acknowledged |
-| `Pausing` | Pipeline is pausing |
-| `Stopping` | Pipeline is stopping |
-
-**Flow policies:**
-| Policy | Behavior | Use Case |
-|--------|----------|----------|
-| `Block` | Wait for downstream (default) | File sources, non-live |
-| `Drop { log_drops }` | Drop frames when busy | Live video capture |
-| `RingBuffer { capacity }` | Overwrite oldest frames | Fixed-latency scenarios |
-| `Adaptive` | Switch between block/drop | Variable network conditions |
-
-**Queue water marks:**
-```rust
-use parallax::elements::flow::Queue;
-use parallax::pipeline::flow::WaterMarks;
-
-// Queue with default water marks (80% high, 20% low)
-let queue = Queue::new(100).with_flow_control();
-
-// Queue with custom water marks
-let wm = WaterMarks::with_percentages(100, 90, 10);  // 90% high, 10% low
-let queue = Queue::new(100).with_water_marks(wm);
-
-// Check queue state
-println!("Fill level: {:.1}%", queue.fill_level());
-println!("Is busy: {}", queue.is_busy());
-println!("Flow signal: {:?}", queue.flow_signal());
-```
-
-**Connecting sources to downstream backpressure:**
-```rust
-use parallax::elements::device::ScreenCaptureSrc;
-use parallax::elements::flow::Queue;
-
-// Create queue with flow control
-let queue = Queue::new(100).with_flow_control();
-let flow_state = queue.flow_state_handle();
-
-// Connect source to queue's flow state
-let mut capture = ScreenCaptureSrc::default_config();
-capture.set_flow_state(flow_state);
-
-// Now when queue reaches high water mark:
-// 1. Queue signals Busy via flow_state
-// 2. Source checks should_produce() -> false
-// 3. Source drops frame according to its flow_policy()
-// 4. When queue drains to low water mark, source resumes
-```
-
-**Implementing flow control in custom sources:**
-```rust
-use parallax::element::{Source, ProduceContext, ProduceResult};
-use parallax::pipeline::flow::{FlowPolicy, FlowSignal, FlowStateHandle};
-
-struct MyLiveSource {
-    flow_state: Option<FlowStateHandle>,
-    frames_dropped: u64,
-}
-
-impl Source for MyLiveSource {
-    fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
-        // Check backpressure before producing
-        if let Some(ref flow_state) = self.flow_state {
-            if !flow_state.should_produce() {
-                self.frames_dropped += 1;
-                flow_state.record_drop();
-                return Ok(ProduceResult::WouldBlock);
-            }
-        }
-        
-        // Produce frame normally...
-        Ok(ProduceResult::OwnBuffer(buffer))
-    }
-    
-    fn flow_policy(&self) -> FlowPolicy {
-        // Live sources should drop frames to avoid lag
-        FlowPolicy::drop_with_logging()
-    }
-    
-    fn handle_flow_signal(&mut self, signal: FlowSignal) {
-        if let Some(ref flow_state) = self.flow_state {
-            flow_state.set_signal(signal);
-        }
-    }
-}
-```
-
-**Built-in sources with flow control:**
-- `ScreenCaptureSrc` - Default: Drop policy (prevents capture lag)
-- `V4l2Src` - Default: Drop policy (camera capture)
-- `LibCameraSrc` - Default: Drop policy (camera capture)
-- `PipeWireSrc` - Default: Drop policy (audio/video capture)
-- `AlsaSrc` - Default: Drop policy (audio capture)
-
-See `examples/47_flow_control.rs` for a complete example.
-
-### Media Type Detection (TypeFind)
-
-Parallax can detect media formats from the first bytes of a stream:
-
-```rust
-use parallax::pipeline::typefind::{TypeFindRegistry, MediaType};
-
-let registry = TypeFindRegistry::with_builtins();
-
-// Detect from bytes
-let result = registry.detect(b"\x00\x00\x00\x20ftypisom").unwrap();
-assert_eq!(result.media_type, MediaType::Mp4);
-
-// Detect from extension (fallback)
-let media_type = registry.detect_from_extension("mkv").unwrap();
-
-// Both with fallback
-let result = registry.detect_with_fallback(&data, Some("mp4"));
-```
-
-**Built-in detectors** (14 formats): MP4, Matroska/WebM, MPEG-TS, FLV, AVI, WAV, Ogg, FLAC, PNG, JPEG, H.264 (Annex B), MP3 (ID3 + frame sync).
-
-See `examples/56_typefind.rs` for a complete example.
-
-### Network Buffering (Queue2)
-
-`Queue2` extends the basic `Queue` with buffering strategies for network streaming:
-
-| Mode | Description | Use Case |
-|------|-------------|----------|
-| `Stream` | In-memory ring buffer with watermarks | HTTP streaming, variable network |
-| `Download` | File-backed progressive download | File download with seek |
-| `Timeshift` | Circular file buffer | DVR rewind of live streams |
-
-```rust
-use parallax::elements::flow::Queue2;
-
-// Stream mode: pause at 10% fill, resume at 95%
-let queue = Queue2::stream(10 * 1024 * 1024)
-    .with_watermarks(10, 95);
-
-// Download mode: progressive download to disk
-let queue = Queue2::download("/tmp/video.tmp", Some(file_size));
-
-// Timeshift mode: 60 MB ring buffer for rewind
-let queue = Queue2::timeshift("/tmp/timeshift.tmp", 60 * 1024 * 1024);
-```
-
-Buffering progress (0-100%) is reported via bus `MessageKind::Buffering` messages with rate estimates.
-
-See `examples/55_queue2_buffering.rs` for a complete example.
-
-### Clock System and Timestamps
-
-Parallax provides a clock system for accurate timing and A/V synchronization, inspired by GStreamer and PipeWire.
-
-**Key types:**
-- `ClockTime` - Nanosecond-precision timestamp with `NONE` sentinel for unset values
-- `Clock` trait - Time source providing `now()`, `flags()`, `resolution()`, `name()`
-- `ClockProvider` trait - Elements that can provide clocks (e.g., audio sinks)
-- `PipelineClock` - Pipeline-level clock with base time for running time calculation
-
-**ClockTime usage:**
-```rust
-use parallax::clock::ClockTime;
-
-// Create timestamps
-let pts = ClockTime::from_nanos(1_000_000_000);  // 1 second
-let pts = ClockTime::from_millis(1000);          // 1 second
-let pts = ClockTime::from_secs(1);               // 1 second
-
-// Special values
-let none = ClockTime::NONE;  // Unset/invalid timestamp
-let zero = ClockTime::ZERO;  // Valid zero timestamp
-
-// Arithmetic (saturating)
-let later = pts + ClockTime::from_millis(500);
-let earlier = pts - ClockTime::from_millis(500);
-
-// Conversions
-let nanos: u64 = pts.nanos();
-let millis: u64 = pts.millis();
-let duration: std::time::Duration = pts.into();
-```
-
-**Hardware timestamp extraction:**
-
-Device sources automatically extract hardware timestamps when available:
-
-| Source | Timestamp Source | Fallback |
-|--------|-----------------|----------|
-| `ScreenCaptureSrc` | PipeWire `spa_meta_header.pts` | System monotonic clock |
-| `V4l2Src` | V4L2 `v4l2_buffer.timestamp` | None (always available) |
-| `AlsaSrc` | ALSA `pcm.status().get_htstamp()` | Sample count calculation |
-
-**Timestamp flow through pipeline:**
-
-Buffers carry PTS (Presentation Timestamp) in their metadata:
-```rust
-use parallax::metadata::Metadata;
-use parallax::clock::ClockTime;
-
-// Source sets PTS
-let mut metadata = Metadata::new();
-metadata.pts = ClockTime::from_nanos(hardware_timestamp);
-
-// Transforms MUST preserve metadata
-impl Element for MyTransform {
-    fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
-        // Clone metadata to preserve PTS, flags, custom data
-        let metadata = buffer.metadata().clone();
-        
-        // ... transform data ...
-        
-        Ok(Some(Buffer::new(new_handle, metadata)))
-    }
-}
-```
-
-**Timestamp debugging:**
-
-Use `TimestampDebug` to inspect timestamp flow:
-```rust
-use parallax::elements::TimestampDebug;
-use parallax::elements::transform::{TimestampFormat, TimestampDebugLevel};
-
-// Basic logging to stderr
-let debug = TimestampDebug::new();
-
-// Verbose with all fields
-let debug = TimestampDebug::verbose();
-
-// Only log anomalies (backwards PTS, discontinuities)
-let debug = TimestampDebug::new()
-    .with_log_level(TimestampDebugLevel::Warnings);
-
-// Silent stats collection
-let debug = TimestampDebug::silent();
-
-// After pipeline run, check stats
-let stats = debug.stats();
-println!("Buffers: {}", stats.buffer_count);
-println!("Missing PTS: {}", stats.missing_pts_count);
-println!("Backwards PTS: {}", stats.backwards_pts_count);
-println!("Avg interval: {:?}ns", stats.avg_interval_ns);
-```
-
-**Clock access in sources:**
-
-Sources can access the pipeline clock via `ProduceContext`:
-```rust
-impl Source for MySource {
-    fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
-        // Get pipeline clock (if started)
-        if let Some(clock) = ctx.clock() {
-            let now = clock.now();
-            // Use clock for timing decisions
-        }
-        
-        // ... produce buffer ...
-    }
-}
-```
-
-### Muxer Synchronization (N-to-1)
-
-Parallax provides PTS-based synchronization for N-to-1 muxer elements:
-
-```rust
-use parallax::element::muxer::{MuxerSyncState, MuxerSyncConfig, PadInfo, StreamType, SyncMode};
-
-// Create sync state with 40ms output interval (25fps video)
-let config = MuxerSyncConfig::new()
-    .with_mode(SyncMode::Strict)
-    .with_interval_ms(40);
-
-let mut sync = MuxerSyncState::new(config);
-
-// Add input pads
-let video_pad = sync.add_pad(PadInfo::new("video", StreamType::Video).required());
-let audio_pad = sync.add_pad(PadInfo::new("audio", StreamType::Audio).required());
-let data_pad = sync.add_pad(PadInfo::new("klv", StreamType::Data).optional());
-
-// Push buffers from each input
-sync.push(video_pad, video_buffer)?;
-sync.push(audio_pad, audio_buffer)?;
-
-// Check if ready and collect synchronized output
-if sync.ready_to_output() {
-    let collected = sync.collect_for_output();
-    // Process collected buffers...
-    sync.advance();  // Move to next output interval
-}
-```
-
-**Key types:**
-- `MuxerSyncState` - Core synchronization state machine
-- `MuxerSyncConfig` - Configuration (mode, interval, live)
-- `PadInfo` - Per-pad configuration (name, stream type, required)
-- `StreamType` - Video, Audio, Subtitle, Data
-- `SyncMode` - Synchronization strategy
-
-**Sync modes:**
-| Mode | Behavior |
-|------|----------|
-| `Strict` | Wait for all required pads to have data |
-| `Loose` | Output when primary stream (video) is ready |
-| `Timed { interval_ms }` | Fixed interval output |
-| `Auto` | Strict for non-live, Loose for live sources |
-
-**Pipeline-ready muxer elements:**
-```rust
-use parallax::elements::mux::{TsMuxElement, TsMuxConfig, TsMuxTrack, TsMuxStreamType};
-
-// Create MPEG-TS muxer with video and KLV tracks
-let config = TsMuxConfig::new()
-    .add_track(TsMuxTrack::new(256, TsMuxStreamType::H264).video())
-    .add_track(TsMuxTrack::new(257, TsMuxStreamType::Klv).private_data());
-
-let mut mux = TsMuxElement::new(config)?;
-
-// Push data via MuxerInput
-mux.push(MuxerInput::new(video_pad_id, video_buffer))?;
-mux.push(MuxerInput::new(data_pad_id, klv_buffer))?;
-
-// Pull synchronized output
-if mux.can_output() {
-    if let Some(ts_buffer) = mux.pull()? {
-        // Write TS packets...
-    }
-}
-```
-
-See `examples/39_muxer_element.rs` for a complete example.
-
-## Build Commands
+| Serialization | rkyv (network links, IPC types) |
+| Errors | thiserror (`Error` enum in `src/error.rs`, `#[non_exhaustive]`) |
+| Metrics/logging | metrics-rs + tracing |
+| Linux APIs | rustix (memfd, mmap, SCM_RIGHTS, eventfd) |
+| Plugin ABI | **Hand-rolled `#[repr(C)]` descriptor + `extern "C"` fns, loaded via libloading.** NOT stabby (old docs claiming stabby are wrong; stabby appears in Cargo.lock only as a transitive dep of zenoh). |
+| Object-safe async traits | trait-variant + dynosaur (`DynAsyncElement`) |
+| GPU | Vulkan Video via ash — **experimental scaffold** (see Gotchas) |
+
+## Build & Test Commands
 
 ```bash
-# Using just (recommended)
-just test          # Run tests with nextest
-just lint          # Run clippy
-just check         # Format + lint + test
-just bench         # Run benchmarks
-just watch         # Auto-run tests on changes
+just test          # cargo nextest run
+just test-one NAME # single test
+just lint          # clippy -D warnings
+just lint-all      # clippy --all-features
+just check         # fmt-check + lint + test
+just bench         # criterion benchmarks
+just watch         # auto-run tests on change
+just coverage      # cargo llvm-cov nextest
 
-# Or directly with cargo
-cargo build
+# Direct cargo
 cargo nextest run
 cargo clippy -- -D warnings
+cargo doc --no-deps
+cargo check --all-targets              # default features
+cargo check --features "h264,mpeg-ts"  # etc. for gated code
 ```
 
-## Architecture
+Feature-gated code is NOT compiled by default — after touching gated modules (codecs, devices, rtp, vulkan…), check with the relevant features enabled.
 
-### Current Implementation
+## Source Tree
 
 ```
-parallax/
-├── src/
-│   ├── lib.rs              # Public API exports
-│   ├── error.rs            # Error types (thiserror)
-│   │
-│   ├── memory/             # Memory management
-│   │   ├── segment.rs      # MemorySegment trait, MemoryType
-│   │   ├── shared_refcount.rs # SharedArena (cross-process refcounting)
-│   │   ├── buffer_pool.rs  # BufferPool trait, FixedBufferPool, PooledBuffer
-│   │   ├── bitmap.rs       # AtomicBitmap (lock-free slot tracking)
-│   │   ├── ipc.rs          # send_fds/recv_fds (SCM_RIGHTS)
-│   │   ├── huge_pages.rs   # Huge page support
-│   │   └── mapped_file.rs  # Memory-mapped file support
-│   │
-│   ├── buffer.rs           # Buffer, MemoryHandle
-│   ├── metadata.rs         # Metadata, BufferFlags
-│   │
-│   ├── element/            # Element system
-│   │   ├── traits.rs       # Source, Sink, Element, AsyncSource, AsyncSink, ExecutionHints
-│   │   ├── pad.rs          # Pad, PadDirection, PadTemplate
-│   │   ├── context.rs      # ElementContext
-│   │   └── muxer.rs        # MuxerSyncState, PadInfo, StreamType, SyncMode
-│   │
-│   ├── pipeline/           # Pipeline execution
-│   │   ├── graph.rs        # Pipeline DAG (daggy-based)
-│   │   ├── unified_executor.rs # Unified Executor (async + RT)
-│   │   ├── rt_scheduler.rs # RT scheduler (graph partitioning, activation records)
-│   │   ├── rt_bridge.rs    # AsyncRtBridge (lock-free SPSC ring buffer + eventfd)
-│   │   ├── driver.rs       # TimerDriver, ManualDriver (PipeWire-style drivers)
-│   │   ├── parser.rs       # Pipeline string parser (winnow)
-│   │   ├── factory.rs      # ElementFactory + PluginRegistry
-│   │   ├── bus.rs          # Pipeline message bus (Bus, BusHandle, Message)
-│   │   ├── tags.rs         # TagList, TagValue for stream metadata
-│   │   ├── seek.rs         # Seeking, position queries, SeekableSource
-│   │   ├── probe.rs        # Pad probes (ProbeRegistry, ProbeType, PadRef)
-│   │   ├── tracer.rs       # Tracer framework (LatencyTracer, FramerateTracer, DropTracer)
-│   │   └── typefind.rs     # Media type detection (TypeFindRegistry, 14 built-in detectors)
-│   │
-│   ├── elements/           # Built-in elements (organized by category)
-│   │   ├── network/        # TCP, UDP, Unix, multicast, HTTP, WebSocket, Zenoh
-│   │   ├── rtp/            # RTP, RTCP, codecs, jitter buffer, RTSP
-│   │   ├── io/             # FileSrc/Sink, FdSrc/Sink, ConsoleSink
-│   │   ├── testing/        # TestSrc, VideoTestSrc, DataSrc, Null
-│   │   ├── flow/           # Queue, Tee, Funnel, Selector, Concat, Valve
-│   │   ├── transform/      # Filter, Map, Batch, buffer/metadata ops
-│   │   ├── app/            # AppSrc, AppSink, IcedVideoSink
-│   │   ├── ipc/            # IpcSrc, IpcSink, MemorySrc/Sink
-│   │   ├── timing/         # Delay, Timeout, RateLimiter
-│   │   ├── demux/          # StreamIdDemux, TsDemux, Mp4Demux
-│   │   ├── mux/            # TsMux, TsMuxElement, Mp4Mux (N-to-1 multiplexing)
-│   │   ├── codec/          # Media codecs (AV1, audio, image - feature-gated)
-│   │   ├── device/         # Hardware devices (V4L2, PipeWire, ALSA, libcamera)
-│   │   ├── streaming/      # HLS/DASH output (HlsSink, DashSink)
-│   │   └── util/           # PassThrough, Identity
-│   │
-│   ├── typed/              # Type-safe pipeline API
-│   │   ├── pipeline.rs     # PipelineWithSource, PipelineWithTransforms
-│   │   ├── operators.rs    # map, filter, take, skip, collect, etc.
-│   │   └── multi_source.rs # merge, zip, join, temporal_join
-│   │
-│   └── plugin/             # Plugin system
-│       ├── registry.rs     # PluginRegistry
-│       ├── loader.rs       # Dynamic loading
-│       └── descriptor.rs   # Plugin metadata (C-compatible ABI)
-│
-├── examples/               # One concept per file, all use Pipeline
-│   │   # Basic examples (no features required)
-│   ├── 01_hello.rs               # Simplest pipeline: src -> sink
-│   ├── 02_transform.rs           # Transform element: src -> xfm -> sink
-│   ├── 03_tee.rs                 # Fan-out: src -> tee -> [sink, sink]
-│   ├── 04_funnel.rs              # Fan-in: [src, src] -> funnel -> sink
-│   ├── 05_queue.rs               # Backpressure with queue
-│   ├── 06_appsrc.rs              # Application integration
-│   ├── 07_file_io.rs             # File read/write
-│   ├── 08_tcp.rs                 # TCP streaming
-│   ├── 09_typed.rs               # Type-safe pipeline API
-│   ├── 10_builder.rs             # Fluent builder DSL with >> operator
-│   ├── 11_buffer_pool.rs         # Pre-allocated buffer pooling
-│   │   # Codec examples (require feature flags)
-│   ├── 13_image.rs               # PNG codec (--features image-codecs)
-│   ├── 14_h264.rs                # H.264 encoding (--features h264)
-│   ├── 15_av1.rs                 # AV1 encoding (--features av1-encode)
-│   ├── 16_mpegts.rs              # MPEG-TS muxing (--features mpeg-ts)
-│   ├── 17_multi_format_caps.rs   # Multi-format caps negotiation
-│   │   # Device examples (require feature flags)
-│   ├── 22_v4l2_capture.rs        # V4L2 camera capture (--features v4l2)
-│   ├── 23_v4l2_display.rs        # V4L2 display output (--features v4l2)
-│   ├── 24_autovideosink.rs       # Auto video sink selection
-│   ├── 41_format_converters.rs   # Format conversion elements
-│   ├── 42_pipewire_audio.rs      # PipeWire audio (--features pipewire)
-│   ├── 43_alsa_audio.rs          # ALSA audio (--features alsa)
-│   ├── 44_libcamera_capture.rs   # libcamera capture (--features libcamera)
-│   │   # Infrastructure examples (no features required)
-│   ├── 51_bus_messages.rs        # Pipeline bus: polling, Stream, select!
-│   ├── 52_seeking.rs             # File seeking and position queries
-│   ├── 53_pad_probes.rs          # Buffer interception with pad probes
-│   ├── 54_tracers.rs             # Latency/framerate tracer framework
-│   ├── 55_queue2_buffering.rs    # Network buffering with Queue2
-│   └── 56_typefind.rs            # Media type detection from bytes
-│
-├── docs/                   # Documentation
-│   ├── design.md           # Complete design document and competitive analysis
-│   ├── architecture.md     # High-level architecture overview
-│   ├── api.md              # API reference
-│   ├── memory.md           # Memory management details
-│   ├── plugins.md          # Plugin development guide
-│   ├── security.md         # Security model and sandboxing
-│   ├── getting-started.md  # Quick start guide
-│   │   # Design documents
-│   ├── auto-converter-research.md    # GStreamer vs PipeWire converter approaches
-│   ├── caps-negotiation-research.md  # Caps negotiation research
-│   ├── vulkan-video-design.md        # Vulkan Video integration design
-│   ├── iced-integration-design.md    # Iced GUI integration design
-│   ├── foundation-design.md          # Foundation layer design
-│   ├── elements-roadmap.md           # Elements implementation roadmap
-│   └── media-streaming-plan.md       # Media streaming plan
-│
-└── plans/                  # Implementation plans (internal)
-    └── README.md           # Plan index and status
+src/
+├── lib.rs              # module decls + prelude
+├── error.rs            # Error/Result (variants: PoolExhausted, BufferPool, AllocationFailed,
+│                       #   InvalidSegment, ValidationFailed, InvalidCaps, Config, Pipeline,
+│                       #   Element, Io, System, Device[feature-gated])
+├── buffer.rs           # Buffer<T=()>, MemoryHandle, DmaBufBuffer
+├── metadata.rs         # Metadata (pts/dts/duration/sequence/stream_id/flags/rtp/format/offset
+│                       #   + typed custom map), BufferFlags, RtpMeta
+├── clock.rs            # ClockTime (NONE sentinel), Clock, ClockProvider, SystemClock, PipelineClock
+├── format.rs           # CapsValue, Video/AudioFormat(+Caps), PixelFormat, MediaFormat,
+│                       #   MemoryCaps, MemoryLayout, FormatMemoryCap, ElementMediaCaps, Caps
+├── event/              # Event enum (StreamStart/Segment/Tags/Eos/CapsChanged/Gap | Seek/Qos/
+│                       #   LatencyQuery | FlushStart/FlushStop/Custom), PipelineItem, TagList
+├── memory/             # SharedArena, SharedSlotRef, SharedIpcSlotRef, SharedArenaCache,
+│                       #   BufferPool/FixedBufferPool/PooledBuffer, DmaBufSegment,
+│                       #   HugePageSegment, MappedFileSegment, AtomicBitmap, ipc (SCM_RIGHTS),
+│                       #   defaults (slot size/count constants)
+├── element/            # traits.rs (Source/Sink/Element/Transform/Async*/Demuxer/Muxer/
+│                       #   SyncElement, ExecutionHints, adapters, AsyncElementDyn/DynAsyncElement)
+│                       # pipeline_element.rs (PipelineElement, ProcessOutput, SimpleSource/
+│                       #   SimpleSink/SimpleTransform, Src/Snk/Xfm wrappers)
+│                       # context.rs (ProduceContext/ConsumeContext/ProcessContext, ProduceResult)
+│                       # pad.rs, muxer.rs (MuxerSyncState/SyncMode/PadInfo/StreamType)
+├── elements/           # Built-ins by category: io, testing, network, rtp, flow, transform,
+│                       #   metadata (KLV), app, ipc, timing, util, demux, mux, codec, device,
+│                       #   streaming (HLS/DASH)
+├── pipeline/           # graph.rs (Pipeline, states, ConverterPolicy, DOT/JSON export, probes/
+│                       #   seek surface), unified_executor.rs (Executor/ExecutorConfig/
+│                       #   PipelineHandle/ElementStrategy), rt_scheduler.rs, rt_bridge.rs,
+│                       #   driver.rs, parser.rs, factory.rs, bus.rs, events.rs, tags.rs,
+│                       #   seek.rs, probe.rs, tracer.rs, typefind.rs, flow.rs, builder.rs
+├── negotiation/        # NegotiationSolver (per-link), ConverterRegistry, builtin registry
+├── converters/         # REAL VideoConvert/AudioConvert/AudioResample/VideoScale impls
+├── link/               # LocalLink (kanal), IpcPublisher/IpcSubscriber (memfd+SCM_RIGHTS),
+│                       #   NetworkSender/Receiver (TCP+rkyv, "PRLX" magic)
+├── typed/              # TypedSource/Sink/Transform, pipeline builder (>> operator), operators,
+│                       #   multi_source (merge/zip/join/temporal_join), bridge to dynamic
+├── temporal/           # Timestamp (SEPARATE from ClockTime), TimeRange, TemporalJoin,
+│                       #   AlignmentStrategy, JoinWindow
+├── gpu/                # Vulkan Video scaffold (context/session/dpb/memory real; decoder stub)
+├── plugin/             # descriptor.rs (#[repr(C)] ABI, define_plugin!), loader.rs (libloading),
+│                       #   registry.rs; entry symbol: parallax_plugin_descriptor; ABI version 1
+└── observability/      # metrics-rs helpers (parallax_* metric names), tracing spans
 ```
 
-### Unified Element System (Plan 05)
+Docs live in `docs/` (user guides + `docs/research/` for historical design notes); implementation plans in `plans/`.
 
-Parallax provides a simplified element API that eliminates adapter boilerplate:
+## Element System
+
+Two coexisting generations:
+
+**Legacy traits** (`element/traits.rs`) — most built-ins use these:
+- `Source::produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult>`
+- `Sink::consume(&mut self, ctx: &ConsumeContext) -> Result<()>`
+- `Element::process(&mut self, buffer: Buffer) -> Result<Option<Buffer>>` (1-to-0/1)
+- `Transform::transform(&mut self, buffer) -> Result<Output>` (multi-output; blanket impl for all `Element`)
+- `AsyncSource`/`AsyncSink`/`AsyncTransform` (async variants), `Demuxer` (1-to-N via `RoutedOutput`), `Muxer` (N-to-1 via `MuxerInput`), `SyncElement` (RT path)
+- Optional methods: `output_caps()`, `output_media_caps()`/`input_media_caps()`, `execution_hints()`, `flush()`, `handle_upstream_event()`/`handle_downstream_event()`, `is_seekable()`, `query_position()`/`query_duration()`, `flow_policy()`, `handle_flow_signal()`, `as_clock_provider()`
+- Adapters wrap author traits into the type-erased runtime trait: `SourceAdapter` (also `with_arena`/`with_pool`), `SinkAdapter`, `ElementAdapter`, `TransformAdapter`, `MuxerAdapter`, etc. → `DynAsyncElement` (dynosaur-generated)
+
+**Unified simple traits** (`element/pipeline_element.rs`) — no adapter boilerplate:
+- `SimpleSource::produce() -> Result<ProcessOutput>`, `SimpleSink::consume(&Buffer)`, `SimpleTransform::transform(Buffer) -> Result<ProcessOutput>`
+- Wrap in `Src(...)`, `Snk(...)`, `Xfm(...)` and pass to `pipeline.add_element(name, ...)`
+- `ProcessOutput::{None, Buffer(..), Buffers(..), Eos, Pending}`
+
+**ProduceResult** (pool-aware sources): `Produced(usize)` (wrote into ctx buffer), `Eos`, `OwnBuffer(Buffer)`, `OwnDmaBuf(DmaBufBuffer)`, `WouldBlock`.
+
+**ExecutionHints** `{ rt_safe, trust_level, crash_safe, uses_native_code, processing, latency, memory }` with profiles `ExecutionHints::rt_safe()`, `io_bound()`, `cpu_intensive()`, `low_latency()`, etc. There is **no `Affinity` type/`affinity()` method** — scheduling derives purely from hints.
+
+**Flush**: executor calls `flush()` repeatedly at EOS until it returns `None`/`Output::None` — implement it in encoders/muxers to drain buffered data.
+
+## Pipeline
+
+### Construction
 
 ```rust
-use parallax::element::{SimpleSource, SimpleSink, SimpleTransform, ProcessOutput};
-use parallax::element::{Src, Snk, Xfm};
-use parallax::pipeline::Pipeline;
-
-// Define a simple source
-struct Counter { count: u32, max: u32 }
-
-impl SimpleSource for Counter {
-    fn produce(&mut self) -> Result<ProcessOutput> {
-        if self.count >= self.max {
-            return Ok(ProcessOutput::Eos);
-        }
-        self.count += 1;
-        Ok(ProcessOutput::buffer(create_buffer(self.count)))
-    }
-}
-
-// Define a simple sink
-struct Logger;
-
-impl SimpleSink for Logger {
-    fn consume(&mut self, buffer: &Buffer) -> Result<()> {
-        println!("Received: {} bytes", buffer.len());
-        Ok(())
-    }
-}
-
-// Define a simple transform
-struct Doubler;
-
-impl SimpleTransform for Doubler {
-    fn transform(&mut self, buffer: Buffer) -> Result<ProcessOutput> {
-        // Transform and return
-        Ok(ProcessOutput::buffer(transformed))
-    }
-}
-
-// Use with Pipeline.add_element() - no adapters needed!
-let mut pipeline = Pipeline::new();
-let src = pipeline.add_element("src", Src(Counter { count: 0, max: 10 }));
-let xfm = pipeline.add_element("xfm", Xfm(Doubler));
-let sink = pipeline.add_element("sink", Snk(Logger));
-pipeline.link(src, xfm)?;
-pipeline.link(xfm, sink)?;
+let mut p = Pipeline::parse("filesrc location=in.bin ! passthrough ! filesink location=out.bin")?;
+// or
+let mut p = Pipeline::new();
+let src  = p.add_source("src", MySource);           // also: add_source_with_arena / _with_pool
+let xfm  = p.add_transform("xfm", MyTransform);     // add_filter for Element impls
+let sink = p.add_sink("sink", MySink);
+let el   = p.add_element("el", Src(MySimpleSource)); // unified API
+p.link(src, xfm)?;                                   // = link_pads(src,"src",xfm,"sink")
+p.link_pads(xfm, "src", sink, "sink")?;
 ```
 
-**Key types:**
-- `ProcessOutput` - Unified output enum (None, Buffer, Buffers, Eos, Pending)
-- `SimpleSource` - Trait for sync sources
-- `SimpleSink` - Trait for sync sinks
-- `SimpleTransform` - Trait for sync transforms
-- `Src<T>`, `Snk<T>`, `Xfm<T>` - Wrapper types implementing `PipelineElement`
-- `PipelineElementAdapter` - Bridge to legacy `AsyncElementDyn`
+- `get_element::<T>(name)` / `get_element_mut::<T>(name)` downcast by node name; `name=` in parse strings sets the name, otherwise `{factory}_{index}`.
+- Fluent alternative: `PipelineBuilder` (typestate; `source().then().tee(..).sink().build()`), see `pipeline/builder.rs`.
+- `add_node` is `pub(crate)` — never show it in docs/examples.
 
-See `examples/40_unified_elements.rs` for a complete example.
-
-### Key Types
-
-```rust
-// Execution hints for automatic strategy detection
-pub struct ExecutionHints {
-    pub trust_level: TrustLevel,      // Trusted, SemiTrusted, Untrusted
-    pub processing: ProcessingHint,    // CpuBound, IoBound, MemoryBound, Unknown
-    pub latency: LatencyHint,          // UltraLow, Low, Normal, Relaxed
-    pub crash_safe: bool,
-    pub uses_native_code: bool,
-    pub memory: MemoryHint,            // Normal, Low, High, Streaming
-}
-
-// Element affinity (for hybrid scheduling)
-pub enum Affinity {
-    Async,     // Always run in Tokio
-    RealTime,  // Always run in RT thread
-    Auto,      // Let scheduler decide based on is_rt_safe()
-}
-
-// Buffer production context (PipeWire-style zero-allocation)
-pub enum ProduceResult {
-    Produced(usize),   // Wrote n bytes to provided buffer
-    Eos,               // End of stream
-    OwnBuffer(Buffer), // Source provides its own buffer (fallback)
-    WouldBlock,        // No data available yet
-}
-
-pub struct ProduceContext<'a> { /* pre-allocated buffer slot */ }
-pub struct ConsumeContext<'a> { /* reference to buffer */ }
-
-// Element traits (sync)
-pub trait Source: Send {
-    fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult>;
-    fn preferred_buffer_size(&self) -> Option<usize> { None }
-    fn affinity(&self) -> Affinity { Affinity::Auto }
-    fn is_rt_safe(&self) -> bool { false }
-    fn execution_hints(&self) -> ExecutionHints { ExecutionHints::default() }
-}
-
-pub trait Sink: Send {
-    fn consume(&mut self, ctx: &ConsumeContext) -> Result<()>;
-    fn affinity(&self) -> Affinity { Affinity::Auto }
-    fn is_rt_safe(&self) -> bool { false }
-    fn execution_hints(&self) -> ExecutionHints { ExecutionHints::default() }
-}
-
-pub trait Element: Send {
-    fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>>;
-    fn flush(&mut self) -> Result<Option<Buffer>> { Ok(None) }  // Called at EOS
-    fn affinity(&self) -> Affinity { Affinity::Auto }
-    fn is_rt_safe(&self) -> bool { false }
-    fn execution_hints(&self) -> ExecutionHints { ExecutionHints::default() }
-}
-
-pub trait Transform: Send {
-    fn transform(&mut self, buffer: Buffer) -> Result<Output>;
-    fn flush(&mut self) -> Result<Output> { Ok(Output::None) }  // Called at EOS
-    fn affinity(&self) -> Affinity { Affinity::Auto }
-    fn is_rt_safe(&self) -> bool { false }
-    fn execution_hints(&self) -> ExecutionHints { ExecutionHints::default() }
-}
-
-// Codec traits for video encoders/decoders
-pub trait VideoEncoder: Send {
-    type Packet: AsRef<[u8]> + Send;
-    fn encode(&mut self, frame: &VideoFrame) -> Result<Vec<Self::Packet>>;
-    fn flush(&mut self) -> Result<Vec<Self::Packet>>;  // Drain buffered frames at EOS
-}
-
-pub trait VideoDecoder: Send {
-    fn decode(&mut self, packet: &[u8]) -> Result<Vec<VideoFrame>>;
-    fn flush(&mut self) -> Result<Vec<VideoFrame>>;  // Drain buffered frames at EOS
-}
-
-// EncoderElement/DecoderElement wrap codec traits for pipeline use
-let encoder = Rav1eEncoder::new(config)?;
-let element = EncoderElement::new(encoder, width, height);
-pipeline.add_node("enc", DynAsyncElement::new_box(TransformAdapter::new(element)));
-
-// Element traits (async - for I/O bound operations)
-pub trait AsyncSource: Send {
-    fn produce(&mut self, ctx: &mut ProduceContext<'_>) -> impl Future<Output = Result<ProduceResult>> + Send;
-    fn preferred_buffer_size(&self) -> Option<usize> { None }
-    fn affinity(&self) -> Affinity { Affinity::Async }  // Default to async
-    fn is_rt_safe(&self) -> bool { false }
-    fn execution_hints(&self) -> ExecutionHints { ExecutionHints::io_bound() }
-}
-
-pub trait AsyncSink: Send {
-    fn consume(&mut self, ctx: &ConsumeContext<'_>) -> impl Future<Output = Result<()>> + Send;
-    fn affinity(&self) -> Affinity { Affinity::Async }
-    fn is_rt_safe(&self) -> bool { false }
-    fn execution_hints(&self) -> ExecutionHints { ExecutionHints::io_bound() }
-}
-
-// Pipeline usage
-let mut pipeline = Pipeline::parse("videotestsrc ! h264enc ! filesink location=out.h264")?;
-pipeline.run().await?;
-```
-
-### Element Retrieval and Downcasting
-
-Like GStreamer's `gst_bin_get_by_name()`, Parallax supports retrieving and modifying elements after pipeline creation:
-
-```rust
-use parallax::pipeline::Pipeline;
-use parallax::elements::io::FileSrc;
-
-// Parse a pipeline with custom element names using name= property
-let mut pipeline = Pipeline::parse(
-    "filesrc name=source location=input.bin ! passthrough ! filesink name=output location=out.bin"
-)?;
-
-// Retrieve element by name and downcast to concrete type
-if let Some(source) = pipeline.get_element::<FileSrc>("source") {
-    println!("Reading from: {}", source.path());
-}
-
-// Mutable access for modifying properties
-if let Some(source) = pipeline.get_element_mut::<FileSrc>("source") {
-    *source = FileSrc::new("different_file.bin");
-}
-
-// Type-safe: wrong type returns None (no panic)
-let wrong = pipeline.get_element::<FileSrc>("output");  // Returns None (it's a FileSink)
-```
-
-**Element naming:**
-- Auto-generated: `{element_type}_{index}` (e.g., `filesrc_0`, `passthrough_1`)
-- Custom: Use `name=myname` property in pipeline string
-- Programmatic: Name is the first argument to `add_source()`, `add_filter()`, `add_sink()`
-
-See `examples/49_element_retrieval.rs` for a complete example.
-
-### Custom Metadata API
-
-Buffers can carry extensible typed metadata for domain-specific data like KLV, SEI NALUs, closed captions, or application-specific values.
-
-```rust
-use parallax::metadata::Metadata;
-
-let mut meta = Metadata::new();
-
-// Store and retrieve typed data (any Clone + Send + Sync + Debug + 'static type)
-meta.set("app/frame_id", 12345u64);
-meta.set("app/quality", 0.95f64);
-assert_eq!(meta.get::<u64>("app/frame_id"), Some(&12345));
-
-// Store custom structs
-#[derive(Clone, Debug)]
-struct GpsPosition { lat: f64, lon: f64 }
-meta.set("sensor/gps", GpsPosition { lat: 37.0, lon: -122.0 });
-
-// Convenience methods for raw bytes
-meta.set_bytes("h264/sei", vec![0x06, 0x05, 0x10]);
-assert_eq!(meta.get_bytes("h264/sei"), Some(&[0x06, 0x05, 0x10][..]));
-
-// KLV/STANAG metadata (common in defense/ISR applications)
-meta.set_klv(vec![0x06, 0x0E, 0x2B, 0x34, /* ... */]);
-assert!(meta.klv().is_some());
-
-// Mutate in place
-if let Some(count) = meta.get_mut::<u32>("app/count") {
-    *count += 1;
-}
-
-// Remove metadata
-let removed: Option<u64> = meta.remove("app/frame_id");
-```
-
-**Key namespaces** (use `"domain/type"` format to avoid collisions):
-- `stanag/*` - STANAG/MISB metadata (KLV, VMTI)
-- `h264/*`, `h265/*`, `av1/*` - Codec-specific (SEI, OBUs)
-- `caption/*` - Closed captions (CEA-608, CEA-708)
-- `audio/*` - Audio metadata (loudness, language)
-- `sensor/*` - Sensor data (GPS, IMU, gimbal)
-- `app/*` - Application-specific data
-
-See `examples/31_av1_pipeline_stanag.rs` for a complete example of attaching KLV metadata to video frames.
-
-### Multi-Format Caps Negotiation
-
-Elements can declare multiple supported formats with memory type coupling, and the pipeline automatically negotiates the best common format. This is inspired by GStreamer's GstCapsFeatures.
-
-**Key types:**
-- `ElementMediaCaps` - Holds multiple format+memory combinations, ordered by preference
-- `FormatMemoryCap` - Couples a format constraint with memory type constraints
-- `VideoFormatCaps`, `AudioFormatCaps` - Format constraints with ranges/lists for dimensions, pixel format, etc.
-
-```rust
-use parallax::format::{
-    CapsValue, ElementMediaCaps, FormatMemoryCap, MemoryCaps, PixelFormat, VideoFormatCaps,
-};
-
-// Declare multiple supported formats (e.g., for a camera source)
-impl Source for MyCamera {
-    fn output_media_caps(&self) -> ElementMediaCaps {
-        let yuyv = VideoFormatCaps {
-            width: CapsValue::Fixed(640),
-            height: CapsValue::Fixed(480),
-            pixel_format: CapsValue::Fixed(PixelFormat::Yuyv),
-            framerate: CapsValue::Any,
-        };
-        let rgb24 = VideoFormatCaps {
-            width: CapsValue::Fixed(640),
-            height: CapsValue::Fixed(480),
-            pixel_format: CapsValue::Fixed(PixelFormat::Rgb24),
-            framerate: CapsValue::Any,
-        };
-        
-        // Formats listed in preference order
-        ElementMediaCaps::new(vec![
-            FormatMemoryCap::new(yuyv.into(), MemoryCaps::cpu_only()),
-            FormatMemoryCap::new(rgb24.into(), MemoryCaps::cpu_only()),
-        ])
-    }
-}
-
-// Sink declares what it accepts
-impl Sink for MyDisplay {
-    fn input_media_caps(&self) -> ElementMediaCaps {
-        let rgba = VideoFormatCaps {
-            pixel_format: CapsValue::Fixed(PixelFormat::Rgba),
-            ..VideoFormatCaps::any()
-        };
-        ElementMediaCaps::new(vec![
-            FormatMemoryCap::new(rgba.into(), MemoryCaps::cpu_only()),
-        ])
-    }
-}
-```
-
-**Negotiation behavior:**
-- The solver iterates source formats against sink formats
-- Returns the first (highest preference) intersection
-- If no direct match, fails with helpful error message (default policy)
-- Error messages list all attempted format combinations and suggest adding explicit converters
-
-**Converter policy** (GStreamer-inspired explicit converters):
-```rust
-use parallax::pipeline::{Pipeline, ConverterPolicy};
-
-// Default: Deny - fails if formats don't match (recommended)
-pipeline.prepare()?;  // Error if converter needed
-
-// Option 1: Add explicit converters to your pipeline
-let pipeline = Pipeline::parse("camera ! videoconvert ! display")?;
-
-// Option 2: Allow auto-insertion for this prepare() call only
-pipeline.prepare_with_auto_converters()?;
-
-// Option 3: Change policy to allow auto-insertion
-pipeline.set_converter_policy(ConverterPolicy::Allow);
-pipeline.prepare()?;
-```
-
-See `examples/17_multi_format_caps.rs` and `examples/41_format_converters.rs` for examples.
-
-### Pipeline Bus & Messaging
-
-Parallax provides a GStreamer-inspired message bus for element-to-application communication.
-
-**Key types:**
-- `Bus` - Thread-safe message bus (MPSC + broadcast)
-- `BusHandle` - Cloneable sender for elements to post messages
-- `Message` - Timestamped message with source name and payload
-- `MessageKind` - Typed message variants (Error, Warning, Tag, QoS, Buffering, StateChanged, etc.)
-- `TagList` - Stream metadata (title, artist, bitrate, duration)
-
-```rust
-use parallax::pipeline::bus::{Bus, MessageKind};
-
-// Bus is created automatically with Pipeline
-let mut pipeline = Pipeline::new();
-
-// Elements post messages via BusHandle (set automatically by executor)
-// Application polls messages:
-if let Some(msg) = pipeline.take_bus().unwrap().poll() {
-    match msg.kind {
-        MessageKind::Eos => println!("End of stream"),
-        MessageKind::Error { error, .. } => eprintln!("Error: {error}"),
-        MessageKind::Tag { tags } => println!("Tags: {tags}"),
-        _ => {}
-    }
-}
-
-// Or wait asynchronously:
-let mut bus = pipeline.take_bus().unwrap();
-bus.wait_for_eos_or_error().await?;
-```
-
-**Async Stream support:** `Bus::into_stream()` returns a `BusStream` implementing `futures::Stream`, enabling `select!` and stream combinators:
-
-```rust
-use futures::StreamExt;
-
-// As a Stream (for select!, combinators)
-let mut stream = bus.into_stream();
-tokio::select! {
-    msg = stream.next() => { /* handle message */ }
-    _ = tokio::signal::ctrl_c() => { /* shutdown */ }
-}
-
-// Message-driven run loop (convenience)
-pipeline.run_with_bus(|msg| {
-    println!("[{}] {}", msg.source, msg.kind);
-    true // continue
-}).await?;
-```
-
-**Context integration:** `ProduceContext` and `ConsumeContext` carry an optional `BusHandle` with `post_message()` convenience method. Elements receive their handle via `set_bus()` during pipeline startup.
-
-See `examples/51_bus_messages.rs` for a complete example.
-
-### Seeking & Position Queries
-
-Parallax supports seeking, position/duration queries, and segment-based timestamp mapping.
-
-**Key types:**
-- `SeekEvent` - Seek request with rate, format, flags, position
-- `SegmentEvent` - Defines timestamp mapping after seek (rate, start, base)
-- `SeekableSource` - Trait for sources that support seeking
-- `PositionQuery`, `DurationQuery`, `SeekableQuery` - Query result types
-
-```rust
-use parallax::pipeline::Pipeline;
-use parallax::event::SegmentFormat;
-
-// Query whether seeking is supported
-let seekable = pipeline.query_seekable();
-if seekable.seekable {
-    // Seek to byte position
-    pipeline.seek_bytes(1024)?;
-
-    // Query current position
-    if let Some(pos) = pipeline.query_position() {
-        println!("Position: {:?} = {:?}", pos.format, pos.position);
-    }
-}
-```
-
-**Segment timestamp mapping:**
-```rust
-use parallax::event::SegmentEvent;
-use parallax::clock::ClockTime;
-
-// After seeking to 10s with 5s already played:
-let seg = SegmentEvent { start: 10_000_000_000, base: 5_000_000_000, rate: 1.0, .. };
-let running_time = seg.to_running_time(ClockTime::from_secs(12));  // → 7s
-let stream_time = seg.to_stream_time(ClockTime::from_secs(12));    // → 12s
-```
-
-**FileSrc** implements byte-based seeking via `Source::handle_upstream_event()`, `is_seekable()`, `query_position()`, and `query_duration()`.
-
-See `examples/52_seeking.rs` for a complete example.
-
-### Pad Probes
-
-Pad probes allow intercepting buffers and events at any point in the pipeline for inspection, filtering, or blocking.
-
-**Key types:**
-- `ProbeType` - What to intercept (BUFFER, EVENT_DOWN, EVENT_UP, BLOCK, IDLE)
-- `ProbeReturn` - What to do (Ok, Drop, Remove, Handled)
-- `ProbeData` - Data passed to callback (Buffer, Event, Idle)
-- `PadRef` - Reference to a specific pad on a node
-- `ProbeRegistry` - Thread-safe probe storage shared with executor
-
-```rust
-use parallax::pipeline::probe::{PadRef, ProbeType, ProbeReturn, ProbeData};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-
-let count = Arc::new(AtomicU64::new(0));
-let count_clone = count.clone();
-
-// Add buffer inspection probe on source's output pad
-let pad = PadRef::src(src_node_id);
-let probe_id = pipeline.add_probe(pad, ProbeType::BUFFER, move |data| {
-    if let ProbeData::Buffer(buf) = data {
-        count_clone.fetch_add(buf.len() as u64, Ordering::Relaxed);
-    }
-    ProbeReturn::Ok  // Pass through
-    // ProbeReturn::Drop    — drop this buffer
-    // ProbeReturn::Remove  — remove probe (one-shot)
-});
-
-// Remove probe when done
-pipeline.remove_probe(probe_id);
-```
-
-**Executor integration:** The executor invokes buffer probes before forwarding data downstream. Drop/Handled returns prevent the buffer from reaching downstream elements.
-
-See `examples/53_pad_probes.rs` for a complete example.
-
-### Tracer Framework
-
-Parallax provides a pluggable tracer framework for pipeline debugging and performance analysis, inspired by GStreamer's tracer subsystem.
-
-**Key types:**
-- `Tracer` trait — hook points for observing pipeline behavior
-- `TracerRegistry` — thread-safe registry shared with executor
-- `LatencyTracer` — per-element processing time (min/avg/max)
-- `FramerateTracer` — actual buffers/sec at each element
-- `DropTracer` — counts dropped buffers per element
-
-```bash
-# Activate tracers via environment variable
-PARALLAX_TRACERS="latency;framerate;drops" ./my_pipeline
-
-# Auto-dump DOT graphs on state transitions
-PARALLAX_DOT_DIR=/tmp/dots ./my_pipeline
-```
-
-```rust
-use parallax::pipeline::tracer::{TracerRegistry, LatencyTracer};
-
-// Programmatic activation
-let registry = TracerRegistry::new();
-registry.add(Box::new(LatencyTracer::new()));
-pipeline.set_tracer_registry(registry.clone());
-
-// After pipeline run, collect reports
-for (name, report) in registry.reports() {
-    println!("{name}:\n{report}");
-}
-
-// Pipeline stats snapshot
-let stats = pipeline.stats_snapshot();
-println!("{} elements, {} links", stats.element_count, stats.link_count);
-```
-
-See `examples/54_tracers.rs` for a complete example.
-
-## Implementation Roadmap
-
-See `docs/design.md` for full details.
-
-| Phase | Focus | Status |
-|-------|-------|--------|
-| 1 | Memory Foundation (SharedArena) | Complete |
-| 2 | Caps Negotiation (global constraint solving) | Complete |
-| 3 | Cross-Process IPC (IpcSrc/IpcSink) | Complete |
-| 4 | GPU Integration (Vulkan Video) | Planned |
-| 5 | Pure Rust Codecs | Partial (audio/image complete, video AV1 ready) |
-| 7 | Plugin System (C-compatible ABI) | Complete |
-| 8 | Distribution (Zenoh) | Complete |
-| 9 | Hybrid Scheduling (PipeWire-inspired) | Complete |
-| 10 | Unified Executor (automatic strategy) | Complete |
-| 11 | Device Support (V4L2, PipeWire, ALSA, libcamera) | Complete |
-| 18 | Pipeline Bus & Messaging | Complete |
-| 19 | Seeking, Position Queries & Trick Modes | Complete |
-| 20 | Pad Probes & Dynamic Reconfiguration | Complete |
-| 21 | Debugging & Inspection Tools (Tracers) | Complete |
-| 22 | Auto-Plugging & Typefinding | Complete |
-| 23 | Network Buffering Strategies (Queue2) | Complete |
-
-## Code Style Guidelines
-
-- Use `rustfmt` defaults
-- Prefer `thiserror` for error types
-- Use `tracing` for logging/instrumentation
-- Derive `rkyv::Archive`, `rkyv::Serialize`, `rkyv::Deserialize` for IPC types
-- Keep element `process()` sync; async only for I/O
-- Document public APIs with examples
-- Write tests for each module
-
-## Testing
-
-```bash
-just test              # Run all tests with nextest
-just test-one NAME     # Run specific test
-just test-verbose      # Run with output capture disabled
-just watch             # Auto-run on changes
-```
-
-## Pipeline Deployment Modes
-
-### Single Binary (gst-launch equivalent)
-```bash
-parallax-launch "videotestsrc ! h264enc ! filesink location=out.h264"
-```
-
-### Multi-Binary (federated pipelines)
-```rust
-// Binary A
-Pipeline::parse("v4l2src ! ipc_sink path=/run/parallax/camera")?;
-
-// Binary B
-Pipeline::parse("ipc_src path=/run/parallax/camera ! encoder ! zenoh_pub key=video")?;
-```
-
-### Cross-Machine (Zenoh)
-```rust
-// Machine A
-Pipeline::parse("camera ! zenoh_pub key=factory/camera/1")?;
-
-// Machine B
-Pipeline::parse("zenoh_sub key=factory/camera/1 ! display")?;
-```
-
-## Media Codecs
-
-Parallax includes feature-gated media codecs prioritizing **pure Rust implementations** for security and portability.
-
-### Codec Feature Flags
-
-```toml
-[dependencies]
-# Video codecs
-parallax = { version = "0.1", features = ["h264"] }        # H.264 encoder/decoder (OpenH264)
-parallax = { version = "0.1", features = ["av1-encode"] }  # AV1 encoder (rav1e, pure Rust)
-parallax = { version = "0.1", features = ["av1-decode"] }  # AV1 decoder (dav1d, C library)
-
-# Audio codecs - Decoders (pure Rust via Symphonia)
-parallax = { version = "0.1", features = ["audio-codecs"] }  # All: FLAC, MP3, AAC, Vorbis
-parallax = { version = "0.1", features = ["audio-flac"] }    # FLAC only
-parallax = { version = "0.1", features = ["audio-mp3"] }     # MP3 only
-parallax = { version = "0.1", features = ["audio-aac"] }     # AAC decoder only
-parallax = { version = "0.1", features = ["audio-vorbis"] }  # Vorbis only
-
-# Audio codecs - Encoders (requires system libraries)
-parallax = { version = "0.1", features = ["opus"] }          # Opus encoder/decoder (needs libopus)
-parallax = { version = "0.1", features = ["aac-encode"] }    # AAC encoder (FDK-AAC, license restrictions)
-
-# Image codecs (all pure Rust)
-parallax = { version = "0.1", features = ["image-codecs"] }  # All: JPEG, PNG
-parallax = { version = "0.1", features = ["image-jpeg"] }    # JPEG decoder (zune-jpeg)
-parallax = { version = "0.1", features = ["image-png"] }     # PNG encoder/decoder (png crate)
-
-# Container formats (all pure Rust)
-parallax = { version = "0.1", features = ["mp4-demux"] }     # MP4 demuxer/muxer
-parallax = { version = "0.1", features = ["mpeg-ts"] }       # MPEG-TS demuxer
-```
-
-### Codec Summary
-
-| Type | Codec | Feature | Crate | Pure Rust | Notes |
-|------|-------|---------|-------|-----------|-------|
-| Video | H.264 | `h264` | openh264 | No | Requires C++ compiler (g++) |
-| Video | AV1 encode | `av1-encode` | rav1e | Yes | Install nasm for SIMD optimizations |
-| Video | AV1 decode | `av1-decode` | dav1d | No | Requires libdav1d system library |
-| Audio | Opus | `opus` | opus | No | Enc/Dec, requires libopus |
-| Audio | AAC encode | `aac-encode` | fdk-aac | No | **License restrictions** |
-| Audio | FLAC | `audio-flac` | symphonia | Yes | Decoder, lossless audio |
-| Audio | MP3 | `audio-mp3` | symphonia | Yes | Decoder, common lossy format |
-| Audio | AAC decode | `audio-aac` | symphonia | Yes | Decoder, common in video containers |
-| Audio | Vorbis | `audio-vorbis` | symphonia | Yes | Decoder, open source lossy format |
-| Image | JPEG | `image-jpeg` | zune-jpeg | Yes | Decoder only |
-| Image | PNG | `image-png` | png | Yes | Encoder and decoder |
-| Container | MP4 | `mp4-demux` | mp4 | Yes | Demuxer and muxer |
-| Container | MPEG-TS | `mpeg-ts` | mpeg2ts-reader | Yes | Demuxer only |
-
-### Build Dependencies
-
-Most codecs are pure Rust with no external dependencies. Exceptions:
-
-- **opus**: Requires `opus-devel` (Fedora) / `libopus-dev` (Debian)
-- **aac-encode**: Requires `fdk-aac-devel` (Fedora, from RPM Fusion) / `libfdk-aac-dev` (Debian). **Note: FDK-AAC has license restrictions for commercial use.**
-- **av1-encode**: Optionally install `nasm` for x86_64 SIMD optimizations
-- **av1-decode**: Requires `libdav1d-devel` (Fedora) / `libdav1d-dev` (Debian)
-
-### Audio Codec Traits
-
-Parallax provides generic traits for audio encoding/decoding:
-
-```rust
-use parallax::elements::codec::{AudioEncoder, AudioDecoder, AudioSamples};
-
-// AudioEncoder trait
-pub trait AudioEncoder: Send {
-    type Packet: AsRef<[u8]> + Send;
-    fn encode(&mut self, samples: &AudioSamples) -> Result<Vec<Self::Packet>>;
-    fn flush(&mut self) -> Result<Vec<Self::Packet>>;
-    fn frame_size(&self) -> Option<usize>;
-    fn output_sample_rate(&self) -> u32;
-    fn output_channels(&self) -> u32;
-}
-
-// AudioDecoder trait
-pub trait AudioDecoder: Send {
-    fn decode(&mut self, packet: &[u8]) -> Result<AudioSamples>;
-    fn flush(&mut self) -> Result<Option<AudioSamples>>;
-    fn output_sample_rate(&self) -> u32;
-    fn output_channels(&self) -> u32;
-}
-```
-
-### Opus Codec Example
-
-```rust
-use parallax::elements::codec::{
-    AudioEncoder, AudioDecoder, AudioSamples, 
-    OpusEncoder, OpusDecoder, OpusApplication
-};
-
-// Create encoder for music at 128 kbps
-let mut encoder = OpusEncoder::new(48000, 2, 128000, OpusApplication::Audio)?;
-
-// Create decoder
-let mut decoder = OpusDecoder::new(48000, 2)?;
-
-// Encode samples (must be 960 samples per channel for 20ms frames at 48kHz)
-let samples = AudioSamples::from_s16(&pcm_data, 2, 48000);
-let packets = encoder.encode(&samples)?;
-
-// Decode packets
-for packet in packets {
-    let decoded = decoder.decode(packet.as_ref())?;
-}
-```
-
-**Opus frame sizes at 48kHz:** 120 (2.5ms), 240 (5ms), 480 (10ms), 960 (20ms), 1920 (40ms), 2880 (60ms)
-
-## SIMD Color Conversion
-
-Parallax provides SIMD-accelerated colorspace conversion via the `simd-colorspace` feature.
-
-### Feature Flag
-
-```toml
-[dependencies]
-parallax = { version = "0.1", features = ["simd-colorspace"] }
-```
-
-### Performance
-
-When enabled, the `yuv` crate provides AVX-512, AVX2, SSE4.1, and NEON acceleration
-for YUV ↔ RGB conversions. Performance matches or exceeds libyuv. Runtime CPU
-feature detection selects the optimal path automatically.
-
-| Conversion | 1080p SIMD | Notes |
-|------------|------------|-------|
-| I420 → RGBA | ~0.9ms | ~3.3 GiB/s throughput |
-| RGBA → I420 | ~1.1ms | Balanced quality mode |
-| NV12 → RGBA | ~0.9ms | Hardware decoder output |
-| YUYV → RGBA | ~0.8ms | Common webcam format |
-
-### Supported Conversions
-
-**YUV → RGB (SIMD-accelerated):**
-- I420 → RGB24, RGBA, BGR24, BGRA
-- NV12 → RGB24, RGBA, BGR24, BGRA  
-- YUYV → RGB24, RGBA, BGR24, BGRA
-- UYVY → RGB24, RGBA
-
-**RGB → YUV (SIMD-accelerated):**
-- RGB24, RGBA, BGR24, BGRA → I420
-- RGB24, RGBA, BGR24, BGRA → NV12
-
-### Usage
-
-```rust
-use parallax::converters::{VideoConvert, PixelFormat};
-
-// SIMD is used automatically when the feature is enabled
-let converter = VideoConvert::new(
-    PixelFormat::I420,
-    PixelFormat::Rgba,
-    1920, 1080
-)?;
-
-converter.convert(&yuv_input, &mut rgba_output)?;
-```
-
-### Memory Alignment
-
-For optimal SIMD performance, buffers should be aligned:
-- SSE: 16-byte alignment
-- AVX/AVX2: 32-byte alignment
-- AVX-512: 64-byte alignment
-
-Use `MemoryLayout::AVX` in caps negotiation to request aligned buffers:
-
-```rust
-use parallax::format::{VideoFormatCaps, MemoryLayout};
-
-let caps = VideoFormatCaps::any().with_layout(MemoryLayout::AVX);
-```
-
-### Benchmarking
-
-```bash
-# Run SIMD benchmarks
-cargo bench --features simd-colorspace --bench colorspace
-
-# Compare with scalar (no feature)
-cargo bench --bench colorspace
-```
-
-## Device Support
-
-Parallax provides feature-gated device elements for hardware capture and output.
-
-### Device Feature Flags
-
-```toml
-[dependencies]
-# Video capture
-parallax = { version = "0.1", features = ["v4l2"] }           # V4L2 camera capture (Linux)
-parallax = { version = "0.1", features = ["libcamera"] }      # libcamera capture (Linux)
-parallax = { version = "0.1", features = ["screen-capture"] } # Screen capture via XDG portal
-
-# Audio capture/playback
-parallax = { version = "0.1", features = ["pipewire"] }       # PipeWire audio (Linux)
-parallax = { version = "0.1", features = ["alsa"] }           # ALSA audio (Linux)
-```
-
-### Device Summary
-
-| Type | Device | Feature | Crate | Notes |
-|------|--------|---------|-------|-------|
-| Video | V4L2 | `v4l2` | v4l | Linux video capture, DMA-BUF export |
-| Video | libcamera | `libcamera` | libcamera | Modern camera API |
-| Video | Screen | `screen-capture` | ashpd | XDG portal screen capture |
-| Audio | PipeWire | `pipewire` | pipewire-rs | Modern Linux audio |
-| Audio | ALSA | `alsa` | alsa-rs | Direct ALSA access |
-
-### Build Dependencies
-
-- **v4l2**: Requires `v4l-utils-devel` (Fedora) / `libv4l-dev` (Debian)
-- **libcamera**: Requires `libcamera-devel` (Fedora) / `libcamera-dev` (Debian)
-- **pipewire**: Requires `pipewire-devel` (Fedora) / `libpipewire-0.3-dev` (Debian)
-- **alsa**: Requires `alsa-lib-devel` (Fedora) / `libasound2-dev` (Debian)
-
-### DMA-BUF Export (Zero-Copy GPU Path)
-
-V4L2 sources can export buffers as DMA-BUF file descriptors for zero-copy
-integration with GPU pipelines:
-
-```rust
-use parallax::elements::device::{V4l2Src, V4l2Config};
-
-let config = V4l2Config {
-    dmabuf_export: true,  // Export via VIDIOC_EXPBUF
-    ..Default::default()
-};
-let camera = V4l2Src::with_config("/dev/video0", config)?;
-
-// Camera now declares DmaBuf as preferred memory type
-// Pipeline will automatically select DMA-BUF path when downstream supports it
-```
-
-The caps negotiation system automatically selects the best memory type:
-- If sink prefers DmaBuf and source offers it -> zero-copy DMA-BUF path
-- If sink only accepts CPU -> fallback to mmap with copy
-
-**Key types for DMA-BUF support:**
-
-| Type | Description |
-|------|-------------|
-| `DmaBufSegment` | Memory segment backed by DMA-BUF file descriptor |
-| `DmaBufBuffer` | Buffer wrapping a DmaBufSegment with metadata |
-| `MemoryCaps::dmabuf_only()` | Accept only DMA-BUF memory |
-| `MemoryCaps::dmabuf_preferred()` | Prefer DMA-BUF, fall back to CPU |
-| `ProduceResult::OwnDmaBuf` | Return a DmaBufBuffer from a source |
-
-**Example: DMA-BUF negotiation**
-
-```rust
-// Source declares multiple memory types (DmaBuf preferred)
-fn output_media_caps(&self) -> ElementMediaCaps {
-    ElementMediaCaps::new(vec![
-        FormatMemoryCap::new(format.into(), MemoryCaps::dmabuf_only()),  // Preferred
-        FormatMemoryCap::new(format.into(), MemoryCaps::cpu_only()),     // Fallback
-    ])
-}
-
-// Sink declares what it accepts
-fn input_media_caps(&self) -> ElementMediaCaps {
-    ElementMediaCaps::new(vec![
-        FormatMemoryCap::new(VideoFormatCaps::any().into(), MemoryCaps::dmabuf_only()),
-        FormatMemoryCap::new(VideoFormatCaps::any().into(), MemoryCaps::cpu_only()),
-    ])
-}
-
-// Pipeline negotiation picks DmaBuf (first common match)
-```
-
-See `examples/45_dmabuf_negotiation.rs` for a complete example.
-
-## Performance Notes
-
-- Buffer cloning is O(1) (Arc increment)
-- Pool slot acquire/release is O(1) amortized (atomic bitmap)
-- All CPU memory is memfd-backed (zero overhead vs malloc, always IPC-ready)
-- Cross-process is true zero-copy (same physical pages via mmap)
-- Arena allocation: 1 fd per pool, not per buffer (avoids fd limits)
-- SharedArena: Cross-process refcounting with O(1) release via lock-free MPSC queue
-- BufferPool: Pipeline-level pooling with natural backpressure when exhausted
-
-## Documentation
-
-- `docs/design.md` - Complete design document and competitive analysis
-- `docs/architecture.md` - High-level architecture overview
-- `docs/api.md` - API reference
-- `docs/memory.md` - Memory management details
-- `docs/plugins.md` - Plugin development guide
-- `docs/security.md` - Security model
-- `docs/getting-started.md` - Quick start guide
+### Parse grammar (IMPORTANT limitations)
+
+- Strictly **linear chains**: `elem prop=val ! elem ...`. NO caps filters, NO tee branching (`t. !`), NO bins. Fan-out requires the programmatic API.
+- Property values: quoted strings, bare words, ints, floats, bools (`true/false/yes/no`).
+- Registered factory names (only these work in `parse`): `nullsource`, `nullsink`, `passthrough`, `tee`, `filesrc`, `filesink`, `videoconvert`, `videotestsrc`, + `autovideosink` [display], `v4l2src` [v4l2]. Extendable via `ElementFactory::with_plugin_registry`. Do NOT write doc examples with unregistered names like `decoder`, `audiosrc`, `h264enc`.
+
+### States (PipeWire-inspired)
+
+`Suspended <-> Idle <-> Running`, plus `Error` (recover via Suspended).
+`prepare()` (validate+negotiate+allocate; converter policy applies), `activate()`, `pause()`, `suspend()`. `run()`/`start()` auto-prepare from Suspended.
+
+### Execution
+
+- `pipeline.run().await` — run to completion. `pipeline.run_with_bus(|msg| bool).await` — with message handler.
+- `Executor::with_config(cfg)`; **`executor.start(&mut p)` is SYNC** and returns `PipelineHandle`; `handle.wait().await`. Only `executor.run()` is async. Never write `executor.start(...).await`.
+- `ExecutorConfig { scheduling: SchedulingMode::{Async|Hybrid|RealTime}, auto_strategy: bool (default true), channel_capacity, rt: RtConfig{quantum, rt_priority, data_threads, bridge_capacity}, driver }`. Presets: `low_latency_audio()`, `video(fps)`, `hybrid()`.
+- **`ElementStrategy` has exactly two variants: `Async` and `RealTime`.** Auto rule: `rt_safe && latency ∈ {UltraLow, Low}` → RealTime; else Async. `trust_level`/`uses_native_code` are currently IGNORED (process isolation was removed in commit da6df59 — never document an "isolated process" strategy).
+- Hybrid mode: `RtScheduler::partition_graph` splits nodes, boundary edges get `AsyncRtBridge` (lock-free SPSC + eventfd), RT threads use PipeWire-style `ActivationRecord`s, paced by `TimerDriver`/`ManualDriver`.
+- `SchedulingMode::RealTime` with zero RT-safe nodes silently falls back to fully-async (does not error).
+
+### Bus & events
+
+- `Bus`/`BusHandle`; `MessageKind::{StateChanged, Eos, Error, Warning, Info, Tag, DurationChanged, StreamCollection, Qos, LatencyChanged, Buffering, AsyncStart, AsyncDone, ClockLost, NewClock, SeekDone, Element, Application}`.
+- Consume: `bus.poll()`, `bus.next().await`, `bus.subscribe()` (broadcast), `bus.into_stream()` (`futures::Stream`, works with `select!`), `bus.wait_for_eos_or_error().await`.
+- Separate typed event channel: `PipelineHandle::subscribe() -> EventReceiver` (`pipeline/events.rs`) — distinct from the bus.
+- In-band events (`src/event/`): downstream `StreamStart/Segment/Tags/Eos/CapsChanged/Gap`, upstream `Seek/Qos/LatencyQuery`, bidirectional `FlushStart/FlushStop/Custom`; `PipelineItem::{Buffer, Event}` keeps ordering through channels.
+
+### Seeking / probes / tracers / typefind / flow control
+
+- Seek: `pipeline.query_seekable()/query_position()/query_duration()`, `seek_bytes(u64)`, `seek_time(ClockTime)`, `seek(&SeekEvent)`. `SegmentEvent::to_running_time/to_stream_time` for timestamp mapping. FileSrc implements `SeekableSource`.
+- Probes: `pipeline.add_probe(PadRef::src(node), ProbeType::BUFFER, |data| ProbeReturn::Ok)`; types `BUFFER, EVENT_DOWN, EVENT_UP, EVENT_FLUSH, BLOCK, IDLE`; returns `Ok/Drop/Remove/Handled`.
+- Tracers: `TracerRegistry` + `LatencyTracer`/`FramerateTracer`/`DropTracer`; env `PARALLAX_TRACERS="latency;framerate;drops"`; DOT dumps via `PARALLAX_DOT_DIR`; `pipeline.to_dot()`/`to_json()`; `pipeline.stats_snapshot()`.
+- Typefind: `TypeFindRegistry::with_builtins()`, `detect(&bytes)`, `detect_from_extension`, `detect_with_fallback`.
+- Flow control (`pipeline/flow.rs`): `FlowSignal::{Ready,Busy,Drop,EosAck,Pausing,Stopping}`, `FlowPolicy::{Block, Drop{..}, RingBuffer{..}, Adaptive{..}}`, `FlowStateHandle`, `WaterMarks`. Queue element: `Queue::new(n).with_flow_control()/.with_water_marks(wm)`, `queue.flow_state_handle()`; live sources accept `set_flow_state(handle)` and check `should_produce()`.
+- `Queue2` (elements/flow): `Queue2::stream(bytes)`, `::download(path, total)`, `::timeshift(path, bytes)`, `.with_watermarks(low, high)`; posts `MessageKind::Buffering`.
+
+## Memory Model
+
+- `SharedArena::new(slot_size, slot_count)` — memfd + MAP_SHARED. Layout: `ArenaHeader (64B) | ReleaseQueue (MPSC ring, 1024 entries) | SlotHeader[N] (8B: refcount+state atomics) | SlotData[N]`.
+- `arena.acquire() -> Option<SharedSlotRef>` (owner only), `slot.ipc_ref() -> SharedIpcSlotRef` (rkyv-serializable), `unsafe SharedArena::from_fd(fd)` / `SharedArenaCache::map_arena` (client), `arena.reclaim()` drains released slots O(k).
+- `FixedBufferPool::new(buffer_size, count) -> Result<Arc<Self>>`; `acquire()` blocks (condvar backpressure), `try_acquire()`, `PooledBuffer` returns slot on drop or `into_buffer()` detaches. Sources use `ctx.acquire_buffer()` inside `produce()`.
+- `Buffer<T=()>` = `MemoryHandle` (slot+offset+len) + `Metadata`; clone = atomic increment; `slice()` = zero-copy sub-buffer.
+- `Metadata`: fields `pts/dts/duration: ClockTime`, `sequence`, `stream_id`, `flags: BufferFlags`, `rtp`, `format`, `offset`; typed custom map `set/get/get_mut/remove` with `&'static str` keys (`"domain/type"` convention: `stanag/*`, `h264/*`, `app/*`, …); helpers `set_bytes/get_bytes`, `set_klv()/klv()`, `set_sei()/sei()`. Transforms MUST clone/propagate metadata or PTS is lost.
+- DMA-BUF: `DmaBufSegment::from_fd`, `DmaBufBuffer`, `ProduceResult::OwnDmaBuf`; V4L2 exports via `dmabuf_export: true` config.
+- IPC helpers: `memory::ipc::{send_fds, recv_fds, send_segment_handle, recv_segment_handle}` (SCM_RIGHTS, max 4 fds/message).
+
+## Caps & Negotiation
+
+- Constraint model: `CapsValue<T>::{Fixed, Range, List, Any}`; `VideoFormatCaps`/`AudioFormatCaps` → `FormatCaps`; `MemoryCaps` (`cpu_only()`, `dmabuf_only()`, `dmabuf_preferred()`, `any()`); pair = `FormatMemoryCap`; element declares preference-ordered `ElementMediaCaps` via `output_media_caps()`/`input_media_caps()`.
+- Solver (`negotiation/solver.rs`) negotiates **per link, first intersection wins** (NOT a global constraint solver despite older docs); converter search is single-hop.
+- `ConverterPolicy::{Deny (default), Warn, Allow}`; `pipeline.prepare()` fails with a helpful error under Deny; `prepare_with_auto_converters()` = Warn; `set_converter_policy(...)`.
+- `MemoryLayout::{NONE, SSE, AVX, AVX512}` requests aligned buffers (arena constructors `new_avx`/`new_avx512`).
+
+## Clock System
+
+- `ClockTime` — ns, `ZERO`/`MAX`/`NONE` sentinels, saturating+NONE-propagating arithmetic.
+- `Clock` trait (`now/flags/resolution/name`), `SystemClock` (monotonic), `PipelineClock` (base_time; `running_time()`, async `wait_until/wait_for`).
+- `ClockProvider::{provide_clock, clock_priority}` — priority bands: 0–99 software, 100–199 hardware audio, 200–299 network, 300+ PTP.
+- **Automatic selection**: executor calls `pipeline.select_clock()` before start — highest-priority element-provided clock wins (e.g. `AlsaSink` provides a hardware clock at priority 100). Manual override: `set_clock`/`use_clock_from`.
+- Sources read the clock via `ctx.clock()` / `ctx.running_time()` in `produce()`.
+
+## Codecs & Devices (feature-gated)
+
+| What | Types | Feature |
+|------|-------|---------|
+| H.264 | `H264Encoder`/`H264Decoder` (implement `Element` directly) | `h264` |
+| AV1 | `Rav1eEncoder` (impl `VideoEncoder`, wrap in `EncoderElement::new(enc, w, h)`), `Dav1dDecoder` (impl `Element`) | `av1-encode` / `av1-decode` |
+| Audio dec | `SymphoniaDecoder` (impl `Element`) | `audio-flac/mp3/aac/vorbis` |
+| Opus | `OpusEncoder::new(rate, ch, bitrate, OpusApplication)` / `OpusDecoder` (impl `AudioEncoder`/`AudioDecoder`, wrap in `AudioEncoderElement`/`AudioDecoderElement`) | `opus` |
+| AAC enc | `AacEncoder` | `aac-encode` (FDK license!) |
+| Images | `JpegDecoder`, `PngEncoder`/`PngDecoder` | `image-*` |
+| Containers | `TsMux`/`TsMuxElement`/`TsDemux` [`mpeg-ts`], `Mp4Mux`/`Mp4FileSink`/`Mp4Demux` [`mp4-demux`] | |
+| RTP | `RtpSrc/Sink`, `RtpH264Pay/Depay`, H265/VP8/VP9 pay/depay, `RtpOpusDepay` (no Opus pay), `RtpJitterBuffer`, `RtcpHandler` | `rtp` |
+| RTSP | `RtspSrc` (client only, via retina) | `rtsp` |
+| HLS/DASH | `HlsSink`, `DashSink` (+ configs) — NOT feature-gated | — |
+| Devices | `V4l2Src` (DMA-BUF export), `LibCameraSrc`, `PipeWireSrc/Sink`, `ScreenCaptureSrc`, `AlsaSrc/Sink` (clock provider) | `v4l2`/`libcamera`/`pipewire`/`screen-capture`/`alsa` |
+| KLV | `KlvEncoder`, `StanagMetadataBuilder` (elements/metadata) | — |
+
+Codec traits: `VideoEncoder`/`VideoDecoder`, `AudioEncoder`/`AudioDecoder` (with `flush()` to drain at EOS). Note the inconsistency: some codecs implement the traits (rav1e, opus, aac), others implement `Element` directly (openh264, dav1d, symphonia).
+
+Muxer sync: `MuxerSyncState`/`MuxerSyncConfig::new().with_mode(SyncMode::{Auto|Strict|Loose|Timed}).with_interval_ms(..)`, `PadInfo::new(name, StreamType).required()/.optional()`; `TsMuxConfig::new().add_track(TsMuxTrack::new(pid, TsMuxStreamType::H264).video())`.
+
+## Plugin System
+
+- ABI: `PluginDescriptor`/`ElementDescriptor` (`#[repr(C)]`), `PARALLAX_ABI_VERSION = 1`, entry symbol `parallax_plugin_descriptor`, loaded with libloading. Element instances cross the boundary as double-boxed `DynAsyncElement` raw pointers.
+- Authoring: `define_plugin!` macro_rules (uses `paste`; what `examples/example-plugin` uses) or `parallax-macros` proc-macros (`#[pipeline_element(...)]` + `plugin!{}`, feature `macros`).
+- `PluginLoader::load_from_path` (unsafe) validates ABI version + descriptor; `PluginRegistry` indexes elements and can back `Pipeline::parse` names.
+- Search paths for `load_by_name`: `.`, `/usr/lib/parallax/plugins`, `/usr/local/lib/parallax/plugins`.
+
+## Observability
+
+- Metrics: `observability::metrics` — `init_metrics()`, `ElementMetrics`, `PipelineMetrics`, metric names `parallax_buffers_*`, `parallax_bytes_*`, `parallax_processing_time_ns`, etc.
+- Tracing: `observability::tracing_support` (`TracingConfig`, span helpers).
+- Env vars: `PARALLAX_TRACERS` (tracer activation), `PARALLAX_DOT_DIR` (DOT dumps on state transitions).
+
+## Gotchas & Pitfalls (read before writing code or docs)
+
+1. **No process isolation.** Removed in da6df59. `ElementStrategy` = Async|RealTime only. Old docs mentioning `run_isolated`, `ElementSandbox`, "isolated process" strategy, or `src/execution/` are describing deleted code.
+2. **Two `PixelFormat` enums**: `format::PixelFormat` (15 variants, caps) vs `converters::PixelFormat` (9 variants, actual conversion). Not interchangeable. Same for `SampleFormat` (`format::` vs `converters::audio::`).
+3. **`negotiation::builtin` converter types are passthrough STUBS** sharing names (`VideoConvert`, `AudioConvert`, …) with the REAL implementations in `src/converters/`. `builtin_registry()` wires the real element wrappers (`VideoConvertElement`, etc.).
+4. **`temporal::Timestamp` ≠ `clock::ClockTime`** — separate types, no conversion provided. Typed temporal joins use `Timestamp`; buffers/events use `ClockTime`.
+5. **`typed::merge` is 2-source alternating interleave**, not N-way funnel. `typed::run_async` is `spawn_blocking` around the sync loop, not native async.
+6. **`Executor::start` is sync**; only `run()` is async.
+7. **`SharedArena::from_fd` assumes 64-byte slot stride** — arenas created with `new_avx` (32-byte alignment) will be mis-indexed by a client mapping them. Known latent bug; don't advertise cross-process AVX-32 arenas.
+8. **`HugePageSegment::ipc_handle()` returns `None`** even though `MemoryType::HugePages.supports_ipc()` claims true — huge-page arenas are not currently fd-shareable.
+9. **Vulkan Video (`vulkan-video`) is a scaffold**: context/session/DPB/DMA-BUF memory are real, but `VulkanH264Decoder::decode_frame` does NOT submit hardware decode commands; no encode; H.265/AV1 absent. The `gpu` feature flag is an empty placeholder.
+10. **Examples 42/43/44 (pipewire/alsa/libcamera) are not `required-features`-gated** — they compile with default features via internal `#[cfg]` stubs; device examples 22/23/24 use `required-features` instead.
+11. **benches/memory_pool.rs and benches/throughput.rs are stubs** (pending rewrite after a memory-API refactor); only `colorspace` is a real bench.
+12. **`AlignmentStrategy::Interpolate` falls back to `Nearest(10ms)`** — not actually implemented.
+13. Types that do NOT exist (stale docs may mention them): `CpuArena`, `HeapSegment`, `MemoryPool`, `SharedMemorySegment`, `PipelineExecutor`, `ElementSandbox`, `Affinity`, `parallax-launch`/`parallax-inspect`/`parallax-top` binaries.
+
+## Code Style
+
+- rustfmt defaults; `#![warn(missing_docs)]` is enforced — every public item needs a doc comment.
+- thiserror for errors; tracing for logs; keep element `process()` sync (async only for real I/O).
+- Derive rkyv traits for IPC-crossing types.
+- Tests colocated per module + integration tests in `tests/`; run `just check` before committing.
+
+## Documentation Map
+
+- `docs/README.md` — index
+- `docs/getting-started.md`, `architecture.md`, `pipeline.md`, `scheduling.md`, `memory.md`, `elements.md`, `formats.md`, `plugins.md`, `api.md`, `security.md` — user guides
+- `docs/design.md` — design rationale + competitive landscape
+- `docs/research/` — historical research/design notes (may describe superseded designs)
+- `plans/` — active implementation plans (`plans/README.md` for status)

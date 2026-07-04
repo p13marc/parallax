@@ -1,569 +1,400 @@
 # Parallax
 
-A Rust-native streaming pipeline engine with zero-copy multi-process support.
+A Rust-native streaming pipeline engine with zero-copy, multi-process shared memory at its core.
 
-Parallax provides both dynamic (runtime-configured) and typed (compile-time safe) pipeline construction, with buffers backed by shared memory for efficient multi-process communication.
+Parallax lets you build media and data pipelines the way GStreamer does — sources, transforms, sinks, connected into a graph — but with a design that is Rust-first throughout: memfd-backed buffers that are always ready for cross-process sharing, reference counts stored *in* shared memory so they work across processes, a hybrid Tokio + real-time-thread executor inspired by PipeWire, and a typed pipeline API with compile-time type checking.
 
-## Features
+> **Status:** Parallax is a young project (v0.1, pre-release). The core engine — memory, pipelines, executor, elements, caps negotiation, plugins — is implemented and covered by 1100+ tests. Some subsystems are still scaffolding (see [Project status](#project-status)). Expect API churn before 1.0.
 
-- **Zero-copy buffers**: Shared memory with cross-process reference counting
-- **Progressive typing**: Start dynamic, graduate to typed
-- **Multi-process pipelines**: memfd + Unix socket IPC
-- **Hybrid scheduling**: PipeWire-inspired async + RT thread execution
-- **rkyv serialization**: Zero-copy deserialization at boundaries
-- **Linux-optimized**: memfd_create, huge pages, memory-mapped files
-- **Plugin system**: Dynamic element loading with C ABI compatibility
-- **Observability**: Built-in metrics and tracing support
+**Requirements:** Linux only (memfd_create, SCM_RIGHTS, eventfd) · Rust **1.85+** (edition 2024)
 
-## Quick Start
+## Highlights
 
-Add to your `Cargo.toml`:
+- **Shared memory first** — every CPU buffer lives in a memfd-backed arena. There is no "convert to shared memory" step: any buffer can be sent to another process by passing one fd.
+- **Cross-process reference counting** — refcounts are atomics stored *inside* the shared arena, so clone/drop work identically from any process. Slot release goes through a lock-free MPSC queue in shared memory; no coordination messages needed.
+- **Hybrid scheduling** — the executor runs I/O-bound elements as Tokio tasks and RT-safe, low-latency elements on dedicated real-time threads (optionally `SCHED_FIFO`), connected by lock-free SPSC bridges with eventfd wakeup. Strategy is chosen automatically from element-declared `ExecutionHints`.
+- **Progressive typing** — build pipelines dynamically from strings (`Pipeline::parse`) or programmatically, or use the typed API (`pipeline(src) >> map(..) >> filter(..)`) with compile-time type checking.
+- **Caps negotiation** — elements declare multiple format+memory capabilities in preference order; the pipeline negotiates per link, including DMA-BUF vs CPU memory selection, and can auto-insert converters (opt-in).
+- **Batteries included** — 100+ built-in elements: file/TCP/UDP/Unix/HTTP/WebSocket/Zenoh I/O, RTP/RTCP/RTSP, MPEG-TS and MP4 mux/demux, HLS/DASH output, V4L2/libcamera/PipeWire/ALSA/screen capture, codecs (H.264, AV1, Opus, AAC, FLAC/MP3/Vorbis, JPEG/PNG), KLV/STANAG metadata, and a rich set of flow/timing/transform utilities.
+- **Pure Rust where possible** — rav1e, Symphonia, zune-jpeg, png, mp4, mpeg2ts-reader; C libraries only where unavoidable (OpenH264, dav1d, libopus, FDK-AAC).
+- **Observability** — pipeline bus (GStreamer-style messages), pad probes, latency/framerate/drop tracers, `metrics`/`tracing` integration, DOT graph export.
+
+## Quick start
 
 ```toml
 [dependencies]
 parallax = "0.1"
 ```
 
-### Dynamic Pipeline
-
-Build pipelines at runtime using a GStreamer-like syntax:
+### Parse a pipeline from a string
 
 ```rust
 use parallax::pipeline::Pipeline;
 
 #[tokio::main]
 async fn main() -> parallax::Result<()> {
-    // Parse pipeline from string
-    let mut pipeline = Pipeline::parse("filesrc location=input.bin ! passthrough ! nullsink")?;
-    
-    // Or build programmatically
-    let mut pipeline = Pipeline::new();
-    let src = pipeline.add_source("src", source);
-    let sink = pipeline.add_sink("sink", sink);
-    pipeline.link(src, sink)?;
-    
-    // Run the pipeline - executor auto-negotiates strategy
-    pipeline.run().await?;
-    
-    Ok(())
+    // GStreamer-like syntax: elements separated by `!`, properties as name=value
+    let mut pipeline = Pipeline::parse(
+        "videotestsrc width=320 height=240 num-buffers=60 ! videoconvert ! nullsink",
+    )?;
+    pipeline.run().await
 }
 ```
 
-### Element Retrieval (GStreamer-like)
+The string grammar is a **linear chain**: `element prop=value ... ! element ...`. Values may be quoted strings, integers, floats, or booleans; `name=foo` gives the node a custom name for later retrieval. Branching (tee), caps filters, and bins are *not* expressible in the string syntax — use the programmatic API for those.
 
-Retrieve and modify elements after pipeline creation:
+Built-in factory names usable in `parse`: `filesrc`, `filesink`, `videotestsrc`, `videoconvert`, `passthrough`, `tee`, `nullsource`, `nullsink`, plus `autovideosink` (feature `display`) and `v4l2src` (feature `v4l2`). More can be registered through a `PluginRegistry` (`Pipeline::parse_with_factory`).
+
+### Build programmatically
 
 ```rust
+use parallax::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
+use parallax::memory::SharedArena;
 use parallax::pipeline::Pipeline;
-use parallax::elements::io::FileSrc;
+use parallax::Result;
 
-// Use name= property to give elements predictable names
-let mut pipeline = Pipeline::parse(
-    "filesrc name=source location=input.bin ! passthrough ! nullsink"
-)?;
+struct HelloSource { sent: bool }
 
-// Retrieve element by name and downcast to concrete type
-if let Some(src) = pipeline.get_element::<FileSrc>("source") {
-    println!("Reading from: {}", src.path());
+impl Source for HelloSource {
+    fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
+        if self.sent {
+            return Ok(ProduceResult::Eos);
+        }
+        self.sent = true;
+        let msg = b"Hello, Parallax!";
+        ctx.output()[..msg.len()].copy_from_slice(msg);
+        Ok(ProduceResult::Produced(msg.len()))
+    }
 }
 
-// Mutable access for modifying properties
-if let Some(src) = pipeline.get_element_mut::<FileSrc>("source") {
-    *src = FileSrc::new("different.bin");
+struct PrintSink;
+
+impl Sink for PrintSink {
+    fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
+        println!("Received: {}", String::from_utf8_lossy(ctx.input()));
+        Ok(())
+    }
 }
 
-// Without name=, elements get auto-generated names: filesrc_0, passthrough_1, etc.
+#[tokio::main]
+async fn main() -> Result<()> {
+    let arena = SharedArena::new(1024, 4)?; // 4 slots × 1 KiB
+
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_source_with_arena("src", HelloSource { sent: false }, arena);
+    let sink = pipeline.add_sink("sink", PrintSink);
+    pipeline.link(src, sink)?;
+
+    pipeline.run().await
+}
 ```
 
-### Typed Pipeline
+Fan-out/fan-in, N-to-1 muxing, and multi-pad linking are done with `link_pads`, the `Tee`/`Funnel` elements, or the fluent `PipelineBuilder` (see `examples/10_builder.rs`).
 
-Build pipelines with compile-time type checking:
+### Typed pipelines (compile-time checked)
 
 ```rust
 use parallax::typed::{pipeline, from_iter, map, filter, collect};
 
 fn main() -> parallax::Result<()> {
     let source = from_iter(vec![1i32, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
-    
-    let result = pipeline(source)
-        .then(filter(|x: &i32| x % 2 == 0))  // Keep even numbers
-        .then(map(|x: i32| x * 10))           // Multiply by 10
+
+    let result = (pipeline(source)
+        >> filter(|x: &i32| x % 2 == 0)   // `>>` is sugar for .then(...)
+        >> map(|x: i32| x * 10))
         .sink(collect::<i32>())
         .run()?
         .into_inner();
-    
-    println!("Result: {:?}", result);  // [20, 40, 60, 80, 100]
+
+    assert_eq!(result, vec![20, 40, 60, 80, 100]);
     Ok(())
 }
 ```
 
-### Multi-Process Pipeline
+Operators: `map`, `filter`, `filter_map`, `inspect`, `take`, `skip`; sources `from_iter`, `range`, `once`, `repeat_with`; sinks `collect`, `discard`, `for_each`, `fold`. Multi-source combinators: `zip`, `merge` (two-source interleave), `join` (hash join), and `temporal_join` (timestamp-aligned join with tolerance windows — useful for sensor fusion).
 
-Use shared memory for zero-copy IPC with true cross-process reference counting:
+### Retrieve elements after construction
 
 ```rust
-use parallax::memory::{SharedArena, SharedArenaCache};
+use parallax::elements::io::FileSrc;
 
-// Process A: Owner (creates arena, acquires slots)
-let arena = SharedArena::new(4096, 16)?;  // 16 slots of 4KB each
-let mut slot = arena.acquire()?;
-slot.data_mut()[..5].copy_from_slice(b"hello");
+let mut pipeline = parallax::pipeline::Pipeline::parse(
+    "filesrc name=reader location=input.bin ! passthrough ! filesink location=out.bin",
+)?;
 
-// Send arena fd + IPC reference to Process B
-let ipc_ref = slot.ipc_ref();
-send_fd_and_ref(arena.fd(), ipc_ref)?;
-
-// Process B: Client (maps arena, accesses slots)
-let mut cache = SharedArenaCache::new();
-cache.map_arena(received_fd)?;
-
-let client_slot = cache.get_slot(&ipc_ref)?;
-assert_eq!(client_slot.data(), b"hello");
-// client_slot shares the refcount with Process A's slot!
-// When both drop, slot is released via lock-free queue
+// Downcast by name; wrong type returns None (no panic)
+if let Some(src) = pipeline.get_element::<FileSrc>("reader") {
+    println!("Reading from: {}", src.path().display());
+}
+if let Some(src) = pipeline.get_element_mut::<FileSrc>("reader") {
+    *src = FileSrc::new("different.bin");
+}
 ```
 
-The refcount is stored in the shared memory itself, so atomic operations work across processes. No messages needed for reference counting.
+Unnamed elements get auto-generated names (`filesrc_0`, `passthrough_1`, …).
 
-### Automatic Execution Strategy
+## Execution model
 
-The unified executor automatically determines the optimal strategy for each element:
+### Pipeline states (PipeWire-inspired)
 
-```rust
-use parallax::pipeline::Pipeline;
-
-// Just run - the executor analyzes element hints and chooses strategies
-let mut pipeline = Pipeline::parse("audiosrc ! decoder ! mixer ! audiosink")?;
-pipeline.run().await?;  // Automatic: audiosrc=async, decoder=RT, mixer=RT, audiosink=async
+```
+Suspended <──> Idle <──> Running
+                            │
+          Error ◄───────────┘
 ```
 
-Elements declare `ExecutionHints` describing their characteristics:
-- **trust_level**: Trusted, SemiTrusted, Untrusted
-- **processing**: CpuBound, IoBound, MemoryBound
-- **latency**: UltraLow, Low, Normal, Relaxed
-- **uses_native_code**: true if uses FFI
-
-The executor automatically chooses:
-| Characteristics | Strategy |
-|----------------|----------|
-| Untrusted or uses native code | Isolated process |
-| RT affinity + RT-safe | RT thread |
-| Low latency + RT-safe | RT thread |
-| I/O-bound | Tokio async |
-
-### Manual Execution Control
-
-For advanced cases, configure the executor manually:
+| State | Resources | Meaning |
+|-------|-----------|---------|
+| `Suspended` | Deallocated | Minimal footprint (initial state) |
+| `Idle` | Allocated | Negotiated and ready — "paused" |
+| `Running` | Allocated | Actively processing |
+| `Error` | Varies | Unrecoverable; recover via `Suspended` |
 
 ```rust
-use parallax::pipeline::{Pipeline, Executor, ExecutorConfig, SchedulingMode, RtConfig};
+pipeline.prepare()?;   // Suspended → Idle: validate, negotiate caps, allocate
+pipeline.activate()?;  // Idle → Running
+pipeline.pause()?;     // Running → Idle (resources kept)
+pipeline.suspend()?;   // Idle → Suspended (resources released)
+```
 
-let mut pipeline = Pipeline::parse("audiosrc ! decoder ! mixer ! audiosink")?;
+`pipeline.run().await` (and `Executor::start`) auto-prepares a `Suspended` pipeline.
 
-// Disable auto-strategy and configure manually
+### Automatic strategy selection
+
+Each element declares `ExecutionHints` (`rt_safe`, `processing`, `latency`, `memory`, `trust_level`, …). With the default `auto_strategy`, the executor assigns each element one of **two** strategies:
+
+| Element characteristics | Strategy |
+|--------------------------|----------|
+| `rt_safe` **and** latency `UltraLow`/`Low` | **RealTime** — dedicated RT thread |
+| I/O-bound, or anything else | **Async** — Tokio task |
+
+If any element lands on an RT thread the pipeline runs in hybrid mode: the graph is partitioned, and async↔RT boundaries are bridged by lock-free SPSC ring buffers with eventfd signaling. A timer or hardware driver paces RT cycles (PipeWire-style activation records).
+
+> Note: process isolation for untrusted elements was prototyped and removed; the `trust_level` and `uses_native_code` hints are currently informational only. All execution is in-process.
+
+### Manual control
+
+```rust
+use parallax::pipeline::{Executor, ExecutorConfig, SchedulingMode, RtConfig};
+
 let config = ExecutorConfig {
     auto_strategy: false,
-    scheduling: SchedulingMode::Hybrid,
+    scheduling: SchedulingMode::Hybrid,  // Async | Hybrid | RealTime
     rt: RtConfig {
-        quantum: 256,           // samples per cycle (5.3ms at 48kHz)
+        quantum: 256,           // samples per cycle (~5.3 ms at 48 kHz)
         rt_priority: Some(50),  // SCHED_FIFO (requires CAP_SYS_NICE)
-        data_threads: 1,
-        bridge_capacity: 16,
         ..Default::default()
     },
     ..Default::default()
 };
 
 let executor = Executor::with_config(config);
-executor.start(&mut pipeline).await?;
+let handle = executor.start(&mut pipeline)?;  // synchronous; returns a PipelineHandle
+handle.wait().await?;                         // or: executor.run(&mut pipeline).await
 ```
 
-The scheduler automatically partitions the graph:
-- **I/O-bound elements** (network, file) → Tokio async tasks
-- **RT-safe elements** (decoders, mixers) → Dedicated RT threads
-- **Untrusted elements** → Isolated processes
-- **Lock-free bridges** connect different domains
+Presets: `ExecutorConfig::low_latency_audio()`, `ExecutorConfig::video(fps)`, `ExecutorConfig::hybrid()`.
 
-### Pipeline States
+## Memory model
 
-Parallax uses a PipeWire-inspired 3-state model:
+All CPU memory is **memfd-backed** (`memfd_create` + `MAP_SHARED`): zero overhead compared to heap allocation, and always IPC-ready — one fd per arena, not per buffer.
 
-```
-Suspended <──> Idle <──> Running
-```
+| Backend | Use case | fd-shareable |
+|---------|----------|--------------|
+| `SharedArena` | Default arena; cross-process refcounting, lock-free release | Yes (memfd) |
+| `FixedBufferPool` | Pipeline-level pool on top of `SharedArena`, blocking backpressure | Yes |
+| `DmaBufSegment` / `DmaBufBuffer` | Zero-copy GPU/device path (V4L2 export, DRM, …) | Yes (DMA-BUF fd) |
+| `MappedFileSegment` | Persistent, file-backed buffers | By path |
+| `HugePageSegment` | 2 MB / 1 GB pages for TLB-heavy workloads | Not currently |
 
-| State | Resources | Description |
-|-------|-----------|-------------|
-| **Suspended** | Deallocated | Minimal memory footprint |
-| **Idle** | Allocated | Ready to process (paused) |
-| **Running** | Allocated | Actively processing |
+### Cross-process reference counting
 
-```rust
-let mut pipeline = Pipeline::parse("src ! sink")?;
-
-pipeline.prepare()?;   // Suspended → Idle (allocate, negotiate)
-pipeline.activate()?;  // Idle → Running (start processing)
-pipeline.pause()?;     // Running → Idle (stop, keep resources)
-pipeline.suspend()?;   // Idle → Suspended (release resources)
-```
-
-## Architecture
+`Arc` keeps its refcount on the process heap, so it cannot be shared. Parallax stores refcounts **in the shared memory itself**:
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         Pipeline                                 │
-│  ┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐      │
-│  │ Source  │───▶│Transform│───▶│   Tee   │───▶│  Sink   │      │
-│  └─────────┘    └─────────┘    └────┬────┘    └─────────┘      │
-│                                     │                           │
-│                                     ▼                           │
-│                               ┌─────────┐                       │
-│                               │  Sink   │                       │
-│                               └─────────┘                       │
-└─────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────┐
-│                     Shared Memory Foundation                     │
-├─────────────────────────────────────────────────────────────────┤
-│  All buffers are memfd-backed (zero overhead, always IPC-ready) │
-│                                                                  │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
-│  │  CpuArena    │  │ SharedArena  │  │  HugePages   │          │
-│  │  (1 fd/pool) │  │ (cross-proc) │  │  (2MB/1GB)   │          │
-│  └──────────────┘  └──────────────┘  └──────────────┘          │
-│  ┌──────────────┐  ┌──────────────┐                             │
-│  │ MappedFile   │  │  GPU Pinned  │                             │
-│  │ (persistent) │  │  (planned)   │                             │
-│  └──────────────┘  └──────────────┘                             │
-└─────────────────────────────────────────────────────────────────┘
+SharedArena layout (one memfd):
+┌──────────────────────────────────────────────────────────────┐
+│ ArenaHeader (64 B, cache-aligned)                            │
+│   magic, version, slot_count, slot_size, arena_id            │
+├──────────────────────────────────────────────────────────────┤
+│ ReleaseQueue — lock-free MPSC ring in shared memory          │
+│   head ← owner drains (single consumer)                      │
+│   tail ← any process pushes (multi producer)                 │
+├──────────────────────────────────────────────────────────────┤
+│ SlotHeader[0..N] (8 B each): refcount + state atomics        │
+├──────────────────────────────────────────────────────────────┤
+│ SlotData[0..N] (aligned user data)                           │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-## Built-in Elements
-
-### Sources
-
-| Element | Description |
-|---------|-------------|
-| `FileSrc` | Reads buffers from a file |
-| `TcpSrc` / `AsyncTcpSrc` | Reads from TCP connection |
-| `UdpSrc` / `AsyncUdpSrc` | Reads datagrams from UDP socket |
-| `FdSrc` | Reads from a raw file descriptor |
-| `AppSrc` | Injects buffers from application code |
-| `DataSrc` | Generates buffers from inline data |
-| `TestSrc` | Generates test pattern buffers |
-| `NullSource` | Produces empty buffers |
-
-### Sinks
-
-| Element | Description |
-|---------|-------------|
-| `FileSink` | Writes buffers to a file |
-| `TcpSink` / `AsyncTcpSink` | Writes to TCP connection |
-| `UdpSink` / `AsyncUdpSink` | Sends datagrams to UDP socket |
-| `FdSink` | Writes to a raw file descriptor |
-| `AppSink` | Extracts buffers to application code |
-| `ConsoleSink` | Prints buffers to console for debugging |
-| `NullSink` | Discards all buffers |
-
-### Sources (Memory/Test)
-
-| Element | Description |
-|---------|-------------|
-| `MemorySrc` | Reads buffers from in-memory data |
-
-### Sinks (Memory)
-
-| Element | Description |
-|---------|-------------|
-| `MemorySink` | Collects buffers into memory |
-| `SharedMemorySink` | Thread-safe memory sink |
-
-### Transforms
-
-| Element | Description |
-|---------|-------------|
-| `PassThrough` | Passes buffers unchanged |
-| `RateLimiter` | Limits buffer throughput rate |
-| `Valve` | Drops or passes buffers (on/off switch) |
-| `Queue` | Async buffer queue with backpressure |
-| `Identity` | Pass-through with callbacks for debugging |
-| `Delay` / `AsyncDelay` | Adds fixed delay between buffers |
-| `Map` | Transforms buffer data with a function |
-| `FilterMap` | Transform and filter in one step |
-| `Chunk` | Splits buffers into fixed-size chunks |
-| `FlatMap` | One-to-many buffer transformation |
-
-### Filtering
-
-| Element | Description |
-|---------|-------------|
-| `Filter` | Filter buffers by predicate |
-| `SampleFilter` | Sample buffers (every Nth, random %, first N) |
-| `MetadataFilter` | Filter by stream ID or sequence range |
-| `DuplicateFilter` | Remove duplicate buffers by content hash |
-| `RangeFilter` | Filter by buffer size or sequence range |
-| `RegexFilter` | Filter by regex pattern match |
-
-### Batching
-
-| Element | Description |
-|---------|-------------|
-| `Batch` | Aggregate multiple buffers into one |
-| `Unbatch` | Split aggregated buffer back into chunks |
-
-### Buffer Operations
-
-| Element | Description |
-|---------|-------------|
-| `BufferTrim` | Trim buffers to maximum size |
-| `BufferSlice` | Extract a slice from each buffer |
-| `BufferPad` | Pad buffers to minimum size |
-| `BufferSplit` | Split buffer at delimiter boundaries |
-| `BufferJoin` | Join buffers with delimiter |
-| `BufferConcat` | Concatenate buffer contents |
-
-### Metadata Operations
-
-| Element | Description |
-|---------|-------------|
-| `SequenceNumber` | Adds sequence numbers to buffers |
-| `Timestamper` | Adds timestamps (system, monotonic) |
-| `MetadataInject` | Injects stream ID, duration, offset |
-| `MetadataExtract` | Extract metadata to sideband channel |
-
-### Timing Control
-
-| Element | Description |
-|---------|-------------|
-| `Timeout` | Generate fallback data on timeout |
-| `Debounce` | Suppress rapid buffer bursts |
-| `Throttle` | Limit buffer rate (drop excess) |
-
-### Routing
-
-| Element | Description |
-|---------|-------------|
-| `Tee` | Duplicates buffers to multiple outputs (1-to-N fanout) |
-| `Funnel` | Merges multiple inputs into one output (N-to-1) |
-| `InputSelector` | Selects one of N inputs (N-to-1 switching) |
-| `OutputSelector` | Routes to one of N outputs (1-to-N routing) |
-| `Concat` | Concatenates streams sequentially |
-| `StreamIdDemux` | Demultiplexes by stream ID |
-
-### Network (Unix/Multicast)
-
-| Element | Description |
-|---------|-------------|
-| `UnixSrc` / `UnixSink` | Unix domain socket I/O |
-| `AsyncUnixSrc` / `AsyncUnixSink` | Async Unix socket I/O |
-| `UdpMulticastSrc` | Receive from multicast group |
-| `UdpMulticastSink` | Send to multicast group |
-
-### Network (HTTP, requires `http` feature)
-
-| Element | Description |
-|---------|-------------|
-| `HttpSrc` | HTTP GET source (fetch from URL) |
-| `HttpSink` | HTTP POST/PUT sink |
-
-### Network (WebSocket, requires `websocket` feature)
-
-| Element | Description |
-|---------|-------------|
-| `WebSocketSrc` | WebSocket message receiver |
-| `WebSocketSink` | WebSocket message sender |
-
-### Zenoh (requires `zenoh` feature)
-
-| Element | Description |
-|---------|-------------|
-| `ZenohSrc` | Subscribe to Zenoh key expression |
-| `ZenohSink` | Publish to Zenoh key expression |
-| `ZenohQueryable` | Handle Zenoh queries |
-| `ZenohQuerier` | Send Zenoh queries |
-
-## Memory Model
-
-All CPU memory in Parallax is **memfd-backed by default**. This means:
-- Zero overhead compared to regular heap allocation
-- Always IPC-ready (can send fd to other processes)
-- Cross-process reference counting works automatically
-
-| Backend | Use Case | IPC Support |
-|---------|----------|-------------|
-| `CpuArena` | Default arena allocation (1 fd per pool) | Yes |
-| `SharedArena` | Cross-process refcounting with lock-free release | Yes |
-| `HugePageSegment` | High-throughput (reduced TLB misses) | Yes |
-| `MappedFileSegment` | Persistent buffers | Yes |
-
-### Cross-Process Reference Counting
-
-Traditional reference counting (like `Arc`) stores the refcount on the heap, which doesn't work across processes. Parallax stores refcounts **in the shared memory itself**:
-
-```
-SharedArena Memory Layout:
-┌─────────────────────────────────────────────────────────────────┐
-│ ArenaHeader (cache-aligned)                                     │
-│   magic, version, slot_count, slot_size, arena_id               │
-├─────────────────────────────────────────────────────────────────┤
-│ ReleaseQueue (lock-free MPSC in shared memory)                  │
-│   head: AtomicU32     ← Owner drains here (single consumer)     │
-│   tail: AtomicU32     ← Any process pushes here (multi producer)│
-│   slots: [AtomicU32]  ← Ring buffer of slot indices             │
-├─────────────────────────────────────────────────────────────────┤
-│ SlotHeader[0..N] (8 bytes each)                                 │
-│   refcount: AtomicU32  ← Works across processes!                │
-│   state: AtomicU32     ← Free or Allocated                      │
-├─────────────────────────────────────────────────────────────────┤
-│ SlotData[0..N] (user data)                                      │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-**How it works:**
-- **Clone**: Atomic increment in shared memory (works across processes)
-- **Drop**: Atomic decrement; if 0, push slot index to release queue
-- **Reclaim**: Owner drains queue in O(k) where k = released slots
+- **Clone** → atomic increment in shared memory (works from any process)
+- **Drop** → atomic decrement; on zero, push slot index to the release queue
+- **Reclaim** → owner drains the queue in O(k), k = released slots
 
 ```rust
 use parallax::memory::{SharedArena, SharedArenaCache};
 
-// Owner process
-let arena = SharedArena::new(4096, 64)?;  // 64 slots of 4KB
-let slot = arena.acquire()?;
+// Process A: owner
+let arena = SharedArena::new(4096, 16)?;          // 16 slots × 4 KiB
+let mut slot = arena.acquire().expect("free slot");
+slot.data_mut()[..5].copy_from_slice(b"hello");
+let ipc_ref = slot.ipc_ref();                      // serializable reference
+// send arena.fd() once + ipc_ref per buffer over a Unix socket (SCM_RIGHTS)
 
-// Client process (after receiving arena fd)
+// Process B: client
 let mut cache = SharedArenaCache::new();
-cache.map_arena(received_fd)?;
-
-let client_slot = cache.get_slot(&ipc_ref)?;
-// Both slots share the same atomic refcount in shared memory!
-// Drop from any process correctly decrements the shared refcount
+// Safety: the fd must be a valid SharedArena memfd received over SCM_RIGHTS
+unsafe { cache.map_arena(received_fd)? };
+let client_slot = cache.get_slot(&ipc_ref).expect("live slot");
+assert_eq!(&client_slot.data()[..5], b"hello");
+// Both processes share the same atomic refcount — drop from either side is correct.
 ```
 
-## Typed Operators
+Helpers in `parallax::memory::ipc` (`send_fds`, `recv_fds`, `send_segment_handle`, …) wrap the SCM_RIGHTS plumbing, and the `IpcSrc`/`IpcSink` elements do all of it for you.
 
-| Operator | Description |
-|----------|-------------|
-| `map(fn)` | Transform each item |
-| `filter(predicate)` | Keep items matching predicate |
-| `filter_map(fn)` | Transform and filter in one step |
-| `take(n)` | Take first n items |
-| `skip(n)` | Skip first n items |
-| `inspect(fn)` | Side-effect without modification |
+## Element library
+
+Full catalog with feature flags in **[docs/elements.md](docs/elements.md)**. Summary:
+
+| Category | Elements |
+|----------|----------|
+| **I/O** | `FileSrc`/`FileSink`, `FdSrc`/`FdSink`, `ConsoleSink` |
+| **Testing** | `TestSrc`, `VideoTestSrc`, `DataSrc`, `NullSource`, `NullSink` |
+| **App integration** | `AppSrc`/`AppSink` (+ handles), `AutoVideoSink` (display window) |
+| **Network** | TCP/UDP/Unix src+sink (sync & async), UDP multicast, `HttpSrc`/`HttpSink`/`HttpStreamingSink`, `WebSocketSrc`/`WebSocketSink`, Zenoh pub/sub/query |
+| **RTP/RTSP** | `RtpSrc`/`RtpSink`, jitter buffer, `RtcpHandler`, payloaders/depayloaders for H.264/H.265/VP8/VP9 (+ Opus depay), `RtspSrc` client |
+| **Flow** | `Queue` (watermarks, leaky modes), `Queue2` (stream/download/timeshift buffering), `Tee`, `Funnel`, `InputSelector`/`OutputSelector`, `Concat`, `Valve` |
+| **Transforms** | `Map`, `Filter`, `FilterMap`, `FlatMap`, `Chunk`, `Batch`/`Unbatch`, buffer trim/slice/pad/split/join/concat, dedup/range/regex filters, `Gain`, `VideoScale`, `VideoConvertElement`, `AudioConvertElement`, `AudioResampleElement` |
+| **Timing** | `Delay`, `Timeout`, `Debounce`, `Throttle`, `RateLimiter` |
+| **Metadata** | `SequenceNumber`, `Timestamper`, `MetadataInject`/`MetadataExtract`, `TimestampDebug`, `KlvEncoder` (STANAG 4609/MISB) |
+| **Mux/Demux** | `TsMux`/`TsMuxElement`, `TsDemux`, `Mp4Mux`/`Mp4FileSink`, `Mp4Demux`, `StreamIdDemux` |
+| **Codecs** | H.264 (OpenH264), AV1 encode (rav1e) / decode (dav1d), Opus, AAC (FDK encode, Symphonia decode), FLAC/MP3/Vorbis (Symphonia), JPEG (zune-jpeg), PNG |
+| **Devices** | `V4l2Src` (DMA-BUF export), `LibCameraSrc`, `PipeWireSrc`/`PipeWireSink`, `ScreenCaptureSrc` (XDG portal), `AlsaSrc`/`AlsaSink` (provides hardware clock) |
+| **Streaming out** | `HlsSink` (TS segments + M3U8, ABR variants), `DashSink` (fMP4 + MPD, live & VOD) |
+| **IPC** | `IpcSrc`/`IpcSink` (zero-copy cross-process), `MemorySrc`/`MemorySink` |
+
+## Infrastructure at a glance
+
+- **Bus & messages** — `Message`/`MessageKind` (Eos, Error, Warning, Tag, Qos, Buffering, StateChanged, …); poll, `await`, broadcast-subscribe, or consume as a `futures::Stream` (`bus.into_stream()`); `pipeline.run_with_bus(|msg| ...)`. See `examples/51_bus_messages.rs`.
+- **Seeking** — `pipeline.seek_bytes(pos)` / `seek_time(t)`, `query_position()`, `query_duration()`, `query_seekable()`; segment events map PTS to running/stream time. See `examples/52_seeking.rs`.
+- **Pad probes** — intercept buffers/events at any pad (`ProbeType::BUFFER`, `ProbeReturn::{Ok, Drop, Remove, Handled}`). See `examples/53_pad_probes.rs`.
+- **Tracers** — `LatencyTracer`, `FramerateTracer`, `DropTracer`; activate with `PARALLAX_TRACERS="latency;framerate;drops"`; DOT graph dumps via `PARALLAX_DOT_DIR`. See `examples/54_tracers.rs`.
+- **Flow control** — `FlowSignal`/`FlowPolicy` backpressure for live sources (block, drop, ring-buffer, adaptive), queue watermarks. See `examples/47_flow_control.rs`.
+- **Type detection** — `TypeFindRegistry` sniffs common container/codec formats (MP4, Matroska, MPEG-TS, Ogg, WAV, FLAC, MP3, H.264, PNG, JPEG, …) from leading bytes, with extension fallback. See `examples/56_typefind.rs`.
+- **Clocks** — `ClockTime` (ns, `NONE` sentinel), pluggable `Clock`/`ClockProvider`; the executor auto-selects the highest-priority provider (e.g. ALSA hardware clock) at start. See `examples/48_clock_provider.rs`.
+- **Caps negotiation** — multi-format `ElementMediaCaps` with memory-type coupling (CPU vs DMA-BUF); converter auto-insertion controlled by `ConverterPolicy::{Deny, Warn, Allow}` (default `Deny`: fail with a helpful error instead of silently inserting converters). See `examples/17_multi_format_caps.rs` and `examples/45_dmabuf_negotiation.rs`.
+- **Plugins** — dynamic loading of `cdylib` element plugins over a versioned `#[repr(C)]` ABI (`define_plugin!` or the `parallax-macros` attribute macros). See [docs/plugins.md](docs/plugins.md).
+
+## Feature flags
+
+Default features are **empty** — everything below is opt-in.
+
+| Feature | Description | External deps |
+|---------|-------------|---------------|
+| `macros` | Plugin authoring proc-macros (`parallax-macros`) | — |
+| `huge-pages` | 2 MB/1 GB huge page segments | — |
+| **Network** | | |
+| `http` | HTTP source/sink (ureq) | — |
+| `websocket` | WebSocket source/sink (tungstenite) | — |
+| `zenoh` | Zenoh pub/sub + query elements | — |
+| `rtp` | RTP/RTCP elements, payloaders, jitter buffer | — |
+| `rtsp` | RTSP client source (implies `rtp`) | — |
+| **Containers** | | |
+| `mpeg-ts` | MPEG-TS demuxer + muxer (pure Rust) | — |
+| `mp4-demux` | MP4/MOV demuxer + muxer (pure Rust) | — |
+| **Video codecs** | | |
+| `h264` | H.264 encode/decode (OpenH264) | C++ compiler |
+| `av1-encode` | AV1 encoder (rav1e, pure Rust) | nasm recommended |
+| `av1-decode` | AV1 decoder (dav1d) | libdav1d |
+| `software-codecs` | All of the above | |
+| `vulkan-video` | Vulkan Video GPU decode (**experimental scaffold**, see status) | Vulkan 1.3 |
+| **Audio codecs** | | |
+| `audio-codecs` | FLAC+MP3+AAC+Vorbis decoders (Symphonia, pure Rust) | — |
+| `audio-flac` / `audio-mp3` / `audio-aac` / `audio-vorbis` | Individual Symphonia decoders | — |
+| `opus` | Opus encode/decode | libopus |
+| `aac-encode` | AAC encoder (FDK-AAC — **license restrictions**) | libfdk-aac |
+| **Images** | | |
+| `image-codecs` | JPEG decode (zune-jpeg) + PNG encode/decode — pure Rust | — |
+| `image-jpeg` / `image-png` | Individual image codecs | — |
+| **Conversion** | | |
+| `simd-colorspace` | SIMD YUV↔RGB via the `yuv` crate (AVX-512/AVX2/SSE4.1/NEON) | — |
+| **Devices** | | |
+| `v4l2` | V4L2 capture, DMA-BUF export | libv4l headers |
+| `libcamera` | libcamera capture | libcamera |
+| `pipewire` | PipeWire audio/video capture + playback | libpipewire |
+| `alsa` | ALSA capture/playback + hardware clock | alsa-lib |
+| `screen-capture` | XDG-portal screen capture (implies `pipewire`) | — |
+| `device-capture` | pipewire + libcamera | |
+| `device-all` | All device backends | |
+| **Display** | | |
+| `display` | `AutoVideoSink` window (winit + softbuffer) | — |
+| **Placeholders** | | |
+| `gpu`, `rdma` | Reserved for future use — currently no-ops | — |
+
+## Examples
+
+38 numbered examples, one concept each (`cargo run --example <name> [--features ...]`):
+
+| Range | Topic |
+|-------|-------|
+| `01`–`08` | Basics: hello, transform, tee, funnel, queue, appsrc, file I/O, TCP |
+| `09`–`11` | Typed pipelines, builder DSL, buffer pools |
+| `13`–`18`, `20` | Codecs: PNG (`image-codecs`), H.264 (`h264`), AV1 (`av1-encode`), MPEG-TS (`mpeg-ts`), caps negotiation, GPU decode (`vulkan-video`), Opus (`opus`) |
+| `22`–`26` | Devices & streaming: V4L2 (`v4l2`), display (`display`), HLS, DASH |
+| `41`–`46` | Converters, PipeWire (`pipewire`), ALSA (`alsa`), libcamera (`libcamera`), DMA-BUF negotiation (`v4l2`), screen capture (`screen-capture,h264,mp4-demux`) |
+| `47`–`56` | Infrastructure: flow control, clocks, element retrieval, hybrid scheduling, bus, seeking, probes, tracers, Queue2 buffering, typefind |
+
+(Numbers 12, 19, 21, 27–40 are retired/unassigned.)
 
 ## Performance
 
 | Operation | Cost | Notes |
 |-----------|------|-------|
-| Buffer clone (same process) | O(1) | Atomic increment |
-| Buffer clone (cross-process) | O(1) | Atomic increment in shared memory |
-| Buffer access | O(1) | Direct pointer |
-| Pool slot acquire | O(1) amortized | Atomic bitmap scan |
-| Slot release (SharedArena) | O(1) | Lock-free queue push |
-| Slot reclaim (SharedArena) | O(k) | k = released slots, not total slots |
-| Tee (N outputs) | O(N) clones | No data copying |
-| Cross-process send | O(1) | Just send IPC ref (no copy) |
-| Cross-process receive | O(1) | Map arena once, then direct access |
+| Buffer clone (any process) | O(1) | Atomic increment in shared memory |
+| Buffer access | O(1) | Direct pointer into the mapped arena |
+| Slot release | O(1) | Lock-free MPSC queue push |
+| Slot reclaim | O(k) | k = released slots, not pool size |
+| Tee to N outputs | O(N) refcount increments | No data copies |
+| Cross-process send | O(1) after setup | Arena fd sent once; then only tiny refs |
+| 1080p I420→RGBA (`simd-colorspace`) | ~0.9 ms | AVX2/AVX-512 via `yuv` crate |
+
+`cargo bench` runs the colorspace benchmark; the memory/throughput benches are being rewritten after a memory-API refactor.
+
+## Project status
+
+Honest accounting of where things stand:
+
+- **Solid:** memory subsystem, pipeline graph + executor (async & hybrid RT), element library, caps negotiation, bus/probes/tracers/seek, plugin loading, typed pipelines. 1112 tests pass.
+- **Functional but young:** RTSP client, HLS/DASH sinks, MP4/TS muxing, device capture (V4L2/PipeWire/ALSA/libcamera/screen).
+- **Scaffolding:** `vulkan-video` — the Vulkan context, video session, DPB, and DMA-BUF import/export are real, but the H.264 decoder does not yet submit actual decode commands; no GPU encode. Treat it as a preview.
+- **Removed:** process isolation/sandboxing for untrusted elements was prototyped and backed out (fork-safety concerns); it may return in a different form. See [docs/security.md](docs/security.md).
+- **Not started:** RDMA, CUDA interop.
 
 ## Documentation
 
-- [Getting Started](docs/getting-started.md) - Quick start guide
-- [Architecture](docs/architecture.md) - System design overview
-- [API Reference](docs/api.md) - Public API documentation
-- [Memory Model](docs/memory.md) - Memory management details
-- [Plugin Development](docs/plugins.md) - Creating plugins
-- [Design Document](docs/design.md) - Comprehensive design reference
-- [Security](docs/security.md) - Sandbox and isolation
-
-## Examples
-
-Run the examples:
-
-```bash
-# Basics
-cargo run --example 01_hello               # Simplest pipeline
-cargo run --example 02_transform           # Custom transforms
-cargo run --example 03_tee                 # 1-to-N fanout
-cargo run --example 04_funnel              # N-to-1 merge
-cargo run --example 05_queue               # Backpressure handling
-
-# Application integration
-cargo run --example 06_appsrc              # Inject buffers from app
-cargo run --example 07_file_io             # Read/write files
-
-# Network
-cargo run --example 08_tcp                 # TCP streaming
-
-# Typed pipelines
-cargo run --example 09_typed               # Type-safe pipelines
-cargo run --example 10_builder             # Fluent builder DSL
-
-# Memory management
-cargo run --example 11_buffer_pool         # Pre-allocated buffer pooling
-
-# Process isolation
-cargo run --example 12_isolation           # Execution modes
-
-# Codecs (require feature flags)
-cargo run --example 13_image --features image-codecs  # PNG codec
-cargo run --example 14_h264 --features h264           # H.264 encoding
-cargo run --example 15_av1 --features av1-encode      # AV1 encoding
-cargo run --example 16_mpegts --features mpeg-ts      # MPEG-TS muxing
-
-# Caps negotiation
-cargo run --example 17_multi_format_caps   # Multi-format negotiation
-```
-
-## Benchmarks
-
-Run benchmarks:
-
-```bash
-cargo bench
-```
-
-## Requirements
-
-- Rust 1.75+
-- Linux (uses Linux-specific APIs: memfd_create, SCM_RIGHTS)
-
-## Feature Flags
-
-| Feature | Description |
-|---------|-------------|
-| `macros` | Plugin authoring convenience macros |
-| `huge-pages` | Enable huge page support |
-| `http` | HTTP source/sink elements (uses ureq) |
-| `websocket` | WebSocket source/sink elements (uses tungstenite) |
-| `zenoh` | Zenoh pub/sub and query elements |
-| **Device Capture** | |
-| `pipewire` | PipeWire audio/video capture (requires libpipewire) |
-| `libcamera` | Camera capture via libcamera (requires libcamera) |
-| `alsa` | ALSA audio capture/playback (requires libasound) |
-| `v4l2` | V4L2 video capture |
-| **Codecs** | |
-| `image-codecs` | All image codecs (JPEG, PNG) |
-| `image-jpeg` | JPEG decoder (zune-jpeg, pure Rust) |
-| `image-png` | PNG encoder/decoder (png crate, pure Rust) |
-| `audio-codecs` | All audio codecs (FLAC, MP3, AAC, Vorbis) |
-| `audio-flac` | FLAC decoder (Symphonia, pure Rust) |
-| `audio-mp3` | MP3 decoder (Symphonia, pure Rust) |
-| `audio-aac` | AAC decoder (Symphonia, pure Rust) |
-| `audio-vorbis` | Vorbis decoder (Symphonia, pure Rust) |
-| `av1-encode` | AV1 encoder (rav1e, pure Rust) |
-| `av1-decode` | AV1 decoder (dav1d, requires libdav1d) |
-| `h264` | H.264 encoder/decoder (OpenH264) |
-| `mpeg-ts` | MPEG-TS demuxer |
+| Doc | Contents |
+|-----|----------|
+| [Getting started](docs/getting-started.md) | Install, first pipeline, custom elements |
+| [Architecture](docs/architecture.md) | System overview: graph, executor, memory, negotiation |
+| [Pipelines](docs/pipeline.md) | Parse syntax, states, bus, events, seeking, probes, tracers, flow control |
+| [Scheduling](docs/scheduling.md) | Executor internals, RT threads, drivers, bridges, clocks |
+| [Memory](docs/memory.md) | SharedArena, buffer pools, DMA-BUF, IPC |
+| [Elements](docs/elements.md) | Complete element catalog with feature flags |
+| [Formats & negotiation](docs/formats.md) | Caps model, negotiation, converters, SIMD |
+| [Plugins](docs/plugins.md) | Writing and loading dynamic plugins |
+| [API overview](docs/api.md) | Map of the public API (`cargo doc` for the full reference) |
+| [Security](docs/security.md) | Current security model and its limits |
+| [Design](docs/design.md) | Design rationale and competitive landscape |
 
 ## License
 
-Licensed under either of:
+Licensed under either of
 
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
 
 at your option.
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Contributions are welcome! Run `just check` (format + clippy + tests) before submitting a PR.

@@ -8,11 +8,12 @@
 //!
 //! ## Features
 //!
-//! - **Zero-copy buffers**: Shared memory with loan-based memory pools
+//! - **Zero-copy buffers**: memfd-backed arenas with cross-process reference counting
 //! - **Progressive typing**: Start dynamic, graduate to typed
-//! - **Multi-process pipelines**: memfd + Unix socket IPC
-//! - **rkyv serialization**: Zero-copy deserialization at boundaries
-//! - **Linux-optimized**: memfd_create, huge pages, future io_uring
+//! - **Multi-process pipelines**: memfd + Unix socket IPC (SCM_RIGHTS)
+//! - **Hybrid scheduling**: Tokio tasks + dedicated real-time threads
+//! - **rkyv serialization**: Zero-copy deserialization at network boundaries
+//! - **Linux-only**: memfd_create, huge pages, eventfd, DMA-BUF
 //!
 //! ## Quick Start
 //!
@@ -20,14 +21,16 @@
 //! use parallax::prelude::*;
 //! use parallax::typed::{pipeline, from_iter, map, filter, collect};
 //!
+//! // Dynamic pipeline (string syntax)
+//! let mut pipeline = Pipeline::parse("videotestsrc num-buffers=60 ! videoconvert ! nullsink")?;
+//! pipeline.run().await?;
+//!
 //! // Dynamic pipeline (programmatic)
 //! let mut pipeline = Pipeline::new();
-//! let src = pipeline.add_node("src", Box::new(source));
-//! let sink = pipeline.add_node("sink", Box::new(sink));
+//! let src = pipeline.add_source("src", my_source);   // impl Source
+//! let sink = pipeline.add_sink("sink", my_sink);     // impl Sink
 //! pipeline.link(src, sink)?;
-//!
-//! let executor = Executor::new();
-//! executor.run(&mut pipeline).await?;
+//! pipeline.run().await?;
 //!
 //! // Typed pipeline (compile-time checked)
 //! let source = from_iter(vec![1, 2, 3, 4, 5]);

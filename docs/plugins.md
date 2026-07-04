@@ -133,11 +133,11 @@ pub struct PluginDescriptor {
     /// Plugin description (null-terminated C string)
     pub description: *const c_char,
     
+    /// Number of elements
+    pub num_elements: u32,
+    
     /// Array of element descriptors
     pub elements: *const ElementDescriptor,
-    
-    /// Number of elements
-    pub num_elements: usize,
 }
 ```
 
@@ -156,12 +156,14 @@ pub struct ElementDescriptor {
     pub element_type: i32,
     
     /// Factory function to create instances
-    pub create: Option<extern "C" fn() -> *mut c_void>,
+    pub create: unsafe extern "C" fn() -> *mut c_void,
     
-    /// Destructor function
-    pub destroy: Option<extern "C" fn(*mut c_void)>,
+    /// Optional destructor function
+    pub destroy: Option<unsafe extern "C" fn(*mut c_void)>,
 }
 ```
+
+Element instances cross the boundary as double-boxed `DynAsyncElement` raw pointers (`Box<Box<DynAsyncElement>>` → `*mut c_void`), so trait-object fat pointers survive the C ABI.
 
 ### Entry Point
 
@@ -176,46 +178,71 @@ pub extern "C" fn parallax_plugin_descriptor() -> *const PluginDescriptor {
 
 The `define_plugin!` macro generates this automatically.
 
-## Loading Plugins
+### Alternative: proc-macros
 
-### Using PluginLoader
+With the `macros` feature, the `parallax-macros` crate offers an attribute-based path instead of `define_plugin!`:
 
 ```rust
-use parallax::plugin::{PluginLoader, PluginRegistry};
+use parallax_macros::{pipeline_element, plugin};
 
-// Create a registry
-let mut registry = PluginRegistry::new();
+#[pipeline_element(name = "doubler", description = "Doubles values", element_type = "Transform")]
+#[derive(Default)]
+pub struct Doubler { /* ... */ }
 
-// Create a loader
-let loader = PluginLoader::new();
-
-// Load a plugin
-loader.load(&mut registry, "path/to/libmy_plugin.so")?;
-
-// Use the registered elements
-if let Some(factory) = registry.get("doubler") {
-    let element = factory.create();
-    // Use element...
+plugin! {
+    name: "my-plugin",
+    version: "0.1.0",
+    author: "Your Name",
+    description: "My plugin",
+    elements: [Doubler],
 }
 ```
 
-### Using PluginRegistry
+Both paths generate the same descriptor and entry point.
+
+> **Version discipline:** although the descriptor itself is C ABI, the element trait objects crossing the boundary are Rust types — build plugins with the **same Rust toolchain and parallax version** as the host, or expect undefined behavior.
+
+## Loading Plugins
+
+Loading is `unsafe` — you are executing code from an arbitrary shared library. The loader validates the ABI version and descriptor before any element is created, but it cannot make the library's code safe.
 
 ```rust
 use parallax::plugin::PluginRegistry;
 
-// Create and configure registry
 let mut registry = PluginRegistry::new();
 registry.add_search_path("/usr/lib/parallax/plugins");
-registry.add_search_path("./plugins");
 
-// Scan and load all plugins
-registry.scan_and_load()?;
-
-// List available elements
-for name in registry.list_elements() {
-    println!("Available: {}", name);
+// SAFETY: we trust this library to be a valid Parallax plugin.
+unsafe {
+    registry.load_plugin("path/to/libmy_plugin.so")?;   // by path
+    registry.load_plugin_by_name("example")?;           // finds libexample.so in search paths
+    let n = registry.load_all_from_dir("./plugins");    // every *.so in a directory
 }
+
+// Introspection
+for name in registry.list_elements() {
+    println!("available: {name}");
+}
+println!("{:?}", registry.plugin_info("example"));
+
+// Instantiate an element (returns Box<DynAsyncElement>)
+let element = registry.create_element("doubler")?;
+```
+
+Default search paths for `load_plugin_by_name`: the current directory, `/usr/lib/parallax/plugins`, `/usr/local/lib/parallax/plugins` (name `foo` → `libfoo.so`).
+
+Failure modes surface as `PluginError`: `LoadFailed`, `MissingEntryPoint`, `NullDescriptor`, `AbiMismatch { expected, actual }`, `InvalidDescriptor`, `ElementNotFound`, `CreateFailed`.
+
+### Using plugin elements in `Pipeline::parse`
+
+Attach the registry to an `ElementFactory` and plugin element names become parseable (built-ins take precedence):
+
+```rust
+use std::sync::Arc;
+use parallax::pipeline::{factory::ElementFactory, Pipeline};
+
+let factory = ElementFactory::with_plugin_registry(Arc::new(registry));
+let pipeline = Pipeline::parse_with_factory("nullsource ! doubler ! nullsink", &factory)?;
 ```
 
 ## Element Types
@@ -223,15 +250,18 @@ for name in registry.list_elements() {
 ### Source Elements
 
 ```rust
-use parallax::element::{Source, SourceAdapter};
+use parallax::element::{ProduceContext, ProduceResult, Source, SourceAdapter};
 
 pub struct MySource {
     // ...
 }
 
 impl Source for MySource {
-    fn produce(&mut self) -> Result<Option<Buffer<()>>> {
-        // Produce buffers...
+    fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
+        let data = b"...";
+        ctx.output()[..data.len()].copy_from_slice(data);
+        Ok(ProduceResult::Produced(data.len()))
+        // or ProduceResult::Eos / OwnBuffer(..) / WouldBlock
     }
 }
 
@@ -242,15 +272,17 @@ create: || Box::new(SourceAdapter::new(MySource::new())),
 ### Sink Elements
 
 ```rust
-use parallax::element::{Sink, SinkAdapter};
+use parallax::element::{ConsumeContext, Sink, SinkAdapter};
 
 pub struct MySink {
     // ...
 }
 
 impl Sink for MySink {
-    fn consume(&mut self, buffer: Buffer<()>) -> Result<()> {
-        // Consume buffer...
+    fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
+        let bytes = ctx.input();
+        // Consume bytes...
+        Ok(())
     }
 }
 

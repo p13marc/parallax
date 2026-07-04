@@ -1,186 +1,188 @@
-# Getting Started with Parallax
+# Getting Started
 
-This guide will walk you through creating your first Parallax pipeline.
+This guide takes you from an empty project to a running pipeline with custom elements.
+
+## Requirements
+
+- **Linux.** Parallax uses `memfd_create`, `SCM_RIGHTS` fd passing, and `eventfd`; there is no macOS/Windows support.
+- **Rust 1.85+** (edition 2024).
 
 ## Installation
-
-Add Parallax to your `Cargo.toml`:
 
 ```toml
 [dependencies]
 parallax = "0.1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-## Your First Pipeline
+Default features are empty. Codecs, containers, network protocols, and device capture are all opt-in feature flags — see the [feature table in the README](../README.md#feature-flags).
 
-### Dynamic Pipeline
+## Your first pipeline
 
-The simplest way to create a pipeline is using the dynamic API:
+The quickest way to run a pipeline is the string syntax:
 
 ```rust
-use parallax::buffer::{Buffer, MemoryHandle};
-use parallax::element::{Source, SourceAdapter, Sink, SinkAdapter};
-use parallax::error::Result;
-use parallax::memory::HeapSegment;
-use parallax::metadata::Metadata;
-use parallax::pipeline::{Pipeline, PipelineExecutor};
-use std::sync::Arc;
+use parallax::pipeline::Pipeline;
 
-// Define a simple source that produces 10 buffers
-struct CountingSource {
-    current: u64,
-    max: u64,
+#[tokio::main]
+async fn main() -> parallax::Result<()> {
+    let mut pipeline = Pipeline::parse(
+        "videotestsrc width=320 height=240 num-buffers=60 ! videoconvert ! nullsink",
+    )?;
+    pipeline.run().await
+}
+```
+
+`Pipeline::parse` understands a linear chain of elements separated by `!`, each with optional `name=value` properties. See [pipeline.md](pipeline.md#parse-syntax) for the exact grammar, its limitations, and the list of built-in element names.
+
+## Writing a custom source and sink
+
+Elements implement one of the author traits from `parallax::element`. Sources write into a pre-allocated buffer provided through `ProduceContext`; sinks read through `ConsumeContext`:
+
+```rust
+use parallax::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
+use parallax::memory::SharedArena;
+use parallax::pipeline::Pipeline;
+use parallax::Result;
+
+struct Counter {
+    current: u32,
+    max: u32,
 }
 
-impl Source for CountingSource {
-    fn produce(&mut self) -> Result<Option<Buffer<()>>> {
+impl Source for Counter {
+    fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
         if self.current >= self.max {
-            return Ok(None);  // End of stream
+            return Ok(ProduceResult::Eos); // end of stream
         }
-        
-        let segment = Arc::new(HeapSegment::new(64)?);
-        let handle = MemoryHandle::from_segment(segment);
-        let buffer = Buffer::new(handle, Metadata::from_sequence(self.current));
-        
         self.current += 1;
-        Ok(Some(buffer))
+        let bytes = self.current.to_le_bytes();
+        ctx.output()[..4].copy_from_slice(&bytes);
+        ctx.set_sequence(self.current as u64);
+        Ok(ProduceResult::Produced(4)) // wrote 4 bytes into the provided buffer
     }
 }
 
-// Define a simple sink that prints buffers
-struct PrintingSink;
+struct Printer;
 
-impl Sink for PrintingSink {
-    fn consume(&mut self, buffer: Buffer<()>) -> Result<()> {
-        println!("Received buffer: seq={}", buffer.metadata().sequence);
+impl Sink for Printer {
+    fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
+        let mut bytes = [0u8; 4];
+        bytes.copy_from_slice(&ctx.input()[..4]);
+        println!("got {}", u32::from_le_bytes(bytes));
         Ok(())
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Create the pipeline
+    // A shared-memory arena backs the source's buffers: 8 slots of 64 bytes.
+    let arena = SharedArena::new(64, 8)?;
+
     let mut pipeline = Pipeline::new();
-    
-    // Add elements
-    let src = pipeline.add_node(
-        "source",
-        Box::new(SourceAdapter::new(CountingSource { current: 0, max: 10 }))
-    );
-    let sink = pipeline.add_node(
-        "sink", 
-        Box::new(SinkAdapter::new(PrintingSink))
-    );
-    
-    // Link them together
+    let src = pipeline.add_source_with_arena("counter", Counter { current: 0, max: 10 }, arena);
+    let sink = pipeline.add_sink("printer", Printer);
     pipeline.link(src, sink)?;
-    
-    // Run the pipeline
-    let executor = PipelineExecutor::new();
-    executor.run(&mut pipeline).await?;
-    
-    println!("Pipeline completed!");
-    Ok(())
+
+    pipeline.run().await
 }
 ```
 
-### Typed Pipeline
+Key points:
 
-For compile-time type safety, use the typed API:
+- `produce` returns a `ProduceResult`:
+  - `Produced(n)` — wrote `n` bytes into the context's buffer (the zero-allocation fast path),
+  - `OwnBuffer(buffer)` — the source made its own `Buffer` (fallback),
+  - `OwnDmaBuf(buffer)` — a DMA-BUF backed buffer (zero-copy device path),
+  - `WouldBlock` — no data right now,
+  - `Eos` — stream finished.
+- Transforms implement `Element` (`process(&mut self, Buffer) -> Result<Option<Buffer>>`) or the multi-output `Transform` trait. There are async variants (`AsyncSource`, `AsyncSink`, `AsyncTransform`) for real I/O.
+- At end-of-stream the executor calls `flush()` repeatedly — implement it if your element buffers data (encoders, muxers, batchers).
+
+## The simpler element API
+
+If you don't need pooled buffers or contexts, the unified "simple" traits remove all boilerplate:
+
+```rust
+use parallax::element::{ProcessOutput, SimpleSink, SimpleSource, Snk, Src};
+
+struct Hello { sent: bool }
+
+impl SimpleSource for Hello {
+    fn produce(&mut self) -> parallax::Result<ProcessOutput> {
+        // construct and return a Buffer, or:
+        Ok(ProcessOutput::Eos)
+    }
+}
+
+struct Log;
+
+impl SimpleSink for Log {
+    fn consume(&mut self, buffer: &parallax::buffer::Buffer) -> parallax::Result<()> {
+        println!("{} bytes", buffer.len());
+        Ok(())
+    }
+}
+
+let mut pipeline = parallax::pipeline::Pipeline::new();
+let src = pipeline.add_element("src", Src(Hello { sent: false }));
+let sink = pipeline.add_element("sink", Snk(Log));
+pipeline.link(src, sink)?;
+```
+
+Wrap simple implementations in `Src(...)`, `Xfm(...)`, or `Snk(...)` and add them with `add_element`.
+
+## Typed pipelines
+
+For data processing where you want the compiler to check types between stages:
 
 ```rust
 use parallax::typed::{pipeline, from_iter, map, filter, collect};
-use parallax::error::Result;
 
-fn main() -> Result<()> {
-    // Create a source from an iterator
-    let source = from_iter(vec![1i32, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
-    
-    // Build the pipeline with type-safe operators
-    let result = pipeline(source)
-        .then(filter(|x: &i32| x % 2 == 0))  // Keep even numbers
-        .then(map(|x: i32| x * x))            // Square them
-        .sink(collect::<i32>())               // Collect results
-        .run()?
-        .into_inner();
-    
-    println!("Squares of even numbers: {:?}", result);
-    // Output: [4, 16, 36, 64, 100]
-    
-    Ok(())
-}
+let result = (pipeline(from_iter(1..=10))
+    >> filter(|x: &i32| x % 2 == 0)
+    >> map(|x: i32| x * 10))
+    .sink(collect::<i32>())
+    .run()?
+    .into_inner();
 ```
 
-## Key Concepts
+The `>>` operator is sugar for `.then(...)`. Available operators, sources, sinks, and multi-source combinators (`zip`, `merge`, `join`, `temporal_join`) are listed in [api.md](api.md#typed-pipelines).
 
-### Buffers
+## Using buffer pools
 
-Buffers are the unit of data in a pipeline. Each buffer contains:
-- **Memory**: A reference to the underlying memory segment
-- **Metadata**: Timestamps, sequence numbers, flags
+For steady-state streaming, pre-allocate buffers in a pool so the hot path never allocates:
 
 ```rust
-use parallax::buffer::{Buffer, MemoryHandle};
-use parallax::memory::HeapSegment;
-use parallax::metadata::Metadata;
+use parallax::memory::FixedBufferPool;
 
-// Create a buffer
-let segment = Arc::new(HeapSegment::new(1024)?);
-let handle = MemoryHandle::from_segment(segment);
-let buffer = Buffer::<()>::new(handle, Metadata::from_sequence(0));
+let pool = FixedBufferPool::new(1024 * 1024, 10)?; // 10 × 1 MiB
+let src = pipeline.add_source_with_pool("src", my_source, pool);
 
-// Access buffer properties
-println!("Length: {}", buffer.len());
-println!("Sequence: {}", buffer.metadata().sequence);
+// or size the pool automatically from negotiated caps:
+pipeline.create_pool_from_caps(10)?;
 ```
 
-### Elements
+Inside `produce()`, call `ctx.acquire_buffer()` — it blocks when the pool is exhausted, giving you backpressure for free. See `examples/11_buffer_pool.rs`.
 
-Elements are the building blocks of pipelines:
-
-| Type | Description | Trait |
-|------|-------------|-------|
-| **Source** | Produces buffers | `Source` |
-| **Sink** | Consumes buffers | `Sink` |
-| **Transform** | Modifies buffers | `Element` |
-
-### Memory Backends
-
-Parallax supports multiple memory backends:
+## Watching pipeline messages
 
 ```rust
-use parallax::memory::{HeapSegment, SharedMemorySegment, MemoryPool};
-
-// Heap memory (default, single-process)
-let heap = HeapSegment::new(4096)?;
-
-// Shared memory (multi-process)
-let shared = SharedMemorySegment::new("my-segment", 1024 * 1024)?;
-
-// Memory pool for efficient allocation
-let pool = MemoryPool::new(heap, 1024)?;  // 1KB slots
-let slot = pool.loan().expect("pool not exhausted");
+let mut pipeline = Pipeline::parse("videotestsrc num-buffers=100 ! nullsink")?;
+pipeline
+    .run_with_bus(|msg| {
+        println!("[{}] {}", msg.source, msg.kind);
+        true // keep handling
+    })
+    .await?;
 ```
 
-## Next Steps
+The bus carries `Eos`, `Error`, `Warning`, `Tag`, `Buffering`, `Qos`, and more — including a `futures::Stream` adapter for `select!` loops. Details in [pipeline.md](pipeline.md#bus--messages).
 
-- [Architecture](architecture.md) - Understand Parallax internals
-- [Memory Model](memory.md) - Learn about zero-copy buffers
-- [API Reference](api.md) - Complete API documentation
-- [Plugin Development](plugins.md) - Create custom elements
+## Where to go next
 
-## Examples
-
-Check out the examples directory:
-
-```bash
-# Simple dynamic pipeline
-cargo run --example simple_pipeline
-
-# Typed pipeline with operators
-cargo run --example typed_pipeline
-
-# Multi-process communication
-cargo run --example multi_process
-```
+- **Examples** — `examples/` contains 38 numbered, single-concept programs. Start with `01_hello` and work up; `cargo run --example 01_hello`.
+- **[pipeline.md](pipeline.md)** — everything about constructing and controlling pipelines.
+- **[memory.md](memory.md)** — the shared-memory model and cross-process pipelines.
+- **[elements.md](elements.md)** — the full element catalog.
+- **[scheduling.md](scheduling.md)** — hybrid real-time scheduling for low-latency audio/video.

@@ -1,279 +1,62 @@
-# Security Sandbox Documentation
+# Security Model
 
-This document describes the security sandbox implementation in Parallax, designed for isolating untrusted pipeline elements.
+This document describes what Parallax currently does — and deliberately does **not** do — for security.
 
-## Overview
+## Summary
 
-Parallax provides per-element process isolation using Linux security primitives:
-- **seccomp-bpf**: System call filtering
-- **Linux namespaces**: Resource isolation (mount, network, PID)
-- **cgroups v2**: Resource limits (memory, CPU, PIDs)
-- **Privilege dropping**: setuid/setgid to unprivileged user
+**All pipeline execution is in-process.** Every element you add to a pipeline, including dynamically loaded plugins, runs with the full privileges of your process. Parallax currently provides *memory safety by construction* (Rust, with audited `unsafe` at the shared-memory and FFI boundaries), but **no privilege isolation between elements**.
 
-## Sandbox Configurations
+## What happened to the sandbox?
 
-### Default Sandbox
+Earlier versions of this documentation described a process-isolation feature (`ElementSandbox`, seccomp policies, namespaces, `run_isolated()`, an `Isolated` execution strategy for untrusted elements). That feature was **prototyped and removed** (commit `da6df59`) — the supervisor/fork design had a fork-bomb risk and was not production-ready. The related hints survive in the API:
 
-```rust
-ElementSandbox::default()
-```
+- `ExecutionHints::trust_level` (`Trusted`/`SemiTrusted`/`Untrusted`) and `uses_native_code` still exist but are **informational only** — the executor ignores them when choosing a strategy (which is always in-process `Async` or `RealTime`).
+- `plans/16_PROCESS_ISOLATION.md` tracks a possible reintroduction with a sounder design.
 
-| Feature | Setting |
-|---------|---------|
-| Seccomp | `MinimalCompute` (restricted syscall allowlist) |
-| Mount namespace | Enabled |
-| Network namespace | Enabled (no network access) |
-| PID namespace | Enabled |
-| Privilege drop | Disabled |
-| cgroup limits | None |
+Do not rely on any Parallax API for confinement of untrusted code today.
 
-### Strict Sandbox
+## Trust boundaries that do exist
 
-```rust
-ElementSandbox::strict()
-```
+### Plugins
 
-Maximum isolation for untrusted code:
-- All namespaces enabled
-- Drops to `nobody:nogroup` (65534:65534)
-- Memory limit: 512 MB
-- CPU quota: 100% of one core
-- PID limit: 64 processes/threads
+Dynamic plugins (`.so` via `PluginLoader`) are **arbitrary native code**. Every loading entry point is marked `unsafe` for this reason. The loader validates the descriptor before use — ABI version match (`PARALLAX_ABI_VERSION`), non-null pointers, element-name sanity — which protects against *malformed* plugins, not *malicious* ones. Load plugins only from paths you control; note the default search paths (`.`, `/usr/lib/parallax/plugins`, `/usr/local/lib/parallax/plugins`) include the current directory.
 
-### Custom Configurations
+### Shared-memory IPC
 
-```rust
-ElementSandbox::default()
-    .drop_privileges(1000, 1000)
-    .with_limits(CgroupLimits::default().with_memory(1 << 30))
-    .allow_path(AllowedPath::read_only("/usr/lib"))
-    .with_env("RUST_LOG", "debug")
-```
+Cross-process pipelines share arenas by fd. Anyone holding the arena fd can read and write **every slot in the arena** — the granularity of trust is the arena, not the buffer. Consequences:
 
-## Seccomp Policies
+- Only share arena fds with processes you trust with all of that arena's data.
+- A malicious/buggy peer can corrupt slot contents and metadata for all other mappers, and can disturb refcounts (a peer that increments without decrementing leaks slots; validation prevents *resurrecting* freed slots via `SharedIpcSlotRef`, and refcount overflow is checked).
+- Denial of service by a peer (holding refs forever, flooding the release queue) is possible; the owner's `reclaim()` double-checks state so queue abuse cannot free live slots.
+- Buffers received from other processes are data, not capabilities: `rkyv` deserialization of IPC references is validated (`bytecheck`), and slot lookups are bounds- and state-checked.
 
-### MinimalCompute (Default)
+### Network links
 
-Allows only syscalls needed for pure computation and IPC via passed file descriptors:
+`NetworkSender`/`NetworkReceiver` frame payloads with a magic, version, length, and CRC32, and validate rkyv payloads on receipt. There is **no encryption or authentication** — run network links over trusted networks or tunnel them (WireGuard, TLS-terminating proxies). The same applies to the HTTP/WebSocket/RTP/Zenoh elements unless the underlying transport is secured (e.g. Zenoh's own security config).
 
-**Memory Management:**
-- `brk`, `mmap`, `munmap`, `mprotect`, `mremap`, `madvise`
+### Parsers and codecs
 
-**I/O (for passed FDs only):**
-- `read`, `write`, `readv`, `writev`, `pread64`, `pwrite64`
+Media parsing is the classic attack surface. Parallax prefers pure-Rust parsers/codecs (Symphonia, zune-jpeg, png, mp4, mpeg2ts-reader, rav1e) precisely to keep memory-unsafety out of that surface. The exceptions are C/C++ codecs behind feature flags — OpenH264, dav1d, libopus, FDK-AAC — which carry the usual native-codec risk; keep them updated, and prefer the pure-Rust alternatives when latency/quality budgets allow.
 
-**Synchronization:**
-- `futex`, `futex_waitv`
+### `unsafe` inventory
 
-**Process Control:**
-- `exit`, `exit_group`, `rt_sigreturn`, `rt_sigaction`, `rt_sigprocmask`
+The crate denies `unsafe_op_in_unsafe_fn` and concentrates `unsafe` in:
 
-**Time:**
-- `clock_gettime`, `gettimeofday`, `nanosleep`, `clock_nanosleep`
+- `src/memory/` — mmap/memfd management, shared-memory atomics, fd passing. Invariants (refcount overflow checks, slot-state validation, `Send`/`Sync` justifications) are documented inline.
+- `src/plugin/` — dynamic loading and C-ABI marshalling (double-boxed trait objects).
+- FFI codec/device bindings behind feature flags.
 
-**Info:**
-- `getpid`, `gettid`, `getuid`, `getgid`, `geteuid`, `getegid`
+Known sharp edge: `MemorySegment::as_mut_slice` can alias if callers violate its exclusive-access contract, and `SharedArena::from_fd` trusts the fd's header (it is `unsafe` accordingly).
 
-**I/O Multiplexing:**
-- `poll`, `ppoll`, `epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`
+## Deployment guidance
 
-**Misc:**
-- `getrandom`, `close`, `dup`, `dup2`, `dup3`, `fcntl`, `ioctl`, `eventfd2`, `pipe2`
+Until in-engine isolation exists, isolate at the OS level:
 
-**Explicitly DENIED:**
-- `open`, `openat` - no filesystem access
-- `socket`, `connect`, `bind` - no network access
-- `fork`, `clone`, `execve` - no process creation
-- `ptrace` - no debugging other processes
-- `mount`, `umount` - no filesystem modification
+- **Separate processes by trust**: put untrusted stages in their own binary connected via `IpcSrc`/`IpcSink` (dedicated arena per boundary), and sandbox that binary with systemd hardening (`SystemCallFilter=`, `MemoryDenyWriteExecute=`, namespaces), bubblewrap, or a container.
+- **Drop privileges** before `run()`; nothing in Parallax requires root. RT scheduling wants `CAP_SYS_NICE` only.
+- **Limit resources** with cgroups (RT threads at `SCHED_FIFO` 50 can starve a core on malfunction).
+- **Fuzz** anything that parses untrusted input; the typefind and demuxer layers are good targets (`cargo fuzz` harnesses welcome).
 
-### WithNetwork
+## Reporting
 
-Extends `MinimalCompute` with:
-- `socket`, `bind`, `listen`, `accept`, `accept4`, `connect`
-- `sendto`, `recvfrom`, `sendmsg`, `recvmsg`
-- `shutdown`, `setsockopt`, `getsockopt`
-- `getsockname`, `getpeername`
-
-### WithFilesystem
-
-Extends `MinimalCompute` with:
-- `open`, `openat`, `stat`, `fstat`, `lstat`, `fstatat`
-- `access`, `faccessat`, `readlink`, `readlinkat`
-- `getcwd`, `chdir`, `fchdir`
-- `rename`, `renameat`, `unlink`, `unlinkat`
-- `mkdir`, `mkdirat`, `rmdir`
-- `lseek`, `getdents64`
-
-### Custom Policy
-
-```rust
-SeccompPolicy::Custom(vec![
-    SeccompRule::allow("read"),
-    SeccompRule::allow("write"),
-    SeccompRule::with_args("ioctl", vec![
-        ArgConstraint { arg: 1, op: ArgOp::Eq, value: TIOCGWINSZ as u64 }
-    ]),
-])
-```
-
-## Namespace Isolation
-
-### Mount Namespace
-
-When enabled, the element runs in a private mount namespace with:
-- Minimal root filesystem (only required libraries)
-- `/proc` mounted (read-only)
-- `/dev/null`, `/dev/zero`, `/dev/urandom` available
-- Explicitly allowed paths bind-mounted
-
-### Network Namespace
-
-When enabled, the element has:
-- No access to host network interfaces
-- Loopback interface only (127.0.0.1)
-- No ability to create external connections
-
-**Exception:** Elements that need network access use `ElementSandbox::with_network()`.
-
-### PID Namespace
-
-When enabled, the element:
-- Cannot see host processes
-- Has PID 1 in its namespace
-- Cannot send signals to host processes
-
-## cgroup Resource Limits
-
-### Default Limits
-
-| Resource | Limit |
-|----------|-------|
-| `memory.max` | 512 MB |
-| `memory.high` | 256 MB (soft limit, triggers reclaim) |
-| `cpu.max` | 100000/100000 (100% of one CPU) |
-| `pids.max` | 64 |
-| `io.weight` | 100 (default) |
-
-### Memory Limits
-
-```rust
-CgroupLimits::default().with_memory(1 << 30)  // 1 GB
-```
-
-When `memory.max` is exceeded, the kernel OOM-kills the process.
-When `memory.high` is exceeded, the kernel aggressively reclaims memory.
-
-### CPU Limits
-
-```rust
-CgroupLimits::default().with_cpu(0.5)  // 50% of one CPU
-```
-
-CPU quota is enforced via `cpu.max` in cgroups v2:
-- Format: `quota period` (microseconds)
-- Example: `50000 100000` = 50ms every 100ms = 50%
-
-### PID Limits
-
-```rust
-CgroupLimits::default().with_pids(16)  // Max 16 threads
-```
-
-Prevents fork bombs and thread exhaustion attacks.
-
-## Privilege Dropping
-
-```rust
-ElementSandbox::default().drop_privileges(65534, 65534)  // nobody:nogroup
-```
-
-After sandbox setup, the process calls `setgid()` then `setuid()` to drop to an unprivileged user. This prevents:
-- Modifying system files
-- Binding to privileged ports (< 1024)
-- Accessing files owned by other users
-
-## Security Considerations
-
-### What IS Protected
-
-1. **Host filesystem** - Elements cannot access files outside allowed paths
-2. **Host network** - Elements cannot make network connections (unless explicitly allowed)
-3. **Host processes** - Elements cannot see or signal other processes
-4. **System resources** - Memory, CPU, PIDs are limited
-5. **Syscall surface** - Only required syscalls are permitted
-
-### What IS NOT Protected
-
-1. **Shared memory** - Elements share memory via memfd for zero-copy IPC. A malicious element could corrupt data.
-2. **Timing attacks** - Elements can measure time and potentially extract information via timing side-channels.
-3. **Resource exhaustion within limits** - An element can use its full allocation.
-4. **Information in passed data** - Elements can read any data passed to them.
-
-### Recommendations
-
-1. **Use strict sandbox for untrusted code:**
-   ```rust
-   pipeline.run_isolated().await?;
-   ```
-
-2. **Isolate codec elements** (common source of vulnerabilities):
-   ```rust
-   pipeline.run_isolating(vec!["*dec*", "*demux*"]).await?;
-   ```
-
-3. **Validate inputs** before passing to sandboxed elements
-
-4. **Monitor resource usage** via cgroup statistics
-
-5. **Use separate user IDs** for different trust levels
-
-## Implementation Notes
-
-### File Descriptor Passing
-
-Isolated elements communicate via:
-- `memfd_create()` for shared memory (data buffers)
-- `eventfd()` for wakeup notifications
-- Unix domain sockets with `SCM_RIGHTS` for FD passing
-
-All FDs are passed at startup; the element cannot create new ones.
-
-### Seccomp Enforcement
-
-The seccomp filter uses `SECCOMP_RET_KILL_PROCESS` for denied syscalls. This immediately terminates the process rather than returning an error, preventing probing attacks.
-
-### Namespace Setup Order
-
-1. `unshare(CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWNET)`
-2. Pivot root to minimal filesystem
-3. Set up allowed bind mounts
-4. Apply cgroup limits
-5. Apply seccomp filter (must be last - limits further syscalls)
-6. Drop privileges via `setgid()` + `setuid()`
-7. Execute element main loop
-
-### Recovery from Crashes
-
-The supervisor monitors child processes via `waitpid()`. On crash:
-1. Collect exit status / signal
-2. Clean up shared memory references
-3. Optionally restart with `RestartPolicy`
-4. Propagate error to pipeline if unrecoverable
-
-## Testing the Sandbox
-
-```bash
-# Run isolated example
-cargo run --example 13_isolate_all
-
-# Verify seccomp is active (requires strace)
-strace -f cargo run --example 13_isolate_all 2>&1 | grep seccomp
-```
-
-## Future Improvements
-
-1. **Landlock** - Additional filesystem sandboxing on Linux 5.13+
-2. **io_uring restrictions** - When io_uring support is added
-3. **Capability dropping** - Fine-grained capability control
-4. **Audit logging** - Log denied syscalls for debugging
+If you find a security issue, please open a private report rather than a public issue.

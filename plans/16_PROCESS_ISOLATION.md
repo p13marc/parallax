@@ -1,14 +1,16 @@
-# Plan 16: Process Isolation — From Scaffolding to Working System
+# Plan 16: Process Isolation
 
-**Priority:** High  
-**Effort:** Large (3-4 weeks)  
-**Depends on:** None (low-level primitives already work)
+**Priority:** Low (deferred)  
+**Effort:** Large (3-4 weeks, from scratch)  
+**Depends on:** None (memory/IPC primitives still work)
+
+> **⚠️ Status update (2026-07):** This plan predates commit `da6df59`, which **removed the entire process-isolation scaffolding** (`src/execution/` — `isolated_executor.rs`, `mode.rs`, `sandbox.rs`, `supervisor.rs`, `protocol.rs` — plus `examples/12_isolation.rs`) because the fork-based supervisor carried a fork-bomb risk and was not production-ready. The "What Actually Works" table below describes **deleted code** and is kept only as a design record; the surviving pieces are the memory layer (`memory/ipc.rs` SCM_RIGHTS, `SharedArena` cross-process refcounting) and the informational `ExecutionHints::trust_level`/`uses_native_code` fields. Any new implementation should be **spawn-based** (fork+exec of a worker binary, or element-group processes bridged by `IpcSrc`/`IpcSink`), not fork-per-element, and should rebase the file/example references below (e.g. example slot 51 is now taken by `51_bus_messages.rs`). Current guidance for users is OS-level sandboxing — see `docs/security.md`.
 
 ---
 
-## Problem Statement
+## Problem Statement (historical, pre-da6df59)
 
-Parallax's core design promise is "Security-First: Inter-process isolation by default." The CLAUDE.md claims Phase 6 (Process Isolation) is "Complete." In reality, calling `pipeline.run_isolated()` logs a warning and silently falls back to in-process execution.
+Parallax's original design promised "Security-First: Inter-process isolation by default." In reality, calling `pipeline.run_isolated()` logged a warning and silently fell back to in-process execution — and the scaffolding has since been removed entirely.
 
 ### What Actually Works
 

@@ -2,128 +2,45 @@
 
 This directory contains implementation plans for remaining Parallax features.
 
-Completed plans have been removed. See git history for details.
+Completed plans have been removed (see git history). Only plans with an existing file are linked; unlinked entries are proposed work whose plan documents have not been written yet.
 
 ---
 
-## Remaining Plans
-
-### Tier 1: Generic Pipeline Infrastructure (Highest Priority)
-
-These are media-independent features that make the pipeline engine complete.
+## Active Plans
 
 | # | Plan | Priority | Effort | Progress |
 |---|------|----------|--------|----------|
-| 21 | [Debugging & Inspection Tools](21_DEBUGGING_INSPECTION_TOOLS.md) | High | Medium | ✅ Complete |
-| 22 | [Auto-Plugging & Typefinding](22_AUTO_PLUGGING_TYPEFINDING.md) | High | Large | ✅ Complete |
-| 23 | [Network Buffering Strategies](23_NETWORK_BUFFERING_STRATEGIES.md) | High | Medium | ✅ Complete |
+| 11 | [GPU Codec Framework](11_GPU_CODEC_FRAMEWORK.md) | Medium-High | Large | 🟡 ~60% — Vulkan context/session/DPB/DMA-BUF memory done; decode command submission not wired into `VulkanH264Decoder`; no encode |
+| 16 | [Process Isolation](16_PROCESS_ISOLATION.md) | Low | Large | ⬜ Not started — **note:** the earlier scaffolding (`src/execution/`) was removed in `da6df59`; any implementation starts from scratch with a spawn-based design |
 
-### Tier 2: Media Processing Elements
+## Proposed Plans (no plan file yet)
 
-Media-specific elements for production pipelines.
-
-| # | Plan | Priority | Effort | Progress |
-|---|------|----------|--------|----------|
-| 24 | [Video Processing Filters](24_VIDEO_PROCESSING_FILTERS.md) | Medium | Medium-Large | ⬜ Not Started |
-| 25 | [Audio Processing Filters](25_AUDIO_PROCESSING_FILTERS.md) | Medium | Medium | ⬜ Not Started |
-
-### Tier 3: Codec & Format Coverage
-
-Expanding media format support for competitive parity.
-
-| # | Plan | Priority | Effort | Progress |
-|---|------|----------|--------|----------|
-| 11 | [GPU Codec Framework](11_GPU_CODEC_FRAMEWORK.md) | Medium-High | Large | 🟡 ~60% |
-| 26 | [Video Codec Expansion (H.265, VP8/VP9)](26_VIDEO_CODEC_EXPANSION.md) | Medium-High | Medium | ⬜ Not Started |
-| 27 | [Container Format Expansion (MKV, FLV, WAV, Ogg)](27_CONTAINER_FORMAT_EXPANSION.md) | Medium | Medium | ⬜ Not Started |
-| 28 | [Streaming Protocol Expansion (WebRTC, SRT, RTMP)](28_STREAMING_PROTOCOL_EXPANSION.md) | Medium-High | Large | ⬜ Not Started |
-
-### Tier 4: Advanced Infrastructure
-
-Complex features for specialized use cases.
-
-| # | Plan | Priority | Effort | Progress |
-|---|------|----------|--------|----------|
-| 16 | [Process Isolation](16_PROCESS_ISOLATION.md) | Low | Large | ⬜ Not Started |
+| # | Idea | Priority | Notes |
+|---|------|----------|-------|
+| 24 | Video processing filters | Medium | VideoCrop, Flip/Rotate, VideoRate, ColorBalance, Compositor, TextOverlay |
+| 25 | Audio processing filters | Medium | AudioMixer, ChannelMix, Equalizer, Compressor/Limiter, AudioLevel |
+| 26 | Video codec expansion | Medium-High | H.265 + VP8/VP9; consider rav1d for pure-Rust AV1 decode |
+| 27 | Container format expansion | Medium | MKV/WebM, FLV, WAV, Ogg (pure Rust crates exist); FLV is prerequisite for RTMP |
+| 28 | Streaming protocol expansion | Medium-High | WHIP (RFC 9725) sink, MoQ sink (Rust stacks exist), SRT, RTMP |
+| — | `parallax-launch` CLI | Medium | gst-launch equivalent; also register the full element library with `ElementFactory` |
+| — | Wayland `ext-image-copy-capture-v1` source | Low | Lower-latency screen capture without the portal/PipeWire path |
 
 **Legend:** ⬜ Not Started | 🟡 In Progress | ✅ Complete
 
 ---
 
-## Recommended Implementation Order
+## Completed Plans (files removed)
 
-```
-Phase A (Foundation — remaining):
-  21 (Debugging)
-  22 (Auto-Plugging)
-  23 (Network Buffering)
-
-Phase B (Media — can start in parallel):
-  26 → 27 → 28
-  24
-  25
-  11
-
-Phase C (Advanced):
-  16
-```
-
-**Phase A** remaining plans are independent of each other. Plan 21 (Debugging) is high-value developer experience. Plan 22 (Auto-Plugging) requires the now-complete seeking (Plan 19) and bus (Plan 18). Plan 23 (Network Buffering) requires the bus for progress reporting.
-
-**Phase B** focuses on media format coverage. Plans 24/25 (filters) and Plan 26 (codecs) can start independently. Plan 27 (containers) is needed before Plan 28 (RTMP needs FLV, WebRTC needs VP8/VP9 from Plan 26).
-
-**Phase C** is for specialized advanced features after the core is solid.
-
----
-
-## Plan Summaries
-
-### Plan 11: GPU Codec Framework (Vulkan Video)
-Hardware-accelerated video encoding/decoding via Vulkan Video. Skeleton and NAL parsing done. Remaining: complete H.264/H.265/AV1 decode, H.264/H.265 encode, video session management.
-
-### Plan 16: Process Isolation
-Production-ready process isolation with seccomp/namespace sandboxing. Scaffolding exists (IPC, supervisor protocol) but needs full sandbox implementation.
-
-### Plan 21: Debugging & Inspection Tools
-`parallax-inspect` CLI (browse elements), DOT graph dumps, tracer framework (latency/framerate/queue level), `parallax-top` TUI monitor. Essential developer experience.
-
-### Plan 22: Auto-Plugging & Typefinding
-TypeFind (detect format from bytes), DecodeBin (auto demux+decode chain), PlayBin (auto-play any URI). Enables "just play this file" use case.
-
-### Plan 23: Network Buffering Strategies
-Queue2 with stream buffering (watermarks), download buffering (disk-backed), timeshift buffering (DVR rewind). Buffering progress via bus messages. Required for reliable network streaming.
-
-### Plan 24: Video Processing Filters
-VideoCrop, VideoFlip/Rotate, VideoRate (framerate adjust), ColorBalance, Compositor (PiP/grid), TextOverlay, ImageOverlay. Production video pipeline essentials.
-
-### Plan 25: Audio Processing Filters
-AudioMixer (N-to-1), ChannelMix (upmix/downmix), Equalizer (parametric biquad), Compressor/Limiter, AudioLevel (peak/RMS metering), AudioPanorama. Production audio pipeline essentials.
-
-### Plan 26: Video Codec Expansion
-H.265/HEVC encode (x265) and decode (libde265). VP8/VP9 encode/decode (libvpx). Needed for modern video content and WebRTC.
-
-### Plan 27: Container Format Expansion
-MKV/WebM (matroska-demuxer), FLV (flavors), WAV (hound), Ogg (ogg crate). All pure Rust or permissively licensed. FLV is prerequisite for RTMP.
-
-### Plan 28: Streaming Protocol Expansion
-WebRTC (str0m, WHIP/WHEP), SRT (srt-rs), RTMP (rml-rtmp). Highest-demand streaming protocols for live interactive and broadcast use cases.
-
----
-
-## Completed Plans (removed)
-
-Plans 00-10, 12-15, 17-20, Clock Provider, and Pipeline Robustness have been completed and their files removed. Key completed work:
-
-- **Phase 1** (Plans 00-08): Metadata API, codec wrappers, muxer sync, buffer pool, element trait consolidation, caps negotiation, builder DSL, events/tagging
-- **Phase 2** (Plans 09-10, 12-14): Format converters, code cleanup, additional codecs (Opus, AAC, Symphonia), device elements (V4L2, PipeWire, ALSA, libcamera, screen capture), streaming protocols (HLS, DASH)
+- **Phase 1** (Plans 00–08): Metadata API, codec wrappers, muxer sync, buffer pool, element trait consolidation, caps negotiation, builder DSL, events/tagging
+- **Phase 2** (Plans 09–10, 12–14): Format converters, code cleanup, additional codecs (Opus, AAC, Symphonia), device elements (V4L2, PipeWire, ALSA, libcamera, screen capture), streaming outputs (HLS, DASH)
 - **Plan 15**: RT scheduling (SyncElement trait, RT thread spawning, driver integration, hybrid async/RT pipelines)
-- **Plan 17**: Consolidated `affinity()`, `is_rt_safe()`, and `execution_hints()` into single `execution_hints()` method; removed `Affinity` enum (PipeWire-inspired capability-based scheduling)
-- **Plan 18**: Pipeline Bus & Messaging — thread-safe message bus (Bus, BusHandle), typed messages (MessageKind), TagList, sync polling and async stream consumption
-- **Plan 19**: Seeking & Position Queries — segment timestamp mapping, SeekableSource trait, FileSrc byte-seeking, Pipeline query API (position, duration, seekable)
-- **Plan 20**: Pad Probes — buffer/event interception (ProbeType, ProbeReturn, ProbeData), ProbeRegistry, executor integration with Drop/Remove semantics
-- **Plan 21**: Debugging & Inspection Tools — Tracer framework (LatencyTracer, FramerateTracer, DropTracer), TracerRegistry, PARALLAX_TRACERS env var, Pipeline stats snapshot, PARALLAX_DOT_DIR auto-dump
-- **Plan 22**: Auto-Plugging & Typefinding — TypeFindRegistry with 14 built-in detectors (MP4, MKV, MPEG-TS, FLV, AVI, WAV, Ogg, FLAC, PNG, JPEG, H.264, MP3), byte-based and extension-based detection
-- **Plan 23**: Network Buffering Strategies — Queue2 element with stream (watermark pause/resume), download (file-backed with range tracking), and timeshift (circular ring buffer) modes; rate estimation; bus buffering messages
-- **Clock Provider**: Hardware timestamp extraction (PipeWire, V4L2, ALSA), Clock/ClockProvider traits, PipelineClock, TimestampDebug element
-- **Auto Clock Selection**: `as_clock_provider()` on element traits, `Pipeline::select_clock()`, AlsaSink auto-provides clock
-- **Pipeline Robustness**: Arena reclaim hygiene, backpressure system (FlowSignal, FlowPolicy, Queue water marks), video scaler
+- **Plan 17**: Consolidated `affinity()`/`is_rt_safe()` into a single `execution_hints()` method; removed the `Affinity` enum
+- **Plan 18**: Pipeline bus & messaging (Bus, BusHandle, MessageKind, TagList, BusStream)
+- **Plan 19**: Seeking & position queries (SegmentEvent mapping, SeekableSource, FileSrc byte-seeking)
+- **Plan 20**: Pad probes (ProbeType/ProbeReturn/ProbeData, ProbeRegistry, executor integration)
+- **Plan 21**: Debugging & inspection (LatencyTracer/FramerateTracer/DropTracer, `PARALLAX_TRACERS`, `PARALLAX_DOT_DIR`, stats snapshot). The originally-planned `parallax-inspect`/`parallax-top` CLIs were **not** built.
+- **Plan 22**: Typefinding (TypeFindRegistry, byte + extension detection). The originally-planned DecodeBin/PlayBin auto-plugging was **not** built.
+- **Plan 23**: Network buffering (Queue2: stream/download/timeshift modes, rate estimation, bus buffering messages)
+- **Clock work**: Clock/ClockProvider/PipelineClock, hardware timestamp extraction, `TimestampDebug`, automatic clock selection (`Pipeline::select_clock()`, AlsaSink provider)
+- **Pipeline robustness**: arena reclaim hygiene, backpressure (FlowSignal/FlowPolicy/water marks), video scaler
+- **Removed feature**: process isolation prototype (`src/execution/`) — deleted in `da6df59` (fork-bomb risk); tracked for redesign in Plan 16
