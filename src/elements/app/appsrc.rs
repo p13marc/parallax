@@ -124,12 +124,11 @@ impl Default for AppSrc {
 
 impl Source for AppSrc {
     fn produce(&mut self, _ctx: &mut ProduceContext) -> Result<ProduceResult> {
+        // Never block here: produce() runs inside an executor task, and a
+        // condvar wait would pin the runtime worker thread (parking sibling
+        // tasks woken into its LIFO slot with it). Returning WouldBlock lets
+        // the executor retry without stalling the pipeline.
         let mut state = self.inner.state.lock().unwrap();
-
-        // Wait for data or EOS
-        while state.queue.is_empty() && !state.eos && !state.flushing {
-            state = self.inner.data_available.wait(state).unwrap();
-        }
 
         if state.flushing {
             return Err(Error::Element("appsrc is flushing".into()));
@@ -137,6 +136,7 @@ impl Source for AppSrc {
 
         if let Some(buffer) = state.queue.pop_front() {
             state.total_produced += 1;
+            self.inner.data_available.notify_all();
             Ok(ProduceResult::OwnBuffer(buffer))
         } else if state.eos {
             Ok(ProduceResult::Eos)

@@ -35,12 +35,12 @@ use crate::element::{
     ProcessingHint, SourceResult,
 };
 use crate::error::{Error, Result};
+use crate::pipeline::bus::{Bus, BusHandle};
+use crate::pipeline::probe::{ProbeRegistry, ProbeReturn};
 use crate::pipeline::rt_bridge::AsyncRtBridge;
 use crate::pipeline::rt_scheduler::{
     BoundaryDirection, GraphPartition, RtConfig, RtScheduler, SchedulingMode,
 };
-use crate::pipeline::bus::{Bus, BusHandle};
-use crate::pipeline::probe::{ProbeRegistry, ProbeReturn};
 use crate::pipeline::tracer::TracerRegistry;
 use crate::pipeline::{
     DriverConfig, EventReceiver, EventSender, NodeId, Pipeline, PipelineEvent, PipelineState,
@@ -902,12 +902,24 @@ impl Executor {
         let tracers = pipeline.tracer_registry().clone();
 
         let task = match element_type {
-            ElementType::Source => {
-                spawn_source_task(node_name, node_id, element, outputs, output_bridges, events_clone, probes, tracers)
-            }
-            ElementType::Sink => {
-                spawn_sink_task(node_name, element, inputs, input_bridges, events_clone, tracers)
-            }
+            ElementType::Source => spawn_source_task(
+                node_name,
+                node_id,
+                element,
+                outputs,
+                output_bridges,
+                events_clone,
+                probes,
+                tracers,
+            ),
+            ElementType::Sink => spawn_sink_task(
+                node_name,
+                element,
+                inputs,
+                input_bridges,
+                events_clone,
+                tracers,
+            ),
             ElementType::Transform => spawn_transform_task(
                 node_name,
                 element,
@@ -1164,16 +1176,31 @@ fn spawn_sink_task(
 
         let mut count: u64 = 0;
 
+        let n_inputs = inputs.len();
+        tracing::debug!("sink '{}': {} inputs", name, n_inputs);
         if let Some(rx) = inputs.into_iter().next() {
             // Standard path: read from kanal channel
-            while let Ok(Message::Buffer(buffer)) = rx.recv().await {
-                count += 1;
-                tracers.notify_buffer(&name, &buffer);
-                if let Err(e) = element.process(Some(buffer)).await {
-                    events.send_error(e.to_string(), Some(name.clone()));
-                    return Err(e);
+            loop {
+                match rx.recv().await {
+                    Ok(Message::Buffer(buffer)) => {
+                        count += 1;
+                        tracing::debug!("sink '{}': received buffer {}", name, count);
+                        tracers.notify_buffer(&name, &buffer);
+                        if let Err(e) = element.process(Some(buffer)).await {
+                            events.send_error(e.to_string(), Some(name.clone()));
+                            return Err(e);
+                        }
+                        tracers.notify_buffer_processed(&name);
+                    }
+                    Ok(Message::Eos) => {
+                        tracing::debug!("sink '{}': EOS after {}", name, count);
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::debug!("sink '{}': channel closed after {}: {}", name, count, e);
+                        break;
+                    }
                 }
-                tracers.notify_buffer_processed(&name);
             }
         } else if let Some(bridge) = input_bridges.into_iter().next() {
             // Bridge path: read from RT→Async bridge
