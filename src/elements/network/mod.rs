@@ -22,6 +22,9 @@ mod websocket;
 #[cfg(feature = "zenoh")]
 mod zenoh;
 
+#[cfg(feature = "zenoh")]
+pub mod zenoh_wire;
+
 // TCP
 pub use tcp::{AsyncTcpSink, AsyncTcpSrc, TcpMode, TcpSink, TcpSrc};
 
@@ -43,8 +46,12 @@ pub use http::{HttpMethod, HttpSink, HttpSinkStats, HttpSrc, HttpStreamingSink};
 pub use websocket::{WebSocketSink, WebSocketSrc, WebSocketStats, WsMessageType};
 
 // Zenoh (feature-gated)
+#[cfg(feature = "zenoh-unstable")]
+pub use zenoh::ZenohReliability;
 #[cfg(feature = "zenoh")]
 pub use zenoh::{
     ZenohCongestionControl, ZenohPriority, ZenohQuerier, ZenohQuery, ZenohQueryable, ZenohSink,
     ZenohSrc, ZenohStats,
 };
+#[cfg(feature = "zenoh")]
+pub use zenoh_wire::{WireFormat, WireMetadata};

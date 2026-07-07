@@ -60,7 +60,7 @@ ureq = { version = "2", optional = true }
 tungstenite = { version = "0.21", optional = true }
 
 # Zenoh pub/sub (optional)
-zenoh = { version = "1.0", optional = true }
+zenoh = { version = "1.9", optional = true }
 
 # RTP/RTCP (optional, from webrtc-rs)
 # Note: rtp uses webrtc-util 0.12, rtcp uses webrtc-util 0.10
@@ -175,6 +175,7 @@ simd-colorspace = ["dep:yuv"]
 http = ["ureq"]       # HTTP source/sink elements
 websocket = ["tungstenite"]  # WebSocket source/sink elements
 zenoh = ["dep:zenoh"] # Zenoh pub/sub elements
+zenoh-unstable = ["zenoh", "zenoh/unstable"] # reliability control + matching listeners
 rtp = ["dep:rtp", "dep:rtcp", "dep:webrtc-util", "dep:webrtc-util-0_10"]  # RTP/RTCP elements
 rtsp = ["rtp", "dep:retina", "dep:url"]  # RTSP client (includes RTP support)
 mpeg-ts = ["dep:mpeg2ts-reader"]  # MPEG-TS demuxer

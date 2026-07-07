@@ -1213,6 +1213,68 @@ impl Pipeline {
         self.add_node(name, DynAsyncElement::new_box(ElementAdapter::new(element)))
     }
 
+    /// Add an async source element to the pipeline.
+    ///
+    /// This automatically wraps the source in an
+    /// [`AsyncSourceAdapter`](crate::element::AsyncSourceAdapter). Use this
+    /// for sources doing real async I/O (network, device event loops), e.g.
+    /// `AsyncTcpSrc` or `ZenohSrc`.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let src = ZenohSrc::new("demo/video/**").await?;
+    /// let node = pipeline.add_async_source("zenoh-in", src);
+    /// ```
+    pub fn add_async_source<S: crate::element::AsyncSource + 'static>(
+        &mut self,
+        name: impl Into<String>,
+        source: S,
+    ) -> NodeId {
+        self.add_node(
+            name,
+            DynAsyncElement::new_box(crate::element::AsyncSourceAdapter::new(source)),
+        )
+    }
+
+    /// Add an async sink element to the pipeline.
+    ///
+    /// This automatically wraps the sink in an
+    /// [`AsyncSinkAdapter`](crate::element::AsyncSinkAdapter). Use this for
+    /// sinks doing real async I/O, e.g. `AsyncTcpSink` or `ZenohSink`.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let sink = ZenohSink::new("demo/video/cam0").await?;
+    /// let node = pipeline.add_async_sink("zenoh-out", sink);
+    /// ```
+    pub fn add_async_sink<S: crate::element::AsyncSink + 'static>(
+        &mut self,
+        name: impl Into<String>,
+        sink: S,
+    ) -> NodeId {
+        self.add_node(
+            name,
+            DynAsyncElement::new_box(crate::element::AsyncSinkAdapter::new(sink)),
+        )
+    }
+
+    /// Add an async transform element to the pipeline.
+    ///
+    /// This automatically wraps the transform in an
+    /// [`AsyncTransformAdapter`](crate::element::AsyncTransformAdapter).
+    pub fn add_async_transform<T: crate::element::AsyncTransform + 'static>(
+        &mut self,
+        name: impl Into<String>,
+        transform: T,
+    ) -> NodeId {
+        self.add_node(
+            name,
+            DynAsyncElement::new_box(crate::element::AsyncTransformAdapter::new(transform)),
+        )
+    }
+
     /// Get a node by ID.
     pub fn get_node(&self, id: NodeId) -> Option<&Node> {
         self.graph.node_weight(id.0)
@@ -1392,12 +1454,7 @@ impl Pipeline {
     /// });
     /// ```
     #[must_use]
-    pub fn add_probe<F>(
-        &self,
-        pad: PadRef,
-        probe_type: ProbeType,
-        callback: F,
-    ) -> ProbeId
+    pub fn add_probe<F>(&self, pad: PadRef, probe_type: ProbeType, callback: F) -> ProbeId
     where
         F: FnMut(ProbeData<'_>) -> ProbeReturn + Send + 'static,
     {
@@ -1538,10 +1595,7 @@ impl Pipeline {
         for src_id in source_ids {
             if let Some(node) = self.get_node_mut(src_id) {
                 if let Some(ref mut element) = node.element {
-                    if element
-                        .handle_upstream_event(event)
-                        .is_handled()
-                    {
+                    if element.handle_upstream_event(event).is_handled() {
                         handled = true;
                     }
                 }
@@ -2570,7 +2624,9 @@ impl Pipeline {
     where
         F: FnMut(&crate::pipeline::bus::Message) -> bool,
     {
-        let mut bus = self.take_bus().unwrap_or_else(|| crate::pipeline::bus::Bus::new().0);
+        let mut bus = self
+            .take_bus()
+            .unwrap_or_else(|| crate::pipeline::bus::Bus::new().0);
         let executor = crate::pipeline::Executor::new();
         let handle = executor.start(self)?;
         handle.wait().await?;
