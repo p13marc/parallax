@@ -103,6 +103,10 @@
 mod common;
 pub use common::{PixelFormat, VideoFrame};
 
+// Runtime control handles (keyframe requests on running pipelines)
+mod control;
+pub use control::{KEYFRAME_REQUEST, KeyframeHandle};
+
 // Video codec traits
 mod traits;
 pub use traits::{FrameType, VideoDecoder, VideoEncoder};

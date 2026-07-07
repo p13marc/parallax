@@ -80,8 +80,8 @@ pub struct HwEncoderElement<E: HwVideoEncoder> {
     packets_out: u64,
     /// Arena for output buffer allocation.
     arena: Option<SharedArena>,
-    /// Force next frame to be keyframe.
-    force_keyframe: bool,
+    /// Pending runtime keyframe requests (shared with [`Self::keyframe_handle`]).
+    keyframe_requests: super::KeyframeHandle,
     /// Expected input width.
     width: u32,
     /// Expected input height.
@@ -105,7 +105,7 @@ impl<E: HwVideoEncoder> HwEncoderElement<E> {
             frames_in: 0,
             packets_out: 0,
             arena: None,
-            force_keyframe: false,
+            keyframe_requests: super::KeyframeHandle::new(),
             width: 0,
             height: 0,
             format: GpuPixelFormat::Nv12,
@@ -122,7 +122,7 @@ impl<E: HwVideoEncoder> HwEncoderElement<E> {
             frames_in: 0,
             packets_out: 0,
             arena: None,
-            force_keyframe: false,
+            keyframe_requests: super::KeyframeHandle::new(),
             width,
             height,
             format,
@@ -131,7 +131,16 @@ impl<E: HwVideoEncoder> HwEncoderElement<E> {
 
     /// Force the next encoded frame to be a keyframe.
     pub fn request_keyframe(&mut self) {
-        self.force_keyframe = true;
+        self.keyframe_requests.request();
+    }
+
+    /// Get a cloneable handle for requesting keyframes at runtime.
+    ///
+    /// Clone this *before* the pipeline starts; a
+    /// [`request()`](super::KeyframeHandle::request) makes the wrapper call
+    /// [`HwVideoEncoder::force_keyframe`] before encoding its next frame.
+    pub fn keyframe_handle(&self) -> super::KeyframeHandle {
+        self.keyframe_requests.clone()
     }
 
     /// Get the number of frames received.
@@ -270,16 +279,15 @@ impl<E: HwVideoEncoder + 'static> Transform for HwEncoderElement<E> {
             .as_nanos()
             .unwrap_or(self.frames_in * 33_333_333) as i64;
 
-        // Check for keyframe request from upstream
+        // Check for keyframe request from upstream or the runtime handle
         let upstream_keyframe = buffer
             .metadata()
-            .get::<bool>("video/keyframe_request")
+            .get::<bool>(super::KEYFRAME_REQUEST)
             .copied()
             .unwrap_or(false);
 
-        if upstream_keyframe || self.force_keyframe {
+        if self.keyframe_requests.take() || upstream_keyframe {
             self.encoder.force_keyframe();
-            self.force_keyframe = false;
         }
 
         self.frames_in += 1;

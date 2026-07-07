@@ -101,6 +101,15 @@ pub trait VideoEncoder: Send {
     fn has_pending(&self) -> bool {
         false
     }
+
+    /// Force the next encoded frame to be a keyframe (IDR).
+    ///
+    /// Default: no-op, for encoders without keyframe control. Encoders that
+    /// support it (H.264, hardware encoders) override this; the
+    /// [`EncoderElement`](super::EncoderElement) wrapper calls it when a
+    /// [`KeyframeHandle`](super::KeyframeHandle) request or an in-band
+    /// [`KEYFRAME_REQUEST`](super::KEYFRAME_REQUEST) metadata flag arrives.
+    fn force_keyframe(&mut self) {}
 }
 
 /// Trait for video decoders.

@@ -69,6 +69,8 @@ pub struct EncoderElement<E: VideoEncoder> {
     frames_in: u64,
     /// Statistics: packets produced.
     packets_out: u64,
+    /// Pending runtime keyframe requests (shared with [`Self::keyframe_handle`]).
+    keyframe_requests: super::KeyframeHandle,
     /// Arena for output buffer allocation.
     arena: SharedArena,
 }
@@ -96,8 +98,18 @@ impl<E: VideoEncoder> EncoderElement<E> {
             height,
             frames_in: 0,
             packets_out: 0,
+            keyframe_requests: super::KeyframeHandle::new(),
             arena,
         })
+    }
+
+    /// Get a cloneable handle for requesting keyframes at runtime.
+    ///
+    /// Clone this *before* the pipeline starts; a
+    /// [`request()`](super::KeyframeHandle::request) makes the wrapper call
+    /// [`VideoEncoder::force_keyframe`] before encoding its next frame.
+    pub fn keyframe_handle(&self) -> super::KeyframeHandle {
+        self.keyframe_requests.clone()
     }
 
     /// Get the number of frames received.
@@ -182,6 +194,18 @@ impl<E: VideoEncoder> EncoderElement<E> {
 
 impl<E: VideoEncoder + 'static> Transform for EncoderElement<E> {
     fn transform(&mut self, buffer: Buffer) -> Result<Output> {
+        // Runtime keyframe requests: from the shared handle or stamped
+        // in-band on the buffer's metadata.
+        if self.keyframe_requests.take()
+            || buffer
+                .metadata()
+                .get::<bool>(super::KEYFRAME_REQUEST)
+                .copied()
+                .unwrap_or(false)
+        {
+            self.encoder.force_keyframe();
+        }
+
         // Convert buffer to frame
         let frame = self.buffer_to_frame(&buffer);
         let input_metadata = buffer.metadata();

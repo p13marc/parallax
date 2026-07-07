@@ -151,6 +151,8 @@ pub struct H264Encoder {
     config: H264EncoderConfig,
     frame_count: u64,
     bytes_encoded: u64,
+    /// Pending runtime keyframe requests (shared with [`Self::keyframe_handle`]).
+    keyframe_requests: super::KeyframeHandle,
     /// Arena for output buffer allocation.
     arena: SharedArena,
 }
@@ -192,6 +194,7 @@ impl H264Encoder {
             config,
             frame_count: 0,
             bytes_encoded: 0,
+            keyframe_requests: super::KeyframeHandle::new(),
             arena,
         })
     }
@@ -237,6 +240,17 @@ impl H264Encoder {
         self.encoder.force_intra_frame();
     }
 
+    /// Get a cloneable handle for requesting keyframes at runtime.
+    ///
+    /// Clone this *before* the pipeline starts (elements are moved into
+    /// their executor tasks at start); calling
+    /// [`request()`](super::KeyframeHandle::request) on it makes the next
+    /// frame processed by this encoder an IDR, flagged
+    /// [`BufferFlags::SYNC_POINT`](crate::metadata::BufferFlags::SYNC_POINT).
+    pub fn keyframe_handle(&self) -> super::KeyframeHandle {
+        self.keyframe_requests.clone()
+    }
+
     /// Get the number of frames encoded.
     pub fn frame_count(&self) -> u64 {
         self.frame_count
@@ -263,15 +277,48 @@ impl std::fmt::Debug for H264Encoder {
     }
 }
 
+/// Returns true if the Annex-B bitstream contains an IDR NAL unit (type 5).
+fn contains_idr(data: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 3 < data.len() {
+        let offset = if data[i..].starts_with(&[0, 0, 0, 1]) {
+            4
+        } else if data[i..].starts_with(&[0, 0, 1]) {
+            3
+        } else {
+            i += 1;
+            continue;
+        };
+        if i + offset < data.len() && data[i + offset] & 0x1F == 5 {
+            return true;
+        }
+        i += offset;
+    }
+    false
+}
+
 /// Element trait implementation for H264Encoder.
 impl Element for H264Encoder {
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
+        // Runtime keyframe requests: from the shared handle or stamped
+        // in-band on the buffer's metadata.
+        let requested = self.keyframe_requests.take()
+            || buffer
+                .metadata()
+                .get::<bool>(super::KEYFRAME_REQUEST)
+                .copied()
+                .unwrap_or(false);
+        if requested {
+            self.encoder.force_intra_frame();
+        }
+
         let input_data = buffer.as_bytes();
         let encoded = self.encode_yuv420(input_data)?;
 
         if encoded.is_empty() {
             return Ok(None);
         }
+        let is_keyframe = contains_idr(&encoded);
 
         // Reclaim any released slots before acquiring
         self.arena.reclaim();
@@ -289,6 +336,9 @@ impl Element for H264Encoder {
         // Preserve input buffer's PTS for proper timing, update sequence number
         let mut metadata = buffer.metadata().clone();
         metadata.sequence = self.frame_count - 1;
+        if is_keyframe {
+            metadata.flags |= crate::metadata::BufferFlags::SYNC_POINT;
+        }
         Ok(Some(Buffer::new(handle, metadata)))
     }
 
@@ -358,6 +408,10 @@ impl super::traits::VideoEncoder for H264Encoder {
         // H.264 codec data (SPS/PPS) would be extracted from the first encoded frame
         // For now, return None - the first keyframe contains the headers inline
         None
+    }
+
+    fn force_keyframe(&mut self) {
+        self.encoder.force_intra_frame();
     }
 }
 
