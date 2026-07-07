@@ -174,11 +174,7 @@ impl std::fmt::Display for Queue2Stats {
         write!(
             f,
             "{}% ({}B in, {}B out, {} bufs, buffering={})",
-            self.percent,
-            self.bytes_in,
-            self.bytes_out,
-            self.buffers_in,
-            self.is_buffering,
+            self.percent, self.bytes_in, self.bytes_out, self.buffers_in, self.is_buffering,
         )
     }
 }
@@ -392,9 +388,11 @@ impl Queue2 {
 
         // Ensure file is open
         if self.file.is_none() {
-            let path = self.config.temp_file.as_ref().ok_or_else(|| {
-                Error::Config("download mode requires temp_file path".into())
-            })?;
+            let path = self
+                .config
+                .temp_file
+                .as_ref()
+                .ok_or_else(|| Error::Config("download mode requires temp_file path".into()))?;
             self.file = Some(File::create(path)?);
         }
 
@@ -413,8 +411,8 @@ impl Queue2 {
 
         // Calculate percentage based on total size
         if let Some(total) = self.config.total_size {
-            if total > 0 {
-                self.percent = ((self.file_write_pos * 100) / total).min(100) as u32;
+            if let Some(pct) = (self.file_write_pos * 100).checked_div(total) {
+                self.percent = pct.min(100) as u32;
             }
         }
 
@@ -434,9 +432,10 @@ impl Queue2 {
 
         // Ensure file is open
         if self.file.is_none() {
-            let path = self.config.temp_file.as_ref().ok_or_else(|| {
-                Error::Config("timeshift mode requires temp_file path".into())
-            })?;
+            let path =
+                self.config.temp_file.as_ref().ok_or_else(|| {
+                    Error::Config("timeshift mode requires temp_file path".into())
+                })?;
             self.file = Some(
                 File::options()
                     .read(true)
@@ -475,9 +474,7 @@ impl Queue2 {
 
     /// Get the available rewind duration in timeshift mode.
     pub fn available_rewind(&self) -> Duration {
-        let available_bytes = self
-            .file_write_pos
-            .min(self.config.max_size_bytes as u64);
+        let available_bytes = self.file_write_pos.min(self.config.max_size_bytes as u64);
         if self.rate_state.avg_in_rate > 0.0 {
             Duration::from_secs_f64(available_bytes as f64 / self.rate_state.avg_in_rate)
         } else {
@@ -506,8 +503,7 @@ impl Queue2 {
 
         // Exponential moving average (alpha=0.3)
         const ALPHA: f64 = 0.3;
-        self.rate_state.avg_in_rate =
-            ALPHA * in_rate + (1.0 - ALPHA) * self.rate_state.avg_in_rate;
+        self.rate_state.avg_in_rate = ALPHA * in_rate + (1.0 - ALPHA) * self.rate_state.avg_in_rate;
         self.rate_state.avg_out_rate =
             ALPHA * out_rate + (1.0 - ALPHA) * self.rate_state.avg_out_rate;
 
@@ -523,8 +519,7 @@ impl Queue2 {
     fn post_buffering(&self, percent: u32) {
         if let Some(ref bus) = self.bus {
             let estimated_total = if self.rate_state.avg_in_rate > 0.0 && percent < 100 {
-                let remaining_bytes =
-                    self.config.max_size_bytes as f64 - self.current_bytes as f64;
+                let remaining_bytes = self.config.max_size_bytes as f64 - self.current_bytes as f64;
                 let eta_secs = remaining_bytes / self.rate_state.avg_in_rate;
                 if eta_secs > 0.0 && eta_secs < 3600.0 {
                     Some(crate::clock::ClockTime::from_nanos(

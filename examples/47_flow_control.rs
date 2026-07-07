@@ -193,6 +193,8 @@ fn main() -> Result<()> {
 
         while !eos {
             match camera.produce(&mut ctx) {
+                // A match guard would be tidier but cannot take `buffer` by value.
+                #[allow(clippy::collapsible_match)]
                 Ok(ProduceResult::OwnBuffer(buffer)) => {
                     // Try to push to queue (non-blocking for this example)
                     if producer_queue

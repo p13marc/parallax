@@ -205,21 +205,19 @@ impl Tracer for LatencyTracer {
     }
 
     fn on_buffer_processed(&self, element_name: &str, ts: Instant) {
-        let start = self
-            .pending
-            .lock()
-            .unwrap()
-            .remove(element_name);
+        let start = self.pending.lock().unwrap().remove(element_name);
 
         if let Some(start) = start {
             let elapsed = ts.duration_since(start).as_nanos() as u64;
             let mut stats = self.stats.lock().unwrap();
-            let entry = stats.entry(element_name.to_string()).or_insert(LatencyStats {
-                min_ns: u64::MAX,
-                max_ns: 0,
-                sum_ns: 0,
-                count: 0,
-            });
+            let entry = stats
+                .entry(element_name.to_string())
+                .or_insert(LatencyStats {
+                    min_ns: u64::MAX,
+                    max_ns: 0,
+                    sum_ns: 0,
+                    count: 0,
+                });
             entry.min_ns = entry.min_ns.min(elapsed);
             entry.max_ns = entry.max_ns.max(elapsed);
             entry.sum_ns += elapsed;
@@ -236,8 +234,7 @@ impl Tracer for LatencyTracer {
         let mut entries: Vec<_> = stats.iter().collect();
         entries.sort_by_key(|(name, _)| (*name).clone());
         for (name, s) in entries {
-            if s.count > 0 {
-                let avg = s.sum_ns / s.count;
+            if let Some(avg) = s.sum_ns.checked_div(s.count) {
                 report.push_str(&format!(
                     "  {name}: avg={:.2}ms min={:.2}ms max={:.2}ms (n={})\n",
                     avg as f64 / 1_000_000.0,
@@ -541,7 +538,9 @@ mod tests {
     fn test_init_tracers_no_env() {
         // Without env var set, should return empty registry
         // SAFETY: Only modifying test-specific env var, no other threads using it
-        unsafe { std::env::remove_var("PARALLAX_TRACERS"); }
+        unsafe {
+            std::env::remove_var("PARALLAX_TRACERS");
+        }
         let registry = init_tracers_from_env();
         assert!(registry.is_empty());
     }
