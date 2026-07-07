@@ -156,6 +156,12 @@ pub struct StreamInfo {
     pub channels: Option<u16>,
     /// For audio: sample rate if known.
     pub sample_rate: Option<u32>,
+    /// For video: SDP frame rate hint if present (`a=framerate`).
+    pub framerate: Option<f32>,
+    /// Codec initialization data if known (H.264: SPS/PPS from
+    /// `sprop-parameter-sets`; AAC: AudioSpecificConfig). Lets a consumer
+    /// initialize a decoder before the first in-band parameter sets arrive.
+    pub codec_data: Option<Vec<u8>>,
 }
 
 /// Media type of a stream.
@@ -374,14 +380,40 @@ impl RtspSession {
             let codec = stream.encoding_name().to_lowercase();
             let clock_rate = stream.clock_rate_hz();
 
+            // Parameters parsed by retina from the SDP (sprop-parameter-sets
+            // etc.). Video parameters may be absent until the first frame for
+            // streams whose SDP omits them.
+            let mut dimensions = None;
+            let mut sample_rate = None;
+            let mut codec_data = None;
+            match stream.parameters() {
+                Some(retina::codec::ParametersRef::Video(video)) => {
+                    dimensions = Some(video.pixel_dimensions());
+                    let extra = video.extra_data();
+                    if !extra.is_empty() {
+                        codec_data = Some(extra.to_vec());
+                    }
+                }
+                Some(retina::codec::ParametersRef::Audio(audio)) => {
+                    sample_rate = Some(audio.clock_rate());
+                    let extra = audio.extra_data();
+                    if !extra.is_empty() {
+                        codec_data = Some(extra.to_vec());
+                    }
+                }
+                _ => {}
+            }
+
             streams.push(StreamInfo {
                 index: i,
                 media_type,
                 codec,
                 clock_rate,
-                dimensions: None, // Could extract from SDP if needed
-                channels: None,
-                sample_rate: None,
+                dimensions,
+                channels: stream.channels().map(|c| c.get()),
+                sample_rate,
+                framerate: stream.framerate(),
+                codec_data,
             });
         }
 
@@ -500,7 +532,7 @@ impl RtspSession {
     }
 
     /// Convert a retina VideoFrame to a Parallax Buffer.
-    fn video_frame_to_buffer(&self, frame: VideoFrame) -> Result<Buffer> {
+    fn video_frame_to_buffer(&mut self, frame: VideoFrame) -> Result<Buffer> {
         let data = frame.data();
         let is_keyframe = frame.is_random_access_point();
         let timestamp = frame.timestamp();
@@ -539,7 +571,7 @@ impl RtspSession {
     }
 
     /// Convert a retina AudioFrame to a Parallax Buffer.
-    fn audio_frame_to_buffer(&self, frame: AudioFrame) -> Result<Buffer> {
+    fn audio_frame_to_buffer(&mut self, frame: AudioFrame) -> Result<Buffer> {
         let data = frame.data();
         let timestamp = frame.timestamp();
 
