@@ -102,6 +102,8 @@ symphonia = { version = "0.5", optional = true, default-features = false }
 
 # Image codecs (pure Rust)
 zune-jpeg = { version = "0.4", optional = true }
+# 0.6 pinned: 0.7 raises MSRV to 1.87 (ours is 1.85)
+jpeg-encoder = { version = "0.6", default-features = false, features = ["std", "simd"], optional = true }
 png = { version = "0.17", optional = true }
 
 # Color space conversion (SIMD-accelerated, pure Rust)
@@ -168,7 +170,7 @@ opus = ["dep:opus"]  # Opus audio encoder/decoder (requires libopus)
 aac-encode = ["dep:fdk-aac"]  # AAC audio encoder (note: FDK-AAC license restrictions)
 # Image codecs (all pure Rust)
 image-codecs = ["image-jpeg", "image-png"]
-image-jpeg = ["dep:zune-jpeg"]
+image-jpeg = ["dep:zune-jpeg", "dep:jpeg-encoder"]
 image-png = ["dep:png"]
 # Color space conversion (SIMD-accelerated)
 simd-colorspace = ["dep:yuv"]

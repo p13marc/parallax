@@ -6,16 +6,19 @@
 //!
 //! | Format | Feature Flag | Decoder | Encoder |
 //! |--------|--------------|---------|---------|
-//! | JPEG | `image-jpeg` | Yes | No |
+//! | JPEG | `image-jpeg` | Yes | Yes |
 //! | PNG | `image-png` | Yes | Yes |
 //!
 //! # Example
 //!
 //! ```rust,ignore
-//! use parallax::elements::codec::{JpegDecoder, PngDecoder, PngEncoder};
+//! use parallax::elements::codec::{JpegDecoder, JpegEncoder, PngDecoder, PngEncoder};
 //!
 //! // Decode JPEG
 //! let decoder = JpegDecoder::new();
+//!
+//! // Encode to JPEG (e.g. a low-fps preview branch)
+//! let encoder = JpegEncoder::new(640, 480, ColorType::Rgb).with_quality(80);
 //!
 //! // Decode PNG
 //! let decoder = PngDecoder::new();
@@ -151,20 +154,18 @@ mod jpeg_codec {
                 .info()
                 .ok_or_else(|| Error::InvalidSegment("Failed to get JPEG info".to_string()))?;
 
-            let _width = info.width as u32;
-            let _height = info.height as u32;
+            let width = info.width as u32;
+            let height = info.height as u32;
 
             // Decode pixels
             let pixels = decoder
                 .decode()
                 .map_err(|e| Error::InvalidSegment(format!("JPEG decode failed: {:?}", e)))?;
 
-            // Determine color type based on output (for future metadata use)
-            let _color_type = match info.components {
-                1 => ColorType::Gray,
-                3 => ColorType::Rgb,
-                4 => ColorType::Rgba,
-                _ => ColorType::Rgb,
+            let pixel_format = match info.components {
+                1 => crate::format::PixelFormat::Gray8,
+                4 => crate::format::PixelFormat::Rgba,
+                _ => crate::format::PixelFormat::Rgb24,
             };
 
             // Lazily initialize arena
@@ -185,8 +186,17 @@ mod jpeg_codec {
 
             self.frame_count += 1;
 
-            let metadata = buffer.metadata().clone();
-            // Could store width/height in metadata if needed
+            // Propagate input metadata and describe the decoded frame so
+            // downstream elements know its dimensions and pixel layout.
+            let mut metadata = buffer.metadata().clone();
+            metadata.format = Some(crate::format::MediaFormat::VideoRaw(
+                crate::format::VideoFormat {
+                    width,
+                    height,
+                    pixel_format,
+                    framerate: crate::format::Framerate::default(),
+                },
+            ));
 
             Ok(Some(Buffer::new(
                 MemoryHandle::with_len(slot, pixels.len()),
@@ -198,10 +208,134 @@ mod jpeg_codec {
             ExecutionHints::cpu_intensive()
         }
     }
+
+    /// JPEG encoder using the jpeg-encoder crate (pure Rust, SIMD on x86).
+    ///
+    /// Encodes raw interleaved pixel data (RGB/RGBA/grayscale) to JPEG —
+    /// e.g. for a low-fps preview branch published over the network. Camera
+    /// YUV output (I420/NV12/YUYV) must be converted upstream first (see
+    /// `VideoConvert`).
+    pub struct JpegEncoder {
+        width: u32,
+        height: u32,
+        color_type: ColorType,
+        quality: u8,
+        frame_count: u64,
+        arena: Option<SharedArena>,
+    }
+
+    impl JpegEncoder {
+        /// Create a new JPEG encoder.
+        ///
+        /// # Arguments
+        /// * `width` - Image width in pixels (max 65535)
+        /// * `height` - Image height in pixels (max 65535)
+        /// * `color_type` - Input pixel layout (Gray, Rgb, Rgba; alpha is
+        ///   ignored during encoding)
+        pub fn new(width: u32, height: u32, color_type: ColorType) -> Self {
+            Self {
+                width,
+                height,
+                color_type,
+                quality: 80,
+                frame_count: 0,
+                arena: None,
+            }
+        }
+
+        /// Set the encoding quality (1-100, default 80). Higher = better
+        /// quality, larger output.
+        pub fn with_quality(mut self, quality: u8) -> Self {
+            self.quality = quality.clamp(1, 100);
+            self
+        }
+
+        /// Get the number of frames encoded.
+        pub fn frame_count(&self) -> u64 {
+            self.frame_count
+        }
+
+        fn to_jpeg_color_type(&self) -> Result<jpeg_encoder::ColorType> {
+            Ok(match self.color_type {
+                ColorType::Gray => jpeg_encoder::ColorType::Luma,
+                ColorType::Rgb => jpeg_encoder::ColorType::Rgb,
+                ColorType::Rgba => jpeg_encoder::ColorType::Rgba,
+                ColorType::GrayAlpha => {
+                    return Err(Error::InvalidCaps(
+                        "JPEG cannot encode gray+alpha input".to_string(),
+                    ));
+                }
+            })
+        }
+    }
+
+    impl Element for JpegEncoder {
+        fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
+            let input = buffer.as_bytes();
+
+            if self.width > u16::MAX as u32 || self.height > u16::MAX as u32 {
+                return Err(Error::InvalidCaps(format!(
+                    "JPEG dimensions limited to 65535, got {}x{}",
+                    self.width, self.height
+                )));
+            }
+
+            let expected_size =
+                self.width as usize * self.height as usize * self.color_type.bytes_per_pixel();
+            if input.len() < expected_size {
+                return Err(Error::InvalidSegment(format!(
+                    "Input buffer too small: {} < {}",
+                    input.len(),
+                    expected_size
+                )));
+            }
+
+            let mut output = Vec::new();
+            let encoder = jpeg_encoder::Encoder::new(&mut output, self.quality);
+            encoder
+                .encode(
+                    &input[..expected_size],
+                    self.width as u16,
+                    self.height as u16,
+                    self.to_jpeg_color_type()?,
+                )
+                .map_err(|e| Error::InvalidSegment(format!("JPEG encode failed: {:?}", e)))?;
+
+            // Lazily initialize arena
+            if self.arena.is_none() {
+                self.arena = Some(
+                    SharedArena::new(output.len().max(1024 * 1024), 16)
+                        .map_err(|e| Error::Element(format!("Failed to create arena: {}", e)))?,
+                );
+            }
+            let arena = self.arena.as_mut().unwrap();
+
+            arena.reclaim();
+
+            let mut slot = arena
+                .acquire()
+                .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+            slot.data_mut()[..output.len()].copy_from_slice(&output);
+
+            self.frame_count += 1;
+
+            // Propagate metadata (PTS!); every JPEG is independently decodable.
+            let mut metadata = buffer.metadata().clone();
+            metadata.flags |= crate::metadata::BufferFlags::SYNC_POINT;
+            Ok(Some(Buffer::new(
+                MemoryHandle::with_len(slot, output.len()),
+                metadata,
+            )))
+        }
+
+        fn execution_hints(&self) -> ExecutionHints {
+            ExecutionHints::cpu_intensive()
+        }
+    }
 }
 
 #[cfg(feature = "image-jpeg")]
-pub use jpeg_codec::JpegDecoder;
+pub use jpeg_codec::{JpegDecoder, JpegEncoder};
 
 // ============================================================================
 // PNG Codec (using png crate)
@@ -414,5 +548,107 @@ mod tests {
         let frame = ImageFrame::new(100, 50, ColorType::Rgba);
         assert_eq!(frame.stride(), 400); // 100 * 4
         assert_eq!(frame.data.len(), 20000); // 100 * 50 * 4
+    }
+
+    #[cfg(feature = "image-jpeg")]
+    mod jpeg {
+        use super::*;
+        use crate::buffer::{Buffer, MemoryHandle};
+        use crate::format::{MediaFormat, PixelFormat};
+        use crate::memory::SharedArena;
+        use crate::metadata::{BufferFlags, Metadata};
+
+        const W: u32 = 32;
+        const H: u32 = 16;
+
+        /// A smooth RGB gradient (JPEG-friendly so round-trips are close).
+        fn gradient_rgb() -> Vec<u8> {
+            let mut data = Vec::with_capacity((W * H * 3) as usize);
+            for y in 0..H {
+                for x in 0..W {
+                    data.push((x * 8) as u8);
+                    data.push((y * 16) as u8);
+                    data.push(128);
+                }
+            }
+            data
+        }
+
+        fn rgb_buffer(data: &[u8]) -> Buffer {
+            let arena = SharedArena::new(data.len().max(1024), 8).unwrap();
+            let mut slot = arena.acquire().unwrap();
+            slot.data_mut()[..data.len()].copy_from_slice(data);
+            let mut metadata = Metadata::from_sequence(7);
+            metadata.pts = crate::clock::ClockTime::from_millis(42);
+            Buffer::new(MemoryHandle::with_len(slot, data.len()), metadata)
+        }
+
+        #[test]
+        fn encode_decode_roundtrip() {
+            let original = gradient_rgb();
+            let mut encoder = JpegEncoder::new(W, H, ColorType::Rgb).with_quality(95);
+            let encoded = encoder
+                .process(rgb_buffer(&original))
+                .unwrap()
+                .expect("encoder output");
+
+            // Metadata propagated, JPEG flagged as an independent sync point.
+            assert_eq!(encoded.metadata().sequence, 7);
+            assert_eq!(
+                encoded.metadata().pts,
+                crate::clock::ClockTime::from_millis(42)
+            );
+            assert!(encoded.metadata().flags.contains(BufferFlags::SYNC_POINT));
+            assert_eq!(&encoded.as_bytes()[..2], &[0xFF, 0xD8], "JPEG SOI marker");
+
+            // Decode back: dimensions + format in metadata, pixels close.
+            let mut decoder = JpegDecoder::new();
+            let decoded = decoder.process(encoded).unwrap().expect("decoder output");
+            match decoded.metadata().format {
+                Some(MediaFormat::VideoRaw(vf)) => {
+                    assert_eq!((vf.width, vf.height), (W, H));
+                    assert_eq!(vf.pixel_format, PixelFormat::Rgb24);
+                }
+                ref other => panic!("expected VideoRaw format metadata, got {other:?}"),
+            }
+            let pixels = decoded.as_bytes();
+            assert_eq!(pixels.len(), original.len());
+            let max_diff = pixels
+                .iter()
+                .zip(&original)
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap();
+            assert!(max_diff < 24, "lossy but close (max diff {max_diff})");
+        }
+
+        #[test]
+        fn quality_orders_output_size() {
+            let data = gradient_rgb();
+            let size_at = |quality: u8| -> usize {
+                let mut encoder = JpegEncoder::new(W, H, ColorType::Rgb).with_quality(quality);
+                encoder.process(rgb_buffer(&data)).unwrap().unwrap().len()
+            };
+            let high = size_at(95);
+            let low = size_at(10);
+            assert!(
+                high > low,
+                "higher quality must produce more bytes: q95={high} q10={low}"
+            );
+        }
+
+        #[test]
+        fn rejects_undersized_input() {
+            let mut encoder = JpegEncoder::new(W, H, ColorType::Rgb);
+            let result = encoder.process(rgb_buffer(&[0u8; 16]));
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn rejects_gray_alpha() {
+            let mut encoder = JpegEncoder::new(W, H, ColorType::GrayAlpha);
+            let data = vec![0u8; (W * H * 2) as usize];
+            assert!(encoder.process(rgb_buffer(&data)).is_err());
+        }
     }
 }

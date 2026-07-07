@@ -26,7 +26,7 @@
 //!
 //! | Format | Feature | Decoder | Encoder | Pure Rust |
 //! |--------|---------|---------|---------|-----------|
-//! | JPEG | `image-jpeg` | [`JpegDecoder`] | - | Yes |
+//! | JPEG | `image-jpeg` | [`JpegDecoder`] | [`JpegEncoder`] | Yes |
 //! | PNG | `image-png` | [`PngDecoder`] | [`PngEncoder`] | Yes |
 //!
 //! # Feature Flags
@@ -191,7 +191,7 @@ mod image;
 pub use image::{ColorType, ImageFrame};
 
 #[cfg(feature = "image-jpeg")]
-pub use image::JpegDecoder;
+pub use image::{JpegDecoder, JpegEncoder};
 
 #[cfg(feature = "image-png")]
 pub use image::{PngDecoder, PngEncoder};

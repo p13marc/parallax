@@ -33,6 +33,7 @@ fn create_test_buffer(data: &[u8]) -> Buffer {
 #[cfg(feature = "image-png")]
 mod png_tests {
     use super::*;
+    use parallax::element::Element;
     use parallax::elements::codec::{ColorType, PngDecoder, PngEncoder};
 
     /// Create a simple 2x2 RGB test image
@@ -213,6 +214,7 @@ mod png_tests {
 #[cfg(feature = "image-jpeg")]
 mod jpeg_tests {
     use super::*;
+    use parallax::element::Element;
     use parallax::elements::codec::JpegDecoder;
 
     #[test]
@@ -390,6 +392,7 @@ mod av1_encode_tests {
 #[cfg(feature = "image-png")]
 mod integration_tests {
     use super::*;
+    use parallax::element::Element;
     use parallax::elements::codec::{ColorType, PngDecoder, PngEncoder};
 
     #[test]

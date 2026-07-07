@@ -143,8 +143,8 @@ pub use testing::{
 // Flow control
 pub use flow::{
     Concat, ConcatStats, ConcatStream, Funnel, FunnelInput, FunnelStats, InputSelector,
-    InputSelectorStats, LeakyMode, OutputSelector, OutputSelectorStats, Queue, Queue2,
-    Queue2Stats, QueueStats, SelectorInput, SelectorOutput, Tee, Valve, ValveControl, ValveStats,
+    InputSelectorStats, LeakyMode, OutputSelector, OutputSelectorStats, Queue, Queue2, Queue2Stats,
+    QueueStats, SelectorInput, SelectorOutput, Tee, Valve, ValveControl, ValveStats,
 };
 
 // Transform
@@ -255,7 +255,7 @@ pub use codec::{ColorType, ImageFrame};
 
 // Image codecs - JPEG
 #[cfg(feature = "image-jpeg")]
-pub use codec::JpegDecoder;
+pub use codec::{JpegDecoder, JpegEncoder};
 
 // Image codecs - PNG
 #[cfg(feature = "image-png")]
