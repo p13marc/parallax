@@ -25,6 +25,7 @@
 //! - `RtspSession`: Active RTSP session
 
 #[cfg(feature = "rtp")]
+#[allow(clippy::module_inception)] // rtp::rtp holds the plain RTP src/sink
 mod rtp;
 
 #[cfg(feature = "rtp")]

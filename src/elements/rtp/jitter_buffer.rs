@@ -453,11 +453,9 @@ impl RtpJitterBuffer {
             expected,
             received: received as u32,
             lost,
-            fraction_lost: if expected > 0 {
-                ((lost * 256) / expected).min(255) as u8
-            } else {
-                0
-            },
+            fraction_lost: (lost * 256)
+                .checked_div(expected)
+                .map_or(0, |f| f.min(255) as u8),
             highest_seq: (self.state.seq_cycles as u32) << 16 | self.state.highest_seq as u32,
         }
     }

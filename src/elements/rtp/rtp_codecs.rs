@@ -908,7 +908,7 @@ impl RtpOpusDepay {
     pub fn new() -> Self {
         Self {
             name: "rtp-opus-depay".into(),
-            depacketizer: OpusPacket::default(),
+            depacketizer: OpusPacket,
             stats: DepayStats::default(),
             arena: None,
         }

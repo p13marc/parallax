@@ -22,7 +22,7 @@
 
 use crate::buffer::Buffer;
 use crate::clock::ClockTime;
-use crate::element::{Sink, Source};
+use crate::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
 use crate::error::{Error, Result};
 use crate::memory::SharedArena;
 use crate::metadata::{BufferFlags, Metadata, RtpMeta};
@@ -239,7 +239,7 @@ impl RtpSrc {
 }
 
 impl Source for RtpSrc {
-    fn produce(&mut self) -> Result<Option<Buffer>> {
+    fn produce(&mut self, _ctx: &mut ProduceContext) -> Result<ProduceResult> {
         // Allocate receive buffer
         let mut recv_buf = vec![0u8; self.buffer_size];
 
@@ -247,7 +247,7 @@ impl Source for RtpSrc {
         let (n, sender) = match self.socket.recv_from(&mut recv_buf) {
             Ok(result) => result,
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                return Ok(None);
+                return Ok(ProduceResult::WouldBlock);
             }
             Err(e) => return Err(Error::Io(e)),
         };
@@ -258,7 +258,7 @@ impl Source for RtpSrc {
         // Parse RTP packet
         let (rtp_meta, payload) = match self.parse_rtp(&recv_buf[..n])? {
             Some(result) => result,
-            None => return Ok(None), // Filtered out
+            None => return Ok(ProduceResult::WouldBlock), // Filtered out
         };
 
         // Create output buffer with payload
@@ -300,7 +300,7 @@ impl Source for RtpSrc {
             .with_rtp(rtp_meta)
             .with_flags(flags);
 
-        Ok(Some(Buffer::new(handle, metadata)))
+        Ok(ProduceResult::OwnBuffer(Buffer::new(handle, metadata)))
     }
 
     fn name(&self) -> &str {
@@ -452,9 +452,9 @@ impl RtpSink {
 }
 
 impl Sink for RtpSink {
-    fn consume(&mut self, buffer: Buffer) -> Result<()> {
-        let metadata = buffer.metadata();
-        let payload = buffer.as_bytes();
+    fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
+        let metadata = ctx.metadata();
+        let payload = ctx.input();
 
         // Use RTP metadata if present, otherwise generate
         let (seq, ts, marker) = if let Some(rtp) = &metadata.rtp {
@@ -826,8 +826,8 @@ impl AsyncRtpSink {
 }
 
 impl crate::element::AsyncSink for AsyncRtpSink {
-    async fn consume(&mut self, buffer: Buffer) -> Result<()> {
-        self.send(buffer).await
+    async fn consume(&mut self, ctx: &ConsumeContext<'_>) -> Result<()> {
+        self.send(ctx.buffer().clone()).await
     }
 
     fn name(&self) -> &str {
@@ -868,7 +868,7 @@ fn rand_timestamp() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::element::{Sink, Source};
+    use crate::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
     use std::sync::OnceLock;
     use std::thread;
     use std::time::Duration;
@@ -876,6 +876,14 @@ mod tests {
     fn test_arena() -> &'static SharedArena {
         static ARENA: OnceLock<SharedArena> = OnceLock::new();
         ARENA.get_or_init(|| SharedArena::new(MAX_RTP_PACKET_SIZE, 64).unwrap())
+    }
+
+    fn produce_own_buffer(src: &mut RtpSrc) -> Buffer {
+        let mut ctx = ProduceContext::without_buffer();
+        match src.produce(&mut ctx).unwrap() {
+            ProduceResult::OwnBuffer(buffer) => buffer,
+            other => panic!("expected OwnBuffer, got {other:?}"),
+        }
     }
 
     fn make_buffer(data: &[u8]) -> Buffer {
@@ -931,11 +939,11 @@ mod tests {
             // Create test buffer
             let buffer = make_buffer(b"hello");
 
-            sink.consume(buffer).unwrap();
+            sink.consume(&ConsumeContext::new(&buffer)).unwrap();
         });
 
         // Receive and verify
-        let buffer = src.produce().unwrap().unwrap();
+        let buffer = produce_own_buffer(&mut src);
         assert_eq!(buffer.as_bytes(), b"hello");
 
         // Check RTP metadata
@@ -968,7 +976,7 @@ mod tests {
 
             let buffer = make_buffer(b"test");
 
-            sink.consume(buffer).unwrap();
+            sink.consume(&ConsumeContext::new(&buffer)).unwrap();
         });
 
         handle.join().unwrap();
@@ -977,9 +985,9 @@ mod tests {
         thread::sleep(Duration::from_millis(50));
 
         // Should be filtered out
-        let result = src.produce();
-        assert!(result.is_ok());
-        // Either None (filtered) or WouldBlock in non-blocking mode
+        let mut ctx = ProduceContext::without_buffer();
+        let result = src.produce(&mut ctx);
+        assert!(matches!(result, Ok(ProduceResult::WouldBlock)));
     }
 
     #[tokio::test]
@@ -1041,10 +1049,10 @@ mod tests {
             let metadata = Metadata::new().with_rtp(rtp);
             let buffer = Buffer::new(buf_handle, metadata);
 
-            sink.consume(buffer).unwrap();
+            sink.consume(&ConsumeContext::new(&buffer)).unwrap();
         });
 
-        let buffer = src.produce().unwrap().unwrap();
+        let buffer = produce_own_buffer(&mut src);
 
         // Verify RTP fields were used (not sink's SSRC since it uses buffer's RTP meta for seq/ts)
         let rtp = buffer.metadata().rtp.unwrap();

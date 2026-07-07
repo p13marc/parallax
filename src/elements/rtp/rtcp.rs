@@ -171,7 +171,7 @@ impl ReceptionStats {
         let delay = if let Some(sr_time) = self.last_sr_time {
             // Delay in 1/65536 seconds
             let elapsed = sr_time.elapsed();
-            ((elapsed.as_secs_f64() * 65536.0) as u32).min(u32::MAX)
+            (elapsed.as_secs_f64() * 65536.0) as u32
         } else {
             0
         };
