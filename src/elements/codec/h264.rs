@@ -38,7 +38,7 @@ use crate::metadata::Metadata;
 
 use openh264::OpenH264API;
 use openh264::decoder::{DecodedYUV, Decoder};
-use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate};
+use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, QpRange};
 use openh264::formats::YUVSource;
 
 // ============================================================================
@@ -56,12 +56,16 @@ pub struct H264EncoderConfig {
     pub bitrate_bps: u32,
     /// Maximum frame rate in Hz.
     pub max_frame_rate: f32,
-    /// Quantization parameter (0-51, lower = better quality, larger files).
-    /// Default is 26.
+    /// Target quantization parameter (0-51, lower = better quality, larger
+    /// files). Default is 26. The encoder's rate control is constrained to
+    /// a QP band of ±4 around this value, so it keeps some freedom to meet
+    /// `bitrate_bps` while staying near the requested quality.
     pub qp: u8,
     /// Enable scene change detection.
     pub scene_change_detect: bool,
-    /// Keyframe interval (0 = auto).
+    /// Keyframe interval in frames: an IDR is emitted every N frames
+    /// (0 = encoder decides). Late joiners on a stream wait at most one
+    /// interval for a decodable frame.
     pub keyframe_interval: u32,
     /// Number of threads (0 = auto).
     pub num_threads: u32,
@@ -158,12 +162,21 @@ impl H264Encoder {
 
         if config.bitrate_bps > 0 {
             encoder_config = encoder_config.bitrate(BitRate::from_bps(config.bitrate_bps));
+        } else {
+            // No bitrate target: quality mode. OpenH264 defaults to a 120 kbps
+            // target with frame skipping enabled, which silently drops most
+            // frames of any real content — disable skipping so every input
+            // frame is encoded and quality is governed by the QP band below.
+            encoder_config = encoder_config.skip_frames(false);
         }
 
+        let qp = config.qp.min(51);
         encoder_config = encoder_config
             .max_frame_rate(FrameRate::from_hz(config.max_frame_rate))
             .scene_change_detect(config.scene_change_detect)
-            .num_threads(config.num_threads as u16);
+            .num_threads(config.num_threads as u16)
+            .qp(QpRange::new(qp.saturating_sub(4), (qp + 4).min(51)))
+            .intra_frame_period(IntraFramePeriod::from_num_frames(config.keyframe_interval));
 
         let api = OpenH264API::from_source();
         let encoder = Encoder::with_api_config(api, encoder_config)
@@ -666,6 +679,85 @@ mod tests {
         let config = H264EncoderConfig::high_quality(1920, 1080);
         assert_eq!(config.qp, 20);
         assert_eq!(config.keyframe_interval, 120);
+    }
+
+    /// Count IDR NAL units (type 5) in an Annex-B bitstream.
+    fn count_idr_nals(data: &[u8]) -> usize {
+        let mut count = 0;
+        let mut i = 0;
+        while i + 3 < data.len() {
+            // 3- or 4-byte start code
+            let (start, offset) = if data[i..].starts_with(&[0, 0, 0, 1]) {
+                (true, 4)
+            } else if data[i..].starts_with(&[0, 0, 1]) {
+                (true, 3)
+            } else {
+                (false, 1)
+            };
+            if start && i + offset < data.len() {
+                if data[i + offset] & 0x1F == 5 {
+                    count += 1;
+                }
+                i += offset;
+            } else {
+                i += 1;
+            }
+        }
+        count
+    }
+
+    /// A deterministic frame with spatial detail so QP visibly affects size.
+    fn detailed_frame(width: usize, height: usize, seed: u8) -> Vec<u8> {
+        let mut data = vec![128u8; width * height * 3 / 2];
+        for y in 0..height {
+            for x in 0..width {
+                data[y * width + x] = ((x * 7 + y * 13) as u8).wrapping_add(seed);
+            }
+        }
+        data
+    }
+
+    #[test]
+    fn test_keyframe_interval_controls_idr_cadence() {
+        let interval = 10u32;
+        let frames = 30usize;
+        let config = H264EncoderConfig::new(320, 240).keyframe_interval(interval);
+        let mut config = config;
+        config.scene_change_detect = false; // deterministic IDR placement
+        let mut encoder = H264Encoder::new(config).unwrap();
+
+        let mut idr_count = 0;
+        for i in 0..frames {
+            let frame = detailed_frame(320, 240, i as u8);
+            let encoded = encoder.encode_yuv420(&frame).unwrap();
+            idr_count += count_idr_nals(&encoded);
+        }
+        // 30 frames at interval 10 => IDRs at frames 0, 10, 20.
+        assert_eq!(
+            idr_count, 3,
+            "expected an IDR every {interval} frames over {frames} frames"
+        );
+    }
+
+    #[test]
+    fn test_qp_affects_output_size() {
+        let encode_total = |qp: u8| -> u64 {
+            let config = H264EncoderConfig::new(320, 240).qp(qp).keyframe_interval(1);
+            let mut encoder = H264Encoder::new(config).unwrap();
+            let mut total = 0u64;
+            for i in 0..10 {
+                let frame = detailed_frame(320, 240, i as u8);
+                total += encoder.encode_yuv420(&frame).unwrap().len() as u64;
+            }
+            total
+        };
+
+        let high_quality = encode_total(10);
+        let low_quality = encode_total(45);
+        assert!(
+            high_quality > low_quality,
+            "low QP (high quality) must produce more bytes: qp10={high_quality} qp45={low_quality}"
+        );
     }
 
     #[test]
