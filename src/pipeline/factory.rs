@@ -308,11 +308,22 @@ fn create_v4l2src(props: &HashMap<String, PropertyValue>) -> Result<Box<DynAsync
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    // framerate=30 (integer fps) or framerate="30000/1001" (fraction)
+    let framerate = props.get("framerate").and_then(|v| {
+        if let Some(fps) = v.as_u64() {
+            return Some((fps as u32, 1));
+        }
+        let s = v.as_string();
+        let (num, den) = s.split_once('/')?;
+        Some((num.trim().parse().ok()?, den.trim().parse().ok()?))
+    });
+
     let config = V4l2Config {
         width,
         height,
         fourcc,
         buffer_count,
+        framerate,
         dmabuf_export,
     };
 

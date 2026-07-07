@@ -127,6 +127,12 @@ pub struct V4l2Config {
     pub fourcc: Option<String>,
     /// Number of buffers.
     pub buffer_count: u32,
+    /// Desired frame rate as frames-per-second numerator/denominator
+    /// (e.g. `(30, 1)` for 30 fps, `(30000, 1001)` for 29.97 fps).
+    /// `None` keeps the driver default. Applied via `VIDIOC_S_PARM`; drivers
+    /// clamp to the nearest supported rate — read the actual rate back with
+    /// [`V4l2Src::framerate`].
+    pub framerate: Option<(u32, u32)>,
     /// Export buffers as DMA-BUF file descriptors.
     ///
     /// When enabled:
@@ -147,6 +153,7 @@ impl Default for V4l2Config {
             height: 480,
             fourcc: None,
             buffer_count: 4,
+            framerate: None,
             dmabuf_export: false,
         }
     }
@@ -217,6 +224,11 @@ pub struct V4l2Src {
     fourcc: [u8; 4],
     /// All supported formats from the device (cached for caps negotiation).
     supported_formats: Vec<V4l2SupportedFormat>,
+    /// Actual frame rate as fps numerator/denominator (None if the driver
+    /// doesn't report streaming parameters).
+    framerate: Option<(u32, u32)>,
+    /// Frame duration derived from the actual rate (buffer duration hint).
+    frame_duration: ClockTime,
     /// Arena for buffer allocation (per-source to avoid contention).
     arena: Option<SharedArena>,
     /// Whether to export buffers as DMA-BUF file descriptors.
@@ -236,7 +248,11 @@ pub struct V4l2Src {
 
 /// Convert a V4L2 timestamp to microseconds since epoch.
 fn v4l2_timestamp_to_usec(ts: &v4l::timestamp::Timestamp) -> i64 {
-    ts.sec as i64 * 1_000_000 + ts.usec as i64
+    // Casts kept for portability: the libc time types differ per target.
+    #[allow(clippy::unnecessary_cast)]
+    {
+        ts.sec as i64 * 1_000_000 + ts.usec as i64
+    }
 }
 
 impl V4l2Src {
@@ -306,6 +322,33 @@ impl V4l2Src {
         let height = format.height;
         let actual_fourcc = format.fourcc.repr;
 
+        // Frame rate: VIDIOC_S_PARM takes a time-per-frame interval, the
+        // inverse of fps. Drivers clamp to the nearest supported rate, so
+        // read the applied parameters back for the real value.
+        let applied_params = if let Some((num, den)) = config.framerate {
+            if num == 0 || den == 0 {
+                return Err(crate::error::Error::Config(format!(
+                    "invalid framerate {num}/{den}"
+                )));
+            }
+            let params = v4l::video::capture::Parameters::new(v4l::Fraction::new(den, num));
+            Some(dev.set_params(&params).map_err(DeviceError::V4l2)?)
+        } else {
+            dev.params().ok()
+        };
+        let framerate = applied_params.and_then(|p| {
+            let interval = p.interval;
+            if interval.numerator == 0 || interval.denominator == 0 {
+                None
+            } else {
+                // interval = seconds-per-frame; fps = inverse
+                Some((interval.denominator, interval.numerator))
+            }
+        });
+        let frame_duration = framerate
+            .map(|(num, den)| ClockTime::from_nanos((1_000_000_000u64 * den as u64) / num as u64))
+            .unwrap_or(ClockTime::ZERO);
+
         // Create mmap stream
         let stream = MmapStream::with_buffers(&dev, Type::VideoCapture, config.buffer_count)
             .map_err(DeviceError::V4l2)?;
@@ -330,6 +373,8 @@ impl V4l2Src {
             height,
             fourcc: actual_fourcc,
             supported_formats,
+            framerate,
+            frame_duration,
             arena: None,
             dmabuf_export: config.dmabuf_export,
             exported_fds,
@@ -454,6 +499,13 @@ impl V4l2Src {
         &self.supported_formats
     }
 
+    /// Get the actual frame rate as fps numerator/denominator, as reported
+    /// by the driver after clamping the configured rate (`None` if the
+    /// driver doesn't report streaming parameters).
+    pub fn framerate(&self) -> Option<(u32, u32)> {
+        self.framerate
+    }
+
     /// Get the device path.
     pub fn path(&self) -> &PathBuf {
         &self.path
@@ -565,6 +617,9 @@ impl Source for V4l2Src {
 
             let mut metadata = Metadata::new().with_pts(pts);
             metadata.sequence = sequence as u64;
+            if self.frame_duration > ClockTime::ZERO {
+                metadata.duration = self.frame_duration;
+            }
 
             return Ok(ProduceResult::OwnDmaBuf(DmaBufBuffer::new(
                 segment, metadata,
@@ -611,6 +666,9 @@ impl Source for V4l2Src {
 
             let mut metadata = Metadata::new().with_pts(pts);
             metadata.sequence = sequence as u64;
+            if self.frame_duration > ClockTime::ZERO {
+                metadata.duration = self.frame_duration;
+            }
 
             return Ok(ProduceResult::OwnBuffer(Buffer::new(handle, metadata)));
         }
@@ -843,5 +901,31 @@ mod tests {
                 println!("Failed to enumerate: {}", e);
             }
         }
+    }
+
+    /// Hardware-gated: set PARALLAX_V4L2_TEST_DEVICE=/dev/videoN to run
+    /// against a real capture device.
+    #[test]
+    fn test_framerate_configuration_on_real_device() {
+        let Ok(device) = std::env::var("PARALLAX_V4L2_TEST_DEVICE") else {
+            println!("PARALLAX_V4L2_TEST_DEVICE not set, skipping");
+            return;
+        };
+
+        let config = V4l2Config {
+            framerate: Some((10, 1)),
+            ..V4l2Config::default()
+        };
+        let src = V4l2Src::with_config(&device, config).expect("open device");
+        let (num, den) = src
+            .framerate()
+            .expect("driver must report streaming parameters");
+        assert!(num > 0 && den > 0, "sane fps fraction");
+        println!("requested 10/1 fps, driver applied {num}/{den}");
+        drop(src); // release the device before reopening
+
+        // Default config: rate untouched, but still readable.
+        let src = V4l2Src::new(&device).expect("open device (default)");
+        println!("driver default rate: {:?}", src.framerate());
     }
 }
