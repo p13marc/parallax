@@ -36,6 +36,15 @@ coverage:
 lint:
     cargo clippy -- -D warnings
 
+# Feature combo the zensight video sensor builds against (mirrors CI)
+sensor_features := "zenoh,h264,v4l2,rtp,rtsp,image-jpeg,hotplug"
+
+# Check + test + lint the sensor feature combo (mirrors CI's test-sensor/clippy jobs)
+check-sensor:
+    cargo check --all-targets --features {{sensor_features}}
+    cargo nextest run --features {{sensor_features}}
+    cargo clippy --all-targets --features {{sensor_features}},image-codecs,zenoh-unstable -- -D warnings
+
 # Run clippy with all features
 lint-all:
     cargo clippy --all-features -- -D warnings

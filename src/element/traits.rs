@@ -1636,7 +1636,7 @@ pub trait AsyncElementDyn {
     /// Elements that implement [`ClockProvider`] (e.g., audio sinks with
     /// hardware clocks) return `Some`. All others return `None`.
     ///
-    /// Used by [`Pipeline::select_clock()`] to auto-select the best clock.
+    /// Used by [`Pipeline::select_clock()`](crate::pipeline::Pipeline::select_clock) to auto-select the best clock.
     fn as_clock_provider(&self) -> Option<&dyn ClockProvider> {
         None
     }
@@ -2008,9 +2008,13 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
                     let mut ctx = ProduceContext::with_pool(slot, pool.as_ref());
                     configure_clock(&mut ctx);
                     match self.inner.produce(&mut ctx)? {
-                        ProduceResult::Produced(n) => Ok(SourceResult::Buffer(Box::new(ctx.finalize(n)))),
+                        ProduceResult::Produced(n) => {
+                            Ok(SourceResult::Buffer(Box::new(ctx.finalize(n))))
+                        }
                         ProduceResult::Eos => Ok(SourceResult::Eos),
-                        ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(Box::new(buffer))),
+                        ProduceResult::OwnBuffer(buffer) => {
+                            Ok(SourceResult::Buffer(Box::new(buffer)))
+                        }
                         ProduceResult::OwnDmaBuf(dmabuf) => {
                             Ok(SourceResult::Buffer(Box::new(dmabuf.to_buffer(arena)?)))
                         }
@@ -2020,7 +2024,9 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
                     let mut ctx = ProduceContext::with_pool_only(pool.as_ref());
                     configure_clock(&mut ctx);
                     match self.inner.produce(&mut ctx)? {
-                        ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(Box::new(buffer))),
+                        ProduceResult::OwnBuffer(buffer) => {
+                            Ok(SourceResult::Buffer(Box::new(buffer)))
+                        }
                         ProduceResult::OwnDmaBuf(_) => Err(crate::error::Error::BufferPool(
                             "arena exhausted, cannot convert DmaBuf to Buffer".into(),
                         )),
@@ -2051,7 +2057,9 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
                 let mut ctx = ProduceContext::new(slot);
                 configure_clock(&mut ctx);
                 match self.inner.produce(&mut ctx)? {
-                    ProduceResult::Produced(n) => Ok(SourceResult::Buffer(Box::new(ctx.finalize(n)))),
+                    ProduceResult::Produced(n) => {
+                        Ok(SourceResult::Buffer(Box::new(ctx.finalize(n))))
+                    }
                     ProduceResult::Eos => Ok(SourceResult::Eos),
                     ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(Box::new(buffer))),
                     ProduceResult::OwnDmaBuf(dmabuf) => {
@@ -2610,7 +2618,9 @@ impl<S: AsyncSource + Send + 'static> SendAsyncElementDyn for AsyncSourceAdapter
                 let mut ctx = ProduceContext::new(slot);
                 configure_clock(&mut ctx);
                 match self.inner.produce(&mut ctx).await? {
-                    ProduceResult::Produced(n) => Ok(SourceResult::Buffer(Box::new(ctx.finalize(n)))),
+                    ProduceResult::Produced(n) => {
+                        Ok(SourceResult::Buffer(Box::new(ctx.finalize(n))))
+                    }
                     ProduceResult::Eos => Ok(SourceResult::Eos),
                     ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(Box::new(buffer))),
                     ProduceResult::OwnDmaBuf(dmabuf) => {

@@ -1,0 +1,79 @@
+# CI: build and test the feature combinations that matter.
+#
+# Default features are empty, so a default-only run compiles none of the
+# codec/device/network code. The "sensor" combo is the feature set the
+# zensight video sensor builds against — pinning it here is the point of
+# this workflow (the zenoh and rtp features once bit-rotted to
+# non-compiling because nothing built them; see #20).
+#
+# Deliberately NOT --all-features: dav1d/alsa/pipewire/libcamera/opus/
+# fdk-aac need system libraries, and vulkan-video carries pre-existing
+# lint debt tracked in #3.
+
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  SENSOR_FEATURES: zenoh,h264,v4l2,rtp,rtsp,image-jpeg,hotplug
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo fmt --check
+
+  test-default:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - run: cargo nextest run
+      - run: cargo test --doc
+
+  test-sensor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      # libudev for the hotplug feature; g++ builds bundled OpenH264.
+      - run: sudo apt-get update && sudo apt-get install -y libudev-dev g++
+      - run: cargo check --all-targets --features "$SENSOR_FEATURES"
+      - run: cargo nextest run --features "$SENSOR_FEATURES"
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y libudev-dev g++
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --features "$SENSOR_FEATURES,image-codecs,zenoh-unstable" -- -D warnings
+
+  doc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y libudev-dev g++
+      - run: cargo doc --no-deps --features "$SENSOR_FEATURES,image-codecs,zenoh-unstable"
+        env:
+          RUSTDOCFLAGS: -D warnings

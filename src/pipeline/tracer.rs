@@ -72,7 +72,7 @@ pub trait Tracer: Send + Sync {
 
 /// Registry of active tracers.
 ///
-/// Shared between pipeline and executor. Thread-safe via Arc<Mutex>.
+/// Shared between pipeline and executor. Thread-safe via `Arc<Mutex>`.
 #[derive(Clone, Default)]
 pub struct TracerRegistry {
     inner: Arc<Mutex<Vec<Box<dyn Tracer>>>>,

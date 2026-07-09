@@ -101,7 +101,7 @@ mod wire_format {
             width: u32,
             /// Frame height in pixels.
             height: u32,
-            /// Pixel format code (see [`pixel_format_to_code`]).
+            /// Pixel format code (see [`pixel_format_to_code`](super::pixel_format_to_code)).
             pixel_format: u8,
             /// Framerate numerator.
             fps_num: u32,
@@ -110,7 +110,7 @@ mod wire_format {
         },
         /// Encoded video.
         Video {
-            /// Codec code (see [`video_codec_to_code`]).
+            /// Codec code (see [`video_codec_to_code`](super::video_codec_to_code)).
             codec: u8,
         },
         /// Raw (uncompressed) audio.
@@ -119,12 +119,12 @@ mod wire_format {
             sample_rate: u32,
             /// Channel count.
             channels: u16,
-            /// Sample format code (see [`sample_format_to_code`]).
+            /// Sample format code (see [`sample_format_to_code`](super::sample_format_to_code)).
             sample_format: u8,
         },
         /// Encoded audio.
         Audio {
-            /// Codec code (see [`audio_codec_to_code`]).
+            /// Codec code (see [`audio_codec_to_code`](super::audio_codec_to_code)).
             codec: u8,
         },
         /// MPEG-TS packets.

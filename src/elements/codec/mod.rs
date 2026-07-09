@@ -8,19 +8,19 @@
 //! | Codec | Feature | Decoder | Encoder | Pure Rust |
 //! |-------|---------|---------|---------|-----------|
 //! | H.264 | `h264` | [`H264Decoder`] | [`H264Encoder`] | No (OpenH264) |
-//! | AV1 | `av1-decode` | [`Dav1dDecoder`] | - | No (C lib) |
-//! | AV1 | `av1-encode` | - | [`Rav1eEncoder`] | Yes |
+//! | AV1 | `av1-decode` | `Dav1dDecoder` | - | No (C lib) |
+//! | AV1 | `av1-encode` | - | `Rav1eEncoder` | Yes |
 //!
 //! # Audio Codecs
 //!
 //! | Codec | Feature | Decoder | Encoder | Pure Rust |
 //! |-------|---------|---------|---------|-----------|
-//! | Opus | `opus` | [`OpusDecoder`] | [`OpusEncoder`] | No (libopus) |
-//! | AAC | `aac-encode` | - | [`AacEncoder`] | No (FDK-AAC) |
-//! | FLAC | `audio-flac` | [`SymphoniaDecoder`] | - | Yes |
-//! | MP3 | `audio-mp3` | [`SymphoniaDecoder`] | - | Yes |
-//! | AAC | `audio-aac` | [`SymphoniaDecoder`] | - | Yes |
-//! | Vorbis | `audio-vorbis` | [`SymphoniaDecoder`] | - | Yes |
+//! | Opus | `opus` | `OpusDecoder` | `OpusEncoder` | No (libopus) |
+//! | AAC | `aac-encode` | - | `AacEncoder` | No (FDK-AAC) |
+//! | FLAC | `audio-flac` | `SymphoniaDecoder` | - | Yes |
+//! | MP3 | `audio-mp3` | `SymphoniaDecoder` | - | Yes |
+//! | AAC | `audio-aac` | `SymphoniaDecoder` | - | Yes |
+//! | Vorbis | `audio-vorbis` | `SymphoniaDecoder` | - | Yes |
 //!
 //! # Image Codecs
 //!

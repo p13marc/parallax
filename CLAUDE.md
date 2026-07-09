@@ -42,6 +42,7 @@ just test-one NAME # single test
 just lint          # clippy -D warnings
 just lint-all      # clippy --all-features
 just check         # fmt-check + lint + test
+just check-sensor  # check+test+clippy the sensor combo (zenoh,h264,v4l2,rtp,rtsp,image-jpeg,hotplug — mirrors CI)
 just bench         # criterion benchmarks
 just watch         # auto-run tests on change
 just coverage      # cargo llvm-cov nextest
@@ -54,7 +55,7 @@ cargo check --all-targets              # default features
 cargo check --features "h264,mpeg-ts"  # etc. for gated code
 ```
 
-Feature-gated code is NOT compiled by default — after touching gated modules (codecs, devices, rtp, vulkan…), check with the relevant features enabled.
+Feature-gated code is NOT compiled by default — after touching gated modules (codecs, devices, rtp, vulkan…), check with the relevant features enabled. CI (`.github/workflows/ci.yml`) runs default tests plus the sensor combo; it deliberately does NOT run `--all-features` (dav1d/alsa/pipewire/libcamera need system libs, and vulkan-video carries lint debt tracked in #3).
 
 ## Source Tree
 
