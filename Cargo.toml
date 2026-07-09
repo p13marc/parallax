@@ -127,6 +127,9 @@ libcamera = { version = "0.4", optional = true }
 # V4L2 (fallback video capture)
 v4l = { version = "0.14", optional = true }
 
+# udev device monitoring (hotplug)
+udev = { version = "0.9", features = ["send"], optional = true }
+
 # ALSA (fallback audio capture/playback)
 alsa = { version = "0.9", optional = true }
 
@@ -193,6 +196,7 @@ alsa = ["dep:alsa"]  # ALSA audio capture/playback (fallback)
 # Combined device features
 device-capture = ["pipewire", "libcamera"]  # Recommended device capture stack
 device-all = ["pipewire", "libcamera", "screen-capture", "v4l2", "alsa"]  # All device capture
+hotplug = ["v4l2", "dep:udev"]  # udev video device hotplug monitoring
 
 [[bench]]
 name = "throughput"

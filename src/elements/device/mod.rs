@@ -46,6 +46,12 @@ pub mod libcamera;
 #[cfg(feature = "v4l2")]
 pub mod v4l2;
 
+#[cfg(feature = "hotplug")]
+pub mod monitor;
+
+#[cfg(feature = "hotplug")]
+pub use monitor::{DeviceEvent, DeviceMonitor};
+
 #[cfg(feature = "alsa")]
 pub mod alsa;
 
