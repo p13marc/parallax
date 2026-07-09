@@ -16,6 +16,7 @@
 //! - [`RtpVp8Pay`]: VP8 packetizer
 //! - [`RtpVp9Pay`]: VP9 packetizer
 //! - [`RtpOpusPay`]: Opus audio packetizer
+//! - [`RtpAv1Pay`]: AV1 packetizer (no depayloader yet)
 //!
 //! # Example
 //!
@@ -37,9 +38,10 @@ use crate::memory::SharedArena;
 use crate::metadata::BufferFlags;
 
 use bytes::Bytes;
+use rtp::codecs::av1::Av1Payloader;
 use rtp::codecs::h264::{H264Packet, H264Payloader};
 use rtp::codecs::h265::{H265Packet, HevcPayloader};
-use rtp::codecs::opus::OpusPacket;
+use rtp::codecs::opus::{OpusPacket, OpusPayloader};
 use rtp::codecs::vp8::{Vp8Packet, Vp8Payloader};
 use rtp::codecs::vp9::{Vp9Packet, Vp9Payloader};
 use rtp::packetizer::{Depacketizer, Payloader};
@@ -982,6 +984,234 @@ impl Element for RtpOpusDepay {
 }
 
 // ============================================================================
+// Opus Payloader
+// ============================================================================
+
+/// Opus RTP packetizer (RFC 7587).
+///
+/// Wraps encoded Opus frames in RTP payloads — one frame per packet, no
+/// fragmentation (Opus frames are far below any sane MTU).
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use parallax::elements::RtpOpusPay;
+///
+/// let pay = RtpOpusPay::new();
+/// ```
+pub struct RtpOpusPay {
+    name: String,
+    payloader: OpusPayloader,
+    mtu: usize,
+    stats: PayStats,
+    arena: Option<SharedArena>,
+}
+
+impl RtpOpusPay {
+    /// Create a new Opus packetizer.
+    pub fn new() -> Self {
+        Self {
+            name: "rtp-opus-pay".into(),
+            payloader: OpusPayloader,
+            mtu: DEFAULT_MTU,
+            stats: PayStats::default(),
+            arena: None,
+        }
+    }
+
+    /// Set the MTU (maximum transmission unit).
+    pub fn with_mtu(mut self, mtu: usize) -> Self {
+        self.mtu = mtu;
+        self
+    }
+
+    /// Set a custom name.
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
+    }
+
+    /// Get statistics.
+    pub fn stats(&self) -> &PayStats {
+        &self.stats
+    }
+}
+
+impl Default for RtpOpusPay {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Element for RtpOpusPay {
+    fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
+        let payload = Bytes::copy_from_slice(buffer.as_bytes());
+        self.stats.frames_in += 1;
+
+        match self.payloader.payload(self.mtu, &payload) {
+            Ok(packets) => {
+                if packets.is_empty() {
+                    return Ok(None);
+                }
+
+                let total_len: usize = packets.iter().map(|p| p.len()).sum();
+                self.stats.packets_out += packets.len() as u64;
+                self.stats.bytes_out += total_len as u64;
+
+                // Lazily initialize arena
+                if self.arena.is_none() {
+                    self.arena =
+                        Some(SharedArena::new(64 * 1024, 32).map_err(|e| {
+                            Error::Element(format!("Failed to create arena: {}", e))
+                        })?);
+                }
+                let arena = self.arena.as_mut().unwrap();
+
+                arena.reclaim();
+
+                let mut slot = arena
+                    .acquire()
+                    .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+
+                let mut offset = 0;
+                for packet in &packets {
+                    slot.data_mut()[offset..offset + packet.len()].copy_from_slice(packet.as_ref());
+                    offset += packet.len();
+                }
+
+                let handle = crate::buffer::MemoryHandle::with_len(slot, total_len);
+
+                let mut metadata = buffer.metadata().clone();
+                metadata.format = Some(MediaFormat::Rtp(RtpFormat::OPUS));
+
+                Ok(Some(Buffer::new(handle, metadata)))
+            }
+            Err(e) => {
+                self.stats.errors += 1;
+                Err(Error::Element(format!("Opus packetize error: {}", e)))
+            }
+        }
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+// ============================================================================
+// AV1 Payloader
+// ============================================================================
+
+/// AV1 RTP packetizer (AV1 RTP spec: OBU aggregation with LEB128 sizes).
+///
+/// Packetizes AV1 temporal units into RTP payloads. There is no matching
+/// depayloader yet — the rtp crate (0.14) ships only the packetizer — so
+/// this is one-way interop towards RTP-native AV1 receivers.
+pub struct RtpAv1Pay {
+    name: String,
+    payloader: Av1Payloader,
+    mtu: usize,
+    stats: PayStats,
+    arena: Option<SharedArena>,
+}
+
+impl RtpAv1Pay {
+    /// Create a new AV1 packetizer.
+    pub fn new() -> Self {
+        Self {
+            name: "rtp-av1-pay".into(),
+            payloader: Av1Payloader {},
+            mtu: DEFAULT_MTU,
+            stats: PayStats::default(),
+            arena: None,
+        }
+    }
+
+    /// Set the MTU (maximum transmission unit).
+    pub fn with_mtu(mut self, mtu: usize) -> Self {
+        self.mtu = mtu;
+        self
+    }
+
+    /// Set a custom name.
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
+    }
+
+    /// Get statistics.
+    pub fn stats(&self) -> &PayStats {
+        &self.stats
+    }
+}
+
+impl Default for RtpAv1Pay {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Element for RtpAv1Pay {
+    fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
+        let payload = Bytes::copy_from_slice(buffer.as_bytes());
+        self.stats.frames_in += 1;
+
+        match self.payloader.payload(self.mtu, &payload) {
+            Ok(packets) => {
+                if packets.is_empty() {
+                    return Ok(None);
+                }
+
+                let total_len: usize = packets.iter().map(|p| p.len()).sum();
+                self.stats.packets_out += packets.len() as u64;
+                self.stats.bytes_out += total_len as u64;
+
+                // Lazily initialize arena
+                if self.arena.is_none() {
+                    self.arena =
+                        Some(SharedArena::new(256 * 1024, 32).map_err(|e| {
+                            Error::Element(format!("Failed to create arena: {}", e))
+                        })?);
+                }
+                let arena = self.arena.as_mut().unwrap();
+
+                arena.reclaim();
+
+                let mut slot = arena
+                    .acquire()
+                    .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+
+                let mut offset = 0;
+                for packet in &packets {
+                    slot.data_mut()[offset..offset + packet.len()].copy_from_slice(packet.as_ref());
+                    offset += packet.len();
+                }
+
+                let handle = crate::buffer::MemoryHandle::with_len(slot, total_len);
+
+                let mut metadata = buffer.metadata().clone();
+                // AV1 has no static payload type; 98 is a common dynamic choice.
+                metadata.format = Some(MediaFormat::Rtp(RtpFormat::new(
+                    98,
+                    90000,
+                    crate::format::RtpEncoding::Av1,
+                )));
+
+                Ok(Some(Buffer::new(handle, metadata)))
+            }
+            Err(e) => {
+                self.stats.errors += 1;
+                Err(Error::Element(format!("AV1 packetize error: {}", e)))
+            }
+        }
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+// ============================================================================
 // Statistics
 // ============================================================================
 
@@ -1038,6 +1268,54 @@ mod tests {
         let depay = RtpH264Depay::new();
         assert_eq!(depay.name(), "rtp-h264-depay");
         assert!(!depay.depacketizer.is_avc);
+    }
+
+    /// Opus pay -> depay round-trip: one frame per packet (RFC 7587), the
+    /// payload is the frame itself.
+    #[test]
+    fn test_opus_pay_depay_roundtrip() {
+        let opus_frame = b"\xfc\x01\x02\x03\x04opus-ish";
+        let mut pay = RtpOpusPay::new();
+        let paid = pay
+            .process(create_test_buffer(opus_frame))
+            .unwrap()
+            .expect("one packet out");
+        assert_eq!(pay.stats().packets_out, 1);
+        assert!(matches!(paid.metadata().format, Some(MediaFormat::Rtp(_))));
+
+        let mut depay = RtpOpusDepay::new();
+        let depaid = depay.process(paid).unwrap().expect("frame out");
+        assert_eq!(depaid.as_bytes(), opus_frame);
+    }
+
+    /// AV1 payloads carry the aggregation header + LEB128-sized OBUs; a
+    /// small temporal unit fits one packet, a large one fragments per MTU.
+    #[test]
+    fn test_av1_pay_packetizes() {
+        // OBU_FRAME (type 6, has-size), leb128 size 3, 3 payload bytes.
+        // (Temporal delimiters alone are stripped per the AV1 RTP spec.)
+        let small = [0x32u8, 0x03, 1, 2, 3];
+        let mut pay = RtpAv1Pay::new();
+        let out = pay
+            .process(create_test_buffer(&small))
+            .unwrap()
+            .expect("packet out");
+        assert!(!out.is_empty());
+        assert_eq!(pay.stats().packets_out, 1);
+
+        // A large payload must fragment into multiple packets.
+        let mut pay = RtpAv1Pay::new().with_mtu(200);
+        let mut large = vec![0x12u8, 0x00];
+        // OBU_FRAME (type 6) with has_size flag, LEB128 size 600.
+        large.push(0x32);
+        large.extend_from_slice(&[0xD8, 0x04]); // leb128(600)
+        large.extend(std::iter::repeat_n(0xAB, 600));
+        pay.process(create_test_buffer(&large)).unwrap();
+        assert!(
+            pay.stats().packets_out > 1,
+            "600-byte OBU at MTU 200 must fragment, got {} packets",
+            pay.stats().packets_out
+        );
     }
 
     #[test]

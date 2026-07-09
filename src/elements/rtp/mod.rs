@@ -53,8 +53,8 @@ pub use rtcp::{
 // RTP Codec Payloaders/Depayloaders
 #[cfg(feature = "rtp")]
 pub use rtp_codecs::{
-    DepayStats, PayStats, RtpH264Depay, RtpH264Pay, RtpH265Depay, RtpH265Pay, RtpOpusDepay,
-    RtpVp8Depay, RtpVp8Pay, RtpVp9Depay, RtpVp9Pay,
+    DepayStats, PayStats, RtpAv1Pay, RtpH264Depay, RtpH264Pay, RtpH265Depay, RtpH265Pay,
+    RtpOpusDepay, RtpOpusPay, RtpVp8Depay, RtpVp8Pay, RtpVp9Depay, RtpVp9Pay,
 };
 
 // Jitter Buffer

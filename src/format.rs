@@ -680,6 +680,8 @@ pub enum RtpEncoding {
     Pcmu,
     /// G.711 A-law audio.
     Pcma,
+    /// AV1 video.
+    Av1,
     /// Dynamic/unknown payload type.
     Dynamic(u8),
 }
