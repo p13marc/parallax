@@ -104,12 +104,12 @@ impl AudioFrameInfo {
 ))]
 mod symphonia_decoder {
     use super::*;
-    use symphonia::core::audio::SampleBuffer;
-    use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
+    use symphonia::core::codecs::CodecParameters;
+    use symphonia::core::codecs::audio::AudioDecoderOptions;
     use symphonia::core::formats::FormatOptions;
+    use symphonia::core::formats::probe::Hint;
     use symphonia::core::io::MediaSourceStream;
     use symphonia::core::meta::MetadataOptions;
-    use symphonia::core::probe::Hint;
 
     /// Audio decoder using Symphonia (pure Rust).
     ///
@@ -192,33 +192,29 @@ mod symphonia_decoder {
             }
 
             // Probe the format
-            let probed = match symphonia::default::get_probe().format(
+            let mut format = match symphonia::default::get_probe().probe(
                 &hint,
                 mss,
-                &FormatOptions::default(),
-                &MetadataOptions::default(),
+                FormatOptions::default(),
+                MetadataOptions::default(),
             ) {
-                Ok(p) => p,
+                Ok(f) => f,
                 Err(_) => return Ok(None), // Not enough data or unknown format
             };
 
-            let mut format = probed.format;
-
-            // Find the first audio track
-            let track = match format
-                .tracks()
-                .iter()
-                .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
-            {
-                Some(t) => t,
-                None => return Ok(None),
-            };
-
-            let track_id = track.id;
+            // Find the first audio track with usable codec parameters
+            let (track_id, audio_params) =
+                match format.tracks().iter().find_map(|t| match &t.codec_params {
+                    Some(CodecParameters::Audio(params)) => Some((t.id, params.clone())),
+                    _ => None,
+                }) {
+                    Some(found) => found,
+                    None => return Ok(None),
+                };
 
             // Create decoder
             let mut decoder = match symphonia::default::get_codecs()
-                .make(&track.codec_params, &DecoderOptions::default())
+                .make_audio_decoder(&audio_params, &AudioDecoderOptions::default())
             {
                 Ok(d) => d,
                 Err(e) => {
@@ -230,10 +226,10 @@ mod symphonia_decoder {
             };
 
             // Get codec parameters
-            let sample_rate = track.codec_params.sample_rate.unwrap_or(44100);
-            let channels = track
-                .codec_params
+            let sample_rate = audio_params.sample_rate.unwrap_or(44100);
+            let channels = audio_params
                 .channels
+                .as_ref()
                 .map(|c| c.count() as u16)
                 .unwrap_or(2);
 
@@ -242,8 +238,8 @@ mod symphonia_decoder {
 
             // Try to decode a packet
             let packet = match format.next_packet() {
-                Ok(p) if p.track_id() == track_id => p,
-                Ok(_) => return Ok(None),
+                Ok(Some(p)) if p.track_id == track_id => p,
+                Ok(_) => return Ok(None), // other track or end of stream
                 Err(_) => return Ok(None),
             };
 
@@ -252,14 +248,9 @@ mod symphonia_decoder {
                 Err(_) => return Ok(None),
             };
 
-            // Convert to f32 samples
-            let spec = *decoded.spec();
-            let duration = decoded.capacity();
-
-            let mut sample_buf = SampleBuffer::<f32>::new(duration as u64, spec);
-            sample_buf.copy_interleaved_ref(decoded);
-
-            let samples = sample_buf.samples().to_vec();
+            // Convert to interleaved f32 samples
+            let mut samples: Vec<f32> = Vec::new();
+            decoded.copy_to_vec_interleaved(&mut samples);
             let samples_per_channel = samples.len() / channels as usize;
 
             // Clear processed data (simplified - in real impl would track position)

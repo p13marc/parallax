@@ -1260,6 +1260,23 @@ impl Pipeline {
         )
     }
 
+    /// Add a muxer element (N inputs → 1 output) to the pipeline.
+    ///
+    /// This automatically wraps the muxer in a
+    /// [`MuxerAdapter`](crate::element::MuxerAdapter). Use this for
+    /// N-to-1 elements implementing [`Muxer`](crate::element::Muxer),
+    /// e.g. `TsMuxElement`.
+    pub fn add_muxer<M: crate::element::Muxer + Send + 'static>(
+        &mut self,
+        name: impl Into<String>,
+        muxer: M,
+    ) -> NodeId {
+        self.add_node(
+            name,
+            DynAsyncElement::new_box(crate::element::MuxerAdapter::new(muxer)),
+        )
+    }
+
     /// Add an async transform element to the pipeline.
     ///
     /// This automatically wraps the transform in an

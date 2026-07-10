@@ -460,11 +460,9 @@ impl<R: Read + Seek> Mp4Demux<R> {
 
         // Calculate timestamps in nanoseconds
         let timescale = track.timescale as u128;
-        let pts_ns = if timescale > 0 {
-            (sample.start_time as u128 * 1_000_000_000 / timescale) as u64
-        } else {
-            0
-        };
+        let pts_ns = (sample.start_time as u128 * 1_000_000_000)
+            .checked_div(timescale)
+            .unwrap_or(0) as u64;
 
         // For DTS, use rendering_offset if available
         let dts_ns = if sample.rendering_offset != 0 && timescale > 0 {
@@ -478,11 +476,9 @@ impl<R: Read + Seek> Mp4Demux<R> {
             pts_ns
         };
 
-        let duration_ns = if timescale > 0 {
-            (sample.duration as u128 * 1_000_000_000 / timescale) as u64
-        } else {
-            0
-        };
+        let duration_ns = (sample.duration as u128 * 1_000_000_000)
+            .checked_div(timescale)
+            .unwrap_or(0) as u64;
 
         // Update statistics
         self.stats.samples_read += 1;
@@ -537,10 +533,8 @@ impl<R: Read + Seek> Mp4Demux<R> {
         let mut metadata = Metadata::new();
         metadata.stream_id = track_id;
 
-        if timescale > 0 {
-            metadata.pts = ClockTime::from_nanos(
-                (sample.start_time as u128 * 1_000_000_000 / timescale) as u64,
-            );
+        if let Some(pts) = (sample.start_time as u128 * 1_000_000_000).checked_div(timescale) {
+            metadata.pts = ClockTime::from_nanos(pts as u64);
 
             let dts = sample.start_time as i64 - sample.rendering_offset as i64;
             if dts >= 0 {

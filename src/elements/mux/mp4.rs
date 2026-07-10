@@ -906,7 +906,7 @@ impl Sink for Mp4FileSink {
         muxer.write_video_sample(track_id, &avcc_data, pts_ms, duration_ms, is_keyframe)?;
         self.frame_count += 1;
 
-        if self.frame_count % 30 == 0 {
+        if self.frame_count.is_multiple_of(30) {
             tracing::debug!("MP4: {} frames written", self.frame_count);
         }
 
@@ -916,10 +916,10 @@ impl Sink for Mp4FileSink {
 
 impl Drop for Mp4FileSink {
     fn drop(&mut self) {
-        if let Some(muxer) = self.muxer.take() {
-            if let Err(e) = muxer.finish() {
-                tracing::error!("Failed to finalize MP4 file: {}", e);
-            }
+        if let Some(muxer) = self.muxer.take()
+            && let Err(e) = muxer.finish()
+        {
+            tracing::error!("Failed to finalize MP4 file: {}", e);
         }
     }
 }
@@ -1158,7 +1158,7 @@ impl Element for Mp4MuxTransform {
         muxer.write_video_sample(track_id, &avcc_data, pts_ms, duration_ms, is_keyframe)?;
         self.frame_count += 1;
 
-        if self.frame_count % 30 == 0 {
+        if self.frame_count.is_multiple_of(30) {
             tracing::debug!(
                 "MP4 mux: {} frames buffered, last pts={}ms",
                 self.frame_count,

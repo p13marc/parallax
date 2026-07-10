@@ -344,18 +344,10 @@ pub struct TsMuxStats {
 // ============================================================================
 
 /// Runtime state for a track.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct TrackState {
     /// Continuity counter (4-bit, 0-15).
     continuity_counter: u8,
-}
-
-impl Default for TrackState {
-    fn default() -> Self {
-        Self {
-            continuity_counter: 0,
-        }
-    }
 }
 
 // ============================================================================
@@ -489,9 +481,7 @@ impl TsMux {
         packet[payload_start..payload_start + section_len].copy_from_slice(&section[..section_len]);
 
         // Fill rest with stuffing
-        for i in payload_start + section_len..TS_PACKET_SIZE {
-            packet[i] = 0xFF;
-        }
+        packet[payload_start + section_len..TS_PACKET_SIZE].fill(0xFF);
 
         self.stats.pat_packets += 1;
         self.stats.packets_written += 1;
@@ -581,9 +571,7 @@ impl TsMux {
         packet[payload_start..payload_start + section_len].copy_from_slice(&section[..section_len]);
 
         // Fill rest with stuffing
-        for i in payload_start + section_len..TS_PACKET_SIZE {
-            packet[i] = 0xFF;
-        }
+        packet[payload_start + section_len..TS_PACKET_SIZE].fill(0xFF);
 
         self.stats.pmt_packets += 1;
         self.stats.packets_written += 1;
@@ -612,9 +600,7 @@ impl TsMux {
             .clone();
 
         // Ensure track state exists
-        if !self.track_states.contains_key(&pid) {
-            self.track_states.insert(pid, TrackState::default());
-        }
+        self.track_states.entry(pid).or_default();
 
         let mut output = Vec::new();
 
@@ -645,15 +631,8 @@ impl TsMux {
         pts: Option<ClockTime>,
         dts: Option<ClockTime>,
     ) -> Vec<u8> {
-        let mut pes = Vec::new();
-
-        // PES start code (00 00 01)
-        pes.push(0x00);
-        pes.push(0x00);
-        pes.push(0x01);
-
-        // Stream ID
-        pes.push(track.stream_id);
+        // PES start code (00 00 01) then stream ID
+        let mut pes = vec![0x00, 0x00, 0x01, track.stream_id];
 
         // Calculate header extension length
         let has_pts = pts.is_some();
@@ -700,7 +679,7 @@ impl TsMux {
 
         // Write PTS
         if let Some(pts_time) = pts {
-            let pts_90khz = pts_time.nanos() as u64 * CLOCK_90KHZ / 1_000_000_000;
+            let pts_90khz = pts_time.nanos() * CLOCK_90KHZ / 1_000_000_000;
             if has_dts {
                 // PTS with DTS flag (0011)
                 pes.extend(encode_timestamp(pts_90khz, 0x03));
@@ -711,11 +690,11 @@ impl TsMux {
         }
 
         // Write DTS
-        if let Some(dts_time) = dts {
-            if has_pts {
-                let dts_90khz = dts_time.nanos() as u64 * CLOCK_90KHZ / 1_000_000_000;
-                pes.extend(encode_timestamp(dts_90khz, 0x01));
-            }
+        if let Some(dts_time) = dts
+            && has_pts
+        {
+            let dts_90khz = dts_time.nanos() * CLOCK_90KHZ / 1_000_000_000;
+            pes.extend(encode_timestamp(dts_90khz, 0x01));
         }
 
         // Payload
@@ -759,7 +738,7 @@ impl TsMux {
             let (adaptation_length, payload_start) = if need_adaptation {
                 // Adaptation field with PCR (7 bytes: 1 length + 1 flags + 6 PCR)
                 let pcr_time = pts
-                    .map(|t| t.nanos() as u64 * CLOCK_27MHZ / 1_000_000_000)
+                    .map(|t| t.nanos() * CLOCK_27MHZ / 1_000_000_000)
                     .unwrap_or(0);
 
                 packet[3] = 0x30 | (cc & 0x0F); // Adaptation + payload
@@ -794,9 +773,7 @@ impl TsMux {
                     packet[4] = (stuffing_needed - 1) as u8; // Adaptation field length
                     packet[5] = 0x00; // No flags
                     // Fill with stuffing bytes
-                    for i in 6..4 + stuffing_needed {
-                        packet[i] = 0xFF;
-                    }
+                    packet[6..4 + stuffing_needed].fill(0xFF);
                     (stuffing_needed, 4 + stuffing_needed)
                 }
             } else {
@@ -812,9 +789,7 @@ impl TsMux {
                 .copy_from_slice(&pes_data[offset..offset + copy_len]);
 
             // If there's remaining space (shouldn't happen with proper stuffing), fill with 0xFF
-            for i in payload_start + copy_len..TS_PACKET_SIZE {
-                packet[i] = 0xFF;
-            }
+            packet[payload_start + copy_len..TS_PACKET_SIZE].fill(0xFF);
 
             output.extend_from_slice(&packet);
             offset += copy_len;

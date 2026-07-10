@@ -264,6 +264,7 @@ mod jpeg_tests {
 ))]
 mod audio_tests {
     use super::*;
+    use parallax::element::Element;
     use parallax::elements::codec::SymphoniaDecoder;
 
     #[test]
@@ -287,6 +288,26 @@ mod audio_tests {
             result.unwrap().is_none(),
             "Should return None when data is insufficient"
         );
+    }
+
+    /// Real decode: a 0.3s 440 Hz mono MP3 generated with ffmpeg. Exercises
+    /// the full probe -> track select -> decode -> interleave path.
+    #[cfg(feature = "audio-mp3")]
+    #[test]
+    fn test_symphonia_decoder_real_mp3() {
+        let mut decoder = SymphoniaDecoder::for_format(parallax::elements::codec::AudioFormat::Mp3)
+            .expect("Should create decoder");
+        let data = include_bytes!("fixtures/sine.mp3");
+        let input = create_test_buffer(data);
+
+        let output = decoder.process(input).expect("decode should not error");
+        let output = output.expect("a full MP3 file must yield decoded samples");
+        assert!(
+            !output.as_bytes().is_empty(),
+            "decoded PCM must be non-empty"
+        );
+        // f32 samples: length must be a whole number of samples
+        assert_eq!(output.as_bytes().len() % 4, 0);
     }
 
     #[test]

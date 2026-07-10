@@ -11,7 +11,7 @@
 //! Run: `cargo run --example 16_mpegts --features mpeg-ts`
 
 use parallax::clock::ClockTime;
-use parallax::element::{DynAsyncElement, ProduceContext, ProduceResult, Source};
+use parallax::element::{ProduceContext, ProduceResult, Source};
 use parallax::elements::FileSink;
 use parallax::elements::mux::{TsMuxConfig, TsMuxElement, TsMuxStreamType, TsMuxTrack};
 use parallax::error::Result;
@@ -80,7 +80,10 @@ async fn main() -> Result<()> {
         .add_track(TsMuxTrack::new(257, TsMuxStreamType::Klv).private_data());
 
     let mux = TsMuxElement::new(mux_config)?;
-    println!("TsMux configured with {} tracks", mux.inputs().len());
+    println!(
+        "TsMux configured with {} tracks",
+        parallax::element::Muxer::inputs(&mux).len()
+    );
 
     let mut pipeline = Pipeline::new();
 
@@ -106,8 +109,8 @@ async fn main() -> Result<()> {
         data_arena,
     );
 
-    // Muxer (special element type - needs DynAsyncElement wrapping)
-    let muxer = pipeline.add_element("tsmux", mux);
+    // Muxer (N-to-1 element, wrapped via MuxerAdapter)
+    let muxer = pipeline.add_muxer("tsmux", mux);
 
     // File sink
     let sink = pipeline.add_sink("filesink", FileSink::new(output_path));

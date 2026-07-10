@@ -249,10 +249,10 @@ impl TsMuxElement {
 
         // Flush sync state
         let remaining = self.sync.flush();
-        if !remaining.is_empty() {
-            if let Some(buffer) = self.mux_inputs(remaining)? {
-                outputs.push(buffer);
-            }
+        if !remaining.is_empty()
+            && let Some(buffer) = self.mux_inputs(remaining)?
+        {
+            outputs.push(buffer);
         }
 
         Ok(outputs)
