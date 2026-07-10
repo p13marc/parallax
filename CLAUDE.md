@@ -6,7 +6,7 @@ This file provides guidance to Claude Code when working with code in this reposi
 
 **Parallax** is a Rust-native streaming pipeline engine (a GStreamer alternative) built on zero-copy shared memory, hybrid async+realtime scheduling, and progressive typing. Linux-only. Workspace: the `parallax` crate (root), `parallax-macros` (proc macros), `examples/example-plugin` (cdylib plugin demo).
 
-- Edition **2024**, MSRV **1.85** (do not claim 1.75 — that's stale).
+- Edition **2024**, MSRV **1.95** (enforced by the CI `msrv` job; do not claim 1.75 or 1.85 — both stale).
 - Default features are empty; most media functionality is feature-gated.
 - ~61k lines of Rust; 1100+ tests, all passing with default features.
 

@@ -2,7 +2,7 @@
 name = "parallax-macros"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.95"
 description = "Procedural macros for the Parallax streaming pipeline engine"
 license = "MIT OR Apache-2.0"
 

@@ -30,6 +30,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo fmt --check
 
+  # Enforce the declared MSRV (Cargo.toml rust-version): the other jobs
+  # float on stable, so without this a dependency update could silently
+  # require a newer compiler than we claim to support.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y libudev-dev g++
+      - run: cargo check --all-targets
+      - run: cargo check --all-targets --features "$SENSOR_FEATURES"
+
   test-default:
     runs-on: ubuntu-latest
     steps:
