@@ -118,7 +118,6 @@ pub(crate) fn shared_manager() -> Result<&'static CameraManager> {
 /// `DeviceMonitor`) already took it. Hand it back with
 /// [`return_hotplug_receiver`] so a later monitor can use it.
 #[cfg(feature = "hotplug")]
-#[allow(dead_code)] // wired up by DeviceMonitor's libcamera integration
 pub(crate) fn take_hotplug_receiver() -> Option<std_mpsc::Receiver<HotplugEvent>> {
     let rx = shared().ok()?.hotplug_rx.lock().unwrap().take();
     if let Some(rx) = &rx {
@@ -130,7 +129,6 @@ pub(crate) fn take_hotplug_receiver() -> Option<std_mpsc::Receiver<HotplugEvent>
 
 /// Return the hotplug receiver taken with [`take_hotplug_receiver`].
 #[cfg(feature = "hotplug")]
-#[allow(dead_code)] // wired up by DeviceMonitor's libcamera integration
 pub(crate) fn return_hotplug_receiver(rx: std_mpsc::Receiver<HotplugEvent>) {
     if let Ok(s) = shared() {
         *s.hotplug_rx.lock().unwrap() = Some(rx);
@@ -159,7 +157,7 @@ pub struct LibCameraInfo {
 ///
 /// Cameras that don't report the property (common for UVC devices) count
 /// as `External`.
-fn location_from_properties(camera: &Camera<'_>) -> CameraLocation {
+pub(crate) fn location_from_properties(camera: &Camera<'_>) -> CameraLocation {
     match camera.properties().get::<properties::Location>() {
         Ok(properties::Location::CameraFront) => CameraLocation::Front,
         Ok(properties::Location::CameraBack) => CameraLocation::Back,

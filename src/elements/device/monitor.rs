@@ -1,4 +1,4 @@
-//! Video device hotplug monitoring via udev.
+//! Video device hotplug monitoring via udev (and libcamera, when enabled).
 //!
 //! [`DeviceMonitor`] watches the kernel's `video4linux` subsystem for devices
 //! appearing and disappearing (USB webcam plugged in / unplugged) and emits
@@ -6,7 +6,10 @@
 //! [`enumerate_video_devices`](super::enumerate_video_devices); the monitor is
 //! what keeps a catalog fresh afterwards.
 //!
-//! Requires the `hotplug` feature (udev + v4l2).
+//! Requires the `hotplug` feature (udev + v4l2). With the `libcamera` feature
+//! also enabled, libcamera's own hotplug events are folded into the same
+//! stream (as `VideoCaptureDevice`s with the `LibCamera` backend). Event
+//! latency is bounded by the poll interval (≤ 500 ms).
 //!
 //! # Example: catalog refresh loop
 //!
@@ -28,6 +31,13 @@
 //! are filtered out. Removal events cannot be capability-checked (the device
 //! is already gone), so consumers may see `Removed` for ids they never saw
 //! `Added` for — match against your own catalog.
+//!
+//! **Dual events**: ids are namespaced per backend (`/dev/video*` paths for
+//! V4L2, opaque libcamera ids like `\_SB_.PCI0...` for libcamera). Plugging
+//! in one USB camera therefore produces *two* `Added` events when libcamera
+//! folding is active — one per backend. Filter on
+//! [`VideoCaptureDevice::backend`](super::VideoCaptureDevice) for the stack
+//! you intend to open the device with.
 
 use std::os::fd::AsRawFd;
 use std::path::Path;
@@ -46,7 +56,8 @@ pub enum DeviceEvent {
     Added(VideoCaptureDevice),
     /// A video device disappeared.
     Removed {
-        /// The device identifier (its `/dev/video*` path).
+        /// The device identifier: a `/dev/video*` path for V4L2 devices, or
+        /// the opaque libcamera camera id for libcamera devices.
         id: String,
     },
 }
@@ -81,6 +92,21 @@ impl DeviceMonitor {
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_thread = shutdown.clone();
 
+        // Fold libcamera hotplug events into the same stream. The receiver
+        // is process-wide and exclusive; without it (libcamera unavailable,
+        // or another monitor holds it) we degrade to udev-only monitoring.
+        #[cfg(feature = "libcamera")]
+        let libcamera_rx = {
+            let rx = super::libcamera::take_hotplug_receiver();
+            if rx.is_none() {
+                tracing::warn!(
+                    "libcamera hotplug events unavailable (libcamera not usable or \
+                     receiver already held); monitoring udev only"
+                );
+            }
+            rx
+        };
+
         let thread = std::thread::Builder::new()
             .name("parallax-devmon".into())
             .spawn(move || {
@@ -91,10 +117,20 @@ impl DeviceMonitor {
                     }
                     Err(e) => {
                         let _ = startup_tx.send(Err(e.to_string()));
+                        #[cfg(feature = "libcamera")]
+                        if let Some(rx) = libcamera_rx {
+                            super::libcamera::return_hotplug_receiver(rx);
+                        }
                         return;
                     }
                 };
-                monitor_loop(socket, tx, shutdown_thread);
+                monitor_loop(
+                    socket,
+                    tx,
+                    shutdown_thread,
+                    #[cfg(feature = "libcamera")]
+                    libcamera_rx,
+                );
             })
             .map_err(|e| Error::Element(format!("failed to spawn monitor thread: {e}")))?;
 
@@ -149,9 +185,45 @@ fn monitor_loop(
     socket: udev::MonitorSocket,
     tx: tokio::sync::mpsc::UnboundedSender<DeviceEvent>,
     shutdown: Arc<AtomicBool>,
+    #[cfg(feature = "libcamera")] libcamera_rx: Option<
+        std::sync::mpsc::Receiver<libcamera::camera_manager::HotplugEvent>,
+    >,
+) {
+    run_monitor_loop(
+        &socket,
+        &tx,
+        &shutdown,
+        #[cfg(feature = "libcamera")]
+        libcamera_rx.as_ref(),
+    );
+
+    // Hand the process-wide receiver back so a future monitor can use it.
+    #[cfg(feature = "libcamera")]
+    if let Some(rx) = libcamera_rx {
+        super::libcamera::return_hotplug_receiver(rx);
+    }
+}
+
+fn run_monitor_loop(
+    socket: &udev::MonitorSocket,
+    tx: &tokio::sync::mpsc::UnboundedSender<DeviceEvent>,
+    shutdown: &AtomicBool,
+    #[cfg(feature = "libcamera")] libcamera_rx: Option<
+        &std::sync::mpsc::Receiver<libcamera::camera_manager::HotplugEvent>,
+    >,
 ) {
     let fd = socket.as_raw_fd();
     while !shutdown.load(Ordering::Acquire) {
+        // Drain any pending libcamera hotplug events (≤ one poll interval old)
+        #[cfg(feature = "libcamera")]
+        if let Some(rx) = libcamera_rx {
+            while let Ok(event) = rx.try_recv() {
+                if !forward_libcamera_event(event, tx) {
+                    return; // receiver dropped
+                }
+            }
+        }
+
         let mut pollfd = libc::pollfd {
             fd,
             events: libc::POLLIN,
@@ -199,6 +271,50 @@ fn monitor_loop(
     }
 }
 
+/// Forward a libcamera hotplug event as a [`DeviceEvent`].
+///
+/// Returns `false` when the consumer side of the channel is gone.
+#[cfg(feature = "libcamera")]
+fn forward_libcamera_event(
+    event: libcamera::camera_manager::HotplugEvent,
+    tx: &tokio::sync::mpsc::UnboundedSender<DeviceEvent>,
+) -> bool {
+    use libcamera::camera_manager::HotplugEvent;
+    match event {
+        HotplugEvent::Added(id) => match probe_libcamera_device(&id) {
+            Some(device) => {
+                tracing::debug!("libcamera device added: {id}");
+                tx.send(DeviceEvent::Added(device)).is_ok()
+            }
+            // Already gone again (or manager unusable): nothing to add.
+            None => true,
+        },
+        HotplugEvent::Removed(id) => {
+            tracing::debug!("libcamera device removed: {id}");
+            tx.send(DeviceEvent::Removed { id }).is_ok()
+        }
+    }
+}
+
+/// Resolve a freshly-added libcamera id to a catalog entry.
+#[cfg(feature = "libcamera")]
+fn probe_libcamera_device(id: &str) -> Option<VideoCaptureDevice> {
+    let manager = super::libcamera::shared_manager().ok()?;
+    let camera = manager.get(id)?;
+    let model = camera
+        .properties()
+        .get::<libcamera::properties::Model>()
+        .map(|m| m.to_string())
+        .unwrap_or_else(|_| id.to_string());
+    Some(VideoCaptureDevice {
+        id: id.to_string(),
+        name: model.clone(),
+        backend: CaptureBackend::LibCamera,
+        model: Some(model),
+        location: Some(super::libcamera::location_from_properties(&camera)),
+    })
+}
+
 /// Probe a freshly-added node; `Some` only for capture-capable devices.
 fn probe_capture_device(path: &Path, id: &str) -> Option<VideoCaptureDevice> {
     let device = v4l::Device::with_path(path).ok()?;
@@ -243,5 +359,27 @@ mod tests {
     #[test]
     fn probe_rejects_missing_nodes() {
         assert!(probe_capture_device(Path::new("/dev/video-nonexistent"), "x").is_none());
+    }
+
+    /// The process-wide libcamera hotplug receiver is exclusive and can be
+    /// handed back. (Runs isolated under nextest; with plain `cargo test`
+    /// it could race a concurrently-running monitor test in this process.)
+    #[cfg(feature = "libcamera")]
+    #[test]
+    fn libcamera_receiver_take_and_return() {
+        use crate::elements::device::libcamera as lc;
+
+        let Some(rx) = lc::take_hotplug_receiver() else {
+            println!("skipping: libcamera unavailable");
+            return;
+        };
+        assert!(
+            lc::take_hotplug_receiver().is_none(),
+            "receiver must be exclusive"
+        );
+        lc::return_hotplug_receiver(rx);
+        let rx = lc::take_hotplug_receiver();
+        assert!(rx.is_some(), "returned receiver must be takeable again");
+        lc::return_hotplug_receiver(rx.unwrap());
     }
 }
