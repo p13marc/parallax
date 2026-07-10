@@ -226,10 +226,18 @@ impl PooledBuffer {
 
 impl Drop for PooledBuffer {
     fn drop(&mut self) {
-        if self.slot.is_some() {
-            // Slot will be returned to arena when dropped
+        if let Some(slot) = self.slot.take() {
+            // Return the slot to the arena's release queue BEFORE notifying,
+            // or a woken waiter can find nothing to reclaim, re-wait, and
+            // never be notified again (the slot would otherwise drop after
+            // this body, in field-drop order).
+            drop(slot);
             self.pool_inner.stats.in_use.fetch_sub(1, Ordering::Relaxed);
-            // Notify waiters that a buffer is available
+            // Notify while holding the pool mutex: a waiter holds it from
+            // its failed try_acquire() until it parks in wait(), so an
+            // unlocked notify could fire in that window and be lost — the
+            // waiter would then sleep forever (lost wakeup).
+            let _guard = self.pool_inner.mutex.lock().unwrap();
             self.pool_inner.notify.notify_one();
         }
         // If slot is None, it was detached via into_buffer()
@@ -586,20 +594,30 @@ mod tests {
 
         let buf = pool.acquire().unwrap();
 
-        // Spawn thread that will wait for buffer
+        // Spawn thread that will wait for the (only) buffer
         let pool2 = pool.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let handle = thread::spawn(move || {
-            let start = std::time::Instant::now();
+            ready_tx.send(()).unwrap();
             let _buf = pool2.acquire().unwrap();
-            start.elapsed()
         });
 
-        // Wait a bit, then release
+        // acquire() cannot return while we hold the buffer, no matter how
+        // the threads are scheduled. (Do NOT assert on elapsed time here:
+        // under CPU contention the spawned thread may only get scheduled
+        // after the drop below, making any timing assertion flaky.)
+        ready_rx.recv().unwrap();
         thread::sleep(Duration::from_millis(50));
-        drop(buf);
+        assert!(
+            !handle.is_finished(),
+            "acquire() must block while the buffer is held"
+        );
 
-        let elapsed = handle.join().unwrap();
-        assert!(elapsed >= Duration::from_millis(40));
+        // Release; the waiter must now complete (a lost condvar wakeup
+        // would hang this join forever)
+        drop(buf);
+        handle.join().unwrap();
+        assert_eq!(pool.available(), 1);
     }
 
     #[test]
