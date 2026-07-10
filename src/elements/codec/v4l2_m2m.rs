@@ -888,7 +888,7 @@ mod tests {
     fn open_with_any_input(device: &str, coded: V4l2CodedFormat) -> V4l2M2mH264Encoder {
         let mut failures = Vec::new();
         for pf in [PixelFormat::Nv12, PixelFormat::I420] {
-            let config = V4l2M2mEncoderConfig::new(320, 240)
+            let config = V4l2M2mEncoderConfig::new(640, 480)
                 .pixel_format(pf)
                 .coded_format(coded);
             match V4l2M2mH264Encoder::new(device, config) {
@@ -922,7 +922,7 @@ mod tests {
 
         let mut packets = 0usize;
         for seq in 0..10 {
-            let frame = test_frame(320, 240, input_format, seq);
+            let frame = test_frame(640, 480, input_format, seq);
             packets += encoder.encode(&frame).expect("encode").len();
         }
         packets += encoder.flush().expect("flush").len();
@@ -931,7 +931,7 @@ mod tests {
         // Re-arm after drain: the encoder must accept another stream.
         let mut packets = 0usize;
         for seq in 0..3 {
-            let frame = test_frame(320, 240, input_format, seq);
+            let frame = test_frame(640, 480, input_format, seq);
             packets += encoder.encode(&frame).expect("encode after re-arm").len();
         }
         packets += encoder.flush().expect("second flush").len();
@@ -958,7 +958,7 @@ mod tests {
             if seq == 15 {
                 encoder.force_keyframe();
             }
-            let frame = test_frame(320, 240, input_format, seq);
+            let frame = test_frame(640, 480, input_format, seq);
             all_packets.extend(encoder.encode(&frame).expect("encode"));
         }
         all_packets.extend(encoder.flush().expect("flush"));
