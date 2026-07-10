@@ -492,11 +492,22 @@ impl VideoEncoder for V4l2M2mH264Encoder {
             )));
         }
 
-        // Resume after a flush(): the spec keeps both queues streaming, a
-        // START command re-arms the encoder.
+        // Resume after a flush(). ENC_CMD_START clears the mem2mem stopped
+        // state, but vb2's last_buffer_dequeued flag — the source of the
+        // EPIPE on DQBUF — is only reliably reset by restarting the CAPTURE
+        // queue (vicodec, for one, never clears it on START because the
+        // mem2mem helper clears has_stopped before the driver checks it).
+        // The spec allows CAPTURE STREAMOFF/STREAMON as an equivalent
+        // resume path, so do both.
         if self.drained {
             ioctl::encoder_cmd::<_, ()>(&*self.device, &EncoderCommand::Start)
                 .map_err(|e| Error::Element(format!("V4L2 M2M: ENC_CMD_START: {e}")))?;
+            self.capture_queue
+                .stream_off()
+                .map_err(|e| Error::Element(format!("V4L2 M2M: capture stream off: {e}")))?;
+            self.capture_queue
+                .stream_on()
+                .map_err(|e| Error::Element(format!("V4L2 M2M: capture stream on: {e}")))?;
             while let Ok(buffer) = self.capture_queue.try_get_free_buffer() {
                 buffer.queue().map_err(|e| {
                     Error::Element(format!("V4L2 M2M: requeue capture buffer: {e}"))
