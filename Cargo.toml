@@ -57,18 +57,15 @@ parallax-macros = { path = "parallax-macros", optional = true }
 ureq = { version = "3", optional = true }
 
 # WebSocket (optional)
-tungstenite = { version = "0.21", optional = true }
+tungstenite = { version = "0.29", optional = true }
 
 # Zenoh pub/sub (optional)
 zenoh = { version = "1.9", optional = true }
 
-# RTP/RTCP (optional, from webrtc-rs)
-# Note: rtp uses webrtc-util 0.12, rtcp uses webrtc-util 0.10
-# We import both versions with different names to avoid diamond dependency issues
-rtp = { version = "0.14", optional = true }
-rtcp = { version = "0.12", optional = true }
-webrtc-util = { version = "0.12", optional = true }
-webrtc-util-0_10 = { package = "webrtc-util", version = "0.10", optional = true }
+# RTP/RTCP (optional, from webrtc-rs; rtp/rtcp 0.17 share webrtc-util 0.17)
+rtp = { version = "0.17", optional = true }
+rtcp = { version = "0.17", optional = true }
+webrtc-util = { version = "0.17", optional = true }
 
 # RTSP client (optional)
 retina = { version = "0.4", optional = true }
@@ -186,7 +183,7 @@ http = ["ureq"]       # HTTP source/sink elements
 websocket = ["tungstenite"]  # WebSocket source/sink elements
 zenoh = ["dep:zenoh"] # Zenoh pub/sub elements
 zenoh-unstable = ["zenoh", "zenoh/unstable"] # reliability control + matching listeners
-rtp = ["dep:rtp", "dep:rtcp", "dep:webrtc-util", "dep:webrtc-util-0_10"]  # RTP/RTCP elements
+rtp = ["dep:rtp", "dep:rtcp", "dep:webrtc-util"]  # RTP/RTCP elements
 rtsp = ["rtp", "dep:retina", "dep:url"]  # RTSP client (includes RTP support)
 mpeg-ts = ["dep:mpeg2ts-reader"]  # MPEG-TS demuxer
 mp4-demux = ["dep:mp4"]  # MP4/MOV container demuxer

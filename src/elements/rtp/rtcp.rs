@@ -45,7 +45,7 @@ use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // Use webrtc-util 0.10 for RTCP (matches rtcp crate's dependency)
-use webrtc_util_0_10::marshal::{Marshal, Unmarshal};
+use webrtc_util::marshal::{Marshal, Unmarshal};
 
 /// Default RTCP report interval (5 seconds per RFC 3550).
 const DEFAULT_RTCP_INTERVAL: Duration = Duration::from_secs(5);

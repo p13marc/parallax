@@ -12,13 +12,13 @@
 #![cfg(feature = "websocket")]
 
 use crate::buffer::{Buffer, MemoryHandle};
-use crate::element::{Sink, Source};
+use crate::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
 use crate::error::{Error, Result};
 use crate::memory::SharedArena;
 use crate::metadata::Metadata;
 use std::net::TcpStream;
 use tungstenite::stream::MaybeTlsStream;
-use tungstenite::{Message, WebSocket, connect};
+use tungstenite::{Bytes, Message, WebSocket, connect};
 
 /// Message type for WebSocket communication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,76 +127,70 @@ impl WebSocketSrc {
             return Ok(());
         }
 
-        let (socket, _response) = connect(&self.url)
+        let (socket, _response) = connect(self.url.as_str())
             .map_err(|e| Error::Element(format!("WebSocket connect error: {}", e)))?;
 
         self.socket = Some(socket);
         self.connected = true;
         Ok(())
     }
+
+    /// Copy one received message payload into an arena buffer.
+    fn buffer_from_message(&mut self, data: &[u8]) -> Result<Buffer> {
+        self.bytes_read += data.len() as u64;
+        self.messages_received += 1;
+        let seq = self.sequence;
+        self.sequence += 1;
+
+        // Lazily initialize arena
+        if self.arena.is_none() {
+            self.arena = Some(
+                SharedArena::new(64 * 1024, 32)
+                    .map_err(|e| Error::Element(format!("Failed to create arena: {}", e)))?,
+            );
+        }
+        let arena = self.arena.as_ref().unwrap();
+        arena.reclaim();
+
+        let mut slot = arena
+            .acquire()
+            .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+        if data.len() > slot.data_mut().len() {
+            return Err(Error::Element(format!(
+                "WebSocket message ({} bytes) exceeds arena slot ({} bytes)",
+                data.len(),
+                slot.data_mut().len()
+            )));
+        }
+        slot.data_mut()[..data.len()].copy_from_slice(data);
+
+        let handle = MemoryHandle::with_len(slot, data.len());
+        Ok(Buffer::new(handle, Metadata::from_sequence(seq)))
+    }
 }
 
 impl Source for WebSocketSrc {
-    fn produce(&mut self) -> Result<Option<Buffer>> {
+    fn produce(&mut self, _ctx: &mut ProduceContext) -> Result<ProduceResult> {
         self.ensure_connected()?;
 
-        let socket = self
-            .socket
-            .as_mut()
-            .ok_or_else(|| Error::Element("not connected".into()))?;
-
         loop {
+            let socket = self
+                .socket
+                .as_mut()
+                .ok_or_else(|| Error::Element("not connected".into()))?;
+
             match socket.read() {
                 Ok(Message::Binary(data)) => {
-                    self.bytes_read += data.len() as u64;
-                    self.messages_received += 1;
-                    let seq = self.sequence;
-                    self.sequence += 1;
-
-                    // Lazily initialize arena
-                    if self.arena.is_none() {
-                        self.arena = Some(SharedArena::new(64 * 1024, 32).map_err(|e| {
-                            Error::Element(format!("Failed to create arena: {}", e))
-                        })?);
-                    }
-                    let arena = self.arena.as_ref().unwrap();
-                    arena.reclaim();
-
-                    let mut slot = arena.acquire().ok_or_else(|| {
-                        Error::Element("Failed to acquire buffer slot".to_string())
-                    })?;
-                    slot.data_mut()[..data.len()].copy_from_slice(&data);
-
-                    let handle = MemoryHandle::with_len(slot, data.len());
-                    return Ok(Some(Buffer::new(handle, Metadata::from_sequence(seq))));
+                    let buffer = self.buffer_from_message(&data)?;
+                    return Ok(ProduceResult::OwnBuffer(buffer));
                 }
                 Ok(Message::Text(text)) => {
-                    let data = text.into_bytes();
-                    self.bytes_read += data.len() as u64;
-                    self.messages_received += 1;
-                    let seq = self.sequence;
-                    self.sequence += 1;
-
-                    // Lazily initialize arena
-                    if self.arena.is_none() {
-                        self.arena = Some(SharedArena::new(64 * 1024, 32).map_err(|e| {
-                            Error::Element(format!("Failed to create arena: {}", e))
-                        })?);
-                    }
-                    let arena = self.arena.as_ref().unwrap();
-                    arena.reclaim();
-
-                    let mut slot = arena.acquire().ok_or_else(|| {
-                        Error::Element("Failed to acquire buffer slot".to_string())
-                    })?;
-                    slot.data_mut()[..data.len()].copy_from_slice(&data);
-
-                    let handle = MemoryHandle::with_len(slot, data.len());
-                    return Ok(Some(Buffer::new(handle, Metadata::from_sequence(seq))));
+                    let buffer = self.buffer_from_message(text.as_bytes())?;
+                    return Ok(ProduceResult::OwnBuffer(buffer));
                 }
                 Ok(Message::Close(_)) => {
                     self.connected = false;
-                    return Ok(None);
+                    return Ok(ProduceResult::Eos);
                 }
                 Ok(Message::Ping(data)) => {
                     // Respond to ping with pong
@@ -213,7 +207,7 @@ impl Source for WebSocketSrc {
                 }
                 Err(tungstenite::Error::ConnectionClosed) => {
                     self.connected = false;
-                    return Ok(None);
+                    return Ok(ProduceResult::Eos);
                 }
                 Err(e) => {
                     return Err(Error::Element(format!("WebSocket read error: {}", e)));
@@ -221,8 +215,11 @@ impl Source for WebSocketSrc {
             }
         }
     }
+}
 
-    fn name(&self) -> &str {
+impl WebSocketSrc {
+    /// Get the element name.
+    pub fn name(&self) -> &str {
         &self.name
     }
 }
@@ -321,7 +318,7 @@ impl WebSocketSink {
     pub fn ping(&mut self) -> Result<()> {
         if let Some(ref mut socket) = self.socket {
             socket
-                .send(Message::Ping(vec![]))
+                .send(Message::Ping(Bytes::new()))
                 .map_err(|e| Error::Element(format!("ping error: {}", e)))?;
         }
         Ok(())
@@ -343,17 +340,22 @@ impl WebSocketSink {
             return Ok(());
         }
 
-        let (socket, _response) = connect(&self.url)
+        let (socket, _response) = connect(self.url.as_str())
             .map_err(|e| Error::Element(format!("WebSocket connect error: {}", e)))?;
 
         self.socket = Some(socket);
         self.connected = true;
         Ok(())
     }
+
+    /// Get the element name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 impl Sink for WebSocketSink {
-    fn consume(&mut self, buffer: Buffer) -> Result<()> {
+    fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
         self.ensure_connected()?;
 
         let socket = self
@@ -361,13 +363,13 @@ impl Sink for WebSocketSink {
             .as_mut()
             .ok_or_else(|| Error::Element("not connected".into()))?;
 
-        let data = buffer.as_bytes();
+        let data = ctx.input();
 
         let message = match self.message_type {
-            WsMessageType::Binary => Message::Binary(data.to_vec()),
+            WsMessageType::Binary => Message::binary(data.to_vec()),
             WsMessageType::Text => {
                 let text = String::from_utf8_lossy(data).into_owned();
-                Message::Text(text)
+                Message::text(text)
             }
         };
 
@@ -379,10 +381,6 @@ impl Sink for WebSocketSink {
         self.messages_sent += 1;
 
         Ok(())
-    }
-
-    fn name(&self) -> &str {
-        &self.name
     }
 }
 
