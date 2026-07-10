@@ -1,0 +1,6 @@
+# Kill hung tests instead of wedging the run: a lost-wakeup bug once left
+# test_pool_backpressure parked on a condvar for hours, locally and in CI.
+# The slowest legitimate tests (hardware/vicodec) finish well under 30s;
+# anything running 2 minutes is stuck.
+[profile.default]
+slow-timeout = { period = "30s", terminate-after = 4 }
