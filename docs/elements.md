@@ -148,13 +148,19 @@ Gated by any of `pipewire`, `libcamera`, `v4l2`, `alsa`. Backend detection/enume
 
 | Element | Feature | Capabilities |
 |---------|---------|--------------|
-| `V4l2Src` | `v4l2` | Camera capture; **DMA-BUF export** (`V4l2Config { dmabuf_export: true }` → `ProduceResult::OwnDmaBuf`); V4L2 monotonic timestamps |
-| `LibCameraSrc` | `libcamera` | Modern camera API (Raspberry Pi, embedded); µs timestamps |
+| `V4l2Src` | `v4l2` | Camera capture; **DMA-BUF export** (`V4l2Config { dmabuf_export: true }` → `ProduceResult::OwnDmaBuf`); configurable frame rate (`framerate: Some((30, 1))`, clamped rate read back via `framerate()`); V4L2 monotonic timestamps |
+| `LibCameraSrc` | `libcamera` | Modern camera API (Raspberry Pi, embedded, UVC); configurable frame rate via `FrameDurationLimits` (best-effort — UVC pipelines may ignore it); PTS from `SensorTimestamp` |
 | `PipeWireSrc` / `PipeWireSink` | `pipewire` | Audio/video via PipeWire; PTS from `spa_meta_header` |
 | `ScreenCaptureSrc` | `screen-capture` | XDG portal ScreenCast (Wayland-safe); cursor modes, session restore tokens |
 | `AlsaSrc` / `AlsaSink` | `alsa` | Audio capture/playback; hardware timestamps; `AlsaSink` **provides a hardware clock** (priority 100) that the pipeline auto-selects |
 
 All capture sources default to a `Drop` flow policy and accept `set_flow_state(handle)` for downstream backpressure — see [pipeline.md](pipeline.md#flow-control--backpressure).
+
+Both camera sources stamp `Metadata.duration` with the configured frame duration; PTS is relative to the first captured frame.
+
+### Hotplug monitoring — `DeviceMonitor` (feature `hotplug`)
+
+`DeviceMonitor::new()` watches udev's `video4linux` subsystem on a background thread and emits `DeviceEvent::Added(VideoCaptureDevice)` / `DeviceEvent::Removed { id }` over an unbounded channel (async `recv().await`, `blocking_recv()`, or `try_recv()`). Only capture-capable nodes produce `Added` — metadata-only `/dev/video*` nodes are filtered out. With the `libcamera` feature also enabled, libcamera's own hotplug events are folded into the same stream (backend `LibCamera`, opaque libcamera ids), so one physical USB camera yields one `Added` per backend — filter on `VideoCaptureDevice::backend`. Event latency is ≤ 500 ms.
 
 ## Streaming output — `elements::streaming`
 

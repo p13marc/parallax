@@ -217,7 +217,7 @@ p.link_pads(xfm, "src", sink, "sink")?;
 | What | Types | Feature |
 |------|-------|---------|
 | H.264 | `H264Encoder`/`H264Decoder` (implement `Element` directly) | `h264` |
-| H.264 hardware | `V4l2M2mH264Encoder` (impl `VideoEncoder`, wrap in `EncoderElement`), `find_m2m_encoder(b"H264")` device probe; `V4l2CodedFormat::Fwht` is test-only (vicodec) | `v4l2-m2m` (build needs libclang + kernel headers — on this host use the fedora toolbox) |
+| H.264 hardware | `V4l2M2mH264Encoder` (impl `VideoEncoder`, wrap in `EncoderElement`), `find_m2m_encoder(b"H264")` device probe; `V4l2CodedFormat::Fwht` is test-only (vicodec) | `v4l2-m2m` (build needs libclang + kernel headers) |
 | AV1 | `Rav1eEncoder` (impl `Element` directly AND `VideoEncoder`; drains lookahead via `Element::flush`), `Dav1dDecoder` (impl `Element`) | `av1-encode` / `av1-decode` |
 | Audio dec | `SymphoniaDecoder` (impl `Element`) | `audio-flac/mp3/aac/vorbis` |
 | Opus | `OpusEncoder::new(rate, ch, bitrate, OpusApplication)` / `OpusDecoder` (impl `AudioEncoder`/`AudioDecoder`, wrap in `AudioEncoderElement`/`AudioDecoderElement`) | `opus` |
@@ -227,7 +227,8 @@ p.link_pads(xfm, "src", sink, "sink")?;
 | RTP | `RtpSrc/Sink`, `RtpH264Pay/Depay`, H265/VP8/VP9 pay/depay, `RtpOpusDepay` (no Opus pay), `RtpJitterBuffer`, `RtcpHandler` | `rtp` |
 | RTSP | `RtspSrc` (client only, via retina) | `rtsp` |
 | HLS/DASH | `HlsSink`, `DashSink` (+ configs) — NOT feature-gated | — |
-| Devices | `V4l2Src` (DMA-BUF export), `LibCameraSrc`, `PipeWireSrc/Sink`, `ScreenCaptureSrc`, `AlsaSrc/Sink` (clock provider) | `v4l2`/`libcamera`/`pipewire`/`screen-capture`/`alsa` |
+| Devices | `V4l2Src` (DMA-BUF export, `framerate` knob), `LibCameraSrc` (libcamera 0.7; `framerate` via FrameDurationLimits, best-effort on UVC; process-wide shared `CameraManager` — a second live instance is fatal in libcamera), `PipeWireSrc/Sink`, `ScreenCaptureSrc`, `AlsaSrc/Sink` (clock provider) | `v4l2`/`libcamera`/`pipewire`/`screen-capture`/`alsa` |
+| Hotplug | `DeviceMonitor` (udev `video4linux` + libcamera events folded in when both features on; one physical USB cam → one `Added` per backend) | `hotplug` (+`libcamera` for folding) |
 | KLV | `KlvEncoder`, `StanagMetadataBuilder` (elements/metadata) | — |
 
 Codec traits: `VideoEncoder`/`VideoDecoder`, `AudioEncoder`/`AudioDecoder` (with `flush()` to drain at EOS). Note the inconsistency: some codecs implement the traits (rav1e, opus, aac, v4l2-m2m), others implement `Element` directly (openh264, dav1d, symphonia). `EncoderElement::new(enc, format: VideoFormat)` maps caps pixel formats to codec ones with per-format strides (I420/I422/I444/NV12/10-bit), errors on RGB/packed input (needs `VideoConvert` upstream), and renegotiates from per-buffer `Metadata.format`.

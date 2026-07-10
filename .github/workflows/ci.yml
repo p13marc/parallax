@@ -6,9 +6,10 @@
 # this workflow (the zenoh and rtp features once bit-rotted to
 # non-compiling because nothing built them; see #20).
 #
-# Deliberately NOT --all-features: dav1d/alsa/pipewire/libcamera/opus/
-# fdk-aac need system libraries, and vulkan-video carries pre-existing
-# lint debt tracked in #3.
+# Deliberately NOT --all-features: dav1d/alsa/pipewire/opus/fdk-aac need
+# system libraries, and vulkan-video carries pre-existing lint debt
+# tracked in #3. libcamera gets its own Fedora-container job below
+# (ubuntu-latest ships libcamera 0.2, too old for the 0.7 crate).
 
 name: CI
 
@@ -78,6 +79,29 @@ jobs:
       - run: cargo nextest run --features v4l2-m2m -E 'test(v4l2_m2m)' --no-capture
         env:
           PARALLAX_VICODEC_TEST_DEVICE: auto
+
+  # libcamera + hotplug folding: lint and run the unit tests. Needs system
+  # libcamera >= 0.4 with dev headers (the crate binds via pkg-config at
+  # build time), which ubuntu-latest is too old to provide — use Fedora.
+  # No camera in CI: hardware tests skip via their env gate.
+  test-libcamera:
+    runs-on: ubuntu-latest
+    container: fedora:44
+    steps:
+      - uses: actions/checkout@v4
+      # git/tar/xz/zstd for the checkout, toolchain and cache actions
+      - run: >
+          dnf install -y gcc gcc-c++ clang-devel libcamera-devel
+          systemd-devel pkgconf-pkg-config git tar xz zstd
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - run: cargo clippy --all-targets --features libcamera,hotplug -- -D warnings
+      - run: cargo nextest run --features libcamera,hotplug -E 'test(libcamera) | test(monitor)'
 
   clippy:
     runs-on: ubuntu-latest
