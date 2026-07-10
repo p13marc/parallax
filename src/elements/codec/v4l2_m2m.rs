@@ -242,12 +242,14 @@ impl V4l2M2mH264Encoder {
             };
 
         // Per the stateful-encoder spec, the coded (CAPTURE) format is set
-        // first; drivers then adjust OUTPUT constraints to match.
+        // first — pixelformat ONLY. Frame dimensions belong to the raw
+        // OUTPUT format and propagate to the coded side; setting a size
+        // here instead makes drivers (e.g. vicodec) ignore it and clamp
+        // the OUTPUT to their current coded size.
         let coded_fourcc = config.coded_format.fourcc();
         let capture_format: Format = capture_queue
             .change_format()
             .map_err(|e| Error::Config(format!("V4L2 M2M: get capture format: {e}")))?
-            .set_size(config.width as usize, config.height as usize)
             .set_pixelformat(coded_fourcc)
             .apply()
             .map_err(|e| Error::Config(format!("V4L2 M2M: set capture format: {e}")))?;
