@@ -29,7 +29,10 @@ async fn main() -> parallax::error::Result<()> {
 
     // Query seekability
     let seekable = pipeline.query_seekable();
-    println!("Seekable: {} (range: {} - {} bytes)", seekable.seekable, seekable.start, seekable.stop);
+    println!(
+        "Seekable: {} (range: {} - {} bytes)",
+        seekable.seekable, seekable.start, seekable.stop
+    );
 
     // Query duration
     if let Some(dur) = pipeline.query_duration() {

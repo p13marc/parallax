@@ -54,8 +54,10 @@ async fn main() -> parallax::error::Result<()> {
 
     // Also show pipeline stats snapshot
     let stats = pipeline.stats_snapshot();
-    println!("Pipeline: {} elements, {} links, state={:?}",
-        stats.element_count, stats.link_count, stats.state);
+    println!(
+        "Pipeline: {} elements, {} links, state={:?}",
+        stats.element_count, stats.link_count, stats.state
+    );
 
     Ok(())
 }

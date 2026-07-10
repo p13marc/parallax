@@ -288,22 +288,34 @@ impl fmt::Display for MessageValue {
 }
 
 impl From<bool> for MessageValue {
-    fn from(v: bool) -> Self { Self::Bool(v) }
+    fn from(v: bool) -> Self {
+        Self::Bool(v)
+    }
 }
 impl From<i64> for MessageValue {
-    fn from(v: i64) -> Self { Self::Int(v) }
+    fn from(v: i64) -> Self {
+        Self::Int(v)
+    }
 }
 impl From<u64> for MessageValue {
-    fn from(v: u64) -> Self { Self::Uint(v) }
+    fn from(v: u64) -> Self {
+        Self::Uint(v)
+    }
 }
 impl From<f64> for MessageValue {
-    fn from(v: f64) -> Self { Self::Float(v) }
+    fn from(v: f64) -> Self {
+        Self::Float(v)
+    }
 }
 impl From<String> for MessageValue {
-    fn from(v: String) -> Self { Self::String(v) }
+    fn from(v: String) -> Self {
+        Self::String(v)
+    }
 }
 impl From<&str> for MessageValue {
-    fn from(v: &str) -> Self { Self::String(v.to_string()) }
+    fn from(v: &str) -> Self {
+        Self::String(v.to_string())
+    }
 }
 
 // ============================================================================
@@ -793,7 +805,10 @@ mod tests {
         let (mut bus, handle) = Bus::new();
 
         let mut tags = TagList::new();
-        tags.set("title", crate::pipeline::tags::TagValue::String("Test".into()));
+        tags.set(
+            "title",
+            crate::pipeline::tags::TagValue::String("Test".into()),
+        );
         handle.post_tags(tags);
 
         let msg = bus.poll().unwrap();

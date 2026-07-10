@@ -25,8 +25,7 @@ pub struct GpuBuffer {
 }
 
 /// Backend-specific buffer handle.
-#[derive(Debug)]
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(crate) enum GpuBufferHandle {
     /// Placeholder for when no backend is available.
     #[default]
@@ -38,7 +37,6 @@ pub(crate) enum GpuBufferHandle {
         image: Option<ash::vk::Image>,
     },
 }
-
 
 /// GPU video frame.
 ///

@@ -234,7 +234,9 @@ impl TagList {
                     self.tags.insert(key.clone(), value.clone());
                 }
                 TagMergeMode::Keep => {
-                    self.tags.entry(key.clone()).or_insert_with(|| value.clone());
+                    self.tags
+                        .entry(key.clone())
+                        .or_insert_with(|| value.clone());
                 }
                 TagMergeMode::Append => {
                     if let Some(existing) = self.tags.get_mut(key) {

@@ -125,8 +125,7 @@ impl From<FlowSignal> for u8 {
 /// Flow control policy for sources.
 ///
 /// Determines how a source responds to backpressure signals.
-#[derive(Debug, Clone, PartialEq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum FlowPolicy {
     /// Block production when downstream is busy.
     ///
@@ -166,7 +165,6 @@ pub enum FlowPolicy {
         log_switches: bool,
     },
 }
-
 
 impl FlowPolicy {
     /// Create a drop policy with default settings.

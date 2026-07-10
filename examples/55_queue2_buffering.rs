@@ -44,10 +44,7 @@ async fn main() -> parallax::error::Result<()> {
     // Check for buffering messages
     let mut buffering_count = 0;
     while let Some(msg) = bus.poll() {
-        if let parallax::pipeline::bus::MessageKind::Buffering {
-            percent, mode, ..
-        } = &msg.kind
-        {
+        if let parallax::pipeline::bus::MessageKind::Buffering { percent, mode, .. } = &msg.kind {
             buffering_count += 1;
             if buffering_count <= 5 {
                 println!("[Bus] Buffering: {}% ({:?})", percent, mode);
@@ -56,7 +53,10 @@ async fn main() -> parallax::error::Result<()> {
     }
 
     if buffering_count > 5 {
-        println!("[Bus] ... and {} more buffering messages", buffering_count - 5);
+        println!(
+            "[Bus] ... and {} more buffering messages",
+            buffering_count - 5
+        );
     }
     println!("\nTotal buffering messages: {}", buffering_count);
 

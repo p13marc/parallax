@@ -6,7 +6,11 @@ use parallax::pipeline::typefind::{MediaType, TypeFindProbability, TypeFindRegis
 #[test]
 fn test_registry_has_builtins() {
     let registry = TypeFindRegistry::with_builtins();
-    assert!(registry.len() >= 12, "Expected at least 12 built-in detectors, got {}", registry.len());
+    assert!(
+        registry.len() >= 12,
+        "Expected at least 12 built-in detectors, got {}",
+        registry.len()
+    );
 }
 
 /// Test detection of all major container formats.
@@ -15,7 +19,9 @@ fn test_detect_containers() {
     let r = TypeFindRegistry::with_builtins();
 
     // MP4
-    let result = r.detect(b"\x00\x00\x00\x20ftypisom\x00\x00\x02\x00").unwrap();
+    let result = r
+        .detect(b"\x00\x00\x00\x20ftypisom\x00\x00\x02\x00")
+        .unwrap();
     assert_eq!(result.media_type, MediaType::Mp4);
 
     // Matroska
@@ -65,7 +71,9 @@ fn test_detect_images() {
     let r = TypeFindRegistry::with_builtins();
 
     // PNG
-    let result = r.detect(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]).unwrap();
+    let result = r
+        .detect(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+        .unwrap();
     assert_eq!(result.media_type, MediaType::Png);
 
     // JPEG

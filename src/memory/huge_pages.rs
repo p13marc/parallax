@@ -108,8 +108,7 @@ impl HugePageSegment {
         // MAP_HUGETLB | (shift << MAP_HUGE_SHIFT)
         // MAP_HUGE_SHIFT is 26, so we shift the size log2 by 26 bits
         let huge_shift = page_size.shift();
-        let huge_flags =
-            MapFlags::from_bits_retain(MapFlags::HUGETLB.bits() | (huge_shift << 26));
+        let huge_flags = MapFlags::from_bits_retain(MapFlags::HUGETLB.bits() | (huge_shift << 26));
 
         let flags = MapFlags::PRIVATE | huge_flags;
 

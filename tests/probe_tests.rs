@@ -3,8 +3,8 @@
 use parallax::elements::{NullSink, NullSource};
 use parallax::pipeline::probe::{PadRef, ProbeData, ProbeReturn, ProbeType};
 use parallax::pipeline::{Executor, Pipeline};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Test that a buffer probe on a source pad counts all buffers.
 #[tokio::test]

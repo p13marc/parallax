@@ -232,12 +232,7 @@ impl ProbeRegistry {
     ///
     /// Returns the probe ID for later removal.
     #[must_use]
-    pub fn add<F>(
-        &self,
-        pad: PadRef,
-        probe_type: ProbeType,
-        callback: F,
-    ) -> ProbeId
+    pub fn add<F>(&self, pad: PadRef, probe_type: ProbeType, callback: F) -> ProbeId
     where
         F: FnMut(ProbeData<'_>) -> ProbeReturn + Send + 'static,
     {
@@ -361,14 +356,11 @@ impl ProbeRegistry {
     /// When a pad has a BLOCK probe, data flow should be paused.
     pub fn is_blocked(&self, pad: &PadRef) -> bool {
         let inner = self.inner.lock().unwrap();
-        inner
-            .probes
-            .get(pad)
-            .is_some_and(|probes| {
-                probes
-                    .iter()
-                    .any(|p| p.probe_type.contains(ProbeType::BLOCK))
-            })
+        inner.probes.get(pad).is_some_and(|probes| {
+            probes
+                .iter()
+                .any(|p| p.probe_type.contains(ProbeType::BLOCK))
+        })
     }
 
     /// Invoke IDLE probes for a pad (called when no data is flowing).
@@ -409,7 +401,10 @@ impl std::fmt::Debug for ProbeRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let inner = self.inner.lock().unwrap();
         f.debug_struct("ProbeRegistry")
-            .field("total_probes", &inner.probes.values().map(|v| v.len()).sum::<usize>())
+            .field(
+                "total_probes",
+                &inner.probes.values().map(|v| v.len()).sum::<usize>(),
+            )
             .field("pads_with_probes", &inner.probes.len())
             .finish()
     }

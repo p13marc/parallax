@@ -44,8 +44,8 @@
 //! pipeline.run().await?;
 //! ```
 
-pub mod bus;
 mod builder;
+pub mod bus;
 mod driver;
 mod events;
 pub mod factory;
@@ -61,31 +61,30 @@ pub mod tracer;
 pub mod typefind;
 mod unified_executor;
 
-pub use driver::{
-    DriverConfig, DriverStats, ManualDriver, RtTimerDriverHandle, TimerDriver, TimerDriverHandle,
-};
 pub use bus::{
     BufferingMode, Bus, BusHandle, BusStream, Message, MessageKind, MessageValue, StreamInfo,
 };
-pub use events::{EventReceiver, EventSender, EventStream, PipelineEvent};
-pub use probe::{PadDirection, PadRef, ProbeData, ProbeId, ProbeRegistry, ProbeReturn, ProbeType};
-pub use seek::{DurationQuery, PositionQuery, SeekRequest, SeekableQuery, SeekableSource};
-pub use typefind::{MediaType, TypeFindProbability, TypeFindRegistry, TypeFindResult};
-pub use tracer::{
-    DropTracer, ElementStats, FramerateTracer, LatencyTracer, PipelineStats, Tracer,
-    TracerRegistry,
+pub use driver::{
+    DriverConfig, DriverStats, ManualDriver, RtTimerDriverHandle, TimerDriver, TimerDriverHandle,
 };
-pub use tags::{TagList, TagMergeMode, TagValue};
+pub use events::{EventReceiver, EventSender, EventStream, PipelineEvent};
 pub use factory::ElementFactory;
 pub use graph::{
     ConverterPolicy, DotOptions, Link, LinkId, LinkInfo, Node, NodeId, Pipeline, PipelineState,
 };
 pub use parser::{ParsedElement, ParsedPipeline, PropertyValue, parse_pipeline};
+pub use probe::{PadDirection, PadRef, ProbeData, ProbeId, ProbeRegistry, ProbeReturn, ProbeType};
 pub use rt_bridge::{AsyncRtBridge, BridgeConfig, EventFd, SharedBridge, shared_bridge};
 pub use rt_scheduler::{
     ActivationRecord, BoundaryDirection, BoundaryEdge, DataThreadHandle, GraphPartition,
     NodeStatus, RtConfig, RtScheduler, SchedulingMode, spawn_data_thread,
 };
+pub use seek::{DurationQuery, PositionQuery, SeekRequest, SeekableQuery, SeekableSource};
+pub use tags::{TagList, TagMergeMode, TagValue};
+pub use tracer::{
+    DropTracer, ElementStats, FramerateTracer, LatencyTracer, PipelineStats, Tracer, TracerRegistry,
+};
+pub use typefind::{MediaType, TypeFindProbability, TypeFindRegistry, TypeFindResult};
 // Unified executor (primary API)
 pub use unified_executor::{
     Executor, ExecutorConfig as UnifiedExecutorConfig, PipelineHandle as UnifiedPipelineHandle,

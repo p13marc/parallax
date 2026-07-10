@@ -15,7 +15,10 @@ use tempfile::NamedTempFile;
 #[test]
 fn test_segment_running_time_normal_playback() {
     let seg = SegmentEvent::new_time(ClockTime::ZERO, None);
-    assert_eq!(seg.to_running_time(ClockTime::from_secs(5)), ClockTime::from_secs(5));
+    assert_eq!(
+        seg.to_running_time(ClockTime::from_secs(5)),
+        ClockTime::from_secs(5)
+    );
     assert_eq!(seg.to_running_time(ClockTime::ZERO), ClockTime::ZERO);
 }
 
@@ -34,23 +37,35 @@ fn test_segment_running_time_after_seek() {
     };
 
     // PTS=10s → running_time = (10-10)/1 + 5 = 5s
-    assert_eq!(seg.to_running_time(ClockTime::from_secs(10)), ClockTime::from_secs(5));
+    assert_eq!(
+        seg.to_running_time(ClockTime::from_secs(10)),
+        ClockTime::from_secs(5)
+    );
     // PTS=15s → running_time = (15-10)/1 + 5 = 10s
-    assert_eq!(seg.to_running_time(ClockTime::from_secs(15)), ClockTime::from_secs(10));
+    assert_eq!(
+        seg.to_running_time(ClockTime::from_secs(15)),
+        ClockTime::from_secs(10)
+    );
 }
 
 #[test]
 fn test_segment_running_time_double_speed() {
     let seg = SegmentEvent::new_time(ClockTime::ZERO, None).with_rate(2.0);
     // At 2x speed, 10s of content plays in 5s of real time
-    assert_eq!(seg.to_running_time(ClockTime::from_secs(10)), ClockTime::from_secs(5));
+    assert_eq!(
+        seg.to_running_time(ClockTime::from_secs(10)),
+        ClockTime::from_secs(5)
+    );
 }
 
 #[test]
 fn test_segment_running_time_half_speed() {
     let seg = SegmentEvent::new_time(ClockTime::ZERO, None).with_rate(0.5);
     // At 0.5x speed, 10s of content plays in 20s of real time
-    assert_eq!(seg.to_running_time(ClockTime::from_secs(10)), ClockTime::from_secs(20));
+    assert_eq!(
+        seg.to_running_time(ClockTime::from_secs(10)),
+        ClockTime::from_secs(20)
+    );
 }
 
 #[test]
@@ -83,7 +98,10 @@ fn test_segment_none_values() {
 #[test]
 fn test_segment_before_start_returns_none() {
     let seg = SegmentEvent::new_time(ClockTime::from_secs(10), None);
-    assert_eq!(seg.to_running_time(ClockTime::from_secs(5)), ClockTime::NONE);
+    assert_eq!(
+        seg.to_running_time(ClockTime::from_secs(5)),
+        ClockTime::NONE
+    );
 }
 
 // ============================================================================

@@ -50,7 +50,9 @@ fn main() {
 
     // Extension-based detection
     println!("\n=== Extension-Based Detection ===\n");
-    for ext in &["mp4", "mkv", "ts", "wav", "flac", "png", "jpg", "mp3", "xyz"] {
+    for ext in &[
+        "mp4", "mkv", "ts", "wav", "flac", "png", "jpg", "mp3", "xyz",
+    ] {
         match registry.detect_from_extension(ext) {
             Some(media_type) => println!("  .{ext:<5} → {media_type}"),
             None => println!("  .{ext:<5} → (unknown)"),

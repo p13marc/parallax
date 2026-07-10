@@ -109,7 +109,9 @@ fn test_pipeline_dot_dump() {
 #[test]
 fn test_default_tracer_registry_empty() {
     // SAFETY: Only modifying test-specific env var, no other threads using it
-    unsafe { std::env::remove_var("PARALLAX_TRACERS"); }
+    unsafe {
+        std::env::remove_var("PARALLAX_TRACERS");
+    }
     let pipeline = Pipeline::new();
     assert!(pipeline.tracer_registry().is_empty());
 }
