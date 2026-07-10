@@ -23,7 +23,7 @@ kanal = "0.1"
 daggy = { version = "0.9", features = ["stable_dag"] }
 
 # Parsing
-winnow = "0.7"
+winnow = "1"
 
 # Serialization (zero-copy)
 rkyv = { version = "0.8", features = ["bytecheck"] }
@@ -47,14 +47,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rustix = { version = "1.0", features = ["mm", "fs", "net", "process", "pipe", "stdio", "event"] }
 libc = "0.2"
 futures = "0.3.31"
-libloading = "0.8.9"
+libloading = "0.9"
 paste = "1.0.15"
 
 # Proc macros (optional, for plugin authoring convenience)
 parallax-macros = { path = "parallax-macros", optional = true }
 
 # HTTP client (optional)
-ureq = { version = "2", optional = true }
+ureq = { version = "3", optional = true }
 
 # WebSocket (optional)
 tungstenite = { version = "0.21", optional = true }
@@ -153,7 +153,7 @@ trait-variant = "0.1"
 
 [dev-dependencies]
 tokio-test = "0.4"
-criterion = "0.6"
+criterion = "0.8"
 proptest = "1"
 tempfile = "3.24.0"
 

@@ -39,7 +39,7 @@ For the element *trait system* (how to write your own), see [getting-started.md]
 | `UnixSrc` / `UnixSink` / `AsyncUnixSrc` / `AsyncUnixSink` | Unix domain sockets (`UnixMode`) |
 | `UdpMulticastSrc` / `UdpMulticastSink` | Multicast group receive/send |
 | `HttpSrc` `[http]` | HTTP GET source |
-| `HttpSink` / `HttpStreamingSink` `[http]` | HTTP POST/PUT sink; chunked streaming sink |
+| `HttpSink` `[http]` | HTTP POST/PUT sink |
 | `WebSocketSrc` / `WebSocketSink` `[websocket]` | WebSocket message I/O |
 | `ZenohSrc` / `ZenohSink` `[zenoh]` | Zenoh subscribe/publish on key expressions |
 | `ZenohQueryable` / `ZenohQuerier` `[zenoh]` | Zenoh query handling / querying |

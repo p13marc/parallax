@@ -13,7 +13,7 @@
 #![cfg(feature = "http")]
 
 use crate::buffer::{Buffer, MemoryHandle};
-use crate::element::{Sink, Source};
+use crate::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
 use crate::error::{Error, Result};
 use crate::memory::SharedArena;
 use crate::metadata::Metadata;
@@ -32,6 +32,7 @@ pub enum HttpMethod {
 }
 
 impl HttpMethod {
+    #[cfg_attr(not(test), allow(dead_code))]
     fn as_str(&self) -> &'static str {
         match self {
             HttpMethod::Post => "POST",
@@ -127,6 +128,11 @@ impl HttpSrc {
         self.bytes_read
     }
 
+    /// Get the element name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     fn ensure_connected(&mut self) -> Result<()> {
         if self.connected {
             return Ok(());
@@ -135,19 +141,19 @@ impl HttpSrc {
         let mut request = ureq::get(&self.url);
 
         if let Some(timeout) = self.timeout {
-            request = request.timeout(timeout);
+            request = request.config().timeout_global(Some(timeout)).build();
         }
 
         for (name, value) in &self.headers {
-            request = request.set(name, value);
+            request = request.header(name.as_str(), value.as_str());
         }
 
         let response = request
             .call()
             .map_err(|e| Error::Element(format!("HTTP error: {}", e)))?;
 
-        self.status_code = Some(response.status());
-        self.response = Some(Box::new(response.into_reader()));
+        self.status_code = Some(response.status().as_u16());
+        self.response = Some(Box::new(response.into_body().into_reader()));
         self.connected = true;
 
         Ok(())
@@ -155,7 +161,7 @@ impl HttpSrc {
 }
 
 impl Source for HttpSrc {
-    fn produce(&mut self) -> Result<Option<Buffer>> {
+    fn produce(&mut self, _ctx: &mut ProduceContext) -> Result<ProduceResult> {
         self.ensure_connected()?;
 
         let reader = self
@@ -179,21 +185,20 @@ impl Source for HttpSrc {
             .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
 
         match reader.read(slot.data_mut()) {
-            Ok(0) => Ok(None), // EOF
+            Ok(0) => Ok(ProduceResult::Eos),
             Ok(n) => {
                 self.bytes_read += n as u64;
                 let seq = self.sequence;
                 self.sequence += 1;
 
                 let handle = MemoryHandle::with_len(slot, n);
-                Ok(Some(Buffer::new(handle, Metadata::from_sequence(seq))))
+                Ok(ProduceResult::OwnBuffer(Buffer::new(
+                    handle,
+                    Metadata::from_sequence(seq),
+                )))
             }
             Err(e) => Err(Error::Io(e)),
         }
-    }
-
-    fn name(&self) -> &str {
-        &self.name
     }
 }
 
@@ -287,6 +292,11 @@ impl HttpSink {
         self.last_status
     }
 
+    /// Get the element name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     /// Get statistics.
     pub fn stats(&self) -> HttpSinkStats {
         HttpSinkStats {
@@ -298,8 +308,8 @@ impl HttpSink {
 }
 
 impl Sink for HttpSink {
-    fn consume(&mut self, buffer: Buffer) -> Result<()> {
-        let data = buffer.as_bytes();
+    fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
+        let data = ctx.input();
 
         let mut request = match self.method {
             HttpMethod::Post => ureq::post(&self.url),
@@ -308,28 +318,24 @@ impl Sink for HttpSink {
         };
 
         if let Some(timeout) = self.timeout {
-            request = request.timeout(timeout);
+            request = request.config().timeout_global(Some(timeout)).build();
         }
 
-        request = request.set("Content-Type", &self.content_type);
+        request = request.header("Content-Type", self.content_type.as_str());
 
         for (name, value) in &self.headers {
-            request = request.set(name, value);
+            request = request.header(name.as_str(), value.as_str());
         }
 
         let response = request
-            .send_bytes(data)
+            .send(data)
             .map_err(|e| Error::Element(format!("HTTP error: {}", e)))?;
 
-        self.last_status = Some(response.status());
+        self.last_status = Some(response.status().as_u16());
         self.bytes_written += data.len() as u64;
         self.requests_sent += 1;
 
         Ok(())
-    }
-
-    fn name(&self) -> &str {
-        &self.name
     }
 }
 
@@ -342,64 +348,6 @@ pub struct HttpSinkStats {
     pub requests_sent: u64,
     /// Last HTTP status code.
     pub last_status: Option<u16>,
-}
-
-/// A streaming HTTP sink that keeps a connection open.
-///
-/// Uses chunked transfer encoding to send multiple buffers
-/// over a single HTTP connection.
-pub struct HttpStreamingSink {
-    name: String,
-    url: String,
-    method: HttpMethod,
-    headers: Vec<(String, String)>,
-    content_type: String,
-    bytes_written: u64,
-    buffers_sent: u64,
-}
-
-impl HttpStreamingSink {
-    /// Create a new streaming HTTP sink.
-    pub fn new(url: impl Into<String>, method: HttpMethod) -> Self {
-        let url = url.into();
-        Self {
-            name: format!("http-streaming-sink-{}", &url[..url.len().min(30)]),
-            url,
-            method,
-            headers: Vec::new(),
-            content_type: "application/octet-stream".to_string(),
-            bytes_written: 0,
-            buffers_sent: 0,
-        }
-    }
-
-    /// Add a custom header.
-    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
-        self.headers.push((name.into(), value.into()));
-        self
-    }
-
-    /// Set the Content-Type header.
-    pub fn with_content_type(mut self, content_type: impl Into<String>) -> Self {
-        self.content_type = content_type.into();
-        self
-    }
-
-    /// Set a custom name.
-    pub fn with_name(mut self, name: impl Into<String>) -> Self {
-        self.name = name.into();
-        self
-    }
-
-    /// Get the number of bytes written.
-    pub fn bytes_written(&self) -> u64 {
-        self.bytes_written
-    }
-
-    /// Get the number of buffers sent.
-    pub fn buffers_sent(&self) -> u64 {
-        self.buffers_sent
-    }
 }
 
 #[cfg(test)]

@@ -39,7 +39,7 @@ pub use multicast::{UdpMulticastSink, UdpMulticastSrc, UdpMulticastStats};
 
 // HTTP (feature-gated)
 #[cfg(feature = "http")]
-pub use http::{HttpMethod, HttpSink, HttpSinkStats, HttpSrc, HttpStreamingSink};
+pub use http::{HttpMethod, HttpSink, HttpSinkStats, HttpSrc};
 
 // WebSocket (feature-gated)
 #[cfg(feature = "websocket")]
