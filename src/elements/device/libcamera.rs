@@ -28,8 +28,7 @@
 //! let camera = LibCameraSrc::with_config(config)?;
 //! ```
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Mutex, OnceLock, mpsc as std_mpsc};
 use std::thread;
 use std::time::Duration;
@@ -38,13 +37,17 @@ use kanal::{Receiver, Sender, bounded};
 use libcamera::{
     camera::CameraConfigurationStatus,
     camera_manager::{CameraManager, HotplugEvent},
+    controls,
+    framebuffer::AsFrameBuffer,
     framebuffer_allocator::{FrameBuffer, FrameBufferAllocator},
     framebuffer_map::MemoryMappedFrameBuffer,
     pixel_format::PixelFormat,
     properties,
+    request::{RequestStatus, ReuseFlag},
     stream::StreamRole,
 };
 
+use crate::clock::ClockTime;
 use crate::element::{AsyncSource, ExecutionHints, ProduceContext, ProduceResult};
 use crate::error::Result;
 use crate::pipeline::flow::{FlowPolicy, FlowSignal, FlowStateHandle};
@@ -210,17 +213,33 @@ impl Default for LibCameraConfig {
 }
 
 /// Captured frame from libcamera.
-#[allow(dead_code)]
 struct CapturedFrame {
-    /// Frame data.
+    /// Frame data (all planes concatenated, `bytes_used` per plane).
     data: Vec<u8>,
-    /// Frame width.
-    width: u32,
-    /// Frame height.
-    height: u32,
-    /// Timestamp in microseconds.
-    timestamp_us: i64,
+    /// Capture timestamp in nanoseconds (CLOCK_MONOTONIC).
+    timestamp_ns: i64,
+    /// Frame sequence number from libcamera.
+    sequence: u64,
 }
+
+/// Stream parameters negotiated by the capture thread, reported through the
+/// startup handshake.
+#[derive(Debug, Clone, Copy)]
+struct NegotiatedInfo {
+    /// Actual frame width (drivers may adjust the requested size).
+    width: u32,
+    /// Actual frame height.
+    height: u32,
+    /// Frame size in bytes as reported by the stream configuration.
+    frame_size: u32,
+}
+
+/// How long the constructor waits for the capture thread to configure and
+/// start the camera.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Poll interval of the capture loop for shutdown checks.
+const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// libcamera video capture source.
 pub struct LibCameraSrc {
@@ -232,8 +251,13 @@ pub struct LibCameraSrc {
     thread: Option<thread::JoinHandle<()>>,
     /// Configuration used.
     config: LibCameraConfig,
+    /// Stream parameters actually negotiated with the camera.
+    negotiated: NegotiatedInfo,
     /// Camera ID being used.
     camera_id: String,
+    /// First frame timestamp for relative PTS calculation (ns; `i64::MIN`
+    /// until the first frame arrives).
+    first_timestamp_ns: AtomicI64,
     /// Flow state handle for downstream backpressure monitoring.
     flow_state: Option<FlowStateHandle>,
     /// Frames dropped due to backpressure.
@@ -262,38 +286,76 @@ impl LibCameraSrc {
     }
 
     /// Create a capture source for a specific camera with configuration.
+    ///
+    /// Blocks until the capture thread has configured and started the camera
+    /// (or failed to), so configuration errors surface here instead of a
+    /// source that silently never produces.
     pub fn with_camera_and_config(camera_id: &str, config: LibCameraConfig) -> Result<Self> {
         let (frame_tx, frame_rx) = bounded::<CapturedFrame>(config.buffer_count);
         let (shutdown_tx, shutdown_rx) = bounded::<()>(1);
+        let (startup_tx, startup_rx) = std_mpsc::channel::<Result<NegotiatedInfo>>();
 
         let camera_id_owned = camera_id.to_string();
         let config_clone = config.clone();
 
-        let thread = thread::spawn(move || {
-            if let Err(e) =
-                Self::capture_thread(camera_id_owned, config_clone, frame_tx, shutdown_rx)
-            {
-                tracing::error!("libcamera capture thread error: {}", e);
+        let thread = thread::Builder::new()
+            .name("parallax-libcamera".to_string())
+            .spawn(move || {
+                if let Err(e) = Self::capture_thread(
+                    camera_id_owned,
+                    config_clone,
+                    frame_tx,
+                    shutdown_rx,
+                    &startup_tx,
+                ) {
+                    tracing::error!("libcamera capture thread error: {}", e);
+                    // No-op if startup already succeeded (receiver dropped).
+                    let _ = startup_tx.send(Err(e));
+                }
+            })
+            .map_err(|e| DeviceError::LibCamera(format!("failed to spawn thread: {e}")))?;
+
+        let negotiated = match startup_rx.recv_timeout(STARTUP_TIMEOUT) {
+            Ok(Ok(info)) => info,
+            Ok(Err(e)) => {
+                let _ = thread.join();
+                return Err(e);
             }
-        });
+            Err(_) => {
+                // Thread is stuck or died without reporting; tell it to stop
+                // and detach. It self-terminates once its startup send fails.
+                let _ = shutdown_tx.send(());
+                return Err(DeviceError::LibCamera(format!(
+                    "camera {camera_id} did not start within {STARTUP_TIMEOUT:?}"
+                ))
+                .into());
+            }
+        };
 
         Ok(Self {
             receiver: frame_rx,
             shutdown: shutdown_tx,
             thread: Some(thread),
             config,
+            negotiated,
             camera_id: camera_id.to_string(),
+            first_timestamp_ns: AtomicI64::new(i64::MIN),
             flow_state: None,
             frames_dropped: 0,
         })
     }
 
     /// Main capture thread.
+    ///
+    /// Reports startup success (with the negotiated stream parameters) or
+    /// failure through `startup_tx`, then loops shipping completed frames to
+    /// `frame_tx` until shut down or the consumer goes away.
     fn capture_thread(
         camera_id: String,
         config: LibCameraConfig,
-        _frame_tx: Sender<CapturedFrame>,
+        frame_tx: Sender<CapturedFrame>,
         shutdown_rx: Receiver<()>,
+        startup_tx: &std_mpsc::Sender<Result<NegotiatedInfo>>,
     ) -> Result<()> {
         // Look up the camera via the process-wide shared manager
         let cm = shared_manager()?;
@@ -324,6 +386,7 @@ impl LibCameraSrc {
             if let Some(format) = config.format {
                 stream_config.set_pixel_format(format);
             }
+            stream_config.set_buffer_count(config.buffer_count as u32);
         }
 
         // Validate and apply configuration
@@ -341,11 +404,14 @@ impl LibCameraSrc {
             .configure(&mut cam_config)
             .map_err(|e| DeviceError::LibCamera(e.to_string()))?;
 
-        // Get stream and allocate buffers
+        // Get stream and the actually-applied parameters
         let stream = cam_config.get(0).unwrap().stream().unwrap();
         let stream_config = cam_config.get(0).unwrap();
-        let _width = stream_config.get_size().width;
-        let _height = stream_config.get_size().height;
+        let negotiated = NegotiatedInfo {
+            width: stream_config.get_size().width,
+            height: stream_config.get_size().height,
+            frame_size: stream_config.get_frame_size(),
+        };
 
         let mut allocator = FrameBufferAllocator::new(&camera);
         let buffers = allocator
@@ -369,6 +435,9 @@ impl LibCameraSrc {
             })
             .collect();
 
+        // Subscribe to completion events before anything can complete
+        let completed_rx = camera.subscribe_request_completed();
+
         // Start camera before queueing so completed requests flow immediately
         camera
             .start(None)
@@ -381,26 +450,77 @@ impl LibCameraSrc {
                 .map_err(|(_, e)| DeviceError::LibCamera(e.to_string()))?;
         }
 
-        let running = Arc::new(AtomicBool::new(true));
+        if startup_tx.send(Ok(negotiated)).is_err() {
+            // The constructor gave up waiting; nobody will consume frames.
+            let _ = camera.stop();
+            return Ok(());
+        }
 
-        // Main capture loop
-        while running.load(Ordering::SeqCst) {
-            // Check for shutdown
-            if shutdown_rx.try_recv().is_ok() {
-                running.store(false, Ordering::SeqCst);
+        // Fallback timestamp base for pipelines that report no SensorTimestamp
+        let started_at = std::time::Instant::now();
+
+        // Main capture loop: receive completed requests, ship the frame,
+        // recycle the request.
+        loop {
+            // Stop on a shutdown message or a closed shutdown channel
+            // (kanal returns Ok(None) when the channel is just empty)
+            if !matches!(shutdown_rx.try_recv(), Ok(None)) {
                 break;
             }
 
-            // Wait for and process completed requests
-            // Note: In a real implementation, we'd use camera.poll() or similar
-            // For now, we simulate with a small sleep
-            thread::sleep(Duration::from_millis(1));
+            let mut request = match completed_rx.recv_timeout(CAPTURE_POLL_INTERVAL) {
+                Ok(req) => req,
+                Err(std_mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
+            };
 
-            // Process any completed requests
-            // This is a simplified version - real implementation would use callbacks
+            if request.status() == RequestStatus::Complete {
+                let timestamp_ns = request
+                    .metadata()
+                    .get::<controls::SensorTimestamp>()
+                    .map(|t| t.0)
+                    .unwrap_or_else(|_| started_at.elapsed().as_nanos() as i64);
+
+                if let Some(fb) = request.buffer::<MemoryMappedFrameBuffer<FrameBuffer>>(&stream) {
+                    // Concatenate the used part of each plane
+                    let planes = fb.data();
+                    let plane_meta = fb.metadata().map(|m| m.planes());
+                    let mut data = Vec::with_capacity(planes.iter().map(|p| p.len()).sum());
+                    for (i, plane) in planes.iter().enumerate() {
+                        let used = plane_meta
+                            .as_ref()
+                            .and_then(|pm| pm.get(i))
+                            .map(|pm| pm.bytes_used as usize)
+                            .unwrap_or(plane.len())
+                            .min(plane.len());
+                        data.extend_from_slice(&plane[..used]);
+                    }
+
+                    let frame = CapturedFrame {
+                        data,
+                        timestamp_ns,
+                        sequence: u64::from(request.sequence()),
+                    };
+                    match frame_tx.try_send(frame) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            // Consumer is behind; drop the frame (live source).
+                            tracing::trace!("libcamera: frame channel full, dropping frame");
+                        }
+                        Err(_) => break, // LibCameraSrc was dropped
+                    }
+                }
+            }
+
+            request.reuse(ReuseFlag::REUSE_BUFFERS);
+            if let Err((_, e)) = camera.queue_request(request) {
+                tracing::error!("libcamera: failed to re-queue request: {}", e);
+                break;
+            }
         }
 
-        // Stop camera
+        // Stop camera; in-flight requests complete as Cancelled into the
+        // soon-dropped completion channel.
         let _ = camera.stop();
 
         Ok(())
@@ -414,6 +534,34 @@ impl LibCameraSrc {
     /// Get the configuration being used.
     pub fn config(&self) -> &LibCameraConfig {
         &self.config
+    }
+
+    /// Actual frame width negotiated with the camera (drivers may adjust
+    /// the requested size).
+    pub fn width(&self) -> u32 {
+        self.negotiated.width
+    }
+
+    /// Actual frame height negotiated with the camera.
+    pub fn height(&self) -> u32 {
+        self.negotiated.height
+    }
+
+    /// Calculate relative PTS from a capture timestamp.
+    ///
+    /// libcamera reports absolute CLOCK_MONOTONIC timestamps; convert to
+    /// time relative to the first captured frame.
+    fn calculate_pts(&self, timestamp_ns: i64) -> ClockTime {
+        // Only the first frame sets the base timestamp
+        let _ = self.first_timestamp_ns.compare_exchange(
+            i64::MIN,
+            timestamp_ns,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+
+        let first_ns = self.first_timestamp_ns.load(Ordering::SeqCst);
+        ClockTime::from_nanos((timestamp_ns - first_ns).max(0) as u64)
     }
 
     /// Set the flow state handle for downstream backpressure monitoring.
@@ -472,8 +620,8 @@ impl AsyncSource for LibCameraSrc {
                 let len = frame.data.len();
                 if len > 0 && len <= ctx.output().len() {
                     ctx.output()[..len].copy_from_slice(&frame.data);
-                    // NOTE: Metadata (timestamp, width, height) should be set
-                    // via ProduceContext when buffer metadata API is extended.
+                    ctx.set_pts(self.calculate_pts(frame.timestamp_ns));
+                    ctx.set_sequence(frame.sequence);
                     Ok(ProduceResult::Produced(len))
                 } else if len > ctx.output().len() {
                     // Buffer too small - request larger buffer
@@ -492,19 +640,12 @@ impl AsyncSource for LibCameraSrc {
     }
 
     fn preferred_buffer_size(&self) -> Option<usize> {
-        // Estimate based on config or default to 1080p
-        let width = if self.config.width > 0 {
-            self.config.width
+        if self.negotiated.frame_size > 0 {
+            Some(self.negotiated.frame_size as usize)
         } else {
-            1920
-        };
-        let height = if self.config.height > 0 {
-            self.config.height
-        } else {
-            1080
-        };
-        // Assume worst case (RGB24)
-        Some((width * height * 3) as usize)
+            // Assume worst case (RGB24) for the negotiated size
+            Some((self.negotiated.width * self.negotiated.height * 3) as usize)
+        }
     }
 
     fn execution_hints(&self) -> ExecutionHints {
