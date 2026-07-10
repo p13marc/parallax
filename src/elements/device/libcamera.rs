@@ -844,6 +844,90 @@ mod tests {
         assert_eq!(reduce_fraction(30, 0), (1, 0)); // gcd(30, 0) = 30; no panic
     }
 
+    /// Resolve the hardware-test camera id from `PARALLAX_LIBCAMERA_TEST_DEVICE`
+    /// (`auto` = first enumerated camera, anything else = a libcamera id).
+    fn test_camera_id() -> Option<String> {
+        let value = std::env::var("PARALLAX_LIBCAMERA_TEST_DEVICE").ok()?;
+        if value == "auto" {
+            enumerate_cameras().ok()?.first().map(|c| c.id.clone())
+        } else {
+            Some(value)
+        }
+    }
+
+    /// End-to-end hardware smoke test: open with a requested frame rate,
+    /// check the rate read-back, pull frames with monotonic PTS and duration
+    /// metadata, and shut down promptly. One test (not three) because
+    /// parallel test processes would fight over the camera.
+    #[tokio::test]
+    async fn test_capture_smoke_on_hardware() {
+        let Some(id) = test_camera_id() else {
+            println!("PARALLAX_LIBCAMERA_TEST_DEVICE not set, skipping");
+            return;
+        };
+
+        let config = LibCameraConfig {
+            width: 640,
+            height: 480,
+            framerate: Some((15, 1)),
+            ..Default::default()
+        };
+        let mut src = LibCameraSrc::with_camera_and_config(&id, config).expect("open camera");
+        assert!(src.width() > 0 && src.height() > 0, "negotiated size");
+
+        // Rate read-back: the clamped request, as a sane fps fraction
+        let (num, den) = src.framerate().expect("framerate reported");
+        let fps = f64::from(num) / f64::from(den);
+        assert!((0.5..=240.0).contains(&fps), "implausible fps {fps}");
+        // Same µs-granularity conversion the source applies
+        let expected_duration =
+            ClockTime::from_nanos(framerate_to_duration_us(num, den).unwrap() * 1000);
+
+        let arena = crate::memory::SharedArena::new(4 * 1024 * 1024, 4).expect("arena");
+        let mut last_pts: Option<ClockTime> = None;
+        let mut first_pts = ClockTime::ZERO;
+        const FRAMES: u64 = 15;
+        for i in 0..FRAMES {
+            arena.reclaim();
+            let slot = arena.acquire().expect("arena slot");
+            let mut ctx = ProduceContext::new(slot);
+            match src.produce(&mut ctx).await.expect("produce") {
+                ProduceResult::Produced(len) => {
+                    assert!(len > 0, "frame {i} is empty");
+                    let pts = ctx.metadata().pts;
+                    assert_ne!(pts, ClockTime::NONE, "frame {i} has no PTS");
+                    if let Some(prev) = last_pts {
+                        assert!(pts > prev, "PTS not monotonic: {pts:?} <= {prev:?}");
+                    } else {
+                        first_pts = pts;
+                    }
+                    last_pts = Some(pts);
+                    assert_eq!(
+                        ctx.metadata().duration,
+                        expected_duration,
+                        "duration hint must match the reported rate"
+                    );
+                }
+                _ => panic!("frame {i}: unexpected produce result"),
+            }
+        }
+
+        // Measured rate is informational: pipeline handlers (notably UVC)
+        // may ignore FrameDurationLimits and run at their own rate.
+        let span = last_pts.unwrap() - first_pts;
+        let measured_fps = (FRAMES - 1) as f64 / (span.nanos() as f64 / 1e9);
+        println!("requested {fps:.2} fps, measured {measured_fps:.2} fps over {FRAMES} frames");
+
+        // Drop must join the capture thread promptly
+        let begin = std::time::Instant::now();
+        drop(src);
+        assert!(
+            begin.elapsed() < Duration::from_secs(2),
+            "shutdown took {:?}",
+            begin.elapsed()
+        );
+    }
+
     #[test]
     fn test_is_available() {
         let available = is_available();
