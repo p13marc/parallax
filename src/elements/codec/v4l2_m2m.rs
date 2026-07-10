@@ -646,12 +646,17 @@ fn fill_output_plane(dst: &mut [u8], format: &Format, frame: &VideoFrame) -> Res
 
     match frame.format {
         PixelFormat::Nv12 => {
-            // One interleaved UV plane, full row width, half height.
+            // One interleaved UV plane: full-width rows spaced like the luma
+            // plane. Addressed straight from the data layout — NV12 stride_u
+            // conventions differ between frame producers (EncoderElement uses
+            // the full row width, VideoFrame::new the planar half-width), but
+            // the bytes are laid out identically.
+            let src_uv = &frame.data[frame.stride_y * height..];
             copy_plane(
                 &mut dst[y_size..],
                 dst_stride,
-                frame.u_plane(),
-                frame.stride_u,
+                src_uv,
+                frame.stride_y,
                 height / 2,
                 row_bytes,
             );
@@ -864,6 +869,69 @@ mod tests {
         let mut dst = [0u8; 12];
         copy_plane(&mut dst, 6, &src, 4, 2, 4);
         assert_eq!(dst, [1, 2, 3, 4, 0, 0, 5, 6, 7, 8, 0, 0]);
+    }
+
+    fn driver_format(width: u32, height: u32, bytesperline: u32, sizeimage: u32) -> Format {
+        Format {
+            width,
+            height,
+            pixelformat: v4l2r::PixelFormat::from_fourcc(b"NV12"),
+            plane_fmt: vec![v4l2r::PlaneLayout {
+                sizeimage,
+                bytesperline,
+            }],
+        }
+    }
+
+    /// NV12 stride_u conventions differ between frame producers
+    /// (EncoderElement: full row width; VideoFrame::new: planar half-width).
+    /// fill_output_plane must copy the same bytes under both.
+    #[test]
+    fn nv12_fill_handles_both_stride_conventions() {
+        const W: usize = 16;
+        const H: usize = 8;
+        let format = driver_format(W as u32, H as u32, W as u32, (W * H * 3 / 2) as u32);
+
+        // VideoFrame::new convention: stride_u = stride_y / 2.
+        let mut frame = VideoFrame::new(W as u32, H as u32, PixelFormat::Nv12);
+        for (i, b) in frame.data.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let mut dst_a = vec![0u8; W * H * 3 / 2];
+        let used = fill_output_plane(&mut dst_a, &format, &frame).unwrap();
+        assert_eq!(used, W * H * 3 / 2);
+
+        // EncoderElement convention: stride_u = stride_y, stride_v = 0.
+        frame.stride_u = frame.stride_y;
+        frame.stride_v = 0;
+        let mut dst_b = vec![0u8; W * H * 3 / 2];
+        fill_output_plane(&mut dst_b, &format, &frame).unwrap();
+
+        assert_eq!(dst_a, dst_b, "same bytes regardless of stride convention");
+        assert_eq!(&dst_a[..], &frame.data[..], "tight NV12 copies verbatim");
+    }
+
+    /// The driver stride can exceed the frame's: rows must land at
+    /// bytesperline offsets with padding between them.
+    #[test]
+    fn nv12_fill_honors_driver_stride() {
+        const W: usize = 8;
+        const H: usize = 4;
+        const DST_STRIDE: usize = 12;
+        let sizeimage = DST_STRIDE * H * 3 / 2;
+        let format = driver_format(W as u32, H as u32, DST_STRIDE as u32, sizeimage as u32);
+
+        let mut frame = VideoFrame::new(W as u32, H as u32, PixelFormat::Nv12);
+        frame.data.fill(0xAA);
+        let mut dst = vec![0u8; sizeimage];
+        fill_output_plane(&mut dst, &format, &frame).unwrap();
+
+        // First luma row: 8 payload bytes then 4 padding bytes.
+        assert_eq!(&dst[..W], &[0xAA; W]);
+        assert_eq!(&dst[W..DST_STRIDE], &[0; DST_STRIDE - W]);
+        // First UV row sits at bytesperline * height.
+        let uv = DST_STRIDE * H;
+        assert_eq!(&dst[uv..uv + W], &[0xAA; W]);
     }
 
     #[test]
