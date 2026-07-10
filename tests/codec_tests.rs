@@ -312,7 +312,8 @@ mod audio_tests {
 #[cfg(feature = "av1-encode")]
 mod av1_encode_tests {
     use super::*;
-    use parallax::elements::codec::{PixelFormat, Rav1eConfig, Rav1eEncoder};
+    use parallax::element::Element;
+    use parallax::elements::codec::{Rav1eConfig, Rav1eEncoder};
 
     fn create_yuv420_frame(width: usize, height: usize) -> Vec<u8> {
         let y_size = width * height;

@@ -187,7 +187,13 @@ async fn in_band_metadata_flag_forces_idr() {
 #[test]
 fn encoder_element_honors_handle_via_trait() {
     let encoder = quiet_encoder();
-    let mut element = EncoderElement::new(encoder, WIDTH, HEIGHT).unwrap();
+    let format = parallax::format::VideoFormat {
+        width: WIDTH,
+        height: HEIGHT,
+        pixel_format: parallax::format::PixelFormat::I420,
+        framerate: parallax::format::Framerate { num: 30, den: 1 },
+    };
+    let mut element = EncoderElement::new(encoder, format).unwrap();
     let keyframes = element.keyframe_handle();
 
     use parallax::element::Transform;

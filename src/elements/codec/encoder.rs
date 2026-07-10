@@ -149,6 +149,10 @@ pub struct Rav1eEncoder {
     frame_count: u64,
     /// Arena for output buffer allocation.
     arena: Option<SharedArena>,
+    /// Packets drained at EOS, returned one per Element::flush call.
+    pending_flush: std::collections::VecDeque<Vec<u8>>,
+    /// Whether the rav1e context has been flushed.
+    flushed: bool,
 }
 
 impl Rav1eEncoder {
@@ -164,6 +168,8 @@ impl Rav1eEncoder {
             config,
             frame_count: 0,
             arena: None,
+            pending_flush: std::collections::VecDeque::new(),
+            flushed: false,
         })
     }
 
@@ -321,6 +327,40 @@ impl Element for Rav1eEncoder {
             }
             None => Ok(None), // Encoder buffering, no output yet
         }
+    }
+
+    fn flush(&mut self) -> Result<Option<Buffer>> {
+        // rav1e buffers frames for lookahead; without draining here the
+        // tail of the stream is silently lost at EOS. The executor calls
+        // this repeatedly until it returns None.
+        if !self.flushed {
+            self.flushed = true;
+            let packets = self.flush_internal()?;
+            self.pending_flush.extend(packets);
+        }
+
+        let Some(packet) = self.pending_flush.pop_front() else {
+            return Ok(None);
+        };
+
+        if self.arena.is_none() {
+            let arena_size = packet.len().max(1024 * 1024);
+            self.arena = Some(
+                SharedArena::new(arena_size, 16)
+                    .map_err(|e| Error::Element(format!("Failed to create arena: {}", e)))?,
+            );
+        }
+        let arena = self.arena.as_mut().unwrap();
+        arena.reclaim();
+        let mut slot = arena
+            .acquire()
+            .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+        slot.data_mut()[..packet.len()].copy_from_slice(&packet);
+
+        Ok(Some(Buffer::new(
+            MemoryHandle::with_len(slot, packet.len()),
+            crate::metadata::Metadata::new(),
+        )))
     }
 
     fn execution_hints(&self) -> ExecutionHints {

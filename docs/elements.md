@@ -132,7 +132,7 @@ Codec traits: `VideoEncoder`/`VideoDecoder` and `AudioEncoder`/`AudioDecoder` (a
 | Codec | Types | Feature | Notes |
 |-------|-------|---------|-------|
 | H.264 | `H264Encoder`, `H264Decoder` (impl `Element` directly) | `h264` | OpenH264 (BSD-2); needs a C++ compiler |
-| AV1 encode | `Rav1eEncoder` (impl `VideoEncoder`; wrap: `EncoderElement::new(enc, w, h)`) | `av1-encode` | rav1e, pure Rust; install nasm for SIMD |
+| AV1 encode | `Rav1eEncoder` (impl `VideoEncoder`; wrap: `EncoderElement::new(enc, VideoFormat)`) | `av1-encode` | rav1e, pure Rust; install nasm for SIMD |
 | AV1 decode | `Dav1dDecoder` (impl `Element`) | `av1-decode` | libdav1d system library |
 | FLAC/MP3/AAC/Vorbis decode | `SymphoniaDecoder` (impl `Element`) | `audio-flac`/`-mp3`/`-aac`/`-vorbis` | Symphonia, pure Rust |
 | Opus | `OpusEncoder::new(rate, ch, bitrate, OpusApplication)`, `OpusDecoder` (impl audio traits) | `opus` | libopus; 48 kHz frame sizes 120–2880 samples |

@@ -26,6 +26,7 @@ use super::traits::VideoEncoder;
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{ExecutionHints, Output, Transform};
 use crate::error::{Error, Result};
+use crate::format::MediaFormat;
 use crate::memory::SharedArena;
 use std::collections::VecDeque;
 
@@ -61,10 +62,9 @@ pub struct EncoderElement<E: VideoEncoder> {
     flushing: bool,
     /// Whether flush is complete.
     flushed: bool,
-    /// Frame width (for buffer-to-frame conversion).
-    width: u32,
-    /// Frame height (for buffer-to-frame conversion).
-    height: u32,
+    /// Current input format (seeded by the constructor, updated by
+    /// per-buffer format metadata).
+    format: crate::format::VideoFormat,
     /// Statistics: frames received.
     frames_in: u64,
     /// Statistics: packets produced.
@@ -81,12 +81,17 @@ impl<E: VideoEncoder> EncoderElement<E> {
     /// # Arguments
     ///
     /// * `encoder` - The video encoder to wrap
-    /// * `width` - Expected frame width
-    /// * `height` - Expected frame height
-    pub fn new(encoder: E, width: u32, height: u32) -> Result<Self> {
+    /// * `format` - Expected input format (width, height, pixel format,
+    ///   framerate). A buffer carrying different `VideoRaw` format metadata
+    ///   renegotiates on the fly. Only planar/semi-planar YUV formats are
+    ///   encodable — packed or RGB input needs `VideoConvert` upstream.
+    pub fn new(encoder: E, format: crate::format::VideoFormat) -> Result<Self> {
+        // Fail fast on formats no wrapped encoder can take.
+        map_pixel_format(format.pixel_format)?;
+
         // Estimate max packet size (compressed should be smaller than raw frame)
-        let max_packet_size = (width as usize) * (height as usize) * 3;
-        let arena = SharedArena::new(max_packet_size, 16)
+        let max_packet_size = (format.width as usize) * (format.height as usize) * 3;
+        let arena = SharedArena::new(max_packet_size.max(4096), 16)
             .map_err(|e| Error::Element(format!("Failed to create arena: {}", e)))?;
 
         Ok(Self {
@@ -94,13 +99,17 @@ impl<E: VideoEncoder> EncoderElement<E> {
             pending_packets: VecDeque::new(),
             flushing: false,
             flushed: false,
-            width,
-            height,
+            format,
             frames_in: 0,
             packets_out: 0,
             keyframe_requests: super::KeyframeHandle::new(),
             arena,
         })
+    }
+
+    /// The current input format (may change via renegotiation).
+    pub fn format(&self) -> crate::format::VideoFormat {
+        self.format
     }
 
     /// Get a cloneable handle for requesting keyframes at runtime.
@@ -132,21 +141,47 @@ impl<E: VideoEncoder> EncoderElement<E> {
         &mut self.encoder
     }
 
-    /// Convert input buffer to VideoFrame.
-    fn buffer_to_frame(&self, buffer: &Buffer) -> VideoFrame {
-        let data = buffer.as_bytes().to_vec();
-        let pts = buffer.metadata().pts.nanos() as i64;
-
-        VideoFrame {
-            width: self.width,
-            height: self.height,
-            format: super::common::PixelFormat::I420, // Assume I420 for now
-            pts,
-            data,
-            stride_y: self.width as usize,
-            stride_u: self.width as usize / 2,
-            stride_v: self.width as usize / 2,
+    /// Convert input buffer to VideoFrame, honoring format renegotiation.
+    fn buffer_to_frame(&mut self, buffer: &Buffer) -> Result<VideoFrame> {
+        // Renegotiation: format metadata (set on the first buffer or on
+        // format changes) overrides the configured format.
+        if let Some(MediaFormat::VideoRaw(vf)) = buffer.metadata().format {
+            if vf != self.format {
+                tracing::debug!(
+                    "encoder input renegotiated: {}x{} {:?} -> {}x{} {:?}",
+                    self.format.width,
+                    self.format.height,
+                    self.format.pixel_format,
+                    vf.width,
+                    vf.height,
+                    vf.pixel_format
+                );
+                self.format = vf;
+            }
         }
+
+        let format = map_pixel_format(self.format.pixel_format)?;
+        let width = self.format.width;
+        let bpc = format.bytes_per_component();
+        let stride_y = width as usize * bpc;
+        let (stride_u, stride_v) = match format {
+            // Semi-planar: one interleaved UV plane at full row width.
+            super::common::PixelFormat::Nv12 => (stride_y, 0),
+            super::common::PixelFormat::I444 => (stride_y, stride_y),
+            // Planar 4:2:0 / 4:2:2: half-width chroma planes.
+            _ => (stride_y / 2, stride_y / 2),
+        };
+
+        Ok(VideoFrame {
+            width,
+            height: self.format.height,
+            format,
+            pts: buffer.metadata().pts.nanos() as i64,
+            data: buffer.as_bytes().to_vec(),
+            stride_y,
+            stride_u,
+            stride_v,
+        })
     }
 
     /// Convert encoded packet to output buffer, preserving input metadata.
@@ -192,6 +227,26 @@ impl<E: VideoEncoder> EncoderElement<E> {
     }
 }
 
+/// Map a caps-level pixel format to the codec-level one.
+///
+/// Only planar/semi-planar YUV layouts are representable as encoder input;
+/// packed YUV, RGB and grayscale need a `VideoConvert` upstream.
+fn map_pixel_format(format: crate::format::PixelFormat) -> Result<super::common::PixelFormat> {
+    use crate::format::PixelFormat as Caps;
+    Ok(match format {
+        Caps::I420 => super::common::PixelFormat::I420,
+        Caps::I420_10Le => super::common::PixelFormat::I420p10,
+        Caps::I422 => super::common::PixelFormat::I422,
+        Caps::I444 => super::common::PixelFormat::I444,
+        Caps::Nv12 => super::common::PixelFormat::Nv12,
+        other => {
+            return Err(Error::InvalidCaps(format!(
+                "encoder cannot take {other:?} input; insert VideoConvert upstream"
+            )));
+        }
+    })
+}
+
 impl<E: VideoEncoder + 'static> Transform for EncoderElement<E> {
     fn transform(&mut self, buffer: Buffer) -> Result<Output> {
         // Runtime keyframe requests: from the shared handle or stamped
@@ -206,8 +261,8 @@ impl<E: VideoEncoder + 'static> Transform for EncoderElement<E> {
             self.encoder.force_keyframe();
         }
 
-        // Convert buffer to frame
-        let frame = self.buffer_to_frame(&buffer);
+        // Convert buffer to frame (may renegotiate the input format)
+        let frame = self.buffer_to_frame(&buffer)?;
         let input_metadata = buffer.metadata();
         let pts = frame.pts;
         self.frames_in += 1;
@@ -271,6 +326,25 @@ impl<E: VideoEncoder + 'static> Transform for EncoderElement<E> {
         "EncoderElement"
     }
 
+    fn input_media_caps(&self) -> crate::format::ElementMediaCaps {
+        use crate::format::{
+            CapsValue, ElementMediaCaps, FormatMemoryCap, MemoryCaps, VideoFormatCaps,
+        };
+        // Advertise the configured format so graph negotiation can catch
+        // mismatches (and auto-insert a converter) instead of failing at the
+        // first encoded frame.
+        let caps = VideoFormatCaps {
+            width: CapsValue::Fixed(self.format.width),
+            height: CapsValue::Fixed(self.format.height),
+            pixel_format: CapsValue::Fixed(self.format.pixel_format),
+            ..VideoFormatCaps::any()
+        };
+        ElementMediaCaps::new(vec![FormatMemoryCap::new(
+            caps.into(),
+            MemoryCaps::cpu_only(),
+        )])
+    }
+
     fn execution_hints(&self) -> ExecutionHints {
         ExecutionHints::cpu_intensive()
     }
@@ -279,12 +353,142 @@ impl<E: VideoEncoder + 'static> Transform for EncoderElement<E> {
 impl<E: VideoEncoder> std::fmt::Debug for EncoderElement<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EncoderElement")
-            .field("width", &self.width)
-            .field("height", &self.height)
+            .field("format", &self.format)
             .field("frames_in", &self.frames_in)
             .field("packets_out", &self.packets_out)
             .field("flushing", &self.flushing)
             .field("flushed", &self.flushed)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::format::{Framerate, PixelFormat, VideoFormat};
+    use crate::memory::SharedArena;
+    use crate::metadata::Metadata;
+
+    /// A no-op encoder that records the frames it is given.
+    struct RecordingEncoder {
+        frames: Vec<(
+            u32,
+            u32,
+            super::super::common::PixelFormat,
+            usize,
+            usize,
+            usize,
+        )>,
+    }
+
+    impl VideoEncoder for RecordingEncoder {
+        type Packet = Vec<u8>;
+        fn encode(&mut self, frame: &VideoFrame) -> Result<Vec<Vec<u8>>> {
+            self.frames.push((
+                frame.width,
+                frame.height,
+                frame.format,
+                frame.stride_y,
+                frame.stride_u,
+                frame.stride_v,
+            ));
+            Ok(vec![vec![0xAB]])
+        }
+        fn flush(&mut self) -> Result<Vec<Vec<u8>>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn video_format(width: u32, height: u32, pixel_format: PixelFormat) -> VideoFormat {
+        VideoFormat {
+            width,
+            height,
+            pixel_format,
+            framerate: Framerate { num: 30, den: 1 },
+        }
+    }
+
+    fn frame_buffer(format: Option<VideoFormat>) -> Buffer {
+        let arena = SharedArena::new(64, 8).unwrap();
+        let slot = arena.acquire().unwrap();
+        let mut metadata = Metadata::from_sequence(0);
+        metadata.format = format.map(MediaFormat::VideoRaw);
+        Buffer::new(MemoryHandle::with_len(slot, 16), metadata)
+    }
+
+    #[test]
+    fn strides_follow_pixel_format() {
+        for (pf, expect) in [
+            (PixelFormat::I420, (640usize, 320usize, 320usize)),
+            (PixelFormat::Nv12, (640, 640, 0)),
+            (PixelFormat::I444, (640, 640, 640)),
+            (PixelFormat::I420_10Le, (1280, 640, 640)),
+        ] {
+            let mut element = EncoderElement::new(
+                RecordingEncoder { frames: vec![] },
+                video_format(640, 480, pf),
+            )
+            .unwrap();
+            element.transform(frame_buffer(None)).unwrap();
+            let (w, h, _, sy, su, sv) = element.encoder().frames[0];
+            assert_eq!((w, h), (640, 480));
+            assert_eq!((sy, su, sv), expect, "strides for {pf:?}");
+        }
+    }
+
+    #[test]
+    fn metadata_renegotiates_format() {
+        let mut element = EncoderElement::new(
+            RecordingEncoder { frames: vec![] },
+            video_format(640, 480, PixelFormat::I420),
+        )
+        .unwrap();
+        element.transform(frame_buffer(None)).unwrap();
+        element
+            .transform(frame_buffer(Some(video_format(
+                1280,
+                720,
+                PixelFormat::Nv12,
+            ))))
+            .unwrap();
+
+        let frames = &element.encoder().frames;
+        assert_eq!((frames[0].0, frames[0].1), (640, 480));
+        assert_eq!((frames[1].0, frames[1].1), (1280, 720));
+        assert_eq!(frames[1].2, super::super::common::PixelFormat::Nv12);
+        assert_eq!(
+            element.format().width,
+            1280,
+            "format sticks after renegotiation"
+        );
+    }
+
+    #[test]
+    fn unmappable_formats_error() {
+        // At construction:
+        assert!(
+            EncoderElement::new(
+                RecordingEncoder { frames: vec![] },
+                video_format(640, 480, PixelFormat::Rgb24)
+            )
+            .is_err(),
+            "RGB input must be rejected (needs VideoConvert)"
+        );
+        // Via renegotiation:
+        let mut element = EncoderElement::new(
+            RecordingEncoder { frames: vec![] },
+            video_format(640, 480, PixelFormat::I420),
+        )
+        .unwrap();
+        assert!(
+            element
+                .transform(frame_buffer(Some(video_format(
+                    640,
+                    480,
+                    PixelFormat::Yuyv
+                ))))
+                .is_err(),
+            "packed YUV renegotiation must be rejected"
+        );
     }
 }
