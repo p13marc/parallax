@@ -121,8 +121,9 @@ fdk-aac = { version = "0.6", optional = true }
 # PipeWire (audio/video capture and playback)
 pipewire = { version = "0.8", optional = true }
 
-# libcamera (modern camera API)
-libcamera = { version = "0.4", optional = true }
+# libcamera (modern camera API; needs system libcamera >= 0.4 with dev headers,
+# the crate picks matching pregenerated bindings via pkg-config at build time)
+libcamera = { version = "0.7", optional = true }
 
 # V4L2 (fallback video capture)
 v4l = { version = "0.14", optional = true }

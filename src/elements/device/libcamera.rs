@@ -287,7 +287,7 @@ impl LibCameraSrc {
             .collect();
 
         // Create requests
-        let mut requests: Vec<_> = buffers
+        let requests: Vec<_> = buffers
             .into_iter()
             .enumerate()
             .map(|(i, buf)| {
@@ -297,19 +297,17 @@ impl LibCameraSrc {
             })
             .collect();
 
-        // Queue all requests
-        for request in requests.iter_mut() {
-            // libcamera 0.4 takes ownership of the request
-            let req = std::mem::replace(request, camera.create_request(None).unwrap());
-            camera
-                .queue_request(req)
-                .map_err(|e| DeviceError::LibCamera(e.to_string()))?;
-        }
-
-        // Start camera (libcamera 0.4 requires controls parameter)
+        // Start camera before queueing so completed requests flow immediately
         camera
             .start(None)
             .map_err(|e| DeviceError::LibCamera(e.to_string()))?;
+
+        // Queue all requests (queue_request hands the request back on failure)
+        for request in requests {
+            camera
+                .queue_request(request)
+                .map_err(|(_, e)| DeviceError::LibCamera(e.to_string()))?;
+        }
 
         let running = Arc::new(AtomicBool::new(true));
 
