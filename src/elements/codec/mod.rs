@@ -8,6 +8,7 @@
 //! | Codec | Feature | Decoder | Encoder | Pure Rust |
 //! |-------|---------|---------|---------|-----------|
 //! | H.264 | `h264` | [`H264Decoder`] | [`H264Encoder`] | No (OpenH264) |
+//! | H.264 (hardware) | `v4l2-m2m` | - | `V4l2M2mH264Encoder` | Yes (kernel driver) |
 //! | AV1 | `av1-decode` | `Dav1dDecoder` | - | No (C lib) |
 //! | AV1 | `av1-encode` | - | `Rav1eEncoder` | Yes |
 //!
@@ -98,6 +99,16 @@
 //! - **Debian/Ubuntu**: `sudo apt install libdav1d-dev`
 //! - **Arch**: `sudo pacman -S dav1d`
 //! - **macOS**: `brew install dav1d`
+//!
+//! ## v4l2-m2m (hardware H.264, Linux only)
+//!
+//! No runtime library — the encoder is a kernel driver. Building needs
+//! **libclang** and the **kernel UAPI headers** (v4l2r generates bindings
+//! from `videodev2.h` at build time; override the header location with
+//! `V4L2R_VIDEODEV2_H_PATH`):
+//!
+//! - **Fedora/RHEL**: `sudo dnf install clang-libs kernel-headers`
+//! - **Debian/Ubuntu**: `sudo apt install libclang-dev linux-libc-dev`
 
 // Common types (video frames, pixel formats)
 mod common;
@@ -142,6 +153,14 @@ pub use audio_encoder_element::AudioEncoderElement;
 mod h264;
 #[cfg(feature = "h264")]
 pub use h264::{DecodedFrame, H264Decoder, H264Encoder, H264EncoderConfig};
+
+// V4L2 M2M stateful hardware encoder
+#[cfg(feature = "v4l2-m2m")]
+mod v4l2_m2m;
+#[cfg(feature = "v4l2-m2m")]
+pub use v4l2_m2m::{
+    V4l2CodedFormat, V4l2H264Profile, V4l2M2mEncoderConfig, V4l2M2mH264Encoder, find_m2m_encoder,
+};
 
 // AV1 video codecs
 #[cfg(feature = "av1-decode")]

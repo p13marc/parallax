@@ -55,6 +55,30 @@ jobs:
       - run: cargo check --all-targets --features "$SENSOR_FEATURES"
       - run: cargo nextest run --features "$SENSOR_FEATURES"
 
+  # V4L2 M2M hardware encoder: build + lint the feature, then exercise the
+  # real queue/drain state machine against the vicodec virtual driver.
+  # v4l2r generates kernel-header bindings at build time (needs libclang).
+  test-v4l2-m2m:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev "linux-modules-extra-$(uname -r)"
+      - run: sudo modprobe vicodec
+      - run: sudo chmod a+rw /dev/video*
+      - run: cargo clippy --all-targets --features v4l2-m2m -- -D warnings
+      - run: cargo nextest run --features v4l2-m2m -E 'test(v4l2_m2m)' --no-capture
+        env:
+          PARALLAX_VICODEC_TEST_DEVICE: auto
+
   clippy:
     runs-on: ubuntu-latest
     steps:

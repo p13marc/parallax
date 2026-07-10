@@ -51,6 +51,7 @@ pub mod app;
 
 #[cfg(any(
     feature = "h264",
+    feature = "v4l2-m2m",
     feature = "av1-encode",
     feature = "av1-decode",
     feature = "audio-flac",
@@ -210,6 +211,12 @@ pub use codec::{PixelFormat as CodecPixelFormat, VideoFrame};
 // Video codecs - H.264
 #[cfg(feature = "h264")]
 pub use codec::{DecodedFrame, H264Decoder, H264Encoder, H264EncoderConfig};
+
+// Video codecs - V4L2 M2M hardware H.264
+#[cfg(feature = "v4l2-m2m")]
+pub use codec::{
+    V4l2CodedFormat, V4l2H264Profile, V4l2M2mEncoderConfig, V4l2M2mH264Encoder, find_m2m_encoder,
+};
 
 // Video codecs - AV1
 #[cfg(feature = "av1-decode")]

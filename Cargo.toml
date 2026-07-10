@@ -127,6 +127,10 @@ libcamera = { version = "0.4", optional = true }
 # V4L2 (fallback video capture)
 v4l = { version = "0.14", optional = true }
 
+# V4L2 M2M stateful hardware codecs (pinned: 0.0.x API is unstable;
+# builds bindings from kernel headers, needs libclang at build time)
+v4l2r = { version = "=0.0.7", optional = true }
+
 # udev device monitoring (hotplug)
 udev = { version = "0.9", features = ["send"], optional = true }
 
@@ -192,6 +196,7 @@ libcamera = ["dep:libcamera"]  # Modern camera API (Raspberry Pi, embedded, etc.
 screen-capture = ["pipewire", "dep:ashpd"]  # Screen capture via XDG portal
 # Device capture (fallback/low-level)
 v4l2 = ["dep:v4l"]  # V4L2 video capture (fallback for simple webcams)
+v4l2-m2m = ["dep:v4l2r"]  # V4L2 M2M stateful hardware H.264 encoder
 alsa = ["dep:alsa"]  # ALSA audio capture/playback (fallback)
 # Combined device features
 device-capture = ["pipewire", "libcamera"]  # Recommended device capture stack

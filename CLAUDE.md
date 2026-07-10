@@ -217,11 +217,12 @@ p.link_pads(xfm, "src", sink, "sink")?;
 | What | Types | Feature |
 |------|-------|---------|
 | H.264 | `H264Encoder`/`H264Decoder` (implement `Element` directly) | `h264` |
-| AV1 | `Rav1eEncoder` (impl `VideoEncoder`, wrap in `EncoderElement::new(enc, w, h)`), `Dav1dDecoder` (impl `Element`) | `av1-encode` / `av1-decode` |
+| H.264 hardware | `V4l2M2mH264Encoder` (impl `VideoEncoder`, wrap in `EncoderElement`), `find_m2m_encoder(b"H264")` device probe; `V4l2CodedFormat::Fwht` is test-only (vicodec) | `v4l2-m2m` (build needs libclang + kernel headers — on this host use the fedora toolbox) |
+| AV1 | `Rav1eEncoder` (impl `Element` directly AND `VideoEncoder`; drains lookahead via `Element::flush`), `Dav1dDecoder` (impl `Element`) | `av1-encode` / `av1-decode` |
 | Audio dec | `SymphoniaDecoder` (impl `Element`) | `audio-flac/mp3/aac/vorbis` |
 | Opus | `OpusEncoder::new(rate, ch, bitrate, OpusApplication)` / `OpusDecoder` (impl `AudioEncoder`/`AudioDecoder`, wrap in `AudioEncoderElement`/`AudioDecoderElement`) | `opus` |
 | AAC enc | `AacEncoder` | `aac-encode` (FDK license!) |
-| Images | `JpegDecoder`, `PngEncoder`/`PngDecoder` | `image-*` |
+| Images | `JpegEncoder`/`JpegDecoder`, `PngEncoder`/`PngDecoder` | `image-*` |
 | Containers | `TsMux`/`TsMuxElement`/`TsDemux` [`mpeg-ts`], `Mp4Mux`/`Mp4FileSink`/`Mp4Demux` [`mp4-demux`] | |
 | RTP | `RtpSrc/Sink`, `RtpH264Pay/Depay`, H265/VP8/VP9 pay/depay, `RtpOpusDepay` (no Opus pay), `RtpJitterBuffer`, `RtcpHandler` | `rtp` |
 | RTSP | `RtspSrc` (client only, via retina) | `rtsp` |
@@ -229,7 +230,9 @@ p.link_pads(xfm, "src", sink, "sink")?;
 | Devices | `V4l2Src` (DMA-BUF export), `LibCameraSrc`, `PipeWireSrc/Sink`, `ScreenCaptureSrc`, `AlsaSrc/Sink` (clock provider) | `v4l2`/`libcamera`/`pipewire`/`screen-capture`/`alsa` |
 | KLV | `KlvEncoder`, `StanagMetadataBuilder` (elements/metadata) | — |
 
-Codec traits: `VideoEncoder`/`VideoDecoder`, `AudioEncoder`/`AudioDecoder` (with `flush()` to drain at EOS). Note the inconsistency: some codecs implement the traits (rav1e, opus, aac), others implement `Element` directly (openh264, dav1d, symphonia).
+Codec traits: `VideoEncoder`/`VideoDecoder`, `AudioEncoder`/`AudioDecoder` (with `flush()` to drain at EOS). Note the inconsistency: some codecs implement the traits (rav1e, opus, aac, v4l2-m2m), others implement `Element` directly (openh264, dav1d, symphonia). `EncoderElement::new(enc, format: VideoFormat)` maps caps pixel formats to codec ones with per-format strides (I420/I422/I444/NV12/10-bit), errors on RGB/packed input (needs `VideoConvert` upstream), and renegotiates from per-buffer `Metadata.format`.
+
+**`elements::codec` is compiled only when at least one codec feature is enabled** (see the `#[cfg(any(...))]` on `pub mod codec` in `elements/mod.rs`). Consequence: unit tests inside codec modules (including the always-present `EncoderElement`) do NOT run under default features — they run in CI's sensor combo and feature-specific jobs. When adding a codec feature, add it to that cfg list or the module silently won't compile.
 
 Muxer sync: `MuxerSyncState`/`MuxerSyncConfig::new().with_mode(SyncMode::{Auto|Strict|Loose|Timed}).with_interval_ms(..)`, `PadInfo::new(name, StreamType).required()/.optional()`; `TsMuxConfig::new().add_track(TsMuxTrack::new(pid, TsMuxStreamType::H264).video())`.
 
