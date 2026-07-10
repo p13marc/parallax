@@ -244,11 +244,11 @@ where
         }
 
         // Check if left is too old to ever match
-        if let Some(right_front) = self.right_buffer.front() {
-            if left_ts + tolerance < right_front.timestamp {
-                let left = self.left_buffer.pop_front()?.data;
-                return Some(JoinResult::LeftOnly(left));
-            }
+        if let Some(right_front) = self.right_buffer.front()
+            && left_ts + tolerance < right_front.timestamp
+        {
+            let left = self.left_buffer.pop_front()?.data;
+            return Some(JoinResult::LeftOnly(left));
         }
 
         None
@@ -283,11 +283,11 @@ where
         }
 
         // Check if left is too old to ever match
-        if let Some(right_front) = self.right_buffer.front() {
-            if left_ts + window < right_front.timestamp {
-                let left = self.left_buffer.pop_front()?.data;
-                return Some(JoinResult::LeftOnly(left));
-            }
+        if let Some(right_front) = self.right_buffer.front()
+            && left_ts + window < right_front.timestamp
+        {
+            let left = self.left_buffer.pop_front()?.data;
+            return Some(JoinResult::LeftOnly(left));
         }
 
         None

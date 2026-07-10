@@ -445,7 +445,7 @@ impl VideoTestSrc {
                 let offset = ((y * self.width + x) as usize) * bpp;
                 let checker_x = x / size;
                 let checker_y = y / size;
-                let is_white = (checker_x + checker_y) % 2 == 0;
+                let is_white = (checker_x + checker_y).is_multiple_of(2);
 
                 let (r, g, b) = if is_white { (255, 255, 255) } else { (0, 0, 0) };
 
@@ -574,10 +574,10 @@ impl Source for VideoTestSrc {
         use crate::metadata::Metadata;
 
         // Check frame limit
-        if let Some(max) = self.num_frames {
-            if self.sequence >= max {
-                return Ok(ProduceResult::Eos);
-            }
+        if let Some(max) = self.num_frames
+            && self.sequence >= max
+        {
+            return Ok(ProduceResult::Eos);
         }
 
         // Wait for next frame time (only in live mode)
@@ -983,7 +983,7 @@ impl AsyncVideoTestSrc {
                 let offset = ((y * self.width + x) as usize) * bpp;
                 let checker_x = x / size;
                 let checker_y = y / size;
-                let is_white = (checker_x + checker_y) % 2 == 0;
+                let is_white = (checker_x + checker_y).is_multiple_of(2);
 
                 let (r, g, b) = if is_white { (255, 255, 255) } else { (0, 0, 0) };
 
@@ -1102,10 +1102,10 @@ impl Default for AsyncVideoTestSrc {
 impl crate::element::AsyncSource for AsyncVideoTestSrc {
     async fn produce(&mut self, ctx: &mut ProduceContext<'_>) -> Result<ProduceResult> {
         // Check frame limit
-        if let Some(max) = self.num_frames {
-            if self.sequence >= max {
-                return Ok(ProduceResult::Eos);
-            }
+        if let Some(max) = self.num_frames
+            && self.sequence >= max
+        {
+            return Ok(ProduceResult::Eos);
         }
 
         // Wait for next frame time using tokio interval (only in live mode)

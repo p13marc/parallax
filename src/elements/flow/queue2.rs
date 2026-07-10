@@ -410,10 +410,10 @@ impl Queue2 {
         self.current_bytes += len as usize;
 
         // Calculate percentage based on total size
-        if let Some(total) = self.config.total_size {
-            if let Some(pct) = (self.file_write_pos * 100).checked_div(total) {
-                self.percent = pct.min(100) as u32;
-            }
+        if let Some(total) = self.config.total_size
+            && let Some(pct) = (self.file_write_pos * 100).checked_div(total)
+        {
+            self.percent = pct.min(100) as u32;
         }
 
         self.update_rate_estimates();

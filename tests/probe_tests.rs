@@ -47,7 +47,7 @@ async fn test_buffer_probe_drop() {
     let pad = PadRef::src(src);
     let _ = pipeline.add_probe(pad, ProbeType::BUFFER, move |_| {
         let n = count_clone.fetch_add(1, Ordering::Relaxed);
-        if n % 2 == 0 {
+        if n.is_multiple_of(2) {
             ProbeReturn::Drop
         } else {
             ProbeReturn::Ok

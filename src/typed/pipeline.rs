@@ -314,7 +314,7 @@ mod tests {
     fn test_pipeline_with_filter() {
         let source = from_iter(vec![1u32, 2, 3, 4, 5]);
         let sink = pipeline(source)
-            .then(filter(|x: &u32| *x % 2 == 0))
+            .then(filter(|x: &u32| (*x).is_multiple_of(2)))
             .sink(collect::<u32>());
 
         let result = sink.run().unwrap();
@@ -325,7 +325,7 @@ mod tests {
     fn test_pipeline_with_multiple_transforms() {
         let source = from_iter(vec![1u32, 2, 3, 4, 5, 6]);
         let sink = pipeline(source)
-            .then(filter(|x: &u32| *x % 2 == 0))
+            .then(filter(|x: &u32| (*x).is_multiple_of(2)))
             .then(map(|x: u32| x * 10))
             .sink(collect::<u32>());
 
@@ -345,7 +345,8 @@ mod tests {
     #[test]
     fn test_shr_operator_chained() {
         let source = from_iter(vec![1u32, 2, 3, 4, 5, 6]);
-        let pipe = pipeline(source) >> filter(|x: &u32| *x % 2 == 0) >> map(|x: u32| x * 10);
+        let pipe =
+            pipeline(source) >> filter(|x: &u32| (*x).is_multiple_of(2)) >> map(|x: u32| x * 10);
         let result = pipe.sink(collect()).run().unwrap();
         assert_eq!(result.into_inner(), vec![20, 40, 60]);
     }

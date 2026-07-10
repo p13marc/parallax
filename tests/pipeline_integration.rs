@@ -125,7 +125,7 @@ async fn test_filter_element() {
     impl Element for EveryNth {
         fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
             self.current += 1;
-            if self.current % self.n == 0 {
+            if self.current.is_multiple_of(self.n) {
                 Ok(Some(buffer))
             } else {
                 Ok(None) // Filter out

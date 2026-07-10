@@ -205,10 +205,10 @@ impl Source for UnixSrc {
 
 impl Drop for UnixSrc {
     fn drop(&mut self) {
-        if self.cleanup_on_drop {
-            if let UnixMode::Server(ref path) = self.mode {
-                let _ = std::fs::remove_file(path);
-            }
+        if self.cleanup_on_drop
+            && let UnixMode::Server(ref path) = self.mode
+        {
+            let _ = std::fs::remove_file(path);
         }
     }
 }
@@ -357,10 +357,10 @@ impl Sink for UnixSink {
 
 impl Drop for UnixSink {
     fn drop(&mut self) {
-        if self.cleanup_on_drop {
-            if let UnixMode::Server(ref path) = self.mode {
-                let _ = std::fs::remove_file(path);
-            }
+        if self.cleanup_on_drop
+            && let UnixMode::Server(ref path) = self.mode
+        {
+            let _ = std::fs::remove_file(path);
         }
     }
 }

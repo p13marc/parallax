@@ -436,10 +436,10 @@ impl Queue {
         if state.buffers.len() >= state.max_buffers {
             return true;
         }
-        if let Some(max_bytes) = state.max_bytes {
-            if state.current_bytes >= max_bytes {
-                return true;
-            }
+        if let Some(max_bytes) = state.max_bytes
+            && state.current_bytes >= max_bytes
+        {
+            return true;
         }
         false
     }

@@ -138,7 +138,7 @@ impl AudioConvert {
         let input_sample_size = self.input_format.bytes_per_sample();
         let output_sample_size = self.output_format.bytes_per_sample();
 
-        if input.len() % input_sample_size != 0 {
+        if !input.len().is_multiple_of(input_sample_size) {
             return Err(Error::Config(format!(
                 "Input size {} not aligned to sample size {}",
                 input.len(),
@@ -343,7 +343,7 @@ impl AudioChannelMix {
         let frame_size_in = sample_size * in_channels;
         let frame_size_out = sample_size * out_channels;
 
-        if input.len() % frame_size_in != 0 {
+        if !input.len().is_multiple_of(frame_size_in) {
             return Err(Error::Config(format!(
                 "Input size {} not aligned to frame size {}",
                 input.len(),

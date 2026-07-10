@@ -566,13 +566,13 @@ impl TimestampDebug {
             }
 
             // Track discontinuities (more than 2x expected interval)
-            if let Some(avg) = self.stats.avg_interval_ns {
-                if last != ClockTime::NONE {
-                    let gap = pts.nanos().saturating_sub(last.nanos()) as f64;
-                    if gap > avg * 2.0 {
-                        self.stats.discontinuity_count += 1;
-                        warning = Some("DISCONTINUITY");
-                    }
+            if let Some(avg) = self.stats.avg_interval_ns
+                && last != ClockTime::NONE
+            {
+                let gap = pts.nanos().saturating_sub(last.nanos()) as f64;
+                if gap > avg * 2.0 {
+                    self.stats.discontinuity_count += 1;
+                    warning = Some("DISCONTINUITY");
                 }
             }
 
@@ -622,7 +622,7 @@ impl Element for TimestampDebug {
         // Determine if we should log
         let should_log = match self.log_level {
             TimestampDebugLevel::All => true,
-            TimestampDebugLevel::Sample(n) => self.stats.buffer_count % n == 0,
+            TimestampDebugLevel::Sample(n) => self.stats.buffer_count.is_multiple_of(n),
             TimestampDebugLevel::Warnings => warning.is_some(),
             TimestampDebugLevel::Silent => false,
         };

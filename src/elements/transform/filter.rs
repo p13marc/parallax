@@ -229,7 +229,7 @@ impl Element for SampleFilter {
         let count = self.count.fetch_add(1, Ordering::Relaxed);
 
         let pass = match self.mode {
-            SampleMode::EveryNth(n) => count % n == 0,
+            SampleMode::EveryNth(n) => count.is_multiple_of(n),
             SampleMode::RandomPercent(pct) => {
                 let r = self.next_random() % 100;
                 r < pct as u64
@@ -343,22 +343,22 @@ impl Element for MetadataFilter {
         let meta = buffer.metadata();
         let mut pass = true;
 
-        if let Some(expected_id) = self.stream_id {
-            if meta.stream_id != expected_id {
-                pass = false;
-            }
+        if let Some(expected_id) = self.stream_id
+            && meta.stream_id != expected_id
+        {
+            pass = false;
         }
 
-        if let Some(min) = self.min_sequence {
-            if meta.sequence < min {
-                pass = false;
-            }
+        if let Some(min) = self.min_sequence
+            && meta.sequence < min
+        {
+            pass = false;
         }
 
-        if let Some(max) = self.max_sequence {
-            if meta.sequence > max {
-                pass = false;
-            }
+        if let Some(max) = self.max_sequence
+            && meta.sequence > max
+        {
+            pass = false;
         }
 
         if pass {

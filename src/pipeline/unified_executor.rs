@@ -645,10 +645,10 @@ impl Executor {
         // Extract RT elements from the pipeline graph
         let mut rt_elements: HashMap<NodeId, Box<DynAsyncElement<'static>>> = HashMap::new();
         for &node_id in &partition.rt_nodes {
-            if let Some(node) = pipeline.get_node_mut(node_id) {
-                if let Some(element) = node.take_element() {
-                    rt_elements.insert(node_id, element);
-                }
+            if let Some(node) = pipeline.get_node_mut(node_id)
+                && let Some(element) = node.take_element()
+            {
+                rt_elements.insert(node_id, element);
             }
         }
 
@@ -886,10 +886,10 @@ impl Executor {
         })?;
 
         // Set clock on source elements so they can provide it to ProduceContext
-        if element_type == ElementType::Source {
-            if let Some((clock, base_time)) = clock_info {
-                element.set_clock(clock.clone(), *base_time);
-            }
+        if element_type == ElementType::Source
+            && let Some((clock, base_time)) = clock_info
+        {
+            element.set_clock(clock.clone(), *base_time);
         }
 
         // Set bus handle so elements can post messages
@@ -1129,7 +1129,7 @@ fn spawn_source_task(
                 }
                 Ok(SourceResult::WouldBlock) => {
                     would_block_count += 1;
-                    if would_block_count == 1 || would_block_count % 1000 == 0 {
+                    if would_block_count == 1 || would_block_count.is_multiple_of(1000) {
                         tracing::debug!(
                             "source '{}': WouldBlock (count: {})",
                             name,

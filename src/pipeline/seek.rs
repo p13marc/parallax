@@ -133,14 +133,14 @@ pub trait SeekableSource {
 
     /// Query the seekable range.
     fn query_seekable(&self) -> SeekableQuery {
-        if self.is_seekable() {
-            if let Some(dur) = self.query_duration() {
-                return SeekableQuery {
-                    seekable: true,
-                    start: 0,
-                    stop: dur.duration.unwrap_or(0),
-                };
-            }
+        if self.is_seekable()
+            && let Some(dur) = self.query_duration()
+        {
+            return SeekableQuery {
+                seekable: true,
+                start: 0,
+                stop: dur.duration.unwrap_or(0),
+            };
         }
         SeekableQuery::not_seekable()
     }

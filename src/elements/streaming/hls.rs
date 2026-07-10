@@ -356,11 +356,11 @@ impl HlsSink {
         }
 
         // Finalize last segment
-        if self.segment_writer.is_open() {
-            if let Some(segment_info) = self.segment_writer.finalize(self.current_pts)? {
-                self.segments.push_back(segment_info);
-                self.total_segments += 1;
-            }
+        if self.segment_writer.is_open()
+            && let Some(segment_info) = self.segment_writer.finalize(self.current_pts)?
+        {
+            self.segments.push_back(segment_info);
+            self.total_segments += 1;
         }
 
         // Write final playlist (with ENDLIST for VOD)

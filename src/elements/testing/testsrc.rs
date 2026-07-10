@@ -211,10 +211,10 @@ impl Default for TestSrc {
 impl Source for TestSrc {
     fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
         // Check buffer limit
-        if let Some(max) = self.num_buffers {
-            if self.sequence >= max {
-                return Ok(ProduceResult::Eos);
-            }
+        if let Some(max) = self.num_buffers
+            && self.sequence >= max
+        {
+            return Ok(ProduceResult::Eos);
         }
 
         // Apply rate limiting

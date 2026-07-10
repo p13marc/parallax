@@ -260,10 +260,10 @@ impl ZenohSrc {
                 let mut metadata = wire.to_metadata();
                 // A gap in the published sequence means samples were lost on
                 // the wire (congestion drop, late join).
-                if let Some(prev) = self.last_wire_sequence {
-                    if wire.sequence != prev.wrapping_add(1) {
-                        metadata.flags |= BufferFlags::DISCONT;
-                    }
+                if let Some(prev) = self.last_wire_sequence
+                    && wire.sequence != prev.wrapping_add(1)
+                {
+                    metadata.flags |= BufferFlags::DISCONT;
                 }
                 self.last_wire_sequence = Some(wire.sequence);
                 metadata

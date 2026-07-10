@@ -206,19 +206,19 @@ impl RtpSrc {
         };
 
         // Filter by payload type if configured
-        if let Some(expected_pt) = self.payload_type {
-            if packet.header.payload_type != expected_pt {
-                self.stats.packets_filtered += 1;
-                return Ok(None);
-            }
+        if let Some(expected_pt) = self.payload_type
+            && packet.header.payload_type != expected_pt
+        {
+            self.stats.packets_filtered += 1;
+            return Ok(None);
         }
 
         // Filter by SSRC if configured
-        if let Some(expected_ssrc) = self.ssrc_filter {
-            if packet.header.ssrc != expected_ssrc {
-                self.stats.packets_filtered += 1;
-                return Ok(None);
-            }
+        if let Some(expected_ssrc) = self.ssrc_filter
+            && packet.header.ssrc != expected_ssrc
+        {
+            self.stats.packets_filtered += 1;
+            return Ok(None);
         }
 
         // Update stats
@@ -616,19 +616,19 @@ impl AsyncRtpSrc {
         };
 
         // Filter by payload type
-        if let Some(expected_pt) = self.payload_type {
-            if packet.header.payload_type != expected_pt {
-                self.stats.packets_filtered += 1;
-                return Ok(None);
-            }
+        if let Some(expected_pt) = self.payload_type
+            && packet.header.payload_type != expected_pt
+        {
+            self.stats.packets_filtered += 1;
+            return Ok(None);
         }
 
         // Filter by SSRC
-        if let Some(expected_ssrc) = self.ssrc_filter {
-            if packet.header.ssrc != expected_ssrc {
-                self.stats.packets_filtered += 1;
-                return Ok(None);
-            }
+        if let Some(expected_ssrc) = self.ssrc_filter
+            && packet.header.ssrc != expected_ssrc
+        {
+            self.stats.packets_filtered += 1;
+            return Ok(None);
         }
 
         // Update stats

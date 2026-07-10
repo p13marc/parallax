@@ -633,12 +633,12 @@ impl DashSink {
         }
 
         // Finalize last segment
-        if self.segment_writer.is_open() {
-            if let Some(segment_info) = self.segment_writer.finalize(self.current_pts)? {
-                self.total_duration += segment_info.duration;
-                self.segments.push_back(segment_info);
-                self.total_segments += 1;
-            }
+        if self.segment_writer.is_open()
+            && let Some(segment_info) = self.segment_writer.finalize(self.current_pts)?
+        {
+            self.total_duration += segment_info.duration;
+            self.segments.push_back(segment_info);
+            self.total_segments += 1;
         }
 
         // Write final manifest
@@ -742,11 +742,12 @@ fn chrono_format_now() -> String {
     let mut remaining_days = days_since_epoch as u32;
 
     loop {
-        let days_in_year = if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
-            366
-        } else {
-            365
-        };
+        let days_in_year =
+            if year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400)) {
+                366
+            } else {
+                365
+            };
         if remaining_days < days_in_year {
             break;
         }
@@ -754,7 +755,7 @@ fn chrono_format_now() -> String {
         year += 1;
     }
 
-    let is_leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let is_leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
     let days_in_months: [u32; 12] = if is_leap {
         [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
     } else {

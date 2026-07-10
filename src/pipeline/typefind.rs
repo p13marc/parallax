@@ -194,13 +194,13 @@ impl TypeFindRegistry {
         let mut best: Option<TypeFindResult> = None;
 
         for finder in &self.finders {
-            if let Some(prob) = (finder.detect)(data) {
-                if best.as_ref().is_none_or(|b| prob > b.probability) {
-                    best = Some(TypeFindResult {
-                        media_type: finder.media_type.clone(),
-                        probability: prob,
-                    });
-                }
+            if let Some(prob) = (finder.detect)(data)
+                && best.as_ref().is_none_or(|b| prob > b.probability)
+            {
+                best = Some(TypeFindResult {
+                    media_type: finder.media_type.clone(),
+                    probability: prob,
+                });
             }
         }
 
@@ -231,13 +231,13 @@ impl TypeFindRegistry {
             return Some(result);
         }
         // Fall back to extension
-        if let Some(ext) = extension {
-            if let Some(media_type) = self.detect_from_extension(ext) {
-                return Some(TypeFindResult {
-                    media_type,
-                    probability: TypeFindProbability::Likely,
-                });
-            }
+        if let Some(ext) = extension
+            && let Some(media_type) = self.detect_from_extension(ext)
+        {
+            return Some(TypeFindResult {
+                media_type,
+                probability: TypeFindProbability::Likely,
+            });
         }
         None
     }

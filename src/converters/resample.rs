@@ -112,7 +112,7 @@ impl AudioResample {
         let sample_size = self.format.bytes_per_sample();
         let frame_size = sample_size * self.channels as usize;
 
-        if input.len() % frame_size != 0 {
+        if !input.len().is_multiple_of(frame_size) {
             return Err(Error::Config(format!(
                 "Input size {} not aligned to frame size {}",
                 input.len(),

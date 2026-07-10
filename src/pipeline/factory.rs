@@ -83,15 +83,12 @@ impl ElementFactory {
         }
 
         // Then try the plugin registry
-        if let Some(ref registry) = self.plugin_registry {
-            if registry.has_element(&parsed.name) {
-                return registry.create_element(&parsed.name).map_err(|e| {
-                    Error::InvalidSegment(format!(
-                        "failed to create element '{}': {}",
-                        parsed.name, e
-                    ))
-                });
-            }
+        if let Some(ref registry) = self.plugin_registry
+            && registry.has_element(&parsed.name)
+        {
+            return registry.create_element(&parsed.name).map_err(|e| {
+                Error::InvalidSegment(format!("failed to create element '{}': {}", parsed.name, e))
+            });
         }
 
         Err(Error::InvalidSegment(format!(

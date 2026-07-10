@@ -145,19 +145,19 @@ impl<E: VideoEncoder> EncoderElement<E> {
     fn buffer_to_frame(&mut self, buffer: &Buffer) -> Result<VideoFrame> {
         // Renegotiation: format metadata (set on the first buffer or on
         // format changes) overrides the configured format.
-        if let Some(MediaFormat::VideoRaw(vf)) = buffer.metadata().format {
-            if vf != self.format {
-                tracing::debug!(
-                    "encoder input renegotiated: {}x{} {:?} -> {}x{} {:?}",
-                    self.format.width,
-                    self.format.height,
-                    self.format.pixel_format,
-                    vf.width,
-                    vf.height,
-                    vf.pixel_format
-                );
-                self.format = vf;
-            }
+        if let Some(MediaFormat::VideoRaw(vf)) = buffer.metadata().format
+            && vf != self.format
+        {
+            tracing::debug!(
+                "encoder input renegotiated: {}x{} {:?} -> {}x{} {:?}",
+                self.format.width,
+                self.format.height,
+                self.format.pixel_format,
+                vf.width,
+                vf.height,
+                vf.pixel_format
+            );
+            self.format = vf;
         }
 
         let format = map_pixel_format(self.format.pixel_format)?;

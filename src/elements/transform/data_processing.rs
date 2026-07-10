@@ -236,31 +236,31 @@ impl Element for RangeFilter {
         let seq = buffer.metadata().sequence;
 
         // Check size constraints
-        if let Some(min) = self.min_size {
-            if size < min {
-                self.dropped.fetch_add(1, Ordering::Relaxed);
-                return Ok(None);
-            }
+        if let Some(min) = self.min_size
+            && size < min
+        {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
         }
-        if let Some(max) = self.max_size {
-            if size > max {
-                self.dropped.fetch_add(1, Ordering::Relaxed);
-                return Ok(None);
-            }
+        if let Some(max) = self.max_size
+            && size > max
+        {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
         }
 
         // Check sequence constraints
-        if let Some(min) = self.min_sequence {
-            if seq < min {
-                self.dropped.fetch_add(1, Ordering::Relaxed);
-                return Ok(None);
-            }
+        if let Some(min) = self.min_sequence
+            && seq < min
+        {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
         }
-        if let Some(max) = self.max_sequence {
-            if seq > max {
-                self.dropped.fetch_add(1, Ordering::Relaxed);
-                return Ok(None);
-            }
+        if let Some(max) = self.max_sequence
+            && seq > max
+        {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
         }
 
         self.passed.fetch_add(1, Ordering::Relaxed);
@@ -790,10 +790,10 @@ impl Element for BufferJoin {
         self.pending.push(data);
 
         // Check if we should flush
-        if let Some(max) = self.max_count {
-            if self.pending.len() >= max {
-                return self.flush();
-            }
+        if let Some(max) = self.max_count
+            && self.pending.len() >= max
+        {
+            return self.flush();
         }
 
         Ok(None)
@@ -929,30 +929,31 @@ impl Element for BufferConcat {
         let data = buffer.as_bytes();
 
         // Check if adding this would exceed max size
-        if let Some(max) = self.max_size {
-            if !self.pending.is_empty() && self.pending.len() + data.len() > max {
-                // Flush current, then start new
-                let result = self.flush();
-                self.pending.extend_from_slice(data);
-                self.pending_count = 1;
-                return result;
-            }
+        if let Some(max) = self.max_size
+            && !self.pending.is_empty()
+            && self.pending.len() + data.len() > max
+        {
+            // Flush current, then start new
+            let result = self.flush();
+            self.pending.extend_from_slice(data);
+            self.pending_count = 1;
+            return result;
         }
 
         self.pending.extend_from_slice(data);
         self.pending_count += 1;
 
         // Check if we should flush
-        if let Some(max) = self.max_count {
-            if self.pending_count >= max {
-                return self.flush();
-            }
+        if let Some(max) = self.max_count
+            && self.pending_count >= max
+        {
+            return self.flush();
         }
 
-        if let Some(max) = self.max_size {
-            if self.pending.len() >= max {
-                return self.flush();
-            }
+        if let Some(max) = self.max_size
+            && self.pending.len() >= max
+        {
+            return self.flush();
         }
 
         Ok(None)

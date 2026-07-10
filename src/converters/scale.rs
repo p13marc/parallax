@@ -43,10 +43,10 @@ impl VideoScale {
 
         // YUV formats require even dimensions
         if format.is_yuv()
-            && (input_width % 2 != 0
-                || input_height % 2 != 0
-                || output_width % 2 != 0
-                || output_height % 2 != 0)
+            && (!input_width.is_multiple_of(2)
+                || !input_height.is_multiple_of(2)
+                || !output_width.is_multiple_of(2)
+                || !output_height.is_multiple_of(2))
         {
             return Err(Error::Config("YUV formats require even dimensions".into()));
         }

@@ -874,7 +874,7 @@ impl MemoryLayout {
         if self.alignment <= 1 {
             true
         } else {
-            (ptr as usize) % (self.alignment as usize) == 0
+            (ptr as usize).is_multiple_of(self.alignment as usize)
         }
     }
 
@@ -884,7 +884,7 @@ impl MemoryLayout {
         if self.stride_alignment <= 1 {
             true
         } else {
-            stride % self.stride_alignment == 0
+            stride.is_multiple_of(self.stride_alignment)
         }
     }
 }

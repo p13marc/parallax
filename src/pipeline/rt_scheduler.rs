@@ -585,11 +585,11 @@ impl RtScheduler {
     pub fn select_driver(&mut self, partition: &GraphPartition, pipeline: &Pipeline) {
         // Find sinks in RT partition
         for &node_id in &partition.rt_nodes {
-            if let Some(node) = pipeline.get_node(node_id) {
-                if node.element_type() == crate::element::ElementType::Sink {
-                    self.driver = Some(node_id);
-                    return;
-                }
+            if let Some(node) = pipeline.get_node(node_id)
+                && node.element_type() == crate::element::ElementType::Sink
+            {
+                self.driver = Some(node_id);
+                return;
             }
         }
 
@@ -702,10 +702,10 @@ pub fn spawn_data_thread(
         .spawn(move || {
             // Set RT priority if configured
             #[cfg(target_os = "linux")]
-            if let Some(priority) = config.rt_priority {
-                if let Err(e) = set_rt_priority(priority) {
-                    tracing::warn!("failed to set RT priority: {}", e);
-                }
+            if let Some(priority) = config.rt_priority
+                && let Err(e) = set_rt_priority(priority)
+            {
+                tracing::warn!("failed to set RT priority: {}", e);
             }
 
             tracing::info!("data thread '{}' started", name);
@@ -853,16 +853,16 @@ pub fn spawn_data_thread(
                     // Signal downstream RT nodes by decrementing their pending counts
                     if let Some(downstreams) = downstream_map.get(&node_id) {
                         for downstream_id in downstreams {
-                            if let Some(downstream_activation) = activations.get(downstream_id) {
-                                if downstream_activation.decrement_pending() {
-                                    // Node is now ready — signal it
-                                    if let Err(e) = downstream_activation.signal() {
-                                        tracing::error!(
-                                            "failed to signal node {:?}: {}",
-                                            downstream_id,
-                                            e
-                                        );
-                                    }
+                            if let Some(downstream_activation) = activations.get(downstream_id)
+                                && downstream_activation.decrement_pending()
+                            {
+                                // Node is now ready — signal it
+                                if let Err(e) = downstream_activation.signal() {
+                                    tracing::error!(
+                                        "failed to signal node {:?}: {}",
+                                        downstream_id,
+                                        e
+                                    );
                                 }
                             }
                         }

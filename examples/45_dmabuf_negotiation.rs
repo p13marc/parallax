@@ -62,7 +62,7 @@ impl SimpleSink for GpuPreferredSink {
             _ => {}
         }
 
-        if frame_num <= 5 || frame_num % 30 == 0 {
+        if frame_num <= 5 || frame_num.is_multiple_of(30) {
             println!(
                 "Frame {}: {} bytes, memory type: {:?}",
                 frame_num,

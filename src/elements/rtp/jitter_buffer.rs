@@ -295,12 +295,11 @@ impl RtpJitterBuffer {
         }
 
         // Check for reordering
-        if !self.buffer.is_empty() {
-            if let Some((&last_seq, _)) = self.buffer.last_key_value() {
-                if ext_seq < last_seq {
-                    self.stats.packets_reordered += 1;
-                }
-            }
+        if !self.buffer.is_empty()
+            && let Some((&last_seq, _)) = self.buffer.last_key_value()
+            && ext_seq < last_seq
+        {
+            self.stats.packets_reordered += 1;
         }
 
         // Insert packet
@@ -367,20 +366,20 @@ impl RtpJitterBuffer {
 
             if elapsed > expected_output_time && !self.buffer.is_empty() {
                 // We've waited long enough, skip to the next available packet
-                if let Some((&next_available, _)) = self.buffer.first_key_value() {
-                    if next_available > self.state.next_output_seq {
-                        // Count skipped packets as lost
-                        let lost = next_available - self.state.next_output_seq;
-                        self.stats.packets_lost += lost as u64;
-                        self.state.next_output_seq = next_available;
+                if let Some((&next_available, _)) = self.buffer.first_key_value()
+                    && next_available > self.state.next_output_seq
+                {
+                    // Count skipped packets as lost
+                    let lost = next_available - self.state.next_output_seq;
+                    self.stats.packets_lost += lost as u64;
+                    self.state.next_output_seq = next_available;
 
-                        // Now try to output the available packet
-                        if let Some(packet) = self.buffer.remove(&self.state.next_output_seq) {
-                            self.state.next_output_seq += 1;
-                            self.stats.packets_output += 1;
-                            self.stats.buffer_level = self.buffer.len();
-                            return Some(packet.buffer);
-                        }
+                    // Now try to output the available packet
+                    if let Some(packet) = self.buffer.remove(&self.state.next_output_seq) {
+                        self.state.next_output_seq += 1;
+                        self.stats.packets_output += 1;
+                        self.stats.buffer_level = self.buffer.len();
+                        return Some(packet.buffer);
                     }
                 }
             }

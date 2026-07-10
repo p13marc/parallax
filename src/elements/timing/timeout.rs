@@ -77,12 +77,12 @@ impl Timeout {
 
     /// Check if timeout has occurred and return fallback if so.
     pub fn check_timeout(&mut self) -> Result<Option<Buffer>> {
-        if let Some(last) = self.last_buffer {
-            if last.elapsed() >= self.timeout {
-                self.timeouts_triggered.fetch_add(1, Ordering::Relaxed);
-                self.last_buffer = Some(Instant::now());
-                return self.create_fallback();
-            }
+        if let Some(last) = self.last_buffer
+            && last.elapsed() >= self.timeout
+        {
+            self.timeouts_triggered.fetch_add(1, Ordering::Relaxed);
+            self.last_buffer = Some(Instant::now());
+            return self.create_fallback();
         }
         Ok(None)
     }
@@ -186,12 +186,12 @@ impl Debounce {
 
     /// Check if quiet period has passed and flush held buffer.
     pub fn check_quiet(&mut self) -> Option<Buffer> {
-        if let Some(time) = self.last_buffer_time {
-            if time.elapsed() >= self.quiet_period {
-                self.passed.fetch_add(1, Ordering::Relaxed);
-                self.last_buffer_time = None;
-                return self.last_buffer.take();
-            }
+        if let Some(time) = self.last_buffer_time
+            && time.elapsed() >= self.quiet_period
+        {
+            self.passed.fetch_add(1, Ordering::Relaxed);
+            self.last_buffer_time = None;
+            return self.last_buffer.take();
         }
         None
     }

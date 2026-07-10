@@ -585,10 +585,10 @@ impl Pipeline {
         let mut best: Option<(Arc<dyn Clock>, u32)> = None;
 
         for (_id, node) in self.nodes() {
-            if let Some((clock, priority)) = &node.provided_clock {
-                if best.as_ref().is_none_or(|(_, p)| *priority > *p) {
-                    best = Some((clock.clone(), *priority));
-                }
+            if let Some((clock, priority)) = &node.provided_clock
+                && best.as_ref().is_none_or(|(_, p)| *priority > *p)
+            {
+                best = Some((clock.clone(), *priority));
             }
         }
 
@@ -919,10 +919,10 @@ impl Pipeline {
 
         // Check all links for negotiated formats
         for link in self.links() {
-            if let Some(format) = &link.negotiated_format {
-                if let Some(size) = format.buffer_size() {
-                    max_size = max_size.max(size);
-                }
+            if let Some(format) = &link.negotiated_format
+                && let Some(size) = format.buffer_size()
+            {
+                max_size = max_size.max(size);
             }
         }
 
@@ -1532,20 +1532,19 @@ impl Pipeline {
     /// Query whether any source in the pipeline supports seeking.
     pub fn query_seekable(&self) -> crate::pipeline::seek::SeekableQuery {
         for src_id in self.sources() {
-            if let Some(node) = self.get_node(src_id) {
-                if let Some(ref element) = node.element {
-                    if element.is_seekable() {
-                        let duration = element
-                            .source_query_duration()
-                            .and_then(|d| d.duration)
-                            .unwrap_or(0);
-                        return crate::pipeline::seek::SeekableQuery {
-                            seekable: true,
-                            start: 0,
-                            stop: duration,
-                        };
-                    }
-                }
+            if let Some(node) = self.get_node(src_id)
+                && let Some(ref element) = node.element
+                && element.is_seekable()
+            {
+                let duration = element
+                    .source_query_duration()
+                    .and_then(|d| d.duration)
+                    .unwrap_or(0);
+                return crate::pipeline::seek::SeekableQuery {
+                    seekable: true,
+                    start: 0,
+                    stop: duration,
+                };
             }
         }
         crate::pipeline::seek::SeekableQuery::not_seekable()
@@ -1557,12 +1556,11 @@ impl Pipeline {
     /// Only works when the pipeline is not running (elements not yet taken).
     pub fn query_position(&self) -> Option<crate::pipeline::seek::PositionQuery> {
         for src_id in self.sources() {
-            if let Some(node) = self.get_node(src_id) {
-                if let Some(ref element) = node.element {
-                    if let Some(pos) = element.source_query_position() {
-                        return Some(pos);
-                    }
-                }
+            if let Some(node) = self.get_node(src_id)
+                && let Some(ref element) = node.element
+                && let Some(pos) = element.source_query_position()
+            {
+                return Some(pos);
             }
         }
         None
@@ -1574,12 +1572,11 @@ impl Pipeline {
     /// Only works when the pipeline is not running (elements not yet taken).
     pub fn query_duration(&self) -> Option<crate::pipeline::seek::DurationQuery> {
         for src_id in self.sources() {
-            if let Some(node) = self.get_node(src_id) {
-                if let Some(ref element) = node.element {
-                    if let Some(dur) = element.source_query_duration() {
-                        return Some(dur);
-                    }
-                }
+            if let Some(node) = self.get_node(src_id)
+                && let Some(ref element) = node.element
+                && let Some(dur) = element.source_query_duration()
+            {
+                return Some(dur);
             }
         }
         None
@@ -1593,12 +1590,11 @@ impl Pipeline {
         let source_ids = self.sources();
         let mut handled = false;
         for src_id in source_ids {
-            if let Some(node) = self.get_node_mut(src_id) {
-                if let Some(ref mut element) = node.element {
-                    if element.handle_upstream_event(event).is_handled() {
-                        handled = true;
-                    }
-                }
+            if let Some(node) = self.get_node_mut(src_id)
+                && let Some(ref mut element) = node.element
+                && element.handle_upstream_event(event).is_handled()
+            {
+                handled = true;
             }
         }
         handled

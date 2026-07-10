@@ -179,7 +179,8 @@ impl VideoConvert {
         }
 
         // Validate YUV formats require even dimensions
-        if (input_format.is_yuv() || output_format.is_yuv()) && (width % 2 != 0 || height % 2 != 0)
+        if (input_format.is_yuv() || output_format.is_yuv())
+            && (!width.is_multiple_of(2) || !height.is_multiple_of(2))
         {
             return Err(Error::Config(
                 "YUV formats require even width and height".into(),

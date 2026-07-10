@@ -109,24 +109,23 @@ impl Batch {
 
     /// Check if a batch should be flushed.
     fn should_flush(&self) -> bool {
-        if let Some(max) = self.max_count {
-            if self.pending.len() >= max {
-                return true;
-            }
+        if let Some(max) = self.max_count
+            && self.pending.len() >= max
+        {
+            return true;
         }
 
-        if let Some(max) = self.max_bytes {
-            if self.pending_bytes >= max {
-                return true;
-            }
+        if let Some(max) = self.max_bytes
+            && self.pending_bytes >= max
+        {
+            return true;
         }
 
-        if let Some(timeout) = self.timeout {
-            if let Some(start) = self.batch_start {
-                if start.elapsed() >= timeout {
-                    return true;
-                }
-            }
+        if let Some(timeout) = self.timeout
+            && let Some(start) = self.batch_start
+            && start.elapsed() >= timeout
+        {
+            return true;
         }
 
         false
@@ -193,12 +192,11 @@ impl Batch {
 
     /// Check if timeout has expired and flush if needed.
     pub fn check_timeout(&mut self) -> Result<Option<Buffer>> {
-        if let Some(timeout) = self.timeout {
-            if let Some(start) = self.batch_start {
-                if start.elapsed() >= timeout {
-                    return self.flush();
-                }
-            }
+        if let Some(timeout) = self.timeout
+            && let Some(start) = self.batch_start
+            && start.elapsed() >= timeout
+        {
+            return self.flush();
         }
         Ok(None)
     }

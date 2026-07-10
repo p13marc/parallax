@@ -134,10 +134,10 @@ impl Source for DataSrc {
         if self.position >= self.data.len() {
             // Check if we should repeat
             if self.repeat {
-                if let Some(max_repeats) = self.repeat_count {
-                    if self.repeats_done >= max_repeats {
-                        return Ok(ProduceResult::Eos);
-                    }
+                if let Some(max_repeats) = self.repeat_count
+                    && self.repeats_done >= max_repeats
+                {
+                    return Ok(ProduceResult::Eos);
                 }
                 self.position = 0;
                 self.repeats_done += 1;

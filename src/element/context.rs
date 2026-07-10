@@ -295,10 +295,10 @@ impl<'a> ProduceContext<'a> {
     ///
     /// Returns `ClockTime::NONE` if no clock is configured or pipeline hasn't started.
     pub fn running_time(&self) -> ClockTime {
-        if let Some(clock) = &self.clock {
-            if self.base_time.is_some() {
-                return clock.now().saturating_sub(self.base_time);
-            }
+        if let Some(clock) = &self.clock
+            && self.base_time.is_some()
+        {
+            return clock.now().saturating_sub(self.base_time);
         }
         ClockTime::NONE
     }

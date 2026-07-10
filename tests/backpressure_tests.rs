@@ -76,13 +76,14 @@ impl Source for FlowAwareSource {
         }
 
         // Check backpressure
-        if let Some(ref flow_state) = self.flow_state {
-            if !flow_state.should_produce() && self.flow_policy.allows_dropping() {
-                self.dropped += 1;
-                flow_state.record_drop();
-                self.count += 1;
-                return Ok(ProduceResult::WouldBlock);
-            }
+        if let Some(ref flow_state) = self.flow_state
+            && !flow_state.should_produce()
+            && self.flow_policy.allows_dropping()
+        {
+            self.dropped += 1;
+            flow_state.record_drop();
+            self.count += 1;
+            return Ok(ProduceResult::WouldBlock);
         }
 
         let buffer = create_test_buffer(self.count);

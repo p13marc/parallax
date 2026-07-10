@@ -201,15 +201,13 @@ impl ConverterRegistry {
         }
 
         // If formats match, check for memory-only conversion
-        if from_format == to_format
+        if (from_format == to_format
             || from_format == FormatType::Any
-            || to_format == FormatType::Any
-        {
-            if let Some((factory, info)) =
+            || to_format == FormatType::Any)
+            && let Some((factory, info)) =
                 self.find_direct(FormatType::Any, FormatType::Any, from_memory, to_memory)
-            {
-                return Some((vec![(factory.clone(), info.clone())], info.cost));
-            }
+        {
+            return Some((vec![(factory.clone(), info.clone())], info.cost));
         }
 
         // NOTE: Multi-hop path finding with Dijkstra would improve this

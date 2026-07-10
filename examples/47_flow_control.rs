@@ -75,23 +75,23 @@ impl Source for SimulatedCameraSource {
         self.last_frame_time = Some(now);
 
         // Check backpressure BEFORE producing
-        if let Some(ref flow_state) = self.flow_state {
-            if !flow_state.should_produce() {
-                // Downstream is congested - drop this frame
-                self.frames_dropped += 1;
-                self.frame_count += 1;
-                flow_state.record_drop();
+        if let Some(ref flow_state) = self.flow_state
+            && !flow_state.should_produce()
+        {
+            // Downstream is congested - drop this frame
+            self.frames_dropped += 1;
+            self.frame_count += 1;
+            flow_state.record_drop();
 
-                // Log periodically
-                if self.frames_dropped == 1 || self.frames_dropped % 10 == 0 {
-                    println!(
-                        "  [Camera] Dropped frame {} (backpressure, total dropped: {})",
-                        self.frame_count, self.frames_dropped
-                    );
-                }
-
-                return Ok(ProduceResult::WouldBlock);
+            // Log periodically
+            if self.frames_dropped == 1 || self.frames_dropped.is_multiple_of(10) {
+                println!(
+                    "  [Camera] Dropped frame {} (backpressure, total dropped: {})",
+                    self.frame_count, self.frames_dropped
+                );
             }
+
+            return Ok(ProduceResult::WouldBlock);
         }
 
         // Produce the frame
@@ -228,7 +228,7 @@ fn main() -> Result<()> {
                     let _ = encoder.process(buffer);
 
                     // Print progress periodically
-                    if encoder.frames_processed() % 20 == 0 {
+                    if encoder.frames_processed().is_multiple_of(20) {
                         println!(
                             "  [Encoder] Processed {} frames, queue fill: {:.0}%",
                             encoder.frames_processed(),

@@ -568,26 +568,26 @@ impl Source for V4l2Src {
     fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
         // Check for downstream backpressure before capturing
         // V4L2 is a live source - dropping frames is better than accumulating lag
-        if let Some(ref flow_state) = self.flow_state {
-            if !flow_state.should_produce() {
-                // Drop this frame due to backpressure
-                self.frames_dropped += 1;
-                flow_state.record_drop();
+        if let Some(ref flow_state) = self.flow_state
+            && !flow_state.should_produce()
+        {
+            // Drop this frame due to backpressure
+            self.frames_dropped += 1;
+            flow_state.record_drop();
 
-                if self.frames_dropped == 1 || self.frames_dropped % 30 == 0 {
-                    tracing::warn!(
-                        "V4L2: dropping frame due to backpressure (total dropped: {})",
-                        self.frames_dropped
-                    );
-                }
-
-                // We need to dequeue and discard a frame to keep the driver happy
-                if let Some(stream) = self.stream.as_mut() {
-                    let _ = stream.next(); // Discard frame
-                }
-
-                return Ok(ProduceResult::WouldBlock);
+            if self.frames_dropped == 1 || self.frames_dropped.is_multiple_of(30) {
+                tracing::warn!(
+                    "V4L2: dropping frame due to backpressure (total dropped: {})",
+                    self.frames_dropped
+                );
             }
+
+            // We need to dequeue and discard a frame to keep the driver happy
+            if let Some(stream) = self.stream.as_mut() {
+                let _ = stream.next(); // Discard frame
+            }
+
+            return Ok(ProduceResult::WouldBlock);
         }
 
         // DMA-BUF export path: capture frame and return DmaBufBuffer
