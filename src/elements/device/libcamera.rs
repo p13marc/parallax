@@ -18,12 +18,12 @@
 //! // Use default camera with auto configuration
 //! let camera = LibCameraSrc::new()?;
 //!
-//! // Or configure specific format
+//! // Or configure format and frame rate
 //! let config = LibCameraConfig {
 //!     width: 1920,
 //!     height: 1080,
-//!     format: PixelFormat::NV12,
-//!     buffer_count: 4,
+//!     framerate: Some((30, 1)),
+//!     ..Default::default()
 //! };
 //! let camera = LibCameraSrc::with_config(config)?;
 //! ```
@@ -37,6 +37,7 @@ use kanal::{Receiver, Sender, bounded};
 use libcamera::{
     camera::CameraConfigurationStatus,
     camera_manager::{CameraManager, HotplugEvent},
+    control::{ControlInfoMap, ControlList},
     controls,
     framebuffer::AsFrameBuffer,
     framebuffer_allocator::{FrameBuffer, FrameBufferAllocator},
@@ -199,6 +200,17 @@ pub struct LibCameraConfig {
     pub format: Option<PixelFormat>,
     /// Number of buffers to allocate.
     pub buffer_count: usize,
+    /// Desired frame rate as frames-per-second numerator/denominator
+    /// (e.g. `(30, 1)` for 30 fps, `(30000, 1001)` for 29.97 fps).
+    /// `None` keeps the camera default.
+    ///
+    /// Applied by locking the `FrameDurationLimits` control (min = max =
+    /// one frame duration) at start; the requested duration is clamped to
+    /// the camera's advertised bounds — read the effective rate back with
+    /// [`LibCameraSrc::framerate`]. Best-effort: some pipeline handlers
+    /// (notably UVC webcams) do not honor the control, so the true rate is
+    /// only observable from buffer PTS deltas.
+    pub framerate: Option<(u32, u32)>,
 }
 
 impl Default for LibCameraConfig {
@@ -208,8 +220,50 @@ impl Default for LibCameraConfig {
             height: 0,
             format: None,
             buffer_count: 4,
+            framerate: None,
         }
     }
+}
+
+/// Convert an fps fraction to a frame duration in microseconds.
+fn framerate_to_duration_us(num: u32, den: u32) -> Result<u64> {
+    if num == 0 || den == 0 {
+        return Err(crate::error::Error::Config(format!(
+            "invalid framerate {num}/{den}"
+        )));
+    }
+    Ok((1_000_000u64 * u64::from(den)) / u64::from(num))
+}
+
+/// Clamp a requested frame duration (µs) to advertised control bounds.
+///
+/// `bounds` is `(min, max)` from the camera's `FrameDurationLimits` control
+/// info; requests pass through unclamped when the camera advertises no
+/// usable bounds.
+fn clamp_frame_duration_us(requested_us: u64, bounds: Option<(i64, i64)>) -> u64 {
+    match bounds {
+        Some((min, max)) if min >= 0 && max >= min => requested_us.clamp(min as u64, max as u64),
+        _ => requested_us,
+    }
+}
+
+/// Read the camera's advertised `FrameDurationLimits` bounds in µs, if any.
+fn frame_duration_bounds(controls: &ControlInfoMap) -> Option<(i64, i64)> {
+    let info = controls
+        .at(controls::ControlId::FrameDurationLimits as u32)
+        .ok()?;
+    let min = i64::try_from(info.min()).ok()?;
+    let max = i64::try_from(info.max()).ok()?;
+    Some((min, max))
+}
+
+/// Reduce an fps fraction by its greatest common divisor.
+fn reduce_fraction(num: u32, den: u32) -> (u32, u32) {
+    fn gcd(a: u32, b: u32) -> u32 {
+        if b == 0 { a } else { gcd(b, a % b) }
+    }
+    let g = gcd(num, den).max(1);
+    (num / g, den / g)
 }
 
 /// Captured frame from libcamera.
@@ -232,6 +286,10 @@ struct NegotiatedInfo {
     height: u32,
     /// Frame size in bytes as reported by the stream configuration.
     frame_size: u32,
+    /// Frame duration applied via `FrameDurationLimits` (µs), after
+    /// clamping to the camera's advertised bounds. `None` when no rate was
+    /// requested.
+    frame_duration_us: Option<u64>,
 }
 
 /// How long the constructor waits for the capture thread to configure and
@@ -253,6 +311,10 @@ pub struct LibCameraSrc {
     config: LibCameraConfig,
     /// Stream parameters actually negotiated with the camera.
     negotiated: NegotiatedInfo,
+    /// Effective frame rate as an fps fraction, when one was requested.
+    framerate: Option<(u32, u32)>,
+    /// Frame duration hint stamped into buffer metadata.
+    frame_duration: ClockTime,
     /// Camera ID being used.
     camera_id: String,
     /// First frame timestamp for relative PTS calculation (ns; `i64::MIN`
@@ -315,7 +377,7 @@ impl LibCameraSrc {
             })
             .map_err(|e| DeviceError::LibCamera(format!("failed to spawn thread: {e}")))?;
 
-        let negotiated = match startup_rx.recv_timeout(STARTUP_TIMEOUT) {
+        let negotiated: NegotiatedInfo = match startup_rx.recv_timeout(STARTUP_TIMEOUT) {
             Ok(Ok(info)) => info,
             Ok(Err(e)) => {
                 let _ = thread.join();
@@ -332,12 +394,30 @@ impl LibCameraSrc {
             }
         };
 
+        // Report the effective rate: echo the requested fraction when it
+        // survived clamping unchanged, otherwise derive one from the
+        // clamped duration.
+        let framerate = negotiated
+            .frame_duration_us
+            .map(|us| match config.framerate {
+                Some((num, den)) if framerate_to_duration_us(num, den).ok() == Some(us) => {
+                    (num, den)
+                }
+                _ => reduce_fraction(1_000_000, us.min(u64::from(u32::MAX)) as u32),
+            });
+        let frame_duration = negotiated
+            .frame_duration_us
+            .map(|us| ClockTime::from_nanos(us * 1000))
+            .unwrap_or(ClockTime::ZERO);
+
         Ok(Self {
             receiver: frame_rx,
             shutdown: shutdown_tx,
             thread: Some(thread),
             config,
             negotiated,
+            framerate,
+            frame_duration,
             camera_id: camera_id.to_string(),
             first_timestamp_ns: AtomicI64::new(i64::MIN),
             flow_state: None,
@@ -404,6 +484,26 @@ impl LibCameraSrc {
             .configure(&mut cam_config)
             .map_err(|e| DeviceError::LibCamera(e.to_string()))?;
 
+        // Frame rate: lock FrameDurationLimits to a single duration, clamped
+        // to the camera's advertised bounds (libcamera has no read-back of
+        // the applied rate, so the clamped request is what we report).
+        let frame_duration_us = match config.framerate {
+            Some((num, den)) => {
+                let requested = framerate_to_duration_us(num, den)?;
+                let clamped =
+                    clamp_frame_duration_us(requested, frame_duration_bounds(camera.controls()));
+                if clamped != requested {
+                    tracing::warn!(
+                        "libcamera: requested frame duration {}µs clamped to {}µs",
+                        requested,
+                        clamped
+                    );
+                }
+                Some(clamped)
+            }
+            None => None,
+        };
+
         // Get stream and the actually-applied parameters
         let stream = cam_config.get(0).unwrap().stream().unwrap();
         let stream_config = cam_config.get(0).unwrap();
@@ -411,6 +511,7 @@ impl LibCameraSrc {
             width: stream_config.get_size().width,
             height: stream_config.get_size().height,
             frame_size: stream_config.get_frame_size(),
+            frame_duration_us,
         };
 
         let mut allocator = FrameBufferAllocator::new(&camera);
@@ -438,9 +539,21 @@ impl LibCameraSrc {
         // Subscribe to completion events before anything can complete
         let completed_rx = camera.subscribe_request_completed();
 
+        let start_controls = match frame_duration_us {
+            Some(us) => {
+                let mut list = ControlList::new();
+                list.set(controls::FrameDurationLimits([us as i64, us as i64]))
+                    .map_err(|e| {
+                        DeviceError::LibCamera(format!("setting FrameDurationLimits: {e}"))
+                    })?;
+                Some(list)
+            }
+            None => None,
+        };
+
         // Start camera before queueing so completed requests flow immediately
         camera
-            .start(None)
+            .start(start_controls.as_deref())
             .map_err(|e| DeviceError::LibCamera(e.to_string()))?;
 
         // Queue all requests (queue_request hands the request back on failure)
@@ -547,6 +660,17 @@ impl LibCameraSrc {
         self.negotiated.height
     }
 
+    /// Effective frame rate as an fps fraction (numerator, denominator).
+    ///
+    /// This is the requested rate after clamping to the camera's advertised
+    /// `FrameDurationLimits` bounds; `None` when no rate was requested
+    /// (camera default). Best-effort: pipeline handlers that ignore the
+    /// control (e.g. UVC webcams) run at their own rate, observable from
+    /// buffer PTS deltas.
+    pub fn framerate(&self) -> Option<(u32, u32)> {
+        self.framerate
+    }
+
     /// Calculate relative PTS from a capture timestamp.
     ///
     /// libcamera reports absolute CLOCK_MONOTONIC timestamps; convert to
@@ -622,6 +746,9 @@ impl AsyncSource for LibCameraSrc {
                     ctx.output()[..len].copy_from_slice(&frame.data);
                     ctx.set_pts(self.calculate_pts(frame.timestamp_ns));
                     ctx.set_sequence(frame.sequence);
+                    if self.frame_duration > ClockTime::ZERO {
+                        ctx.metadata_mut().duration = self.frame_duration;
+                    }
                     Ok(ProduceResult::Produced(len))
                 } else if len > ctx.output().len() {
                     // Buffer too small - request larger buffer
@@ -671,6 +798,46 @@ impl AsyncSource for LibCameraSrc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_framerate_to_duration() {
+        assert_eq!(framerate_to_duration_us(30, 1).unwrap(), 33333);
+        assert_eq!(framerate_to_duration_us(30000, 1001).unwrap(), 33366);
+        assert_eq!(framerate_to_duration_us(15, 1).unwrap(), 66666);
+        assert_eq!(framerate_to_duration_us(1, 1).unwrap(), 1_000_000);
+        assert!(framerate_to_duration_us(0, 1).is_err());
+        assert!(framerate_to_duration_us(30, 0).is_err());
+    }
+
+    #[test]
+    fn test_clamp_frame_duration() {
+        // In range: unchanged
+        assert_eq!(
+            clamp_frame_duration_us(33333, Some((10_000, 100_000))),
+            33333
+        );
+        // Below min / above max: clamped
+        assert_eq!(
+            clamp_frame_duration_us(5_000, Some((10_000, 100_000))),
+            10_000
+        );
+        assert_eq!(
+            clamp_frame_duration_us(200_000, Some((10_000, 100_000))),
+            100_000
+        );
+        // No or nonsensical bounds: passthrough
+        assert_eq!(clamp_frame_duration_us(33333, None), 33333);
+        assert_eq!(clamp_frame_duration_us(33333, Some((-1, 100))), 33333);
+        assert_eq!(clamp_frame_duration_us(33333, Some((100, 10))), 33333);
+    }
+
+    #[test]
+    fn test_reduce_fraction() {
+        assert_eq!(reduce_fraction(1_000_000, 33333), (1_000_000, 33333)); // coprime
+        assert_eq!(reduce_fraction(1_000_000, 50_000), (20, 1));
+        assert_eq!(reduce_fraction(1_000_000, 66666), (500_000, 33333));
+        assert_eq!(reduce_fraction(30, 0), (1, 0)); // gcd(30, 0) = 30; no panic
+    }
 
     #[test]
     fn test_is_available() {

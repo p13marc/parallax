@@ -57,7 +57,8 @@ fn main() {
             let config = LibCameraConfig {
                 width: 640,
                 height: 480,
-                format: None, // Use default format
+                format: None,             // Use default format
+                framerate: Some((15, 1)), // Request 15 fps (best-effort)
                 buffer_count: 4,
             };
 
