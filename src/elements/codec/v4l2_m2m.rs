@@ -427,7 +427,12 @@ impl V4l2M2mH264Encoder {
                         })?;
                     }
                 }
-                Err(v4l2r::ioctl::IoctlConvertError::IoctlError(DqBufIoctlError::NotReady)) => {
+                // NotReady: nothing encoded yet. Eos (EPIPE): the stream is
+                // stopped after a drain and produces nothing until the
+                // re-arm takes effect — same answer for a non-blocking poll.
+                Err(v4l2r::ioctl::IoctlConvertError::IoctlError(
+                    DqBufIoctlError::NotReady | DqBufIoctlError::Eos,
+                )) => {
                     break;
                 }
                 Err(e) => {
@@ -558,6 +563,11 @@ impl VideoEncoder for V4l2M2mH264Encoder {
                     if is_last {
                         break 'drain;
                     }
+                }
+                // Eos (EPIPE): the driver already considers the stream
+                // stopped — drain complete.
+                Err(v4l2r::ioctl::IoctlConvertError::IoctlError(DqBufIoctlError::Eos)) => {
+                    break 'drain;
                 }
                 Err(v4l2r::ioctl::IoctlConvertError::IoctlError(DqBufIoctlError::NotReady)) => {
                     if self.capture_queue.num_queued_buffers() == 0 {
