@@ -884,15 +884,17 @@ mod tests {
     }
 
     fn open_with_any_input(device: &str, coded: V4l2CodedFormat) -> V4l2M2mH264Encoder {
-        [PixelFormat::Nv12, PixelFormat::I420]
-            .into_iter()
-            .find_map(|pf| {
-                let config = V4l2M2mEncoderConfig::new(320, 240)
-                    .pixel_format(pf)
-                    .coded_format(coded);
-                V4l2M2mH264Encoder::new(device, config).ok()
-            })
-            .expect("device accepts neither NV12 nor I420 input")
+        let mut failures = Vec::new();
+        for pf in [PixelFormat::Nv12, PixelFormat::I420] {
+            let config = V4l2M2mEncoderConfig::new(320, 240)
+                .pixel_format(pf)
+                .coded_format(coded);
+            match V4l2M2mH264Encoder::new(device, config) {
+                Ok(encoder) => return encoder,
+                Err(e) => failures.push(format!("{pf:?}: {e}")),
+            }
+        }
+        panic!("device accepts neither NV12 nor I420 input: {failures:?}");
     }
 
     /// Hardware-gated: `modprobe vicodec`, then set
