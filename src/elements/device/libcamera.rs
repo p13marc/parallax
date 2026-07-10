@@ -30,13 +30,14 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock, mpsc as std_mpsc};
 use std::thread;
 use std::time::Duration;
 
 use kanal::{Receiver, Sender, bounded};
 use libcamera::{
     camera::CameraConfigurationStatus,
-    camera_manager::CameraManager,
+    camera_manager::{CameraManager, HotplugEvent},
     framebuffer_allocator::{FrameBuffer, FrameBufferAllocator},
     framebuffer_map::MemoryMappedFrameBuffer,
     pixel_format::PixelFormat,
@@ -50,12 +51,93 @@ use crate::pipeline::flow::{FlowPolicy, FlowSignal, FlowStateHandle};
 
 use super::{CameraLocation, DeviceError};
 
+/// Process-wide [`CameraManager`] plus the hotplug subscription made at init.
+///
+/// libcamera enforces a single `CameraManager` per process — constructing a
+/// second one while the first is alive is a fatal error in the C++ library
+/// ("Multiple CameraManager objects are not allowed"). Everything in this
+/// crate therefore shares this one instance, created on first use and kept
+/// for the lifetime of the process.
+struct SharedCameraManager {
+    manager: CameraManager,
+    /// Hotplug event receiver, subscribed once at init (the crate replaces
+    /// the internal sender on re-subscription, so it must never be called
+    /// again). Taken by `DeviceMonitor` and returned when it shuts down.
+    #[cfg_attr(not(feature = "hotplug"), allow(dead_code))]
+    hotplug_rx: Mutex<Option<std_mpsc::Receiver<HotplugEvent>>>,
+}
+
+// SAFETY: `CameraManager` is `!Send`/`!Sync` because it holds raw pointers,
+// but the C++ `CameraManager` methods reachable through `&self` on the Rust
+// wrapper (`cameras()`, `get()`, `version()`, `is_started()`) are documented
+// thread-safe in libcamera (internal locking). All `&mut self` methods
+// (`subscribe_hotplug_events`) are called exactly once inside `shared()`
+// before the reference is published, and the leaked reference makes further
+// `&mut` access impossible. The hotplug callbacks registered by the crate
+// run on libcamera's internal thread and only touch the mpsc sender, which
+// is what `subscribe_hotplug_events` set up for exactly that purpose.
+// `hotplug_rx` is independently synchronized by its `Mutex`.
+unsafe impl Send for SharedCameraManager {}
+unsafe impl Sync for SharedCameraManager {}
+
+/// Cached init result: the leaked shared manager, or a sticky error string
+/// (libcamera has no daemon that could "come up later", so retrying is
+/// pointless and would risk the fatal double-instantiation).
+static SHARED: OnceLock<std::result::Result<&'static SharedCameraManager, String>> =
+    OnceLock::new();
+
+fn shared() -> Result<&'static SharedCameraManager> {
+    SHARED
+        .get_or_init(|| {
+            let mut manager = CameraManager::new().map_err(|e| e.to_string())?;
+            let hotplug_rx = manager.subscribe_hotplug_events();
+            Ok(&*Box::leak(Box::new(SharedCameraManager {
+                manager,
+                hotplug_rx: Mutex::new(Some(hotplug_rx)),
+            })))
+        })
+        .clone()
+        .map_err(|e| DeviceError::LibCamera(e).into())
+}
+
+/// Get the process-wide shared [`CameraManager`].
+///
+/// The first call creates (and leaks) the manager; a failure to create it is
+/// cached and returned on every subsequent call.
+pub(crate) fn shared_manager() -> Result<&'static CameraManager> {
+    shared().map(|s| &s.manager)
+}
+
+/// Take the process-wide hotplug event receiver, draining any stale events.
+///
+/// Returns `None` if libcamera is unavailable or another holder (a running
+/// `DeviceMonitor`) already took it. Hand it back with
+/// [`return_hotplug_receiver`] so a later monitor can use it.
+#[cfg(feature = "hotplug")]
+#[allow(dead_code)] // wired up by DeviceMonitor's libcamera integration
+pub(crate) fn take_hotplug_receiver() -> Option<std_mpsc::Receiver<HotplugEvent>> {
+    let rx = shared().ok()?.hotplug_rx.lock().unwrap().take();
+    if let Some(rx) = &rx {
+        // Events that accumulated while nobody was listening are stale.
+        while rx.try_recv().is_ok() {}
+    }
+    rx
+}
+
+/// Return the hotplug receiver taken with [`take_hotplug_receiver`].
+#[cfg(feature = "hotplug")]
+#[allow(dead_code)] // wired up by DeviceMonitor's libcamera integration
+pub(crate) fn return_hotplug_receiver(rx: std_mpsc::Receiver<HotplugEvent>) {
+    if let Ok(s) = shared() {
+        *s.hotplug_rx.lock().unwrap() = Some(rx);
+    }
+}
+
 /// Check if libcamera is available on this system.
 pub fn is_available() -> bool {
-    match CameraManager::new() {
-        Ok(cm) => !cm.cameras().is_empty(),
-        Err(_) => false,
-    }
+    shared_manager()
+        .map(|m| !m.cameras().is_empty())
+        .unwrap_or(false)
 }
 
 /// Information about a libcamera camera.
@@ -71,7 +153,7 @@ pub struct LibCameraInfo {
 
 /// Enumerate cameras available via libcamera.
 pub fn enumerate_cameras() -> Result<Vec<LibCameraInfo>> {
-    let cm = CameraManager::new().map_err(|e| DeviceError::LibCamera(e.to_string()))?;
+    let cm = shared_manager()?;
 
     let camera_list = cm.cameras();
     let mut cameras = Vec::new();
@@ -213,21 +295,11 @@ impl LibCameraSrc {
         _frame_tx: Sender<CapturedFrame>,
         shutdown_rx: Receiver<()>,
     ) -> Result<()> {
-        // Create camera manager
-        let cm = CameraManager::new().map_err(|e| DeviceError::LibCamera(e.to_string()))?;
-
-        // Find camera
-        let camera_list = cm.cameras();
-        let mut found_camera = None;
-        for i in 0..camera_list.len() {
-            if let Some(camera) = camera_list.get(i) {
-                if camera.id() == camera_id {
-                    found_camera = Some(camera);
-                    break;
-                }
-            }
-        }
-        let camera = found_camera.ok_or_else(|| DeviceError::NotFound(camera_id.clone()))?;
+        // Look up the camera via the process-wide shared manager
+        let cm = shared_manager()?;
+        let camera = cm
+            .get(&camera_id)
+            .ok_or_else(|| DeviceError::NotFound(camera_id.clone()))?;
 
         // Acquire camera
         let mut camera = camera
