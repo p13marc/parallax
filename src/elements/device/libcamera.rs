@@ -35,7 +35,7 @@ use std::time::Duration;
 
 use kanal::{Receiver, Sender, bounded};
 use libcamera::{
-    camera::CameraConfigurationStatus,
+    camera::{Camera, CameraConfigurationStatus},
     camera_manager::{CameraManager, HotplugEvent},
     control::{ControlInfoMap, ControlList},
     controls,
@@ -155,6 +155,18 @@ pub struct LibCameraInfo {
     pub location: CameraLocation,
 }
 
+/// Map a camera's `Location` property to a [`CameraLocation`].
+///
+/// Cameras that don't report the property (common for UVC devices) count
+/// as `External`.
+fn location_from_properties(camera: &Camera<'_>) -> CameraLocation {
+    match camera.properties().get::<properties::Location>() {
+        Ok(properties::Location::CameraFront) => CameraLocation::Front,
+        Ok(properties::Location::CameraBack) => CameraLocation::Back,
+        Ok(properties::Location::CameraExternal) | Err(_) => CameraLocation::External,
+    }
+}
+
 /// Enumerate cameras available via libcamera.
 pub fn enumerate_cameras() -> Result<Vec<LibCameraInfo>> {
     let cm = shared_manager()?;
@@ -162,28 +174,23 @@ pub fn enumerate_cameras() -> Result<Vec<LibCameraInfo>> {
     let camera_list = cm.cameras();
     let mut cameras = Vec::new();
 
-    for i in 0..camera_list.len() {
-        if let Some(camera) = camera_list.get(i) {
-            let id = camera.id().to_string();
+    for camera in camera_list.iter() {
+        let id = camera.id().to_string();
 
-            // Get model from properties - use id as fallback
-            let model = camera
-                .properties()
-                .get::<properties::Model>()
-                .map(|m| m.to_string())
-                .unwrap_or_else(|_| id.clone());
+        // Get model from properties - use id as fallback
+        let model = camera
+            .properties()
+            .get::<properties::Model>()
+            .map(|m| m.to_string())
+            .unwrap_or_else(|_| id.clone());
 
-            // Get location from properties
-            // NOTE: The libcamera properties API varies by version.
-            // Default to External for compatibility.
-            let location = CameraLocation::External;
+        let location = location_from_properties(&camera);
 
-            cameras.push(LibCameraInfo {
-                id,
-                model,
-                location,
-            });
-        }
+        cameras.push(LibCameraInfo {
+            id,
+            model,
+            location,
+        });
     }
 
     Ok(cameras)
