@@ -210,7 +210,7 @@ pub use codec::{PixelFormat as CodecPixelFormat, VideoFrame};
 
 // Video codecs - H.264
 #[cfg(feature = "h264")]
-pub use codec::{DecodedFrame, H264Decoder, H264Encoder, H264EncoderConfig};
+pub use codec::{DecodedFrame, H264Decoder, H264Encoder, H264EncoderConfig, SpsPpsStrategy};
 
 // Video codecs - V4L2 M2M hardware H.264
 #[cfg(feature = "v4l2-m2m")]

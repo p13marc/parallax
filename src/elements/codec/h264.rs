@@ -45,6 +45,46 @@ use openh264::formats::YUVSource;
 // Encoder Configuration
 // ============================================================================
 
+/// How the encoder manages SPS/PPS parameter-set IDs (mirrors OpenH264's
+/// `eSpsPpsIdStrategy`).
+///
+/// Note: with OpenH264 0.9.x, the parameter sets themselves are written at
+/// the start of **every** IDR access unit under every strategy (verified by
+/// the mid-stream-join regression test below), so any keyframe is a
+/// self-contained decoder entry point regardless of this setting. The
+/// strategy only governs how the SPS/PPS *IDs* evolve across IDRs —
+/// `IncreasingId` lets decoders detect missed IDRs, the listing variants
+/// maintain parameter-set lists for multi-stream scenarios.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SpsPpsStrategy {
+    /// Constant SPS/PPS ID across the whole encode session (OpenH264's and
+    /// this crate's default).
+    #[default]
+    ConstantId,
+    /// Increment the SPS/PPS ID with each IDR, letting decoders detect
+    /// missing IDR frames.
+    IncreasingId,
+    /// Use SPS in the existing list if possible.
+    SpsListing,
+    /// SPS listing with increasing PPS IDs.
+    SpsListingAndPpsIncreasing,
+    /// Full SPS/PPS listing.
+    SpsPpsListing,
+}
+
+impl SpsPpsStrategy {
+    fn to_openh264(self) -> openh264::encoder::SpsPpsStrategy {
+        use openh264::encoder::SpsPpsStrategy as O;
+        match self {
+            Self::ConstantId => O::ConstantId,
+            Self::IncreasingId => O::IncreasingId,
+            Self::SpsListing => O::SpsListing,
+            Self::SpsListingAndPpsIncreasing => O::SpsListingAndPpsIncreasing,
+            Self::SpsPpsListing => O::SpsPpsListing,
+        }
+    }
+}
+
 /// H.264 encoder configuration.
 #[derive(Debug, Clone)]
 pub struct H264EncoderConfig {
@@ -69,6 +109,8 @@ pub struct H264EncoderConfig {
     pub keyframe_interval: u32,
     /// Number of threads (0 = auto).
     pub num_threads: u32,
+    /// SPS/PPS parameter-set ID strategy (see [`SpsPpsStrategy`]).
+    pub sps_pps_strategy: SpsPpsStrategy,
 }
 
 impl H264EncoderConfig {
@@ -83,6 +125,7 @@ impl H264EncoderConfig {
             scene_change_detect: true,
             keyframe_interval: 0,
             num_threads: 0,
+            sps_pps_strategy: SpsPpsStrategy::default(),
         }
     }
 
@@ -113,6 +156,12 @@ impl H264EncoderConfig {
     /// Set the number of encoding threads.
     pub fn threads(mut self, threads: u32) -> Self {
         self.num_threads = threads;
+        self
+    }
+
+    /// Set the SPS/PPS emission strategy (see [`SpsPpsStrategy`]).
+    pub fn sps_pps_strategy(mut self, strategy: SpsPpsStrategy) -> Self {
+        self.sps_pps_strategy = strategy;
         self
     }
 
@@ -178,7 +227,8 @@ impl H264Encoder {
             .scene_change_detect(config.scene_change_detect)
             .num_threads(config.num_threads as u16)
             .qp(QpRange::new(qp.saturating_sub(4), (qp + 4).min(51)))
-            .intra_frame_period(IntraFramePeriod::from_num_frames(config.keyframe_interval));
+            .intra_frame_period(IntraFramePeriod::from_num_frames(config.keyframe_interval))
+            .sps_pps_strategy(config.sps_pps_strategy.to_openh264());
 
         let api = OpenH264API::from_source();
         let encoder = Encoder::with_api_config(api, encoder_config)
@@ -336,8 +386,16 @@ impl Element for H264Encoder {
         // Preserve input buffer's PTS for proper timing, update sequence number
         let mut metadata = buffer.metadata().clone();
         metadata.sequence = self.frame_count - 1;
+        // SYNC_POINT must reflect the ENCODED stream, not the input: raw
+        // sources flag every uncompressed frame as a sync point, and a
+        // delta AU wrongly advertised as a keyframe sends fresh decoders
+        // into an unrecoverable dsNoParamSets loop (#22).
         if is_keyframe {
             metadata.flags |= crate::metadata::BufferFlags::SYNC_POINT;
+        } else {
+            metadata.flags = metadata
+                .flags
+                .remove(crate::metadata::BufferFlags::SYNC_POINT);
         }
         Ok(Some(Buffer::new(handle, metadata)))
     }
@@ -812,6 +870,133 @@ mod tests {
             high_quality > low_quality,
             "low QP (high quality) must produce more bytes: qp10={high_quality} qp45={low_quality}"
         );
+    }
+
+    /// All NAL unit types (header & 0x1F) in an Annex-B bitstream, in order.
+    fn nal_unit_types(data: &[u8]) -> Vec<u8> {
+        let mut types = Vec::new();
+        let mut i = 0;
+        while i + 3 < data.len() {
+            let offset = if data[i..].starts_with(&[0, 0, 0, 1]) {
+                4
+            } else if data[i..].starts_with(&[0, 0, 1]) {
+                3
+            } else {
+                i += 1;
+                continue;
+            };
+            if i + offset < data.len() {
+                types.push(data[i + offset] & 0x1F);
+            }
+            i += offset;
+        }
+        types
+    }
+
+    /// Encode two GOPs, force a keyframe mid-GOP, and return the per-frame
+    /// access units from the forced IDR onward.
+    fn encode_with_midstream_forced_idr(strategy: SpsPpsStrategy) -> Vec<Vec<u8>> {
+        let mut config = H264EncoderConfig::new(320, 240)
+            .keyframe_interval(10)
+            .sps_pps_strategy(strategy);
+        config.scene_change_detect = false; // deterministic IDR placement
+        let mut encoder = H264Encoder::new(config).unwrap();
+
+        let mut tail = Vec::new();
+        for i in 0..18usize {
+            if i == 13 {
+                // Mid-GOP forced IDR — the keyframe-on-subscribe path.
+                encoder.force_keyframe();
+            }
+            let frame = detailed_frame(320, 240, i as u8);
+            let encoded = encoder.encode_yuv420(&frame).unwrap();
+            if i == 13 {
+                assert!(
+                    nal_unit_types(&encoded).contains(&5),
+                    "forced keyframe must produce an IDR NAL"
+                );
+            }
+            if i >= 13 {
+                tail.push(encoded);
+            }
+        }
+        tail
+    }
+
+    /// The keyframe-on-subscribe contract: a decoder that joins at a
+    /// mid-stream *forced* IDR must be able to initialize and decode —
+    /// under EVERY parameter-set ID strategy (#22).
+    #[test]
+    fn test_fresh_decoder_syncs_on_midstream_forced_idr() {
+        for strategy in [
+            SpsPpsStrategy::ConstantId,
+            SpsPpsStrategy::IncreasingId,
+            SpsPpsStrategy::SpsListing,
+            SpsPpsStrategy::SpsListingAndPpsIncreasing,
+            SpsPpsStrategy::SpsPpsListing,
+        ] {
+            let tail = encode_with_midstream_forced_idr(strategy);
+
+            // The forced IDR access unit must carry its own SPS(7)/PPS(8).
+            let idr_types = nal_unit_types(&tail[0]);
+            assert!(
+                idr_types.contains(&7) && idr_types.contains(&8),
+                "{strategy:?}: forced IDR must carry SPS+PPS, got NAL types {idr_types:?}"
+            );
+
+            let mut decoder = H264Decoder::new().unwrap();
+            let mut decoded_any = false;
+            for au in &tail {
+                if decoder
+                    .decode(au)
+                    .expect("mid-stream join must decode")
+                    .is_some()
+                {
+                    decoded_any = true;
+                }
+            }
+            assert!(
+                decoded_any,
+                "{strategy:?}: fresh decoder produced no frame from the forced IDR onward"
+            );
+        }
+    }
+
+    /// Regression (#22): the encoder's output SYNC_POINT flag must reflect
+    /// the ENCODED stream, even when the input raw frames are all flagged as
+    /// sync points (raw sources flag every frame). A delta AU advertised as
+    /// a keyframe sends fresh downstream decoders into an unrecoverable
+    /// dsNoParamSets loop.
+    #[test]
+    fn test_output_sync_point_ignores_input_flag() {
+        use crate::buffer::MemoryHandle;
+        use crate::memory::SharedArena;
+        use crate::metadata::{BufferFlags, Metadata};
+
+        let mut config = H264EncoderConfig::new(320, 240).keyframe_interval(5);
+        config.scene_change_detect = false;
+        let mut encoder = H264Encoder::new(config).unwrap();
+
+        let arena = SharedArena::new(320 * 240 * 3 / 2, 8).unwrap();
+        for i in 0..12usize {
+            let frame = detailed_frame(320, 240, i as u8);
+            arena.reclaim();
+            let mut slot = arena.acquire().unwrap();
+            slot.data_mut()[..frame.len()].copy_from_slice(&frame);
+            let mut metadata = Metadata::from_sequence(i as u64);
+            metadata.flags |= BufferFlags::SYNC_POINT; // raw frames all "keyframes"
+            let buffer = Buffer::new(MemoryHandle::with_len(slot, frame.len()), metadata);
+
+            let out = encoder.process(buffer).unwrap().expect("encoded AU");
+            let is_idr = nal_unit_types(out.as_bytes()).contains(&5);
+            assert_eq!(
+                out.metadata().flags.contains(BufferFlags::SYNC_POINT),
+                is_idr,
+                "frame {i}: SYNC_POINT flag must match IDR presence"
+            );
+            // Interval 5 → IDRs exactly at frames 0, 5, 10.
+            assert_eq!(is_idr, i % 5 == 0, "frame {i}: unexpected IDR cadence");
+        }
     }
 
     #[test]
