@@ -4,7 +4,7 @@ This file provides guidance to Claude Code when working with code in this reposi
 
 ## Project Overview
 
-**Parallax** is a Rust-native streaming pipeline engine (a GStreamer alternative) built on zero-copy shared memory, hybrid async+realtime scheduling, and progressive typing. Linux-only. Workspace: the `parallax` crate (root), `parallax-macros` (proc macros), `examples/example-plugin` (cdylib plugin demo).
+**Parallax** is a Rust-native streaming pipeline engine (a GStreamer alternative) built on zero-copy shared memory, hybrid async+realtime scheduling, and progressive typing. Linux-only. Workspace: the root crate (package **`parallax-pipeline`** on crates.io, `[lib] name = "parallax"` — the bare crates.io name is squatted, so package and lib names intentionally differ; imports stay `use parallax::`), `parallax-macros/` (package `parallax-pipeline-macros`, lib `parallax_macros`), `examples/example-plugin` (cdylib plugin demo, publish = false).
 
 - Edition **2024**, MSRV **1.95** (enforced by the CI `msrv` job; do not claim 1.75 or 1.85 — both stale).
 - Default features are empty; most media functionality is feature-gated.

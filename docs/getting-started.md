@@ -11,9 +11,13 @@ This guide takes you from an empty project to a running pipeline with custom ele
 
 ```toml
 [dependencies]
-parallax = "0.1"
+parallax-pipeline = "0.1"   # lib name is `parallax`: code writes `use parallax::...`
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
+
+The package is published as `parallax-pipeline` (the bare `parallax` name on
+crates.io belongs to an unrelated crate), but the library target is named
+`parallax`, so all imports use `parallax::`.
 
 Default features are empty. Codecs, containers, network protocols, and device capture are all opt-in feature flags — see the [feature table in the README](../README.md#feature-flags).
 

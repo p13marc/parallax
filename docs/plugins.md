@@ -27,7 +27,7 @@ edition = "2024"
 crate-type = ["cdylib"]  # Important: creates a .so file
 
 [dependencies]
-parallax = "0.1"
+parallax-pipeline = "0.1"   # lib name is `parallax`: code still writes `use parallax::...`
 ```
 
 ### 3. Implement Elements
@@ -76,7 +76,7 @@ impl Element for Counter {
 ### 4. Define the Plugin Descriptor
 
 ```rust
-use parallax::element::ElementAdapter;
+use parallax::element::{DynAsyncElement, ElementAdapter};
 
 // Element type constants
 const TRANSFORM: i32 = 1;
@@ -92,13 +92,13 @@ parallax::define_plugin! {
             name: "doubler",
             description: "Doubles values in buffers",
             element_type: TRANSFORM,
-            create: || Box::new(ElementAdapter::new(Doubler::default())),
+            create: || DynAsyncElement::new_box(ElementAdapter::new(Doubler::default())),
         },
         {
             name: "counter",
             description: "Counts buffers passing through",
             element_type: TRANSFORM,
-            create: || Box::new(ElementAdapter::new(Counter::default())),
+            create: || DynAsyncElement::new_box(ElementAdapter::new(Counter::default())),
         },
     ]
 }
@@ -250,7 +250,7 @@ let pipeline = Pipeline::parse_with_factory("nullsource ! doubler ! nullsink", &
 ### Source Elements
 
 ```rust
-use parallax::element::{ProduceContext, ProduceResult, Source, SourceAdapter};
+use parallax::element::{DynAsyncElement, ProduceContext, ProduceResult, Source, SourceAdapter};
 
 pub struct MySource {
     // ...
@@ -266,13 +266,13 @@ impl Source for MySource {
 }
 
 // In plugin descriptor:
-create: || Box::new(SourceAdapter::new(MySource::new())),
+create: || DynAsyncElement::new_box(SourceAdapter::new(MySource::new())),
 ```
 
 ### Sink Elements
 
 ```rust
-use parallax::element::{ConsumeContext, Sink, SinkAdapter};
+use parallax::element::{ConsumeContext, DynAsyncElement, Sink, SinkAdapter};
 
 pub struct MySink {
     // ...
@@ -287,7 +287,7 @@ impl Sink for MySink {
 }
 
 // In plugin descriptor:
-create: || Box::new(SinkAdapter::new(MySink::new())),
+create: || DynAsyncElement::new_box(SinkAdapter::new(MySink::new())),
 ```
 
 ### Transform Elements
@@ -306,7 +306,7 @@ impl Element for MyTransform {
 }
 
 // In plugin descriptor:
-create: || Box::new(ElementAdapter::new(MyTransform::new())),
+create: || DynAsyncElement::new_box(ElementAdapter::new(MyTransform::new())),
 ```
 
 ## Best Practices
@@ -320,8 +320,8 @@ create: || Box::new(ElementAdapter::new(MyTransform::new())),
 ### Memory Safety
 
 ```rust
-// Good: Use Box for heap allocation
-create: || Box::new(ElementAdapter::new(MyElement::default())),
+// Good: type-erase through DynAsyncElement::new_box
+create: || DynAsyncElement::new_box(ElementAdapter::new(MyElement::default())),
 
 // The plugin system handles memory correctly:
 // - create() returns a Box that's converted to raw pointer

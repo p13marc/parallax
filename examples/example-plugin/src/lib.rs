@@ -5,7 +5,7 @@
 //! - `counter`: A transform element that counts buffers passing through
 
 use parallax::buffer::Buffer;
-use parallax::element::{Element, ElementAdapter};
+use parallax::element::{DynAsyncElement, Element, ElementAdapter};
 use parallax::error::Result;
 
 /// A transform element that doubles each byte value in a buffer.
@@ -65,13 +65,13 @@ parallax::define_plugin! {
             name: "doubler",
             description: "Doubles byte values in buffers",
             element_type: TRANSFORM,
-            create: || Box::new(ElementAdapter::new(Doubler::default())),
+            create: || DynAsyncElement::new_box(ElementAdapter::new(Doubler::default())),
         },
         {
             name: "counter",
             description: "Counts buffers passing through",
             element_type: TRANSFORM,
-            create: || Box::new(ElementAdapter::new(Counter::default())),
+            create: || DynAsyncElement::new_box(ElementAdapter::new(Counter::default())),
         },
     ]
 }

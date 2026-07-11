@@ -294,7 +294,7 @@ impl PluginInfo {
 ///             name: "myfilter",
 ///             description: "A filter element",
 ///             element_type: 1, // 0=Source, 1=Transform, 2=Sink
-///             create: || Box::new(MyFilter::new()),
+///             create: || DynAsyncElement::new_box(ElementAdapter::new(MyFilter::new())),
 ///         }
 ///     ]
 /// }

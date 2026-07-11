@@ -11,5 +11,7 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-parallax = { path = "../.." }
+# Package renamed to parallax-pipeline; the lib name is still `parallax`,
+# so `use parallax::...` works unchanged.
+parallax-pipeline = { path = "../.." }
 paste = "1.0"

@@ -1535,7 +1535,7 @@ dependencies = [
 name = "example-plugin"
 version = "0.1.0"
 dependencies = [
- "parallax",
+ "parallax-pipeline",
  "paste",
 ]
 
@@ -3498,8 +3498,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "parallax"
-version = "0.1.0"
+name = "parallax-pipeline"
+version = "0.1.1"
 dependencies = [
  "alsa",
  "anyhow",
@@ -3524,7 +3524,7 @@ dependencies = [
  "mpeg2ts-reader",
  "openh264",
  "opus",
- "parallax-macros",
+ "parallax-pipeline-macros",
  "paste",
  "pipewire",
  "png",
@@ -3564,8 +3564,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "parallax-macros"
-version = "0.1.0"
+name = "parallax-pipeline-macros"
+version = "0.1.1"
 dependencies = [
  "proc-macro2",
  "quote",

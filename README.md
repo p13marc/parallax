@@ -1,12 +1,18 @@
 # Parallax
 
+[![crates.io](https://img.shields.io/crates/v/parallax-pipeline.svg)](https://crates.io/crates/parallax-pipeline)
+[![docs.rs](https://img.shields.io/docsrs/parallax-pipeline)](https://docs.rs/parallax-pipeline)
+[![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
 A Rust-native streaming pipeline engine with zero-copy, multi-process shared memory at its core.
+
+> Published on crates.io as **`parallax-pipeline`** (the bare `parallax` name was taken); the library is still imported as `parallax` — `use parallax::pipeline::Pipeline;` works as-is.
 
 Parallax lets you build media and data pipelines the way GStreamer does — sources, transforms, sinks, connected into a graph — but with a design that is Rust-first throughout: memfd-backed buffers that are always ready for cross-process sharing, reference counts stored *in* shared memory so they work across processes, a hybrid Tokio + real-time-thread executor inspired by PipeWire, and a typed pipeline API with compile-time type checking.
 
 > **Status:** Parallax is a young project (v0.1, pre-release). The core engine — memory, pipelines, executor, elements, caps negotiation, plugins — is implemented and covered by 1100+ tests. Some subsystems are still scaffolding (see [Project status](#project-status)). Expect API churn before 1.0.
 
-**Requirements:** Linux only (memfd_create, SCM_RIGHTS, eventfd) · Rust **1.85+** (edition 2024)
+**Requirements:** Linux only (memfd_create, SCM_RIGHTS, eventfd) · Rust **1.95+** (edition 2024)
 
 ## Highlights
 
@@ -23,7 +29,7 @@ Parallax lets you build media and data pipelines the way GStreamer does — sour
 
 ```toml
 [dependencies]
-parallax = "0.1"
+parallax-pipeline = "0.1"   # lib name is `parallax`: code writes `use parallax::...`
 ```
 
 ### Parse a pipeline from a string
