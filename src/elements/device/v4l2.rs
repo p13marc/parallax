@@ -229,6 +229,10 @@ pub struct V4l2Src {
     framerate: Option<(u32, u32)>,
     /// Frame duration derived from the actual rate (buffer duration hint).
     frame_duration: ClockTime,
+    /// Driver-reported maximum buffer size (`sizeimage` from VIDIOC_S_FMT).
+    /// The authoritative frame-size bound — per-fourcc estimates are only a
+    /// fallback (compressed MJPG frames routinely exceed width*height).
+    driver_buffer_size: Option<usize>,
     /// Arena for buffer allocation (per-source to avoid contention).
     arena: Option<SharedArena>,
     /// Whether to export buffers as DMA-BUF file descriptors.
@@ -321,6 +325,9 @@ impl V4l2Src {
         let width = format.width;
         let height = format.height;
         let actual_fourcc = format.fourcc.repr;
+        // `size` is the driver's sizeimage — the guaranteed upper bound for a
+        // dequeued frame. Some drivers report 0; treat that as unknown.
+        let driver_buffer_size = (format.size > 0).then_some(format.size as usize);
 
         // Frame rate: VIDIOC_S_PARM takes a time-per-frame interval, the
         // inverse of fps. Drivers clamp to the nearest supported rate, so
@@ -375,6 +382,7 @@ impl V4l2Src {
             supported_formats,
             framerate,
             frame_duration,
+            driver_buffer_size,
             arena: None,
             dmabuf_export: config.dmabuf_export,
             exported_fds,
@@ -660,6 +668,15 @@ impl Source for V4l2Src {
                 .acquire()
                 .ok_or_else(|| crate::error::Error::Element("V4L2 arena exhausted".to_string()))?;
 
+            // A frame larger than the slot means the driver exceeded its own
+            // sizeimage (or reported none and the estimate was short) — error
+            // out instead of panicking on the slice copy.
+            if len > slot.data_mut().len() {
+                return Err(crate::error::Error::Element(format!(
+                    "V4L2 frame ({len} bytes) exceeds arena slot ({} bytes)",
+                    slot.data_mut().len()
+                )));
+            }
             slot.data_mut()[..len].copy_from_slice(&frame_data);
 
             let handle = MemoryHandle::with_len(slot, len);
@@ -681,7 +698,14 @@ impl Source for V4l2Src {
     }
 
     fn preferred_buffer_size(&self) -> Option<usize> {
-        // Estimate based on format
+        // The driver's sizeimage (VIDIOC_S_FMT) is the authoritative bound —
+        // estimates below undershoot for compressed formats (a 640x480 MJPG
+        // frame can exceed width*height) and even for YUYV once the driver
+        // adds stride padding.
+        if let Some(size) = self.driver_buffer_size {
+            return Some(size);
+        }
+        // Fallback estimate based on format (driver reported sizeimage = 0)
         let fourcc_str = std::str::from_utf8(&self.fourcc).unwrap_or("????");
         let size = match fourcc_str {
             "MJPG" | "JPEG" => {
@@ -875,6 +899,25 @@ impl V4l2Src {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The arena must be sized from the driver's sizeimage, not the
+    /// per-fourcc estimate — a 640x480 MJPG frame can exceed width*height
+    /// (observed: 614989 bytes vs a 307200 estimate), which used to panic
+    /// the source on the first captured frame.
+    #[test]
+    #[ignore = "needs a V4L2 capture device"]
+    fn preferred_buffer_size_uses_driver_sizeimage() {
+        let devices = enumerate_devices().expect("enumerate");
+        let dev = devices.first().expect("no V4L2 capture device present");
+        let src = V4l2Src::new(dev.path.to_str().unwrap()).expect("open");
+        let driver = src
+            .driver_buffer_size
+            .expect("driver reported no sizeimage");
+        assert_eq!(src.preferred_buffer_size(), Some(driver));
+        // sizeimage is a byte bound for the negotiated frame; it can never be
+        // smaller than the old MJPG estimate that caused the overflow.
+        assert!(driver >= (src.width * src.height) as usize);
+    }
 
     #[test]
     fn test_is_available() {
