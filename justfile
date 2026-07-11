@@ -114,3 +114,8 @@ bench-pool:
 # Run throughput benchmark
 bench-throughput:
     cargo bench --bench throughput
+
+# Serve a local H.264 RTSP test stream (for the RTSP examples; needs
+# python3-gobject + gstreamer1-rtsp-server)
+rtsp-server:
+    ./scripts/rtsp_test_server.py

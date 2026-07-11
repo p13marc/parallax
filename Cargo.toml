@@ -148,6 +148,8 @@ dynosaur = "0.3"
 trait-variant = "0.1"
 
 [dev-dependencies]
+# "signal" is example-only (Ctrl-C handling); keep it out of the library deps
+tokio = { version = "1", features = ["signal"] }
 tokio-test = "0.4"
 criterion = "0.8"
 proptest = "1"
@@ -294,6 +296,14 @@ required-features = ["v4l2"]
 [[example]]
 name = "46_screen_capture"
 required-features = ["screen-capture", "h264", "mp4-demux"]
+
+[[example]]
+name = "57_rtsp_capture"
+required-features = ["rtsp"]
+
+[[example]]
+name = "58_rtsp_display"
+required-features = ["rtsp", "h264", "display"]
 
 # Streaming protocol examples (25-26): no special features required
 [[example]]
