@@ -186,6 +186,19 @@ impl Default for VideoConvertElement {
 
 impl Element for VideoConvertElement {
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
+        // If dimensions weren't configured, adopt them from per-buffer metadata
+        // (decoders set "width"/"height") before the converter is created.
+        if self.converter.is_none()
+            && (self.width == 0 || self.height == 0)
+            && let (Some(&w), Some(&h)) = (
+                buffer.metadata().get::<u64>("width"),
+                buffer.metadata().get::<u64>("height"),
+            )
+        {
+            self.width = w as u32;
+            self.height = h as u32;
+        }
+
         let input_data = buffer.as_bytes();
 
         tracing::debug!(

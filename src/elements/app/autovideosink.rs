@@ -179,9 +179,15 @@ impl Sink for AutoVideoSink {
 
         tracing::debug!("AutoVideoSink: received buffer with {} bytes", data.len());
 
-        // Detect frame dimensions from data size (assuming RGBA)
-        // Common resolutions: 640x480=1228800, 1280x720=3686400, 1920x1080=8294400
-        let (width, height) = detect_dimensions(data.len());
+        // Dimensions: prefer per-buffer metadata (decoders set "width"/"height"),
+        // fall back to guessing from the RGBA buffer size.
+        let meta = ctx.metadata();
+        let (width, height) = match (meta.get::<u64>("width"), meta.get::<u64>("height")) {
+            (Some(&w), Some(&h)) if w > 0 && h > 0 && (w * h * 4) as usize == data.len() => {
+                (w as u32, h as u32)
+            }
+            _ => detect_dimensions(data.len()),
+        };
 
         tracing::debug!("AutoVideoSink: detected dimensions {}x{}", width, height);
 
@@ -405,10 +411,10 @@ fn run_display_loop(
             }
 
             // Resize surface if needed
-            if let (Some(w), Some(h)) = (NonZeroU32::new(width), NonZeroU32::new(height)) {
-                if surface.resize(w, h).is_err() {
-                    return;
-                }
+            if let (Some(w), Some(h)) = (NonZeroU32::new(width), NonZeroU32::new(height))
+                && surface.resize(w, h).is_err()
+            {
+                return;
             }
 
             // Get buffer and blit frame
