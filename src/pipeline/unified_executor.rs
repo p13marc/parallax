@@ -49,6 +49,7 @@ use crate::pipeline::{
 use kanal::{AsyncReceiver, AsyncSender, bounded_async};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::task::JoinHandle;
 
@@ -295,6 +296,9 @@ pub struct PipelineHandle {
     bus: Option<Bus>,
     /// Bus handle for posting pipeline-level messages.
     bus_handle: Option<BusHandle>,
+    /// Cooperative stop flag, checked by source tasks between `produce()`
+    /// calls (see [`PipelineHandle::stop`]).
+    stop: Arc<AtomicBool>,
 }
 
 impl PipelineHandle {
@@ -359,8 +363,27 @@ impl PipelineHandle {
         }
     }
 
+    /// Signal all sources to stop cooperatively.
+    ///
+    /// Sources end their produce loop at the next iteration and propagate
+    /// EOS downstream exactly like a natural end-of-stream, so sinks drain
+    /// and [`wait`](Self::wait) returns `Ok(())`. This is the graceful way
+    /// to stop a pipeline with live (infinite) sources — [`abort`](Self::abort)
+    /// alone cannot end a source loop that never reaches an await point.
+    ///
+    /// Limitation: a source blocked *inside* a synchronous `produce()` call
+    /// (e.g. waiting on a hardware frame with no timeout) only observes the
+    /// flag once that call returns.
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Release);
+    }
+
     /// Abort all pipeline tasks.
     pub fn abort(mut self) {
+        // Best effort for live sources: tasks blocked in a synchronous
+        // produce() are never re-polled by abort(), so also raise the
+        // cooperative stop flag — they exit at the next loop iteration.
+        self.stop.store(true, Ordering::Release);
         if let Some(task) = self.rt_driver_task.take() {
             task.abort();
         }
@@ -444,6 +467,10 @@ impl Executor {
         // Create event sender
         let events = EventSender::new(256);
 
+        // Cooperative stop flag shared with every source task (see
+        // PipelineHandle::stop).
+        let stop = Arc::new(AtomicBool::new(false));
+
         // Analyze pipeline for automatic strategy if enabled
         let plan = if self.config.auto_strategy {
             let plan = analyze_pipeline(pipeline);
@@ -515,13 +542,13 @@ impl Executor {
         // Execute based on scheduling mode
         let (tasks, rt_handles, bridges, rt_driver_task) = match effective_scheduling {
             SchedulingMode::Async => {
-                let tasks = self.run_async(pipeline, clock_info.as_ref(), &events)?;
+                let tasks = self.run_async(pipeline, clock_info.as_ref(), &events, &stop)?;
                 (tasks, Vec::new(), Vec::new(), None)
             }
             SchedulingMode::Hybrid | SchedulingMode::RealTime => {
                 if partition.rt_nodes.is_empty() {
                     // No RT nodes, fall back to async
-                    let tasks = self.run_async(pipeline, clock_info.as_ref(), &events)?;
+                    let tasks = self.run_async(pipeline, clock_info.as_ref(), &events, &stop)?;
                     (tasks, Vec::new(), Vec::new(), None)
                 } else {
                     self.run_hybrid(
@@ -530,6 +557,7 @@ impl Executor {
                         &mut scheduler,
                         clock_info.as_ref(),
                         &events,
+                        &stop,
                     )?
                 }
             }
@@ -562,6 +590,7 @@ impl Executor {
             rt_driver_task,
             bus,
             bus_handle,
+            stop,
         })
     }
 
@@ -571,6 +600,7 @@ impl Executor {
         pipeline: &mut Pipeline,
         clock_info: Option<&(Arc<dyn Clock>, ClockTime)>,
         events: &EventSender,
+        stop: &Arc<AtomicBool>,
     ) -> Result<Vec<JoinHandle<Result<()>>>> {
         let mut channels = ChannelNetwork::new();
 
@@ -580,7 +610,7 @@ impl Executor {
         }
 
         // Spawn tasks
-        self.spawn_tasks(pipeline, channels, clock_info, events)
+        self.spawn_tasks(pipeline, channels, clock_info, events, stop)
     }
 
     /// Run with hybrid async + RT execution.
@@ -591,6 +621,7 @@ impl Executor {
         scheduler: &mut RtScheduler,
         clock_info: Option<&(Arc<dyn Clock>, ClockTime)>,
         events: &EventSender,
+        stop: &Arc<AtomicBool>,
     ) -> Result<(
         Vec<JoinHandle<Result<()>>>,
         Vec<crate::pipeline::rt_scheduler::DataThreadHandle>,
@@ -630,7 +661,7 @@ impl Executor {
 
         // Spawn async tasks for the async portion of the graph
         let tasks = self.spawn_tasks_for_partition(
-            pipeline, partition, channels, scheduler, clock_info, events,
+            pipeline, partition, channels, scheduler, clock_info, events, stop,
         )?;
 
         // Collect bridges (keep alive)
@@ -780,6 +811,7 @@ impl Executor {
         mut channels: ChannelNetwork,
         clock_info: Option<&(Arc<dyn Clock>, ClockTime)>,
         events: &EventSender,
+        stop: &Arc<AtomicBool>,
     ) -> Result<Vec<JoinHandle<Result<()>>>> {
         let mut tasks = Vec::new();
 
@@ -794,7 +826,7 @@ impl Executor {
 
         for node_id in node_ids {
             let task =
-                self.spawn_node_task(pipeline, node_id, &mut channels, clock_info, events)?;
+                self.spawn_node_task(pipeline, node_id, &mut channels, clock_info, events, stop)?;
             tasks.push(task);
         }
 
@@ -802,6 +834,7 @@ impl Executor {
     }
 
     /// Spawn tasks for async partition only.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_tasks_for_partition(
         &self,
         pipeline: &mut Pipeline,
@@ -810,6 +843,7 @@ impl Executor {
         scheduler: &RtScheduler,
         clock_info: Option<&(Arc<dyn Clock>, ClockTime)>,
         events: &EventSender,
+        stop: &Arc<AtomicBool>,
     ) -> Result<Vec<JoinHandle<Result<()>>>> {
         let mut tasks = Vec::new();
 
@@ -836,6 +870,7 @@ impl Executor {
                 input_bridges,
                 clock_info,
                 events,
+                stop,
             )?;
             tasks.push(task);
         }
@@ -851,6 +886,7 @@ impl Executor {
         channels: &mut ChannelNetwork,
         clock_info: Option<&(Arc<dyn Clock>, ClockTime)>,
         events: &EventSender,
+        stop: &Arc<AtomicBool>,
     ) -> Result<JoinHandle<Result<()>>> {
         self.spawn_node_task_with_bridges(
             pipeline,
@@ -860,10 +896,12 @@ impl Executor {
             Vec::new(),
             clock_info,
             events,
+            stop,
         )
     }
 
     /// Spawn a task with optional bridges.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_node_task_with_bridges(
         &self,
         pipeline: &mut Pipeline,
@@ -873,6 +911,7 @@ impl Executor {
         input_bridges: Vec<Arc<AsyncRtBridge>>,
         clock_info: Option<&(Arc<dyn Clock>, ClockTime)>,
         events: &EventSender,
+        stop: &Arc<AtomicBool>,
     ) -> Result<JoinHandle<Result<()>>> {
         let node = pipeline
             .get_node_mut(node_id)
@@ -911,6 +950,7 @@ impl Executor {
                 events_clone,
                 probes,
                 tracers,
+                stop.clone(),
             ),
             ElementType::Sink => spawn_sink_task(
                 node_name,
@@ -1079,6 +1119,7 @@ impl ChannelNetwork {
 // Task Spawning
 // ============================================================================
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_source_task(
     name: String,
     node_id: NodeId,
@@ -1088,6 +1129,7 @@ fn spawn_source_task(
     events: EventSender,
     probe_registry: ProbeRegistry,
     tracers: TracerRegistry,
+    stop: Arc<AtomicBool>,
 ) -> JoinHandle<Result<()>> {
     tokio::spawn(async move {
         tracing::debug!("source '{}' started", name);
@@ -1098,6 +1140,19 @@ fn spawn_source_task(
         let mut would_block_count: u64 = 0;
 
         loop {
+            // Cooperative stop (PipelineHandle::stop/abort): end the loop
+            // like a natural EOS so live sources release their device and
+            // downstream drains cleanly.
+            if stop.load(Ordering::Acquire) {
+                tracing::info!("source '{}': stopped after {} buffers", name, count);
+                for tx in &outputs {
+                    let _ = tx.send(Message::Eos).await;
+                }
+                for bridge in &output_bridges {
+                    bridge.signal_eos();
+                }
+                break;
+            }
             tracing::trace!("source '{}': calling process_source", name);
             match element.process_source().await {
                 Ok(SourceResult::Buffer(buffer)) => {
