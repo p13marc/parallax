@@ -2190,6 +2190,10 @@ impl<S: Sink + Send + 'static> SendAsyncElementDyn for SinkAdapter<S> {
         self.inner.execution_hints()
     }
 
+    fn handle_downstream_event(&mut self, event: Event) -> Option<Event> {
+        self.inner.handle_downstream_event(event)
+    }
+
     fn as_clock_provider(&self) -> Option<&dyn ClockProvider> {
         self.inner.as_clock_provider()
     }

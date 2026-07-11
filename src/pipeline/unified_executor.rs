@@ -1152,6 +1152,15 @@ fn spawn_source_task(
                 Err(e) => {
                     tracing::error!("source '{}': error: {}", name, e);
                     events.send_error(e.to_string(), Some(name.clone()));
+                    // A failed source will never produce again — propagate EOS
+                    // downstream (like the Eos arm) so sinks terminate instead
+                    // of waiting forever on a wedged pipeline.
+                    for tx in &outputs {
+                        let _ = tx.send(Message::Eos).await;
+                    }
+                    for bridge in &output_bridges {
+                        bridge.signal_eos();
+                    }
                     return Err(e);
                 }
             }
@@ -1194,10 +1203,14 @@ fn spawn_sink_task(
                     }
                     Ok(Message::Eos) => {
                         tracing::debug!("sink '{}': EOS after {}", name, count);
+                        // Deliver EOS to the element so sinks with external
+                        // consumers (AppSink) can unblock them.
+                        let _ = element.handle_downstream_event(crate::event::Event::Eos);
                         break;
                     }
                     Err(e) => {
                         tracing::debug!("sink '{}': channel closed after {}: {}", name, count, e);
+                        let _ = element.handle_downstream_event(crate::event::Event::Eos);
                         break;
                     }
                 }
@@ -1216,6 +1229,7 @@ fn spawn_sink_task(
                 // Check if we're done (EOS + empty)
                 if bridge.is_done() {
                     tracing::info!("sink '{}': bridge EOS after {} buffers", name, count);
+                    let _ = element.handle_downstream_event(crate::event::Event::Eos);
                     break;
                 }
                 // Wait for more data or EOS signal
@@ -1305,6 +1319,9 @@ fn spawn_transform_task(
                             Err(e) => {
                                 tracing::error!("transform '{}': error: {}", name, e);
                                 events.send_error(e.to_string(), Some(name.clone()));
+                                // A failed transform stops processing — propagate
+                                // EOS downstream so sinks terminate cleanly.
+                                send_eos(&outputs, &output_bridges).await;
                                 return Err(e);
                             }
                         }

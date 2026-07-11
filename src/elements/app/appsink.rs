@@ -175,6 +175,19 @@ impl Sink for AppSink {
     fn name(&self) -> &str {
         &self.name
     }
+
+    fn handle_downstream_event(
+        &mut self,
+        event: crate::event::Event,
+    ) -> Option<crate::event::Event> {
+        // Pipeline EOS (including a source/transform error upstream, which the
+        // executor converts to EOS) must reach consumers blocked on
+        // `pull_buffer` — flip the handle-visible EOS flag.
+        if matches!(event, crate::event::Event::Eos) {
+            self.send_eos();
+        }
+        Some(event)
+    }
 }
 
 impl AppSinkHandle {
