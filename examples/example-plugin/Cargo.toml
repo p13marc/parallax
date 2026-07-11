@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.95"
 description = "Example plugin for Parallax"
 license = "MIT OR Apache-2.0"
+publish = false
 
 [lib]
 crate-type = ["cdylib"]

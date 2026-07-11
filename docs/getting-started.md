@@ -181,7 +181,7 @@ The bus carries `Eos`, `Error`, `Warning`, `Tag`, `Buffering`, `Qos`, and more �
 
 ## Where to go next
 
-- **Examples** — `examples/` contains 38 numbered, single-concept programs. Start with `01_hello` and work up; `cargo run --example 01_hello`.
+- **Examples** — `examples/` contains 41 numbered, single-concept programs. Start with `01_hello` and work up; `cargo run --example 01_hello`.
 - **[pipeline.md](pipeline.md)** — everything about constructing and controlling pipelines.
 - **[memory.md](memory.md)** — the shared-memory model and cross-process pipelines.
 - **[elements.md](elements.md)** — the full element catalog.

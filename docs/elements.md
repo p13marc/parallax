@@ -28,7 +28,7 @@ For the element *trait system* (how to write your own), see [getting-started.md]
 |---------|-------------|
 | `AppSrc` (+ `AppSrcHandle`) | Push buffers from application code into a pipeline |
 | `AppSink` (+ `AppSinkHandle`) | Pull buffers out of a pipeline into application code |
-| `AutoVideoSink` `[display]` | Display video in a window (winit + softbuffer) |
+| `AutoVideoSink` `[display]` | Display video in a window (winit + softbuffer); frame dimensions from per-buffer `width`/`height` metadata when present, else guessed from RGBA buffer size |
 
 ## Network — `elements::network`
 
@@ -55,7 +55,16 @@ For the element *trait system* (how to write your own), see [getting-started.md]
 | `RtpH265Pay` / `RtpH265Depay` | H.265/HEVC payloading |
 | `RtpVp8Pay` / `RtpVp8Depay`, `RtpVp9Pay` / `RtpVp9Depay` | VP8/VP9 payloading |
 | `RtpOpusDepay` | Opus depayloading (no payloader yet) |
-| `RtspSrc` `[rtsp]` | RTSP client source (retina): DESCRIBE/SETUP/PLAY, TCP-interleaved or UDP, Basic/Digest auth |
+| `RtspSrc` `[rtsp]` | RTSP client source (retina): DESCRIBE/SETUP/PLAY, TCP-interleaved or UDP, Basic/Digest auth (also lifted from `rtsp://user:pass@host/...` URLs), `connect_timeout` enforced on each RTSP operation |
+
+`RtspSrc` output framing is controlled by `RtspFrameFormat`: the default
+`AnnexB` is self-describing (start codes, SPS/PPS prepended to every keyframe,
+ADTS-wrapped AAC), so frames feed `H264Decoder`, typefind, or a raw file dump
+directly; `LengthPrefixed` emits 4-byte-length NALs for MP4 muxing. See
+`examples/57_rtsp_capture.rs` (record a playable `.h264` file) and
+`examples/58_rtsp_display.rs` (decode and display in a window via
+`AppSrc → H264Decoder → VideoConvert → AutoVideoSink`). A local test stream is
+one command away: `just rtsp-server` (= `scripts/rtsp_test_server.py`).
 
 ## Flow — `elements::flow`
 
@@ -81,7 +90,7 @@ For the element *trait system* (how to write your own), see [getting-started.md]
 | `BufferSplit` / `BufferJoin` / `BufferConcat` | Split/join at delimiters; concatenate |
 | `Gain` | RT-safe audio gain (PCM multiply) |
 | `VideoScale` | Resize YUV420 frames (`ScaleMode`) |
-| `VideoConvertElement` | Pixel-format conversion (see [formats.md](formats.md)) |
+| `VideoConvertElement` | Pixel-format conversion (see [formats.md](formats.md)); dimensions from `with_size`, per-buffer `width`/`height` metadata, or buffer-size auto-detection, in that order |
 | `AudioConvertElement` | Sample-format conversion (S16 ↔ F32, …) |
 | `AudioResampleElement` | Sample-rate conversion |
 | `SequenceNumber` / `Timestamper` | Stamp sequence numbers / timestamps (`TimestampMode`) |

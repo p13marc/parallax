@@ -8,7 +8,7 @@ edition = "2024"
 rust-version = "1.95"
 description = "A Rust-native streaming pipeline engine with zero-copy multi-process support"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/example/parallax"
+repository = "https://github.com/p13marc/parallax"
 keywords = ["streaming", "pipeline", "zero-copy", "dataflow"]
 categories = ["multimedia", "asynchronous", "data-structures"]
 

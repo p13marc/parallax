@@ -262,7 +262,7 @@ Full catalog with feature flags in **[docs/elements.md](docs/elements.md)**. Sum
 | **Testing** | `TestSrc`, `VideoTestSrc`, `DataSrc`, `NullSource`, `NullSink` |
 | **App integration** | `AppSrc`/`AppSink` (+ handles), `AutoVideoSink` (display window) |
 | **Network** | TCP/UDP/Unix src+sink (sync & async), UDP multicast, `HttpSrc`/`HttpSink`/`HttpStreamingSink`, `WebSocketSrc`/`WebSocketSink`, Zenoh pub/sub/query |
-| **RTP/RTSP** | `RtpSrc`/`RtpSink`, jitter buffer, `RtcpHandler`, payloaders/depayloaders for H.264/H.265/VP8/VP9 (+ Opus depay), `RtspSrc` client |
+| **RTP/RTSP** | `RtpSrc`/`RtpSink`, jitter buffer, `RtcpHandler`, payloaders/depayloaders for H.264/H.265/VP8/VP9 (+ Opus depay), `RtspSrc` client (Annex-B or length-prefixed framing, URL credentials, per-op timeouts). See `examples/57_rtsp_capture.rs` and `examples/58_rtsp_display.rs`; `just rtsp-server` serves a local test stream |
 | **Flow** | `Queue` (watermarks, leaky modes), `Queue2` (stream/download/timeshift buffering), `Tee`, `Funnel`, `InputSelector`/`OutputSelector`, `Concat`, `Valve` |
 | **Transforms** | `Map`, `Filter`, `FilterMap`, `FlatMap`, `Chunk`, `Batch`/`Unbatch`, buffer trim/slice/pad/split/join/concat, dedup/range/regex filters, `Gain`, `VideoScale`, `VideoConvertElement`, `AudioConvertElement`, `AudioResampleElement` |
 | **Timing** | `Delay`, `Timeout`, `Debounce`, `Throttle`, `RateLimiter` |
