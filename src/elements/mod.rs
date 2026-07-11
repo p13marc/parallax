@@ -128,8 +128,8 @@ pub use rtp::{
 
 #[cfg(feature = "rtsp")]
 pub use rtp::{
-    MediaType, RtspConfig, RtspCredentials, RtspFrame, RtspSession, RtspSrc, RtspStats,
-    RtspTransport, StreamInfo, StreamSelection,
+    MediaType, RtspConfig, RtspCredentials, RtspFrame, RtspFrameFormat, RtspSession, RtspSrc,
+    RtspStats, RtspTransport, StreamInfo, StreamSelection,
 };
 
 // I/O

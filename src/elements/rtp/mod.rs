@@ -66,6 +66,6 @@ pub use jitter_buffer::{
 // RTSP
 #[cfg(feature = "rtsp")]
 pub use rtsp::{
-    MediaType, RtspConfig, RtspCredentials, RtspFrame, RtspSession, RtspSrc, RtspStats,
-    RtspTransport, StreamInfo, StreamSelection,
+    MediaType, RtspConfig, RtspCredentials, RtspFrame, RtspFrameFormat, RtspSession, RtspSrc,
+    RtspStats, RtspTransport, StreamInfo, StreamSelection,
 };

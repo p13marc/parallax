@@ -67,6 +67,31 @@ impl From<RtspTransport> for retina::client::Transport {
     }
 }
 
+/// Output framing for depacketized frames.
+///
+/// Controls how retina frames H.26x NAL units (and AAC audio) in the buffers
+/// returned by [`RtspSession::next_frame`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RtspFrameFormat {
+    /// Self-describing output: Annex-B start codes with SPS/PPS prepended to
+    /// every keyframe, ADTS-wrapped AAC. This is what parallax's `H264Decoder`,
+    /// typefind, and raw-bytestream file dumps expect.
+    #[default]
+    AnnexB,
+    /// ISO-BMFF style: 4-byte length-prefixed NALs with parameter sets only in
+    /// [`StreamInfo::codec_data`], raw AAC. For feeding an MP4 muxer directly.
+    LengthPrefixed,
+}
+
+impl From<RtspFrameFormat> for retina::codec::FrameFormat {
+    fn from(f: RtspFrameFormat) -> Self {
+        match f {
+            RtspFrameFormat::AnnexB => retina::codec::FrameFormat::SIMPLE,
+            RtspFrameFormat::LengthPrefixed => retina::codec::FrameFormat::MP4,
+        }
+    }
+}
+
 /// RTSP authentication credentials.
 #[derive(Debug, Clone)]
 pub struct RtspCredentials {
@@ -110,6 +135,8 @@ pub struct RtspConfig {
     pub credentials: Option<RtspCredentials>,
     /// Stream selection policy.
     pub stream_selection: StreamSelection,
+    /// Output framing for video/audio frames.
+    pub frame_format: RtspFrameFormat,
     /// User agent string.
     pub user_agent: String,
     /// Whether to send TEARDOWN on close.
@@ -127,6 +154,7 @@ impl Default for RtspConfig {
             transport: RtspTransport::default(),
             credentials: None,
             stream_selection: StreamSelection::default(),
+            frame_format: RtspFrameFormat::default(),
             user_agent: "Parallax RTSP Client".into(),
             teardown: retina::client::TeardownPolicy::Auto,
             connect_timeout: Duration::from_secs(10),
@@ -161,6 +189,9 @@ pub struct StreamInfo {
     /// Codec initialization data if known (H.264: SPS/PPS from
     /// `sprop-parameter-sets`; AAC: AudioSpecificConfig). Lets a consumer
     /// initialize a decoder before the first in-band parameter sets arrive.
+    /// For H.26x the encoding follows [`RtspConfig::frame_format`]: Annex-B
+    /// start codes under [`RtspFrameFormat::AnnexB`], a decoder configuration
+    /// record under [`RtspFrameFormat::LengthPrefixed`].
     pub codec_data: Option<Vec<u8>>,
 }
 
@@ -284,6 +315,12 @@ impl RtspSrc {
         self
     }
 
+    /// Set the output framing for video/audio frames.
+    pub fn with_frame_format(mut self, format: RtspFrameFormat) -> Self {
+        self.config.frame_format = format;
+        self
+    }
+
     /// Set the user agent string.
     pub fn with_user_agent(mut self, user_agent: impl Into<String>) -> Self {
         self.config.user_agent = user_agent.into();
@@ -327,6 +364,23 @@ impl RtspSrc {
     }
 }
 
+/// Parse an RTSP URL, lifting embedded `user:pass@` credentials out of it
+/// (retina rejects URLs that contain credentials).
+fn split_url_credentials(url_str: &str) -> Result<(Url, Option<RtspCredentials>)> {
+    let mut url =
+        Url::parse(url_str).map_err(|e| Error::Element(format!("Invalid RTSP URL: {}", e)))?;
+    let mut credentials = None;
+    if !url.username().is_empty() || url.password().is_some() {
+        credentials = Some(RtspCredentials {
+            username: url.username().to_string(),
+            password: url.password().unwrap_or_default().to_string(),
+        });
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
+    }
+    Ok((url, credentials))
+}
+
 // ============================================================================
 // RtspSession (Connected)
 // ============================================================================
@@ -350,23 +404,32 @@ pub struct RtspSession {
 impl RtspSession {
     /// Connect to an RTSP server.
     async fn connect(config: RtspConfig) -> Result<Self> {
-        // Parse URL
-        let url = Url::parse(&config.url)
-            .map_err(|e| Error::Element(format!("Invalid RTSP URL: {}", e)))?;
+        // Parse URL. retina rejects URLs with embedded credentials, so lift
+        // `rtsp://user:pass@host/...` into RtspCredentials (explicit
+        // `with_credentials` wins if both are present).
+        let (url, url_credentials) = split_url_credentials(&config.url)?;
+        let credentials = config.credentials.or(url_credentials);
 
         // Build session options
         let mut session_opts = SessionOptions::default()
             .user_agent(config.user_agent.clone())
             .teardown(config.teardown);
 
-        if let Some(creds) = config.credentials {
+        if let Some(creds) = credentials {
             session_opts = session_opts.creds(Some(creds.into()));
         }
 
-        // Describe
-        let mut session = Session::describe(url, session_opts)
-            .await
-            .map_err(|e| Error::Element(format!("RTSP DESCRIBE failed: {}", e)))?;
+        // Describe (connect_timeout covers TCP connect + DESCRIBE round-trip)
+        let mut session =
+            tokio::time::timeout(config.connect_timeout, Session::describe(url, session_opts))
+                .await
+                .map_err(|_| {
+                    Error::Element(format!(
+                        "RTSP DESCRIBE timed out after {:?}",
+                        config.connect_timeout
+                    ))
+                })?
+                .map_err(|e| Error::Element(format!("RTSP DESCRIBE failed: {}", e)))?;
 
         // Get stream information
         let mut streams = Vec::new();
@@ -439,13 +502,20 @@ impl RtspSession {
 
         // Setup selected streams
         let transport: retina::client::Transport = config.transport.into();
+        let frame_format: retina::codec::FrameFormat = config.frame_format.into();
         for &i in &selected_streams {
-            session
-                .setup(i, SetupOptions::default().transport(transport.clone()))
-                .await
-                .map_err(|e| {
-                    Error::Element(format!("RTSP SETUP failed for stream {}: {}", i, e))
-                })?;
+            tokio::time::timeout(
+                config.connect_timeout,
+                session.setup(
+                    i,
+                    SetupOptions::default()
+                        .transport(transport.clone())
+                        .frame_format(frame_format),
+                ),
+            )
+            .await
+            .map_err(|_| Error::Element(format!("RTSP SETUP timed out for stream {}", i)))?
+            .map_err(|e| Error::Element(format!("RTSP SETUP failed for stream {}: {}", i, e)))?;
         }
 
         // Play
@@ -455,9 +525,14 @@ impl RtspSession {
                     .unwrap_or(NonZeroU32::new(10).unwrap()),
             );
 
-        let session = session
-            .play(play_opts)
+        let session = tokio::time::timeout(config.connect_timeout, session.play(play_opts))
             .await
+            .map_err(|_| {
+                Error::Element(format!(
+                    "RTSP PLAY timed out after {:?}",
+                    config.connect_timeout
+                ))
+            })?
             .map_err(|e| Error::Element(format!("RTSP PLAY failed: {}", e)))?
             .demuxed()
             .map_err(|e| Error::Element(format!("Failed to demux RTSP session: {}", e)))?;
@@ -721,5 +796,37 @@ mod tests {
         assert!(matches!(config.transport, RtspTransport::TcpInterleaved));
         assert!(config.credentials.is_none());
         assert_eq!(config.connect_timeout, Duration::from_secs(10));
+        assert_eq!(config.frame_format, RtspFrameFormat::AnnexB);
+    }
+
+    #[test]
+    fn test_split_url_credentials() {
+        let (url, creds) =
+            split_url_credentials("rtsp://demo:secret@cam.example:5541/stream?profile=1").unwrap();
+        assert_eq!(url.as_str(), "rtsp://cam.example:5541/stream?profile=1");
+        let creds = creds.unwrap();
+        assert_eq!(creds.username, "demo");
+        assert_eq!(creds.password, "secret");
+
+        // Username without password
+        let (url, creds) = split_url_credentials("rtsp://demo@cam.example/stream").unwrap();
+        assert_eq!(url.as_str(), "rtsp://cam.example/stream");
+        assert_eq!(creds.unwrap().password, "");
+
+        // No credentials at all
+        let (url, creds) = split_url_credentials("rtsp://cam.example/stream").unwrap();
+        assert_eq!(url.as_str(), "rtsp://cam.example/stream");
+        assert!(creds.is_none());
+
+        assert!(split_url_credentials("not a url").is_err());
+    }
+
+    #[test]
+    fn test_frame_format_conversion() {
+        let annexb: retina::codec::FrameFormat = RtspFrameFormat::AnnexB.into();
+        assert_eq!(annexb, retina::codec::FrameFormat::SIMPLE);
+
+        let prefixed: retina::codec::FrameFormat = RtspFrameFormat::LengthPrefixed.into();
+        assert_eq!(prefixed, retina::codec::FrameFormat::MP4);
     }
 }
