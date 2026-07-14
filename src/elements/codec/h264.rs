@@ -232,6 +232,18 @@ pub struct H264EncoderConfig {
     /// produce packet-sized NALs, so the payloader does not have to fragment
     /// every slice.
     pub max_slice_len: Option<u32>,
+    /// Whether rate control may **drop frames** to hold the bitrate target.
+    ///
+    /// `None` (the default) means "whatever the rate control needs": skipping
+    /// is on when a bitrate target is set, off in quality mode. That is
+    /// OpenH264's own behaviour, and it has a sharp edge — under a tight target
+    /// the encoder simply emits nothing for some input frames, so a pipeline
+    /// that expects one packet per frame quietly gets fewer.
+    ///
+    /// Set `Some(false)` when something upstream already limits the framerate
+    /// (a [`Throttle`](crate::elements::Throttle), say) and you would rather
+    /// every frame you send be encoded, spending quality instead of frames.
+    pub skip_frames: Option<bool>,
     /// H.264 profile. `None` lets OpenH264 choose.
     pub profile: Option<Profile>,
     /// CPU spent per frame (see [`Complexity`]).
@@ -255,6 +267,7 @@ impl H264EncoderConfig {
             sps_pps_strategy: SpsPpsStrategy::default(),
             rate_control: RateControlMode::default(),
             max_slice_len: None,
+            skip_frames: None,
             profile: None,
             complexity: Complexity::default(),
             usage_type: UsageType::default(),
@@ -310,6 +323,13 @@ impl H264EncoderConfig {
     /// [`max_slice_len`](Self::max_slice_len)).
     pub fn max_slice_len(mut self, bytes: u32) -> Self {
         self.max_slice_len = Some(bytes);
+        self
+    }
+
+    /// Allow or forbid rate control dropping frames to hold the bitrate target
+    /// (see [`skip_frames`](Self::skip_frames)).
+    pub fn skip_frames(mut self, skip: bool) -> Self {
+        self.skip_frames = Some(skip);
         self
     }
 
@@ -384,13 +404,15 @@ fn build_encoder(config: &H264EncoderConfig) -> Result<Encoder> {
 
     if config.bitrate_bps > 0 {
         encoder_config = encoder_config.bitrate(BitRate::from_bps(config.bitrate_bps));
-    } else {
-        // No bitrate target: quality mode. OpenH264 defaults to a 120 kbps
-        // target with frame skipping enabled, which silently drops most
-        // frames of any real content — disable skipping so every input
-        // frame is encoded and quality is governed by the QP band below.
-        encoder_config = encoder_config.skip_frames(false);
     }
+
+    // Frame skipping. Default: on with a bitrate target (OpenH264's own
+    // behaviour), off in quality mode — where OpenH264 would otherwise apply a
+    // 120 kbps default target and silently drop most frames of real content.
+    // Either way this is a knob worth knowing about: when skipping is on, a
+    // tight target makes the encoder emit *nothing* for some input frames.
+    let skip_frames = config.skip_frames.unwrap_or(config.bitrate_bps > 0);
+    encoder_config = encoder_config.skip_frames(skip_frames);
 
     let qp = config.qp.min(51);
     encoder_config = encoder_config
@@ -1269,12 +1291,48 @@ mod tests {
         assert_eq!(profile_idc(Profile::High), 100);
     }
 
+    /// Rate control may drop frames to hold its target — an encoder emitting
+    /// *nothing* for an input frame is legal and surprising. Pin both sides of
+    /// the knob.
+    #[test]
+    fn skip_frames_governs_whether_every_input_frame_is_encoded() {
+        let count_encoded = |skip: bool| -> usize {
+            let mut config = H264EncoderConfig::new(320, 240)
+                .bitrate(20_000) // a target far too tight for this content
+                .rate_control(RateControlMode::Bitrate)
+                .skip_frames(skip);
+            config.scene_change_detect = false;
+            let mut encoder = H264Encoder::new(config).unwrap();
+
+            (0..20)
+                .filter(|i| {
+                    !encoder
+                        .encode_yuv420(&detailed_frame(320, 240, *i as u8))
+                        .unwrap()
+                        .is_empty()
+                })
+                .count()
+        };
+
+        assert_eq!(
+            count_encoded(false),
+            20,
+            "with skipping off, every input frame must produce output"
+        );
+        assert!(
+            count_encoded(true) < 20,
+            "with skipping on, a tight bitrate target drops frames — the \
+             behaviour a caller needs to be able to turn off"
+        );
+    }
+
     #[test]
     fn new_knobs_default_to_previous_behaviour() {
         // Guards against a silent quality/bitrate regression for existing users.
         let config = H264EncoderConfig::new(320, 240);
         assert_eq!(config.rate_control, RateControlMode::Quality);
         assert_eq!(config.max_slice_len, None);
+        assert_eq!(config.skip_frames, None);
         assert_eq!(config.profile, None);
         assert_eq!(config.complexity, Complexity::Medium);
         assert_eq!(config.usage_type, UsageType::CameraRealtime);
