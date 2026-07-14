@@ -3,7 +3,7 @@
 use crate::element::{
     DynAsyncElement, ElementAdapter, SinkAdapter, SourceAdapter, TransformAdapter,
 };
-use crate::elements::{FileSink, FileSrc, NullSink, NullSource, PassThrough, Tee};
+use crate::elements::{FileSink, FileSrc, Inspect, NullSink, NullSource, PassThrough};
 use crate::error::{Error, Result};
 use crate::pipeline::parser::{ParsedElement, PropertyValue};
 use crate::plugin::PluginRegistry;
@@ -33,7 +33,10 @@ impl ElementFactory {
         factory.register("nullsource", create_nullsource);
         factory.register("nullsink", create_nullsink);
         factory.register("passthrough", create_passthrough);
-        factory.register("tee", create_tee);
+        factory.register("inspect", create_inspect);
+        // Deprecated alias: "tee" never fanned out — it is a passthrough counter.
+        // Kept so existing pipeline strings keep parsing.
+        factory.register("tee", create_inspect);
         factory.register("filesrc", create_filesrc);
         factory.register("filesink", create_filesink);
 
@@ -156,8 +159,12 @@ fn create_passthrough(
     )))
 }
 
-fn create_tee(_props: &HashMap<String, PropertyValue>) -> Result<Box<DynAsyncElement<'static>>> {
-    Ok(DynAsyncElement::new_box(ElementAdapter::new(Tee::new())))
+fn create_inspect(
+    _props: &HashMap<String, PropertyValue>,
+) -> Result<Box<DynAsyncElement<'static>>> {
+    Ok(DynAsyncElement::new_box(
+        ElementAdapter::new(Inspect::new()),
+    ))
 }
 
 fn create_filesrc(props: &HashMap<String, PropertyValue>) -> Result<Box<DynAsyncElement<'static>>> {
@@ -339,7 +346,11 @@ mod tests {
         assert!(factory.is_registered("nullsource"));
         assert!(factory.is_registered("nullsink"));
         assert!(factory.is_registered("passthrough"));
-        assert!(factory.is_registered("tee"));
+        assert!(factory.is_registered("inspect"));
+        assert!(
+            factory.is_registered("tee"),
+            "deprecated alias still parses"
+        );
         assert!(factory.is_registered("filesrc"));
         assert!(factory.is_registered("filesink"));
         assert!(!factory.is_registered("unknown"));

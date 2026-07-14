@@ -766,23 +766,11 @@ fn check_resolution(width: u32, height: u32) -> Result<()> {
 }
 
 /// Returns true if the Annex-B bitstream contains an IDR NAL unit (type 5).
+///
+/// Thin alias for [`annexb::has_idr`](crate::codec::annexb::has_idr), which is
+/// the one copy of this scan in the crate.
 fn contains_idr(data: &[u8]) -> bool {
-    let mut i = 0;
-    while i + 3 < data.len() {
-        let offset = if data[i..].starts_with(&[0, 0, 0, 1]) {
-            4
-        } else if data[i..].starts_with(&[0, 0, 1]) {
-            3
-        } else {
-            i += 1;
-            continue;
-        };
-        if i + offset < data.len() && data[i + offset] & 0x1F == 5 {
-            return true;
-        }
-        i += offset;
-    }
-    false
+    crate::codec::annexb::has_idr(data)
 }
 
 /// Element trait implementation for H264Encoder.

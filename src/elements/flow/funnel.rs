@@ -12,7 +12,10 @@ use std::time::Duration;
 /// A funnel element that merges multiple inputs into a single output.
 ///
 /// Buffers from all inputs are interleaved in arrival order.
-/// This is the complement to `Tee` which splits one output to many.
+///
+/// There is no element on the other side of this: fan-out is done by linking one
+/// src-pad to several sinks (see [`Inspect`](super::Inspect)), not by an
+/// element.
 ///
 /// # Example
 ///

@@ -363,13 +363,13 @@ impl PipelineBuilder<HasSource> {
     where
         F: FnOnce(&mut TeeBuilder),
     {
-        use crate::elements::Tee;
+        use crate::elements::Inspect;
 
-        // Add the tee element
+        // The junction node. It is a plain passthrough — the fan-out comes from
+        // the *node's* src-pad being 1:N, not from anything the element does.
         let tee_name = format!("tee_{}", self.name_counter);
         self.name_counter += 1;
-        let tee_element = Tee::new();
-        let adapter = ElementAdapter::new(tee_element);
+        let adapter = ElementAdapter::new(Inspect::new());
         let tee_id = self
             .pipeline
             .add_node(&tee_name, DynAsyncElement::new_box(adapter));

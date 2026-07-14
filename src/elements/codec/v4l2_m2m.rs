@@ -794,54 +794,24 @@ fn copy_plane(
     }
 }
 
-/// Extract SPS (NAL type 7) and PPS (NAL type 8) units from an Annex-B
-/// stream, concatenated with 4-byte start codes. Empty if none found.
+/// Extract SPS (NAL type 7) and PPS (NAL type 8) units from an Annex-B stream,
+/// concatenated with 4-byte start codes. Empty if none found.
+///
+/// The hardware encoder emits parameter sets once, so they are cached and
+/// re-prepended to every keyframe — hence the start-code-carrying form here,
+/// unlike [`annexb::extract_param_sets`](crate::codec::annexb::extract_param_sets)
+/// which returns them raw.
 fn extract_sps_pps(data: &[u8]) -> Vec<u8> {
+    use crate::codec::annexb::{NAL_PPS, NAL_SPS, nal_units};
+
     let mut headers = Vec::new();
-    for nal in annex_b_nals(data) {
-        let nal_type = nal.first().map(|b| b & 0x1F);
-        if nal_type == Some(7) || nal_type == Some(8) {
+    for nal in nal_units(data) {
+        if matches!(nal.nal_type(), NAL_SPS | NAL_PPS) {
             headers.extend_from_slice(&[0, 0, 0, 1]);
-            headers.extend_from_slice(nal);
+            headers.extend_from_slice(nal.data);
         }
     }
     headers
-}
-
-/// Split an Annex-B stream into NAL unit payloads (start codes stripped).
-fn annex_b_nals(data: &[u8]) -> Vec<&[u8]> {
-    let mut starts = Vec::new();
-    let mut i = 0;
-    while i + 3 <= data.len() {
-        if data[i..].starts_with(&[0, 0, 0, 1]) {
-            starts.push(i + 4);
-            i += 4;
-        } else if data[i..].starts_with(&[0, 0, 1]) {
-            starts.push(i + 3);
-            i += 3;
-        } else {
-            i += 1;
-        }
-    }
-    starts
-        .iter()
-        .enumerate()
-        .map(|(n, &start)| {
-            let end = starts
-                .get(n + 1)
-                .map(|&next| {
-                    // Back off over the next NAL's start code.
-                    let code_len = if next >= 4 && data[next - 4..next] == [0, 0, 0, 1] {
-                        4
-                    } else {
-                        3
-                    };
-                    next - code_len
-                })
-                .unwrap_or(data.len());
-            &data[start..end]
-        })
-        .collect()
 }
 
 /// Find the first `/dev/video*` node that is an M2M device producing the

@@ -27,6 +27,7 @@
 
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::clock::ClockTime;
+use crate::element::ProduceResult;
 use crate::error::{Error, Result};
 use crate::memory::SharedArena;
 use crate::metadata::{BufferFlags, Metadata, RtpMeta};
@@ -145,6 +146,13 @@ pub struct RtspConfig {
     pub connect_timeout: Duration,
     /// Maximum timestamp jump in seconds before resync.
     pub max_timestamp_jump_secs: u32,
+    /// Drop video frames until the first keyframe.
+    ///
+    /// Joining a live stream lands mid-GOP, so the first frames reference a
+    /// picture the decoder never saw. Feeding them to a decoder produces either
+    /// garbage or an error. Defaults to `true` — every correct consumer wants
+    /// it, and every one of them was writing the same skip loop by hand.
+    pub skip_until_keyframe: bool,
 }
 
 impl Default for RtspConfig {
@@ -159,6 +167,7 @@ impl Default for RtspConfig {
             teardown: retina::client::TeardownPolicy::Auto,
             connect_timeout: Duration::from_secs(10),
             max_timestamp_jump_secs: 10,
+            skip_until_keyframe: true,
         }
     }
 }
@@ -339,6 +348,16 @@ impl RtspSrc {
         self
     }
 
+    /// Emit video frames from the first keyframe on, or from wherever the join
+    /// happened to land.
+    ///
+    /// Defaults to skipping (`true`). Turn it off only if you are recording the
+    /// raw stream rather than decoding it.
+    pub fn skip_until_keyframe(mut self, skip: bool) -> Self {
+        self.config.skip_until_keyframe = skip;
+        self
+    }
+
     /// Set video-only stream selection.
     pub fn video_only(mut self) -> Self {
         self.config.stream_selection = StreamSelection::VideoOnly;
@@ -399,6 +418,11 @@ pub struct RtspSession {
     selected_streams: Vec<usize>,
     /// Arena for output buffers.
     arena: Option<SharedArena>,
+    /// Drop video frames until the first keyframe (see
+    /// [`RtspConfig::skip_until_keyframe`]).
+    skip_until_keyframe: bool,
+    /// Whether the first keyframe has been seen.
+    saw_keyframe: bool,
 }
 
 impl RtspSession {
@@ -546,6 +570,8 @@ impl RtspSession {
             },
             selected_streams,
             arena: None,
+            skip_until_keyframe: config.skip_until_keyframe,
+            saw_keyframe: false,
         })
     }
 
@@ -709,14 +735,59 @@ impl RtspSession {
 // ============================================================================
 
 impl RtspSession {
-    /// Produce the next buffer (for use as an async source).
+    /// Pull the next buffer from the stream, or `None` at end of stream.
     ///
-    /// This is the main interface for pipeline integration.
-    pub async fn produce(&mut self) -> Result<Option<Buffer>> {
-        match self.next_frame().await? {
-            Some(frame) => Ok(Some(frame.into_buffer())),
-            None => Ok(None),
+    /// The manual pump: use this when you want to own the loop. For a session
+    /// that drives itself inside a pipeline, add it as a source — it implements
+    /// [`AsyncSource`].
+    ///
+    /// (This was called `produce()`, which shadowed the `AsyncSource` method of
+    /// the same name and so kept the session from ever *being* a source.)
+    pub async fn next_buffer(&mut self) -> Result<Option<Buffer>> {
+        loop {
+            let Some(frame) = self.next_frame().await? else {
+                return Ok(None);
+            };
+
+            // Joining a live stream lands mid-GOP: those frames reference a
+            // picture the decoder never saw. Skip to the first keyframe.
+            if self.skip_until_keyframe && frame.is_video() && !self.saw_keyframe {
+                if !frame.buffer().metadata().is_keyframe() {
+                    continue;
+                }
+                self.saw_keyframe = true;
+            }
+
+            return Ok(Some(frame.into_buffer()));
         }
+    }
+}
+
+/// A connected RTSP session is a source like any other.
+///
+/// Before this, `RtspSrc` was a session API and nothing else: to get its frames
+/// into a pipeline you had to spawn a task, pump `produce()` by hand, and shovel
+/// the buffers through an `AppSrc`. Every caller wrote the same bridge.
+///
+/// ```rust,ignore
+/// let session = RtspSrc::new("rtsp://camera/stream").connect().await?;
+/// let src = pipeline.add_async_source("rtsp", session);
+/// let dec = pipeline.add_filter("dec", H264Decoder::new()?);
+/// pipeline.link(src, dec)?;
+/// ```
+impl crate::element::AsyncSource for RtspSession {
+    async fn produce(
+        &mut self,
+        _ctx: &mut crate::element::ProduceContext<'_>,
+    ) -> Result<ProduceResult> {
+        match self.next_buffer().await? {
+            Some(buffer) => Ok(ProduceResult::OwnBuffer(buffer)),
+            None => Ok(ProduceResult::Eos),
+        }
+    }
+
+    fn name(&self) -> &str {
+        "rtspsrc"
     }
 }
 

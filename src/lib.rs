@@ -53,6 +53,7 @@
 
 pub mod buffer;
 pub mod clock;
+pub mod codec;
 pub mod control;
 pub mod converters;
 pub mod element;
