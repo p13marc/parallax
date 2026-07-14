@@ -9,11 +9,11 @@
 //! use parallax::elements::codec::{H264Encoder, H264EncoderConfig};
 //!
 //! // Create encoder for 1920x1080 video
-//! let config = H264EncoderConfig::new(1920, 1080);
+//! let config = H264EncoderConfig::new();
 //! let mut encoder = H264Encoder::new(config)?;
 //!
 //! // Encode YUV frames
-//! let encoded = encoder.encode_yuv420(&yuv_data)?;
+//! let encoded = encoder.encode_yuv420_at(&yuv_data, 1920, 1080)?;
 //! ```
 //!
 //! # Example - Decoding
@@ -197,12 +197,14 @@ impl UsageType {
 }
 
 /// H.264 encoder configuration.
+///
+/// Carries **no dimensions**. Geometry travels in-band, in [`Metadata`], and the
+/// encoder takes it from each frame — OpenH264 re-initialises itself on a size
+/// change and emits a fresh IDR, so a mid-stream resize is free. Config
+/// dimensions would be a value that *looks* authoritative and is silently
+/// ignored the moment a scaler is in the graph.
 #[derive(Debug, Clone)]
 pub struct H264EncoderConfig {
-    /// Video width in pixels.
-    pub width: u32,
-    /// Video height in pixels.
-    pub height: u32,
     /// Target bitrate in bits per second (0 = auto).
     pub bitrate_bps: u32,
     /// Maximum frame rate in Hz.
@@ -253,11 +255,11 @@ pub struct H264EncoderConfig {
 }
 
 impl H264EncoderConfig {
-    /// Create a new encoder configuration with the given dimensions.
-    pub fn new(width: u32, height: u32) -> Self {
+    /// Create a new encoder configuration.
+    ///
+    /// No dimensions: the encoder encodes whatever each buffer declares.
+    pub fn new() -> Self {
         Self {
-            width,
-            height,
             bitrate_bps: 0,
             max_frame_rate: 30.0,
             qp: 26,
@@ -352,16 +354,16 @@ impl H264EncoderConfig {
     }
 
     /// Create a configuration for low-latency streaming.
-    pub fn low_latency(width: u32, height: u32) -> Self {
-        Self::new(width, height)
+    pub fn low_latency() -> Self {
+        Self::new()
             .frame_rate(30.0)
             .keyframe_interval(30) // Keyframe every second at 30fps
             .qp(28) // Slightly lower quality for speed
     }
 
     /// Create a configuration for high-quality encoding.
-    pub fn high_quality(width: u32, height: u32) -> Self {
-        Self::new(width, height)
+    pub fn high_quality() -> Self {
+        Self::new()
             .frame_rate(30.0)
             .keyframe_interval(120) // Keyframe every 4 seconds
             .qp(20) // Higher quality
@@ -370,7 +372,7 @@ impl H264EncoderConfig {
 
 impl Default for H264EncoderConfig {
     fn default() -> Self {
-        Self::new(1920, 1080)
+        Self::new()
     }
 }
 
@@ -386,8 +388,11 @@ pub struct H264Encoder {
     config: H264EncoderConfig,
     frame_count: u64,
     bytes_encoded: u64,
+    /// Geometry of the last frame encoded. Observability and change detection
+    /// only — it is *never* a fallback, because geometry travels in-band.
+    dims: Option<(u32, u32)>,
     /// Runtime control: keyframe requests plus bitrate/GOP/QP changes (shared
-    /// with [`Self::control_handle`] and [`Self::keyframe_handle`]).
+    /// with [`Self::control`] and [`Self::keyframe_handle`]).
     control: super::EncoderControl,
     /// The control generation last applied to the encoder.
     applied_generation: u64,
@@ -453,10 +458,19 @@ impl H264Encoder {
             config,
             frame_count: 0,
             bytes_encoded: 0,
+            dims: None,
             control: super::EncoderControl::new(),
             applied_generation: 0,
             arena,
         })
+    }
+
+    /// The geometry of the last frame encoded, if any.
+    ///
+    /// `None` before the first frame: this encoder takes its size from the data,
+    /// so until data arrives it does not have one.
+    pub fn dimensions(&self) -> Option<(u32, u32)> {
+        self.dims
     }
 
     /// Rebuild the OpenH264 encoder for the current config, keeping the arena.
@@ -507,17 +521,11 @@ impl H264Encoder {
     /// - U plane: (width/2) * (height/2) bytes
     /// - V plane: (width/2) * (height/2) bytes
     ///
-    /// Returns the encoded H.264 bitstream (NAL units).
-    pub fn encode_yuv420(&mut self, yuv_data: &[u8]) -> Result<Vec<u8>> {
-        let (width, height) = (self.config.width, self.config.height);
-        self.encode_yuv420_at(yuv_data, width, height)
-    }
-
     /// Encode a YUV420 frame of the given size, changing resolution if needed.
     ///
     /// A size different from the last frame's re-initialises the encoder and
-    /// starts a fresh IDR, so the switch is a clean decoder entry point. The
-    /// configured resolution follows the frames — it is a seed, not a contract.
+    /// starts a fresh IDR, so the switch is a clean decoder entry point. There is
+    /// no configured resolution to contradict: geometry comes from the data.
     pub fn encode_yuv420_at(
         &mut self,
         yuv_data: &[u8],
@@ -537,17 +545,18 @@ impl H264Encoder {
             )));
         }
 
-        if (width, height) != (self.config.width, self.config.height) {
+        if let Some(previous) = self.dims
+            && previous != (width, height)
+        {
             tracing::info!(
                 "H264Encoder: resolution {}x{} -> {}x{} (re-init, IDR)",
-                self.config.width,
-                self.config.height,
+                previous.0,
+                previous.1,
                 width,
                 height
             );
-            self.config.width = width;
-            self.config.height = height;
         }
+        self.dims = Some((width, height));
 
         let yuv = YuvFrame {
             data: yuv_data,
@@ -681,11 +690,29 @@ impl Element for H264Encoder {
         }
 
         // The frame's own metadata decides the resolution: an upstream scaler
-        // can retarget mid-stream, and the encoder follows it.
-        let (width, height) = buffer
-            .metadata()
-            .video_dims()
-            .unwrap_or((self.config.width, self.config.height));
+        // can retarget mid-stream, and the encoder follows it. There is no
+        // constructor value to fall back to — a frame that does not say how big
+        // it is cannot be encoded, and inventing a size would silently produce
+        // sheared or truncated video.
+        let (width, height) = buffer.metadata().video_dims().ok_or_else(|| {
+            Error::Config(
+                "H264Encoder: buffer carries no video dimensions — the upstream element must \
+                 call Metadata::set_video_dims()"
+                    .into(),
+            )
+        })?;
+
+        // Caps say I420 (`input_media_caps`), but nothing enforced it, so RGB
+        // bytes were happily encoded as if they were YUV planes. Only reject a
+        // format that is *declared* and wrong, so a hand-built I420 buffer with
+        // only legacy keys still works.
+        if let Some(pf) = buffer.metadata().video_pixel_format()
+            && pf != crate::format::PixelFormat::I420
+        {
+            return Err(Error::Config(format!(
+                "H264Encoder needs I420, got {pf:?} — insert a VideoConvertElement upstream"
+            )));
+        }
 
         let input_data = buffer.as_bytes();
         let encoded = self.encode_yuv420_at(input_data, width, height)?;
@@ -1110,21 +1137,17 @@ mod tests {
     #[test]
     fn test_encoder_config_default() {
         let config = H264EncoderConfig::default();
-        assert_eq!(config.width, 1920);
-        assert_eq!(config.height, 1080);
         assert_eq!(config.qp, 26);
     }
 
     #[test]
     fn test_encoder_config_builder() {
-        let config = H264EncoderConfig::new(640, 480)
+        let config = H264EncoderConfig::new()
             .bitrate(1_000_000)
             .frame_rate(25.0)
             .qp(24)
             .keyframe_interval(60);
 
-        assert_eq!(config.width, 640);
-        assert_eq!(config.height, 480);
         assert_eq!(config.bitrate_bps, 1_000_000);
         assert_eq!(config.max_frame_rate, 25.0);
         assert_eq!(config.qp, 24);
@@ -1133,15 +1156,13 @@ mod tests {
 
     #[test]
     fn test_encoder_config_low_latency() {
-        let config = H264EncoderConfig::low_latency(1280, 720);
-        assert_eq!(config.width, 1280);
-        assert_eq!(config.height, 720);
+        let config = H264EncoderConfig::low_latency();
         assert_eq!(config.keyframe_interval, 30);
     }
 
     #[test]
     fn test_encoder_config_high_quality() {
-        let config = H264EncoderConfig::high_quality(1920, 1080);
+        let config = H264EncoderConfig::high_quality();
         assert_eq!(config.qp, 20);
         assert_eq!(config.keyframe_interval, 120);
     }
@@ -1228,14 +1249,12 @@ mod tests {
     #[test]
     fn bitrate_mode_tracks_the_target_more_tightly_than_no_rate_control() {
         let encode_all = |mode: RateControlMode| -> u64 {
-            let mut config = H264EncoderConfig::new(320, 240)
-                .bitrate(150_000)
-                .rate_control(mode);
+            let mut config = H264EncoderConfig::new().bitrate(150_000).rate_control(mode);
             config.scene_change_detect = false;
             let mut encoder = H264Encoder::new(config).unwrap();
             for i in 0..20 {
                 encoder
-                    .encode_yuv420(&detailed_frame(320, 240, i as u8))
+                    .encode_yuv420_at(&detailed_frame(320, 240, i as u8), 320, 240)
                     .unwrap();
             }
             encoder.bytes_encoded()
@@ -1255,14 +1274,14 @@ mod tests {
     #[test]
     fn max_slice_len_caps_nal_size() {
         const CAP: u32 = 1200;
-        let mut config = H264EncoderConfig::new(320, 240).max_slice_len(CAP);
+        let mut config = H264EncoderConfig::new().max_slice_len(CAP);
         config.scene_change_detect = false;
         let mut encoder = H264Encoder::new(config).unwrap();
 
         let mut seen_any = false;
         for i in 0..5 {
             let encoded = encoder
-                .encode_yuv420(&detailed_frame(320, 240, i as u8))
+                .encode_yuv420_at(&detailed_frame(320, 240, i as u8), 320, 240)
                 .unwrap();
             for size in nal_sizes(&encoded) {
                 seen_any = true;
@@ -1280,9 +1299,10 @@ mod tests {
         // SPS (NAL type 7) carries profile_idc in its first payload byte:
         // 66 = Baseline, 77 = Main, 100 = High.
         let profile_idc = |profile: Profile| -> u8 {
-            let mut encoder =
-                H264Encoder::new(H264EncoderConfig::new(320, 240).profile(profile)).unwrap();
-            let encoded = encoder.encode_yuv420(&detailed_frame(320, 240, 0)).unwrap();
+            let mut encoder = H264Encoder::new(H264EncoderConfig::new().profile(profile)).unwrap();
+            let encoded = encoder
+                .encode_yuv420_at(&detailed_frame(320, 240, 0), 320, 240)
+                .unwrap();
 
             let mut i = 0;
             while i + 4 < encoded.len() {
@@ -1304,7 +1324,7 @@ mod tests {
     #[test]
     fn skip_frames_governs_whether_every_input_frame_is_encoded() {
         let count_encoded = |skip: bool| -> usize {
-            let mut config = H264EncoderConfig::new(320, 240)
+            let mut config = H264EncoderConfig::new()
                 .bitrate(20_000) // a target far too tight for this content
                 .rate_control(RateControlMode::Bitrate)
                 .skip_frames(skip);
@@ -1314,7 +1334,7 @@ mod tests {
             (0..20)
                 .filter(|i| {
                     !encoder
-                        .encode_yuv420(&detailed_frame(320, 240, *i as u8))
+                        .encode_yuv420_at(&detailed_frame(320, 240, *i as u8), 320, 240)
                         .unwrap()
                         .is_empty()
                 })
@@ -1336,7 +1356,7 @@ mod tests {
     #[test]
     fn new_knobs_default_to_previous_behaviour() {
         // Guards against a silent quality/bitrate regression for existing users.
-        let config = H264EncoderConfig::new(320, 240);
+        let config = H264EncoderConfig::new();
         assert_eq!(config.rate_control, RateControlMode::Quality);
         assert_eq!(config.max_slice_len, None);
         assert_eq!(config.skip_frames, None);
@@ -1351,7 +1371,7 @@ mod tests {
 
         // The rebuild path must re-apply every knob, not just the three the
         // control handle carries.
-        let config = H264EncoderConfig::new(320, 240)
+        let config = H264EncoderConfig::new()
             .bitrate(2_000_000)
             .rate_control(RateControlMode::Bitrate)
             .max_slice_len(1200)
@@ -1378,7 +1398,7 @@ mod tests {
     fn live_bitrate_change_shrinks_the_stream() {
         use crate::element::Element;
 
-        let mut config = H264EncoderConfig::new(320, 240).bitrate(4_000_000);
+        let mut config = H264EncoderConfig::new().bitrate(4_000_000);
         config.scene_change_detect = false;
         let mut encoder = H264Encoder::new(config).unwrap();
         let control = encoder.control();
@@ -1418,7 +1438,7 @@ mod tests {
     fn live_bitrate_change_emits_an_idr() {
         use crate::element::Element;
 
-        let mut config = H264EncoderConfig::new(320, 240).bitrate(4_000_000);
+        let mut config = H264EncoderConfig::new().bitrate(4_000_000);
         config.scene_change_detect = false;
         let mut encoder = H264Encoder::new(config).unwrap();
         let control = encoder.control();
@@ -1452,7 +1472,7 @@ mod tests {
     fn live_keyframe_interval_change_changes_idr_cadence() {
         use crate::element::Element;
 
-        let mut config = H264EncoderConfig::new(320, 240).keyframe_interval(100);
+        let mut config = H264EncoderConfig::new().keyframe_interval(100);
         config.scene_change_detect = false;
         let mut encoder = H264Encoder::new(config).unwrap();
         let control = encoder.control();
@@ -1478,16 +1498,19 @@ mod tests {
     fn unchanged_parameters_do_not_rebuild_the_encoder() {
         use super::super::traits::VideoEncoder;
 
-        let mut encoder =
-            H264Encoder::new(H264EncoderConfig::new(320, 240).bitrate(1_000_000)).unwrap();
+        let mut encoder = H264Encoder::new(H264EncoderConfig::new().bitrate(1_000_000)).unwrap();
 
         // Setting the value it already has must not force a spurious IDR.
         encoder.set_bitrate(1_000_000).unwrap();
-        let encoded = encoder.encode_yuv420(&detailed_frame(320, 240, 1)).unwrap();
+        let encoded = encoder
+            .encode_yuv420_at(&detailed_frame(320, 240, 1), 320, 240)
+            .unwrap();
         let first_idrs = count_idr_nals(&encoded);
 
         encoder.set_bitrate(1_000_000).unwrap();
-        let encoded = encoder.encode_yuv420(&detailed_frame(320, 240, 2)).unwrap();
+        let encoded = encoder
+            .encode_yuv420_at(&detailed_frame(320, 240, 2), 320, 240)
+            .unwrap();
         assert_eq!(
             count_idr_nals(&encoded),
             0,
@@ -1500,7 +1523,7 @@ mod tests {
     /// (and any viewer joining after it) can follow the change.
     #[test]
     fn resolution_change_mid_stream_reinits_and_emits_an_idr() {
-        let mut config = H264EncoderConfig::new(320, 240);
+        let mut config = H264EncoderConfig::new();
         config.scene_change_detect = false; // no incidental IDRs
         let mut encoder = H264Encoder::new(config).unwrap();
         let mut decoder = H264Decoder::new().unwrap();
@@ -1534,16 +1557,24 @@ mod tests {
 
     /// The encoder follows the frames rather than pinning its constructor size.
     #[test]
-    fn config_dimensions_track_the_encoded_frames() {
-        let mut encoder = H264Encoder::new(H264EncoderConfig::new(320, 240)).unwrap();
+    fn dimensions_come_from_the_frames_not_the_config() {
+        let mut encoder = H264Encoder::new(H264EncoderConfig::new()).unwrap();
+        assert_eq!(
+            encoder.dimensions(),
+            None,
+            "before the first frame the encoder has no size — it takes one from the data"
+        );
+
         encoder
             .encode_yuv420_at(&detailed_frame(160, 120, 0), 160, 120)
             .unwrap();
+        assert_eq!(encoder.dimensions(), Some((160, 120)));
 
-        assert_eq!(
-            (encoder.config().width, encoder.config().height),
-            (160, 120)
-        );
+        // ...and follows a mid-stream resize.
+        encoder
+            .encode_yuv420_at(&detailed_frame(320, 240, 1), 320, 240)
+            .unwrap();
+        assert_eq!(encoder.dimensions(), Some((320, 240)));
     }
 
     /// VideoEncoder::encode used to hard-error on any size mismatch.
@@ -1552,7 +1583,7 @@ mod tests {
         use super::super::common::{PixelFormat as CodecPixelFormat, VideoFrame};
         use super::super::traits::VideoEncoder;
 
-        let mut encoder = H264Encoder::new(H264EncoderConfig::new(320, 240)).unwrap();
+        let mut encoder = H264Encoder::new(H264EncoderConfig::new()).unwrap();
         let frame = VideoFrame {
             width: 160,
             height: 120,
@@ -1570,7 +1601,7 @@ mod tests {
 
     #[test]
     fn oversized_resolution_is_rejected_clearly() {
-        let mut encoder = H264Encoder::new(H264EncoderConfig::new(320, 240)).unwrap();
+        let mut encoder = H264Encoder::new(H264EncoderConfig::new()).unwrap();
         let err = encoder
             .encode_yuv420_at(&[0u8; 16], 4096, 2160)
             .expect_err("beyond OpenH264's 3840x2160 ceiling");
@@ -1583,7 +1614,7 @@ mod tests {
 
     #[test]
     fn undersized_buffer_is_rejected_for_the_declared_size() {
-        let mut encoder = H264Encoder::new(H264EncoderConfig::new(320, 240)).unwrap();
+        let mut encoder = H264Encoder::new(H264EncoderConfig::new()).unwrap();
         // Claims 320x240 but carries a 160x120 frame's worth of bytes.
         let err = encoder
             .encode_yuv420_at(&detailed_frame(160, 120, 0), 320, 240)
@@ -1596,7 +1627,7 @@ mod tests {
     fn test_keyframe_interval_controls_idr_cadence() {
         let interval = 10u32;
         let frames = 30usize;
-        let config = H264EncoderConfig::new(320, 240).keyframe_interval(interval);
+        let config = H264EncoderConfig::new().keyframe_interval(interval);
         let mut config = config;
         config.scene_change_detect = false; // deterministic IDR placement
         let mut encoder = H264Encoder::new(config).unwrap();
@@ -1604,7 +1635,7 @@ mod tests {
         let mut idr_count = 0;
         for i in 0..frames {
             let frame = detailed_frame(320, 240, i as u8);
-            let encoded = encoder.encode_yuv420(&frame).unwrap();
+            let encoded = encoder.encode_yuv420_at(&frame, 320, 240).unwrap();
             idr_count += count_idr_nals(&encoded);
         }
         // 30 frames at interval 10 => IDRs at frames 0, 10, 20.
@@ -1617,12 +1648,12 @@ mod tests {
     #[test]
     fn test_qp_affects_output_size() {
         let encode_total = |qp: u8| -> u64 {
-            let config = H264EncoderConfig::new(320, 240).qp(qp).keyframe_interval(1);
+            let config = H264EncoderConfig::new().qp(qp).keyframe_interval(1);
             let mut encoder = H264Encoder::new(config).unwrap();
             let mut total = 0u64;
             for i in 0..10 {
                 let frame = detailed_frame(320, 240, i as u8);
-                total += encoder.encode_yuv420(&frame).unwrap().len() as u64;
+                total += encoder.encode_yuv420_at(&frame, 320, 240).unwrap().len() as u64;
             }
             total
         };
@@ -1659,7 +1690,7 @@ mod tests {
     /// Encode two GOPs, force a keyframe mid-GOP, and return the per-frame
     /// access units from the forced IDR onward.
     fn encode_with_midstream_forced_idr(strategy: SpsPpsStrategy) -> Vec<Vec<u8>> {
-        let mut config = H264EncoderConfig::new(320, 240)
+        let mut config = H264EncoderConfig::new()
             .keyframe_interval(10)
             .sps_pps_strategy(strategy);
         config.scene_change_detect = false; // deterministic IDR placement
@@ -1672,7 +1703,7 @@ mod tests {
                 encoder.force_keyframe();
             }
             let frame = detailed_frame(320, 240, i as u8);
-            let encoded = encoder.encode_yuv420(&frame).unwrap();
+            let encoded = encoder.encode_yuv420_at(&frame, 320, 240).unwrap();
             if i == 13 {
                 assert!(
                     nal_unit_types(&encoded).contains(&5),
@@ -1736,7 +1767,7 @@ mod tests {
         use crate::memory::SharedArena;
         use crate::metadata::{BufferFlags, Metadata};
 
-        let mut config = H264EncoderConfig::new(320, 240).keyframe_interval(5);
+        let mut config = H264EncoderConfig::new().keyframe_interval(5);
         config.scene_change_detect = false;
         let mut encoder = H264Encoder::new(config).unwrap();
 
@@ -1748,6 +1779,7 @@ mod tests {
             slot.data_mut()[..frame.len()].copy_from_slice(&frame);
             let mut metadata = Metadata::from_sequence(i as u64);
             metadata.flags |= BufferFlags::SYNC_POINT; // raw frames all "keyframes"
+            metadata.set_video_dims(320, 240, crate::format::PixelFormat::I420);
             let buffer = Buffer::new(MemoryHandle::with_len(slot, frame.len()), metadata);
 
             let out = encoder.process(buffer).unwrap().expect("encoded AU");
@@ -1770,7 +1802,7 @@ mod tests {
 
     #[test]
     fn test_encoder_creation() {
-        let config = H264EncoderConfig::new(320, 240);
+        let config = H264EncoderConfig::new();
         let encoder = H264Encoder::new(config);
         assert!(encoder.is_ok());
     }
@@ -1792,10 +1824,12 @@ mod tests {
         }
 
         // Encode
-        let config = H264EncoderConfig::new(width as u32, height as u32);
+        let config = H264EncoderConfig::new();
         let mut encoder = H264Encoder::new(config).expect("Failed to create encoder");
 
-        let encoded = encoder.encode_yuv420(&yuv_data).expect("Failed to encode");
+        let encoded = encoder
+            .encode_yuv420_at(&yuv_data, width as u32, height as u32)
+            .expect("Failed to encode");
         assert!(!encoded.is_empty(), "Encoded data should not be empty");
 
         // Decode
@@ -1815,13 +1849,15 @@ mod tests {
         let uv_size = (width / 2) * (height / 2);
         let yuv_data = vec![128u8; y_size + uv_size * 2];
 
-        let config = H264EncoderConfig::new(width as u32, height as u32);
+        let config = H264EncoderConfig::new();
         let mut encoder = H264Encoder::new(config).expect("Failed to create encoder");
 
         assert_eq!(encoder.frame_count(), 0);
         assert_eq!(encoder.bytes_encoded(), 0);
 
-        encoder.encode_yuv420(&yuv_data).expect("Failed to encode");
+        encoder
+            .encode_yuv420_at(&yuv_data, width as u32, height as u32)
+            .expect("Failed to encode");
 
         assert_eq!(encoder.frame_count(), 1);
         assert!(encoder.bytes_encoded() > 0);

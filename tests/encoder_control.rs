@@ -97,7 +97,7 @@ async fn bitrate_and_resolution_change_on_a_running_pipeline() {
     let scaler = VideoScale::new();
     let scale = scaler.control();
 
-    let mut config = H264EncoderConfig::new(WIDTH, HEIGHT)
+    let mut config = H264EncoderConfig::new()
         .bitrate(4_000_000)
         .rate_control(RateControlMode::Bitrate)
         // Hold the rate by spending quality, not by dropping frames — otherwise
@@ -203,7 +203,7 @@ async fn resolution_can_be_lowered_and_restored_while_running() {
     let scaler = VideoScale::new();
     let scale = scaler.control();
 
-    let mut config = H264EncoderConfig::new(WIDTH, HEIGHT);
+    let mut config = H264EncoderConfig::new();
     config.scene_change_detect = false;
     let encoder = H264Encoder::new(config).unwrap();
 

@@ -26,6 +26,24 @@ fn create_test_buffer(data: &[u8]) -> Buffer {
     Buffer::new(handle, Metadata::from_sequence(0))
 }
 
+/// A raw-video buffer that describes its own geometry, the way every source and
+/// decoder now does. Image encoders read their size and pixel layout from here.
+fn create_video_buffer(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    pixel_format: parallax::format::PixelFormat,
+) -> Buffer {
+    let arena = test_arena();
+    let mut slot = arena.acquire().expect("failed to acquire slot from arena");
+    slot.data_mut()[..data.len()].copy_from_slice(data);
+    let handle = MemoryHandle::with_len(slot, data.len());
+
+    let mut metadata = Metadata::from_sequence(0);
+    metadata.set_video_dims(width, height, pixel_format);
+    Buffer::new(handle, metadata)
+}
+
 // ============================================================================
 // PNG Codec Tests
 // ============================================================================
@@ -34,7 +52,7 @@ fn create_test_buffer(data: &[u8]) -> Buffer {
 mod png_tests {
     use super::*;
     use parallax::element::Element;
-    use parallax::elements::codec::{ColorType, PngDecoder, PngEncoder};
+    use parallax::elements::codec::{PngDecoder, PngEncoder};
 
     /// Create a simple 2x2 RGB test image
     fn create_rgb_image(width: u32, height: u32) -> Vec<u8> {
@@ -69,8 +87,13 @@ mod png_tests {
         let raw_image = create_rgb_image(width, height);
 
         // Encode to PNG
-        let mut encoder = PngEncoder::new(width, height, ColorType::Rgb);
-        let input_buffer = create_test_buffer(&raw_image);
+        let mut encoder = PngEncoder::new();
+        let input_buffer = create_video_buffer(
+            &raw_image,
+            width,
+            height,
+            parallax::format::PixelFormat::Rgb24,
+        );
         let encoded = encoder.process(input_buffer).unwrap().unwrap();
 
         // Verify PNG signature
@@ -99,8 +122,13 @@ mod png_tests {
         let raw_image = create_gray_image(width, height);
 
         // Encode to PNG
-        let mut encoder = PngEncoder::new(width, height, ColorType::Gray);
-        let input_buffer = create_test_buffer(&raw_image);
+        let mut encoder = PngEncoder::new();
+        let input_buffer = create_video_buffer(
+            &raw_image,
+            width,
+            height,
+            parallax::format::PixelFormat::Gray8,
+        );
         let encoded = encoder.process(input_buffer).unwrap().unwrap();
 
         // Decode the PNG
@@ -127,8 +155,13 @@ mod png_tests {
         }
 
         // Encode to PNG
-        let mut encoder = PngEncoder::new(width, height, ColorType::Rgba);
-        let input_buffer = create_test_buffer(&raw_image);
+        let mut encoder = PngEncoder::new();
+        let input_buffer = create_video_buffer(
+            &raw_image,
+            width,
+            height,
+            parallax::format::PixelFormat::Rgba,
+        );
         let encoded = encoder.process(input_buffer).unwrap().unwrap();
 
         // Decode the PNG
@@ -148,8 +181,13 @@ mod png_tests {
         let raw_size = raw_image.len();
 
         // Encode to PNG
-        let mut encoder = PngEncoder::new(width, height, ColorType::Rgb);
-        let input_buffer = create_test_buffer(&raw_image);
+        let mut encoder = PngEncoder::new();
+        let input_buffer = create_video_buffer(
+            &raw_image,
+            width,
+            height,
+            parallax::format::PixelFormat::Rgb24,
+        );
         let encoded = encoder.process(input_buffer).unwrap().unwrap();
 
         // PNG should provide some compression for this pattern
@@ -180,7 +218,7 @@ mod png_tests {
         let width = 8;
         let height = 8;
 
-        let mut encoder = PngEncoder::new(width, height, ColorType::Rgb);
+        let mut encoder = PngEncoder::new();
         let mut decoder = PngDecoder::new();
 
         // Process multiple frames
@@ -193,7 +231,12 @@ mod png_tests {
                 pixel[2] = (i * 30) as u8;
             }
 
-            let input_buffer = create_test_buffer(&raw_image);
+            let input_buffer = create_video_buffer(
+                &raw_image,
+                width,
+                height,
+                parallax::format::PixelFormat::Rgb24,
+            );
             let encoded = encoder.process(input_buffer).unwrap().unwrap();
             let decoded = decoder.process(encoded).unwrap().unwrap();
 
@@ -415,7 +458,7 @@ mod av1_encode_tests {
 mod integration_tests {
     use super::*;
     use parallax::element::Element;
-    use parallax::elements::codec::{ColorType, PngDecoder, PngEncoder};
+    use parallax::elements::codec::{PngDecoder, PngEncoder};
 
     #[test]
     fn test_encoder_decoder_pipeline() {
@@ -433,11 +476,16 @@ mod integration_tests {
             }
         }
 
-        let mut encoder = PngEncoder::new(width, height, ColorType::Rgb);
+        let mut encoder = PngEncoder::new();
         let mut decoder = PngDecoder::new();
 
         // Process through encoder
-        let input = create_test_buffer(&raw_data);
+        let input = create_video_buffer(
+            &raw_data,
+            width,
+            height,
+            parallax::format::PixelFormat::Rgb24,
+        );
         let encoded = encoder.process(input).unwrap().unwrap();
 
         // Process through decoder
@@ -454,7 +502,7 @@ mod integration_tests {
         let height = 16;
         let frame_count = 10;
 
-        let mut encoder = PngEncoder::new(width, height, ColorType::Rgb);
+        let mut encoder = PngEncoder::new();
         let mut decoder = PngDecoder::new();
 
         for frame_idx in 0..frame_count {
@@ -464,7 +512,12 @@ mod integration_tests {
                 *byte = ((i + frame_idx * 100) % 256) as u8;
             }
 
-            let input = create_test_buffer(&raw_data);
+            let input = create_video_buffer(
+                &raw_data,
+                width,
+                height,
+                parallax::format::PixelFormat::Rgb24,
+            );
             let encoded = encoder.process(input).unwrap().unwrap();
             let decoded = decoder.process(encoded).unwrap().unwrap();
 
@@ -475,5 +528,165 @@ mod integration_tests {
                 frame_idx
             );
         }
+    }
+}
+
+// ============================================================================
+// Geometry travels in-band (#38)
+// ============================================================================
+
+/// The invariant these tests pin down:
+///
+/// > **Geometry travels in-band, in `Metadata`. No element takes dimensions at
+/// > construction. An element that cannot determine its geometry from metadata
+/// > errors — it never falls back to a stale constructor value.**
+///
+/// Before this, elements disagreed about where geometry lived, and that
+/// disagreement *was* a bug class: put a scaler upstream of an image encoder
+/// constructed at the source size and it either threw "Input buffer too small"
+/// when the frame shrank, or silently encoded the top-left corner of a larger
+/// one.
+#[cfg(feature = "image-jpeg")]
+mod geometry_in_metadata {
+    use super::*;
+    use parallax::element::Element;
+    use parallax::elements::codec::{JpegDecoder, JpegEncoder};
+    use parallax::elements::transform::VideoScale;
+    use parallax::format::PixelFormat;
+
+    fn rgb_gradient(width: u32, height: u32) -> Vec<u8> {
+        let mut data = Vec::with_capacity((width * height * 3) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                data.push((x * 255 / width.max(1)) as u8);
+                data.push((y * 255 / height.max(1)) as u8);
+                data.push(64);
+            }
+        }
+        data
+    }
+
+    /// The zensight preview branch, and the thing 0.2.0 could not express at all:
+    /// decode a JPEG, scale it down, re-encode it. Previews were being encoded at
+    /// *full source size* — a 1080p camera's thumbnail was a 1080p JPEG rendered
+    /// into a 320x180 tile — because the scaler corrupted RGB (#36/#37) and the
+    /// encoder's geometry was frozen at construction (#38). Neither fix alone is
+    /// enough; this needs both.
+    ///
+    /// Note what is *not* here: no dimensions are passed to any constructor. Every
+    /// element learns the geometry from the buffer it is handed.
+    #[test]
+    fn jpeg_decode_scale_encode_rgb_chain() {
+        const SRC_W: u32 = 32;
+        const SRC_H: u32 = 16;
+
+        // A source JPEG at 32x16.
+        let mut jpeg_encoder = JpegEncoder::new().with_quality(95);
+        let source = create_video_buffer(
+            &rgb_gradient(SRC_W, SRC_H),
+            SRC_W,
+            SRC_H,
+            PixelFormat::Rgb24,
+        );
+        let jpeg = jpeg_encoder.process(source).unwrap().unwrap();
+
+        // Decode -> the decoder stamps 32x16 Rgb24.
+        let mut decoder = JpegDecoder::new();
+        let decoded = decoder.process(jpeg).unwrap().unwrap();
+        assert_eq!(decoded.metadata().video_dims(), Some((SRC_W, SRC_H)));
+        assert_eq!(
+            decoded.metadata().video_pixel_format(),
+            Some(PixelFormat::Rgb24),
+            "the scaler needs to know this is RGB, not planar YUV"
+        );
+
+        // Scale to half size, in RGB, with no colourspace round-trip.
+        let mut scaler = VideoScale::new();
+        scaler.control().set_target(SRC_W / 2, SRC_H / 2);
+        let scaled = scaler.process(decoded).unwrap().unwrap();
+
+        assert_eq!(scaled.metadata().video_dims(), Some((16, 8)));
+        assert_eq!(
+            scaled.metadata().video_pixel_format(),
+            Some(PixelFormat::Rgb24),
+            "scaling preserves the pixel format"
+        );
+        assert_eq!(scaled.len(), 16 * 8 * 3);
+
+        // Re-encode. The encoder takes 16x8 from the buffer — it was never told a
+        // size, so it cannot be encoding a stale one.
+        let mut preview_encoder = JpegEncoder::new().with_quality(75);
+        let preview = preview_encoder.process(scaled).unwrap().unwrap();
+
+        let mut check = JpegDecoder::new();
+        let final_frame = check.process(preview).unwrap().unwrap();
+        assert_eq!(
+            final_frame.metadata().video_dims(),
+            Some((16, 8)),
+            "the preview must be a *small* JPEG, not a full-size one"
+        );
+
+        // And it must still look like the gradient: left darker than right.
+        let px = final_frame.as_bytes();
+        let left_red = px[0] as i32;
+        let right_red = px[15 * 3] as i32;
+        assert!(
+            right_red > left_red + 40,
+            "the horizontal gradient did not survive the chain \
+             (left R={left_red}, right R={right_red})"
+        );
+    }
+
+    /// An image encoder follows the buffer, frame by frame. Constructed once, fed
+    /// two different sizes, it must encode each at its own size — where before it
+    /// would have cropped the larger one to the corner or errored on the smaller.
+    #[test]
+    fn image_encoder_geometry_follows_the_buffer() {
+        let mut encoder = JpegEncoder::new();
+        let mut decoder = JpegDecoder::new();
+
+        for (w, h) in [(32u32, 16u32), (16, 8), (48, 24)] {
+            let raw = create_video_buffer(&rgb_gradient(w, h), w, h, PixelFormat::Rgb24);
+            let jpeg = encoder.process(raw).unwrap().unwrap();
+            let decoded = decoder.process(jpeg).unwrap().unwrap();
+
+            assert_eq!(
+                decoded.metadata().video_dims(),
+                Some((w, h)),
+                "encoder did not follow the buffer to {w}x{h}"
+            );
+        }
+    }
+
+    /// A YUV frame handed to an image encoder means someone forgot a
+    /// VideoConvertElement. It used to be encoded as if its planes were
+    /// interleaved RGB — garbage, silently. Say so instead.
+    #[test]
+    fn an_image_encoder_rejects_yuv_input() {
+        let yuv = create_video_buffer(&vec![128u8; 16 * 16 * 3 / 2], 16, 16, PixelFormat::I420);
+
+        let err = JpegEncoder::new().process(yuv).unwrap_err().to_string();
+        assert!(
+            err.contains("I420"),
+            "the error must name the format: {err}"
+        );
+        assert!(
+            err.contains("VideoConvertElement"),
+            "the error must say how to fix it: {err}"
+        );
+    }
+
+    /// No geometry, no encode. There is no constructor value left to fall back to,
+    /// and inventing one produces sheared or truncated pictures.
+    #[test]
+    fn an_image_encoder_without_geometry_errors() {
+        let bare = create_test_buffer(&[0u8; 768]);
+
+        let err = JpegEncoder::new().process(bare).unwrap_err().to_string();
+        assert!(
+            err.contains("no video dimensions"),
+            "unhelpful error: {err}"
+        );
+        assert!(err.contains("set_video_dims"), "unhelpful error: {err}");
     }
 }
