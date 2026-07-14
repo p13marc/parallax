@@ -213,7 +213,7 @@ mod image;
 pub use image::{ColorType, ImageFrame};
 
 #[cfg(feature = "image-jpeg")]
-pub use image::{JpegDecoder, JpegEncoder};
+pub use image::{JpegDecoder, JpegEncoder, JpegQualityControl};
 
 #[cfg(feature = "image-png")]
 pub use image::{PngDecoder, PngEncoder};

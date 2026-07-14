@@ -219,9 +219,35 @@ mod jpeg_codec {
         width: u32,
         height: u32,
         color_type: ColorType,
-        quality: u8,
+        /// Shared with [`JpegQualityControl`] handles so a running pipeline can
+        /// change it.
+        quality: std::sync::Arc<std::sync::atomic::AtomicU8>,
         frame_count: u64,
         arena: Option<SharedArena>,
+    }
+
+    /// Cloneable handle to change a running [`JpegEncoder`]'s quality.
+    ///
+    /// A preview branch is a real per-viewer cost — at 640x480 and quality 75,
+    /// even 2 fps is on the order of 50-100 kB/s each — and quality is the
+    /// cheapest knob on it.
+    ///
+    /// Like the other runtime control handles, clone it from the element
+    /// **before** `executor.start()`.
+    #[derive(Clone, Debug)]
+    pub struct JpegQualityControl(std::sync::Arc<std::sync::atomic::AtomicU8>);
+
+    impl JpegQualityControl {
+        /// Set the encoding quality (clamped to 1-100).
+        pub fn set_quality(&self, quality: u8) {
+            self.0
+                .store(quality.clamp(1, 100), std::sync::atomic::Ordering::Release);
+        }
+
+        /// The current encoding quality.
+        pub fn quality(&self) -> u8 {
+            self.0.load(std::sync::atomic::Ordering::Acquire)
+        }
     }
 
     impl JpegEncoder {
@@ -237,7 +263,7 @@ mod jpeg_codec {
                 width,
                 height,
                 color_type,
-                quality: 80,
+                quality: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(80)),
                 frame_count: 0,
                 arena: None,
             }
@@ -245,9 +271,21 @@ mod jpeg_codec {
 
         /// Set the encoding quality (1-100, default 80). Higher = better
         /// quality, larger output.
-        pub fn with_quality(mut self, quality: u8) -> Self {
-            self.quality = quality.clamp(1, 100);
+        pub fn with_quality(self, quality: u8) -> Self {
+            self.quality_control().set_quality(quality);
             self
+        }
+
+        /// Get a cloneable handle for changing the quality at runtime.
+        ///
+        /// Clone it *before* the pipeline starts — see [`JpegQualityControl`].
+        pub fn quality_control(&self) -> JpegQualityControl {
+            JpegQualityControl(std::sync::Arc::clone(&self.quality))
+        }
+
+        /// The current encoding quality (1-100).
+        pub fn quality(&self) -> u8 {
+            self.quality.load(std::sync::atomic::Ordering::Relaxed)
         }
 
         /// Get the number of frames encoded.
@@ -291,7 +329,9 @@ mod jpeg_codec {
             }
 
             let mut output = Vec::new();
-            let encoder = jpeg_encoder::Encoder::new(&mut output, self.quality);
+            // Read per frame: a JpegQualityControl handle may have changed it
+            // while the pipeline runs.
+            let encoder = jpeg_encoder::Encoder::new(&mut output, self.quality());
             encoder
                 .encode(
                     &input[..expected_size],
@@ -335,7 +375,7 @@ mod jpeg_codec {
 }
 
 #[cfg(feature = "image-jpeg")]
-pub use jpeg_codec::{JpegDecoder, JpegEncoder};
+pub use jpeg_codec::{JpegDecoder, JpegEncoder, JpegQualityControl};
 
 // ============================================================================
 // PNG Codec (using png crate)
@@ -584,6 +624,52 @@ mod tests {
             let mut metadata = Metadata::from_sequence(7);
             metadata.pts = crate::clock::ClockTime::from_millis(42);
             Buffer::new(MemoryHandle::with_len(slot, data.len()), metadata)
+        }
+
+        /// Preview quality is a live knob: a viewer on a thin link asks for a
+        /// cheaper preview and gets one without the pipeline restarting.
+        #[test]
+        fn quality_change_reaches_a_running_encoder() {
+            let original = gradient_rgb();
+            let mut encoder = JpegEncoder::new(W, H, ColorType::Rgb).with_quality(95);
+            let control = encoder.quality_control();
+
+            let high = encoder
+                .process(rgb_buffer(&original))
+                .unwrap()
+                .expect("encoder output");
+            let high_len = high.as_bytes().len();
+
+            control.set_quality(15);
+            let low = encoder
+                .process(rgb_buffer(&original))
+                .unwrap()
+                .expect("encoder output");
+            let low_len = low.as_bytes().len();
+
+            assert!(
+                low_len < high_len,
+                "quality 15 must produce a smaller JPEG than quality 95 \
+                 (got {low_len} vs {high_len} bytes)"
+            );
+
+            // Both must still be valid JPEGs a viewer can decode.
+            let mut decoder = JpegDecoder::new();
+            for encoded in [high, low] {
+                assert_eq!(&encoded.as_bytes()[..2], &[0xFF, 0xD8], "JPEG SOI marker");
+                assert!(decoder.process(encoded).unwrap().is_some());
+            }
+        }
+
+        #[test]
+        fn quality_is_clamped_on_every_path() {
+            let encoder = JpegEncoder::new(W, H, ColorType::Rgb).with_quality(200);
+            assert_eq!(encoder.quality(), 100);
+
+            let control = encoder.quality_control();
+            control.set_quality(0);
+            assert_eq!(control.quality(), 1, "0 would be a library-level surprise");
+            assert_eq!(encoder.quality(), 1, "handle and element share state");
         }
 
         #[test]
