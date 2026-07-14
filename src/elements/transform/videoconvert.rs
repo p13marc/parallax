@@ -140,7 +140,7 @@ impl VideoConvertElement {
     ) -> Result<(PixelFormat, u32, u32)> {
         let format = metadata
             .video_pixel_format()
-            .and_then(from_format_pixel_format)
+            .and_then(|pf| PixelFormat::try_from(pf).ok())
             .or(self.input_format);
         let dims = metadata
             .video_dims()
@@ -262,7 +262,7 @@ impl Element for VideoConvertElement {
         // only the pixel format changes — but the input's dimension metadata
         // must be carried forward in both representations, or a downstream
         // encoder and AutoVideoSink can disagree about the frame size.
-        metadata.set_video_dims(width, height, convert_pixel_format(self.output_format));
+        metadata.set_video_dims(width, height, self.output_format.into());
         let output = Buffer::new(handle, metadata);
 
         Ok(Some(output))
@@ -284,7 +284,7 @@ impl Element for VideoConvertElement {
     fn output_caps(&self) -> Caps {
         // Output is always the configured output format
         // Use 0x0 dimensions since we don't know them until we process the first frame
-        Caps::video_raw_any_resolution(convert_pixel_format(self.output_format))
+        Caps::video_raw_any_resolution(self.output_format.into())
     }
 
     fn input_media_caps(&self) -> crate::format::ElementMediaCaps {
@@ -320,7 +320,7 @@ impl Element for VideoConvertElement {
         let format = VideoFormatCaps {
             width: CapsValue::Any,
             height: CapsValue::Any,
-            pixel_format: CapsValue::Fixed(convert_pixel_format(self.output_format)),
+            pixel_format: CapsValue::Fixed(self.output_format.into()),
             framerate: CapsValue::Any,
             layout: MemoryLayout::AVX, // Produce aligned output
         };
@@ -329,42 +329,6 @@ impl Element for VideoConvertElement {
             FormatCaps::VideoRaw(format),
             MemoryCaps::cpu_only(),
         )])
-    }
-}
-
-/// Convert from format::PixelFormat to converters::PixelFormat.
-///
-/// The inverse of [`convert_pixel_format`]. `None` for the caps-only formats
-/// this crate can describe but not convert (10-bit, I422, I444, …) — see the
-/// two-`PixelFormat`-enums gotcha (#7).
-fn from_format_pixel_format(pf: crate::format::PixelFormat) -> Option<PixelFormat> {
-    use crate::format::PixelFormat as Caps;
-    Some(match pf {
-        Caps::Yuyv => PixelFormat::Yuyv,
-        Caps::Uyvy => PixelFormat::Uyvy,
-        Caps::Nv12 => PixelFormat::Nv12,
-        Caps::I420 => PixelFormat::I420,
-        Caps::Rgb24 => PixelFormat::Rgb24,
-        Caps::Bgr24 => PixelFormat::Bgr24,
-        Caps::Rgba => PixelFormat::Rgba,
-        Caps::Bgra => PixelFormat::Bgra,
-        Caps::Gray8 => PixelFormat::Gray8,
-        _ => return None,
-    })
-}
-
-/// Convert from converters::PixelFormat to format::PixelFormat
-fn convert_pixel_format(pf: PixelFormat) -> crate::format::PixelFormat {
-    match pf {
-        PixelFormat::Yuyv => crate::format::PixelFormat::Yuyv,
-        PixelFormat::Uyvy => crate::format::PixelFormat::Uyvy,
-        PixelFormat::Nv12 => crate::format::PixelFormat::Nv12,
-        PixelFormat::I420 => crate::format::PixelFormat::I420,
-        PixelFormat::Rgb24 => crate::format::PixelFormat::Rgb24,
-        PixelFormat::Bgr24 => crate::format::PixelFormat::Bgr24,
-        PixelFormat::Rgba => crate::format::PixelFormat::Rgba,
-        PixelFormat::Bgra => crate::format::PixelFormat::Bgra,
-        PixelFormat::Gray8 => crate::format::PixelFormat::Gray8,
     }
 }
 
@@ -390,7 +354,7 @@ mod tests {
 
     /// A raw frame of `format` at `w`x`h`, carrying its geometry in metadata.
     fn frame(format: crate::format::PixelFormat, w: u32, h: u32) -> Buffer {
-        let size = from_format_pixel_format(format).unwrap().buffer_size(w, h);
+        let size = PixelFormat::try_from(format).unwrap().buffer_size(w, h);
         let arena = SharedArena::new(size, 4).unwrap();
         let mut slot = arena.acquire().unwrap();
         slot.data_mut()[..size].fill(0x40);

@@ -36,6 +36,6 @@ mod resample;
 mod scale;
 
 pub use audio::{AudioChannelMix, AudioConvert, ChannelLayout, SampleFormat};
-pub use colorspace::{ColorMatrix, PixelFormat, VideoConvert};
+pub use colorspace::{ColorMatrix, PixelFormat, UnsupportedPixelFormat, VideoConvert};
 pub use resample::{AudioResample, ResampleQuality};
 pub use scale::{ScaleAlgorithm, VideoScale};
