@@ -85,6 +85,117 @@ impl SpsPpsStrategy {
     }
 }
 
+/// How the encoder trades bits against quality (mirrors OpenH264's `iRCMode`).
+///
+/// This is the knob that decides how seriously
+/// [`bitrate_bps`](H264EncoderConfig::bitrate_bps) is taken. The default is
+/// [`Quality`](Self::Quality), matching OpenH264 — a streaming sensor on a
+/// constrained link usually wants [`Bitrate`](Self::Bitrate) instead.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RateControlMode {
+    /// Quality first: the bitrate target is a hint, not a budget (OpenH264's
+    /// default, and this crate's).
+    #[default]
+    Quality,
+    /// Bitrate first: hold the target, spending quality to do it. What you want
+    /// when the link, not the picture, is the constraint.
+    Bitrate,
+    /// Ignore the bitrate target; adjust quality from buffer status alone.
+    BufferBased,
+    /// Rate control driven by frame timestamps.
+    Timestamp,
+    /// No rate control at all: quality is governed purely by the QP band.
+    Off,
+}
+
+impl RateControlMode {
+    fn to_openh264(self) -> openh264::encoder::RateControlMode {
+        use openh264::encoder::RateControlMode as O;
+        match self {
+            Self::Quality => O::Quality,
+            Self::Bitrate => O::Bitrate,
+            Self::BufferBased => O::Bufferbased,
+            Self::Timestamp => O::Timestamp,
+            Self::Off => O::Off,
+        }
+    }
+}
+
+/// H.264 profile (decoder compatibility).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Profile {
+    /// Baseline: no B-frames or CABAC. The most widely decodable.
+    Baseline,
+    /// Main: CABAC and B-frames. The usual choice for streaming.
+    Main,
+    /// High: Main plus 8x8 transforms. Best compression, still ubiquitous.
+    High,
+}
+
+impl Profile {
+    fn to_openh264(self) -> openh264::encoder::Profile {
+        use openh264::encoder::Profile as O;
+        match self {
+            Self::Baseline => O::Baseline,
+            Self::Main => O::Main,
+            Self::High => O::High,
+        }
+    }
+}
+
+/// Encoder complexity: CPU spent per frame.
+///
+/// The knob to reach for when encoding cannot keep up — cheaper than dropping
+/// resolution, and invisible to the receiver.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Complexity {
+    /// Fastest, lowest quality per bit.
+    Low,
+    /// OpenH264's default.
+    #[default]
+    Medium,
+    /// Slowest, best quality per bit.
+    High,
+}
+
+impl Complexity {
+    fn to_openh264(self) -> openh264::encoder::Complexity {
+        use openh264::encoder::Complexity as O;
+        match self {
+            Self::Low => O::Low,
+            Self::Medium => O::Medium,
+            Self::High => O::High,
+        }
+    }
+}
+
+/// What kind of content is being encoded, which tunes the encoder's heuristics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UsageType {
+    /// Camera video, real-time (the default).
+    #[default]
+    CameraRealtime,
+    /// Screen content, real-time — for `ScreenCaptureSrc` and friends, where
+    /// sharp edges and static regions dominate.
+    ScreenRealtime,
+    /// Camera video, non-real-time (offline transcode).
+    CameraNonRealtime,
+    /// Screen content, non-real-time.
+    ScreenNonRealtime,
+}
+
+impl UsageType {
+    fn to_openh264(self) -> openh264::encoder::UsageType {
+        use openh264::encoder::UsageType as O;
+        match self {
+            Self::CameraRealtime => O::CameraVideoRealTime,
+            Self::ScreenRealtime => O::ScreenContentRealTime,
+            Self::CameraNonRealtime => O::CameraVideoNonRealTime,
+            Self::ScreenNonRealtime => O::ScreenContentNonRealTime,
+        }
+    }
+}
+
 /// H.264 encoder configuration.
 #[derive(Debug, Clone)]
 pub struct H264EncoderConfig {
@@ -111,6 +222,22 @@ pub struct H264EncoderConfig {
     pub num_threads: u32,
     /// SPS/PPS parameter-set ID strategy (see [`SpsPpsStrategy`]).
     pub sps_pps_strategy: SpsPpsStrategy,
+    /// How strictly [`bitrate_bps`](Self::bitrate_bps) is honoured (see
+    /// [`RateControlMode`]). Defaults to `Quality`, matching OpenH264.
+    pub rate_control: RateControlMode,
+    /// Cap on the size of each emitted NAL unit, in bytes.
+    ///
+    /// `None` (the default) emits one slice per frame. Setting this to just
+    /// under the path MTU (~1200 bytes for RTP over Ethernet) makes the encoder
+    /// produce packet-sized NALs, so the payloader does not have to fragment
+    /// every slice.
+    pub max_slice_len: Option<u32>,
+    /// H.264 profile. `None` lets OpenH264 choose.
+    pub profile: Option<Profile>,
+    /// CPU spent per frame (see [`Complexity`]).
+    pub complexity: Complexity,
+    /// Content type, which tunes the encoder's heuristics (see [`UsageType`]).
+    pub usage_type: UsageType,
 }
 
 impl H264EncoderConfig {
@@ -126,6 +253,11 @@ impl H264EncoderConfig {
             keyframe_interval: 0,
             num_threads: 0,
             sps_pps_strategy: SpsPpsStrategy::default(),
+            rate_control: RateControlMode::default(),
+            max_slice_len: None,
+            profile: None,
+            complexity: Complexity::default(),
+            usage_type: UsageType::default(),
         }
     }
 
@@ -162,6 +294,40 @@ impl H264EncoderConfig {
     /// Set the SPS/PPS emission strategy (see [`SpsPpsStrategy`]).
     pub fn sps_pps_strategy(mut self, strategy: SpsPpsStrategy) -> Self {
         self.sps_pps_strategy = strategy;
+        self
+    }
+
+    /// Set how strictly the bitrate target is honoured (see [`RateControlMode`]).
+    ///
+    /// Pair [`RateControlMode::Bitrate`] with [`bitrate`](Self::bitrate) when
+    /// the link is the constraint.
+    pub fn rate_control(mut self, mode: RateControlMode) -> Self {
+        self.rate_control = mode;
+        self
+    }
+
+    /// Cap the size of each emitted NAL unit, in bytes (see
+    /// [`max_slice_len`](Self::max_slice_len)).
+    pub fn max_slice_len(mut self, bytes: u32) -> Self {
+        self.max_slice_len = Some(bytes);
+        self
+    }
+
+    /// Set the H.264 profile.
+    pub fn profile(mut self, profile: Profile) -> Self {
+        self.profile = Some(profile);
+        self
+    }
+
+    /// Set the encoder complexity (CPU per frame).
+    pub fn complexity(mut self, complexity: Complexity) -> Self {
+        self.complexity = complexity;
+        self
+    }
+
+    /// Set the content type (camera vs screen, real-time vs not).
+    pub fn usage_type(mut self, usage: UsageType) -> Self {
+        self.usage_type = usage;
         self
     }
 
@@ -233,7 +399,17 @@ fn build_encoder(config: &H264EncoderConfig) -> Result<Encoder> {
         .num_threads(config.num_threads as u16)
         .qp(QpRange::new(qp.saturating_sub(4), (qp + 4).min(51)))
         .intra_frame_period(IntraFramePeriod::from_num_frames(config.keyframe_interval))
-        .sps_pps_strategy(config.sps_pps_strategy.to_openh264());
+        .sps_pps_strategy(config.sps_pps_strategy.to_openh264())
+        .rate_control_mode(config.rate_control.to_openh264())
+        .complexity(config.complexity.to_openh264())
+        .usage_type(config.usage_type.to_openh264());
+
+    if let Some(max_slice_len) = config.max_slice_len {
+        encoder_config = encoder_config.max_slice_len(max_slice_len);
+    }
+    if let Some(profile) = config.profile {
+        encoder_config = encoder_config.profile(profile.to_openh264());
+    }
 
     let api = OpenH264API::from_source();
     Encoder::with_api_config(api, encoder_config)
@@ -990,6 +1166,145 @@ mod tests {
             }
         }
         data
+    }
+
+    /// Sizes of every Annex-B NAL payload (excluding start codes).
+    fn nal_sizes(data: &[u8]) -> Vec<usize> {
+        let mut starts = Vec::new();
+        let mut i = 0;
+        while i + 3 < data.len() {
+            if data[i..].starts_with(&[0, 0, 0, 1]) {
+                starts.push(i + 4);
+                i += 4;
+            } else if data[i..].starts_with(&[0, 0, 1]) {
+                starts.push(i + 3);
+                i += 3;
+            } else {
+                i += 1;
+            }
+        }
+        starts
+            .iter()
+            .enumerate()
+            .map(|(n, &start)| {
+                let end = starts.get(n + 1).map(|&s| s - 4).unwrap_or(data.len());
+                end.saturating_sub(start)
+            })
+            .collect()
+    }
+
+    /// Rate control is the knob that decides whether `bitrate_bps` is a budget
+    /// or a suggestion. Until now it was never set at all, so every stream ran
+    /// on OpenH264's default (Quality) no matter what bitrate was asked for.
+    #[test]
+    fn bitrate_mode_tracks_the_target_more_tightly_than_no_rate_control() {
+        let encode_all = |mode: RateControlMode| -> u64 {
+            let mut config = H264EncoderConfig::new(320, 240)
+                .bitrate(150_000)
+                .rate_control(mode);
+            config.scene_change_detect = false;
+            let mut encoder = H264Encoder::new(config).unwrap();
+            for i in 0..20 {
+                encoder
+                    .encode_yuv420(&detailed_frame(320, 240, i as u8))
+                    .unwrap();
+            }
+            encoder.bytes_encoded()
+        };
+
+        let budgeted = encode_all(RateControlMode::Bitrate);
+        let unconstrained = encode_all(RateControlMode::Off);
+
+        assert!(
+            budgeted < unconstrained,
+            "Bitrate mode must honour a 150 kbps target more than no rate control at all \
+             (got {budgeted} vs {unconstrained} bytes)"
+        );
+    }
+
+    /// MTU-sized NALs: without this the RTP payloader fragments every slice.
+    #[test]
+    fn max_slice_len_caps_nal_size() {
+        const CAP: u32 = 1200;
+        let mut config = H264EncoderConfig::new(320, 240).max_slice_len(CAP);
+        config.scene_change_detect = false;
+        let mut encoder = H264Encoder::new(config).unwrap();
+
+        let mut seen_any = false;
+        for i in 0..5 {
+            let encoded = encoder
+                .encode_yuv420(&detailed_frame(320, 240, i as u8))
+                .unwrap();
+            for size in nal_sizes(&encoded) {
+                seen_any = true;
+                assert!(
+                    size <= CAP as usize,
+                    "NAL of {size} bytes exceeds the {CAP}-byte cap"
+                );
+            }
+        }
+        assert!(seen_any, "expected some NAL units");
+    }
+
+    #[test]
+    fn profile_is_reflected_in_the_sps() {
+        // SPS (NAL type 7) carries profile_idc in its first payload byte:
+        // 66 = Baseline, 77 = Main, 100 = High.
+        let profile_idc = |profile: Profile| -> u8 {
+            let mut encoder =
+                H264Encoder::new(H264EncoderConfig::new(320, 240).profile(profile)).unwrap();
+            let encoded = encoder.encode_yuv420(&detailed_frame(320, 240, 0)).unwrap();
+
+            let mut i = 0;
+            while i + 4 < encoded.len() {
+                if encoded[i..].starts_with(&[0, 0, 0, 1]) && encoded[i + 4] & 0x1F == 7 {
+                    return encoded[i + 5];
+                }
+                i += 1;
+            }
+            panic!("no SPS in the stream");
+        };
+
+        assert_eq!(profile_idc(Profile::Baseline), 66);
+        assert_eq!(profile_idc(Profile::High), 100);
+    }
+
+    #[test]
+    fn new_knobs_default_to_previous_behaviour() {
+        // Guards against a silent quality/bitrate regression for existing users.
+        let config = H264EncoderConfig::new(320, 240);
+        assert_eq!(config.rate_control, RateControlMode::Quality);
+        assert_eq!(config.max_slice_len, None);
+        assert_eq!(config.profile, None);
+        assert_eq!(config.complexity, Complexity::Medium);
+        assert_eq!(config.usage_type, UsageType::CameraRealtime);
+    }
+
+    #[test]
+    fn config_knobs_survive_a_live_reconfigure() {
+        use crate::element::Element;
+
+        // The rebuild path must re-apply every knob, not just the three the
+        // control handle carries.
+        let config = H264EncoderConfig::new(320, 240)
+            .bitrate(2_000_000)
+            .rate_control(RateControlMode::Bitrate)
+            .max_slice_len(1200)
+            .profile(Profile::Baseline);
+        let mut encoder = H264Encoder::new(config).unwrap();
+        let control = encoder.control_handle();
+
+        control.set_bitrate(400_000);
+        let out = encoder
+            .process(yuv_buffer(&detailed_frame(320, 240, 0), 320, 240))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(encoder.config().rate_control, RateControlMode::Bitrate);
+        assert_eq!(encoder.config().max_slice_len, Some(1200));
+        for size in nal_sizes(out.as_bytes()) {
+            assert!(size <= 1200, "slice cap lost across the rebuild: {size}");
+        }
     }
 
     /// The point of the whole exercise: dropping the bitrate on a live encoder
