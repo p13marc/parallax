@@ -117,6 +117,24 @@ impl PixelFormat {
         )
     }
 
+    /// Every format the conversion and scaling engines can actually touch.
+    ///
+    /// The caps vocabulary ([`format::PixelFormat`](crate::format::PixelFormat))
+    /// is deliberately wider than this — it can *name* 10-bit, 4:2:2 and 4:4:4
+    /// planar formats that no engine here handles. This is the subset an
+    /// element should advertise if it delegates to `converters`.
+    pub const ALL: [PixelFormat; 9] = [
+        PixelFormat::I420,
+        PixelFormat::Nv12,
+        PixelFormat::Yuyv,
+        PixelFormat::Uyvy,
+        PixelFormat::Rgb24,
+        PixelFormat::Rgba,
+        PixelFormat::Bgr24,
+        PixelFormat::Bgra,
+        PixelFormat::Gray8,
+    ];
+
     /// Try to parse a V4L2 fourcc code into a PixelFormat.
     pub fn from_fourcc(fourcc: &[u8; 4]) -> Option<Self> {
         match fourcc {
@@ -130,6 +148,73 @@ impl PixelFormat {
             b"GREY" | b"Y800" => Some(PixelFormat::Gray8),
             _ => None,
         }
+    }
+}
+
+/// A caps pixel format that no conversion engine can handle.
+///
+/// [`format::PixelFormat`](crate::format::PixelFormat) has 15 variants because
+/// caps must be able to *describe* what a device produces; `converters` has 9
+/// because those are the ones there is code for. Converting between them is
+/// therefore total in one direction and fallible in the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnsupportedPixelFormat(pub crate::format::PixelFormat);
+
+impl std::fmt::Display for UnsupportedPixelFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "pixel format {:?} has no conversion engine (supported: {:?})",
+            self.0,
+            PixelFormat::ALL
+        )
+    }
+}
+
+impl std::error::Error for UnsupportedPixelFormat {}
+
+impl From<UnsupportedPixelFormat> for crate::error::Error {
+    fn from(e: UnsupportedPixelFormat) -> Self {
+        crate::error::Error::InvalidCaps(e.to_string())
+    }
+}
+
+/// Total: every engine format has a name in the caps vocabulary.
+impl From<PixelFormat> for crate::format::PixelFormat {
+    fn from(pf: PixelFormat) -> Self {
+        use crate::format::PixelFormat as Caps;
+        match pf {
+            PixelFormat::I420 => Caps::I420,
+            PixelFormat::Nv12 => Caps::Nv12,
+            PixelFormat::Yuyv => Caps::Yuyv,
+            PixelFormat::Uyvy => Caps::Uyvy,
+            PixelFormat::Rgb24 => Caps::Rgb24,
+            PixelFormat::Rgba => Caps::Rgba,
+            PixelFormat::Bgr24 => Caps::Bgr24,
+            PixelFormat::Bgra => Caps::Bgra,
+            PixelFormat::Gray8 => Caps::Gray8,
+        }
+    }
+}
+
+/// Partial: only 9 of the 15 caps formats have an engine behind them.
+impl TryFrom<crate::format::PixelFormat> for PixelFormat {
+    type Error = UnsupportedPixelFormat;
+
+    fn try_from(pf: crate::format::PixelFormat) -> std::result::Result<Self, Self::Error> {
+        use crate::format::PixelFormat as Caps;
+        Ok(match pf {
+            Caps::I420 => PixelFormat::I420,
+            Caps::Nv12 => PixelFormat::Nv12,
+            Caps::Yuyv => PixelFormat::Yuyv,
+            Caps::Uyvy => PixelFormat::Uyvy,
+            Caps::Rgb24 => PixelFormat::Rgb24,
+            Caps::Rgba => PixelFormat::Rgba,
+            Caps::Bgr24 => PixelFormat::Bgr24,
+            Caps::Bgra => PixelFormat::Bgra,
+            Caps::Gray8 => PixelFormat::Gray8,
+            other => return Err(UnsupportedPixelFormat(other)),
+        })
     }
 }
 
@@ -2078,6 +2163,36 @@ impl VideoConvert {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_engine_format_round_trips_through_the_caps_vocabulary() {
+        for engine in PixelFormat::ALL {
+            let caps: crate::format::PixelFormat = engine.into();
+            assert_eq!(
+                PixelFormat::try_from(caps),
+                Ok(engine),
+                "{engine:?} did not survive the round trip"
+            );
+        }
+    }
+
+    #[test]
+    fn caps_only_formats_have_no_engine() {
+        use crate::format::PixelFormat as Caps;
+        // Caps can *name* these; there is no code that converts them.
+        for caps in [
+            Caps::I420_10Le,
+            Caps::P010,
+            Caps::I422,
+            Caps::I444,
+            Caps::Argb,
+            Caps::Gray16Le,
+        ] {
+            let err = PixelFormat::try_from(caps).unwrap_err();
+            assert_eq!(err, UnsupportedPixelFormat(caps));
+            assert!(err.to_string().contains("no conversion engine"));
+        }
+    }
 
     // ========================================================================
     // Packed 4:2:2 -> 4:2:0 (#34)
