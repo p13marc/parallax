@@ -177,17 +177,12 @@ impl<E: HwVideoEncoder> HwEncoderElement<E> {
     /// - Upload CPU data to GPU memory
     /// - Or import DMA-BUF for zero-copy
     fn buffer_to_frame(&mut self, buffer: &Buffer) -> Result<GpuFrame> {
-        // Extract dimensions from metadata if available
-        let width = buffer
+        // Geometry travels in-band; fall back to the configured size only when
+        // the buffer says nothing.
+        let (width, height) = buffer
             .metadata()
-            .get::<u32>("video/width")
-            .copied()
-            .unwrap_or(self.width);
-        let height = buffer
-            .metadata()
-            .get::<u32>("video/height")
-            .copied()
-            .unwrap_or(self.height);
+            .video_dims()
+            .unwrap_or((self.width, self.height));
 
         // Update dimensions on first frame
         if self.width == 0 {

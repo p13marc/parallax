@@ -130,10 +130,9 @@ impl<D: VideoDecoder> DecoderElement<D> {
         metadata.pts = ClockTime::from_nanos(frame.pts as u64);
         // Note: VideoFrame doesn't have duration, it's preserved from input metadata
 
-        // Store frame dimensions in metadata for downstream elements
-        metadata.set("video/width", frame.width);
-        metadata.set("video/height", frame.height);
-        metadata.set("video/format", format!("{:?}", frame.format));
+        // Geometry travels in-band: describe the decoded frame so downstream
+        // elements never have to infer it from the buffer size.
+        metadata.set_video_dims(frame.width, frame.height, frame.format.into());
 
         Ok(Buffer::new(
             MemoryHandle::with_len(slot, frame.data.len()),
@@ -171,10 +170,9 @@ impl<D: VideoDecoder> DecoderElement<D> {
 
         // Note: VideoFrame doesn't have duration, it's preserved from input metadata
 
-        // Store frame dimensions in metadata for downstream elements
-        metadata.set("video/width", frame.width);
-        metadata.set("video/height", frame.height);
-        metadata.set("video/format", format!("{:?}", frame.format));
+        // Geometry travels in-band: describe the decoded frame so downstream
+        // elements never have to infer it from the buffer size.
+        metadata.set_video_dims(frame.width, frame.height, frame.format.into());
 
         Ok(Buffer::new(
             MemoryHandle::with_len(slot, frame.data.len()),
