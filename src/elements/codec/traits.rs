@@ -25,7 +25,7 @@
 //! ```
 
 use super::common::VideoFrame;
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 /// Frame type hint for encoded frames.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -110,6 +110,42 @@ pub trait VideoEncoder: Send {
     /// [`KeyframeHandle`](super::KeyframeHandle) request or an in-band
     /// [`KEYFRAME_REQUEST`](super::KEYFRAME_REQUEST) metadata flag arrives.
     fn force_keyframe(&mut self) {}
+
+    /// Set the target bitrate in bits per second, on a possibly-running encoder.
+    ///
+    /// `0` means "no bitrate target": encoders that support it fall back to
+    /// quality-driven rate control.
+    ///
+    /// Default: `Err` — the encoder cannot change its bitrate. This is
+    /// deliberately not a silent no-op: a caller lowering the bitrate to fit a
+    /// congested link needs to know when nothing happened.
+    fn set_bitrate(&mut self, bps: u32) -> Result<()> {
+        let _ = bps;
+        Err(unsupported("bitrate"))
+    }
+
+    /// Set the keyframe (IDR) interval in frames. `0` lets the encoder decide.
+    ///
+    /// Default: `Err` — see [`set_bitrate`](Self::set_bitrate).
+    fn set_keyframe_interval(&mut self, frames: u32) -> Result<()> {
+        let _ = frames;
+        Err(unsupported("keyframe interval"))
+    }
+
+    /// Set the target quantization parameter (0-51, lower = better quality).
+    ///
+    /// Default: `Err` — see [`set_bitrate`](Self::set_bitrate).
+    fn set_qp(&mut self, qp: u8) -> Result<()> {
+        let _ = qp;
+        Err(unsupported("QP"))
+    }
+}
+
+/// The error returned by the default [`VideoEncoder`] parameter setters.
+fn unsupported(parameter: &str) -> Error {
+    Error::Config(format!(
+        "this encoder does not support changing its {parameter} at runtime"
+    ))
 }
 
 /// Trait for video decoders.
