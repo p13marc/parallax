@@ -120,7 +120,8 @@ async fn main() -> Result<()> {
         .with_size(capture_width, capture_height);
 
     // 3. H.264 encoder with multi-threading enabled
-    let encoder_config = H264EncoderConfig::new(1920, 1080)
+    // No dimensions: the encoder takes them from each frame's metadata.
+    let encoder_config = H264EncoderConfig::new()
         .frame_rate(framerate)
         .bitrate(4_000_000) // 4 Mbps for good quality screen capture
         .threads(0); // 0 = auto-detect (uses all available cores)
