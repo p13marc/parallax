@@ -136,7 +136,9 @@ let conv = VideoConvert::new(PixelFormat::I420, PixelFormat::Rgba, 1920, 1080)?;
 conv.convert(&yuv_in, &mut rgba_out)?;
 ```
 
-Supported directions: I420/NV12/YUYV/UYVY → RGB24/RGBA/BGR24/BGRA (UYVY: RGB24/RGBA only); RGB24/RGBA/BGR24/BGRA → I420/NV12; RGB↔BGR swizzles; alpha add/remove; Gray8 → RGB. Color matrices: BT.601 (default), BT.709.
+Supported directions: I420/NV12/YUYV/UYVY → RGB24/RGBA/BGR24/BGRA (UYVY: RGB24/RGBA only); RGB24/RGBA/BGR24/BGRA → I420/NV12; **YUYV/UYVY → I420/NV12** (the path a webcam takes to an encoder); **I420 ↔ NV12**; RGB↔BGR swizzles; alpha add/remove; Gray8 → RGB. Color matrices: BT.601 (default), BT.709.
+
+The YUV→YUV directions carry no colour-space maths — they de-interleave and subsample chroma (4:2:2 → 4:2:0 averages the two source rows) — so they are both cheaper and more accurate than routing through RGB.
 
 **SIMD**: with feature `simd-colorspace`, conversions route through the `yuv` crate (runtime-detected AVX-512/AVX2/SSE4.1/NEON — ~0.9 ms for 1080p I420→RGBA). Without it, a scalar fallback is used. Request aligned buffers via `MemoryLayout::AVX` in caps (arena constructors `SharedArena::new_avx`/`new_avx512`).
 
