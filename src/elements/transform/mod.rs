@@ -58,7 +58,7 @@ mod videoconvert;
 pub use generic::{Chunk, FilterMap, FlatMap, Map};
 
 // Video processing
-pub use scale::{ScaleMode, VideoScale};
+pub use scale::{ScaleControl, ScaleMode, VideoScale};
 pub use videoconvert::VideoConvertElement;
 
 // Audio processing
