@@ -3,12 +3,14 @@
 //! Encode video frames to H.264 using OpenH264.
 //!
 //! ```text
-//! [VideoTestSrc] → [H264Encoder] → [FileSink]
+//! [VideoTestSrc] → [VideoConvert(→I420)] → [H264Encoder] → [FileSink]
 //! ```
 //!
 //! Run: `cargo run --example 14_h264 --features h264`
 
+use parallax::converters::PixelFormat as ConverterPixelFormat;
 use parallax::elements::codec::{H264Encoder, H264EncoderConfig};
+use parallax::elements::transform::VideoConvertElement;
 use parallax::elements::{FileSink, VideoTestSrc};
 use parallax::error::Result;
 use parallax::pipeline::Pipeline;
@@ -31,14 +33,22 @@ async fn main() -> Result<()> {
             .with_num_frames(30),
     );
 
-    // H.264 encoder
-    let encoder_config = H264EncoderConfig::new(320, 240);
-    let encoder = pipeline.add_filter("h264enc", H264Encoder::new(encoder_config)?);
+    // VideoTestSrc emits RGB24; H.264 encodes I420 planes. Without this the
+    // encoder would read RGB bytes as if they were Y/U/V — which is exactly what
+    // this example used to do, silently.
+    let convert = pipeline.add_filter(
+        "videoconvert",
+        VideoConvertElement::new().with_output_format(ConverterPixelFormat::I420),
+    );
+
+    // H.264 encoder. No dimensions: it encodes whatever each frame declares.
+    let encoder = pipeline.add_filter("h264enc", H264Encoder::new(H264EncoderConfig::new())?);
 
     // File sink
     let sink = pipeline.add_sink("filesink", FileSink::new(&output_path));
 
-    pipeline.link(src, encoder)?;
+    pipeline.link(src, convert)?;
+    pipeline.link(convert, encoder)?;
     pipeline.link(encoder, sink)?;
 
     println!("Encoding 30 frames at 320x240...");

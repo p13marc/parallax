@@ -18,13 +18,13 @@
 //! let decoder = JpegDecoder::new();
 //!
 //! // Encode to JPEG (e.g. a low-fps preview branch)
-//! let encoder = JpegEncoder::new(640, 480, ColorType::Rgb).with_quality(80);
+//! let encoder = JpegEncoder::new().with_quality(80);
 //!
 //! // Decode PNG
 //! let decoder = PngDecoder::new();
 //!
 //! // Encode to PNG
-//! let encoder = PngEncoder::new(1920, 1080, ColorType::Rgba);
+//! let encoder = PngEncoder::new();
 //! ```
 
 use crate::buffer::{Buffer, MemoryHandle};
@@ -98,6 +98,57 @@ impl ImageFrame {
         let start = y as usize * stride;
         &self.data[start..start + stride]
     }
+}
+
+/// Resolve what an image encoder is being handed, from the buffer itself.
+///
+/// Geometry travels in-band, so both the size and the pixel layout come from the
+/// same [`Metadata`] as the bytes and cannot disagree with them. A `hint` (from
+/// `with_color_type`) covers hand-built buffers that declare no pixel format; a
+/// buffer that *does* declare one always wins.
+///
+/// Errors rather than falling back to a stale constructor value. That fallback
+/// is precisely what made a scaler upstream of an image encoder either throw
+/// "Input buffer too small" or — worse — silently encode the top-left corner of
+/// a larger frame.
+#[cfg(any(feature = "image-jpeg", feature = "image-png"))]
+fn resolve_image_input(
+    metadata: &crate::metadata::Metadata,
+    hint: Option<ColorType>,
+    who: &str,
+) -> Result<(u32, u32, ColorType)> {
+    use crate::format::PixelFormat;
+
+    let (width, height) = metadata.video_dims().ok_or_else(|| {
+        Error::InvalidCaps(format!(
+            "{who}: buffer carries no video dimensions — the upstream element must call \
+             Metadata::set_video_dims()"
+        ))
+    })?;
+
+    // A declared format is authoritative. Only interleaved 8-bit layouts can be
+    // encoded; a YUV frame here means someone forgot a VideoConvertElement, and
+    // encoding its planes as if they were RGB is a bug we used to commit
+    // silently.
+    let color_type = match metadata.video_pixel_format() {
+        Some(PixelFormat::Gray8) => ColorType::Gray,
+        Some(PixelFormat::Rgb24) => ColorType::Rgb,
+        Some(PixelFormat::Rgba) => ColorType::Rgba,
+        Some(other) => {
+            return Err(Error::InvalidCaps(format!(
+                "{who} cannot encode {other:?} — insert a VideoConvertElement upstream to reach \
+                 Rgb24, Rgba or Gray8"
+            )));
+        }
+        None => hint.ok_or_else(|| {
+            Error::InvalidCaps(format!(
+                "{who}: buffer is {width}x{height} but declares no pixel format, and no \
+                 with_color_type() hint was given"
+            ))
+        })?,
+    };
+
+    Ok((width, height, color_type))
 }
 
 // ============================================================================
@@ -211,10 +262,14 @@ mod jpeg_codec {
     /// e.g. for a low-fps preview branch published over the network. Camera
     /// YUV output (I420/NV12/YUYV) must be converted upstream first (see
     /// `VideoConvert`).
+    ///
+    /// Takes **no dimensions**: geometry travels in-band, in [`Metadata`], and
+    /// the encoder reads it from each buffer. A colour-type *hint* is available
+    /// via [`with_color_type`](Self::with_color_type) for buffers that carry no
+    /// pixel format, but a buffer that declares one wins.
     pub struct JpegEncoder {
-        width: u32,
-        height: u32,
-        color_type: ColorType,
+        /// Colour-type hint, used only when the buffer declares no pixel format.
+        color_type: Option<ColorType>,
         /// Shared with [`JpegQualityControl`] handles so a running pipeline can
         /// change it.
         quality: std::sync::Arc<std::sync::atomic::AtomicU8>,
@@ -249,20 +304,23 @@ mod jpeg_codec {
     impl JpegEncoder {
         /// Create a new JPEG encoder.
         ///
-        /// # Arguments
-        /// * `width` - Image width in pixels (max 65535)
-        /// * `height` - Image height in pixels (max 65535)
-        /// * `color_type` - Input pixel layout (Gray, Rgb, Rgba; alpha is
-        ///   ignored during encoding)
-        pub fn new(width: u32, height: u32, color_type: ColorType) -> Self {
+        /// Geometry and pixel layout come from each buffer's [`Metadata`].
+        pub fn new() -> Self {
             Self {
-                width,
-                height,
-                color_type,
+                color_type: None,
                 quality: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(80)),
                 frame_count: 0,
                 arena: None,
             }
+        }
+
+        /// Hint the input pixel layout, for buffers that declare no pixel format.
+        ///
+        /// A buffer that *does* declare one always wins — this is a fallback for
+        /// hand-built buffers, not an override.
+        pub fn with_color_type(mut self, color_type: ColorType) -> Self {
+            self.color_type = Some(color_type);
+            self
         }
 
         /// Set the encoding quality (1-100, default 80). Higher = better
@@ -282,8 +340,8 @@ mod jpeg_codec {
             self.frame_count
         }
 
-        fn to_jpeg_color_type(&self) -> Result<jpeg_encoder::ColorType> {
-            Ok(match self.color_type {
+        fn to_jpeg_color_type(color_type: ColorType) -> Result<jpeg_encoder::ColorType> {
+            Ok(match color_type {
                 ColorType::Gray => jpeg_encoder::ColorType::Luma,
                 ColorType::Rgb => jpeg_encoder::ColorType::Rgb,
                 ColorType::Rgba => jpeg_encoder::ColorType::Rgba,
@@ -307,22 +365,31 @@ mod jpeg_codec {
         }
     }
 
+    impl Default for JpegEncoder {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl Element for JpegEncoder {
         fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
             let input = buffer.as_bytes();
 
-            if self.width > u16::MAX as u32 || self.height > u16::MAX as u32 {
+            // Geometry travels in-band. Both the size *and* the pixel layout come
+            // from the buffer that carries the bytes, so they can never disagree.
+            let (width, height, color_type) =
+                resolve_image_input(buffer.metadata(), self.color_type, "JpegEncoder")?;
+
+            if width > u16::MAX as u32 || height > u16::MAX as u32 {
                 return Err(Error::InvalidCaps(format!(
-                    "JPEG dimensions limited to 65535, got {}x{}",
-                    self.width, self.height
+                    "JPEG dimensions limited to 65535, got {width}x{height}"
                 )));
             }
 
-            let expected_size =
-                self.width as usize * self.height as usize * self.color_type.bytes_per_pixel();
+            let expected_size = width as usize * height as usize * color_type.bytes_per_pixel();
             if input.len() < expected_size {
                 return Err(Error::InvalidSegment(format!(
-                    "Input buffer too small: {} < {}",
+                    "Input buffer too small: {} < {} ({width}x{height} {color_type:?})",
                     input.len(),
                     expected_size
                 )));
@@ -335,9 +402,9 @@ mod jpeg_codec {
             encoder
                 .encode(
                     &input[..expected_size],
-                    self.width as u16,
-                    self.height as u16,
-                    self.to_jpeg_color_type()?,
+                    width as u16,
+                    height as u16,
+                    Self::to_jpeg_color_type(color_type)?,
                 )
                 .map_err(|e| Error::InvalidSegment(format!("JPEG encode failed: {:?}", e)))?;
 
@@ -362,6 +429,10 @@ mod jpeg_codec {
             // Propagate metadata (PTS!); every JPEG is independently decodable.
             let mut metadata = buffer.metadata().clone();
             metadata.flags |= crate::metadata::BufferFlags::SYNC_POINT;
+            // These bytes are a JPEG, not raw video. Carrying the input's
+            // VideoRaw format forward would tell downstream elements they can
+            // index into planes that are no longer there.
+            metadata.format = None;
             Ok(Some(Buffer::new(
                 MemoryHandle::with_len(slot, output.len()),
                 metadata,
@@ -499,10 +570,14 @@ mod png_codec {
     /// PNG encoder using the png crate (pure Rust).
     ///
     /// Encodes raw pixel data to PNG format.
+    ///
+    /// Takes **no dimensions**: geometry travels in-band, in [`Metadata`], and
+    /// the encoder reads it from each buffer. A colour-type *hint* is available
+    /// via [`with_color_type`](Self::with_color_type) for buffers that carry no
+    /// pixel format.
     pub struct PngEncoder {
-        width: u32,
-        height: u32,
-        color_type: ColorType,
+        /// Colour-type hint, used only when the buffer declares no pixel format.
+        color_type: Option<ColorType>,
         frame_count: u64,
         arena: Option<SharedArena>,
     }
@@ -510,18 +585,21 @@ mod png_codec {
     impl PngEncoder {
         /// Create a new PNG encoder.
         ///
-        /// # Arguments
-        /// * `width` - Image width in pixels
-        /// * `height` - Image height in pixels
-        /// * `color_type` - Color type (Gray, GrayAlpha, Rgb, Rgba)
-        pub fn new(width: u32, height: u32, color_type: ColorType) -> Self {
+        /// Geometry and pixel layout come from each buffer's [`Metadata`].
+        pub fn new() -> Self {
             Self {
-                width,
-                height,
-                color_type,
+                color_type: None,
                 frame_count: 0,
                 arena: None,
             }
+        }
+
+        /// Hint the input pixel layout, for buffers that declare no pixel format.
+        ///
+        /// A buffer that *does* declare one always wins.
+        pub fn with_color_type(mut self, color_type: ColorType) -> Self {
+            self.color_type = Some(color_type);
+            self
         }
 
         /// Get the number of frames encoded.
@@ -529,8 +607,8 @@ mod png_codec {
             self.frame_count
         }
 
-        fn to_png_color_type(&self) -> png::ColorType {
-            match self.color_type {
+        fn to_png_color_type(color_type: ColorType) -> png::ColorType {
+            match color_type {
                 ColorType::Gray => png::ColorType::Grayscale,
                 ColorType::GrayAlpha => png::ColorType::GrayscaleAlpha,
                 ColorType::Rgb => png::ColorType::Rgb,
@@ -539,16 +617,26 @@ mod png_codec {
         }
     }
 
+    impl Default for PngEncoder {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl Element for PngEncoder {
         fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
             let input = buffer.as_bytes();
 
+            // Geometry travels in-band: size and layout come from the same
+            // metadata as the bytes, so they cannot disagree.
+            let (width, height, color_type) =
+                resolve_image_input(buffer.metadata(), self.color_type, "PngEncoder")?;
+
             // Expected input size
-            let expected_size =
-                self.width as usize * self.height as usize * self.color_type.bytes_per_pixel();
+            let expected_size = width as usize * height as usize * color_type.bytes_per_pixel();
             if input.len() < expected_size {
                 return Err(Error::InvalidSegment(format!(
-                    "Input buffer too small: {} < {}",
+                    "Input buffer too small: {} < {} ({width}x{height} {color_type:?})",
                     input.len(),
                     expected_size
                 )));
@@ -557,8 +645,8 @@ mod png_codec {
             // Encode to PNG
             let mut output = Vec::new();
             {
-                let mut encoder = png::Encoder::new(&mut output, self.width, self.height);
-                encoder.set_color(self.to_png_color_type());
+                let mut encoder = png::Encoder::new(&mut output, width, height);
+                encoder.set_color(Self::to_png_color_type(color_type));
                 encoder.set_depth(png::BitDepth::Eight);
 
                 let mut writer = encoder.write_header().map_err(|e| {
@@ -589,7 +677,9 @@ mod png_codec {
 
             self.frame_count += 1;
 
-            let metadata = buffer.metadata().clone();
+            let mut metadata = buffer.metadata().clone();
+            // These bytes are a PNG, not raw video.
+            metadata.format = None;
             Ok(Some(Buffer::new(
                 MemoryHandle::with_len(slot, output.len()),
                 metadata,
@@ -656,6 +746,8 @@ mod tests {
             slot.data_mut()[..data.len()].copy_from_slice(data);
             let mut metadata = Metadata::from_sequence(7);
             metadata.pts = crate::clock::ClockTime::from_millis(42);
+            // Geometry travels in-band, so a test frame describes itself too.
+            metadata.set_video_dims(W, H, crate::format::PixelFormat::Rgb24);
             Buffer::new(MemoryHandle::with_len(slot, data.len()), metadata)
         }
 
@@ -664,7 +756,7 @@ mod tests {
         #[test]
         fn quality_change_reaches_a_running_encoder() {
             let original = gradient_rgb();
-            let mut encoder = JpegEncoder::new(W, H, ColorType::Rgb).with_quality(95);
+            let mut encoder = JpegEncoder::new().with_quality(95);
             let control = encoder.control();
 
             let high = encoder
@@ -696,7 +788,7 @@ mod tests {
 
         #[test]
         fn quality_is_clamped_on_every_path() {
-            let encoder = JpegEncoder::new(W, H, ColorType::Rgb).with_quality(200);
+            let encoder = JpegEncoder::new().with_quality(200);
             assert_eq!(encoder.quality(), 100);
 
             let control = encoder.control();
@@ -708,7 +800,7 @@ mod tests {
         #[test]
         fn encode_decode_roundtrip() {
             let original = gradient_rgb();
-            let mut encoder = JpegEncoder::new(W, H, ColorType::Rgb).with_quality(95);
+            let mut encoder = JpegEncoder::new().with_quality(95);
             let encoded = encoder
                 .process(rgb_buffer(&original))
                 .unwrap()
@@ -748,7 +840,7 @@ mod tests {
         fn quality_orders_output_size() {
             let data = gradient_rgb();
             let size_at = |quality: u8| -> usize {
-                let mut encoder = JpegEncoder::new(W, H, ColorType::Rgb).with_quality(quality);
+                let mut encoder = JpegEncoder::new().with_quality(quality);
                 encoder.process(rgb_buffer(&data)).unwrap().unwrap().len()
             };
             let high = size_at(95);
@@ -761,14 +853,14 @@ mod tests {
 
         #[test]
         fn rejects_undersized_input() {
-            let mut encoder = JpegEncoder::new(W, H, ColorType::Rgb);
+            let mut encoder = JpegEncoder::new();
             let result = encoder.process(rgb_buffer(&[0u8; 16]));
             assert!(result.is_err());
         }
 
         #[test]
         fn rejects_gray_alpha() {
-            let mut encoder = JpegEncoder::new(W, H, ColorType::GrayAlpha);
+            let mut encoder = JpegEncoder::new();
             let data = vec![0u8; (W * H * 2) as usize];
             assert!(encoder.process(rgb_buffer(&data)).is_err());
         }

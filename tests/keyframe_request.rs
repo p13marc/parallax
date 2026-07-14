@@ -14,6 +14,7 @@ use parallax::elements::app::{AppSink, AppSrc};
 use parallax::elements::codec::{
     EncoderElement, H264Encoder, H264EncoderConfig, KEYFRAME_REQUEST, KeyframeHandle,
 };
+use parallax::format::PixelFormat;
 use parallax::memory::SharedArena;
 use parallax::metadata::{BufferFlags, Metadata};
 use parallax::pipeline::{Executor, Pipeline};
@@ -39,16 +40,16 @@ fn yuv_frame(seq: u64) -> Buffer {
             data[y * WIDTH as usize + x] = ((x * 7 + y * 13) as u8).wrapping_add(seq as u8);
         }
     }
-    Buffer::new(
-        MemoryHandle::with_len(slot, FRAME_SIZE),
-        Metadata::from_sequence(seq),
-    )
+    // Geometry travels in-band: the encoder takes its size from the frame.
+    let mut metadata = Metadata::from_sequence(seq);
+    metadata.set_video_dims(WIDTH, HEIGHT, PixelFormat::I420);
+    Buffer::new(MemoryHandle::with_len(slot, FRAME_SIZE), metadata)
 }
 
 /// Encoder config with no periodic or scene-change IDRs, so the only
 /// keyframes are frame 0 and explicitly requested ones.
 fn quiet_encoder() -> H264Encoder {
-    let mut config = H264EncoderConfig::new(WIDTH, HEIGHT);
+    let mut config = H264EncoderConfig::new();
     config.scene_change_detect = false;
     H264Encoder::new(config).unwrap()
 }
