@@ -12,4 +12,6 @@ mod timeout;
 
 pub use delay::{AsyncDelay, Delay, DelayStats};
 pub use rate_limiter::{RateLimitMode, RateLimiter};
-pub use timeout::{Debounce, DebounceStats, Throttle, ThrottleStats, Timeout, TimeoutStats};
+pub use timeout::{
+    Debounce, DebounceStats, Throttle, ThrottleControl, ThrottleStats, Timeout, TimeoutStats,
+};

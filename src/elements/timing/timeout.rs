@@ -7,8 +7,8 @@ use crate::element::Element;
 use crate::error::{Error, Result};
 use crate::memory::SharedArena;
 use crate::metadata::Metadata;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Get the global timeout arena (lazily initialized).
@@ -243,10 +243,76 @@ pub struct DebounceStats {
     pub suppressed: u64,
 }
 
+/// Cloneable handle to change a running [`Throttle`]'s rate.
+///
+/// Framerate is the third bandwidth lever (after bitrate and resolution), and
+/// the one to combine with a bitrate cut: fewer frames sharing the same budget
+/// keeps each of them watchable.
+///
+/// Like the other runtime control handles, clone it from the element **before**
+/// `executor.start()` — elements are moved into their executor tasks at start.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let throttle = Throttle::rate(30.0);
+/// let rate = throttle.control();      // BEFORE start
+/// pipeline.add_filter("rate", throttle);
+/// let handle = executor.start(&mut pipeline)?;
+///
+/// rate.set_rate(10.0);   // drop to 10 fps
+/// ```
+#[derive(Clone, Debug)]
+pub struct ThrottleControl(Arc<AtomicU64>);
+
+/// A rate of zero means "pass nothing": an interval no clock will ever reach.
+const DROP_EVERYTHING_NS: u64 = u64::MAX;
+
+impl ThrottleControl {
+    /// Limit to `buffers_per_second`.
+    ///
+    /// A rate of zero (or negative) drops every buffer — the throttle becomes a
+    /// closed valve rather than dividing by zero.
+    pub fn set_rate(&self, buffers_per_second: f64) {
+        let nanos = if buffers_per_second > 0.0 {
+            (1e9 / buffers_per_second).round() as u64
+        } else {
+            DROP_EVERYTHING_NS
+        };
+        self.0.store(nanos, Ordering::Release);
+    }
+
+    /// Set the minimum interval between passed buffers directly.
+    pub fn set_min_interval(&self, interval: Duration) {
+        self.0.store(
+            interval.as_nanos().min(u64::MAX as u128) as u64,
+            Ordering::Release,
+        );
+    }
+
+    /// The current minimum interval between passed buffers.
+    pub fn min_interval(&self) -> Duration {
+        Duration::from_nanos(self.0.load(Ordering::Acquire))
+    }
+
+    /// The current rate in buffers per second (0.0 when dropping everything).
+    pub fn rate(&self) -> f64 {
+        match self.0.load(Ordering::Acquire) {
+            0 => f64::INFINITY,
+            DROP_EVERYTHING_NS => 0.0,
+            nanos => 1e9 / nanos as f64,
+        }
+    }
+}
+
 /// A throttle element that limits the rate of buffer flow.
 ///
 /// Drops buffers if they arrive too quickly. Different from RateLimiter
-/// which delays rather than drops.
+/// which delays rather than drops — dropping is what you want ahead of a live
+/// source, where delaying would back-pressure the camera.
+///
+/// The rate can be changed on a running pipeline through
+/// [`control`](Self::control).
 ///
 /// # Example
 ///
@@ -259,7 +325,9 @@ pub struct DebounceStats {
 /// ```
 pub struct Throttle {
     name: String,
-    min_interval: Duration,
+    /// Minimum interval between passed buffers, in nanoseconds. Shared with
+    /// [`ThrottleControl`] handles, so it can change while the pipeline runs.
+    min_interval_ns: Arc<AtomicU64>,
     last_passed: Option<Instant>,
     passed: AtomicU64,
     dropped: AtomicU64,
@@ -268,13 +336,15 @@ pub struct Throttle {
 impl Throttle {
     /// Create a new throttle element.
     pub fn new(min_interval: Duration) -> Self {
-        Self {
+        let throttle = Self {
             name: "throttle".to_string(),
-            min_interval,
+            min_interval_ns: Arc::new(AtomicU64::new(0)),
             last_passed: None,
             passed: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
-        }
+        };
+        throttle.control().set_min_interval(min_interval);
+        throttle
     }
 
     /// Create from milliseconds.
@@ -283,9 +353,24 @@ impl Throttle {
     }
 
     /// Create limiting to a specific rate (buffers per second).
+    ///
+    /// A rate of zero drops everything (see [`ThrottleControl::set_rate`]).
     pub fn rate(buffers_per_second: f64) -> Self {
-        let interval = Duration::from_secs_f64(1.0 / buffers_per_second);
-        Self::new(interval)
+        let throttle = Self::new(Duration::ZERO);
+        throttle.control().set_rate(buffers_per_second);
+        throttle
+    }
+
+    /// Get a cloneable handle for changing the rate at runtime.
+    ///
+    /// Clone it *before* the pipeline starts — see [`ThrottleControl`].
+    pub fn control(&self) -> ThrottleControl {
+        ThrottleControl(Arc::clone(&self.min_interval_ns))
+    }
+
+    /// The current minimum interval between passed buffers.
+    pub fn min_interval(&self) -> Duration {
+        Duration::from_nanos(self.min_interval_ns.load(Ordering::Relaxed))
     }
 
     /// Set a custom name.
@@ -306,10 +391,17 @@ impl Throttle {
 impl Element for Throttle {
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         let now = Instant::now();
+        // One relaxed load per buffer; the rate may have been changed by a
+        // ThrottleControl handle since the last one.
+        let min_interval_ns = self.min_interval_ns.load(Ordering::Relaxed);
 
-        let should_pass = match self.last_passed {
-            None => true,
-            Some(last) => now.duration_since(last) >= self.min_interval,
+        let should_pass = if min_interval_ns == DROP_EVERYTHING_NS {
+            false
+        } else {
+            match self.last_passed {
+                None => true,
+                Some(last) => now.duration_since(last).as_nanos() >= min_interval_ns as u128,
+            }
         };
 
         if should_pass {
@@ -347,7 +439,11 @@ mod tests {
 
     fn create_test_buffer(seq: u64) -> Buffer {
         let arena = test_arena();
-        let slot = arena.acquire().unwrap();
+        // Reclaim first: the arena is shared across the module's tests and has
+        // 64 slots, so a test that runs more buffers than that through a
+        // dropping element would otherwise exhaust it.
+        arena.reclaim();
+        let slot = arena.acquire().expect("test arena slot");
         let handle = MemoryHandle::new(slot);
         Buffer::new(handle, Metadata::from_sequence(seq))
     }
@@ -499,7 +595,103 @@ mod tests {
     #[test]
     fn test_throttle_rate() {
         let throttle = Throttle::rate(10.0); // 10 per second = 100ms interval
-        assert!(throttle.min_interval >= Duration::from_millis(99));
-        assert!(throttle.min_interval <= Duration::from_millis(101));
+        assert!(throttle.min_interval() >= Duration::from_millis(99));
+        assert!(throttle.min_interval() <= Duration::from_millis(101));
+    }
+
+    // ========================================================================
+    // Runtime rate control (#30)
+    // ========================================================================
+
+    #[test]
+    fn rate_change_takes_effect_immediately() {
+        let mut throttle = Throttle::from_millis(100);
+        let control = throttle.control();
+
+        // First passes, second is too soon at 100ms.
+        assert!(throttle.process(create_test_buffer(0)).unwrap().is_some());
+        assert!(throttle.process(create_test_buffer(1)).unwrap().is_none());
+
+        // Raising the rate applies to the very next buffer.
+        control.set_min_interval(Duration::ZERO);
+        assert!(
+            throttle.process(create_test_buffer(2)).unwrap().is_some(),
+            "a raised rate must apply to the next buffer, not the next interval"
+        );
+    }
+
+    #[test]
+    fn lowering_the_rate_does_not_stall() {
+        let mut throttle = Throttle::from_millis(1);
+        let control = throttle.control();
+
+        throttle.process(create_test_buffer(0)).unwrap();
+        control.set_rate(1.0); // one per second
+
+        // The next buffer is dropped (too soon)...
+        assert!(throttle.process(create_test_buffer(1)).unwrap().is_none());
+        // ...but the throttle recovers once the new interval elapses, rather
+        // than wedging itself shut.
+        control.set_min_interval(Duration::from_millis(5));
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(throttle.process(create_test_buffer(2)).unwrap().is_some());
+    }
+
+    #[test]
+    fn zero_rate_drops_everything() {
+        // Previously this panicked: 1.0/0.0 is infinite and
+        // Duration::from_secs_f64(inf) is not representable.
+        let mut throttle = Throttle::rate(0.0);
+        let control = throttle.control();
+        assert_eq!(control.rate(), 0.0);
+
+        for i in 0..5 {
+            assert!(
+                throttle.process(create_test_buffer(i)).unwrap().is_none(),
+                "a rate of zero passes nothing"
+            );
+        }
+        assert_eq!(throttle.stats().passed, 0);
+        assert_eq!(throttle.stats().dropped, 5);
+
+        // ...and it reopens.
+        control.set_rate(1000.0);
+        assert!(throttle.process(create_test_buffer(9)).unwrap().is_some());
+    }
+
+    #[test]
+    fn control_reports_the_current_rate() {
+        let throttle = Throttle::rate(25.0);
+        let control = throttle.control();
+        assert!((control.rate() - 25.0).abs() < 0.01);
+
+        control.set_rate(5.0);
+        assert!((control.rate() - 5.0).abs() < 0.01);
+        assert_eq!(control.min_interval(), Duration::from_millis(200));
+    }
+
+    #[test]
+    fn halving_the_rate_halves_the_output() {
+        // The bandwidth claim: half the framerate, half the frames on the wire.
+        let count_passed = |fps: f64| -> u64 {
+            let mut throttle = Throttle::rate(fps);
+            // Feed for ~200ms at a much higher rate than the throttle allows.
+            let deadline = Instant::now() + Duration::from_millis(200);
+            let mut seq = 0;
+            while Instant::now() < deadline {
+                throttle.process(create_test_buffer(seq)).unwrap();
+                seq += 1;
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            throttle.stats().passed
+        };
+
+        let fast = count_passed(50.0); // ~10 in 200ms
+        let slow = count_passed(25.0); // ~5 in 200ms
+
+        assert!(
+            slow < fast,
+            "halving the rate must halve the frames passed (got {slow} vs {fast})"
+        );
     }
 }

@@ -171,7 +171,7 @@ pub use ipc::{IpcSink, IpcSrc, MemorySink, MemorySinkStats, MemorySrc, SharedMem
 // Timing
 pub use timing::{
     AsyncDelay, Debounce, DebounceStats, Delay, DelayStats, RateLimitMode, RateLimiter, Throttle,
-    ThrottleStats, Timeout, TimeoutStats,
+    ThrottleControl, ThrottleStats, Timeout, TimeoutStats,
 };
 
 // Demux
