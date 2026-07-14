@@ -1,8 +1,11 @@
 //! Negotiation solver for pipeline caps.
 
-use super::converters::{ConverterFactory, ConverterRegistry, FormatType};
+use super::converters::{
+    CapsConflict, ConversionRequest, ConversionStep, ConvertAxes, ConverterRegistry, FormatType,
+    diff_caps,
+};
 use super::error::NegotiationError;
-use crate::format::{ElementMediaCaps, MediaCaps, MediaFormat};
+use crate::format::{ElementMediaCaps, FormatCaps, FormatMemoryCap, MediaCaps, MediaFormat};
 use crate::memory::MemoryType;
 use std::collections::HashMap;
 
@@ -26,15 +29,21 @@ pub struct LinkNegotiation {
     pub memory_type: MemoryType,
 }
 
-/// A converter to insert into the pipeline.
+/// A chain of converters to splice into one link.
+///
+/// The chain covers **every** axis on which the two elements disagree; a plan
+/// that could only cover some of them is a negotiation error instead, because a
+/// partial chain would leave the pipeline running and wrong.
 pub struct ConverterInsertion {
-    /// Link where converter should be inserted.
+    /// Link where the chain should be inserted.
     pub link_id: usize,
-    /// Factory to create the converter element.
-    pub factory: ConverterFactory,
+    /// Converters, in the order they are spliced (upstream first).
+    pub chain: Vec<ConversionStep>,
+    /// What each converter is being asked to do — passed to its factory.
+    pub request: ConversionRequest,
     /// Reason for insertion.
     pub reason: String,
-    /// Cost of this conversion.
+    /// Total cost of the chain.
     pub cost: u32,
 }
 
@@ -42,9 +51,39 @@ impl std::fmt::Debug for ConverterInsertion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConverterInsertion")
             .field("link_id", &self.link_id)
+            .field(
+                "chain",
+                &self.chain.iter().map(|s| s.info.name).collect::<Vec<_>>(),
+            )
             .field("reason", &self.reason)
             .field("cost", &self.cost)
             .finish_non_exhaustive()
+    }
+}
+
+/// Fixated pixel count of a video cap, when it pins both dimensions.
+fn pixel_count(caps: &FormatCaps) -> Option<u64> {
+    let FormatCaps::VideoRaw(v) = caps else {
+        return None;
+    };
+    Some(u64::from(v.width.fixate()?) * u64::from(v.height.fixate()?))
+}
+
+/// Order a conversion chain.
+///
+/// Scaling down before converting means the pixel-format conversion runs on
+/// fewer pixels; scaling up after converting means the same. The dominant real
+/// pipeline (a 1080p camera feeding a 720p encoder) is a downscale, so this is
+/// worth roughly 2x on the hottest CPU path.
+fn order_chain(steps: Vec<ConversionStep>, downscale: bool) -> Vec<ConversionStep> {
+    let (geometry, rest): (Vec<_>, Vec<_>) = steps
+        .into_iter()
+        .partition(|s| s.info.axes.contains(ConvertAxes::GEOMETRY));
+
+    if downscale {
+        geometry.into_iter().chain(rest).collect()
+    } else {
+        rest.into_iter().chain(geometry).collect()
     }
 }
 
@@ -177,7 +216,7 @@ impl NegotiationSolver {
                     converter,
                 } => {
                     result.link_caps.insert(link.id, negotiation);
-                    result.converters.push(converter);
+                    result.converters.push(*converter);
                 }
             }
         }
@@ -209,51 +248,45 @@ impl NegotiationSolver {
             }));
         }
 
-        // No direct match - try to find a converter
-        // For converter lookup, we need to consider all source/sink format combinations
+        // No direct match: work out *which axes* disagree, then plan a chain of
+        // converters that covers all of them. The first (highest-preference)
+        // source/sink pair with a complete plan wins.
         if let Some(registry) = &self.converter_registry {
-            // Try each source format against each sink format to find a converter path
             for source_cap in source_caps.iter() {
-                let source_format_type = FormatType::from(&source_cap.format);
-                let source_memory = source_cap.memory.fixate().unwrap_or(MemoryType::Cpu);
-
                 for sink_cap in sink_caps.iter() {
-                    let sink_format_type = FormatType::from(&sink_cap.format);
+                    let Some(CapsConflict::Axes(needed)) = diff_caps(source_cap, sink_cap) else {
+                        continue; // Incompatible media kinds: no converter can help
+                    };
+
+                    let source_memory = source_cap.memory.fixate().unwrap_or(MemoryType::Cpu);
                     let sink_memory = sink_cap.memory.fixate().unwrap_or(MemoryType::Cpu);
 
-                    if let Some((factories_with_info, total_cost)) = registry.find_path(
-                        source_format_type,
-                        sink_format_type,
+                    let Some(plan) = registry.plan(
+                        FormatType::from(&source_cap.format),
+                        FormatType::from(&sink_cap.format),
                         source_memory,
                         sink_memory,
-                    ) {
-                        // Use the first factory (for now, we only support single-hop)
-                        if let Some((factory, info)) = factories_with_info.into_iter().next() {
-                            // Fixate source format for the link (use defaults for Any values)
-                            let format = source_cap.format.fixate_with_defaults();
+                        needed,
+                    ) else {
+                        continue;
+                    };
 
-                            return Ok(LinkResult::NeedsConverter {
-                                negotiation: LinkNegotiation {
-                                    link_id: link.id,
-                                    format,
-                                    memory_type: source_memory,
-                                },
-                                converter: ConverterInsertion {
-                                    link_id: link.id,
-                                    factory,
-                                    reason: format!(
-                                        "{}: {:?}/{:?} -> {:?}/{:?}",
-                                        info.name,
-                                        source_format_type,
-                                        source_memory,
-                                        sink_format_type,
-                                        sink_memory
-                                    ),
-                                    cost: total_cost,
-                                },
-                            });
-                        }
-                    }
+                    return Ok(LinkResult::NeedsConverter {
+                        negotiation: LinkNegotiation {
+                            link_id: link.id,
+                            format: source_cap.format.fixate_with_defaults(),
+                            memory_type: source_memory,
+                        },
+                        converter: Box::new(self.build_insertion(
+                            link,
+                            source_cap,
+                            sink_cap,
+                            plan,
+                            needed,
+                            source_memory,
+                            sink_memory,
+                        )),
+                    });
                 }
             }
         }
@@ -275,6 +308,49 @@ impl NegotiationSolver {
             &source_formats.join(" | "),
             &sink_formats.join(" | "),
         ))
+    }
+
+    /// Turn a [`ConversionPlan`](super::converters::ConversionPlan) into an
+    /// ordered, instantiable [`ConverterInsertion`].
+    #[allow(clippy::too_many_arguments)]
+    fn build_insertion(
+        &self,
+        link: &LinkInfo,
+        source_cap: &FormatMemoryCap,
+        sink_cap: &FormatMemoryCap,
+        plan: super::converters::ConversionPlan,
+        needed: ConvertAxes,
+        source_memory: MemoryType,
+        sink_memory: MemoryType,
+    ) -> ConverterInsertion {
+        let downscale = match (
+            pixel_count(&source_cap.format),
+            pixel_count(&sink_cap.format),
+        ) {
+            (Some(src), Some(dst)) => dst < src,
+            _ => false,
+        };
+
+        let names: Vec<_> = plan.steps.iter().map(|s| s.info.name).collect();
+
+        ConverterInsertion {
+            link_id: link.id,
+            chain: order_chain(plan.steps, downscale),
+            request: ConversionRequest {
+                input: source_cap.format.clone(),
+                output: sink_cap.format.clone(),
+                input_memory: source_memory,
+                output_memory: sink_memory,
+            },
+            reason: format!(
+                "{} -> {}: {:?} mismatch, inserting {}",
+                link.source_element,
+                link.sink_element,
+                needed,
+                names.join(" ! "),
+            ),
+            cost: plan.total_cost,
+        }
     }
 
     /// Get source (output) caps for a link.
@@ -328,10 +404,10 @@ impl Default for NegotiationSolver {
 enum LinkResult {
     /// Direct negotiation succeeded.
     Direct(LinkNegotiation),
-    /// Needs a converter to be inserted.
+    /// Needs a chain of converters to be inserted.
     NeedsConverter {
         negotiation: LinkNegotiation,
-        converter: ConverterInsertion,
+        converter: Box<ConverterInsertion>,
     },
 }
 

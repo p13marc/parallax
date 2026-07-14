@@ -1,306 +1,35 @@
-//! Built-in converters for common format and memory type conversions.
+//! Built-in converters for common format, geometry, rate and memory conversions.
 //!
-//! These converters handle the most common transformations needed in pipelines:
-//! - Video scaling (resize frames)
-//! - Video format conversion (pixel format changes)
-//! - Audio resampling (sample rate changes)
-//! - Audio format conversion (sample format/channel changes)
-//! - Memory copies (CPU <-> GPU transfers)
+//! [`builtin_registry`] wires the *real* converter elements (the ones in
+//! [`crate::elements::transform`], backed by [`crate::converters`]) into the
+//! negotiation registry, each tagged with the [`ConvertAxes`] it fixes:
+//!
+//! | Converter | Axes | Element |
+//! |---|---|---|
+//! | `videoconvert` | `FORMAT` | [`VideoConvertElement`](crate::elements::transform::VideoConvertElement) |
+//! | `videoscale` | `GEOMETRY` | [`VideoScale`](crate::elements::transform::VideoScale) |
+//! | `audioconvert` | `FORMAT` | [`AudioConvertElement`](crate::elements::transform::AudioConvertElement) |
+//! | `audioresample` | `RATE` | [`AudioResampleElement`](crate::elements::transform::AudioResampleElement) |
+//! | `memorycopy` | `MEMORY` | [`MemoryCopy`] |
+//! | `identity` | `NONE` | [`Identity`] |
+//!
+//! `identity` fixes nothing, so the planner can never insert it to "resolve" a
+//! conflict — it exists only as an explicit passthrough node.
+//!
+//! Each factory is handed a [`ConversionRequest`] and configures its element
+//! from the downstream caps, so a link wanting I420 gets an I420 converter (the
+//! old registry hardcoded RGBA and then silently dropped the converters when the
+//! second negotiation pass found the fresh mismatch).
 
-use super::converters::{ConverterElement, ConverterRegistry, FormatType};
+use super::converters::{
+    ConversionRequest, ConvertAxes, ConverterElement, ConverterRegistry, ConverterSpec, FormatType,
+};
 use crate::buffer::Buffer;
 use crate::element::Element;
 use crate::error::Result;
-use crate::format::{AudioFormatCaps, FormatCaps, PixelFormat, SampleFormat, VideoFormatCaps};
+use crate::format::{FormatCaps, SampleFormat};
 use crate::memory::MemoryType;
 use std::sync::Arc;
-
-// ============================================================================
-// VideoScale - resize video frames
-// ============================================================================
-
-/// Video scaler for resizing frames.
-///
-/// Supports bilinear and nearest-neighbor scaling.
-pub struct VideoScale {
-    /// Target width (None = passthrough).
-    target_width: Option<u32>,
-    /// Target height (None = passthrough).
-    target_height: Option<u32>,
-    /// Scaling algorithm.
-    algorithm: ScaleAlgorithm,
-}
-
-/// Scaling algorithm.
-#[derive(Clone, Copy, Debug, Default)]
-pub enum ScaleAlgorithm {
-    /// Nearest neighbor (fast, blocky).
-    Nearest,
-    /// Bilinear interpolation (default).
-    #[default]
-    Bilinear,
-}
-
-impl VideoScale {
-    /// Create a new video scaler.
-    pub fn new(target_width: Option<u32>, target_height: Option<u32>) -> Self {
-        Self {
-            target_width,
-            target_height,
-            algorithm: ScaleAlgorithm::default(),
-        }
-    }
-
-    /// Set the scaling algorithm.
-    pub fn with_algorithm(mut self, algorithm: ScaleAlgorithm) -> Self {
-        self.algorithm = algorithm;
-        self
-    }
-}
-
-impl Element for VideoScale {
-    fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
-        // PLAN-09: Implement actual scaling (see plans/09_FORMAT_CONVERTERS.md)
-        // For now, passthrough - actual implementation pending
-        Ok(Some(buffer))
-    }
-
-    fn name(&self) -> &str {
-        "videoscale"
-    }
-}
-
-impl ConverterElement for VideoScale {
-    fn converter_name(&self) -> &str {
-        "videoscale"
-    }
-
-    fn input_format(&self) -> FormatCaps {
-        FormatCaps::VideoRaw(VideoFormatCaps::any())
-    }
-
-    fn output_format(&self) -> FormatCaps {
-        let mut caps = VideoFormatCaps::any();
-        if let Some(w) = self.target_width {
-            caps.width = w.into();
-        }
-        if let Some(h) = self.target_height {
-            caps.height = h.into();
-        }
-        FormatCaps::VideoRaw(caps)
-    }
-
-    fn input_memory(&self) -> MemoryType {
-        MemoryType::Cpu
-    }
-
-    fn output_memory(&self) -> MemoryType {
-        MemoryType::Cpu
-    }
-
-    fn cost(&self) -> u32 {
-        10 // Moderate cost - CPU bound
-    }
-}
-
-// ============================================================================
-// VideoConvert - convert between pixel formats
-// ============================================================================
-
-/// Video format converter for pixel format changes.
-///
-/// Converts between different pixel formats (e.g., I420 to RGBA).
-pub struct VideoConvert {
-    /// Target pixel format.
-    target_format: PixelFormat,
-}
-
-impl VideoConvert {
-    /// Create a new video converter.
-    pub fn new(target_format: PixelFormat) -> Self {
-        Self { target_format }
-    }
-}
-
-impl Element for VideoConvert {
-    fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
-        // PLAN-09: Implement actual pixel format conversion (see plans/09_FORMAT_CONVERTERS.md)
-        // For now, passthrough - actual implementation pending
-        Ok(Some(buffer))
-    }
-
-    fn name(&self) -> &str {
-        "videoconvert"
-    }
-}
-
-impl ConverterElement for VideoConvert {
-    fn converter_name(&self) -> &str {
-        "videoconvert"
-    }
-
-    fn input_format(&self) -> FormatCaps {
-        FormatCaps::VideoRaw(VideoFormatCaps::any())
-    }
-
-    fn output_format(&self) -> FormatCaps {
-        let mut caps = VideoFormatCaps::any();
-        caps.pixel_format = self.target_format.into();
-        FormatCaps::VideoRaw(caps)
-    }
-
-    fn input_memory(&self) -> MemoryType {
-        MemoryType::Cpu
-    }
-
-    fn output_memory(&self) -> MemoryType {
-        MemoryType::Cpu
-    }
-
-    fn cost(&self) -> u32 {
-        5 // Low-moderate cost - simple color conversion
-    }
-}
-
-// ============================================================================
-// AudioResample - resample audio
-// ============================================================================
-
-/// Audio resampler for sample rate conversion.
-pub struct AudioResample {
-    /// Target sample rate.
-    target_rate: u32,
-}
-
-impl AudioResample {
-    /// Create a new audio resampler.
-    pub fn new(target_rate: u32) -> Self {
-        Self { target_rate }
-    }
-}
-
-impl Element for AudioResample {
-    fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
-        // PLAN-09: Implement actual resampling (see plans/09_FORMAT_CONVERTERS.md)
-        Ok(Some(buffer))
-    }
-
-    fn name(&self) -> &str {
-        "audioresample"
-    }
-}
-
-impl ConverterElement for AudioResample {
-    fn converter_name(&self) -> &str {
-        "audioresample"
-    }
-
-    fn input_format(&self) -> FormatCaps {
-        FormatCaps::AudioRaw(AudioFormatCaps::any())
-    }
-
-    fn output_format(&self) -> FormatCaps {
-        let mut caps = AudioFormatCaps::any();
-        caps.sample_rate = self.target_rate.into();
-        FormatCaps::AudioRaw(caps)
-    }
-
-    fn input_memory(&self) -> MemoryType {
-        MemoryType::Cpu
-    }
-
-    fn output_memory(&self) -> MemoryType {
-        MemoryType::Cpu
-    }
-
-    fn cost(&self) -> u32 {
-        8 // Moderate cost - DSP operations
-    }
-}
-
-// ============================================================================
-// AudioConvert - convert sample formats
-// ============================================================================
-
-/// Audio format converter for sample format and channel changes.
-pub struct AudioConvert {
-    /// Target sample format.
-    target_format: Option<SampleFormat>,
-    /// Target channel count.
-    target_channels: Option<u16>,
-}
-
-impl AudioConvert {
-    /// Create a new audio converter.
-    pub fn new() -> Self {
-        Self {
-            target_format: None,
-            target_channels: None,
-        }
-    }
-
-    /// Set target sample format.
-    pub fn with_format(mut self, format: SampleFormat) -> Self {
-        self.target_format = Some(format);
-        self
-    }
-
-    /// Set target channel count.
-    pub fn with_channels(mut self, channels: u16) -> Self {
-        self.target_channels = Some(channels);
-        self
-    }
-}
-
-impl Default for AudioConvert {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Element for AudioConvert {
-    fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
-        // PLAN-09: Implement actual audio conversion (see plans/09_FORMAT_CONVERTERS.md)
-        Ok(Some(buffer))
-    }
-
-    fn name(&self) -> &str {
-        "audioconvert"
-    }
-}
-
-impl ConverterElement for AudioConvert {
-    fn converter_name(&self) -> &str {
-        "audioconvert"
-    }
-
-    fn input_format(&self) -> FormatCaps {
-        FormatCaps::AudioRaw(AudioFormatCaps::any())
-    }
-
-    fn output_format(&self) -> FormatCaps {
-        let mut caps = AudioFormatCaps::any();
-        if let Some(fmt) = self.target_format {
-            caps.sample_format = fmt.into();
-        }
-        if let Some(ch) = self.target_channels {
-            caps.channels = ch.into();
-        }
-        FormatCaps::AudioRaw(caps)
-    }
-
-    fn input_memory(&self) -> MemoryType {
-        MemoryType::Cpu
-    }
-
-    fn output_memory(&self) -> MemoryType {
-        MemoryType::Cpu
-    }
-
-    fn cost(&self) -> u32 {
-        3 // Low cost - simple format changes
-    }
-}
 
 // ============================================================================
 // MemoryCopy - copy between memory types
@@ -386,6 +115,7 @@ impl ConverterElement for MemoryCopy {
 /// Identity converter that passes data through unchanged.
 ///
 /// Used when formats are compatible but the pipeline needs an explicit node.
+/// It fixes no [`ConvertAxes`], so negotiation can never auto-insert it.
 pub struct Identity;
 
 impl Element for Identity {
@@ -425,89 +155,162 @@ impl ConverterElement for Identity {
 }
 
 // ============================================================================
+// Factory helpers: read the target out of the request
+// ============================================================================
+
+/// The pixel format the downstream element wants, if it pins one.
+fn target_pixel_format(request: &ConversionRequest) -> Option<crate::converters::PixelFormat> {
+    let FormatCaps::VideoRaw(caps) = &request.output else {
+        return None;
+    };
+    caps.pixel_format.fixate()?.try_into().ok()
+}
+
+/// The geometry the downstream element wants, if it pins one.
+fn target_geometry(request: &ConversionRequest) -> Option<(u32, u32)> {
+    let FormatCaps::VideoRaw(caps) = &request.output else {
+        return None;
+    };
+    Some((caps.width.fixate()?, caps.height.fixate()?))
+}
+
+/// Map the caps-level sample format onto the converter engine's.
+fn engine_sample_format(format: SampleFormat) -> crate::converters::SampleFormat {
+    use crate::converters::SampleFormat as Engine;
+    match format {
+        SampleFormat::U8 => Engine::U8,
+        SampleFormat::S16 => Engine::S16Le,
+        SampleFormat::S32 => Engine::S32Le,
+        SampleFormat::F32 => Engine::F32Le,
+    }
+}
+
+// ============================================================================
 // Registry builder
 // ============================================================================
 
-/// Create a converter registry with built-in converters.
-///
-/// This registers commonly needed converters:
-/// - Video scaling and format conversion
-/// - Audio resampling and format conversion
-/// - Memory type transfers
+/// Create a converter registry with the built-in converters.
 pub fn builtin_registry() -> ConverterRegistry {
     let mut registry = ConverterRegistry::new();
 
-    // Video format conversions (same memory type)
-    // Use the real VideoConvertElement that does actual YUYV->RGBA conversion
-    registry.register(
-        FormatType::VideoRaw,
-        FormatType::VideoRaw,
-        MemoryType::Cpu,
-        MemoryType::Cpu,
-        5,
-        "videoconvert",
-        Arc::new(|| {
-            Box::new(
-                crate::elements::transform::VideoConvertElement::new()
-                    .with_output_format(crate::converters::PixelFormat::Rgba),
-            )
+    // Pixel format conversion. Carries the input geometry through — it does not
+    // rescale — hence FORMAT only.
+    registry.register(ConverterSpec {
+        name: "videoconvert",
+        from_format: FormatType::VideoRaw,
+        to_format: FormatType::VideoRaw,
+        from_memory: MemoryType::Cpu,
+        to_memory: MemoryType::Cpu,
+        axes: ConvertAxes::FORMAT,
+        cost: 5,
+        factory: Arc::new(|request: &ConversionRequest| {
+            let mut element = crate::elements::transform::VideoConvertElement::new();
+            if let Some(format) = target_pixel_format(request) {
+                element = element.with_output_format(format);
+            }
+            Box::new(element)
         }),
-    );
+    });
 
-    // Audio format conversions - use the real AudioConvertElement
-    registry.register(
-        FormatType::AudioRaw,
-        FormatType::AudioRaw,
-        MemoryType::Cpu,
-        MemoryType::Cpu,
-        3,
-        "audioconvert",
-        Arc::new(|| Box::new(crate::elements::transform::AudioConvertElement::new())),
-    );
+    // Geometry. Keeps the input pixel format — hence GEOMETRY only.
+    registry.register(ConverterSpec {
+        name: "videoscale",
+        from_format: FormatType::VideoRaw,
+        to_format: FormatType::VideoRaw,
+        from_memory: MemoryType::Cpu,
+        to_memory: MemoryType::Cpu,
+        axes: ConvertAxes::GEOMETRY,
+        cost: 10,
+        factory: Arc::new(|request: &ConversionRequest| {
+            let element = crate::elements::transform::VideoScale::new();
+            if let Some((width, height)) = target_geometry(request) {
+                element.control().set_target(width, height);
+            }
+            Box::new(element)
+        }),
+    });
 
-    // Audio resampling - use the real AudioResampleElement
-    registry.register(
-        FormatType::AudioRaw,
-        FormatType::AudioRaw,
-        MemoryType::Cpu,
-        MemoryType::Cpu,
-        8,
-        "audioresample",
-        Arc::new(|| Box::new(crate::elements::transform::AudioResampleElement::new())),
-    );
+    // Sample format and channel count.
+    registry.register(ConverterSpec {
+        name: "audioconvert",
+        from_format: FormatType::AudioRaw,
+        to_format: FormatType::AudioRaw,
+        from_memory: MemoryType::Cpu,
+        to_memory: MemoryType::Cpu,
+        axes: ConvertAxes::FORMAT,
+        cost: 3,
+        factory: Arc::new(|request: &ConversionRequest| {
+            let mut element = crate::elements::transform::AudioConvertElement::new();
+            if let FormatCaps::AudioRaw(caps) = &request.input
+                && let Some(format) = caps.sample_format.fixate()
+            {
+                element = element.with_input_format(engine_sample_format(format));
+            }
+            if let FormatCaps::AudioRaw(caps) = &request.output {
+                if let Some(format) = caps.sample_format.fixate() {
+                    element = element.with_output_format(engine_sample_format(format));
+                }
+                if let Some(channels) = caps.channels.fixate() {
+                    element = element.with_channels(u32::from(channels));
+                }
+            }
+            Box::new(element)
+        }),
+    });
 
-    // CPU to GPU upload
-    registry.register(
-        FormatType::Any,
-        FormatType::Any,
-        MemoryType::Cpu,
-        MemoryType::GpuDevice,
-        20,
-        "memorycopy",
-        Arc::new(|| Box::new(MemoryCopy::cpu_to_gpu())),
-    );
+    // Sample rate. Registered on the same key as audioconvert — which is why the
+    // registry has to keep more than one converter per key; the old one silently
+    // evicted audioconvert here.
+    registry.register(ConverterSpec {
+        name: "audioresample",
+        from_format: FormatType::AudioRaw,
+        to_format: FormatType::AudioRaw,
+        from_memory: MemoryType::Cpu,
+        to_memory: MemoryType::Cpu,
+        axes: ConvertAxes::RATE,
+        cost: 8,
+        factory: Arc::new(|request: &ConversionRequest| {
+            let mut element = crate::elements::transform::AudioResampleElement::new();
+            if let FormatCaps::AudioRaw(caps) = &request.input
+                && let Some(rate) = caps.sample_rate.fixate()
+            {
+                element = element.with_input_rate(rate);
+            }
+            if let FormatCaps::AudioRaw(caps) = &request.output {
+                if let Some(rate) = caps.sample_rate.fixate() {
+                    element = element.with_output_rate(rate);
+                }
+                if let Some(channels) = caps.channels.fixate() {
+                    element = element.with_channels(u32::from(channels));
+                }
+            }
+            Box::new(element)
+        }),
+    });
 
-    // GPU to CPU download
-    registry.register(
-        FormatType::Any,
-        FormatType::Any,
-        MemoryType::GpuDevice,
-        MemoryType::Cpu,
-        20,
-        "memorycopy",
-        Arc::new(|| Box::new(MemoryCopy::gpu_to_cpu())),
-    );
+    // CPU to GPU upload.
+    registry.register(ConverterSpec {
+        name: "memorycopy",
+        from_format: FormatType::Any,
+        to_format: FormatType::Any,
+        from_memory: MemoryType::Cpu,
+        to_memory: MemoryType::GpuDevice,
+        axes: ConvertAxes::MEMORY,
+        cost: 20,
+        factory: Arc::new(|_request: &ConversionRequest| Box::new(MemoryCopy::cpu_to_gpu())),
+    });
 
-    // Identity (same format, same memory)
-    registry.register(
-        FormatType::Any,
-        FormatType::Any,
-        MemoryType::Cpu,
-        MemoryType::Cpu,
-        0,
-        "identity",
-        Arc::new(|| Box::new(Identity)),
-    );
+    // GPU to CPU download.
+    registry.register(ConverterSpec {
+        name: "memorycopy",
+        from_format: FormatType::Any,
+        to_format: FormatType::Any,
+        from_memory: MemoryType::GpuDevice,
+        to_memory: MemoryType::Cpu,
+        axes: ConvertAxes::MEMORY,
+        cost: 20,
+        factory: Arc::new(|_request: &ConversionRequest| Box::new(MemoryCopy::gpu_to_cpu())),
+    });
 
     registry
 }
@@ -515,39 +318,141 @@ pub fn builtin_registry() -> ConverterRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::{AudioFormatCaps, CapsValue, PixelFormat, VideoFormatCaps};
 
-    #[test]
-    fn test_video_scale_creation() {
-        let scaler = VideoScale::new(Some(1280), Some(720));
-        assert_eq!(scaler.converter_name(), "videoscale");
-        assert_eq!(scaler.cost(), 10);
+    fn video_request(output: VideoFormatCaps) -> ConversionRequest {
+        ConversionRequest {
+            input: FormatCaps::VideoRaw(VideoFormatCaps::any()),
+            output: FormatCaps::VideoRaw(output),
+            input_memory: MemoryType::Cpu,
+            output_memory: MemoryType::Cpu,
+        }
     }
 
     #[test]
-    fn test_video_convert_creation() {
-        let converter = VideoConvert::new(PixelFormat::Rgba);
-        assert_eq!(converter.converter_name(), "videoconvert");
-        assert_eq!(converter.cost(), 5);
+    fn audioconvert_and_audioresample_both_survive_registration() {
+        let registry = builtin_registry();
+        let names: Vec<_> = registry
+            .candidates(
+                FormatType::AudioRaw,
+                FormatType::AudioRaw,
+                MemoryType::Cpu,
+                MemoryType::Cpu,
+            )
+            .iter()
+            .map(|c| c.info.name)
+            .collect();
+
+        // audioconvert used to be evicted by audioresample: identical key,
+        // HashMap::insert.
+        assert!(names.contains(&"audioconvert"), "got {names:?}");
+        assert!(names.contains(&"audioresample"), "got {names:?}");
     }
 
     #[test]
-    fn test_audio_resample_creation() {
-        let resampler = AudioResample::new(48000);
-        assert_eq!(resampler.converter_name(), "audioresample");
-        assert_eq!(resampler.cost(), 8);
+    fn a_format_and_geometry_conflict_plans_convert_plus_scale() {
+        let registry = builtin_registry();
+        let plan = registry
+            .plan(
+                FormatType::VideoRaw,
+                FormatType::VideoRaw,
+                MemoryType::Cpu,
+                MemoryType::Cpu,
+                ConvertAxes::FORMAT | ConvertAxes::GEOMETRY,
+            )
+            .expect("videoconvert + videoscale cover both axes");
+
+        let names: Vec<_> = plan.steps.iter().map(|s| s.info.name).collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"videoconvert"));
+        assert!(names.contains(&"videoscale"));
     }
 
     #[test]
-    fn test_audio_convert_creation() {
-        let converter = AudioConvert::new()
-            .with_format(SampleFormat::F32)
-            .with_channels(2);
-        assert_eq!(converter.converter_name(), "audioconvert");
-        assert_eq!(converter.cost(), 3);
+    fn identity_is_never_planned() {
+        let registry = builtin_registry();
+        // identity fixes no axis, so it can never be chosen to cover one.
+        let plan = registry.plan(
+            FormatType::VideoRaw,
+            FormatType::VideoRaw,
+            MemoryType::Cpu,
+            MemoryType::Cpu,
+            ConvertAxes::RATE,
+        );
+        assert!(plan.is_none(), "nothing converts video framerate");
     }
 
     #[test]
-    fn test_memory_copy_creation() {
+    fn the_videoconvert_factory_is_told_its_target_format() {
+        let registry = builtin_registry();
+        let converter = registry
+            .candidates(
+                FormatType::VideoRaw,
+                FormatType::VideoRaw,
+                MemoryType::Cpu,
+                MemoryType::Cpu,
+            )
+            .iter()
+            .find(|c| c.info.name == "videoconvert")
+            .unwrap();
+
+        // The old registry hardcoded RGBA here regardless of what the sink asked
+        // for. Prove the element now takes its target from the request.
+        let element = (converter.factory)(&video_request(VideoFormatCaps {
+            pixel_format: CapsValue::Fixed(PixelFormat::I420),
+            ..VideoFormatCaps::any()
+        }));
+        assert_eq!(element.name(), "videoconvert");
+    }
+
+    #[test]
+    fn the_videoscale_factory_is_told_its_target_geometry() {
+        let request = video_request(VideoFormatCaps {
+            width: CapsValue::Fixed(1280),
+            height: CapsValue::Fixed(720),
+            ..VideoFormatCaps::any()
+        });
+        assert_eq!(target_geometry(&request), Some((1280, 720)));
+
+        // An unconstrained sink pins nothing, and the scaler stays passthrough.
+        assert_eq!(
+            target_geometry(&video_request(VideoFormatCaps::any())),
+            None
+        );
+    }
+
+    #[test]
+    fn the_audio_factories_read_both_ends_of_the_request() {
+        let registry = builtin_registry();
+        let resample = registry
+            .candidates(
+                FormatType::AudioRaw,
+                FormatType::AudioRaw,
+                MemoryType::Cpu,
+                MemoryType::Cpu,
+            )
+            .iter()
+            .find(|c| c.info.name == "audioresample")
+            .unwrap();
+
+        let element = (resample.factory)(&ConversionRequest {
+            input: FormatCaps::AudioRaw(AudioFormatCaps {
+                sample_rate: CapsValue::Fixed(44_100),
+                ..AudioFormatCaps::any()
+            }),
+            output: FormatCaps::AudioRaw(AudioFormatCaps {
+                sample_rate: CapsValue::Fixed(48_000),
+                channels: CapsValue::Fixed(2),
+                ..AudioFormatCaps::any()
+            }),
+            input_memory: MemoryType::Cpu,
+            output_memory: MemoryType::Cpu,
+        });
+        assert_eq!(element.name(), "audioresample");
+    }
+
+    #[test]
+    fn memory_copy_creation() {
         let uploader = MemoryCopy::cpu_to_gpu();
         assert_eq!(uploader.converter_name(), "memorycopy");
         assert_eq!(uploader.input_memory(), MemoryType::Cpu);
@@ -556,71 +461,20 @@ mod tests {
     }
 
     #[test]
-    fn test_identity_creation() {
-        let identity = Identity;
-        assert_eq!(identity.converter_name(), "identity");
-        assert_eq!(identity.cost(), 0);
-    }
-
-    #[test]
-    fn test_builtin_registry() {
-        let registry = builtin_registry();
-        assert!(!registry.is_empty());
-
-        // Should find video-to-video converter
-        let video_path = registry.find_path(
-            FormatType::VideoRaw,
-            FormatType::VideoRaw,
-            MemoryType::Cpu,
-            MemoryType::Cpu,
-        );
-        assert!(video_path.is_some());
-
-        // Should find audio-to-audio converter
-        let audio_path = registry.find_path(
-            FormatType::AudioRaw,
-            FormatType::AudioRaw,
-            MemoryType::Cpu,
-            MemoryType::Cpu,
-        );
-        assert!(audio_path.is_some());
-
-        // Should find CPU-to-GPU transfer
-        let upload_path = registry.find_path(
-            FormatType::Any,
-            FormatType::Any,
-            MemoryType::Cpu,
-            MemoryType::GpuDevice,
-        );
-        assert!(upload_path.is_some());
-    }
-
-    #[test]
-    fn test_video_scale_output_caps() {
-        let scaler = VideoScale::new(Some(1920), Some(1080));
-        let output = scaler.output_format();
-
-        if let FormatCaps::VideoRaw(caps) = output {
-            assert_eq!(caps.width.fixate(), Some(1920));
-            assert_eq!(caps.height.fixate(), Some(1080));
-        } else {
-            panic!("Expected VideoRaw caps");
-        }
-    }
-
-    #[test]
-    fn test_converter_element_process_passthrough() {
+    fn identity_passes_buffers_through() {
         use crate::buffer::MemoryHandle;
         use crate::memory::SharedArena;
         use crate::metadata::Metadata;
 
         let mut identity = Identity;
+        assert_eq!(identity.converter_name(), "identity");
+        assert_eq!(identity.cost(), 0);
+
         let arena = SharedArena::new(64, 4).unwrap();
         let slot = arena.acquire().unwrap();
         let handle = MemoryHandle::with_len(slot, 4);
         let buffer = Buffer::new(handle, Metadata::from_sequence(0));
         let result = Element::process(&mut identity, buffer).unwrap();
-        assert!(result.is_some());
         assert_eq!(result.unwrap().len(), 4);
     }
 }
