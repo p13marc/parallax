@@ -154,6 +154,39 @@ impl ColorMatrix {
     }
 }
 
+/// Byte offsets within a packed 4:2:2 group (4 bytes = 2 pixels).
+///
+/// YUYV and UYVY carry identical data in a different order, so every packed-422
+/// conversion is the same code with a different one of these.
+#[derive(Clone, Copy, Debug)]
+struct Packed422 {
+    /// Offset of the first pixel's luma.
+    y0: usize,
+    /// Offset of the shared U (Cb) sample.
+    u: usize,
+    /// Offset of the second pixel's luma.
+    y1: usize,
+    /// Offset of the shared V (Cr) sample.
+    v: usize,
+}
+
+impl Packed422 {
+    /// `Y0 U Y1 V` — the common webcam format.
+    const YUYV: Self = Self {
+        y0: 0,
+        u: 1,
+        y1: 2,
+        v: 3,
+    };
+    /// `U Y0 V Y1`.
+    const UYVY: Self = Self {
+        u: 0,
+        y0: 1,
+        v: 2,
+        y1: 3,
+    };
+}
+
 /// Video format converter.
 ///
 /// Converts between pixel formats while maintaining the same resolution.
@@ -349,6 +382,33 @@ impl VideoConvert {
                 self.remove_alpha(input, output, false);
             }
 
+            // Packed YUV 4:2:2 -> planar/semi-planar YUV 4:2:0.
+            //
+            // The path a plain USB webcam needs to reach an encoder. These are
+            // pure data reshuffles — de-interleave and subsample chroma — with
+            // no colour-space maths, so they are both cheaper and more accurate
+            // than the YUV -> RGB -> YUV detour they replace.
+            (PixelFormat::Yuyv, PixelFormat::I420) => {
+                self.packed422_to_i420(input, output, Packed422::YUYV);
+            }
+            (PixelFormat::Uyvy, PixelFormat::I420) => {
+                self.packed422_to_i420(input, output, Packed422::UYVY);
+            }
+            (PixelFormat::Yuyv, PixelFormat::Nv12) => {
+                self.packed422_to_nv12(input, output, Packed422::YUYV);
+            }
+            (PixelFormat::Uyvy, PixelFormat::Nv12) => {
+                self.packed422_to_nv12(input, output, Packed422::UYVY);
+            }
+
+            // Planar <-> semi-planar YUV 4:2:0 (a chroma plane interleave).
+            (PixelFormat::I420, PixelFormat::Nv12) => {
+                self.i420_to_nv12(input, output);
+            }
+            (PixelFormat::Nv12, PixelFormat::I420) => {
+                self.nv12_to_i420(input, output);
+            }
+
             // Gray conversions
             (PixelFormat::Gray8, PixelFormat::Rgb24) => {
                 self.gray_to_rgb24(input, output);
@@ -366,6 +426,117 @@ impl VideoConvert {
         }
 
         Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // YUV <-> YUV conversions
+    //
+    // No colour-space maths here: these only move bytes around, so there is no
+    // SIMD variant and no colour matrix involved.
+    // -------------------------------------------------------------------------
+
+    /// Packed 4:2:2 -> planar I420.
+    ///
+    /// Luma is copied straight through. Chroma is subsampled vertically by
+    /// averaging the two source rows that fall in each 2x2 block — 4:2:2 already
+    /// carries one chroma sample per horizontal pair, so only the vertical
+    /// direction loses resolution.
+    fn packed422_to_i420(&self, input: &[u8], output: &mut [u8], p: Packed422) {
+        let (w, h) = (self.width as usize, self.height as usize);
+        let (cw, ch) = (w / 2, h / 2);
+        let y_size = w * h;
+        let c_size = cw * ch;
+
+        let (y_out, chroma) = output.split_at_mut(y_size);
+        let (u_out, v_out) = chroma.split_at_mut(c_size);
+
+        Self::copy_luma(input, y_out, w, h, p);
+
+        for cy in 0..ch {
+            for cx in 0..cw {
+                let (u, v) = Self::average_chroma(input, w, cy, cx, p);
+                u_out[cy * cw + cx] = u;
+                v_out[cy * cw + cx] = v;
+            }
+        }
+    }
+
+    /// Packed 4:2:2 -> semi-planar NV12 (interleaved UV plane).
+    fn packed422_to_nv12(&self, input: &[u8], output: &mut [u8], p: Packed422) {
+        let (w, h) = (self.width as usize, self.height as usize);
+        let (cw, ch) = (w / 2, h / 2);
+        let y_size = w * h;
+
+        let (y_out, uv_out) = output.split_at_mut(y_size);
+
+        Self::copy_luma(input, y_out, w, h, p);
+
+        for cy in 0..ch {
+            for cx in 0..cw {
+                let (u, v) = Self::average_chroma(input, w, cy, cx, p);
+                let idx = (cy * cw + cx) * 2;
+                uv_out[idx] = u;
+                uv_out[idx + 1] = v;
+            }
+        }
+    }
+
+    /// I420 -> NV12: interleave the two chroma planes.
+    fn i420_to_nv12(&self, input: &[u8], output: &mut [u8]) {
+        let (w, h) = (self.width as usize, self.height as usize);
+        let (cw, ch) = (w / 2, h / 2);
+        let y_size = w * h;
+        let c_size = cw * ch;
+
+        output[..y_size].copy_from_slice(&input[..y_size]);
+
+        let u_plane = &input[y_size..y_size + c_size];
+        let v_plane = &input[y_size + c_size..y_size + 2 * c_size];
+        for i in 0..c_size {
+            output[y_size + i * 2] = u_plane[i];
+            output[y_size + i * 2 + 1] = v_plane[i];
+        }
+    }
+
+    /// NV12 -> I420: de-interleave the chroma plane.
+    fn nv12_to_i420(&self, input: &[u8], output: &mut [u8]) {
+        let (w, h) = (self.width as usize, self.height as usize);
+        let (cw, ch) = (w / 2, h / 2);
+        let y_size = w * h;
+        let c_size = cw * ch;
+
+        output[..y_size].copy_from_slice(&input[..y_size]);
+
+        for i in 0..c_size {
+            output[y_size + i] = input[y_size + i * 2];
+            output[y_size + c_size + i] = input[y_size + i * 2 + 1];
+        }
+    }
+
+    /// Copy the luma plane out of a packed 4:2:2 frame.
+    fn copy_luma(input: &[u8], y_out: &mut [u8], w: usize, h: usize, p: Packed422) {
+        for row in 0..h {
+            let src_row = row * w * 2;
+            for pair in 0..w / 2 {
+                let src = src_row + pair * 4;
+                y_out[row * w + pair * 2] = input[src + p.y0];
+                y_out[row * w + pair * 2 + 1] = input[src + p.y1];
+            }
+        }
+    }
+
+    /// The (U, V) for one 4:2:0 chroma cell, averaged over the two source rows.
+    fn average_chroma(input: &[u8], w: usize, cy: usize, cx: usize, p: Packed422) -> (u8, u8) {
+        let row_stride = w * 2;
+        let top = (cy * 2) * row_stride + cx * 4;
+        let bottom = top + row_stride;
+
+        // Rounded mean of the two source rows.
+        let mean = |a: u8, b: u8| (a as u16 + b as u16).div_ceil(2) as u8;
+        (
+            mean(input[top + p.u], input[bottom + p.u]),
+            mean(input[top + p.v], input[bottom + p.v]),
+        )
     }
 
     // -------------------------------------------------------------------------
@@ -1907,6 +2078,156 @@ impl VideoConvert {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========================================================================
+    // Packed 4:2:2 -> 4:2:0 (#34)
+    // ========================================================================
+
+    /// A 4x4 YUYV frame with distinct luma per pixel and distinct chroma per
+    /// horizontal pair, so a transposed or mis-sampled plane cannot pass.
+    fn yuyv_4x4() -> Vec<u8> {
+        let (w, h) = (4usize, 4usize);
+        let mut data = vec![0u8; w * h * 2];
+        for row in 0..h {
+            for pair in 0..w / 2 {
+                let i = row * w * 2 + pair * 4;
+                data[i] = (row * 16 + pair * 2) as u8; // Y0
+                data[i + 1] = (100 + row * 4 + pair) as u8; // U
+                data[i + 2] = (row * 16 + pair * 2 + 1) as u8; // Y1
+                data[i + 3] = (200 - row * 4 - pair) as u8; // V
+            }
+        }
+        data
+    }
+
+    #[test]
+    fn yuyv_to_i420_places_luma_and_chroma_correctly() {
+        let src = yuyv_4x4();
+        let conv = VideoConvert::new(PixelFormat::Yuyv, PixelFormat::I420, 4, 4).unwrap();
+        let mut out = vec![0u8; conv.output_size()];
+        conv.convert(&src, &mut out).unwrap();
+
+        // Luma passes through untouched, pixel for pixel.
+        for row in 0..4usize {
+            for col in 0..4usize {
+                let pair = col / 2;
+                let i = row * 8 + pair * 4;
+                let expected = if col % 2 == 0 { src[i] } else { src[i + 2] };
+                assert_eq!(out[row * 4 + col], expected, "luma at ({row}, {col})");
+            }
+        }
+
+        // Chroma is averaged over the two rows of each 2x2 block. Row 0/1,
+        // pair 0: U = mean(100, 104) = 102; V = mean(200, 196) = 198.
+        let u_plane = &out[16..16 + 4];
+        let v_plane = &out[20..20 + 4];
+        assert_eq!(u_plane[0], 102);
+        assert_eq!(v_plane[0], 198);
+        // Row 2/3, pair 1: U = mean(100+8+1, 100+12+1) = mean(109, 113) = 111.
+        assert_eq!(u_plane[3], 111);
+        // V = mean(200-8-1, 200-12-1) = mean(191, 187) = 189.
+        assert_eq!(v_plane[3], 189);
+    }
+
+    /// The direct path must agree with the round-trip it replaces: converting
+    /// YUYV -> I420 -> RGB should land close to YUYV -> RGB.
+    #[test]
+    fn yuyv_to_i420_agrees_with_the_rgb_detour() {
+        let src = yuyv_4x4();
+
+        let direct = VideoConvert::new(PixelFormat::Yuyv, PixelFormat::Rgb24, 4, 4).unwrap();
+        let mut rgb_direct = vec![0u8; direct.output_size()];
+        direct.convert(&src, &mut rgb_direct).unwrap();
+
+        let to_i420 = VideoConvert::new(PixelFormat::Yuyv, PixelFormat::I420, 4, 4).unwrap();
+        let mut i420 = vec![0u8; to_i420.output_size()];
+        to_i420.convert(&src, &mut i420).unwrap();
+
+        let to_rgb = VideoConvert::new(PixelFormat::I420, PixelFormat::Rgb24, 4, 4).unwrap();
+        let mut rgb_via_i420 = vec![0u8; to_rgb.output_size()];
+        to_rgb.convert(&i420, &mut rgb_via_i420).unwrap();
+
+        // Not identical: 4:2:0 loses vertical chroma resolution. But it must be
+        // close — a wrong U/V assignment would swing colours wildly.
+        for (i, (a, b)) in rgb_direct.iter().zip(&rgb_via_i420).enumerate() {
+            let delta = (*a as i32 - *b as i32).abs();
+            assert!(
+                delta <= 24,
+                "channel {i}: direct={a} via_i420={b} (delta {delta})"
+            );
+        }
+    }
+
+    #[test]
+    fn uyvy_and_yuyv_carry_the_same_picture() {
+        // Same data, different byte order: converting both to I420 must agree.
+        let yuyv = yuyv_4x4();
+        let mut uyvy = vec![0u8; yuyv.len()];
+        for g in 0..yuyv.len() / 4 {
+            let (i, j) = (g * 4, g * 4);
+            uyvy[j] = yuyv[i + 1]; // U
+            uyvy[j + 1] = yuyv[i]; // Y0
+            uyvy[j + 2] = yuyv[i + 3]; // V
+            uyvy[j + 3] = yuyv[i + 2]; // Y1
+        }
+
+        let from_yuyv = VideoConvert::new(PixelFormat::Yuyv, PixelFormat::I420, 4, 4).unwrap();
+        let from_uyvy = VideoConvert::new(PixelFormat::Uyvy, PixelFormat::I420, 4, 4).unwrap();
+
+        let mut a = vec![0u8; from_yuyv.output_size()];
+        let mut b = vec![0u8; from_uyvy.output_size()];
+        from_yuyv.convert(&yuyv, &mut a).unwrap();
+        from_uyvy.convert(&uyvy, &mut b).unwrap();
+
+        assert_eq!(
+            a, b,
+            "YUYV and UYVY of the same frame must yield the same I420"
+        );
+    }
+
+    #[test]
+    fn yuyv_to_nv12_interleaves_chroma() {
+        let src = yuyv_4x4();
+
+        let to_i420 = VideoConvert::new(PixelFormat::Yuyv, PixelFormat::I420, 4, 4).unwrap();
+        let mut i420 = vec![0u8; to_i420.output_size()];
+        to_i420.convert(&src, &mut i420).unwrap();
+
+        let to_nv12 = VideoConvert::new(PixelFormat::Yuyv, PixelFormat::Nv12, 4, 4).unwrap();
+        let mut nv12 = vec![0u8; to_nv12.output_size()];
+        to_nv12.convert(&src, &mut nv12).unwrap();
+
+        assert_eq!(&nv12[..16], &i420[..16], "same luma plane");
+        for i in 0..4 {
+            assert_eq!(nv12[16 + i * 2], i420[16 + i], "U at chroma cell {i}");
+            assert_eq!(nv12[16 + i * 2 + 1], i420[20 + i], "V at chroma cell {i}");
+        }
+    }
+
+    #[test]
+    fn i420_nv12_roundtrip_is_lossless() {
+        // A plane interleave, so it must survive exactly.
+        let src = yuyv_4x4();
+        let to_i420 = VideoConvert::new(PixelFormat::Yuyv, PixelFormat::I420, 4, 4).unwrap();
+        let mut i420 = vec![0u8; to_i420.output_size()];
+        to_i420.convert(&src, &mut i420).unwrap();
+
+        let to_nv12 = VideoConvert::new(PixelFormat::I420, PixelFormat::Nv12, 4, 4).unwrap();
+        let mut nv12 = vec![0u8; to_nv12.output_size()];
+        to_nv12.convert(&i420, &mut nv12).unwrap();
+
+        let back = VideoConvert::new(PixelFormat::Nv12, PixelFormat::I420, 4, 4).unwrap();
+        let mut i420_again = vec![0u8; back.output_size()];
+        back.convert(&nv12, &mut i420_again).unwrap();
+
+        assert_eq!(i420, i420_again);
+    }
+
+    #[test]
+    fn odd_dimensions_are_still_rejected_for_the_new_paths() {
+        assert!(VideoConvert::new(PixelFormat::Yuyv, PixelFormat::I420, 5, 4).is_err());
+        assert!(VideoConvert::new(PixelFormat::Yuyv, PixelFormat::Nv12, 4, 3).is_err());
+    }
 
     #[test]
     fn test_pixel_format_buffer_size() {

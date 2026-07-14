@@ -483,6 +483,31 @@ mod tests {
         assert_eq!(out.metadata().get::<u64>("width"), Some(&640));
     }
 
+    /// The exact element the zensight sensor builds for a YUYV camera
+    /// (`pipeline.rs:333`). It used to fail on the first buffer with
+    /// "Unsupported conversion: Yuyv -> I420", so no non-MJPG webcam worked.
+    #[test]
+    fn yuyv_camera_can_feed_an_i420_encoder() {
+        let mut element = VideoConvertElement::new()
+            .with_input_format(PixelFormat::Yuyv)
+            .with_output_format(PixelFormat::I420)
+            .with_size(640, 480);
+
+        let out = element
+            .process(frame(crate::format::PixelFormat::Yuyv, 640, 480))
+            .unwrap()
+            .expect("a YUYV webcam must be able to reach the encoder");
+
+        assert_eq!(
+            out.as_bytes().len(),
+            PixelFormat::I420.buffer_size(640, 480)
+        );
+        assert_eq!(
+            out.metadata().video_pixel_format(),
+            Some(crate::format::PixelFormat::I420)
+        );
+    }
+
     #[test]
     fn buffers_without_metadata_still_auto_detect() {
         // Sources that stamp no format at all keep working (unchanged behaviour).
