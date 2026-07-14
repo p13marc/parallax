@@ -131,6 +131,8 @@ Two coexisting generations:
 
 **Flush**: executor calls `flush()` repeatedly at EOS until it returns `None`/`Output::None` — implement it in encoders/muxers to drain buffered data.
 
+**Runtime control**: `Executor::start()` *moves* elements into their tasks, so `get_element_mut()` returns `None` on a running pipeline. The only way to mutate a live element is an `Arc<Atomic*>` **control handle cloned before `start()`**: `EncoderControl` (bitrate/GOP/QP/keyframe), `KeyframeHandle`, `ScaleControl` (`VideoScale`), `ThrottleControl`, `JpegQualityControl`, `ValveControl`, `FlowStateHandle`. See `docs/elements.md` § Runtime control.
+
 ## Pipeline
 
 ### Construction
@@ -216,7 +218,7 @@ p.link_pads(xfm, "src", sink, "sink")?;
 
 | What | Types | Feature |
 |------|-------|---------|
-| H.264 | `H264Encoder`/`H264Decoder` (implement `Element` directly) | `h264` |
+| H.264 | `H264Encoder`/`H264Decoder` (implement `Element` directly). Live bitrate/GOP/QP via `control_handle()`; resolution follows `Metadata`'s dims (OpenH264 re-inits + IDR). Config: `rate_control`, `skip_frames`, `max_slice_len`, `profile`, `complexity`, `usage_type` | `h264` |
 | H.264 hardware | `V4l2M2mH264Encoder` (impl `VideoEncoder`, wrap in `EncoderElement`), `find_m2m_encoder(b"H264")` device probe; `V4l2CodedFormat::Fwht` is test-only (vicodec) | `v4l2-m2m` (build needs libclang + kernel headers) |
 | AV1 | `Rav1eEncoder` (impl `Element` directly AND `VideoEncoder`; drains lookahead via `Element::flush`), `Dav1dDecoder` (impl `Element`) | `av1-encode` / `av1-decode` |
 | Audio dec | `SymphoniaDecoder` (impl `Element`) | `audio-flac/mp3/aac/vorbis` |
@@ -231,7 +233,9 @@ p.link_pads(xfm, "src", sink, "sink")?;
 | Hotplug | `DeviceMonitor` (udev `video4linux` + libcamera events folded in when both features on; one physical USB cam → one `Added` per backend) | `hotplug` (+`libcamera` for folding) |
 | KLV | `KlvEncoder`, `StanagMetadataBuilder` (elements/metadata) | — |
 
-Codec traits: `VideoEncoder`/`VideoDecoder`, `AudioEncoder`/`AudioDecoder` (with `flush()` to drain at EOS). Note the inconsistency: some codecs implement the traits (rav1e, opus, aac, v4l2-m2m), others implement `Element` directly (openh264, dav1d, symphonia). `EncoderElement::new(enc, format: VideoFormat)` maps caps pixel formats to codec ones with per-format strides (I420/I422/I444/NV12/10-bit), errors on RGB/packed input (needs `VideoConvert` upstream), and renegotiates from per-buffer `Metadata.format`.
+Codec traits: `VideoEncoder`/`VideoDecoder`, `AudioEncoder`/`AudioDecoder` (with `flush()` to drain at EOS; `VideoEncoder` also has `force_keyframe()` plus defaulted `set_bitrate`/`set_keyframe_interval`/`set_qp` that `Err` when the codec cannot comply — rav1e/opus/aac do not override them). Note the inconsistency: some codecs implement the traits (rav1e, opus, aac, v4l2-m2m), others implement `Element` directly (openh264, dav1d, symphonia). `EncoderElement::new(enc, format: VideoFormat)` maps caps pixel formats to codec ones with per-format strides (I420/I422/I444/NV12/10-bit), errors on RGB/packed input (needs `VideoConvert` upstream), and renegotiates from per-buffer `Metadata.format`.
+
+**Video dimensions in metadata**: two conventions coexist — `Metadata.format` (`MediaFormat::VideoRaw`, read by `EncoderElement`) and the legacy `"width"`/`"height"` `u64` custom keys (set by `H264Decoder`, read by `AutoVideoSink`). Use `Metadata::set_video_dims()` / `video_dims()`, which write and read **both**; updating only one leaves the other stale and silently mis-sizes frames downstream.
 
 **`elements::codec` is compiled only when at least one codec feature is enabled** (see the `#[cfg(any(...))]` on `pub mod codec` in `elements/mod.rs`). Consequence: unit tests inside codec modules (including the always-present `EncoderElement`) do NOT run under default features — they run in CI's sensor combo and feature-specific jobs. When adding a codec feature, add it to that cfg list or the module silently won't compile.
 
