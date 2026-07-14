@@ -125,18 +125,6 @@ impl<E: VideoEncoder> EncoderElement<E> {
         self.control.keyframe_handle()
     }
 
-    /// Get a cloneable handle for changing bitrate / keyframe interval / QP at
-    /// runtime.
-    ///
-    /// Clone this *before* the pipeline starts. Changes are applied through
-    /// [`VideoEncoder::set_bitrate`] and friends before the next frame is
-    /// encoded; an encoder that does not support a parameter reports it (the
-    /// wrapper logs a warning and keeps encoding rather than failing the
-    /// stream).
-    pub fn control_handle(&self) -> super::EncoderControl {
-        self.control.clone()
-    }
-
     /// Get the number of frames received.
     pub fn frames_in(&self) -> u64 {
         self.frames_in
@@ -240,6 +228,21 @@ impl<E: VideoEncoder> EncoderElement<E> {
             MemoryHandle::with_len(slot, data.len()),
             metadata,
         ))
+    }
+}
+
+impl<E: VideoEncoder> super::Controllable for EncoderElement<E> {
+    type Control = super::EncoderControl;
+
+    /// A handle for changing bitrate / keyframe interval / QP at runtime.
+    ///
+    /// Clone it *before* `executor.start()`. Changes are applied through
+    /// [`VideoEncoder::set_bitrate`] and friends before the next frame is
+    /// encoded; an encoder that cannot honor a parameter reports it, and the
+    /// wrapper logs a warning and keeps encoding rather than failing the
+    /// stream. See [`crate::control`].
+    fn control(&self) -> super::EncoderControl {
+        self.control.clone()
     }
 }
 

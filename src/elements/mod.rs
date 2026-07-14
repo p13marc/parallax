@@ -210,7 +210,10 @@ pub use codec::{PixelFormat as CodecPixelFormat, VideoFrame};
 
 // Video codecs - H.264
 #[cfg(feature = "h264")]
-pub use codec::{DecodedFrame, H264Decoder, H264Encoder, H264EncoderConfig, SpsPpsStrategy};
+pub use codec::{
+    Complexity, DecodedFrame, H264Decoder, H264Encoder, H264EncoderConfig, Profile,
+    RateControlMode, SpsPpsStrategy, UsageType,
+};
 
 // Video codecs - V4L2 M2M hardware H.264
 #[cfg(feature = "v4l2-m2m")]
@@ -262,7 +265,7 @@ pub use codec::{ColorType, ImageFrame};
 
 // Image codecs - JPEG
 #[cfg(feature = "image-jpeg")]
-pub use codec::{JpegDecoder, JpegEncoder};
+pub use codec::{JpegDecoder, JpegEncoder, JpegQualityControl};
 
 // Image codecs - PNG
 #[cfg(feature = "image-png")]

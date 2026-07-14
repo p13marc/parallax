@@ -271,6 +271,16 @@ impl<E: HwVideoEncoder> HwEncoderElement<E> {
     }
 }
 
+impl<E: HwVideoEncoder> super::Controllable for HwEncoderElement<E> {
+    /// Hardware encoders expose only keyframe forcing today — there is no
+    /// `HwVideoEncoder::set_bitrate`, so there is nothing wider to hand out.
+    type Control = super::KeyframeHandle;
+
+    fn control(&self) -> super::KeyframeHandle {
+        self.keyframe_requests.clone()
+    }
+}
+
 impl<E: HwVideoEncoder + 'static> Transform for HwEncoderElement<E> {
     fn transform(&mut self, buffer: Buffer) -> Result<Output> {
         let pts = buffer

@@ -1,29 +1,67 @@
-//! Runtime control handles for codec elements.
+//! Runtime control: change a running pipeline without tearing it down.
 //!
-//! Once a pipeline is started, its elements are moved into their executor
-//! tasks and can no longer be reached through
-//! [`Pipeline::get_element_mut`](crate::pipeline::Pipeline::get_element_mut).
-//! Control handles bridge that gap: they are cloned from an element *before*
-//! `executor.start()` and remain valid while the pipeline runs, exactly like
-//! [`AppSinkHandle`](crate::elements::app::AppSinkHandle).
+//! # The one invariant
+//!
+//! [`Executor::start`](crate::pipeline::Executor::start) **moves** every element
+//! into its executor task, so
+//! [`Pipeline::get_element_mut`](crate::pipeline::Pipeline::get_element_mut)
+//! returns `None` for anything that is running. The *only* way to reach a live
+//! element is through a control handle:
+//!
+//! > **Clone the handle from the element _before_ `executor.start()`.**
+//!
+//! Every handle here is an `Arc<Atomic…>` — lock-free, allocation-free, safe to
+//! call from any thread or async task, and free on the hot path when nothing
+//! has changed.
+//!
+//! # The handles
+//!
+//! Every controllable element implements [`Controllable`], so the accessor is
+//! always called `control()`:
+//!
+//! | Handle | From | Changes |
+//! |--------|------|---------|
+//! | [`EncoderControl`] | `H264Encoder`, `EncoderElement` | bitrate, GOP, QP, rate-control mode, frame skipping, keyframe requests |
+//! | [`EncoderStatsHandle`] | `H264Encoder`, `EncoderElement` | *read-only*: frames, bytes, rate-control drops, encode time |
+//! | [`KeyframeHandle`] | `…::keyframe_handle()` | force the next frame to be an IDR |
+//! | [`ScaleControl`] | `VideoScale` | target resolution (`set_max_height`, `passthrough`) |
+//! | [`ThrottleControl`] | `Throttle` | framerate (drop-based) |
+//! | [`JpegQualityControl`] | `JpegEncoder` | JPEG quality 1..=100 |
+//! | [`ValveControl`] | `Valve` | open / close |
+//! | [`FlowStateHandle`] | `Queue` | backpressure signalling to live sources |
 //!
 //! # Example
 //!
 //! ```rust,ignore
+//! use parallax::control::{Controllable, EncoderControl};
+//!
 //! let encoder = H264Encoder::new(config)?;
-//! let keyframes = encoder.keyframe_handle();
-//! let control = encoder.control_handle();
+//! let control = encoder.control();      // BEFORE start()
+//! let stats = encoder.stats();          //  ""
 //! pipeline.add_filter("enc", encoder);
 //!
 //! let handle = executor.start(&mut pipeline)?;
 //! // ... later, when a new viewer subscribes:
-//! keyframes.request(); // next encoded frame is an IDR
+//! control.request_keyframe();           // next encoded frame is an IDR
 //! // ... or when the link gets congested:
-//! control.set_bitrate(400_000); // 400 kbps from the next frame on
+//! control.set_bitrate(400_000);         // 400 kbps, applied seamlessly
+//! println!("{} kbps", stats.bytes_encoded());
 //! ```
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+
+/// An element that exposes a runtime control handle.
+///
+/// The handle must be cloned *before* `executor.start()` — see the
+/// [module docs](self).
+pub trait Controllable {
+    /// The handle type this element hands out.
+    type Control;
+
+    /// Clone this element's control handle.
+    fn control(&self) -> Self::Control;
+}
 
 /// Buffer-metadata key requesting a keyframe from a downstream encoder.
 ///
@@ -74,7 +112,7 @@ impl KeyframeHandle {
 /// Sentinel for "this parameter has never been set" in [`EncoderControl`].
 ///
 /// A bitrate of 0 is *meaningful* (it selects quality mode in
-/// [`H264Encoder`](super::H264Encoder)), so 0 cannot double as "unset".
+/// `H264Encoder`), so 0 cannot double as "unset".
 const UNSET_U32: u32 = u32::MAX;
 /// Sentinel for "this parameter has never been set" (QP is 0-51, so 255 is free).
 const UNSET_U8: u8 = u8::MAX;
@@ -123,8 +161,8 @@ impl EncoderParams {
 /// # Example
 ///
 /// ```rust,ignore
-/// let encoder = H264Encoder::new(H264EncoderConfig::new(1280, 720))?;
-/// let control = encoder.control_handle();   // BEFORE start
+/// let encoder = H264Encoder::new(H264EncoderConfig::new())?;
+/// let control = encoder.control();          // BEFORE start
 /// pipeline.add_filter("enc", encoder);
 /// let handle = executor.start(&mut pipeline)?;
 ///
@@ -258,6 +296,114 @@ fn unset_u32(value: u32) -> Option<u32> {
 fn unset_u8(value: u8) -> Option<u8> {
     (value != UNSET_U8).then_some(value)
 }
+
+// ============================================================================
+// Encoder statistics
+// ============================================================================
+
+/// Read-only handle to a running encoder's counters.
+///
+/// The numbers a streaming sender needs — how many frames went in, how many
+/// bytes came out, how many frames the rate controller swallowed, and how long
+/// the last encode took — are computed inside the element, which
+/// `executor.start()` then moves out of reach. Clone this handle *before*
+/// start, exactly like [`EncoderControl`].
+///
+/// Zenoh and other TCP/QUIC transports hide packet loss behind retransmission,
+/// so there is no congestion signal to close a rate-control loop on. These
+/// sender-side counters are the only bandwidth feedback that exists.
+#[derive(Clone, Debug, Default)]
+pub struct EncoderStatsHandle(Arc<EncoderStatsInner>);
+
+#[derive(Debug, Default)]
+struct EncoderStatsInner {
+    frames_encoded: AtomicU64,
+    bytes_encoded: AtomicU64,
+    frames_dropped_by_rc: AtomicU64,
+    last_encode_ns: AtomicU64,
+}
+
+impl EncoderStatsHandle {
+    /// Create a new handle with all counters at zero.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Frames the encoder emitted a bitstream for.
+    pub fn frames_encoded(&self) -> u64 {
+        self.0.frames_encoded.load(Ordering::Relaxed)
+    }
+
+    /// Total bytes of encoded bitstream produced.
+    pub fn bytes_encoded(&self) -> u64 {
+        self.0.bytes_encoded.load(Ordering::Relaxed)
+    }
+
+    /// Input frames the encoder swallowed without emitting anything.
+    ///
+    /// Rate control is allowed to spend *frames* rather than *quality* to hold
+    /// a bitrate target (see `H264EncoderConfig::skip_frames`). When it does,
+    /// the input frame simply produces no output — which any downstream
+    /// fps/kbps accounting has to know about.
+    pub fn frames_dropped_by_rc(&self) -> u64 {
+        self.0.frames_dropped_by_rc.load(Ordering::Relaxed)
+    }
+
+    /// Wall-clock duration of the most recent encode call, in nanoseconds.
+    pub fn last_encode_ns(&self) -> u64 {
+        self.0.last_encode_ns.load(Ordering::Relaxed)
+    }
+
+    /// A consistent-enough snapshot of every counter.
+    pub fn snapshot(&self) -> EncoderStats {
+        EncoderStats {
+            frames_encoded: self.frames_encoded(),
+            bytes_encoded: self.bytes_encoded(),
+            frames_dropped_by_rc: self.frames_dropped_by_rc(),
+            last_encode_ns: self.last_encode_ns(),
+        }
+    }
+
+    /// Record an encoded frame. Called by encoder elements.
+    pub fn record_frame(&self, bytes: usize, encode_ns: u64) {
+        self.0.frames_encoded.fetch_add(1, Ordering::Relaxed);
+        self.0
+            .bytes_encoded
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+        self.0.last_encode_ns.store(encode_ns, Ordering::Relaxed);
+    }
+
+    /// Record an input frame that rate control produced no output for.
+    pub fn record_rc_drop(&self, encode_ns: u64) {
+        self.0.frames_dropped_by_rc.fetch_add(1, Ordering::Relaxed);
+        self.0.last_encode_ns.store(encode_ns, Ordering::Relaxed);
+    }
+}
+
+/// A point-in-time copy of [`EncoderStatsHandle`]'s counters.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EncoderStats {
+    /// Frames the encoder emitted a bitstream for.
+    pub frames_encoded: u64,
+    /// Total bytes of encoded bitstream produced.
+    pub bytes_encoded: u64,
+    /// Input frames swallowed by rate control.
+    pub frames_dropped_by_rc: u64,
+    /// Duration of the most recent encode, in nanoseconds.
+    pub last_encode_ns: u64,
+}
+
+// ============================================================================
+// Re-exports: one place to find every runtime handle
+// ============================================================================
+
+pub use crate::elements::flow::ValveControl;
+pub use crate::elements::timing::ThrottleControl;
+pub use crate::elements::transform::ScaleControl;
+pub use crate::pipeline::flow::FlowStateHandle;
+
+#[cfg(feature = "image-jpeg")]
+pub use crate::elements::codec::JpegQualityControl;
 
 #[cfg(test)]
 mod tests {

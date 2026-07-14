@@ -388,6 +388,14 @@ impl Throttle {
     }
 }
 
+impl crate::control::Controllable for Throttle {
+    type Control = ThrottleControl;
+
+    fn control(&self) -> ThrottleControl {
+        ThrottleControl(Arc::clone(&self.min_interval_ns))
+    }
+}
+
 impl Element for Throttle {
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         let now = Instant::now();

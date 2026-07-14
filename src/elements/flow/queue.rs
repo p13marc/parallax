@@ -464,6 +464,16 @@ pub struct QueueStats {
     pub high_water_events: u64,
 }
 
+impl crate::control::Controllable for Queue {
+    /// A queue's runtime surface is its flow state: live sources poll it to
+    /// decide whether to keep producing under backpressure.
+    type Control = FlowStateHandle;
+
+    fn control(&self) -> FlowStateHandle {
+        Arc::clone(&self.inner.shared_flow_state)
+    }
+}
+
 impl Element for Queue {
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         // In element mode, queue acts as pass-through with internal buffering

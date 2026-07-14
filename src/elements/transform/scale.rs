@@ -244,7 +244,10 @@ impl VideoScale {
 
     /// Get a cloneable handle for retargeting this scaler at runtime.
     ///
-    /// Clone it *before* the pipeline starts — see [`ScaleControl`].
+    /// Clone it *before* the pipeline starts — see [`crate::control`].
+    ///
+    /// Kept as an inherent method as well as the [`Controllable`](crate::control::Controllable)
+    /// impl so callers need not import the trait.
     pub fn control(&self) -> ScaleControl {
         self.control.clone()
     }
@@ -468,6 +471,14 @@ impl VideoScale {
 // ============================================================================
 // Element Implementation
 // ============================================================================
+
+impl crate::control::Controllable for VideoScale {
+    type Control = ScaleControl;
+
+    fn control(&self) -> ScaleControl {
+        self.control.clone()
+    }
+}
 
 impl Element for VideoScale {
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
