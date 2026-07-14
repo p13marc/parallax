@@ -115,3 +115,56 @@ fn test_default_tracer_registry_empty() {
     let pipeline = Pipeline::new();
     assert!(pipeline.tracer_registry().is_empty());
 }
+
+/// #43: a transform must appear in the latency report.
+///
+/// `spawn_transform_task` took no tracers at all, so `LatencyTracer` could never
+/// produce a number for an *encoder* — the one element whose cost you most want
+/// to see. The pipeline was observable at its edges and opaque in the middle.
+#[tokio::test]
+async fn a_transform_appears_in_the_latency_report() {
+    use parallax::elements::PassThrough;
+
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_source("src", NullSource::new(50));
+    let filter = pipeline.add_filter("filter", PassThrough::new());
+    let sink = pipeline.add_sink("sink", NullSink::new());
+    pipeline.link(src, filter).unwrap();
+    pipeline.link(filter, sink).unwrap();
+
+    let registry = TracerRegistry::new();
+    registry.add(Box::new(LatencyTracer::new()));
+    pipeline.set_tracer_registry(registry.clone());
+
+    let executor = Executor::new();
+    executor.run(&mut pipeline).await.unwrap();
+
+    let (_, report) = &registry.reports()[0];
+    assert!(
+        report.contains("filter"),
+        "the transform must be measured, not just the source and sink. Report:\n{report}"
+    );
+}
+
+/// #43: framerate through a transform is measurable too.
+#[tokio::test]
+async fn a_transform_appears_in_the_framerate_report() {
+    use parallax::elements::PassThrough;
+
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_source("src", NullSource::new(50));
+    let filter = pipeline.add_filter("filter", PassThrough::new());
+    let sink = pipeline.add_sink("sink", NullSink::new());
+    pipeline.link(src, filter).unwrap();
+    pipeline.link(filter, sink).unwrap();
+
+    let registry = TracerRegistry::new();
+    registry.add(Box::new(FramerateTracer::new()));
+    pipeline.set_tracer_registry(registry.clone());
+
+    let executor = Executor::new();
+    executor.run(&mut pipeline).await.unwrap();
+
+    let (_, report) = &registry.reports()[0];
+    assert!(report.contains("filter"), "Report:\n{report}");
+}

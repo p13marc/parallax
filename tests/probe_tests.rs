@@ -155,3 +155,81 @@ async fn test_multiple_probes_same_pad() {
     assert_eq!(count_a.load(Ordering::Relaxed), 10);
     assert_eq!(count_b.load(Ordering::Relaxed), 10);
 }
+
+/// #43: probes fire on a transform's pads, not just a source's.
+///
+/// `spawn_transform_task` took no probe registry at all, so a probe could only
+/// ever be attached to a source's src-pad.
+#[tokio::test]
+async fn probes_fire_on_a_transform_pads() {
+    use parallax::elements::PassThrough;
+
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_source("src", NullSource::new(20));
+    let filter = pipeline.add_filter("filter", PassThrough::new());
+    let sink = pipeline.add_sink("sink", NullSink::new());
+    pipeline.link(src, filter).unwrap();
+    pipeline.link(filter, sink).unwrap();
+
+    let on_input = Arc::new(AtomicU64::new(0));
+    let on_output = Arc::new(AtomicU64::new(0));
+
+    let counter = on_input.clone();
+    let _ = pipeline.add_probe(PadRef::sink(filter), ProbeType::BUFFER, move |data| {
+        if matches!(data, ProbeData::Buffer(_)) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+        ProbeReturn::Ok
+    });
+
+    let counter = on_output.clone();
+    let _ = pipeline.add_probe(PadRef::src(filter), ProbeType::BUFFER, move |data| {
+        if matches!(data, ProbeData::Buffer(_)) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+        ProbeReturn::Ok
+    });
+
+    let executor = Executor::new();
+    executor.run(&mut pipeline).await.unwrap();
+
+    assert_eq!(on_input.load(Ordering::Relaxed), 20, "sink-pad probe");
+    assert_eq!(on_output.load(Ordering::Relaxed), 20, "src-pad probe");
+}
+
+/// A probe on a transform's sink pad can drop buffers before the element ever
+/// sees them.
+#[tokio::test]
+async fn a_probe_can_drop_buffers_at_a_transform() {
+    use parallax::elements::PassThrough;
+
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_source("src", NullSource::new(20));
+    let filter = pipeline.add_filter("filter", PassThrough::new());
+    let sink = pipeline.add_sink("sink", NullSink::new());
+    pipeline.link(src, filter).unwrap();
+    pipeline.link(filter, sink).unwrap();
+
+    let reached_sink = Arc::new(AtomicU64::new(0));
+    let counter = reached_sink.clone();
+    let _ = pipeline.add_probe(PadRef::sink(sink), ProbeType::BUFFER, move |data| {
+        if matches!(data, ProbeData::Buffer(_)) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+        ProbeReturn::Ok
+    });
+
+    // Drop everything at the filter's input.
+    let _ = pipeline.add_probe(PadRef::sink(filter), ProbeType::BUFFER, |_| {
+        ProbeReturn::Drop
+    });
+
+    let executor = Executor::new();
+    executor.run(&mut pipeline).await.unwrap();
+
+    assert_eq!(
+        reached_sink.load(Ordering::Relaxed),
+        0,
+        "a dropping probe on the transform's sink pad stops everything"
+    );
+}
