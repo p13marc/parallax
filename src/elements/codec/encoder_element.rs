@@ -69,8 +69,11 @@ pub struct EncoderElement<E: VideoEncoder> {
     frames_in: u64,
     /// Statistics: packets produced.
     packets_out: u64,
-    /// Pending runtime keyframe requests (shared with [`Self::keyframe_handle`]).
-    keyframe_requests: super::KeyframeHandle,
+    /// Runtime control: keyframe requests plus bitrate/GOP/QP changes
+    /// (shared with [`Self::control_handle`] and [`Self::keyframe_handle`]).
+    control: super::EncoderControl,
+    /// The control generation last applied to the encoder.
+    applied_generation: u64,
     /// Arena for output buffer allocation.
     arena: SharedArena,
 }
@@ -102,7 +105,8 @@ impl<E: VideoEncoder> EncoderElement<E> {
             format,
             frames_in: 0,
             packets_out: 0,
-            keyframe_requests: super::KeyframeHandle::new(),
+            control: super::EncoderControl::new(),
+            applied_generation: 0,
             arena,
         })
     }
@@ -118,7 +122,19 @@ impl<E: VideoEncoder> EncoderElement<E> {
     /// [`request()`](super::KeyframeHandle::request) makes the wrapper call
     /// [`VideoEncoder::force_keyframe`] before encoding its next frame.
     pub fn keyframe_handle(&self) -> super::KeyframeHandle {
-        self.keyframe_requests.clone()
+        self.control.keyframe_handle()
+    }
+
+    /// Get a cloneable handle for changing bitrate / keyframe interval / QP at
+    /// runtime.
+    ///
+    /// Clone this *before* the pipeline starts. Changes are applied through
+    /// [`VideoEncoder::set_bitrate`] and friends before the next frame is
+    /// encoded; an encoder that does not support a parameter reports it (the
+    /// wrapper logs a warning and keeps encoding rather than failing the
+    /// stream).
+    pub fn control_handle(&self) -> super::EncoderControl {
+        self.control.clone()
     }
 
     /// Get the number of frames received.
@@ -247,11 +263,43 @@ fn map_pixel_format(format: crate::format::PixelFormat) -> Result<super::common:
     })
 }
 
+impl<E: VideoEncoder + 'static> EncoderElement<E> {
+    /// Apply any parameter changes made through [`Self::control_handle`].
+    ///
+    /// A rejected parameter is logged, not propagated: an encoder that cannot
+    /// change its bitrate should keep encoding at the old one, not tear the
+    /// stream down.
+    fn apply_pending_control(&mut self) {
+        let Some(params) = self.control.poll(&mut self.applied_generation) else {
+            return;
+        };
+
+        if let Some(bps) = params.bitrate_bps
+            && let Err(e) = self.encoder.set_bitrate(bps)
+        {
+            tracing::warn!("encoder bitrate change to {bps} bps rejected: {e}");
+        }
+        if let Some(frames) = params.keyframe_interval
+            && let Err(e) = self.encoder.set_keyframe_interval(frames)
+        {
+            tracing::warn!("encoder keyframe interval change to {frames} rejected: {e}");
+        }
+        if let Some(qp) = params.qp
+            && let Err(e) = self.encoder.set_qp(qp)
+        {
+            tracing::warn!("encoder QP change to {qp} rejected: {e}");
+        }
+    }
+}
+
 impl<E: VideoEncoder + 'static> Transform for EncoderElement<E> {
     fn transform(&mut self, buffer: Buffer) -> Result<Output> {
+        // Runtime reconfiguration (bitrate / GOP / QP) from the control handle.
+        self.apply_pending_control();
+
         // Runtime keyframe requests: from the shared handle or stamped
         // in-band on the buffer's metadata.
-        if self.keyframe_requests.take()
+        if self.control.take_keyframe()
             || buffer
                 .metadata()
                 .get::<bool>(super::KEYFRAME_REQUEST)

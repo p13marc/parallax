@@ -116,7 +116,7 @@ pub use common::{PixelFormat, VideoFrame};
 
 // Runtime control handles (keyframe requests on running pipelines)
 mod control;
-pub use control::{KEYFRAME_REQUEST, KeyframeHandle};
+pub use control::{EncoderControl, EncoderParams, KEYFRAME_REQUEST, KeyframeHandle};
 
 // Video codec traits
 mod traits;
