@@ -89,8 +89,8 @@ one command away: `just rtsp-server` (= `scripts/rtsp_test_server.py`).
 | `BufferTrim` / `BufferSlice` / `BufferPad` | Trim to max / extract range / pad to min |
 | `BufferSplit` / `BufferJoin` / `BufferConcat` | Split/join at delimiters; concatenate |
 | `Gain` | RT-safe audio gain (PCM multiply) |
-| `VideoScale` | Resize YUV420 frames (`ScaleMode`) |
-| `VideoConvertElement` | Pixel-format conversion (see [formats.md](formats.md)); dimensions from `with_size`, per-buffer `width`/`height` metadata, or buffer-size auto-detection, in that order |
+| `VideoScale` | Resize YUV420 frames (`ScaleMode`); source size from buffer metadata, target retargetable at runtime via `ScaleControl` (see [Runtime control](#runtime-control-bandwidth-knobs)) |
+| `VideoConvertElement` | Pixel-format conversion (see [formats.md](formats.md)); format and dimensions from buffer metadata, then `with_input_format`/`with_size`, then buffer-size auto-detection — and re-negotiated when they change mid-stream |
 | `AudioConvertElement` | Sample-format conversion (S16 ↔ F32, …) |
 | `AudioResampleElement` | Sample-rate conversion |
 | `SequenceNumber` / `Timestamper` | Stamp sequence numbers / timestamps (`TimestampMode`) |
@@ -104,7 +104,7 @@ one command away: `just rtsp-server` (= `scripts/rtsp_test_server.py`).
 | `Delay` / `AsyncDelay` | Fixed delay per buffer |
 | `Timeout` | Emit fallback data when upstream stalls |
 | `Debounce` | Suppress rapid bursts |
-| `Throttle` | Drop buffers arriving faster than a rate |
+| `Throttle` | Drop buffers arriving faster than a rate; rate tunable at runtime via `ThrottleControl` (rate 0 drops everything) |
 | `RateLimiter` | Limit throughput (`RateLimitMode`) |
 
 ## Utility — `elements::util`
@@ -140,7 +140,7 @@ Codec traits: `VideoEncoder`/`VideoDecoder` and `AudioEncoder`/`AudioDecoder` (a
 
 | Codec | Types | Feature | Notes |
 |-------|-------|---------|-------|
-| H.264 | `H264Encoder`, `H264Decoder` (impl `Element` directly) | `h264` | OpenH264 (BSD-2); needs a C++ compiler |
+| H.264 | `H264Encoder`, `H264Decoder` (impl `Element` directly) | `h264` | OpenH264 (BSD-2); needs a C++ compiler. Live bitrate/GOP/QP via `EncoderControl`; resolution follows the buffer's metadata. Knobs: `rate_control`, `skip_frames`, `max_slice_len`, `profile`, `complexity`, `usage_type` |
 | H.264 hardware encode | `V4l2M2mH264Encoder` (impl `VideoEncoder`; wrap: `EncoderElement::new(enc, VideoFormat)`) | `v4l2-m2m` | V4L2 M2M stateful encoder (RPi, i.MX, Rockchip…); locate with `find_m2m_encoder(b"H264")`; building needs libclang + kernel headers; VAAPI backend planned |
 | AV1 encode | `Rav1eEncoder` (impl `VideoEncoder`; wrap: `EncoderElement::new(enc, VideoFormat)`) | `av1-encode` | rav1e, pure Rust; install nasm for SIMD |
 | AV1 decode | `Dav1dDecoder` (impl `Element`) | `av1-decode` | libdav1d system library |
@@ -150,6 +150,60 @@ Codec traits: `VideoEncoder`/`VideoDecoder` and `AudioEncoder`/`AudioDecoder` (a
 | JPEG | `JpegEncoder` / `JpegDecoder` | `image-jpeg` | zune-jpeg + jpeg-encoder, pure Rust |
 | PNG | `PngEncoder` / `PngDecoder` | `image-png` | png crate, pure Rust |
 | GPU H.264 decode | `HwDecoderElement` | `vulkan-video` | **experimental scaffold** — does not perform real hardware decode yet |
+
+## Runtime control (bandwidth knobs)
+
+`Executor::start()` **moves** each element into its executor task, so
+`pipeline.get_element_mut()` returns `None` for anything that is running. To change an
+element while it runs you must clone a **control handle from it before `start()`**. The handle
+is an `Arc<Atomic…>` — lock-free, allocation-free, safe to call from any thread or task, and
+free on the hot path when nothing has changed.
+
+| Handle | From | Changes |
+|--------|------|---------|
+| `EncoderControl` | `H264Encoder::control_handle()`, `EncoderElement::control_handle()` | `set_bitrate`, `set_keyframe_interval`, `set_qp`, `request_keyframe` |
+| `KeyframeHandle` | `…::keyframe_handle()` | `request()` — force the next frame to be an IDR |
+| `ScaleControl` | `VideoScale::control()` | `set_target(w, h)`, `set_max_height(h)` (aspect-preserving, never upscales), `passthrough()` |
+| `ThrottleControl` | `Throttle::control()` | `set_rate(fps)`, `set_min_interval(d)` |
+| `JpegQualityControl` | `JpegEncoder::quality_control()` | `set_quality(1..=100)` |
+| `ValveControl` | `Valve::control()` | `open()` / `close()` |
+| `FlowStateHandle` | `Queue::flow_state_handle()` | backpressure signalling to live sources |
+
+```rust,ignore
+let scaler  = VideoScale::new(1920, 1080, 1920, 1080);
+let encoder = H264Encoder::new(H264EncoderConfig::new(1920, 1080).bitrate(4_000_000))?;
+
+// Clone the handles BEFORE the pipeline starts.
+let scale   = scaler.control();
+let control = encoder.control_handle();
+
+pipeline.add_filter("scale", scaler);
+pipeline.add_filter("enc", encoder);
+let handle = executor.start(&mut pipeline)?;   // sync — elements move into their tasks here
+
+// ...later, on a viewer's request or a congested link:
+scale.set_max_height(360);      // quarter the pixels, aspect preserved
+control.set_bitrate(800_000);   // and a tenth of the bits
+```
+
+Both changes take effect on the next frame, with no teardown. Resolution travels **in-band**:
+`VideoScale` stamps the produced size into the buffer's metadata (`Metadata::set_video_dims`),
+and `H264Encoder` encodes at the size the buffer declares — OpenH264 re-initialises itself and
+emits a fresh IDR, so the switch is a clean decoder entry point. A bitrate/GOP/QP change
+rebuilds the OpenH264 encoder (it exposes no setter), which likewise starts with an IDR;
+rate-limit changes to roughly 1/s rather than one per slider pixel.
+
+Things worth knowing:
+
+- **Frame skipping.** With a bitrate target, OpenH264's rate control drops frames to hold it —
+  the encoder emits *nothing* for some inputs. `H264EncoderConfig::skip_frames(false)` says
+  "spend quality, not frames", which is what you want when something upstream (a `Throttle`)
+  already governs the framerate.
+- **Rate-control mode.** `RateControlMode::Quality` (the default) treats `bitrate_bps` as a
+  hint. Use `RateControlMode::Bitrate` when the link, not the picture, is the constraint.
+- **Hardware.** `V4l2M2mH264Encoder` accepts live `set_bitrate`/`set_keyframe_interval` (V4L2
+  permits control changes at any time), but some drivers accept the ioctl and then ignore it
+  mid-stream — GOP is the usual casualty. Best-effort; verify on your driver.
 
 ## Devices — `elements::device`
 
