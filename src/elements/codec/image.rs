@@ -188,15 +188,11 @@ mod jpeg_codec {
 
             // Propagate input metadata and describe the decoded frame so
             // downstream elements know its dimensions and pixel layout.
+            // `set_video_dims` rather than writing `format` directly: it also
+            // writes the legacy "width"/"height" keys, and readers are split
+            // across both conventions.
             let mut metadata = buffer.metadata().clone();
-            metadata.format = Some(crate::format::MediaFormat::VideoRaw(
-                crate::format::VideoFormat {
-                    width,
-                    height,
-                    pixel_format,
-                    framerate: crate::format::Framerate::default(),
-                },
-            ));
+            metadata.set_video_dims(width, height, pixel_format);
 
             Ok(Some(Buffer::new(
                 MemoryHandle::with_len(slot, pixels.len()),
@@ -457,7 +453,12 @@ mod png_codec {
 
             self.frame_count += 1;
 
-            let metadata = buffer.metadata().clone();
+            // Geometry travels in-band: describe what we decoded, or refuse to
+            // emit a buffer nobody downstream can interpret.
+            let pixel_format = png_pixel_format(info.color_type, info.bit_depth)?;
+            let mut metadata = buffer.metadata().clone();
+            metadata.set_video_dims(info.width, info.height, pixel_format);
+
             Ok(Some(Buffer::new(
                 MemoryHandle::with_len(slot, pixels.len()),
                 metadata,
@@ -466,6 +467,32 @@ mod png_codec {
 
         fn execution_hints(&self) -> ExecutionHints {
             ExecutionHints::cpu_intensive()
+        }
+    }
+
+    /// Name a decoded PNG's pixel layout in the caps vocabulary.
+    ///
+    /// PNG can express layouts parallax has no `PixelFormat` for — 16-bit
+    /// channels, grayscale+alpha, and palettes. Emitting such a buffer without
+    /// a format leaves every downstream element to guess at its bytes, which is
+    /// the class of bug the in-band-geometry invariant exists to kill. So we
+    /// refuse it instead. (Widening this via `png::Transformations` to expand
+    /// those into Rgb8/Gray8 would be a strict improvement — a good follow-up.)
+    fn png_pixel_format(
+        color_type: png::ColorType,
+        bit_depth: png::BitDepth,
+    ) -> Result<crate::format::PixelFormat> {
+        use crate::format::PixelFormat as Pf;
+        use png::{BitDepth, ColorType};
+
+        match (color_type, bit_depth) {
+            (ColorType::Grayscale, BitDepth::Eight) => Ok(Pf::Gray8),
+            (ColorType::Rgb, BitDepth::Eight) => Ok(Pf::Rgb24),
+            (ColorType::Rgba, BitDepth::Eight) => Ok(Pf::Rgba),
+            _ => Err(Error::InvalidSegment(format!(
+                "PNG is {color_type:?}/{bit_depth:?}, which has no raw-video pixel format \
+                 parallax can describe (supported: 8-bit Grayscale, Rgb, Rgba)"
+            ))),
         }
     }
 

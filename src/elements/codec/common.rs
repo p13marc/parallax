@@ -15,6 +15,19 @@ pub enum PixelFormat {
     Nv12,
 }
 
+impl From<PixelFormat> for crate::format::PixelFormat {
+    fn from(pf: PixelFormat) -> Self {
+        use crate::format::PixelFormat as Caps;
+        match pf {
+            PixelFormat::I420 => Caps::I420,
+            PixelFormat::I420p10 => Caps::I420_10Le,
+            PixelFormat::I422 => Caps::I422,
+            PixelFormat::I444 => Caps::I444,
+            PixelFormat::Nv12 => Caps::Nv12,
+        }
+    }
+}
+
 impl PixelFormat {
     /// Get bytes per pixel component.
     pub fn bytes_per_component(&self) -> usize {

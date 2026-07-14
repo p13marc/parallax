@@ -1005,10 +1005,12 @@ impl Source for ScreenCaptureSrc {
 
         let handle = crate::buffer::MemoryHandle::with_len(slot, frame_size);
         let mut metadata = Metadata::new().with_pts(frame.pts);
-        metadata.set("video/width", frame.width);
-        metadata.set("video/height", frame.height);
+        // Geometry travels in-band, via the one convention every element reads.
+        // This used to invent a third one ("video/width", "video/height" and a
+        // *stringified* "video/format"), which nothing downstream understood.
+        metadata.set_video_dims(frame.width, frame.height, frame.format);
+        // Stride is not expressible in `VideoFormat`, so it stays a custom key.
         metadata.set("video/stride", frame.stride);
-        metadata.set("video/format", format!("{:?}", frame.format));
 
         // Increment frames produced counter
         self.frames_produced += 1;

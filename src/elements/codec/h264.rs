@@ -929,8 +929,13 @@ impl Element for H264Decoder {
 
                 let handle = crate::buffer::MemoryHandle::with_len(slot, yuv_data.len());
                 let mut metadata = Metadata::from_sequence(self.frame_count - 1);
-                metadata.set("width", frame.width() as u64);
-                metadata.set("height", frame.height() as u64);
+                // Geometry travels in-band. `to_yuv420_planar` is in the name:
+                // whatever the bitstream was, what we emit is I420.
+                metadata.set_video_dims(
+                    frame.width() as u32,
+                    frame.height() as u32,
+                    crate::format::PixelFormat::I420,
+                );
                 Ok(Some(Buffer::new(handle, metadata)))
             }
             None => Ok(None),

@@ -54,6 +54,17 @@ pub enum PixelFormat {
     Bgra32,
 }
 
+impl From<PixelFormat> for crate::format::PixelFormat {
+    fn from(pf: PixelFormat) -> Self {
+        match pf {
+            PixelFormat::Rgb24 => crate::format::PixelFormat::Rgb24,
+            PixelFormat::Rgba32 => crate::format::PixelFormat::Rgba,
+            PixelFormat::Bgr24 => crate::format::PixelFormat::Bgr24,
+            PixelFormat::Bgra32 => crate::format::PixelFormat::Bgra,
+        }
+    }
+}
+
 impl PixelFormat {
     /// Get the number of bytes per pixel.
     pub fn bytes_per_pixel(&self) -> usize {
@@ -280,6 +291,18 @@ impl VideoTestSrc {
         ClockTime::from_nanos(
             (self.framerate_den as u64 * 1_000_000_000) / self.framerate_num as u64,
         )
+    }
+
+    /// Describe the frames this source produces, in-band on the buffer.
+    ///
+    /// A source *originates* geometry — downstream elements must never have to
+    /// infer it from the buffer size.
+    fn stamp_geometry(&self, metadata: &mut crate::metadata::Metadata) {
+        metadata.set_video_dims(self.width, self.height, self.pixel_format.into());
+        metadata.set_framerate(crate::format::Framerate::new(
+            self.framerate_num,
+            self.framerate_den,
+        ));
     }
 
     /// Reset the source.
@@ -603,6 +626,7 @@ impl Source for VideoTestSrc {
             ctx.set_pts(pts);
             ctx.metadata_mut().duration = self.frame_duration();
             ctx.set_keyframe();
+            self.stamp_geometry(ctx.metadata_mut());
 
             Ok(ProduceResult::Produced(write_size))
         } else {
@@ -622,11 +646,12 @@ impl Source for VideoTestSrc {
             self.fill_frame(slot.data_mut());
 
             let handle = MemoryHandle::with_len(slot, frame_size);
-            let metadata = Metadata::default()
+            let mut metadata = Metadata::default()
                 .with_sequence(self.sequence - 1)
                 .with_pts(pts)
                 .with_duration(self.frame_duration())
                 .keyframe();
+            self.stamp_geometry(&mut metadata);
 
             Ok(ProduceResult::OwnBuffer(Buffer::new(handle, metadata)))
         }
@@ -1134,6 +1159,14 @@ impl crate::element::AsyncSource for AsyncVideoTestSrc {
         ctx.set_pts(pts);
         ctx.metadata_mut().duration = self.frame_duration();
         ctx.set_keyframe(); // Video test patterns are always keyframes
+        // Geometry travels in-band: say what these bytes are.
+        ctx.metadata_mut()
+            .set_video_dims(self.width, self.height, self.pixel_format.into());
+        ctx.metadata_mut()
+            .set_framerate(crate::format::Framerate::new(
+                self.framerate_num,
+                self.framerate_den,
+            ));
 
         self.sequence += 1;
         self.frames_produced += 1;
@@ -1724,6 +1757,49 @@ mod tests {
             .with_resolution(100, 100)
             .with_pixel_format(PixelFormat::Rgb24);
         assert_eq!(src.preferred_buffer_size(), Some(100 * 100 * 3));
+    }
+
+    /// A source *originates* geometry. If it does not stamp it, every element
+    /// downstream is left inferring the pixel layout from the buffer size —
+    /// which is ambiguous (I420 and NV12 are both w*h*3/2) and is the bug class
+    /// the in-band-geometry invariant exists to kill.
+    #[test]
+    fn produced_buffers_describe_their_own_geometry() {
+        for format in [
+            PixelFormat::Rgb24,
+            PixelFormat::Rgba32,
+            PixelFormat::Bgr24,
+            PixelFormat::Bgra32,
+        ] {
+            let mut src = VideoTestSrc::new()
+                .with_resolution(64, 32)
+                .with_pixel_format(format)
+                .with_framerate(10, 1);
+            let buffer = produce_buffer(&mut src).expect("a frame");
+            let meta = buffer.metadata();
+
+            assert_eq!(meta.video_dims(), Some((64, 32)), "{format:?}");
+            assert_eq!(
+                meta.video_pixel_format(),
+                Some(format.into()),
+                "{format:?} must be named, not guessed"
+            );
+        }
+    }
+
+    /// A source that limits its rate must not let `set_video_dims`' 30fps
+    /// default stand in for the rate it is actually producing.
+    #[test]
+    fn produced_buffers_carry_the_real_framerate_not_the_default() {
+        let mut src = VideoTestSrc::new()
+            .with_resolution(64, 32)
+            .with_framerate(10, 1);
+        let buffer = produce_buffer(&mut src).expect("a frame");
+
+        let Some(crate::format::MediaFormat::VideoRaw(vf)) = buffer.metadata().format else {
+            panic!("expected a raw-video format");
+        };
+        assert_eq!(vf.framerate, crate::format::Framerate::new(10, 1));
     }
 
     #[test]

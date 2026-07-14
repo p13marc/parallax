@@ -514,6 +514,25 @@ impl V4l2Src {
         self.framerate
     }
 
+    /// Describe the frames this device is producing, in-band on the buffer.
+    ///
+    /// A source *originates* geometry — downstream elements must never have to
+    /// infer it from the buffer size. Compressed captures (MJPG) get nothing:
+    /// their bytes are not raw video, and claiming a `VideoRaw` format for them
+    /// would be a lie that a decoder then has to undo.
+    fn stamp_geometry(&self, metadata: &mut Metadata) {
+        let Some(pixel_format) =
+            crate::converters::PixelFormat::from_fourcc(&self.fourcc).map(Into::into)
+        else {
+            return;
+        };
+
+        metadata.set_video_dims(self.width, self.height, pixel_format);
+        if let Some((num, den)) = self.framerate {
+            metadata.set_framerate(crate::format::Framerate::new(num, den));
+        }
+    }
+
     /// Get the device path.
     pub fn path(&self) -> &PathBuf {
         &self.path
@@ -628,6 +647,7 @@ impl Source for V4l2Src {
             if self.frame_duration > ClockTime::ZERO {
                 metadata.duration = self.frame_duration;
             }
+            self.stamp_geometry(&mut metadata);
 
             return Ok(ProduceResult::OwnDmaBuf(DmaBufBuffer::new(
                 segment, metadata,
@@ -686,6 +706,7 @@ impl Source for V4l2Src {
             if self.frame_duration > ClockTime::ZERO {
                 metadata.duration = self.frame_duration;
             }
+            self.stamp_geometry(&mut metadata);
 
             return Ok(ProduceResult::OwnBuffer(Buffer::new(handle, metadata)));
         }
@@ -693,6 +714,7 @@ impl Source for V4l2Src {
         ctx.output()[..len].copy_from_slice(&frame_data);
         ctx.set_pts(pts);
         ctx.set_sequence(sequence as u64);
+        self.stamp_geometry(ctx.metadata_mut());
 
         Ok(ProduceResult::Produced(len))
     }

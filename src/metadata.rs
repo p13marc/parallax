@@ -640,6 +640,21 @@ impl Metadata {
         self.set("height", height as u64);
     }
 
+    /// Declare the framerate of the raw video this buffer belongs to.
+    ///
+    /// [`set_video_dims`](Self::set_video_dims) has to put *something* in the
+    /// framerate slot, and it defaults to 30 fps. A source that knows its real
+    /// rate should say so rather than let that default stand — call this after
+    /// `set_video_dims`. Elements that genuinely cannot know the rate (a decoder
+    /// looking at one frame) leave the default alone.
+    ///
+    /// No-op on a buffer that carries no raw-video format.
+    pub fn set_framerate(&mut self, framerate: crate::format::Framerate) {
+        if let Some(MediaFormat::VideoRaw(vf)) = &mut self.format {
+            vf.framerate = framerate;
+        }
+    }
+
     /// Raw video dimensions, if this buffer carries them.
     ///
     /// Prefers [`format`](Self::format) and falls back to the legacy
