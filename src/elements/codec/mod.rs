@@ -152,7 +152,10 @@ pub use audio_encoder_element::AudioEncoderElement;
 #[cfg(feature = "h264")]
 mod h264;
 #[cfg(feature = "h264")]
-pub use h264::{DecodedFrame, H264Decoder, H264Encoder, H264EncoderConfig, SpsPpsStrategy};
+pub use h264::{
+    Complexity, DecodedFrame, H264Decoder, H264Encoder, H264EncoderConfig, Profile,
+    RateControlMode, SpsPpsStrategy, UsageType,
+};
 
 // V4L2 M2M stateful hardware encoder
 #[cfg(feature = "v4l2-m2m")]
