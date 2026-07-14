@@ -8,6 +8,7 @@ use crate::element::Element;
 use crate::error::{Error, Result};
 use crate::format::Caps;
 use crate::memory::SharedArena;
+use crate::metadata::Metadata;
 
 /// Video format conversion element.
 ///
@@ -37,8 +38,12 @@ pub struct VideoConvertElement {
     width: u32,
     /// Frame height (0 = auto-detect)
     height: u32,
-    /// Cached converter (created on first frame)
+    /// Cached converter (rebuilt whenever [`Self::converter_key`] changes)
     converter: Option<VideoConvert>,
+    /// The (input format, output format, width, height) the cached converter
+    /// was built for. A converter is only valid for one of these — caching it
+    /// unconditionally is what made mid-stream format changes impossible.
+    converter_key: Option<(PixelFormat, PixelFormat, u32, u32)>,
     /// Output buffer for conversion
     output_buffer: Vec<u8>,
     /// Element name
@@ -58,6 +63,7 @@ impl VideoConvertElement {
             width: 0,
             height: 0,
             converter: None,
+            converter_key: None,
             output_buffer: Vec::new(),
             name: "videoconvert".to_string(),
             arena: None,
@@ -122,57 +128,83 @@ impl VideoConvertElement {
         None
     }
 
-    /// Initialize the converter if needed.
-    fn ensure_converter(&mut self, input_size: usize) -> Result<()> {
-        if self.converter.is_some() {
+    /// Resolve the input format and dimensions for a buffer.
+    ///
+    /// Buffer metadata wins (a decoder or scaler upstream knows what it just
+    /// produced), then the constructor-configured values, then size-based
+    /// auto-detection.
+    fn resolve_input(
+        &self,
+        metadata: &Metadata,
+        input_size: usize,
+    ) -> Result<(PixelFormat, u32, u32)> {
+        let format = metadata
+            .video_pixel_format()
+            .and_then(from_format_pixel_format)
+            .or(self.input_format);
+        let dims = metadata
+            .video_dims()
+            .or((self.width > 0 && self.height > 0).then_some((self.width, self.height)));
+
+        match (format, dims) {
+            (Some(format), Some((width, height))) => Ok((format, width, height)),
+            // Format known, dimensions not: only a buffer-size match can
+            // recover them, and only for the sizes detect_format knows.
+            (Some(format), None) => self
+                .detect_format(input_size)
+                .filter(|(detected, _, _)| *detected == format)
+                .map(|(_, w, h)| (format, w, h))
+                .ok_or_else(|| {
+                    Error::Element(format!(
+                        "Cannot determine dimensions for format {format:?} with buffer size {input_size}"
+                    ))
+                }),
+            (None, _) => self.detect_format(input_size).ok_or_else(|| {
+                Error::Element(format!(
+                    "Cannot auto-detect video format for buffer size {input_size}"
+                ))
+            }),
+        }
+    }
+
+    /// Build the converter for this input, reusing the cached one when the
+    /// format and dimensions are unchanged (the common case, once per frame).
+    fn ensure_converter(
+        &mut self,
+        input_format: PixelFormat,
+        width: u32,
+        height: u32,
+    ) -> Result<()> {
+        let key = (input_format, self.output_format, width, height);
+        if self.converter_key == Some(key) {
             return Ok(());
         }
 
-        // Determine input format and dimensions
-        let (input_format, width, height) = if let Some(fmt) = self.input_format {
-            if self.width > 0 && self.height > 0 {
-                (fmt, self.width, self.height)
-            } else {
-                // Try to derive dimensions from buffer size
-                let expected = fmt.buffer_size(self.width.max(640), self.height.max(480));
-                if input_size == expected {
-                    (fmt, self.width.max(640), self.height.max(480))
-                } else {
-                    return Err(Error::Element(format!(
-                        "Cannot determine dimensions for format {:?} with buffer size {}",
-                        fmt, input_size
-                    )));
-                }
-            }
-        } else {
-            // Auto-detect
-            self.detect_format(input_size).ok_or_else(|| {
-                Error::Element(format!(
-                    "Cannot auto-detect video format for buffer size {}",
-                    input_size
-                ))
-            })?
-        };
-
-        // Create converter
         let converter = VideoConvert::new(input_format, self.output_format, width, height)?;
 
-        // Allocate output buffer
         let output_size = self.output_format.buffer_size(width, height);
         self.output_buffer.resize(output_size, 0);
+
+        tracing::info!(
+            "VideoConvert: {:?} {}x{} -> {:?} {}x{}{}",
+            input_format,
+            width,
+            height,
+            self.output_format,
+            width,
+            height,
+            if self.converter_key.is_some() {
+                " (renegotiated)"
+            } else {
+                ""
+            }
+        );
 
         self.width = width;
         self.height = height;
         self.input_format = Some(input_format);
         self.converter = Some(converter);
-
-        tracing::info!(
-            "VideoConvert: {:?} {}x{} -> {:?}",
-            input_format,
-            width,
-            height,
-            self.output_format
-        );
+        self.converter_key = Some(key);
 
         Ok(())
     }
@@ -186,19 +218,6 @@ impl Default for VideoConvertElement {
 
 impl Element for VideoConvertElement {
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
-        // If dimensions weren't configured, adopt them from per-buffer metadata
-        // (decoders set "width"/"height") before the converter is created.
-        if self.converter.is_none()
-            && (self.width == 0 || self.height == 0)
-            && let (Some(&w), Some(&h)) = (
-                buffer.metadata().get::<u64>("width"),
-                buffer.metadata().get::<u64>("height"),
-            )
-        {
-            self.width = w as u32;
-            self.height = h as u32;
-        }
-
         let input_data = buffer.as_bytes();
 
         tracing::debug!(
@@ -206,8 +225,12 @@ impl Element for VideoConvertElement {
             input_data.len()
         );
 
-        // Initialize converter on first frame
-        self.ensure_converter(input_data.len())?;
+        // Resolve per buffer, not once: an upstream scaler or a renegotiating
+        // camera can change the format mid-stream, and the converter must
+        // follow it rather than keep converting at the first frame's geometry.
+        let (input_format, width, height) =
+            self.resolve_input(buffer.metadata(), input_data.len())?;
+        self.ensure_converter(input_format, width, height)?;
 
         let converter = self.converter.as_ref().unwrap();
 
@@ -231,8 +254,16 @@ impl Element for VideoConvertElement {
         // Copy converted data
         slot.data_mut()[..output_size].copy_from_slice(&self.output_buffer);
 
-        let handle = MemoryHandle::new(slot);
-        let output = Buffer::new(handle, buffer.metadata().clone());
+        // Size the handle by the converted data, not by the arena slot: the
+        // slot is reused across geometry changes and is only ever >= the frame.
+        let handle = MemoryHandle::with_len(slot, output_size);
+        let mut metadata = buffer.metadata().clone();
+        // Describe what we actually produced. Conversion preserves geometry, so
+        // only the pixel format changes — but the input's dimension metadata
+        // must be carried forward in both representations, or a downstream
+        // encoder and AutoVideoSink can disagree about the frame size.
+        metadata.set_video_dims(width, height, convert_pixel_format(self.output_format));
+        let output = Buffer::new(handle, metadata);
 
         Ok(Some(output))
     }
@@ -301,6 +332,27 @@ impl Element for VideoConvertElement {
     }
 }
 
+/// Convert from format::PixelFormat to converters::PixelFormat.
+///
+/// The inverse of [`convert_pixel_format`]. `None` for the caps-only formats
+/// this crate can describe but not convert (10-bit, I422, I444, …) — see the
+/// two-`PixelFormat`-enums gotcha (#7).
+fn from_format_pixel_format(pf: crate::format::PixelFormat) -> Option<PixelFormat> {
+    use crate::format::PixelFormat as Caps;
+    Some(match pf {
+        Caps::Yuyv => PixelFormat::Yuyv,
+        Caps::Uyvy => PixelFormat::Uyvy,
+        Caps::Nv12 => PixelFormat::Nv12,
+        Caps::I420 => PixelFormat::I420,
+        Caps::Rgb24 => PixelFormat::Rgb24,
+        Caps::Bgr24 => PixelFormat::Bgr24,
+        Caps::Rgba => PixelFormat::Rgba,
+        Caps::Bgra => PixelFormat::Bgra,
+        Caps::Gray8 => PixelFormat::Gray8,
+        _ => return None,
+    })
+}
+
 /// Convert from converters::PixelFormat to format::PixelFormat
 fn convert_pixel_format(pf: PixelFormat) -> crate::format::PixelFormat {
     match pf {
@@ -334,5 +386,118 @@ mod tests {
         let size = PixelFormat::Yuyv.buffer_size(1280, 720);
         let detected = element.detect_format(size);
         assert_eq!(detected, Some((PixelFormat::Yuyv, 1280, 720)));
+    }
+
+    /// A raw frame of `format` at `w`x`h`, carrying its geometry in metadata.
+    fn frame(format: crate::format::PixelFormat, w: u32, h: u32) -> Buffer {
+        let size = from_format_pixel_format(format).unwrap().buffer_size(w, h);
+        let arena = SharedArena::new(size, 4).unwrap();
+        let mut slot = arena.acquire().unwrap();
+        slot.data_mut()[..size].fill(0x40);
+
+        let mut metadata = Metadata::new();
+        metadata.set_video_dims(w, h, format);
+        Buffer::new(MemoryHandle::with_len(slot, size), metadata)
+    }
+
+    fn rgb_to_i420() -> VideoConvertElement {
+        VideoConvertElement::new().with_output_format(PixelFormat::I420)
+    }
+
+    /// The regression: the converter used to be cached on the first frame and
+    /// never rebuilt, so a resolution change mid-stream was either mis-converted
+    /// or rejected on a length check.
+    #[test]
+    fn resolution_change_mid_stream_rebuilds_the_converter() {
+        let mut element = rgb_to_i420();
+        use crate::format::PixelFormat as Caps;
+
+        let big = element
+            .process(frame(Caps::Rgb24, 640, 480))
+            .unwrap()
+            .expect("640x480 converts");
+        assert_eq!(
+            big.as_bytes().len(),
+            PixelFormat::I420.buffer_size(640, 480)
+        );
+
+        let small = element
+            .process(frame(Caps::Rgb24, 320, 240))
+            .unwrap()
+            .expect("320x240 must convert too, not reuse the 640x480 converter");
+        assert_eq!(
+            small.as_bytes().len(),
+            PixelFormat::I420.buffer_size(320, 240)
+        );
+        assert_eq!(small.metadata().video_dims(), Some((320, 240)));
+    }
+
+    #[test]
+    fn pixel_format_change_mid_stream_rebuilds_the_converter() {
+        let mut element = rgb_to_i420();
+        use crate::format::PixelFormat as Caps;
+
+        element.process(frame(Caps::Rgb24, 640, 480)).unwrap();
+        let out = element
+            .process(frame(Caps::Rgba, 640, 480))
+            .unwrap()
+            .expect("a format change must rebuild the converter");
+        assert_eq!(
+            out.as_bytes().len(),
+            PixelFormat::I420.buffer_size(640, 480)
+        );
+        assert_eq!(
+            element.converter_key,
+            Some((PixelFormat::Rgba, PixelFormat::I420, 640, 480))
+        );
+    }
+
+    #[test]
+    fn unchanged_geometry_reuses_the_cached_converter() {
+        // The hot path: same format and size every frame must not rebuild.
+        let mut element = rgb_to_i420();
+        use crate::format::PixelFormat as Caps;
+
+        element.process(frame(Caps::Rgb24, 640, 480)).unwrap();
+        let key = element.converter_key;
+        element.process(frame(Caps::Rgb24, 640, 480)).unwrap();
+
+        assert_eq!(element.converter_key, key, "converter must be reused");
+        assert_eq!(key, Some((PixelFormat::Rgb24, PixelFormat::I420, 640, 480)));
+    }
+
+    #[test]
+    fn output_describes_what_was_produced() {
+        let mut element = rgb_to_i420();
+        let out = element
+            .process(frame(crate::format::PixelFormat::Rgb24, 640, 480))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            out.metadata().video_pixel_format(),
+            Some(crate::format::PixelFormat::I420),
+            "output metadata must carry the OUTPUT format, not the input's"
+        );
+        assert_eq!(out.metadata().video_dims(), Some((640, 480)));
+        assert_eq!(out.metadata().get::<u64>("width"), Some(&640));
+    }
+
+    #[test]
+    fn buffers_without_metadata_still_auto_detect() {
+        // Sources that stamp no format at all keep working (unchanged behaviour).
+        // Auto-detection guesses YUYV for this size, which only converts to RGB.
+        let mut element = VideoConvertElement::new().with_output_format(PixelFormat::Rgb24);
+        let size = PixelFormat::Yuyv.buffer_size(640, 480);
+        let arena = SharedArena::new(size, 4).unwrap();
+        let mut slot = arena.acquire().unwrap();
+        slot.data_mut()[..size].fill(0x40);
+        let buffer = Buffer::new(MemoryHandle::with_len(slot, size), Metadata::new());
+
+        let out = element.process(buffer).unwrap().expect("auto-detected");
+        assert_eq!(
+            out.as_bytes().len(),
+            PixelFormat::Rgb24.buffer_size(640, 480)
+        );
     }
 }
