@@ -379,6 +379,26 @@ impl std::fmt::Debug for Node {
     }
 }
 
+/// What a link does when its downstream channel is full.
+///
+/// This is a property of the **link**, not the pad: fan-out means several links
+/// leave the same src-pad, and the whole point is that they can behave
+/// differently. A 2 fps preview branch may drop; the branch feeding the recorder
+/// may not.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LinkPolicy {
+    /// Wait for room. Back-pressures upstream — and, on a fan-out, every
+    /// sibling branch with it. The default, and correct when no data may be lost.
+    #[default]
+    Block,
+    /// Drop the buffer and carry on. Degrades **this** branch only, which is
+    /// what keeps a slow consumer from stalling the source and its siblings.
+    ///
+    /// EOS is never dropped, whatever the policy: a sink that misses it would
+    /// wait forever.
+    Drop,
+}
+
 /// A link between two nodes in the pipeline.
 #[derive(Debug, Clone)]
 pub struct Link {
@@ -386,6 +406,11 @@ pub struct Link {
     pub src_pad: String,
     /// Name of the sink pad.
     pub sink_pad: String,
+    /// What happens when the downstream channel is full (see [`LinkPolicy`]).
+    pub policy: LinkPolicy,
+    /// Channel capacity for this link; `None` uses
+    /// [`ExecutorConfig::channel_capacity`](crate::pipeline::ExecutorConfig).
+    pub capacity: Option<usize>,
 }
 
 impl Default for Link {
@@ -393,6 +418,8 @@ impl Default for Link {
         Self {
             src_pad: "src".to_string(),
             sink_pad: "sink".to_string(),
+            policy: LinkPolicy::default(),
+            capacity: None,
         }
     }
 }
@@ -408,7 +435,20 @@ impl Link {
         Self {
             src_pad: src_pad.into(),
             sink_pad: sink_pad.into(),
+            ..Self::default()
         }
+    }
+
+    /// Set what happens when the downstream channel is full.
+    pub fn with_policy(mut self, policy: LinkPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Set this link's channel capacity, overriding the executor default.
+    pub fn with_capacity(mut self, capacity: usize) -> Self {
+        self.capacity = Some(capacity);
+        self
     }
 }
 
@@ -1364,6 +1404,32 @@ impl Pipeline {
         self.link_pads(src, "src", sink, "sink")
     }
 
+    /// Link two nodes, dropping buffers on this branch when it falls behind.
+    ///
+    /// The fan-out knob. Several links may leave one src-pad — that is how
+    /// parallax does 1-to-N, since buffers are refcounted clones — but a
+    /// [`Block`](LinkPolicy::Block) branch that fills its channel back-pressures
+    /// the source and therefore **every sibling branch**. So a cheap 2 fps
+    /// preview stalls a full-rate H.264 branch, which is the opposite of what
+    /// anyone predicts.
+    ///
+    /// Make the branch that is allowed to fall behind lossy:
+    ///
+    /// ```rust,ignore
+    /// pipeline.link(camera, encoder)?;         // must not lose frames
+    /// pipeline.link_lossy(camera, preview)?;   // may; it degrades alone
+    /// ```
+    ///
+    /// EOS is still delivered blocking, whatever the policy.
+    pub fn link_lossy(&mut self, src: NodeId, sink: NodeId) -> Result<()> {
+        self.link_with(src, sink, LinkPolicy::Drop)
+    }
+
+    /// Link two nodes with an explicit [`LinkPolicy`], using default pad names.
+    pub fn link_with(&mut self, src: NodeId, sink: NodeId, policy: LinkPolicy) -> Result<()> {
+        self.link_pads_full(src, "src", sink, "sink", policy, None)
+    }
+
     /// Link two nodes with specific pad names.
     pub fn link_pads(
         &mut self,
@@ -1371,6 +1437,36 @@ impl Pipeline {
         src_pad: &str,
         sink: NodeId,
         sink_pad: &str,
+    ) -> Result<()> {
+        self.link_pads_full(src, src_pad, sink, sink_pad, LinkPolicy::default(), None)
+    }
+
+    /// Link two nodes with specific pad names and an explicit [`LinkPolicy`].
+    pub fn link_pads_with(
+        &mut self,
+        src: NodeId,
+        src_pad: &str,
+        sink: NodeId,
+        sink_pad: &str,
+        policy: LinkPolicy,
+    ) -> Result<()> {
+        self.link_pads_full(src, src_pad, sink, sink_pad, policy, None)
+    }
+
+    /// Link two nodes, specifying every property of the link.
+    ///
+    /// `capacity` overrides
+    /// [`ExecutorConfig::channel_capacity`](crate::pipeline::ExecutorConfig) for
+    /// this link alone — a deep queue on a bursty branch, a shallow one where
+    /// latency matters more than smoothness.
+    pub fn link_pads_full(
+        &mut self,
+        src: NodeId,
+        src_pad: &str,
+        sink: NodeId,
+        sink_pad: &str,
+        policy: LinkPolicy,
+        capacity: Option<usize>,
     ) -> Result<()> {
         // Validate source node and pad
         let src_node = self
@@ -1399,7 +1495,8 @@ impl Pipeline {
         }
 
         // Create the link
-        let link = Link::with_pads(src_pad, sink_pad);
+        let mut link = Link::with_pads(src_pad, sink_pad).with_policy(policy);
+        link.capacity = capacity;
 
         // Add edge (daggy ensures no cycles)
         self.graph

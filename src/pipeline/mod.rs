@@ -70,7 +70,8 @@ pub use driver::{
 pub use events::{EventReceiver, EventSender, EventStream, PipelineEvent};
 pub use factory::ElementFactory;
 pub use graph::{
-    ConverterPolicy, DotOptions, Link, LinkId, LinkInfo, Node, NodeId, Pipeline, PipelineState,
+    ConverterPolicy, DotOptions, Link, LinkId, LinkInfo, LinkPolicy, Node, NodeId, Pipeline,
+    PipelineState,
 };
 pub use parser::{ParsedElement, ParsedPipeline, PropertyValue, parse_pipeline};
 pub use probe::{PadDirection, PadRef, ProbeData, ProbeId, ProbeRegistry, ProbeReturn, ProbeType};
@@ -86,9 +87,11 @@ pub use tracer::{
 };
 pub use typefind::{MediaType, TypeFindProbability, TypeFindRegistry, TypeFindResult};
 // Unified executor (primary API)
-pub use unified_executor::{
-    Executor, ExecutorConfig as UnifiedExecutorConfig, PipelineHandle as UnifiedPipelineHandle,
-};
+/// Deprecated alias for [`ExecutorConfig`]; there is only one executor now.
+pub use unified_executor::ExecutorConfig as UnifiedExecutorConfig;
+/// Deprecated alias for [`PipelineHandle`]; there is only one executor now.
+pub use unified_executor::PipelineHandle as UnifiedPipelineHandle;
+pub use unified_executor::{Executor, ExecutorConfig, PipelineHandle};
 
 // Builder API
 pub use builder::{
