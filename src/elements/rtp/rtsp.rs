@@ -739,7 +739,7 @@ impl RtspSession {
     ///
     /// The manual pump: use this when you want to own the loop. For a session
     /// that drives itself inside a pipeline, add it as a source — it implements
-    /// [`AsyncSource`].
+    /// [`AsyncSource`](crate::element::AsyncSource).
     ///
     /// (This was called `produce()`, which shadowed the `AsyncSource` method of
     /// the same name and so kept the session from ever *being* a source.)

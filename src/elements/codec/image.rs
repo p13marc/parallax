@@ -263,7 +263,7 @@ mod jpeg_codec {
     /// YUV output (I420/NV12/YUYV) must be converted upstream first (see
     /// `VideoConvert`).
     ///
-    /// Takes **no dimensions**: geometry travels in-band, in [`Metadata`], and
+    /// Takes **no dimensions**: geometry travels in-band, in [`Metadata`](crate::metadata::Metadata), and
     /// the encoder reads it from each buffer. A colour-type *hint* is available
     /// via [`with_color_type`](Self::with_color_type) for buffers that carry no
     /// pixel format, but a buffer that declares one wins.
@@ -304,7 +304,7 @@ mod jpeg_codec {
     impl JpegEncoder {
         /// Create a new JPEG encoder.
         ///
-        /// Geometry and pixel layout come from each buffer's [`Metadata`].
+        /// Geometry and pixel layout come from each buffer's [`Metadata`](crate::metadata::Metadata).
         pub fn new() -> Self {
             Self {
                 color_type: None,
@@ -571,7 +571,7 @@ mod png_codec {
     ///
     /// Encodes raw pixel data to PNG format.
     ///
-    /// Takes **no dimensions**: geometry travels in-band, in [`Metadata`], and
+    /// Takes **no dimensions**: geometry travels in-band, in [`Metadata`](crate::metadata::Metadata), and
     /// the encoder reads it from each buffer. A colour-type *hint* is available
     /// via [`with_color_type`](Self::with_color_type) for buffers that carry no
     /// pixel format.
@@ -585,7 +585,7 @@ mod png_codec {
     impl PngEncoder {
         /// Create a new PNG encoder.
         ///
-        /// Geometry and pixel layout come from each buffer's [`Metadata`].
+        /// Geometry and pixel layout come from each buffer's [`Metadata`](crate::metadata::Metadata).
         pub fn new() -> Self {
             Self {
                 color_type: None,
