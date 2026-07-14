@@ -33,10 +33,10 @@ value      := "double-quoted" | 'single-quoted' | integer | float
 **Limitations** (by design, for now):
 
 - No caps filters (`video/x-raw,width=...` is not valid syntax).
-- No branching — `tee name=t ! ... t. ! ...` style pad references don't exist. The grammar produces one linear chain; use the programmatic API or `PipelineBuilder` for fan-out/fan-in.
+- No branching — `tee name=t ! ... t. ! ...` style pad references don't exist. The grammar produces one **strictly linear chain**; [fan-out](#fan-out) requires the programmatic API or `PipelineBuilder`.
 - No bins/parentheses.
 
-**Built-in factory names**: `nullsource`, `nullsink`, `passthrough`, `tee`, `filesrc` (`location`, `chunk-size`), `filesink` (`location`), `videotestsrc` (`pattern`, `width`, `height`, `num-buffers`, `framerate`; output is RGBA), `videoconvert`, plus `autovideosink` (feature `display`) and `v4l2src` (feature `v4l2`). Plugin-provided elements become parseable via `Pipeline::parse_with_factory(desc, &factory)` with an `ElementFactory` that has a `PluginRegistry` attached.
+**Built-in factory names**: `nullsource`, `nullsink`, `passthrough`, `inspect` (`tee` is a deprecated alias — it never fanned out), `filesrc` (`location`, `chunk-size`), `filesink` (`location`), `videotestsrc` (`pattern`, `width`, `height`, `num-buffers`, `framerate`; output is RGBA), `videoconvert`, plus `autovideosink` (feature `display`) and `v4l2src` (feature `v4l2`). Plugin-provided elements become parseable via `Pipeline::parse_with_factory(desc, &factory)` with an `ElementFactory` that has a `PluginRegistry` attached.
 
 ### Programmatically
 
@@ -52,9 +52,53 @@ p.link(src, xfm)?;                        // = link_pads(src, "src", xfm, "sink"
 p.link_pads(xfm, "src", flt, "sink")?;    // explicit pads for multi-pad elements
 ```
 
-Variants: `add_source_with_arena(name, src, arena)` and `add_source_with_pool(name, src, pool)` attach buffer backing; `add_element_auto` auto-names.
+Variants: `add_source_with_arena(name, src, arena)` and `add_source_with_pool(name, src, pool)` attach buffer backing; `add_element_auto` auto-names. `add_async_source` takes an `AsyncSource` (e.g. a connected `RtspSession`).
 
 Cycles are rejected (`daggy` enforces a DAG). Introspection: `sources()`, `sinks()`, `children(id)`, `parents(id)`, `nodes()`, `links()`, `validate()`, `describe()`, `to_dot()`, `to_json()`.
+
+### Fan-out
+
+**Fan-out needs no element.** Src-pads are genuinely 1:N — link the same node twice and the
+executor hands each branch a clone of the buffer, which is a refcount bump on shared memory,
+not a copy. (There is no `Tee`: the element of that name was a 1-in/1-out counter and is now
+honestly called `Inspect`.)
+
+```rust,ignore
+let src  = p.add_source("camera", V4l2Src::new("/dev/video0")?);
+let rec  = p.add_sink("recorder", recorder);
+let live = p.add_sink("preview", preview);
+
+p.link(src, rec)?;          // both links leave the same "src" pad
+p.link_lossy(src, live)?;   // and this one may drop when it falls behind
+```
+
+The parse grammar is a strictly linear chain and cannot express this.
+
+#### Link policy
+
+Each **link** — not each pad, since fan-out means several links leave one pad — carries a
+`LinkPolicy` and an optional channel capacity:
+
+| Policy | Behaviour |
+|--------|-----------|
+| `Block` (default) | Wait for room. Back-pressures upstream — and, on a fan-out, **every sibling branch with it**. |
+| `Drop` | Drop the buffer and carry on. Degrades *this* branch alone. |
+
+This matters more than it sounds. With every branch blocking, a persistently slow branch fills
+its channel and stalls the source and all its siblings — so a cheap 2 fps preview drags down a
+full-rate H.264 branch, which is the opposite of what anyone predicts. Make the branch that is
+allowed to fall behind lossy.
+
+```rust,ignore
+p.link_lossy(src, preview)?;                                   // Drop, default pads
+p.link_with(src, preview, LinkPolicy::Drop)?;                  // same thing, explicit
+p.link_pads_with(src, "src", preview, "sink", LinkPolicy::Drop)?;
+p.link_pads_full(src, "src", rec, "sink", LinkPolicy::Block, Some(64))?;  // deeper queue
+```
+
+**EOS is never dropped**, whatever the policy — a sink that missed it would wait forever. Only
+buffers are. Dropped buffers are reported to `TracerRegistry::notify_drop`, so `DropTracer`
+counts them.
 
 ### Element retrieval
 
@@ -221,7 +265,9 @@ let probe_id = pipeline.add_probe(PadRef::src(src_node), ProbeType::BUFFER, move
 pipeline.remove_probe(probe_id);
 ```
 
-`ProbeType` is a bitflag set: `BUFFER`, `EVENT_DOWN`, `EVENT_UP`, `EVENT_FLUSH`, `BLOCK`, `IDLE`. The executor invokes buffer probes before forwarding downstream. See `examples/53_pad_probes.rs`.
+`ProbeType` is a bitflag set: `BUFFER`, `EVENT_DOWN`, `EVENT_UP`, `EVENT_FLUSH`, `BLOCK`, `IDLE`. The executor invokes buffer probes before forwarding downstream.
+
+Probes fire on **every** element's pads — a transform's `PadRef::sink(node)` (before the element sees the buffer) and `PadRef::src(node)` (after it produces one), as well as sources and sinks. See `examples/53_pad_probes.rs`.
 
 ## Tracers & debugging
 
@@ -238,7 +284,7 @@ for (name, report) in registry.reports() {
 }
 ```
 
-Built-in tracers: `LatencyTracer` (per-element min/avg/max processing time), `FramerateTracer` (buffers/sec), `DropTracer`. Environment activation:
+Built-in tracers: `LatencyTracer` (per-element min/avg/max processing time), `FramerateTracer` (buffers/sec), `DropTracer` (buffers dropped on `LinkPolicy::Drop` links). They cover **every** element, transforms included — so an encoder's cost shows up in the latency report, which is usually the number you actually wanted. Environment activation:
 
 ```bash
 PARALLAX_TRACERS="latency;framerate;drops" ./my_pipeline   # tracers

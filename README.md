@@ -49,7 +49,7 @@ async fn main() -> parallax::Result<()> {
 
 The string grammar is a **linear chain**: `element prop=value ... ! element ...`. Values may be quoted strings, integers, floats, or booleans; `name=foo` gives the node a custom name for later retrieval. Branching (tee), caps filters, and bins are *not* expressible in the string syntax — use the programmatic API for those.
 
-Built-in factory names usable in `parse`: `filesrc`, `filesink`, `videotestsrc`, `videoconvert`, `passthrough`, `tee`, `nullsource`, `nullsink`, plus `autovideosink` (feature `display`) and `v4l2src` (feature `v4l2`). More can be registered through a `PluginRegistry` (`Pipeline::parse_with_factory`).
+Built-in factory names usable in `parse`: `filesrc`, `filesink`, `videotestsrc`, `videoconvert`, `passthrough`, `inspect` (`tee` is a deprecated alias), `nullsource`, `nullsink`, plus `autovideosink` (feature `display`) and `v4l2src` (feature `v4l2`). More can be registered through a `PluginRegistry` (`Pipeline::parse_with_factory`).
 
 ### Build programmatically
 
@@ -95,7 +95,7 @@ async fn main() -> Result<()> {
 }
 ```
 
-Fan-out/fan-in, N-to-1 muxing, and multi-pad linking are done with `link_pads`, the `Tee`/`Funnel` elements, or the fluent `PipelineBuilder` (see `examples/10_builder.rs`).
+**Fan-out needs no element**: link one src-pad to several sinks and the executor hands each branch a refcounted clone. Each link carries a `LinkPolicy` — `Block` (default) back-pressures the source *and every sibling branch*, so use `link_lossy()` on branches allowed to fall behind. Fan-in uses the `Funnel` element; N-to-1 muxing and multi-pad linking use `link_pads`. There is also the fluent `PipelineBuilder` (see `examples/10_builder.rs`).
 
 ### Typed pipelines (compile-time checked)
 
@@ -269,7 +269,7 @@ Full catalog with feature flags in **[docs/elements.md](docs/elements.md)**. Sum
 | **App integration** | `AppSrc`/`AppSink` (+ handles), `AutoVideoSink` (display window) |
 | **Network** | TCP/UDP/Unix src+sink (sync & async), UDP multicast, `HttpSrc`/`HttpSink`/`HttpStreamingSink`, `WebSocketSrc`/`WebSocketSink`, Zenoh pub/sub/query |
 | **RTP/RTSP** | `RtpSrc`/`RtpSink`, jitter buffer, `RtcpHandler`, payloaders/depayloaders for H.264/H.265/VP8/VP9 (+ Opus depay), `RtspSrc` client (Annex-B or length-prefixed framing, URL credentials, per-op timeouts). See `examples/57_rtsp_capture.rs` and `examples/58_rtsp_display.rs`; `just rtsp-server` serves a local test stream |
-| **Flow** | `Queue` (watermarks, leaky modes), `Queue2` (stream/download/timeshift buffering), `Tee`, `Funnel`, `InputSelector`/`OutputSelector`, `Concat`, `Valve` |
+| **Flow** | `Queue` (watermarks, leaky modes), `Queue2` (stream/download/timeshift buffering), `Inspect` (passthrough counter), `Funnel`, `InputSelector`/`OutputSelector`, `Concat`, `Valve` |
 | **Transforms** | `Map`, `Filter`, `FilterMap`, `FlatMap`, `Chunk`, `Batch`/`Unbatch`, buffer trim/slice/pad/split/join/concat, dedup/range/regex filters, `Gain`, `VideoScale`, `VideoConvertElement`, `AudioConvertElement`, `AudioResampleElement` |
 | **Timing** | `Delay`, `Timeout`, `Debounce`, `Throttle`, `RateLimiter` |
 | **Metadata** | `SequenceNumber`, `Timestamper`, `MetadataInject`/`MetadataExtract`, `TimestampDebug`, `KlvEncoder` (STANAG 4609/MISB) |
@@ -343,7 +343,7 @@ Default features are **empty** — everything below is opt-in.
 
 | Range | Topic |
 |-------|-------|
-| `01`–`08` | Basics: hello, transform, tee, funnel, queue, appsrc, file I/O, TCP |
+| `01`–`08` | Basics: hello, transform, fan-out, funnel, queue, appsrc, file I/O, TCP |
 | `09`–`11` | Typed pipelines, builder DSL, buffer pools |
 | `13`–`18`, `20` | Codecs: PNG (`image-codecs`), H.264 (`h264`), AV1 (`av1-encode`), MPEG-TS (`mpeg-ts`), caps negotiation, GPU decode (`vulkan-video`), Opus (`opus`) |
 | `22`–`26` | Devices & streaming: V4L2 (`v4l2`), display (`display`), HLS, DASH |
@@ -360,7 +360,7 @@ Default features are **empty** — everything below is opt-in.
 | Buffer access | O(1) | Direct pointer into the mapped arena |
 | Slot release | O(1) | Lock-free MPSC queue push |
 | Slot reclaim | O(k) | k = released slots, not pool size |
-| Tee to N outputs | O(N) refcount increments | No data copies |
+| Fan-out to N sinks | O(N) refcount increments | No data copies |
 | Cross-process send | O(1) after setup | Arena fd sent once; then only tiny refs |
 | 1080p I420→RGBA (`simd-colorspace`) | ~0.9 ms | AVX2/AVX-512 via `yuv` crate |
 

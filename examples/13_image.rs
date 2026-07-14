@@ -10,7 +10,7 @@
 
 use parallax::element::{ConsumeContext, Sink};
 use parallax::elements::VideoTestSrc;
-use parallax::elements::codec::{ColorType, PngDecoder, PngEncoder};
+use parallax::elements::codec::{PngDecoder, PngEncoder};
 use parallax::error::Result;
 use parallax::pipeline::Pipeline;
 
@@ -46,8 +46,9 @@ async fn main() -> Result<()> {
             .with_num_frames(3),
     );
 
-    // PNG encoder
-    let encoder = pipeline.add_filter("png_enc", PngEncoder::new(64, 64, ColorType::Rgb));
+    // PNG encoder. No dimensions and no colour type: it reads both from each
+    // buffer's metadata, which VideoTestSrc stamps.
+    let encoder = pipeline.add_filter("png_enc", PngEncoder::new());
 
     // PNG decoder
     let decoder = pipeline.add_filter("png_dec", PngDecoder::new());

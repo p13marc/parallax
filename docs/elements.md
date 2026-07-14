@@ -72,7 +72,7 @@ one command away: `just rtsp-server` (= `scripts/rtsp_test_server.py`).
 |---------|-------------|
 | `Queue` | Bounded queue with backpressure, watermarks (`with_flow_control`, `with_water_marks`), leaky modes (`LeakyMode`) |
 | `Queue2` | Network buffering: `stream` (memory ring), `download` (progressive file), `timeshift` (circular file); posts `Buffering` messages |
-| `Tee` | 1-to-N fan-out (refcount clones, no copies) |
+| `Inspect` | 1-in/1-out passthrough counter (buffers/bytes). **Not** a fan-out — it was called `Tee` and never was one. Fan-out needs no element: link one src-pad to several sinks (see [pipeline.md](pipeline.md#fan-out)). `tee` survives as a deprecated parse alias |
 | `Funnel` | N-to-1 merge (`FunnelInput` handles) |
 | `InputSelector` / `OutputSelector` | Switch between N inputs / route to one of N outputs |
 | `Concat` | Sequential stream concatenation |
@@ -89,7 +89,7 @@ one command away: `just rtsp-server` (= `scripts/rtsp_test_server.py`).
 | `BufferTrim` / `BufferSlice` / `BufferPad` | Trim to max / extract range / pad to min |
 | `BufferSplit` / `BufferJoin` / `BufferConcat` | Split/join at delimiters; concatenate |
 | `Gain` | RT-safe audio gain (PCM multiply) |
-| `VideoScale` | Resize YUV420 frames (`ScaleMode`); source size from buffer metadata, target retargetable at runtime via `ScaleControl` (see [Runtime control](#runtime-control-bandwidth-knobs)) |
+| `VideoScale` | Resize frames in **any** format the scaler engine supports (I420, NV12, RGB24, BGR24, RGBA, BGRA, Gray8, YUYV, UYVY) — it reads the pixel format from the buffer and errors if the buffer does not declare one. `ScaleMode` picks the filter; source geometry comes from the buffer, target is retargetable at runtime via `ScaleControl` (see [Runtime control](#runtime-control-bandwidth-knobs)). Target == source is a zero-copy passthrough |
 | `VideoConvertElement` | Pixel-format conversion (see [formats.md](formats.md)); format and dimensions from buffer metadata, then `with_input_format`/`with_size`, then buffer-size auto-detection — and re-negotiated when they change mid-stream |
 | `AudioConvertElement` | Sample-format conversion (S16 ↔ F32, …) |
 | `AudioResampleElement` | Sample-rate conversion |
@@ -153,29 +153,39 @@ Codec traits: `VideoEncoder`/`VideoDecoder` and `AudioEncoder`/`AudioDecoder` (a
 
 ## Runtime control (bandwidth knobs)
 
+Everything here lives in one module: **`parallax::control`**.
+
 `Executor::start()` **moves** each element into its executor task, so
 `pipeline.get_element_mut()` returns `None` for anything that is running. To change an
 element while it runs you must clone a **control handle from it before `start()`**. The handle
 is an `Arc<Atomic…>` — lock-free, allocation-free, safe to call from any thread or task, and
 free on the hot path when nothing has changed.
 
+Every controllable element implements `Controllable`, so the accessor is always `control()`.
+
 | Handle | From | Changes |
 |--------|------|---------|
-| `EncoderControl` | `H264Encoder::control_handle()`, `EncoderElement::control_handle()` | `set_bitrate`, `set_keyframe_interval`, `set_qp`, `request_keyframe` |
+| `EncoderControl` | `H264Encoder::control()`, `EncoderElement::control()` | `set_bitrate`, `set_keyframe_interval`, `set_qp`, `set_rate_control`, `set_skip_frames`, `request_keyframe` |
+| `EncoderStatsHandle` | `H264Encoder::stats()`, `EncoderElement::stats()` | *read-only*: `frames_encoded`, `bytes_encoded`, `frames_dropped_by_rc`, `last_encode_ns` |
 | `KeyframeHandle` | `…::keyframe_handle()` | `request()` — force the next frame to be an IDR |
 | `ScaleControl` | `VideoScale::control()` | `set_target(w, h)`, `set_max_height(h)` (aspect-preserving, never upscales), `passthrough()` |
 | `ThrottleControl` | `Throttle::control()` | `set_rate(fps)`, `set_min_interval(d)` |
-| `JpegQualityControl` | `JpegEncoder::quality_control()` | `set_quality(1..=100)` |
+| `JpegQualityControl` | `JpegEncoder::control()` | `set_quality(1..=100)` |
 | `ValveControl` | `Valve::control()` | `open()` / `close()` |
-| `FlowStateHandle` | `Queue::flow_state_handle()` | backpressure signalling to live sources |
+| `FlowStateHandle` | `Queue::control()` | backpressure signalling to live sources |
+| `AppSinkHandle` / `AppSrcHandle` | `AppSink::handle()` / `AppSrc::handle()` | `pull_buffer_async`, `push_buffer_async`, `stats()` |
 
 ```rust,ignore
-let scaler  = VideoScale::new(1920, 1080, 1920, 1080);
-let encoder = H264Encoder::new(H264EncoderConfig::new(1920, 1080).bitrate(4_000_000))?;
+use parallax::control::Controllable;
+
+// No dimensions anywhere: geometry travels in-band, in Metadata.
+let scaler  = VideoScale::new();
+let encoder = H264Encoder::new(H264EncoderConfig::new().bitrate(4_000_000))?;
 
 // Clone the handles BEFORE the pipeline starts.
 let scale   = scaler.control();
-let control = encoder.control_handle();
+let control = encoder.control();
+let stats   = encoder.stats();
 
 pipeline.add_filter("scale", scaler);
 pipeline.add_filter("enc", encoder);
@@ -183,24 +193,38 @@ let handle = executor.start(&mut pipeline)?;   // sync — elements move into th
 
 // ...later, on a viewer's request or a congested link:
 scale.set_max_height(360);      // quarter the pixels, aspect preserved
-control.set_bitrate(800_000);   // and a tenth of the bits
+control.set_bitrate(800_000);   // and a fifth of the bits — no IDR, the GOP survives
+println!("{} frames, {} bytes", stats.frames_encoded(), stats.bytes_encoded());
 ```
 
-Both changes take effect on the next frame, with no teardown. Resolution travels **in-band**:
-`VideoScale` stamps the produced size into the buffer's metadata (`Metadata::set_video_dims`),
-and `H264Encoder` encodes at the size the buffer declares — OpenH264 re-initialises itself and
-emits a fresh IDR, so the switch is a clean decoder entry point. A bitrate/GOP/QP change
-rebuilds the OpenH264 encoder (it exposes no setter), which likewise starts with an IDR;
-rate-limit changes to roughly 1/s rather than one per slider pixel.
+Both changes take effect on the next frame, with no teardown.
+
+**What costs an IDR and what does not:**
+
+- **A bitrate change is seamless.** It goes in through OpenH264's `SetOption(ENCODER_OPTION_BITRATE)`,
+  so the GOP is not broken. Setting the bitrate to the value it already has does nothing at all.
+- **Everything else rebuilds the encoder** (GOP length, QP, rate-control mode, frame skipping),
+  and a rebuilt encoder leads with an IDR so decoders pick up the new parameter sets.
+- **A resolution change rebuilds too**, and must: the encoder re-initialises, and the IDR is what
+  makes the new size a clean decoder entry point.
+
+Resolution travels **in-band**: `VideoScale` stamps the produced size into the buffer's metadata
+(`Metadata::set_video_dims`), and `H264Encoder` encodes at the size the buffer declares. No
+element takes dimensions at construction; one that cannot determine its geometry from the buffer
+errors rather than falling back to a stale constructor value.
 
 Things worth knowing:
 
-- **Frame skipping.** With a bitrate target, OpenH264's rate control drops frames to hold it —
-  the encoder emits *nothing* for some inputs. `H264EncoderConfig::skip_frames(false)` says
-  "spend quality, not frames", which is what you want when something upstream (a `Throttle`)
-  already governs the framerate.
-- **Rate-control mode.** `RateControlMode::Quality` (the default) treats `bitrate_bps` as a
-  hint. Use `RateControlMode::Bitrate` when the link, not the picture, is the constraint.
+- **Defaults.** `rate_control` defaults to `RateControlMode::Bitrate` and `bitrate_bps` to 2 Mbps
+  — for a crate whose headline feature is live bandwidth control, "the bitrate is a hint" is the
+  wrong default. `Bitrate` mode with a zero target is a hard error (OpenH264 would silently fall
+  back to ~120 kbps and drop most frames).
+- **Frame skipping is off by default.** OpenH264 holds a bitrate target by dropping frames —
+  emitting *nothing* for some inputs, which quietly breaks every downstream fps/kbps figure.
+  Parallax spends quality instead; use an upstream `Throttle` to shed frames deliberately.
+  `EncoderStatsHandle::frames_dropped_by_rc()` counts any that rate control does swallow.
+- **In `Bitrate` mode with skipping off**, `qp` is a quality *ceiling*, not a target: the encoder
+  may fall below it to make budget. (With a tight ±4 band it simply misses the target instead.)
 - **Hardware.** `V4l2M2mH264Encoder` accepts live `set_bitrate`/`set_keyframe_interval` (V4L2
   permits control changes at any time), but some drivers accept the ioctl and then ignore it
   mid-stream — GOP is the usual casualty. Best-effort; verify on your driver.

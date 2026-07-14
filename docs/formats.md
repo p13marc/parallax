@@ -82,7 +82,28 @@ During `pipeline.prepare()`, the solver (`negotiation::NegotiationSolver`) walks
 3. On success, `fixate` the intersection into a concrete `MediaFormat` + `MemoryType` and record it on the link (visible via `pipeline.link_format(..)` / `link_memory_type(..)`).
 4. On failure, consult the `ConverterPolicy`.
 
-Notes on scope: negotiation is **per-link** (no cross-link constraint propagation), and converter search is **single-hop** (one converter inserted per link; multi-hop pathfinding is a TODO).
+Notes on scope: negotiation is **per-link** — there is no cross-link constraint propagation.
+
+### Which axes disagree
+
+When two elements do not intersect, the solver works out *which axes* they disagree on rather than reaching for one converter and hoping:
+
+| Axis | Meaning | Fixed by |
+|------|---------|----------|
+| `FORMAT` | pixel format; sample format + channels | `videoconvert`, `audioconvert` |
+| `GEOMETRY` | width, height | `videoscale` |
+| `RATE` | framerate; sample rate | `audioresample` |
+| `MEMORY` | CPU / GPU / DMA-BUF | `memorycopy` |
+
+`ConvertAxes` is a bitflag set; `diff_caps(source, sink)` reports the conflict. `Any` never conflicts, and `Fixed(1920)` against `Range { 1280..=1920 }` does not either — it fixates to 1920.
+
+`ConverterRegistry::plan()` then covers those axes with the **cheapest chain** of converters. A 1080p RGB camera into a 720p I420 encoder disagrees on two axes and gets two elements — `videoscale ! videoconvert`, in that order, because scaling down first means converting fewer pixels (an upscale converts first instead).
+
+If the registry cannot cover **every** conflicting axis, negotiation **fails**. It never emits a partial chain: that would leave a pipeline running and quietly wrong.
+
+Each converter is handed a `ConversionRequest` describing both ends of the link, so it configures itself for the actual target (a sink that wants I420 gets an I420 converter).
+
+**Honest limitation**: auto-insertion only fires when the *source* side pins the property in question. `AppSrc` and most transforms declare `Any`, and `Any ∩ Fixed = Fixed` never conflicts — so no converter is needed and none is inserted. It fires for `V4l2Src`/`ScreenCaptureSrc`-rooted graphs and for `EncoderElement`, which pin geometry.
 
 ### Converter policy
 
@@ -107,7 +128,7 @@ pipeline.prepare()?;
 let p = Pipeline::parse("videotestsrc ! videoconvert ! autovideosink")?;
 ```
 
-The `ConverterRegistry` (see `negotiation::builtin_registry()`) maps (format, memory) pairs to converter factories with costs: `videoconvert` (5), `audioconvert` (3), `audioresample` (8), `memorycopy` (20), `identity` (0).
+The `ConverterRegistry` (see `negotiation::builtin_registry()`) holds converter factories keyed by (format type, memory type) — **several per key**, distinguished by the axes they fix and ordered by cost: `audioconvert` (3), `videoconvert` (5), `audioresample` (8), `videoscale` (10), `memorycopy` (20). `identity` fixes no axis, so it can never be auto-inserted to "resolve" a conflict.
 
 ### DMA-BUF example
 
@@ -154,10 +175,12 @@ cargo bench --bench colorspace                              # scalar comparison
 
 ### VideoScale
 
-Nearest-neighbor or bilinear resize of raw frames.
+Nearest-neighbor or bilinear resize of raw frames, in any of I420, NV12, RGB24, BGR24, RGBA, BGRA, Gray8, YUYV, UYVY. The `VideoScale` *element* reads the pixel format and geometry from each buffer's metadata and rebuilds its engine when either changes; a target equal to the source is a zero-copy passthrough.
+
+(The YUYV/UYVY paths are low-quality by the engine's own admission — assert structure and size on them, not pixel fidelity.)
 
 ## Pitfalls
 
-- **Two `PixelFormat` enums exist**: `format::PixelFormat` (15 variants, used in caps) and `converters::PixelFormat` (9 variants, used by the conversion engine). Likewise two `SampleFormat` enums (`format::` vs `converters::audio::`). They are separate types — convert explicitly at the boundary.
-- **`negotiation::builtin` re-exports stub types** named `VideoConvert`/`AudioConvert`/etc. whose `process()` is passthrough — they exist only to describe converter metadata to the registry. The real engines are in `parallax::converters`, and `builtin_registry()` correctly wires the real element wrappers.
+- **Geometry travels in-band, in `Metadata`.** No element takes dimensions at construction; one that cannot determine its geometry from the buffer **errors** rather than falling back to a stale constructor value. Producers stamp it with `Metadata::set_video_dims(w, h, pixel_format)`, which writes *both* the `MediaFormat::VideoRaw` field and the legacy `"width"`/`"height"` keys — write only one and the other goes stale, silently mis-sizing frames downstream.
+- **Two `PixelFormat` enums exist**: `format::PixelFormat` (15 variants, used in caps) and `converters::PixelFormat` (9 variants, used by the conversion engine). They are separate types, but conversion is now explicit and total in one direction: `From<converters::PixelFormat> for format::PixelFormat`, and `TryFrom` back (the caps enum names formats the engine cannot convert). Likewise two `SampleFormat` enums (`format::` vs `converters::audio::`).
 - After changing element caps at runtime, call `pipeline.invalidate_negotiation()` (or check `needs_renegotiation()`).

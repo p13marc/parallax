@@ -69,6 +69,10 @@ src/
 ├── metadata.rs         # Metadata (pts/dts/duration/sequence/stream_id/flags/rtp/format/offset
 │                       #   + typed custom map), BufferFlags, RtpMeta
 ├── clock.rs            # ClockTime (NONE sentinel), Clock, ClockProvider, SystemClock, PipelineClock
+├── codec/annexb.rs     # Annex-B helpers (nal_units/has_idr/extract_param_sets/annex_b_to_avcc)
+│                       #   — ALWAYS compiled, no codec feature needed
+├── control.rs          # Controllable trait + every runtime handle (EncoderControl,
+│                       #   EncoderStatsHandle, RateControlMode, KeyframeHandle, ScaleControl, …)
 ├── format.rs           # CapsValue, Video/AudioFormat(+Caps), PixelFormat, MediaFormat,
 │                       #   MemoryCaps, MemoryLayout, FormatMemoryCap, ElementMediaCaps, Caps
 ├── event/              # Event enum (StreamStart/Segment/Tags/Eos/CapsChanged/Gap | Seek/Qos/
@@ -131,7 +135,9 @@ Two coexisting generations:
 
 **Flush**: executor calls `flush()` repeatedly at EOS until it returns `None`/`Output::None` — implement it in encoders/muxers to drain buffered data.
 
-**Runtime control**: `Executor::start()` *moves* elements into their tasks, so `get_element_mut()` returns `None` on a running pipeline. The only way to mutate a live element is an `Arc<Atomic*>` **control handle cloned before `start()`**: `EncoderControl` (bitrate/GOP/QP/keyframe), `KeyframeHandle`, `ScaleControl` (`VideoScale`), `ThrottleControl`, `JpegQualityControl`, `ValveControl`, `FlowStateHandle`. See `docs/elements.md` § Runtime control.
+**Runtime control** (`src/control.rs`, always compiled): `Executor::start()` *moves* elements into their tasks, so `get_element_mut()` returns `None` on a running pipeline. The only way to mutate a live element is an `Arc<Atomic*>` **handle cloned before `start()`**. Every controllable element implements `Controllable`, so the accessor is always `control()`: `EncoderControl` (bitrate/GOP/QP/rate-control/skip-frames/keyframe), `EncoderStatsHandle` (read-only counters), `KeyframeHandle`, `ScaleControl`, `ThrottleControl`, `JpegQualityControl`, `ValveControl`, `FlowStateHandle`. See `docs/elements.md` § Runtime control.
+
+**Geometry-in-Metadata invariant**: geometry travels in-band. **No element takes dimensions at construction** (`H264EncoderConfig::new()`, `JpegEncoder::new()`, `PngEncoder::new()`, `VideoScale::new()` are all no-arg); an element that cannot determine its geometry from `Metadata` **errors** rather than falling back to a stale constructor value. The exception still to fix: `EncoderElement::new(enc, format: VideoFormat)`.
 
 ## Pipeline
 
@@ -202,7 +208,10 @@ p.link_pads(xfm, "src", sink, "sink")?;
 ## Caps & Negotiation
 
 - Constraint model: `CapsValue<T>::{Fixed, Range, List, Any}`; `VideoFormatCaps`/`AudioFormatCaps` → `FormatCaps`; `MemoryCaps` (`cpu_only()`, `dmabuf_only()`, `dmabuf_preferred()`, `any()`); pair = `FormatMemoryCap`; element declares preference-ordered `ElementMediaCaps` via `output_media_caps()`/`input_media_caps()`.
-- Solver (`negotiation/solver.rs`) negotiates **per link, first intersection wins** (NOT a global constraint solver despite older docs); converter search is single-hop.
+- Solver (`negotiation/solver.rs`) negotiates **per link, first intersection wins** (NOT a global constraint solver).
+- On a mismatch, `diff_caps()` reports which **`ConvertAxes`** (`FORMAT|GEOMETRY|RATE|MEMORY`) conflict, and `ConverterRegistry::plan()` covers them with the cheapest **chain** (several converters per link). It returns `None` — a negotiation error — if it cannot cover them ALL; a partial chain is never emitted. Chain order: downscale ⇒ scale-then-convert, upscale ⇒ convert-then-scale.
+- Registered: `videoconvert` (FORMAT), `videoscale` (GEOMETRY), `audioconvert` (FORMAT), `audioresample` (RATE), `memorycopy` (MEMORY), `identity` (NONE — so it can never be auto-inserted). Factories take a `ConversionRequest` and configure themselves from the sink's caps.
+- Auto-insertion only fires when the **source** side pins the property (`Any ∩ Fixed = Fixed` never conflicts) — i.e. v4l2/screen-capture-rooted graphs and `EncoderElement`.
 - `ConverterPolicy::{Deny (default), Warn, Allow}`; `pipeline.prepare()` fails with a helpful error under Deny; `prepare_with_auto_converters()` = Warn; `set_converter_policy(...)`.
 - `MemoryLayout::{NONE, SSE, AVX, AVX512}` requests aligned buffers (arena constructors `new_avx`/`new_avx512`).
 
@@ -218,7 +227,7 @@ p.link_pads(xfm, "src", sink, "sink")?;
 
 | What | Types | Feature |
 |------|-------|---------|
-| H.264 | `H264Encoder`/`H264Decoder` (implement `Element` directly). Live bitrate/GOP/QP via `control_handle()`; resolution follows `Metadata`'s dims (OpenH264 re-inits + IDR). Config: `rate_control`, `skip_frames`, `max_slice_len`, `profile`, `complexity`, `usage_type` | `h264` |
+| H.264 | `H264Encoder`/`H264Decoder` (implement `Element` directly). `H264EncoderConfig::new()` takes **no dimensions**; geometry follows `Metadata` (a resize rebuilds the encoder + IDR). Live control via `control()`: a **bitrate change is seamless** (openh264-sys2 `SetOption(ENCODER_OPTION_BITRATE)`, no IDR); GOP/QP/rate-control/skip-frames rebuild (IDR). A no-op change does nothing. Counters via `stats()` → `EncoderStatsHandle`. **Defaults**: `rate_control = Bitrate`, `bitrate_bps = 2_000_000` (Bitrate + 0 is an error), `skip_frames = false`. In Bitrate mode with skipping off, `qp` is a quality *ceiling* (the band opens to 51) | `h264` |
 | H.264 hardware | `V4l2M2mH264Encoder` (impl `VideoEncoder`, wrap in `EncoderElement`), `find_m2m_encoder(b"H264")` device probe; `V4l2CodedFormat::Fwht` is test-only (vicodec) | `v4l2-m2m` (build needs libclang + kernel headers) |
 | AV1 | `Rav1eEncoder` (impl `Element` directly AND `VideoEncoder`; drains lookahead via `Element::flush`), `Dav1dDecoder` (impl `Element`) | `av1-encode` / `av1-decode` |
 | Audio dec | `SymphoniaDecoder` (impl `Element`) | `audio-flac/mp3/aac/vorbis` |
@@ -257,8 +266,8 @@ Muxer sync: `MuxerSyncState`/`MuxerSyncConfig::new().with_mode(SyncMode::{Auto|S
 ## Gotchas & Pitfalls (read before writing code or docs)
 
 1. **No process isolation.** Removed in da6df59. `ElementStrategy` = Async|RealTime only. Old docs mentioning `run_isolated`, `ElementSandbox`, "isolated process" strategy, or `src/execution/` are describing deleted code.
-2. **Two `PixelFormat` enums**: `format::PixelFormat` (15 variants, caps) vs `converters::PixelFormat` (9 variants, actual conversion). Not interchangeable. Same for `SampleFormat` (`format::` vs `converters::audio::`).
-3. **`negotiation::builtin` converter types are passthrough STUBS** sharing names (`VideoConvert`, `AudioConvert`, …) with the REAL implementations in `src/converters/`. `builtin_registry()` wires the real element wrappers (`VideoConvertElement`, etc.).
+2. **Two `PixelFormat` enums**: `format::PixelFormat` (15 variants, caps) vs `converters::PixelFormat` (9 variants, actual conversion). Separate types, but conversion is explicit: `From<converters::PixelFormat> for format::PixelFormat` (total) and `TryFrom` back (partial). Same split for `SampleFormat` (`format::` vs `converters::audio::`), with no conversion impls.
+3. **`Tee` no longer exists** — it was a 1-in/1-out passthrough counter that never fanned out, and is now `Inspect` (`tee` remains a deprecated parse alias). **Fan-out needs no element**: link one src-pad to several sinks. Each `Link` carries a `LinkPolicy` (`Block` default | `Drop`) — a `Block` branch that fills its channel back-pressures the source *and every sibling*, so use `pipeline.link_lossy()` on branches allowed to fall behind. EOS is never dropped.
 4. **`temporal::Timestamp` ≠ `clock::ClockTime`** — separate types, no conversion provided. Typed temporal joins use `Timestamp`; buffers/events use `ClockTime`.
 5. **`typed::merge` is 2-source alternating interleave**, not N-way funnel. `typed::run_async` is `spawn_blocking` around the sync loop, not native async.
 6. **`Executor::start` is sync**; only `run()` is async.
