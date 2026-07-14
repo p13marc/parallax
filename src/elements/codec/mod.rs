@@ -156,9 +156,11 @@ pub use audio_encoder_element::AudioEncoderElement;
 #[cfg(feature = "h264")]
 mod h264;
 #[cfg(feature = "h264")]
+pub use crate::control::RateControlMode;
+#[cfg(feature = "h264")]
 pub use h264::{
-    Complexity, DecodedFrame, H264Decoder, H264Encoder, H264EncoderConfig, Profile,
-    RateControlMode, SpsPpsStrategy, UsageType,
+    Complexity, DecodedFrame, H264Decoder, H264Encoder, H264EncoderConfig, Profile, SpsPpsStrategy,
+    UsageType,
 };
 
 // V4L2 M2M stateful hardware encoder

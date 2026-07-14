@@ -72,6 +72,9 @@ pub struct EncoderElement<E: VideoEncoder> {
     /// Runtime control: keyframe requests plus bitrate/GOP/QP changes
     /// (shared with [`Self::control_handle`] and [`Self::keyframe_handle`]).
     control: super::EncoderControl,
+    /// Frames, bytes, rate-control drops and encode time, readable while the
+    /// element is inside its executor task (see [`Self::stats`]).
+    stats: crate::control::EncoderStatsHandle,
     /// The control generation last applied to the encoder.
     applied_generation: u64,
     /// Arena for output buffer allocation.
@@ -106,6 +109,7 @@ impl<E: VideoEncoder> EncoderElement<E> {
             frames_in: 0,
             packets_out: 0,
             control: super::EncoderControl::new(),
+            stats: crate::control::EncoderStatsHandle::default(),
             applied_generation: 0,
             arena,
         })
@@ -128,6 +132,15 @@ impl<E: VideoEncoder> EncoderElement<E> {
     /// Get the number of frames received.
     pub fn frames_in(&self) -> u64 {
         self.frames_in
+    }
+
+    /// A cloneable handle to this encoder's counters.
+    ///
+    /// Clone it *before* `executor.start()`: the element is moved into its
+    /// executor task there, so the plain `&self` counters below can never be
+    /// read while it is actually encoding. This handle can.
+    pub fn stats(&self) -> crate::control::EncoderStatsHandle {
+        self.stats.clone()
     }
 
     /// Get the number of packets produced.
@@ -292,6 +305,9 @@ impl<E: VideoEncoder + 'static> EncoderElement<E> {
         {
             tracing::warn!("encoder QP change to {qp} rejected: {e}");
         }
+        // rate_control and skip_frames are OpenH264-specific knobs; the
+        // VideoEncoder trait has no setter for them, so they are ignored here
+        // rather than silently pretending to apply.
     }
 }
 
@@ -319,20 +335,27 @@ impl<E: VideoEncoder + 'static> Transform for EncoderElement<E> {
         self.frames_in += 1;
 
         // Encode frame
+        let started = std::time::Instant::now();
         let packets = self.encoder.encode(&frame)?;
+        let elapsed_ns = started.elapsed().as_nanos() as u64;
 
-        // If no packets, encoder is buffering
+        // If no packets, the encoder is buffering (lookahead) or rate control
+        // swallowed the frame. Either way nothing came out for this input.
         if packets.is_empty() {
+            self.stats.record_rc_drop(elapsed_ns);
             return Ok(Output::None);
         }
 
         // Convert packets to buffers, preserving input metadata
         let mut buffers = Vec::with_capacity(packets.len());
+        let mut encoded_bytes = 0usize;
         for packet in packets {
             let data = packet.as_ref().to_vec();
+            encoded_bytes += data.len();
             buffers.push(self.packet_to_buffer(data, pts, input_metadata)?);
             self.packets_out += 1;
         }
+        self.stats.record_frame(encoded_bytes, elapsed_ns);
 
         Ok(Output::from(buffers))
     }

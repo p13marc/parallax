@@ -31,6 +31,7 @@
 //! ```
 
 use crate::buffer::Buffer;
+use crate::control::{EncoderStatsHandle, RateControlMode};
 use crate::element::Element;
 use crate::error::{Error, Result};
 use crate::memory::SharedArena;
@@ -85,39 +86,15 @@ impl SpsPpsStrategy {
     }
 }
 
-/// How the encoder trades bits against quality (mirrors OpenH264's `iRCMode`).
-///
-/// This is the knob that decides how seriously
-/// [`bitrate_bps`](H264EncoderConfig::bitrate_bps) is taken. The default is
-/// [`Quality`](Self::Quality), matching OpenH264 — a streaming sensor on a
-/// constrained link usually wants [`Bitrate`](Self::Bitrate) instead.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum RateControlMode {
-    /// Quality first: the bitrate target is a hint, not a budget (OpenH264's
-    /// default, and this crate's).
-    #[default]
-    Quality,
-    /// Bitrate first: hold the target, spending quality to do it. What you want
-    /// when the link, not the picture, is the constraint.
-    Bitrate,
-    /// Ignore the bitrate target; adjust quality from buffer status alone.
-    BufferBased,
-    /// Rate control driven by frame timestamps.
-    Timestamp,
-    /// No rate control at all: quality is governed purely by the QP band.
-    Off,
-}
-
-impl RateControlMode {
-    fn to_openh264(self) -> openh264::encoder::RateControlMode {
-        use openh264::encoder::RateControlMode as O;
-        match self {
-            Self::Quality => O::Quality,
-            Self::Bitrate => O::Bitrate,
-            Self::BufferBased => O::Bufferbased,
-            Self::Timestamp => O::Timestamp,
-            Self::Off => O::Off,
-        }
+/// Map the crate-wide [`RateControlMode`] onto OpenH264's `iRCMode`.
+fn rate_control_to_openh264(mode: RateControlMode) -> openh264::encoder::RateControlMode {
+    use openh264::encoder::RateControlMode as O;
+    match mode {
+        RateControlMode::Quality => O::Quality,
+        RateControlMode::Bitrate => O::Bitrate,
+        RateControlMode::BufferBased => O::Bufferbased,
+        RateControlMode::Timestamp => O::Timestamp,
+        RateControlMode::Off => O::Off,
     }
 }
 
@@ -205,7 +182,12 @@ impl UsageType {
 /// ignored the moment a scaler is in the graph.
 #[derive(Debug, Clone)]
 pub struct H264EncoderConfig {
-    /// Target bitrate in bits per second (0 = auto).
+    /// Target bitrate in bits per second.
+    ///
+    /// Defaults to 2 Mbps — a real budget, not `0`. Under the default
+    /// [`RateControlMode::Bitrate`] a target of `0` is rejected at construction
+    /// rather than silently handed to OpenH264, which would fall back to its own
+    /// ~120 kbps default and drop most frames of real content.
     pub bitrate_bps: u32,
     /// Maximum frame rate in Hz.
     pub max_frame_rate: f32,
@@ -225,7 +207,12 @@ pub struct H264EncoderConfig {
     /// SPS/PPS parameter-set ID strategy (see [`SpsPpsStrategy`]).
     pub sps_pps_strategy: SpsPpsStrategy,
     /// How strictly [`bitrate_bps`](Self::bitrate_bps) is honoured (see
-    /// [`RateControlMode`]). Defaults to `Quality`, matching OpenH264.
+    /// [`RateControlMode`]). Defaults to `Bitrate`: this crate's reason to exist
+    /// is holding a bandwidth budget, and OpenH264's quality-first default makes
+    /// the budget advisory.
+    ///
+    /// Changeable on a running encoder via
+    /// [`EncoderControl::set_rate_control`](crate::control::EncoderControl::set_rate_control).
     pub rate_control: RateControlMode,
     /// Cap on the size of each emitted NAL unit, in bytes.
     ///
@@ -236,16 +223,17 @@ pub struct H264EncoderConfig {
     pub max_slice_len: Option<u32>,
     /// Whether rate control may **drop frames** to hold the bitrate target.
     ///
-    /// `None` (the default) means "whatever the rate control needs": skipping
-    /// is on when a bitrate target is set, off in quality mode. That is
-    /// OpenH264's own behaviour, and it has a sharp edge — under a tight target
-    /// the encoder simply emits nothing for some input frames, so a pipeline
-    /// that expects one packet per frame quietly gets fewer.
+    /// Defaults to `false` — spend quality, not frames. OpenH264 turns skipping
+    /// on whenever a bitrate target is set, and it has a sharp edge: under a
+    /// tight target the encoder simply emits *nothing* for some input frames, so
+    /// a pipeline expecting one packet per frame quietly gets fewer and every
+    /// downstream fps/kbps figure is wrong. An upstream
+    /// [`Throttle`](crate::elements::Throttle) is the way to shed frames
+    /// deliberately.
     ///
-    /// Set `Some(false)` when something upstream already limits the framerate
-    /// (a [`Throttle`](crate::elements::Throttle), say) and you would rather
-    /// every frame you send be encoded, spending quality instead of frames.
-    pub skip_frames: Option<bool>,
+    /// Changeable on a running encoder via
+    /// [`EncoderControl::set_skip_frames`](crate::control::EncoderControl::set_skip_frames).
+    pub skip_frames: bool,
     /// H.264 profile. `None` lets OpenH264 choose.
     pub profile: Option<Profile>,
     /// CPU spent per frame (see [`Complexity`]).
@@ -260,7 +248,7 @@ impl H264EncoderConfig {
     /// No dimensions: the encoder encodes whatever each buffer declares.
     pub fn new() -> Self {
         Self {
-            bitrate_bps: 0,
+            bitrate_bps: 2_000_000,
             max_frame_rate: 30.0,
             qp: 26,
             scene_change_detect: true,
@@ -269,7 +257,7 @@ impl H264EncoderConfig {
             sps_pps_strategy: SpsPpsStrategy::default(),
             rate_control: RateControlMode::default(),
             max_slice_len: None,
-            skip_frames: None,
+            skip_frames: false,
             profile: None,
             complexity: Complexity::default(),
             usage_type: UsageType::default(),
@@ -331,7 +319,7 @@ impl H264EncoderConfig {
     /// Allow or forbid rate control dropping frames to hold the bitrate target
     /// (see [`skip_frames`](Self::skip_frames)).
     pub fn skip_frames(mut self, skip: bool) -> Self {
-        self.skip_frames = Some(skip);
+        self.skip_frames = skip;
         self
     }
 
@@ -386,8 +374,9 @@ impl Default for H264EncoderConfig {
 pub struct H264Encoder {
     encoder: Encoder,
     config: H264EncoderConfig,
-    frame_count: u64,
-    bytes_encoded: u64,
+    /// Frames, bytes, rate-control drops and encode time — readable while the
+    /// element is inside its executor task (see [`Self::stats`]).
+    stats: EncoderStatsHandle,
     /// Geometry of the last frame encoded. Observability and change detection
     /// only — it is *never* a fallback, because geometry travels in-band.
     dims: Option<(u32, u32)>,
@@ -405,29 +394,51 @@ pub struct H264Encoder {
 /// Shared by [`H264Encoder::new`] and the runtime reconfigure path, so
 /// start-time and live settings can never drift apart.
 fn build_encoder(config: &H264EncoderConfig) -> Result<Encoder> {
+    // Bitrate mode with no target is a trap: OpenH264 falls back to its own
+    // ~120 kbps default and drops most frames of real content. Refuse instead.
+    if config.rate_control == RateControlMode::Bitrate && config.bitrate_bps == 0 {
+        return Err(Error::Config(
+            "H264Encoder: RateControlMode::Bitrate needs a bitrate target — set \
+             H264EncoderConfig::bitrate(), or pick RateControlMode::Quality"
+                .into(),
+        ));
+    }
+
     let mut encoder_config = EncoderConfig::new();
 
     if config.bitrate_bps > 0 {
         encoder_config = encoder_config.bitrate(BitRate::from_bps(config.bitrate_bps));
     }
 
-    // Frame skipping. Default: on with a bitrate target (OpenH264's own
-    // behaviour), off in quality mode — where OpenH264 would otherwise apply a
-    // 120 kbps default target and silently drop most frames of real content.
-    // Either way this is a knob worth knowing about: when skipping is on, a
-    // tight target makes the encoder emit *nothing* for some input frames.
-    let skip_frames = config.skip_frames.unwrap_or(config.bitrate_bps > 0);
-    encoder_config = encoder_config.skip_frames(skip_frames);
+    encoder_config = encoder_config.skip_frames(config.skip_frames);
 
+    // The QP band is what rate control has to work with.
+    //
+    // In Bitrate mode with frame skipping off — this crate's default — OpenH264
+    // can only hold the target by raising QP, and a ±4 band around the target
+    // does not give it enough room: the target is then simply missed (OpenH264
+    // even warns that the bitrate "can't be controlled" without frame skipping).
+    // So the band opens all the way down in quality: `qp` becomes a quality
+    // *ceiling* the encoder may fall below to make budget, which is exactly
+    // "spend quality, not frames".
+    //
+    // In every other mode `qp` is a target and the tight band around it is the
+    // point.
     let qp = config.qp.min(51);
+    let qp_range = if config.rate_control == RateControlMode::Bitrate && !config.skip_frames {
+        QpRange::new(qp.saturating_sub(4), 51)
+    } else {
+        QpRange::new(qp.saturating_sub(4), (qp + 4).min(51))
+    };
+
     encoder_config = encoder_config
         .max_frame_rate(FrameRate::from_hz(config.max_frame_rate))
         .scene_change_detect(config.scene_change_detect)
         .num_threads(config.num_threads as u16)
-        .qp(QpRange::new(qp.saturating_sub(4), (qp + 4).min(51)))
+        .qp(qp_range)
         .intra_frame_period(IntraFramePeriod::from_num_frames(config.keyframe_interval))
         .sps_pps_strategy(config.sps_pps_strategy.to_openh264())
-        .rate_control_mode(config.rate_control.to_openh264())
+        .rate_control_mode(rate_control_to_openh264(config.rate_control))
         .complexity(config.complexity.to_openh264())
         .usage_type(config.usage_type.to_openh264());
 
@@ -456,8 +467,7 @@ impl H264Encoder {
         Ok(Self {
             encoder,
             config,
-            frame_count: 0,
-            bytes_encoded: 0,
+            stats: EncoderStatsHandle::default(),
             dims: None,
             control: super::EncoderControl::new(),
             applied_generation: 0,
@@ -489,29 +499,108 @@ impl H264Encoder {
         Ok(())
     }
 
-    /// Apply any parameter changes made through [`Self::control_handle`].
+    /// Change the bitrate on the live encoder, with no IDR and no rebuild.
+    ///
+    /// OpenH264's Rust wrapper exposes no bitrate setter, but the C API does —
+    /// `SetOption(ENCODER_OPTION_BITRATE)`, which OpenH264 itself uses
+    /// internally. Reached through `Encoder::raw_api()`.
+    ///
+    /// Returns `false` if the encoder rejected the change, in which case the
+    /// caller falls back to a rebuild. A bitrate step must never fail the
+    /// pipeline.
+    fn set_bitrate_live(&mut self, bps: u32) -> bool {
+        use openh264_sys2::{ENCODER_OPTION_BITRATE, SBitrateInfo, SPATIAL_LAYER_ALL};
+
+        let mut info = SBitrateInfo {
+            iLayer: SPATIAL_LAYER_ALL,
+            iBitrate: bps as std::os::raw::c_int,
+        };
+
+        // SAFETY: `info` outlives the call, and ENCODER_OPTION_BITRATE is
+        // documented to take a *mut SBitrateInfo. The encoder is exclusively
+        // borrowed, so nothing else touches it concurrently.
+        let rc = unsafe {
+            self.encoder
+                .raw_api()
+                .set_option(ENCODER_OPTION_BITRATE, (&raw mut info).cast())
+        };
+        rc == 0
+    }
+
+    /// Apply any parameter changes made through the [`EncoderControl`] handle.
+    ///
+    /// Two things matter here:
+    ///
+    /// * **A no-op costs nothing.** Every parameter is compared against the
+    ///   current config, so `set_bitrate(same_value)` does not force an IDR —
+    ///   which is what a naive `if changed { rebuild }` on the generation
+    ///   counter alone used to do.
+    /// * **A bitrate-only change is seamless.** It goes through `SetOption`, so
+    ///   the GOP is not broken. Every other parameter (GOP length, QP, rate
+    ///   control, frame skipping) needs a fresh encoder, and that rebuild picks
+    ///   up any bitrate change with it.
     fn apply_pending_control(&mut self) -> Result<()> {
         let Some(params) = self.control.poll(&mut self.applied_generation) else {
             return Ok(());
         };
 
-        if let Some(bps) = params.bitrate_bps {
+        let mut bitrate_change = None;
+        let mut needs_rebuild = false;
+
+        if let Some(bps) = params.bitrate_bps
+            && bps != self.config.bitrate_bps
+        {
             self.config.bitrate_bps = bps;
+            bitrate_change = Some(bps);
         }
-        if let Some(frames) = params.keyframe_interval {
+        if let Some(frames) = params.keyframe_interval
+            && frames != self.config.keyframe_interval
+        {
             self.config.keyframe_interval = frames;
+            needs_rebuild = true;
         }
-        if let Some(qp) = params.qp {
+        if let Some(qp) = params.qp
+            && qp.min(51) != self.config.qp
+        {
             self.config.qp = qp.min(51);
+            needs_rebuild = true;
+        }
+        if let Some(mode) = params.rate_control
+            && mode != self.config.rate_control
+        {
+            self.config.rate_control = mode;
+            needs_rebuild = true;
+        }
+        if let Some(skip) = params.skip_frames
+            && skip != self.config.skip_frames
+        {
+            self.config.skip_frames = skip;
+            needs_rebuild = true;
         }
 
-        tracing::info!(
-            "H264Encoder: reconfigured — bitrate {} bps, keyframe interval {}, qp {}",
-            self.config.bitrate_bps,
-            self.config.keyframe_interval,
-            self.config.qp
-        );
-        self.rebuild_encoder()
+        if needs_rebuild {
+            tracing::info!(
+                "H264Encoder: rebuilding — bitrate {} bps, keyframe interval {}, qp {}, \
+                 rate control {:?}, skip frames {}",
+                self.config.bitrate_bps,
+                self.config.keyframe_interval,
+                self.config.qp,
+                self.config.rate_control,
+                self.config.skip_frames,
+            );
+            return self.rebuild_encoder();
+        }
+
+        if let Some(bps) = bitrate_change {
+            if self.set_bitrate_live(bps) {
+                tracing::info!("H264Encoder: bitrate -> {bps} bps (seamless, no IDR)");
+            } else {
+                tracing::warn!("H264Encoder: live bitrate change rejected, rebuilding");
+                return self.rebuild_encoder();
+            }
+        }
+
+        Ok(())
     }
 
     /// Encode a YUV420 frame at the configured resolution.
@@ -549,12 +638,18 @@ impl H264Encoder {
             && previous != (width, height)
         {
             tracing::info!(
-                "H264Encoder: resolution {}x{} -> {}x{} (re-init, IDR)",
+                "H264Encoder: resolution {}x{} -> {}x{} (rebuild, IDR)",
                 previous.0,
                 previous.1,
                 width,
                 height
             );
+            // OpenH264 would re-initialise itself on the size change — but from
+            // the parameters it was *constructed* with, silently reverting any
+            // bitrate applied since through SetOption. Rebuilding from our own
+            // config keeps the config authoritative. A resolution change forces
+            // a fresh IDR either way, so this costs nothing extra.
+            self.rebuild_encoder()?;
         }
         self.dims = Some((width, height));
 
@@ -567,14 +662,22 @@ impl H264Encoder {
         // OpenH264 notices the dimension change itself: it re-initialises via
         // SetOption(SVC_ENCODE_PARAM_EXT) and forces an IDR. We only have to
         // stop pinning the size and let the frame through.
+        let started = std::time::Instant::now();
         let bitstream = self
             .encoder
             .encode(&yuv)
             .map_err(|e| Error::Config(format!("H.264 encode failed: {:?}", e)))?;
 
         let encoded = bitstream.to_vec();
-        self.frame_count += 1;
-        self.bytes_encoded += encoded.len() as u64;
+        let elapsed_ns = started.elapsed().as_nanos() as u64;
+
+        if encoded.is_empty() {
+            // Rate control swallowed the frame. Routine once skip_frames is on,
+            // and counted nowhere before this.
+            self.stats.record_rc_drop(elapsed_ns);
+        } else {
+            self.stats.record_frame(encoded.len(), elapsed_ns);
+        }
 
         Ok(encoded)
     }
@@ -597,12 +700,25 @@ impl H264Encoder {
 
     /// Get the number of frames encoded.
     pub fn frame_count(&self) -> u64 {
-        self.frame_count
+        self.stats.frames_encoded()
     }
 
     /// Get the total bytes encoded.
     pub fn bytes_encoded(&self) -> u64 {
-        self.bytes_encoded
+        self.stats.bytes_encoded()
+    }
+
+    /// A cloneable handle to this encoder's counters.
+    ///
+    /// Clone it *before* `executor.start()`: the element is moved into its
+    /// executor task there, so `frame_count()` and `bytes_encoded()` — plain
+    /// `&self` methods on the element — can never be called while it is actually
+    /// encoding. This handle can.
+    ///
+    /// It also exposes what those two never could: `frames_dropped_by_rc`
+    /// (frames rate control swallowed) and `last_encode_ns`.
+    pub fn stats(&self) -> EncoderStatsHandle {
+        self.stats.clone()
     }
 
     /// Get the encoder configuration.
@@ -627,8 +743,7 @@ impl std::fmt::Debug for H264Encoder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("H264Encoder")
             .field("config", &self.config)
-            .field("frame_count", &self.frame_count)
-            .field("bytes_encoded", &self.bytes_encoded)
+            .field("stats", &self.stats.snapshot())
             .finish()
     }
 }
@@ -737,7 +852,7 @@ impl Element for H264Encoder {
         let handle = crate::buffer::MemoryHandle::with_len(slot, encoded.len());
         // Preserve input buffer's PTS for proper timing, update sequence number
         let mut metadata = buffer.metadata().clone();
-        metadata.sequence = self.frame_count - 1;
+        metadata.sequence = self.frame_count().saturating_sub(1);
         // SYNC_POINT must reflect the ENCODED stream, not the input: raw
         // sources flag every uncompressed frame as a sync point, and a
         // delta AU wrongly advertised as a keyframe sends fresh decoders
@@ -1354,15 +1469,37 @@ mod tests {
     }
 
     #[test]
-    fn new_knobs_default_to_previous_behaviour() {
-        // Guards against a silent quality/bitrate regression for existing users.
+    fn the_defaults_hold_a_bitrate_budget_and_never_drop_frames() {
+        // These two defaults deliberately diverge from OpenH264's. A crate whose
+        // headline feature is live bandwidth control must treat the bitrate as a
+        // budget, not a hint — and it must shed quality rather than frames, so
+        // downstream fps accounting stays honest.
         let config = H264EncoderConfig::new();
-        assert_eq!(config.rate_control, RateControlMode::Quality);
+        assert_eq!(config.rate_control, RateControlMode::Bitrate);
+        assert_eq!(config.bitrate_bps, 2_000_000);
+        assert!(!config.skip_frames);
+
         assert_eq!(config.max_slice_len, None);
-        assert_eq!(config.skip_frames, None);
         assert_eq!(config.profile, None);
         assert_eq!(config.complexity, Complexity::Medium);
         assert_eq!(config.usage_type, UsageType::CameraRealtime);
+    }
+
+    #[test]
+    fn bitrate_mode_without_a_target_is_refused_not_silently_mishandled() {
+        // OpenH264 would fall back to ~120 kbps and drop most frames of real
+        // content. Refusing is the only honest option.
+        let config = H264EncoderConfig::new()
+            .rate_control(RateControlMode::Bitrate)
+            .bitrate(0);
+        let error = H264Encoder::new(config).unwrap_err().to_string();
+        assert!(error.contains("needs a bitrate target"), "got: {error}");
+
+        // Quality mode with no target is fine.
+        let config = H264EncoderConfig::new()
+            .rate_control(RateControlMode::Quality)
+            .bitrate(0);
+        assert!(H264Encoder::new(config).is_ok());
     }
 
     #[test]
@@ -1435,9 +1572,12 @@ mod tests {
     }
 
     #[test]
-    fn live_bitrate_change_emits_an_idr() {
+    fn a_live_bitrate_change_breaks_no_gop() {
         use crate::element::Element;
 
+        // A bitrate step goes through OpenH264's SetOption, so the GOP survives
+        // it. This used to rebuild the encoder and force an IDR — expensive, and
+        // brutal for a controller that steps the rate often.
         let mut config = H264EncoderConfig::new().bitrate(4_000_000);
         config.scene_change_detect = false;
         let mut encoder = H264Encoder::new(config).unwrap();
@@ -1457,15 +1597,66 @@ mod tests {
 
         assert_eq!(
             count_idr_nals(out.as_bytes()),
-            1,
-            "a rebuilt encoder must lead with an IDR so decoders get the new SPS/PPS"
+            0,
+            "a bitrate change must not force a keyframe"
         );
-        assert!(
-            out.metadata()
-                .flags
-                .contains(crate::metadata::BufferFlags::SYNC_POINT),
-            "and the buffer must be flagged as a sync point"
+        assert_eq!(encoder.config().bitrate_bps, 400_000);
+    }
+
+    #[test]
+    fn a_no_op_bitrate_change_does_nothing_at_all() {
+        use crate::element::Element;
+
+        // Setting a parameter to the value it already holds must not rebuild the
+        // encoder, and so must not force an IDR.
+        let mut config = H264EncoderConfig::new().bitrate(2_000_000);
+        config.scene_change_detect = false;
+        config.keyframe_interval = 0;
+        let mut encoder = H264Encoder::new(config).unwrap();
+        let control = encoder.control();
+
+        for i in 0..3 {
+            encoder
+                .process(yuv_buffer(&detailed_frame(320, 240, i), 320, 240))
+                .unwrap();
+        }
+
+        control.set_bitrate(2_000_000); // same value
+        control.set_qp(26); // same value
+        let out = encoder
+            .process(yuv_buffer(&detailed_frame(320, 240, 4), 320, 240))
+            .unwrap()
+            .expect("a frame");
+
+        assert_eq!(
+            count_idr_nals(out.as_bytes()),
+            0,
+            "a no-op reconfigure must not force a keyframe"
         );
+    }
+
+    #[test]
+    fn stats_count_frames_bytes_and_encode_time() {
+        use crate::element::Element;
+
+        let mut encoder = H264Encoder::new(H264EncoderConfig::new()).unwrap();
+        let stats = encoder.stats();
+        assert_eq!(stats.frames_encoded(), 0);
+
+        let mut total = 0u64;
+        for i in 0..5 {
+            let out = encoder
+                .process(yuv_buffer(&detailed_frame(320, 240, i), 320, 240))
+                .unwrap()
+                .expect("a frame");
+            total += out.as_bytes().len() as u64;
+        }
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.frames_encoded, 5);
+        assert_eq!(snapshot.bytes_encoded, total);
+        assert_eq!(snapshot.frames_dropped_by_rc, 0);
+        assert!(snapshot.last_encode_ns > 0);
     }
 
     #[test]
