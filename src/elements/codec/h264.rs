@@ -249,7 +249,7 @@ impl H264Encoder {
         })
     }
 
-    /// Encode a YUV420 frame.
+    /// Encode a YUV420 frame at the configured resolution.
     ///
     /// The input data must be in YUV420 planar format:
     /// - Y plane: width * height bytes
@@ -258,21 +258,55 @@ impl H264Encoder {
     ///
     /// Returns the encoded H.264 bitstream (NAL units).
     pub fn encode_yuv420(&mut self, yuv_data: &[u8]) -> Result<Vec<u8>> {
-        let expected_size = self.config.width as usize * self.config.height as usize * 3 / 2;
+        let (width, height) = (self.config.width, self.config.height);
+        self.encode_yuv420_at(yuv_data, width, height)
+    }
+
+    /// Encode a YUV420 frame of the given size, changing resolution if needed.
+    ///
+    /// A size different from the last frame's re-initialises the encoder and
+    /// starts a fresh IDR, so the switch is a clean decoder entry point. The
+    /// configured resolution follows the frames — it is a seed, not a contract.
+    pub fn encode_yuv420_at(
+        &mut self,
+        yuv_data: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>> {
+        check_resolution(width, height)?;
+
+        let expected_size = width as usize * height as usize * 3 / 2;
         if yuv_data.len() < expected_size {
             return Err(Error::Config(format!(
-                "YUV data too small: expected {} bytes, got {}",
+                "YUV data too small: expected {} bytes for {}x{}, got {}",
                 expected_size,
+                width,
+                height,
                 yuv_data.len()
             )));
         }
 
+        if (width, height) != (self.config.width, self.config.height) {
+            tracing::info!(
+                "H264Encoder: resolution {}x{} -> {}x{} (re-init, IDR)",
+                self.config.width,
+                self.config.height,
+                width,
+                height
+            );
+            self.config.width = width;
+            self.config.height = height;
+        }
+
         let yuv = YuvFrame {
             data: yuv_data,
-            width: self.config.width as usize,
-            height: self.config.height as usize,
+            width: width as usize,
+            height: height as usize,
         };
 
+        // OpenH264 notices the dimension change itself: it re-initialises via
+        // SetOption(SVC_ENCODE_PARAM_EXT) and forces an IDR. We only have to
+        // stop pinning the size and let the frame through.
         let bitstream = self
             .encoder
             .encode(&yuv)
@@ -327,6 +361,23 @@ impl std::fmt::Debug for H264Encoder {
     }
 }
 
+/// OpenH264's hard ceiling: it supports up to level 5.2, i.e. 3840x2160 in
+/// either orientation, and errors out beyond that.
+fn check_resolution(width: u32, height: u32) -> Result<()> {
+    if width == 0 || height == 0 {
+        return Err(Error::Config(format!(
+            "H.264 resolution must be non-zero, got {width}x{height}"
+        )));
+    }
+    let (long, short) = (width.max(height), width.min(height));
+    if long > 3840 || short > 2160 {
+        return Err(Error::Config(format!(
+            "H.264 resolution {width}x{height} exceeds OpenH264's 3840x2160 limit"
+        )));
+    }
+    Ok(())
+}
+
 /// Returns true if the Annex-B bitstream contains an IDR NAL unit (type 5).
 fn contains_idr(data: &[u8]) -> bool {
     let mut i = 0;
@@ -362,8 +413,15 @@ impl Element for H264Encoder {
             self.encoder.force_intra_frame();
         }
 
+        // The frame's own metadata decides the resolution: an upstream scaler
+        // can retarget mid-stream, and the encoder follows it.
+        let (width, height) = buffer
+            .metadata()
+            .video_dims()
+            .unwrap_or((self.config.width, self.config.height));
+
         let input_data = buffer.as_bytes();
-        let encoded = self.encode_yuv420(input_data)?;
+        let encoded = self.encode_yuv420_at(input_data, width, height)?;
 
         if encoded.is_empty() {
             return Ok(None);
@@ -440,15 +498,10 @@ impl super::traits::VideoEncoder for H264Encoder {
     type Packet = Vec<u8>;
 
     fn encode(&mut self, frame: &super::common::VideoFrame) -> Result<Vec<Self::Packet>> {
-        // Validate frame dimensions match encoder config
-        if frame.width != self.config.width || frame.height != self.config.height {
-            return Err(Error::Config(format!(
-                "Frame dimensions {}x{} don't match encoder config {}x{}",
-                frame.width, frame.height, self.config.width, self.config.height
-            )));
-        }
-
-        let encoded = self.encode_yuv420(&frame.data)?;
+        // A frame of a different size is not an error: OpenH264 re-initialises
+        // and emits a fresh IDR, which is exactly how a live resolution change
+        // is supposed to look.
+        let encoded = self.encode_yuv420_at(&frame.data, frame.width, frame.height)?;
 
         if encoded.is_empty() {
             Ok(Vec::new())
@@ -827,6 +880,103 @@ mod tests {
             }
         }
         data
+    }
+
+    /// The switch itself: a differently-sized frame must encode, must produce a
+    /// decodable stream at the new size, and must lead with an IDR so a decoder
+    /// (and any viewer joining after it) can follow the change.
+    #[test]
+    fn resolution_change_mid_stream_reinits_and_emits_an_idr() {
+        let mut config = H264EncoderConfig::new(320, 240);
+        config.scene_change_detect = false; // no incidental IDRs
+        let mut encoder = H264Encoder::new(config).unwrap();
+        let mut decoder = H264Decoder::new().unwrap();
+
+        let mut sizes = Vec::new();
+        for i in 0..6 {
+            // Halve the resolution half-way through.
+            let (w, h) = if i < 3 { (320, 240) } else { (160, 120) };
+            let encoded = encoder
+                .encode_yuv420_at(&detailed_frame(w, h, i as u8), w as u32, h as u32)
+                .unwrap();
+
+            if i == 3 {
+                assert_eq!(
+                    count_idr_nals(&encoded),
+                    1,
+                    "the first frame at the new size must be an IDR"
+                );
+            }
+
+            if let Some(frame) = decoder.decode(&encoded).unwrap() {
+                sizes.push((frame.width(), frame.height()));
+            }
+        }
+
+        assert!(
+            sizes.contains(&(320, 240)) && sizes.contains(&(160, 120)),
+            "decoded frames must change size mid-stream, got {sizes:?}"
+        );
+    }
+
+    /// The encoder follows the frames rather than pinning its constructor size.
+    #[test]
+    fn config_dimensions_track_the_encoded_frames() {
+        let mut encoder = H264Encoder::new(H264EncoderConfig::new(320, 240)).unwrap();
+        encoder
+            .encode_yuv420_at(&detailed_frame(160, 120, 0), 160, 120)
+            .unwrap();
+
+        assert_eq!(
+            (encoder.config().width, encoder.config().height),
+            (160, 120)
+        );
+    }
+
+    /// VideoEncoder::encode used to hard-error on any size mismatch.
+    #[test]
+    fn video_encoder_trait_accepts_a_changed_frame_size() {
+        use super::super::common::{PixelFormat as CodecPixelFormat, VideoFrame};
+        use super::super::traits::VideoEncoder;
+
+        let mut encoder = H264Encoder::new(H264EncoderConfig::new(320, 240)).unwrap();
+        let frame = VideoFrame {
+            width: 160,
+            height: 120,
+            format: CodecPixelFormat::I420,
+            pts: 0,
+            data: detailed_frame(160, 120, 0),
+            stride_y: 160,
+            stride_u: 80,
+            stride_v: 80,
+        };
+
+        let packets = encoder.encode(&frame).expect("a resize is not an error");
+        assert!(!packets.is_empty());
+    }
+
+    #[test]
+    fn oversized_resolution_is_rejected_clearly() {
+        let mut encoder = H264Encoder::new(H264EncoderConfig::new(320, 240)).unwrap();
+        let err = encoder
+            .encode_yuv420_at(&[0u8; 16], 4096, 2160)
+            .expect_err("beyond OpenH264's 3840x2160 ceiling");
+
+        assert!(
+            err.to_string().contains("3840x2160"),
+            "the limit should be named, not surfaced as an opaque FFI failure: {err}"
+        );
+    }
+
+    #[test]
+    fn undersized_buffer_is_rejected_for_the_declared_size() {
+        let mut encoder = H264Encoder::new(H264EncoderConfig::new(320, 240)).unwrap();
+        // Claims 320x240 but carries a 160x120 frame's worth of bytes.
+        let err = encoder
+            .encode_yuv420_at(&detailed_frame(160, 120, 0), 320, 240)
+            .expect_err("must not read past the end of the buffer");
+
+        assert!(err.to_string().contains("too small"), "{err}");
     }
 
     #[test]
