@@ -43,8 +43,8 @@ use crate::pipeline::rt_scheduler::{
 };
 use crate::pipeline::tracer::TracerRegistry;
 use crate::pipeline::{
-    DriverConfig, EventReceiver, EventSender, NodeId, Pipeline, PipelineEvent, PipelineState,
-    TimerDriver,
+    DriverConfig, EventReceiver, EventSender, LinkPolicy, NodeId, Pipeline, PipelineEvent,
+    PipelineState, TimerDriver,
 };
 use kanal::{AsyncReceiver, AsyncSender, bounded_async};
 use std::collections::{HashMap, HashSet};
@@ -751,7 +751,8 @@ impl Executor {
     fn build_channels(&self, pipeline: &Pipeline, node_id: NodeId, network: &mut ChannelNetwork) {
         for (child_id, link) in pipeline.children(node_id) {
             if !network.has_channel(node_id, &link.src_pad, child_id, &link.sink_pad) {
-                let (tx, rx) = bounded_async::<Message>(self.config.channel_capacity);
+                let capacity = link.capacity.unwrap_or(self.config.channel_capacity);
+                let (tx, rx) = bounded_async::<Message>(capacity);
                 network.add_channel(
                     node_id,
                     link.src_pad.clone(),
@@ -759,6 +760,8 @@ impl Executor {
                     link.sink_pad.clone(),
                     tx,
                     rx,
+                    link.policy,
+                    node_name(pipeline, child_id),
                 );
             }
             self.build_channels(pipeline, child_id, network);
@@ -787,7 +790,8 @@ impl Executor {
 
             if async_set.contains(&child_id) {
                 if !network.has_channel(node_id, &link.src_pad, child_id, &link.sink_pad) {
-                    let (tx, rx) = bounded_async::<Message>(self.config.channel_capacity);
+                    let capacity = link.capacity.unwrap_or(self.config.channel_capacity);
+                    let (tx, rx) = bounded_async::<Message>(capacity);
                     network.add_channel(
                         node_id,
                         link.src_pad.clone(),
@@ -795,6 +799,8 @@ impl Executor {
                         link.sink_pad.clone(),
                         tx,
                         rx,
+                        link.policy,
+                        node_name(pipeline, child_id),
                     );
                 }
                 self.build_channels_for_async(
@@ -968,14 +974,29 @@ impl Executor {
                 input_bridges,
                 output_bridges,
                 events_clone,
+                tracers,
             ),
             ElementType::Demuxer => {
                 let outputs_by_pad = channels.take_outputs_by_pad(node_id);
-                spawn_demuxer_task(node_name, element, inputs, outputs_by_pad, events_clone)
+                spawn_demuxer_task(
+                    node_name,
+                    element,
+                    inputs,
+                    outputs_by_pad,
+                    events_clone,
+                    tracers,
+                )
             }
             ElementType::Muxer => {
                 let inputs_by_pad = channels.take_inputs_by_pad(node_id);
-                spawn_muxer_task(node_name, element, inputs_by_pad, outputs, events_clone)
+                spawn_muxer_task(
+                    node_name,
+                    element,
+                    inputs_by_pad,
+                    outputs,
+                    events_clone,
+                    tracers,
+                )
             }
         };
 
@@ -1031,9 +1052,79 @@ enum Message {
 
 type ChannelKey = (NodeId, String, NodeId, String);
 
+/// One downstream branch of a src-pad, with the policy of the link that made it.
+///
+/// The old code flattened a pad's outputs to a bare `Vec<AsyncSender>`, which
+/// threw away *which branch is which* — and with it any chance of treating a
+/// slow branch differently from a fast one.
+#[derive(Clone)]
+struct OutputBranch {
+    tx: AsyncSender<Message>,
+    policy: LinkPolicy,
+    /// Name of the element on the far end, for drop reporting.
+    sink_name: String,
+}
+
+impl OutputBranch {
+    /// Send a buffer, honouring the link policy.
+    ///
+    /// kanal's `try_send` returns `Ok(false)` when the channel is **full** (not
+    /// an error) and `Err` only when it is closed — easy to get backwards.
+    async fn send_buffer(&self, buffer: Buffer, tracers: &TracerRegistry) {
+        match self.policy {
+            LinkPolicy::Block => {
+                let _ = self.tx.send(Message::Buffer(buffer)).await;
+            }
+            LinkPolicy::Drop => match self.tx.try_send(Message::Buffer(buffer)) {
+                Ok(true) => {}
+                Ok(false) => tracers.notify_drop(&self.sink_name),
+                Err(_) => {} // closed
+            },
+        }
+    }
+}
+
+/// Broadcast one buffer to every branch of a pad.
+///
+/// Blocking branches are awaited **concurrently**, not one after another: a
+/// sequential loop makes each branch wait for the ones before it, which shows up
+/// as latency skew between equal-speed branches. The single-output case — the
+/// overwhelmingly common one — takes a direct await and allocates nothing.
+async fn broadcast(branches: &[OutputBranch], buffer: Buffer, tracers: &TracerRegistry) {
+    match branches {
+        [] => {}
+        [only] => only.send_buffer(buffer, tracers).await,
+        many => {
+            futures::future::join_all(
+                many.iter()
+                    .map(|branch| branch.send_buffer(buffer.clone(), tracers)),
+            )
+            .await;
+        }
+    }
+}
+
+/// Send EOS to every branch, **always blocking**.
+///
+/// A dropped EOS would leave the branch's sink waiting forever, so `Drop` does
+/// not apply to it. Only buffers are ever dropped.
+async fn broadcast_eos(branches: &[OutputBranch]) {
+    for branch in branches {
+        let _ = branch.tx.send(Message::Eos).await;
+    }
+}
+
+/// Name of a node, for drop reporting on the link that feeds it.
+fn node_name(pipeline: &Pipeline, node_id: NodeId) -> String {
+    pipeline
+        .get_node(node_id)
+        .map(|n| n.name().to_string())
+        .unwrap_or_default()
+}
+
 struct ChannelNetwork {
     channels: HashMap<ChannelKey, (AsyncSender<Message>, AsyncReceiver<Message>)>,
-    outputs: HashMap<(NodeId, String), Vec<AsyncSender<Message>>>,
+    outputs: HashMap<(NodeId, String), Vec<OutputBranch>>,
     inputs: HashMap<(NodeId, String), Vec<AsyncReceiver<Message>>>,
 }
 
@@ -1051,6 +1142,7 @@ impl ChannelNetwork {
             .contains_key(&(src, src_pad.to_string(), sink, sink_pad.to_string()))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn add_channel(
         &mut self,
         src: NodeId,
@@ -1059,16 +1151,25 @@ impl ChannelNetwork {
         sink_pad: String,
         tx: AsyncSender<Message>,
         rx: AsyncReceiver<Message>,
+        policy: LinkPolicy,
+        sink_name: String,
     ) {
         self.channels.insert(
             (src, src_pad.clone(), sink, sink_pad.clone()),
             (tx.clone(), rx.clone()),
         );
-        self.outputs.entry((src, src_pad)).or_default().push(tx);
+        self.outputs
+            .entry((src, src_pad))
+            .or_default()
+            .push(OutputBranch {
+                tx,
+                policy,
+                sink_name,
+            });
         self.inputs.entry((sink, sink_pad)).or_default().push(rx);
     }
 
-    fn take_outputs_by_pad(&mut self, node: NodeId) -> HashMap<String, Vec<AsyncSender<Message>>> {
+    fn take_outputs_by_pad(&mut self, node: NodeId) -> HashMap<String, Vec<OutputBranch>> {
         let mut result = HashMap::new();
         let keys: Vec<_> = self
             .outputs
@@ -1100,7 +1201,7 @@ impl ChannelNetwork {
         result
     }
 
-    fn take_outputs(&mut self, node: NodeId) -> Vec<AsyncSender<Message>> {
+    fn take_outputs(&mut self, node: NodeId) -> Vec<OutputBranch> {
         self.take_outputs_by_pad(node)
             .into_values()
             .flatten()
@@ -1124,7 +1225,7 @@ fn spawn_source_task(
     name: String,
     node_id: NodeId,
     mut element: Box<DynAsyncElement<'static>>,
-    outputs: Vec<AsyncSender<Message>>,
+    outputs: Vec<OutputBranch>,
     output_bridges: Vec<Arc<AsyncRtBridge>>,
     events: EventSender,
     probe_registry: ProbeRegistry,
@@ -1145,9 +1246,7 @@ fn spawn_source_task(
             // downstream drains cleanly.
             if stop.load(Ordering::Acquire) {
                 tracing::info!("source '{}': stopped after {} buffers", name, count);
-                for tx in &outputs {
-                    let _ = tx.send(Message::Eos).await;
-                }
+                broadcast_eos(&outputs).await;
                 for bridge in &output_bridges {
                     bridge.signal_eos();
                 }
@@ -1175,9 +1274,7 @@ fn spawn_source_task(
                         count,
                         buffer.len()
                     );
-                    for tx in &outputs {
-                        let _ = tx.send(Message::Buffer(buffer.clone())).await;
-                    }
+                    broadcast(&outputs, buffer.clone(), &tracers).await;
                     for bridge in &output_bridges {
                         let _ = bridge.push_async(buffer.clone()).await;
                     }
@@ -1196,9 +1293,7 @@ fn spawn_source_task(
                 }
                 Ok(SourceResult::Eos) => {
                     tracing::info!("source '{}': EOS after {} buffers", name, count);
-                    for tx in &outputs {
-                        let _ = tx.send(Message::Eos).await;
-                    }
+                    broadcast_eos(&outputs).await;
                     for bridge in &output_bridges {
                         bridge.signal_eos();
                     }
@@ -1210,9 +1305,7 @@ fn spawn_source_task(
                     // A failed source will never produce again — propagate EOS
                     // downstream (like the Eos arm) so sinks terminate instead
                     // of waiting forever on a wedged pipeline.
-                    for tx in &outputs {
-                        let _ = tx.send(Message::Eos).await;
-                    }
+                    broadcast_eos(&outputs).await;
                     for bridge in &output_bridges {
                         bridge.signal_eos();
                     }
@@ -1303,14 +1396,16 @@ fn spawn_sink_task(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_transform_task(
     name: String,
     mut element: Box<DynAsyncElement<'static>>,
     inputs: Vec<AsyncReceiver<Message>>,
-    outputs: Vec<AsyncSender<Message>>,
+    outputs: Vec<OutputBranch>,
     input_bridges: Vec<Arc<AsyncRtBridge>>,
     output_bridges: Vec<Arc<AsyncRtBridge>>,
     events: EventSender,
+    tracers: TracerRegistry,
 ) -> JoinHandle<Result<()>> {
     tokio::spawn(async move {
         tracing::debug!("transform '{}' started", name);
@@ -1321,22 +1416,19 @@ fn spawn_transform_task(
         /// Helper to send output buffer to all downstream channels and bridges.
         async fn send_output(
             buffer: Buffer,
-            outputs: &[AsyncSender<Message>],
+            outputs: &[OutputBranch],
             output_bridges: &[Arc<AsyncRtBridge>],
+            tracers: &TracerRegistry,
         ) {
-            for tx in outputs {
-                let _ = tx.send(Message::Buffer(buffer.clone())).await;
-            }
+            broadcast(outputs, buffer.clone(), tracers).await;
             for bridge in output_bridges {
                 let _ = bridge.push_async(buffer.clone()).await;
             }
         }
 
         /// Helper to send EOS to all downstream channels and bridges.
-        async fn send_eos(outputs: &[AsyncSender<Message>], output_bridges: &[Arc<AsyncRtBridge>]) {
-            for tx in outputs {
-                let _ = tx.send(Message::Eos).await;
-            }
+        async fn send_eos(outputs: &[OutputBranch], output_bridges: &[Arc<AsyncRtBridge>]) {
+            broadcast_eos(outputs).await;
             for bridge in output_bridges {
                 bridge.signal_eos();
             }
@@ -1362,7 +1454,7 @@ fn spawn_transform_task(
                                     name,
                                     out.len()
                                 );
-                                send_output(out, &outputs, &output_bridges).await;
+                                send_output(out, &outputs, &output_bridges, &tracers).await;
                             }
                             Ok(None) => {
                                 tracing::debug!(
@@ -1401,7 +1493,7 @@ fn spawn_transform_task(
                                     buffers.len()
                                 );
                                 for buffer in buffers {
-                                    send_output(buffer, &outputs, &output_bridges).await;
+                                    send_output(buffer, &outputs, &output_bridges, &tracers).await;
                                 }
                             }
                             Err(e) => {
@@ -1424,7 +1516,7 @@ fn spawn_transform_task(
                     count += 1;
                     match element.process(Some(buffer)).await {
                         Ok(Some(out)) => {
-                            send_output(out, &outputs, &output_bridges).await;
+                            send_output(out, &outputs, &output_bridges, &tracers).await;
                         }
                         Ok(None) => {}
                         Err(e) => {
@@ -1443,7 +1535,7 @@ fn spawn_transform_task(
                                 Output::Multiple(v) => v,
                             };
                             for buffer in buffers {
-                                send_output(buffer, &outputs, &output_bridges).await;
+                                send_output(buffer, &outputs, &output_bridges, &tracers).await;
                             }
                         }
                         Err(e) => {
@@ -1472,8 +1564,9 @@ fn spawn_demuxer_task(
     name: String,
     mut element: Box<DynAsyncElement<'static>>,
     inputs: Vec<AsyncReceiver<Message>>,
-    outputs_by_pad: HashMap<String, Vec<AsyncSender<Message>>>,
+    outputs_by_pad: HashMap<String, Vec<OutputBranch>>,
     events: EventSender,
+    tracers: TracerRegistry,
 ) -> JoinHandle<Result<()>> {
     tokio::spawn(async move {
         tracing::debug!("demuxer '{}' started", name);
@@ -1488,10 +1581,8 @@ fn spawn_demuxer_task(
                         count += 1;
                         match element.process(Some(buffer)).await {
                             Ok(Some(out)) => {
-                                for senders in outputs_by_pad.values() {
-                                    for tx in senders {
-                                        let _ = tx.send(Message::Buffer(out.clone())).await;
-                                    }
+                                for branches in outputs_by_pad.values() {
+                                    broadcast(branches, out.clone(), &tracers).await;
                                 }
                             }
                             Ok(None) => {}
@@ -1511,10 +1602,8 @@ fn spawn_demuxer_task(
                                     Output::Multiple(v) => v,
                                 };
                                 for buffer in buffers {
-                                    for senders in outputs_by_pad.values() {
-                                        for tx in senders {
-                                            let _ = tx.send(Message::Buffer(buffer.clone())).await;
-                                        }
+                                    for branches in outputs_by_pad.values() {
+                                        broadcast(branches, buffer.clone(), &tracers).await;
                                     }
                                 }
                             }
@@ -1522,10 +1611,8 @@ fn spawn_demuxer_task(
                                 tracing::warn!("flush error in '{}': {}", name, e);
                             }
                         }
-                        for senders in outputs_by_pad.values() {
-                            for tx in senders {
-                                let _ = tx.send(Message::Eos).await;
-                            }
+                        for branches in outputs_by_pad.values() {
+                            broadcast_eos(branches).await;
                         }
                         break;
                     }
@@ -1538,12 +1625,14 @@ fn spawn_demuxer_task(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_muxer_task(
     name: String,
     mut element: Box<DynAsyncElement<'static>>,
     inputs_by_pad: HashMap<String, Vec<AsyncReceiver<Message>>>,
-    outputs: Vec<AsyncSender<Message>>,
+    outputs: Vec<OutputBranch>,
     events: EventSender,
+    tracers: TracerRegistry,
 ) -> JoinHandle<Result<()>> {
     use futures::stream::{FuturesUnordered, StreamExt};
 
@@ -1572,9 +1661,7 @@ fn spawn_muxer_task(
                     count += 1;
                     match element.process(Some(buffer)).await {
                         Ok(Some(out)) => {
-                            for tx in &outputs {
-                                let _ = tx.send(Message::Buffer(out.clone())).await;
-                            }
+                            broadcast(&outputs, out, &tracers).await;
                         }
                         Ok(None) => {}
                         Err(e) => {
@@ -1588,9 +1675,7 @@ fn spawn_muxer_task(
                     if eos_count >= total {
                         // Flush any remaining data from final processing
                         if let Ok(Some(out)) = element.process(None).await {
-                            for tx in &outputs {
-                                let _ = tx.send(Message::Buffer(out.clone())).await;
-                            }
+                            broadcast(&outputs, out, &tracers).await;
                         }
                         // Flush any buffered data before propagating EOS
                         match element.flush().await {
@@ -1601,18 +1686,14 @@ fn spawn_muxer_task(
                                     Output::Multiple(v) => v,
                                 };
                                 for buffer in buffers {
-                                    for tx in &outputs {
-                                        let _ = tx.send(Message::Buffer(buffer.clone())).await;
-                                    }
+                                    broadcast(&outputs, buffer, &tracers).await;
                                 }
                             }
                             Err(e) => {
                                 tracing::warn!("flush error in '{}': {}", name, e);
                             }
                         }
-                        for tx in &outputs {
-                            let _ = tx.send(Message::Eos).await;
-                        }
+                        broadcast_eos(&outputs).await;
                         break;
                     }
                 }
