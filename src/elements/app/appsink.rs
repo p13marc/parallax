@@ -8,6 +8,7 @@ use crate::error::{Error, Result};
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
+use tokio::sync::Notify;
 
 /// A sink element that allows applications to extract buffers from a pipeline.
 ///
@@ -38,6 +39,13 @@ struct AppSinkInner {
     state: Mutex<AppSinkState>,
     data_available: Condvar,
     space_available: Condvar,
+    /// Async counterparts of the two condvars.
+    ///
+    /// The queue is a `Mutex<VecDeque>` + `Condvar`, not a channel, so there is
+    /// no `recv_async()` to reach for — an async consumer needs its own wakeup
+    /// path. `Notify` is signalled everywhere the condvars are.
+    data_available_async: Notify,
+    space_available_async: Notify,
 }
 
 struct AppSinkState {
@@ -82,6 +90,8 @@ impl AppSink {
                 }),
                 data_available: Condvar::new(),
                 space_available: Condvar::new(),
+                data_available_async: Notify::new(),
+                space_available_async: Notify::new(),
             }),
         }
     }
@@ -134,6 +144,7 @@ impl AppSink {
         let mut state = self.inner.state.lock().unwrap();
         state.eos = true;
         self.inner.data_available.notify_all();
+        self.inner.data_available_async.notify_waiters();
     }
 }
 
@@ -151,7 +162,14 @@ impl Sink for AppSink {
             return Err(Error::Element("appsink is flushing".into()));
         }
 
-        // Handle full queue
+        // Handle full queue.
+        //
+        // NOTE: this condvar wait blocks the executor task's thread — a tokio
+        // worker — until the application pulls. That is the *designed*
+        // back-pressure path (AppSrc::produce deliberately refuses to do the
+        // same and returns WouldBlock instead), but it is worth knowing about:
+        // an application that stops pulling stalls a runtime worker. Use
+        // `drop_on_full(true)` when the consumer is allowed to fall behind.
         while state.queue.len() >= state.max_buffers && !state.flushing {
             if state.drop_on_full {
                 state.total_dropped += 1;
@@ -169,6 +187,7 @@ impl Sink for AppSink {
         state.total_received += 1;
 
         self.inner.data_available.notify_one();
+        self.inner.data_available_async.notify_one();
         Ok(())
     }
 
@@ -224,9 +243,68 @@ impl AppSinkHandle {
         if let Some(buffer) = state.queue.pop_front() {
             state.total_pulled += 1;
             self.inner.space_available.notify_one();
+            self.inner.space_available_async.notify_one();
             Ok(Some(buffer))
         } else {
             Ok(None)
+        }
+    }
+
+    /// Pull a buffer, awaiting one if the queue is empty.
+    ///
+    /// The async twin of [`pull_buffer`](Self::pull_buffer): it yields the task
+    /// instead of parking the thread, so a consumer can `select!` over it.
+    /// Returns `Ok(None)` at EOS with an empty queue.
+    pub async fn pull_buffer_async(&self) -> Result<Option<Buffer>> {
+        loop {
+            // Register for the wakeup *before* looking at the queue, or a push
+            // landing between the check and the await would be missed.
+            let notified = self.inner.data_available_async.notified();
+
+            {
+                let mut state = self.inner.state.lock().unwrap();
+                if state.flushing {
+                    return Err(Error::Element("appsink is flushing".into()));
+                }
+                if let Some(buffer) = state.queue.pop_front() {
+                    state.total_pulled += 1;
+                    self.inner.space_available.notify_one();
+                    self.inner.space_available_async.notify_one();
+                    return Ok(Some(buffer));
+                }
+                if state.eos {
+                    return Ok(None);
+                }
+            }
+
+            notified.await;
+        }
+    }
+
+    /// Pull a buffer asynchronously, giving up after `timeout`.
+    ///
+    /// Returns `Ok(None)` on timeout or at EOS.
+    pub async fn pull_buffer_timeout_async(&self, timeout: Duration) -> Result<Option<Buffer>> {
+        match tokio::time::timeout(timeout, self.pull_buffer_async()).await {
+            Ok(result) => result,
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Statistics for this sink.
+    ///
+    /// The element itself is moved into its executor task at `start()`, so
+    /// `AppSink::stats()` cannot be called on a running pipeline. This can —
+    /// which is what makes `total_dropped`, the number a live consumer actually
+    /// cares about, readable at all.
+    pub fn stats(&self) -> AppSinkStats {
+        let state = self.inner.state.lock().unwrap();
+        AppSinkStats {
+            queued_buffers: state.queue.len(),
+            total_received: state.total_received,
+            total_pulled: state.total_pulled,
+            total_dropped: state.total_dropped,
+            eos: state.eos,
         }
     }
 
@@ -237,6 +315,7 @@ impl AppSinkHandle {
         if let Some(buffer) = state.queue.pop_front() {
             state.total_pulled += 1;
             self.inner.space_available.notify_one();
+            self.inner.space_available_async.notify_one();
             Some(buffer)
         } else {
             None
@@ -250,6 +329,8 @@ impl AppSinkHandle {
         if flushing {
             self.inner.data_available.notify_all();
             self.inner.space_available.notify_all();
+            self.inner.data_available_async.notify_waiters();
+            self.inner.space_available_async.notify_waiters();
         }
     }
 
@@ -258,6 +339,7 @@ impl AppSinkHandle {
         let mut state = self.inner.state.lock().unwrap();
         state.queue.clear();
         self.inner.space_available.notify_all();
+        self.inner.space_available_async.notify_waiters();
     }
 
     /// Get the current queue length.
@@ -465,5 +547,68 @@ mod tests {
         assert_eq!(stats.total_received, 2);
         assert_eq!(stats.total_pulled, 1);
         assert_eq!(stats.queued_buffers, 1);
+    }
+
+    #[tokio::test]
+    async fn pull_buffer_async_wakes_when_a_buffer_arrives() {
+        let mut sink = AppSink::new();
+        let handle = sink.handle();
+
+        // Nothing queued yet: the pull must wait, not spin or return None.
+        let pull = tokio::spawn(async move { handle.pull_buffer_async().await });
+
+        tokio::task::yield_now().await;
+
+        let buf = create_test_buffer(7);
+        let ctx = ConsumeContext::new(&buf);
+        sink.consume(&ctx).unwrap();
+
+        let pulled = pull.await.unwrap().unwrap().expect("a buffer");
+        assert_eq!(pulled.metadata().sequence, 7);
+    }
+
+    #[tokio::test]
+    async fn pull_buffer_async_returns_none_at_eos() {
+        let sink = AppSink::new();
+        let handle = sink.handle();
+
+        let pull = tokio::spawn(async move { handle.pull_buffer_async().await });
+        tokio::task::yield_now().await;
+
+        sink.send_eos();
+        assert!(pull.await.unwrap().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn pull_buffer_timeout_async_gives_up() {
+        let sink = AppSink::new();
+        let handle = sink.handle();
+
+        let result = handle
+            .pull_buffer_timeout_async(Duration::from_millis(20))
+            .await
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "no data and no EOS: time out, do not hang"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_handle_exposes_stats_including_drops() {
+        let mut sink = AppSink::with_max_buffers(1).drop_on_full(true);
+        let handle = sink.handle();
+
+        for seq in 0..3 {
+            let buf = create_test_buffer(seq);
+            let ctx = ConsumeContext::new(&buf);
+            sink.consume(&ctx).unwrap();
+        }
+
+        // AppSink::stats() is unreachable on a running pipeline (the element is
+        // moved into its task); the handle's is not.
+        let stats = handle.stats();
+        assert_eq!(stats.total_received, 1);
+        assert_eq!(stats.total_dropped, 2);
     }
 }
