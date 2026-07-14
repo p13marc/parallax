@@ -960,20 +960,24 @@ impl Executor {
             ),
             ElementType::Sink => spawn_sink_task(
                 node_name,
+                node_id,
                 element,
                 inputs,
                 input_bridges,
                 events_clone,
+                probes,
                 tracers,
             ),
             ElementType::Transform => spawn_transform_task(
                 node_name,
+                node_id,
                 element,
                 inputs,
                 outputs,
                 input_bridges,
                 output_bridges,
                 events_clone,
+                probes,
                 tracers,
             ),
             ElementType::Demuxer => {
@@ -1319,18 +1323,22 @@ fn spawn_source_task(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_sink_task(
     name: String,
+    node_id: NodeId,
     mut element: Box<DynAsyncElement<'static>>,
     inputs: Vec<AsyncReceiver<Message>>,
     input_bridges: Vec<Arc<AsyncRtBridge>>,
     events: EventSender,
+    probe_registry: ProbeRegistry,
     tracers: TracerRegistry,
 ) -> JoinHandle<Result<()>> {
     tokio::spawn(async move {
         tracing::debug!("sink '{}' started", name);
         events.send_node_started(&name);
 
+        let sink_pad = crate::pipeline::probe::PadRef::sink(node_id);
         let mut count: u64 = 0;
 
         let n_inputs = inputs.len();
@@ -1342,6 +1350,10 @@ fn spawn_sink_task(
                     Ok(Message::Buffer(buffer)) => {
                         count += 1;
                         tracing::debug!("sink '{}': received buffer {}", name, count);
+                        match probe_registry.invoke_buffer(&sink_pad, &buffer) {
+                            ProbeReturn::Drop | ProbeReturn::Handled => continue,
+                            _ => {}
+                        }
                         tracers.notify_buffer(&name, &buffer);
                         if let Err(e) = element.process(Some(buffer)).await {
                             events.send_error(e.to_string(), Some(name.clone()));
@@ -1399,18 +1411,22 @@ fn spawn_sink_task(
 #[allow(clippy::too_many_arguments)]
 fn spawn_transform_task(
     name: String,
+    node_id: NodeId,
     mut element: Box<DynAsyncElement<'static>>,
     inputs: Vec<AsyncReceiver<Message>>,
     outputs: Vec<OutputBranch>,
     input_bridges: Vec<Arc<AsyncRtBridge>>,
     output_bridges: Vec<Arc<AsyncRtBridge>>,
     events: EventSender,
+    probe_registry: ProbeRegistry,
     tracers: TracerRegistry,
 ) -> JoinHandle<Result<()>> {
     tokio::spawn(async move {
         tracing::debug!("transform '{}' started", name);
         events.send_node_started(&name);
 
+        let sink_pad = crate::pipeline::probe::PadRef::sink(node_id);
+        let src_pad = crate::pipeline::probe::PadRef::src(node_id);
         let mut count: u64 = 0;
 
         /// Helper to send output buffer to all downstream channels and bridges.
@@ -1447,13 +1463,33 @@ fn spawn_transform_task(
                             count,
                             buffer.len()
                         );
-                        match element.process(Some(buffer)).await {
+
+                        // Sink-pad probes see the input before the element does.
+                        match probe_registry.invoke_buffer(&sink_pad, &buffer) {
+                            ProbeReturn::Drop | ProbeReturn::Handled => continue,
+                            _ => {}
+                        }
+
+                        // LatencyTracer pairs notify_buffer with
+                        // notify_buffer_processed, so the second call must land
+                        // BEFORE send_output — otherwise a downstream
+                        // send().await sits between them and back-pressure gets
+                        // billed as this element's processing time.
+                        tracers.notify_buffer(&name, &buffer);
+                        let result = element.process(Some(buffer)).await;
+                        tracers.notify_buffer_processed(&name);
+
+                        match result {
                             Ok(Some(out)) => {
                                 tracing::debug!(
                                     "transform '{}': produced output ({} bytes)",
                                     name,
                                     out.len()
                                 );
+                                match probe_registry.invoke_buffer(&src_pad, &out) {
+                                    ProbeReturn::Drop | ProbeReturn::Handled => continue,
+                                    _ => {}
+                                }
                                 send_output(out, &outputs, &output_bridges, &tracers).await;
                             }
                             Ok(None) => {
