@@ -665,126 +665,17 @@ impl Mp4FileSink {
 
     /// Extract SPS and PPS from H.264 NAL units.
     ///
-    /// Scans the data for NAL units and extracts SPS (type 7) and PPS (type 8).
+    /// Delegates to [`annexb::extract_param_sets`](crate::codec::annexb::extract_param_sets);
+    /// this shim exists only so callers of the sink keep working.
     pub fn extract_sps_pps(data: &[u8]) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
-        let mut sps = None;
-        let mut pps = None;
-        let mut i = 0;
-
-        while i + 4 < data.len() {
-            // Look for start code (0x00 0x00 0x00 0x01 or 0x00 0x00 0x01)
-            let start_code_len = if i + 4 <= data.len()
-                && data[i] == 0
-                && data[i + 1] == 0
-                && data[i + 2] == 0
-                && data[i + 3] == 1
-            {
-                4
-            } else if i + 3 <= data.len() && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
-                3
-            } else {
-                i += 1;
-                continue;
-            };
-
-            let nal_start = i + start_code_len;
-            if nal_start >= data.len() {
-                break;
-            }
-
-            let nal_type = data[nal_start] & 0x1F;
-
-            // Find end of this NAL unit (next start code or end of data)
-            let mut nal_end = data.len();
-            for j in (nal_start + 1)..(data.len().saturating_sub(2)) {
-                if (data[j] == 0 && data[j + 1] == 0 && data[j + 2] == 1)
-                    || (j + 3 < data.len()
-                        && data[j] == 0
-                        && data[j + 1] == 0
-                        && data[j + 2] == 0
-                        && data[j + 3] == 1)
-                {
-                    nal_end = j;
-                    break;
-                }
-            }
-
-            let nal_data = &data[nal_start..nal_end];
-
-            match nal_type {
-                7 => {
-                    // SPS
-                    sps = Some(nal_data.to_vec());
-                }
-                8 => {
-                    // PPS
-                    pps = Some(nal_data.to_vec());
-                }
-                _ => {}
-            }
-
-            i = nal_end;
-        }
-
-        (sps, pps)
+        crate::codec::annexb::extract_param_sets(data)
     }
 
-    /// Convert Annex-B format to AVCC format.
+    /// Convert Annex-B format to AVCC (length-prefixed) format, as MP4 requires.
     ///
-    /// Replaces start codes (0x00 0x00 0x00 0x01) with 4-byte length prefixes.
+    /// Delegates to [`annexb::annex_b_to_avcc`](crate::codec::annexb::annex_b_to_avcc).
     pub fn annex_b_to_avcc(data: &[u8]) -> Vec<u8> {
-        let mut result = Vec::with_capacity(data.len());
-        let mut i = 0;
-
-        while i < data.len() {
-            // Find start code
-            let start_code_len = if i + 4 <= data.len()
-                && data[i] == 0
-                && data[i + 1] == 0
-                && data[i + 2] == 0
-                && data[i + 3] == 1
-            {
-                4
-            } else if i + 3 <= data.len() && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
-                3
-            } else {
-                // No start code at this position, just copy byte
-                result.push(data[i]);
-                i += 1;
-                continue;
-            };
-
-            let nal_start = i + start_code_len;
-            if nal_start >= data.len() {
-                break;
-            }
-
-            // Find end of this NAL unit
-            let mut nal_end = data.len();
-            for j in (nal_start + 1)..(data.len().saturating_sub(2)) {
-                if (data[j] == 0 && data[j + 1] == 0 && data[j + 2] == 1)
-                    || (j + 3 < data.len()
-                        && data[j] == 0
-                        && data[j + 1] == 0
-                        && data[j + 2] == 0
-                        && data[j + 3] == 1)
-                {
-                    nal_end = j;
-                    break;
-                }
-            }
-
-            let nal_data = &data[nal_start..nal_end];
-            let nal_len = nal_data.len() as u32;
-
-            // Write 4-byte length prefix (big-endian)
-            result.extend_from_slice(&nal_len.to_be_bytes());
-            result.extend_from_slice(nal_data);
-
-            i = nal_end;
-        }
-
-        result
+        crate::codec::annexb::annex_b_to_avcc(data)
     }
 
     /// Initialize the muxer with the given SPS/PPS.

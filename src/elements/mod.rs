@@ -15,7 +15,7 @@
 //! Test pattern generators, video test sources, null elements
 //!
 //! ## [`flow`] - Flow Control and Routing
-//! Queue, tee, funnel, selectors, concat, valve
+//! Queue, inspect, funnel, selectors, concat, valve
 //!
 //! ## [`transform`] - Data Transformation
 //! Map, filter, batch, chunk, buffer operations, metadata operations
@@ -144,8 +144,8 @@ pub use testing::{
 // Flow control
 pub use flow::{
     Concat, ConcatStats, ConcatStream, Funnel, FunnelInput, FunnelStats, InputSelector,
-    InputSelectorStats, LeakyMode, OutputSelector, OutputSelectorStats, Queue, Queue2, Queue2Stats,
-    QueueStats, SelectorInput, SelectorOutput, Tee, Valve, ValveControl, ValveStats,
+    InputSelectorStats, Inspect, LeakyMode, OutputSelector, OutputSelectorStats, Queue, Queue2,
+    Queue2Stats, QueueStats, SelectorInput, SelectorOutput, Valve, ValveControl, ValveStats,
 };
 
 // Transform

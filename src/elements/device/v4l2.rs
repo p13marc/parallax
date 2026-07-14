@@ -297,6 +297,14 @@ impl V4l2Src {
                 DeviceError::NotFound(device_path.to_string())
             } else if e.kind() == std::io::ErrorKind::PermissionDenied {
                 DeviceError::PermissionDenied(device_path.to_string())
+            } else if e.kind() == std::io::ErrorKind::ResourceBusy
+                || e.raw_os_error() == Some(libc::EBUSY)
+            {
+                // The single most common camera failure: something else already
+                // has the device open. It was reaching callers as an opaque
+                // V4l2(io error), which cannot be matched on — so a supervisor
+                // could not tell "retry in a moment" from "this camera is gone".
+                DeviceError::Busy(device_path.to_string())
             } else {
                 DeviceError::V4l2(e)
             }

@@ -4,8 +4,11 @@
 //! - [`Queue`]: Async buffer queue with backpressure
 //! - [`Queue2`]: Advanced network buffering (stream/download/timeshift)
 //!
+//! ## Inspection
+//! - [`Inspect`]: 1-in/1-out passthrough counter (formerly, and misleadingly,
+//!   called `Tee` — fan-out needs no element: link one src-pad to several sinks)
+//!
 //! ## Routing
-//! - [`Tee`]: 1-to-N fanout (duplicates buffers)
 //! - [`Funnel`]: N-to-1 merge
 //! - [`InputSelector`]: N-to-1 switching (selects one input)
 //! - [`OutputSelector`]: 1-to-N routing (routes to one output)
@@ -16,19 +19,19 @@
 
 mod concat;
 mod funnel;
+mod inspect;
 mod queue;
 mod queue2;
 mod selector;
-mod tee;
 mod valve;
 
 pub use concat::{Concat, ConcatStats, ConcatStream};
 pub use funnel::{Funnel, FunnelInput, FunnelStats};
+pub use inspect::Inspect;
 pub use queue::{LeakyMode, Queue, QueueStats};
 pub use queue2::{BufferingAction, BufferingConfig, DownloadedRanges, Queue2, Queue2Stats};
 pub use selector::{
     InputSelector, InputSelectorStats, OutputSelector, OutputSelectorStats, SelectorInput,
     SelectorOutput,
 };
-pub use tee::Tee;
 pub use valve::{Valve, ValveControl, ValveStats};

@@ -1,6 +1,6 @@
 //! Integration tests for the Parallax pipeline system.
 
-use parallax::elements::{NullSink, NullSource, PassThrough, Tee};
+use parallax::elements::{Inspect, NullSink, NullSource, PassThrough};
 use parallax::pipeline::{Executor, Pipeline};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,13 +35,13 @@ async fn test_source_passthrough_sink() {
     executor.run(&mut pipeline).await.unwrap();
 }
 
-/// Test a pipeline with a Tee element for statistics.
+/// Test a pipeline with an Inspect element for statistics.
 #[tokio::test]
 async fn test_source_tee_sink() {
     let mut pipeline = Pipeline::new();
 
     let src = pipeline.add_source("src", NullSource::new(25));
-    let tee = pipeline.add_filter("tee", Tee::new());
+    let tee = pipeline.add_filter("inspect", Inspect::new());
     let sink = pipeline.add_sink("sink", NullSink::new());
 
     pipeline.link(src, tee).unwrap();
@@ -60,7 +60,7 @@ async fn test_long_pipeline() {
     let p1 = pipeline.add_filter("p1", PassThrough::new());
     let p2 = pipeline.add_filter("p2", PassThrough::new());
     let p3 = pipeline.add_filter("p3", PassThrough::new());
-    let tee = pipeline.add_filter("tee", Tee::new());
+    let tee = pipeline.add_filter("inspect", Inspect::new());
     let sink = pipeline.add_sink("sink", NullSink::new());
 
     pipeline.link(src, p1).unwrap();

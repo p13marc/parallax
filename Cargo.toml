@@ -233,7 +233,7 @@ name = "01_hello"
 name = "02_transform"
 
 [[example]]
-name = "03_tee"
+name = "03_fanout"
 
 [[example]]
 name = "04_funnel"
