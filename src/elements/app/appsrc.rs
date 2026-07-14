@@ -8,6 +8,7 @@ use crate::error::{Error, Result};
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
+use tokio::sync::Notify;
 
 /// A source element that allows applications to inject buffers into a pipeline.
 ///
@@ -38,6 +39,11 @@ pub struct AppSrc {
 struct AppSrcInner {
     state: Mutex<AppSrcState>,
     data_available: Condvar,
+    /// Async wakeup for a producer waiting on queue space.
+    ///
+    /// The queue is a `Mutex<VecDeque>` + `Condvar`, not a channel, so an async
+    /// producer needs its own wakeup path. Signalled wherever the condvar is.
+    space_available_async: Notify,
 }
 
 struct AppSrcState {
@@ -77,6 +83,7 @@ impl AppSrc {
                     total_produced: 0,
                 }),
                 data_available: Condvar::new(),
+                space_available_async: Notify::new(),
             }),
         }
     }
@@ -137,6 +144,7 @@ impl Source for AppSrc {
         if let Some(buffer) = state.queue.pop_front() {
             state.total_produced += 1;
             self.inner.data_available.notify_all();
+            self.inner.space_available_async.notify_waiters();
             Ok(ProduceResult::OwnBuffer(buffer))
         } else if state.eos {
             Ok(ProduceResult::Eos)
@@ -194,6 +202,51 @@ impl AppSrcHandle {
         Ok(())
     }
 
+    /// Push a buffer, awaiting queue space instead of blocking the thread.
+    ///
+    /// The async twin of [`push_buffer`](Self::push_buffer). Use this from a
+    /// tokio task: the blocking version parks the whole worker thread while the
+    /// queue is full.
+    pub async fn push_buffer_async(&self, buffer: Buffer) -> Result<()> {
+        loop {
+            // Register for the wakeup before checking, or a `produce()` draining
+            // the queue between the check and the await would be missed.
+            let notified = self.inner.space_available_async.notified();
+
+            {
+                let mut state = self.inner.state.lock().unwrap();
+                if state.eos {
+                    return Err(Error::Element("appsrc is at EOS".into()));
+                }
+                if state.flushing {
+                    return Err(Error::Element("appsrc is flushing".into()));
+                }
+                if state.queue.len() < state.max_buffers {
+                    state.queue.push_back(buffer);
+                    state.total_pushed += 1;
+                    self.inner.data_available.notify_one();
+                    return Ok(());
+                }
+            }
+
+            notified.await;
+        }
+    }
+
+    /// Statistics for this source.
+    ///
+    /// The element is moved into its executor task at `start()`, so
+    /// `AppSrc::stats()` cannot be called on a running pipeline. This can.
+    pub fn stats(&self) -> AppSrcStats {
+        let state = self.inner.state.lock().unwrap();
+        AppSrcStats {
+            queued_buffers: state.queue.len(),
+            total_pushed: state.total_pushed,
+            total_produced: state.total_produced,
+            eos: state.eos,
+        }
+    }
+
     /// Signal end of stream.
     ///
     /// After calling this, no more buffers can be pushed.
@@ -201,6 +254,7 @@ impl AppSrcHandle {
         let mut state = self.inner.state.lock().unwrap();
         state.eos = true;
         self.inner.data_available.notify_all();
+        self.inner.space_available_async.notify_waiters();
     }
 
     /// Set flushing mode.
@@ -209,6 +263,7 @@ impl AppSrcHandle {
         state.flushing = flushing;
         if flushing {
             self.inner.data_available.notify_all();
+            self.inner.space_available_async.notify_waiters();
         }
     }
 
@@ -218,6 +273,7 @@ impl AppSrcHandle {
         state.queue.clear();
         state.eos = false;
         state.flushing = false;
+        self.inner.space_available_async.notify_waiters();
     }
 
     /// Get the current queue length.
@@ -395,5 +451,45 @@ mod tests {
         assert_eq!(stats.total_pushed, 2);
         assert_eq!(stats.total_produced, 1);
         assert_eq!(stats.queued_buffers, 1);
+    }
+
+    #[tokio::test]
+    async fn push_buffer_async_waits_for_space_instead_of_blocking() {
+        let mut src = AppSrc::with_max_buffers(1);
+        let handle = src.handle();
+
+        handle.push_buffer(create_test_buffer(0)).unwrap();
+        assert!(handle.is_full());
+
+        // The queue is full: this must await, not park the worker thread.
+        let pushed = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.push_buffer_async(create_test_buffer(1)).await }
+        });
+
+        tokio::task::yield_now().await;
+        assert_eq!(handle.queue_len(), 1, "the second push is still waiting");
+
+        // Draining makes room, and the waiter wakes.
+        let mut ctx = ProduceContext::without_buffer();
+        src.produce(&mut ctx).unwrap();
+
+        pushed.await.unwrap().unwrap();
+        assert_eq!(handle.queue_len(), 1);
+        assert_eq!(handle.stats().total_pushed, 2);
+    }
+
+    #[tokio::test]
+    async fn push_buffer_async_fails_at_eos() {
+        let src = AppSrc::new();
+        let handle = src.handle();
+        handle.end_stream();
+
+        assert!(
+            handle
+                .push_buffer_async(create_test_buffer(0))
+                .await
+                .is_err()
+        );
     }
 }
