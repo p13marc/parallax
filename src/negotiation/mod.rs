@@ -41,12 +41,11 @@ mod converters;
 mod error;
 mod solver;
 
-pub use builtin::{
-    AudioConvert, AudioResample, Identity, MemoryCopy, ScaleAlgorithm, VideoConvert, VideoScale,
-    builtin_registry,
-};
+pub use builtin::{Identity, MemoryCopy, builtin_registry};
 pub use converters::{
-    ConverterElement, ConverterFactory, ConverterInfo, ConverterRegistry, FormatType,
+    CapsConflict, ConversionKey, ConversionPlan, ConversionRequest, ConversionStep, ConvertAxes,
+    ConverterElement, ConverterFactory, ConverterInfo, ConverterRegistry, ConverterSpec,
+    FormatType, RegisteredConverter, diff_caps,
 };
 pub use error::NegotiationError;
 pub use solver::{

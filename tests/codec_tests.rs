@@ -28,6 +28,7 @@ fn create_test_buffer(data: &[u8]) -> Buffer {
 
 /// A raw-video buffer that describes its own geometry, the way every source and
 /// decoder now does. Image encoders read their size and pixel layout from here.
+#[allow(dead_code)]
 fn create_video_buffer(
     data: &[u8],
     width: u32,
