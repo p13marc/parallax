@@ -200,39 +200,50 @@ pub struct H264Encoder {
     config: H264EncoderConfig,
     frame_count: u64,
     bytes_encoded: u64,
-    /// Pending runtime keyframe requests (shared with [`Self::keyframe_handle`]).
-    keyframe_requests: super::KeyframeHandle,
+    /// Runtime control: keyframe requests plus bitrate/GOP/QP changes (shared
+    /// with [`Self::control_handle`] and [`Self::keyframe_handle`]).
+    control: super::EncoderControl,
+    /// The control generation last applied to the encoder.
+    applied_generation: u64,
     /// Arena for output buffer allocation.
     arena: SharedArena,
+}
+
+/// Build an OpenH264 encoder from our config.
+///
+/// Shared by [`H264Encoder::new`] and the runtime reconfigure path, so
+/// start-time and live settings can never drift apart.
+fn build_encoder(config: &H264EncoderConfig) -> Result<Encoder> {
+    let mut encoder_config = EncoderConfig::new();
+
+    if config.bitrate_bps > 0 {
+        encoder_config = encoder_config.bitrate(BitRate::from_bps(config.bitrate_bps));
+    } else {
+        // No bitrate target: quality mode. OpenH264 defaults to a 120 kbps
+        // target with frame skipping enabled, which silently drops most
+        // frames of any real content — disable skipping so every input
+        // frame is encoded and quality is governed by the QP band below.
+        encoder_config = encoder_config.skip_frames(false);
+    }
+
+    let qp = config.qp.min(51);
+    encoder_config = encoder_config
+        .max_frame_rate(FrameRate::from_hz(config.max_frame_rate))
+        .scene_change_detect(config.scene_change_detect)
+        .num_threads(config.num_threads as u16)
+        .qp(QpRange::new(qp.saturating_sub(4), (qp + 4).min(51)))
+        .intra_frame_period(IntraFramePeriod::from_num_frames(config.keyframe_interval))
+        .sps_pps_strategy(config.sps_pps_strategy.to_openh264());
+
+    let api = OpenH264API::from_source();
+    Encoder::with_api_config(api, encoder_config)
+        .map_err(|e| Error::Config(format!("Failed to create H.264 encoder: {:?}", e)))
 }
 
 impl H264Encoder {
     /// Create a new H.264 encoder with the given configuration.
     pub fn new(config: H264EncoderConfig) -> Result<Self> {
-        let mut encoder_config = EncoderConfig::new();
-
-        if config.bitrate_bps > 0 {
-            encoder_config = encoder_config.bitrate(BitRate::from_bps(config.bitrate_bps));
-        } else {
-            // No bitrate target: quality mode. OpenH264 defaults to a 120 kbps
-            // target with frame skipping enabled, which silently drops most
-            // frames of any real content — disable skipping so every input
-            // frame is encoded and quality is governed by the QP band below.
-            encoder_config = encoder_config.skip_frames(false);
-        }
-
-        let qp = config.qp.min(51);
-        encoder_config = encoder_config
-            .max_frame_rate(FrameRate::from_hz(config.max_frame_rate))
-            .scene_change_detect(config.scene_change_detect)
-            .num_threads(config.num_threads as u16)
-            .qp(QpRange::new(qp.saturating_sub(4), (qp + 4).min(51)))
-            .intra_frame_period(IntraFramePeriod::from_num_frames(config.keyframe_interval))
-            .sps_pps_strategy(config.sps_pps_strategy.to_openh264());
-
-        let api = OpenH264API::from_source();
-        let encoder = Encoder::with_api_config(api, encoder_config)
-            .map_err(|e| Error::Config(format!("Failed to create H.264 encoder: {:?}", e)))?;
+        let encoder = build_encoder(&config)?;
 
         // Create arena for encoded output buffers (typically < 1MB per frame)
         // Use 64 slots to handle buffering when downstream is slower than encoding
@@ -244,9 +255,62 @@ impl H264Encoder {
             config,
             frame_count: 0,
             bytes_encoded: 0,
-            keyframe_requests: super::KeyframeHandle::new(),
+            control: super::EncoderControl::new(),
+            applied_generation: 0,
             arena,
         })
+    }
+
+    /// Rebuild the OpenH264 encoder for the current config, keeping the arena.
+    ///
+    /// OpenH264 exposes no bitrate setter, so a live change means a new
+    /// encoder. That is cheap (a few ms) and forces a fresh SPS/PPS + IDR —
+    /// which is what you want on a rate step anyway, since decoders need the
+    /// new parameter sets and a mid-GOP rate change looks bad. The **arena is
+    /// deliberately reused**: allocating a fresh 64 MiB of slots on every
+    /// bitrate step would be a silent memory leak in a long-running sensor.
+    fn rebuild_encoder(&mut self) -> Result<()> {
+        self.encoder = build_encoder(&self.config)?;
+        // A new encoder starts a new sequence; make its first frame an IDR so
+        // decoders pick up the new parameter sets immediately.
+        self.encoder.force_intra_frame();
+        Ok(())
+    }
+
+    /// Apply any parameter changes made through [`Self::control_handle`].
+    fn apply_pending_control(&mut self) -> Result<()> {
+        let Some(params) = self.control.poll(&mut self.applied_generation) else {
+            return Ok(());
+        };
+
+        if let Some(bps) = params.bitrate_bps {
+            self.config.bitrate_bps = bps;
+        }
+        if let Some(frames) = params.keyframe_interval {
+            self.config.keyframe_interval = frames;
+        }
+        if let Some(qp) = params.qp {
+            self.config.qp = qp.min(51);
+        }
+
+        tracing::info!(
+            "H264Encoder: reconfigured — bitrate {} bps, keyframe interval {}, qp {}",
+            self.config.bitrate_bps,
+            self.config.keyframe_interval,
+            self.config.qp
+        );
+        self.rebuild_encoder()
+    }
+
+    /// Get a cloneable handle for changing bitrate, keyframe interval and QP on
+    /// a running pipeline.
+    ///
+    /// Clone this *before* the pipeline starts (elements are moved into their
+    /// executor tasks at start). Each change rebuilds the underlying OpenH264
+    /// encoder and emits an IDR, so rate-limit changes to roughly one per
+    /// second rather than, say, once per slider pixel.
+    pub fn control_handle(&self) -> super::EncoderControl {
+        self.control.clone()
     }
 
     /// Encode a YUV420 frame at the configured resolution.
@@ -332,7 +396,7 @@ impl H264Encoder {
     /// frame processed by this encoder an IDR, flagged
     /// [`BufferFlags::SYNC_POINT`](crate::metadata::BufferFlags::SYNC_POINT).
     pub fn keyframe_handle(&self) -> super::KeyframeHandle {
-        self.keyframe_requests.clone()
+        self.control.keyframe_handle()
     }
 
     /// Get the number of frames encoded.
@@ -401,9 +465,13 @@ fn contains_idr(data: &[u8]) -> bool {
 /// Element trait implementation for H264Encoder.
 impl Element for H264Encoder {
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
+        // Runtime reconfiguration (bitrate / keyframe interval / QP). Costs one
+        // relaxed load when nothing changed; rebuilds the encoder when it did.
+        self.apply_pending_control()?;
+
         // Runtime keyframe requests: from the shared handle or stamped
         // in-band on the buffer's metadata.
-        let requested = self.keyframe_requests.take()
+        let requested = self.control.take_keyframe()
             || buffer
                 .metadata()
                 .get::<bool>(super::KEYFRAME_REQUEST)
@@ -523,6 +591,33 @@ impl super::traits::VideoEncoder for H264Encoder {
 
     fn force_keyframe(&mut self) {
         self.encoder.force_intra_frame();
+    }
+
+    fn set_bitrate(&mut self, bps: u32) -> Result<()> {
+        if self.config.bitrate_bps == bps {
+            return Ok(());
+        }
+        // 0 is not "unset" here: it selects quality mode, where rate control is
+        // driven by the QP band instead of a target (see build_encoder).
+        self.config.bitrate_bps = bps;
+        self.rebuild_encoder()
+    }
+
+    fn set_keyframe_interval(&mut self, frames: u32) -> Result<()> {
+        if self.config.keyframe_interval == frames {
+            return Ok(());
+        }
+        self.config.keyframe_interval = frames;
+        self.rebuild_encoder()
+    }
+
+    fn set_qp(&mut self, qp: u8) -> Result<()> {
+        let qp = qp.min(51);
+        if self.config.qp == qp {
+            return Ok(());
+        }
+        self.config.qp = qp;
+        self.rebuild_encoder()
     }
 }
 
@@ -871,6 +966,21 @@ mod tests {
         count
     }
 
+    /// Wrap raw I420 bytes in a Buffer that declares its geometry, as a real
+    /// upstream element would.
+    fn yuv_buffer(data: &[u8], width: u32, height: u32) -> Buffer {
+        use crate::buffer::MemoryHandle;
+        use crate::format::PixelFormat;
+
+        let arena = SharedArena::new(data.len(), 4).unwrap();
+        let mut slot = arena.acquire().unwrap();
+        slot.data_mut()[..data.len()].copy_from_slice(data);
+
+        let mut metadata = Metadata::new();
+        metadata.set_video_dims(width, height, PixelFormat::I420);
+        Buffer::new(MemoryHandle::with_len(slot, data.len()), metadata)
+    }
+
     /// A deterministic frame with spatial detail so QP visibly affects size.
     fn detailed_frame(width: usize, height: usize, seed: u8) -> Vec<u8> {
         let mut data = vec![128u8; width * height * 3 / 2];
@@ -880,6 +990,129 @@ mod tests {
             }
         }
         data
+    }
+
+    /// The point of the whole exercise: dropping the bitrate on a live encoder
+    /// must actually shrink the stream.
+    #[test]
+    fn live_bitrate_change_shrinks_the_stream() {
+        use crate::element::Element;
+
+        let mut config = H264EncoderConfig::new(320, 240).bitrate(4_000_000);
+        config.scene_change_detect = false;
+        let mut encoder = H264Encoder::new(config).unwrap();
+        let control = encoder.control_handle();
+
+        // Encode at 4 Mbps, then at 200 kbps, and compare steady-state sizes.
+        // The frame right after the change is an IDR (new parameter sets), so
+        // it is excluded from the comparison — it is expected to be large.
+        let encode_run = |encoder: &mut H264Encoder, seed_base: u8| -> Vec<usize> {
+            (0..15)
+                .map(|i| {
+                    let frame = detailed_frame(320, 240, seed_base.wrapping_add(i));
+                    encoder.process(yuv_buffer(&frame, 320, 240)).unwrap();
+                    encoder.bytes_encoded()
+                })
+                .collect::<Vec<_>>()
+                .windows(2)
+                .map(|w| (w[1] - w[0]) as usize)
+                .collect()
+        };
+
+        let fast = encode_run(&mut encoder, 0);
+        control.set_bitrate(200_000);
+        let slow = encode_run(&mut encoder, 100);
+
+        // Skip the first few frames of each run (IDR + rate-control settling).
+        let mean = |sizes: &[usize]| sizes[4..].iter().sum::<usize>() / sizes[4..].len();
+        let (fast_mean, slow_mean) = (mean(&fast), mean(&slow));
+
+        assert!(
+            slow_mean * 2 < fast_mean,
+            "200 kbps must produce materially smaller frames than 4 Mbps \
+             (got {slow_mean} vs {fast_mean} bytes/frame)"
+        );
+    }
+
+    #[test]
+    fn live_bitrate_change_emits_an_idr() {
+        use crate::element::Element;
+
+        let mut config = H264EncoderConfig::new(320, 240).bitrate(4_000_000);
+        config.scene_change_detect = false;
+        let mut encoder = H264Encoder::new(config).unwrap();
+        let control = encoder.control_handle();
+
+        for i in 0..4 {
+            encoder
+                .process(yuv_buffer(&detailed_frame(320, 240, i), 320, 240))
+                .unwrap();
+        }
+
+        control.set_bitrate(400_000);
+        let out = encoder
+            .process(yuv_buffer(&detailed_frame(320, 240, 9), 320, 240))
+            .unwrap()
+            .expect("a frame");
+
+        assert_eq!(
+            count_idr_nals(out.as_bytes()),
+            1,
+            "a rebuilt encoder must lead with an IDR so decoders get the new SPS/PPS"
+        );
+        assert!(
+            out.metadata()
+                .flags
+                .contains(crate::metadata::BufferFlags::SYNC_POINT),
+            "and the buffer must be flagged as a sync point"
+        );
+    }
+
+    #[test]
+    fn live_keyframe_interval_change_changes_idr_cadence() {
+        use crate::element::Element;
+
+        let mut config = H264EncoderConfig::new(320, 240).keyframe_interval(100);
+        config.scene_change_detect = false;
+        let mut encoder = H264Encoder::new(config).unwrap();
+        let control = encoder.control_handle();
+
+        control.set_keyframe_interval(5);
+        let mut idrs = 0;
+        for i in 0..15 {
+            let out = encoder
+                .process(yuv_buffer(&detailed_frame(320, 240, i), 320, 240))
+                .unwrap()
+                .unwrap();
+            idrs += count_idr_nals(out.as_bytes());
+        }
+
+        // Frame 0 (rebuild IDR) plus one every 5 frames.
+        assert!(
+            idrs >= 3,
+            "an interval of 5 over 15 frames should yield several IDRs, got {idrs}"
+        );
+    }
+
+    #[test]
+    fn unchanged_parameters_do_not_rebuild_the_encoder() {
+        use super::super::traits::VideoEncoder;
+
+        let mut encoder =
+            H264Encoder::new(H264EncoderConfig::new(320, 240).bitrate(1_000_000)).unwrap();
+
+        // Setting the value it already has must not force a spurious IDR.
+        encoder.set_bitrate(1_000_000).unwrap();
+        let encoded = encoder.encode_yuv420(&detailed_frame(320, 240, 1)).unwrap();
+        let first_idrs = count_idr_nals(&encoded);
+
+        encoder.set_bitrate(1_000_000).unwrap();
+        let encoded = encoder.encode_yuv420(&detailed_frame(320, 240, 2)).unwrap();
+        assert_eq!(
+            count_idr_nals(&encoded),
+            0,
+            "a no-op set_bitrate must not rebuild the encoder (first frame had {first_idrs} IDRs)"
+        );
     }
 
     /// The switch itself: a differently-sized frame must encode, must produce a
