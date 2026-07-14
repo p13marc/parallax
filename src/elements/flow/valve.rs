@@ -115,6 +115,16 @@ impl Default for Valve {
     }
 }
 
+impl crate::control::Controllable for Valve {
+    type Control = ValveControl;
+
+    fn control(&self) -> ValveControl {
+        ValveControl {
+            inner: std::sync::Arc::clone(&self.inner),
+        }
+    }
+}
+
 impl Element for Valve {
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         if self.inner.open.load(Ordering::SeqCst) {

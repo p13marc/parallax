@@ -500,17 +500,6 @@ impl H264Encoder {
         self.rebuild_encoder()
     }
 
-    /// Get a cloneable handle for changing bitrate, keyframe interval and QP on
-    /// a running pipeline.
-    ///
-    /// Clone this *before* the pipeline starts (elements are moved into their
-    /// executor tasks at start). Each change rebuilds the underlying OpenH264
-    /// encoder and emits an IDR, so rate-limit changes to roughly one per
-    /// second rather than, say, once per slider pixel.
-    pub fn control_handle(&self) -> super::EncoderControl {
-        self.control.clone()
-    }
-
     /// Encode a YUV420 frame at the configured resolution.
     ///
     /// The input data must be in YUV420 planar format:
@@ -610,6 +599,18 @@ impl H264Encoder {
     /// Get the encoder configuration.
     pub fn config(&self) -> &H264EncoderConfig {
         &self.config
+    }
+}
+
+impl super::Controllable for H264Encoder {
+    type Control = super::EncoderControl;
+
+    /// A handle for changing bitrate, keyframe interval, QP, rate-control mode
+    /// and frame skipping on a running pipeline.
+    ///
+    /// Clone it *before* `executor.start()` — see [`crate::control`].
+    fn control(&self) -> super::EncoderControl {
+        self.control.clone()
     }
 }
 
@@ -1099,6 +1100,7 @@ impl<'a> YUVSource for YuvFrame<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::Controllable;
 
     #[test]
     fn test_encoder_config_default() {
@@ -1350,7 +1352,7 @@ mod tests {
             .max_slice_len(1200)
             .profile(Profile::Baseline);
         let mut encoder = H264Encoder::new(config).unwrap();
-        let control = encoder.control_handle();
+        let control = encoder.control();
 
         control.set_bitrate(400_000);
         let out = encoder
@@ -1374,7 +1376,7 @@ mod tests {
         let mut config = H264EncoderConfig::new(320, 240).bitrate(4_000_000);
         config.scene_change_detect = false;
         let mut encoder = H264Encoder::new(config).unwrap();
-        let control = encoder.control_handle();
+        let control = encoder.control();
 
         // Encode at 4 Mbps, then at 200 kbps, and compare steady-state sizes.
         // The frame right after the change is an IDR (new parameter sets), so
@@ -1414,7 +1416,7 @@ mod tests {
         let mut config = H264EncoderConfig::new(320, 240).bitrate(4_000_000);
         config.scene_change_detect = false;
         let mut encoder = H264Encoder::new(config).unwrap();
-        let control = encoder.control_handle();
+        let control = encoder.control();
 
         for i in 0..4 {
             encoder
@@ -1448,7 +1450,7 @@ mod tests {
         let mut config = H264EncoderConfig::new(320, 240).keyframe_interval(100);
         config.scene_change_detect = false;
         let mut encoder = H264Encoder::new(config).unwrap();
-        let control = encoder.control_handle();
+        let control = encoder.control();
 
         control.set_keyframe_interval(5);
         let mut idrs = 0;

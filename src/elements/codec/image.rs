@@ -272,15 +272,8 @@ mod jpeg_codec {
         /// Set the encoding quality (1-100, default 80). Higher = better
         /// quality, larger output.
         pub fn with_quality(self, quality: u8) -> Self {
-            self.quality_control().set_quality(quality);
+            JpegQualityControl(std::sync::Arc::clone(&self.quality)).set_quality(quality);
             self
-        }
-
-        /// Get a cloneable handle for changing the quality at runtime.
-        ///
-        /// Clone it *before* the pipeline starts — see [`JpegQualityControl`].
-        pub fn quality_control(&self) -> JpegQualityControl {
-            JpegQualityControl(std::sync::Arc::clone(&self.quality))
         }
 
         /// The current encoding quality (1-100).
@@ -304,6 +297,17 @@ mod jpeg_codec {
                     ));
                 }
             })
+        }
+    }
+
+    impl crate::control::Controllable for JpegEncoder {
+        type Control = JpegQualityControl;
+
+        /// A handle for changing the JPEG quality on a running pipeline.
+        ///
+        /// Clone it *before* `executor.start()` — see [`crate::control`].
+        fn control(&self) -> JpegQualityControl {
+            JpegQualityControl(std::sync::Arc::clone(&self.quality))
         }
     }
 
@@ -577,6 +581,8 @@ pub use png_codec::{PngDecoder, PngEncoder};
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "image-jpeg")]
+    use crate::control::Controllable;
 
     #[test]
     fn test_color_type_channels() {
@@ -632,7 +638,7 @@ mod tests {
         fn quality_change_reaches_a_running_encoder() {
             let original = gradient_rgb();
             let mut encoder = JpegEncoder::new(W, H, ColorType::Rgb).with_quality(95);
-            let control = encoder.quality_control();
+            let control = encoder.control();
 
             let high = encoder
                 .process(rgb_buffer(&original))
@@ -666,7 +672,7 @@ mod tests {
             let encoder = JpegEncoder::new(W, H, ColorType::Rgb).with_quality(200);
             assert_eq!(encoder.quality(), 100);
 
-            let control = encoder.quality_control();
+            let control = encoder.control();
             control.set_quality(0);
             assert_eq!(control.quality(), 1, "0 would be a library-level surprise");
             assert_eq!(encoder.quality(), 1, "handle and element share state");

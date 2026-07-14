@@ -12,6 +12,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use parallax::buffer::{Buffer, MemoryHandle};
+use parallax::control::Controllable;
 use parallax::elements::app::{AppSink, AppSrc};
 use parallax::elements::codec::{H264Decoder, H264Encoder, H264EncoderConfig, RateControlMode};
 use parallax::elements::transform::VideoScale;
@@ -105,7 +106,7 @@ async fn bitrate_and_resolution_change_on_a_running_pipeline() {
         .skip_frames(false);
     config.scene_change_detect = false; // deterministic IDR placement
     let encoder = H264Encoder::new(config).unwrap();
-    let control = encoder.control_handle();
+    let control = encoder.control();
 
     let mut pipeline = Pipeline::new();
     let s = pipeline.add_source("src", src);

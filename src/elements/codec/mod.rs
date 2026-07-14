@@ -114,9 +114,13 @@
 mod common;
 pub use common::{PixelFormat, VideoFrame};
 
-// Runtime control handles (keyframe requests on running pipelines)
-mod control;
-pub use control::{EncoderControl, EncoderParams, KEYFRAME_REQUEST, KeyframeHandle};
+// Runtime control handles. These live in `crate::control` — the one module that
+// documents the clone-before-start invariant — and are re-exported here so the
+// codec-facing paths keep working.
+pub use crate::control::{
+    Controllable, EncoderControl, EncoderParams, EncoderStats, EncoderStatsHandle,
+    KEYFRAME_REQUEST, KeyframeHandle,
+};
 
 // Video codec traits
 mod traits;
