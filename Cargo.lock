@@ -3523,6 +3523,7 @@ dependencies = [
  "mp4",
  "mpeg2ts-reader",
  "openh264",
+ "openh264-sys2",
  "opus",
  "parallax-pipeline-macros",
  "paste",

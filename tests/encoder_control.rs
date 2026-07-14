@@ -254,3 +254,207 @@ async fn resolution_can_be_lowered_and_restored_while_running() {
         "expected full resolution before the change and after passthrough(), got {sizes:?}"
     );
 }
+
+/// Encode `frames` frames, applying `change` to the control handle after
+/// `change_at` of them have reached the sink. Returns the encoded buffers.
+async fn run_with_change(
+    encoder: H264Encoder,
+    frames: u64,
+    change_at: u64,
+    change: impl FnOnce(&parallax::control::EncoderControl),
+) -> Vec<Buffer> {
+    let src = AppSrc::new();
+    let src_handle = src.handle();
+    let sink = AppSink::new();
+    let sink_handle = sink.handle();
+    let control = encoder.control();
+
+    let mut pipeline = Pipeline::new();
+    let s = pipeline.add_source("src", src);
+    let e = pipeline.add_filter("enc", encoder);
+    let k = pipeline.add_sink("sink", sink);
+    pipeline.link(s, e).unwrap();
+    pipeline.link(e, k).unwrap();
+
+    let executor = Executor::new();
+    let handle = executor.start(&mut pipeline).unwrap();
+
+    for seq in 0..change_at {
+        src_handle.push_buffer(yuv_frame(seq)).unwrap();
+    }
+    wait_for(&sink_handle, change_at as usize).await;
+
+    change(&control);
+
+    for seq in change_at..frames {
+        src_handle.push_buffer(yuv_frame(seq)).unwrap();
+    }
+    src_handle.end_stream();
+    handle.wait().await.unwrap();
+
+    let mut outputs = Vec::new();
+    while let Some(buffer) = sink_handle.try_pull_buffer() {
+        outputs.push(buffer);
+    }
+    outputs
+}
+
+fn quiet_encoder(config: H264EncoderConfig) -> H264Encoder {
+    let mut config = config;
+    config.scene_change_detect = false;
+    config.keyframe_interval = 0; // no periodic IDRs: only frame 0 and forced ones
+    H264Encoder::new(config).unwrap()
+}
+
+/// #42: a bitrate change goes in through OpenH264's `SetOption`, so the GOP is
+/// not broken — the stream keeps flowing, no IDR, and the bytes still fall.
+///
+/// Contrast with the resolution change above, which *must* IDR because the
+/// encoder re-initialises.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bitrate_change_is_seamless_and_forces_no_idr() {
+    let encoder = quiet_encoder(
+        H264EncoderConfig::new()
+            .bitrate(4_000_000)
+            .rate_control(RateControlMode::Bitrate),
+    );
+
+    let outputs = run_with_change(encoder, 24, 12, |control| control.set_bitrate(200_000)).await;
+    assert_eq!(outputs.len(), 24);
+
+    for (i, buffer) in outputs.iter().enumerate().skip(1) {
+        assert!(
+            !contains_idr(buffer.as_bytes()),
+            "frame {i}: a bitrate change must not break the GOP (only frame 0 is an IDR)"
+        );
+    }
+
+    let mean = |frames: &[Buffer]| -> usize {
+        frames.iter().map(|b| b.as_bytes().len()).sum::<usize>() / frames.len()
+    };
+    let before = mean(&outputs[2..12]);
+    let after = mean(&outputs[16..24]);
+    assert!(
+        after < before,
+        "the new bitrate must actually take effect ({after} vs {before} bytes/frame)"
+    );
+}
+
+/// #41: setting a parameter to the value it already has is a no-op. It used to
+/// rebuild the encoder unconditionally, forcing a pointless IDR — brutal on a
+/// controller that reasserts its desired bitrate periodically.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_no_op_change_forces_no_idr() {
+    let encoder = quiet_encoder(
+        H264EncoderConfig::new()
+            .bitrate(2_000_000)
+            .rate_control(RateControlMode::Bitrate),
+    );
+
+    // Set the bitrate to exactly what it already is, and change the GOP to the
+    // value it already has. Neither is a change.
+    let outputs = run_with_change(encoder, 10, 5, |control| {
+        control.set_bitrate(2_000_000);
+        control.set_keyframe_interval(0);
+    })
+    .await;
+
+    assert_eq!(outputs.len(), 10);
+    for (i, buffer) in outputs.iter().enumerate().skip(1) {
+        assert!(
+            !contains_idr(buffer.as_bytes()),
+            "frame {i}: a no-op reconfigure must not force a keyframe"
+        );
+    }
+}
+
+/// #40: rate control is a live knob, not a construction-time one. Switching to
+/// Bitrate mode mid-stream makes the encoder start honouring the target.
+#[tokio::test(flavor = "multi_thread")]
+async fn rate_control_can_be_switched_on_a_running_encoder() {
+    // Start quality-first with a tiny nominal target it is free to ignore.
+    let encoder = quiet_encoder(
+        H264EncoderConfig::new()
+            .bitrate(150_000)
+            .qp(20)
+            .rate_control(RateControlMode::Quality),
+    );
+
+    let outputs = run_with_change(encoder, 24, 12, |control| {
+        control.set_rate_control(RateControlMode::Bitrate);
+    })
+    .await;
+    assert_eq!(outputs.len(), 24);
+
+    let mean = |frames: &[Buffer]| -> usize {
+        frames.iter().map(|b| b.as_bytes().len()).sum::<usize>() / frames.len()
+    };
+    // Skip the IDR the mode switch produces (it rebuilds the encoder).
+    let before = mean(&outputs[2..12]);
+    let after = mean(&outputs[14..24]);
+    assert!(
+        after < before,
+        "honouring a 150 kbps target must cost fewer bytes than ignoring it \
+         ({after} vs {before} bytes/frame)"
+    );
+}
+
+/// #44: the counters are readable while the encoder is inside its executor task.
+/// `frame_count()` and `bytes_encoded()` are `&self` on the element, and the
+/// element is moved at start() — so they never could be.
+#[tokio::test(flavor = "multi_thread")]
+async fn encoder_stats_are_readable_on_a_running_pipeline() {
+    let src = AppSrc::new();
+    let src_handle = src.handle();
+    let sink = AppSink::new();
+    let sink_handle = sink.handle();
+
+    let encoder = quiet_encoder(H264EncoderConfig::new());
+    let stats = encoder.stats(); // BEFORE start
+
+    let mut pipeline = Pipeline::new();
+    let s = pipeline.add_source("src", src);
+    let e = pipeline.add_filter("enc", encoder);
+    let k = pipeline.add_sink("sink", sink);
+    pipeline.link(s, e).unwrap();
+    pipeline.link(e, k).unwrap();
+
+    let executor = Executor::new();
+    let handle = executor.start(&mut pipeline).unwrap();
+
+    assert_eq!(stats.frames_encoded(), 0);
+
+    for seq in 0..8 {
+        src_handle.push_buffer(yuv_frame(seq)).unwrap();
+    }
+    wait_for(&sink_handle, 8).await;
+
+    // Read them mid-flight — the pipeline is still running.
+    let mid = stats.snapshot();
+    assert_eq!(mid.frames_encoded, 8);
+    assert!(mid.bytes_encoded > 0);
+    assert!(mid.last_encode_ns > 0, "encode time must be recorded");
+    assert_eq!(
+        mid.frames_dropped_by_rc, 0,
+        "skip_frames is off by default, so nothing may be dropped"
+    );
+
+    src_handle.end_stream();
+    handle.wait().await.unwrap();
+
+    let end = stats.snapshot();
+    assert_eq!(end.frames_encoded, 8);
+    assert_eq!(
+        end.bytes_encoded,
+        sink_handle_total(&sink_handle),
+        "bytes_encoded must match what actually reached the sink"
+    );
+}
+
+fn sink_handle_total(sink: &parallax::elements::app::AppSinkHandle) -> u64 {
+    let mut total = 0;
+    while let Some(buffer) = sink.try_pull_buffer() {
+        total += buffer.as_bytes().len() as u64;
+    }
+    total
+}

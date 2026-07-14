@@ -117,6 +117,52 @@ const UNSET_U32: u32 = u32::MAX;
 /// Sentinel for "this parameter has never been set" (QP is 0-51, so 255 is free).
 const UNSET_U8: u8 = u8::MAX;
 
+/// How an encoder trades bits against quality.
+///
+/// This is the knob that decides how seriously a bitrate target is taken. It
+/// lives here, not in the codec module, because it is a *live* parameter: it can
+/// be changed on a running encoder through [`EncoderControl::set_rate_control`].
+///
+/// The default is [`Bitrate`](Self::Bitrate) — for a crate whose headline
+/// feature is live bandwidth control, "the bitrate is a hint" is the wrong
+/// default. (OpenH264's own default is quality-first; this crate deliberately
+/// diverges.)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RateControlMode {
+    /// Bitrate first: hold the target, spending quality to do it. What you want
+    /// when the link, not the picture, is the constraint.
+    #[default]
+    Bitrate = 0,
+    /// Quality first: the bitrate target is a hint, not a budget.
+    Quality = 1,
+    /// Ignore the bitrate target; adjust quality from buffer status alone.
+    BufferBased = 2,
+    /// Rate control driven by frame timestamps.
+    Timestamp = 3,
+    /// No rate control at all: quality is governed purely by the QP band.
+    Off = 4,
+}
+
+impl RateControlMode {
+    /// The `u8` this mode is stored as inside [`EncoderControl`].
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// Recover a mode from its `u8`, or `None` if it is not one.
+    pub const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Bitrate),
+            1 => Some(Self::Quality),
+            2 => Some(Self::BufferBased),
+            3 => Some(Self::Timestamp),
+            4 => Some(Self::Off),
+            _ => None,
+        }
+    }
+}
+
 /// Encoder parameters pending application, as reported by
 /// [`EncoderControl::poll`].
 ///
@@ -131,6 +177,10 @@ pub struct EncoderParams {
     pub keyframe_interval: Option<u32>,
     /// Target quantization parameter (0-51, lower = better quality).
     pub qp: Option<u8>,
+    /// How strictly the bitrate target is honoured.
+    pub rate_control: Option<RateControlMode>,
+    /// Whether rate control may drop frames to hold the bitrate target.
+    pub skip_frames: Option<bool>,
 }
 
 impl EncoderParams {
@@ -191,6 +241,10 @@ struct EncoderControlInner {
     bitrate_bps: AtomicU32,
     keyframe_interval: AtomicU32,
     qp: AtomicU8,
+    /// A [`RateControlMode`] as `u8`, or [`UNSET_U8`].
+    rate_control: AtomicU8,
+    /// Tri-state: 0 = no, 1 = yes, [`UNSET_U8`] = never set.
+    skip_frames: AtomicU8,
     /// Bumped by every setter. Encoders compare it against the generation they
     /// last applied, so an unchanged handle costs one relaxed load per frame.
     generation: AtomicU64,
@@ -204,6 +258,8 @@ impl EncoderControl {
             bitrate_bps: AtomicU32::new(UNSET_U32),
             keyframe_interval: AtomicU32::new(UNSET_U32),
             qp: AtomicU8::new(UNSET_U8),
+            rate_control: AtomicU8::new(UNSET_U8),
+            skip_frames: AtomicU8::new(UNSET_U8),
             generation: AtomicU64::new(0),
         }))
     }
@@ -244,6 +300,22 @@ impl EncoderControl {
         self.bump();
     }
 
+    /// Set how strictly the bitrate target is honoured (see [`RateControlMode`]).
+    pub fn set_rate_control(&self, mode: RateControlMode) {
+        self.0.rate_control.store(mode.as_u8(), Ordering::Release);
+        self.bump();
+    }
+
+    /// Allow or forbid rate control dropping frames to hold the bitrate target.
+    ///
+    /// With skipping on, a tight target makes the encoder emit *nothing* for
+    /// some input frames, so a pipeline expecting one packet per frame quietly
+    /// gets fewer. Off (the default) it spends quality instead.
+    pub fn set_skip_frames(&self, skip: bool) {
+        self.0.skip_frames.store(u8::from(skip), Ordering::Release);
+        self.bump();
+    }
+
     /// The generation counter, incremented by every setter.
     pub fn generation(&self) -> u64 {
         self.0.generation.load(Ordering::Acquire)
@@ -271,6 +343,9 @@ impl EncoderControl {
             bitrate_bps: unset_u32(self.0.bitrate_bps.load(Ordering::Acquire)),
             keyframe_interval: unset_u32(self.0.keyframe_interval.load(Ordering::Acquire)),
             qp: unset_u8(self.0.qp.load(Ordering::Acquire)),
+            rate_control: unset_u8(self.0.rate_control.load(Ordering::Acquire))
+                .and_then(RateControlMode::from_u8),
+            skip_frames: unset_u8(self.0.skip_frames.load(Ordering::Acquire)).map(|v| v != 0),
         };
 
         // A generation bump with nothing set cannot happen through the public
@@ -529,6 +604,8 @@ mod tests {
                 bitrate_bps: Some(1_000_000),
                 keyframe_interval: Some(60),
                 qp: Some(28),
+                rate_control: None,
+                skip_frames: None,
             })
         );
     }
