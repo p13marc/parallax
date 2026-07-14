@@ -1,31 +1,44 @@
 //! Video scaling/resizing element.
 //!
-//! This module provides video scaling for YUV420 planar frames.
-//! Supports bilinear and nearest-neighbor interpolation.
+//! Scales raw video frames, preserving their pixel format. Every format the
+//! conversion engines handle works here — I420, NV12, YUYV, UYVY, RGB24, BGR24,
+//! RGBA, BGRA and Gray8 — because this element is a thin pipeline wrapper around
+//! [`converters::VideoScale`](crate::converters::VideoScale), which does the
+//! actual resampling.
+//!
+//! # Geometry travels in-band
+//!
+//! The scaler takes **no dimensions at construction**. The source size and pixel
+//! format come from each buffer's [`Metadata`], and the *target* is a runtime
+//! knob ([`ScaleControl`]) because it is one — resolution is the second-biggest
+//! bandwidth lever after bitrate. A buffer that does not describe its own
+//! geometry is an error, not a guess: the byte length alone cannot distinguish
+//! I420 from NV12 (both are `w*h*3/2`), and guessing wrong scrambles chroma
+//! silently.
 //!
 //! # Example
 //!
 //! ```rust,ignore
 //! use parallax::elements::transform::{VideoScale, ScaleMode};
 //!
-//! // Create scaler: 1920x1080 -> 1280x720
-//! let mut scaler = VideoScale::new(1920, 1080, 1280, 720);
+//! let scaler = VideoScale::new().with_mode(ScaleMode::NearestNeighbor);
+//! let scale = scaler.control();   // BEFORE executor.start()
+//! pipeline.add_filter("scale", scaler);
 //!
-//! // Or with explicit mode
-//! let mut scaler = VideoScale::new(1920, 1080, 640, 480)
-//!     .with_mode(ScaleMode::NearestNeighbor);
-//!
-//! // Scale a YUV420 frame
-//! let scaled_yuv = scaler.scale_yuv420(&input_yuv)?;
+//! scale.set_max_height(360);      // downscale to 360p, aspect preserved
+//! scale.passthrough();            // back to the source resolution
 //! ```
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::buffer::{Buffer, MemoryHandle};
+use crate::converters::{self, ScaleAlgorithm};
 use crate::element::Element;
 use crate::error::{Error, Result};
-use crate::format::PixelFormat;
+use crate::format::{
+    CapsValue, ElementMediaCaps, FormatMemoryCap, MemoryCaps, PixelFormat, VideoFormatCaps,
+};
 use crate::memory::SharedArena;
 use crate::metadata::Metadata;
 
@@ -63,7 +76,7 @@ pub enum ScaleMode {
 /// # Example
 ///
 /// ```rust,ignore
-/// let scaler = VideoScale::new(1920, 1080, 1920, 1080);
+/// let scaler = VideoScale::new();
 /// let scale = scaler.control();          // BEFORE start
 /// pipeline.add_filter("scale", scaler);
 /// let handle = executor.start(&mut pipeline)?;
@@ -174,28 +187,38 @@ fn even(value: u32) -> u32 {
 // Video Scaler
 // ============================================================================
 
-/// Video scaling element for YUV420 planar frames.
+/// Video scaling element.
 ///
-/// Scales video frames from source dimensions to target dimensions.
+/// Resamples raw video frames to a target size, **preserving the pixel format**.
+/// The work is delegated to [`converters::VideoScale`], so every format that
+/// engine supports works here: I420, NV12, YUYV, UYVY, RGB24, BGR24, RGBA, BGRA
+/// and Gray8.
 ///
-/// Both ends are dynamic: the source size is taken from each buffer's metadata
-/// (falling back to the constructor's value), and the target can be changed on
-/// a running pipeline through [`control`](Self::control). Output buffers are
-/// stamped with the dimensions actually produced, so a downstream encoder
-/// follows the change instead of encoding at a stale geometry.
+/// Geometry travels in-band. The source size and pixel format are read from each
+/// buffer's [`Metadata`]; the *target* is a runtime knob ([`ScaleControl`]).
+/// Output buffers are stamped with the size actually produced — and with the
+/// **input's** pixel format, since scaling does not change it — so a downstream
+/// encoder follows a resize instead of encoding at a stale geometry.
+///
+/// A buffer that carries no geometry, or a pixel format no engine handles, is an
+/// error. There is no constructor value to fall back to, and inferring the
+/// format from the byte count is ambiguous (I420 and NV12 are both `w*h*3/2`).
 pub struct VideoScale {
-    /// Source width (seeded by the constructor, updated from buffer metadata).
-    src_width: u32,
-    /// Source height (seeded by the constructor, updated from buffer metadata).
-    src_height: u32,
-    /// Target width, resolved from [`Self::control`] for the current source.
-    dst_width: u32,
-    /// Target height, resolved from [`Self::control`] for the current source.
-    dst_height: u32,
     /// The requested target, shared with [`Self::control`] handles.
     control: ScaleControl,
-    /// Interpolation mode.
+    /// Interpolation mode, fixed at construction.
     mode: ScaleMode,
+    /// Cached engine, rebuilt whenever `engine_key` changes.
+    engine: Option<converters::VideoScale>,
+    /// The `(format, src_w, src_h, dst_w, dst_h)` the cached engine was built
+    /// for. A change in *any* of them rebuilds it.
+    engine_key: Option<(converters::PixelFormat, u32, u32, u32, u32)>,
+    /// Scratch output: the engine writes into a `&mut [u8]`.
+    scratch: Vec<u8>,
+    /// Geometry of the last frame — observability only, never a fallback.
+    last_source: Option<(u32, u32, PixelFormat)>,
+    /// Target of the last frame — observability only.
+    last_target: Option<(u32, u32)>,
     /// Statistics.
     frames_processed: u64,
     /// Arena for output buffers.
@@ -205,11 +228,10 @@ pub struct VideoScale {
 impl std::fmt::Debug for VideoScale {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VideoScale")
-            .field("src_width", &self.src_width)
-            .field("src_height", &self.src_height)
-            .field("dst_width", &self.dst_width)
-            .field("dst_height", &self.dst_height)
+            .field("target", &self.control.target())
             .field("mode", &self.mode)
+            .field("last_source", &self.last_source)
+            .field("last_target", &self.last_target)
             .field("frames_processed", &self.frames_processed)
             .field("arena", &self.arena.as_ref().map(|_| "SharedArena(...)"))
             .finish()
@@ -217,26 +239,19 @@ impl std::fmt::Debug for VideoScale {
 }
 
 impl VideoScale {
-    /// Create a new video scaler.
+    /// Create a scaler that passes frames through until it is given a target.
     ///
-    /// # Arguments
-    ///
-    /// * `src_width` - Source frame width.
-    /// * `src_height` - Source frame height.
-    /// * `dst_width` - Target frame width.
-    /// * `dst_height` - Target frame height.
-    pub fn new(src_width: u32, src_height: u32, dst_width: u32, dst_height: u32) -> Self {
-        let control = ScaleControl::new();
-        control.set_target(dst_width, dst_height);
-        let (dst_width, dst_height) = control.resolve(src_width, src_height);
-
+    /// Takes no dimensions: the source is described by each buffer, and the
+    /// target belongs on [`control`](Self::control) because it is a runtime knob.
+    pub fn new() -> Self {
         Self {
-            src_width,
-            src_height,
-            dst_width,
-            dst_height,
-            control,
+            control: ScaleControl::new(),
             mode: ScaleMode::default(),
+            engine: None,
+            engine_key: None,
+            scratch: Vec::new(),
+            last_source: None,
+            last_target: None,
             frames_processed: 0,
             arena: None,
         }
@@ -246,8 +261,9 @@ impl VideoScale {
     ///
     /// Clone it *before* the pipeline starts — see [`crate::control`].
     ///
-    /// Kept as an inherent method as well as the [`Controllable`](crate::control::Controllable)
-    /// impl so callers need not import the trait.
+    /// Kept as an inherent method as well as the
+    /// [`Controllable`](crate::control::Controllable) impl so callers need not
+    /// import the trait.
     pub fn control(&self) -> ScaleControl {
         self.control.clone()
     }
@@ -255,30 +271,21 @@ impl VideoScale {
     /// Set the interpolation mode.
     pub fn with_mode(mut self, mode: ScaleMode) -> Self {
         self.mode = mode;
+        self.engine_key = None; // force a rebuild with the new algorithm
         self
     }
 
-    /// Adopt `width` x `height` as the source size and re-resolve the target.
+    /// The source geometry of the most recent frame, if any.
     ///
-    /// Called for every buffer: the source can change (a camera renegotiating,
-    /// an upstream scaler being retargeted) and an aspect-preserving target
-    /// depends on it.
-    fn set_source(&mut self, width: u32, height: u32) {
-        self.src_width = width;
-        self.src_height = height;
-        let (dst_width, dst_height) = self.control.resolve(width, height);
-        self.dst_width = dst_width;
-        self.dst_height = dst_height;
+    /// `None` before the first buffer: until one arrives, this element does not
+    /// know its geometry, and saying so is the point.
+    pub fn src_dimensions(&self) -> Option<(u32, u32)> {
+        self.last_source.map(|(w, h, _)| (w, h))
     }
 
-    /// Get source dimensions.
-    pub fn src_dimensions(&self) -> (u32, u32) {
-        (self.src_width, self.src_height)
-    }
-
-    /// Get target dimensions.
-    pub fn dst_dimensions(&self) -> (u32, u32) {
-        (self.dst_width, self.dst_height)
+    /// The target geometry of the most recent frame, if any.
+    pub fn dst_dimensions(&self) -> Option<(u32, u32)> {
+        self.last_target
     }
 
     /// Get frames processed count.
@@ -286,191 +293,111 @@ impl VideoScale {
         self.frames_processed
     }
 
-    /// Check if scaling is a no-op (same dimensions).
-    pub fn is_noop(&self) -> bool {
-        self.src_width == self.dst_width && self.src_height == self.dst_height
-    }
-
-    /// Calculate YUV420 buffer size for given dimensions.
-    pub fn yuv420_size(width: u32, height: u32) -> usize {
-        let y_size = (width * height) as usize;
-        let uv_size = ((width / 2) * (height / 2)) as usize;
-        y_size + 2 * uv_size
-    }
-
-    /// Scale a YUV420 planar frame.
+    /// Resolve what this buffer *is*, from what it says about itself.
     ///
-    /// Input format: Y plane followed by U plane followed by V plane.
-    /// Each plane is width*height for Y, (width/2)*(height/2) for U and V.
-    pub fn scale_yuv420(&mut self, input: &[u8]) -> Result<Vec<u8>> {
-        let expected_size = Self::yuv420_size(self.src_width, self.src_height);
-        if input.len() < expected_size {
-            return Err(Error::Element(format!(
-                "Input buffer too small: {} < {} (expected for {}x{})",
-                input.len(),
-                expected_size,
-                self.src_width,
-                self.src_height
-            )));
-        }
+    /// Errors rather than guessing. See the type-level docs for why.
+    fn resolve_input(metadata: &Metadata) -> Result<(PixelFormat, u32, u32)> {
+        let (width, height) = metadata.video_dims().ok_or_else(|| {
+            Error::Element(
+                "VideoScale: buffer carries no video dimensions — the upstream element must \
+                 call Metadata::set_video_dims()"
+                    .into(),
+            )
+        })?;
 
-        // If no scaling needed, just copy
-        if self.is_noop() {
-            self.frames_processed += 1;
-            return Ok(input[..expected_size].to_vec());
-        }
+        let format = metadata.video_pixel_format().ok_or_else(|| {
+            Error::Element(format!(
+                "VideoScale: buffer is {width}x{height} but carries no pixel format — the \
+                 upstream element must call Metadata::set_video_dims() rather than writing \
+                 bare \"width\"/\"height\" keys. The byte count cannot disambiguate it \
+                 (I420 and NV12 are both w*h*3/2)."
+            ))
+        })?;
 
-        // Calculate plane sizes
-        let src_y_size = (self.src_width * self.src_height) as usize;
-        let src_uv_width = self.src_width / 2;
-        let src_uv_height = self.src_height / 2;
-        let src_uv_size = (src_uv_width * src_uv_height) as usize;
-
-        let dst_y_size = (self.dst_width * self.dst_height) as usize;
-        let dst_uv_width = self.dst_width / 2;
-        let dst_uv_height = self.dst_height / 2;
-        let dst_uv_size = (dst_uv_width * dst_uv_height) as usize;
-
-        // Split input into planes
-        let y_plane = &input[0..src_y_size];
-        let u_plane = &input[src_y_size..src_y_size + src_uv_size];
-        let v_plane = &input[src_y_size + src_uv_size..src_y_size + 2 * src_uv_size];
-
-        // Allocate output
-        let mut output = vec![0u8; dst_y_size + 2 * dst_uv_size];
-
-        // Scale each plane
-        match self.mode {
-            ScaleMode::Bilinear => {
-                scale_plane_bilinear(
-                    y_plane,
-                    self.src_width,
-                    self.src_height,
-                    &mut output[0..dst_y_size],
-                    self.dst_width,
-                    self.dst_height,
-                );
-                scale_plane_bilinear(
-                    u_plane,
-                    src_uv_width,
-                    src_uv_height,
-                    &mut output[dst_y_size..dst_y_size + dst_uv_size],
-                    dst_uv_width,
-                    dst_uv_height,
-                );
-                scale_plane_bilinear(
-                    v_plane,
-                    src_uv_width,
-                    src_uv_height,
-                    &mut output[dst_y_size + dst_uv_size..],
-                    dst_uv_width,
-                    dst_uv_height,
-                );
-            }
-            ScaleMode::NearestNeighbor => {
-                scale_plane_nearest(
-                    y_plane,
-                    self.src_width,
-                    self.src_height,
-                    &mut output[0..dst_y_size],
-                    self.dst_width,
-                    self.dst_height,
-                );
-                scale_plane_nearest(
-                    u_plane,
-                    src_uv_width,
-                    src_uv_height,
-                    &mut output[dst_y_size..dst_y_size + dst_uv_size],
-                    dst_uv_width,
-                    dst_uv_height,
-                );
-                scale_plane_nearest(
-                    v_plane,
-                    src_uv_width,
-                    src_uv_height,
-                    &mut output[dst_y_size + dst_uv_size..],
-                    dst_uv_width,
-                    dst_uv_height,
-                );
-            }
-        }
-
-        self.frames_processed += 1;
-        Ok(output)
+        Ok((format, width, height))
     }
 
-    /// Scale a YUV420 frame with separate plane strides.
+    /// Build (or reuse) the engine for this exact conversion.
     ///
-    /// Useful when planes have padding (stride > width).
-    pub fn scale_yuv420_strided(
+    /// Keyed on the format *and* both sizes, so a source resolution change, a
+    /// retarget, or a mid-stream format change all rebuild it — and an unchanged
+    /// stream costs one comparison per frame.
+    fn ensure_engine(
         &mut self,
-        y_plane: &[u8],
-        y_stride: u32,
-        u_plane: &[u8],
-        u_stride: u32,
-        v_plane: &[u8],
-        v_stride: u32,
-    ) -> Result<Vec<u8>> {
-        // First, copy to contiguous buffer removing stride padding
-        let src_y_size = (self.src_width * self.src_height) as usize;
-        let src_uv_width = self.src_width / 2;
-        let src_uv_height = self.src_height / 2;
-        let src_uv_size = (src_uv_width * src_uv_height) as usize;
-
-        let mut contiguous = vec![0u8; src_y_size + 2 * src_uv_size];
-
-        // Copy Y plane
-        for row in 0..self.src_height as usize {
-            let src_start = row * y_stride as usize;
-            let dst_start = row * self.src_width as usize;
-            contiguous[dst_start..dst_start + self.src_width as usize]
-                .copy_from_slice(&y_plane[src_start..src_start + self.src_width as usize]);
+        format: converters::PixelFormat,
+        src_w: u32,
+        src_h: u32,
+        dst_w: u32,
+        dst_h: u32,
+    ) -> Result<()> {
+        let key = (format, src_w, src_h, dst_w, dst_h);
+        if self.engine_key == Some(key) {
+            return Ok(());
         }
 
-        // Copy U plane
-        for row in 0..src_uv_height as usize {
-            let src_start = row * u_stride as usize;
-            let dst_start = src_y_size + row * src_uv_width as usize;
-            contiguous[dst_start..dst_start + src_uv_width as usize]
-                .copy_from_slice(&u_plane[src_start..src_start + src_uv_width as usize]);
-        }
+        let algorithm = match self.mode {
+            ScaleMode::Bilinear => ScaleAlgorithm::Bilinear,
+            ScaleMode::NearestNeighbor => ScaleAlgorithm::NearestNeighbor,
+        };
+        let engine = converters::VideoScale::new(src_w, src_h, dst_w, dst_h, format)?
+            .with_algorithm(algorithm);
 
-        // Copy V plane
-        for row in 0..src_uv_height as usize {
-            let src_start = row * v_stride as usize;
-            let dst_start = src_y_size + src_uv_size + row * src_uv_width as usize;
-            contiguous[dst_start..dst_start + src_uv_width as usize]
-                .copy_from_slice(&v_plane[src_start..src_start + src_uv_width as usize]);
-        }
+        self.scratch.clear();
+        self.scratch.resize(format.buffer_size(dst_w, dst_h), 0);
 
-        self.scale_yuv420(&contiguous)
-    }
+        tracing::info!(
+            "VideoScale: {:?} {}x{} -> {}x{}{}",
+            format,
+            src_w,
+            src_h,
+            dst_w,
+            dst_h,
+            if self.engine_key.is_some() {
+                " (renegotiated)"
+            } else {
+                ""
+            }
+        );
 
-    /// Create a Buffer from scaled YUV data.
-    pub fn scale_to_buffer(&mut self, input: &[u8], metadata: Metadata) -> Result<Buffer> {
-        let scaled = self.scale_yuv420(input)?;
-        let output_size = scaled.len();
-
-        if self.arena.is_none() || self.arena.as_ref().unwrap().slot_size() < output_size {
-            self.arena = Some(SharedArena::new(output_size, 32)?);
-        }
-
-        let arena = self.arena.as_mut().unwrap();
-        arena.reclaim();
-        let mut slot = arena
-            .acquire()
-            .ok_or_else(|| Error::Element("arena exhausted".into()))?;
-
-        slot.data_mut()[..output_size].copy_from_slice(&scaled);
-
-        let handle = MemoryHandle::with_len(slot, output_size);
-        Ok(Buffer::new(handle, metadata))
+        self.engine = Some(engine);
+        self.engine_key = Some(key);
+        Ok(())
     }
 }
 
-// ============================================================================
-// Element Implementation
-// ============================================================================
+impl Default for VideoScale {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Every format the scaling engine can resize, at any resolution.
+///
+/// Deliberately a `List`, not `Any`: the caps vocabulary is wider than what the
+/// engine handles (10-bit, I422, I444, …), and saying so is what lets
+/// negotiation insert a `VideoConvertElement` in front of us for those.
+///
+/// Width and height are `Any` — this element *is* the answer to a geometry
+/// mismatch, so it must not itself constrain geometry.
+fn scalable_caps() -> ElementMediaCaps {
+    let format = VideoFormatCaps {
+        width: CapsValue::Any,
+        height: CapsValue::Any,
+        pixel_format: CapsValue::List(
+            converters::PixelFormat::ALL
+                .iter()
+                .copied()
+                .map(Into::into)
+                .collect(),
+        ),
+        ..VideoFormatCaps::any()
+    };
+
+    ElementMediaCaps::new(vec![FormatMemoryCap::new(
+        format.into(),
+        MemoryCaps::cpu_only(),
+    )])
+}
 
 impl crate::control::Controllable for VideoScale {
     type Control = ScaleControl;
@@ -482,357 +409,407 @@ impl crate::control::Controllable for VideoScale {
 
 impl Element for VideoScale {
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
-        // Resolve both ends per frame: the source may have changed, and the
-        // target may have been retargeted through a ScaleControl handle while
-        // the pipeline runs.
-        let (src_width, src_height) = buffer
-            .metadata()
-            .video_dims()
-            .unwrap_or((self.src_width, self.src_height));
+        // What is this buffer? Ask it — do not infer.
+        let (caps_format, src_w, src_h) = Self::resolve_input(buffer.metadata())?;
+        // Caps-only formats (I444, 10-bit, …) fail here with a message naming them.
+        let format = converters::PixelFormat::try_from(caps_format)?;
 
-        let previous = (self.dst_width, self.dst_height);
-        self.set_source(src_width, src_height);
-        if previous != (self.dst_width, self.dst_height) {
-            tracing::info!(
-                "VideoScale: {}x{} -> {}x{}",
-                self.src_width,
-                self.src_height,
-                self.dst_width,
-                self.dst_height
-            );
+        // Resolve the target against the *current* source, so an aspect-preserving
+        // target survives a source resolution change.
+        let (dst_w, dst_h) = self.control.resolve(src_w, src_h);
+
+        self.frames_processed += 1;
+        self.last_source = Some((src_w, src_h, caps_format));
+        self.last_target = Some((dst_w, dst_h));
+
+        // Passthrough. The buffer already describes itself correctly, so forward
+        // it untouched — no engine, no arena, no copy.
+        if (dst_w, dst_h) == (src_w, src_h) {
+            return Ok(Some(buffer));
         }
+
+        self.ensure_engine(format, src_w, src_h, dst_w, dst_h)?;
+        let engine = self.engine.as_ref().expect("ensure_engine just built one");
+        engine.scale(buffer.as_bytes(), &mut self.scratch)?;
+
+        let output_size = self.scratch.len();
+        if self
+            .arena
+            .as_ref()
+            .is_none_or(|a| a.slot_size() < output_size)
+        {
+            self.arena = Some(SharedArena::new(output_size, 32)?);
+        }
+        let arena = self.arena.as_mut().expect("just ensured");
+        arena.reclaim();
+        let mut slot = arena
+            .acquire()
+            .ok_or_else(|| Error::Element("VideoScale: arena exhausted".into()))?;
+        slot.data_mut()[..output_size].copy_from_slice(&self.scratch);
 
         let mut metadata = buffer.metadata().clone();
-        // Tell downstream what we actually produced — without this the encoder
+        // The INPUT format, not a hardcoded I420: scaling preserves the format.
+        // And the size we actually produced — without this the downstream encoder
         // keeps encoding at the old geometry and the resize never takes effect.
-        metadata.set_video_dims(self.dst_width, self.dst_height, PixelFormat::I420);
+        metadata.set_video_dims(dst_w, dst_h, caps_format);
 
-        let scaled_buffer = self.scale_to_buffer(buffer.as_bytes(), metadata)?;
-        Ok(Some(scaled_buffer))
+        Ok(Some(Buffer::new(
+            MemoryHandle::with_len(slot, output_size),
+            metadata,
+        )))
+    }
+
+    fn input_media_caps(&self) -> ElementMediaCaps {
+        scalable_caps()
+    }
+
+    fn output_media_caps(&self) -> ElementMediaCaps {
+        scalable_caps()
     }
 }
-
-// ============================================================================
-// Scaling Algorithms
-// ============================================================================
-
-/// Bilinear interpolation for a single plane.
-fn scale_plane_bilinear(
-    src: &[u8],
-    src_width: u32,
-    src_height: u32,
-    dst: &mut [u8],
-    dst_width: u32,
-    dst_height: u32,
-) {
-    let x_ratio = src_width as f32 / dst_width as f32;
-    let y_ratio = src_height as f32 / dst_height as f32;
-
-    for dst_y in 0..dst_height {
-        let src_y_f = dst_y as f32 * y_ratio;
-        let src_y0 = src_y_f.floor() as u32;
-        let src_y1 = (src_y0 + 1).min(src_height - 1);
-        let y_frac = src_y_f - src_y0 as f32;
-
-        for dst_x in 0..dst_width {
-            let src_x_f = dst_x as f32 * x_ratio;
-            let src_x0 = src_x_f.floor() as u32;
-            let src_x1 = (src_x0 + 1).min(src_width - 1);
-            let x_frac = src_x_f - src_x0 as f32;
-
-            // Get four neighboring pixels
-            let p00 = src[(src_y0 * src_width + src_x0) as usize] as f32;
-            let p10 = src[(src_y0 * src_width + src_x1) as usize] as f32;
-            let p01 = src[(src_y1 * src_width + src_x0) as usize] as f32;
-            let p11 = src[(src_y1 * src_width + src_x1) as usize] as f32;
-
-            // Bilinear interpolation
-            let top = p00 * (1.0 - x_frac) + p10 * x_frac;
-            let bottom = p01 * (1.0 - x_frac) + p11 * x_frac;
-            let value = top * (1.0 - y_frac) + bottom * y_frac;
-
-            dst[(dst_y * dst_width + dst_x) as usize] = value.round() as u8;
-        }
-    }
-}
-
-/// Nearest neighbor scaling for a single plane.
-fn scale_plane_nearest(
-    src: &[u8],
-    src_width: u32,
-    src_height: u32,
-    dst: &mut [u8],
-    dst_width: u32,
-    dst_height: u32,
-) {
-    let x_ratio = src_width as f32 / dst_width as f32;
-    let y_ratio = src_height as f32 / dst_height as f32;
-
-    for dst_y in 0..dst_height {
-        let src_y = ((dst_y as f32 + 0.5) * y_ratio) as u32;
-        let src_y = src_y.min(src_height - 1);
-
-        for dst_x in 0..dst_width {
-            let src_x = ((dst_x as f32 + 0.5) * x_ratio) as u32;
-            let src_x = src_x.min(src_width - 1);
-
-            dst[(dst_y * dst_width + dst_x) as usize] = src[(src_y * src_width + src_x) as usize];
-        }
-    }
-}
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::MediaFormat;
 
-    #[test]
-    fn test_scaler_creation() {
-        let scaler = VideoScale::new(1920, 1080, 1280, 720);
-        assert_eq!(scaler.src_dimensions(), (1920, 1080));
-        assert_eq!(scaler.dst_dimensions(), (1280, 720));
-        assert!(!scaler.is_noop());
+    /// A raw frame of `format` at `w`x`h`, describing itself the way any real
+    /// source or decoder now does.
+    fn frame(format: PixelFormat, w: u32, h: u32) -> Buffer {
+        let size = converters::PixelFormat::try_from(format)
+            .unwrap()
+            .buffer_size(w, h);
+        frame_with_bytes(format, w, h, &vec![0x40; size])
     }
 
-    #[test]
-    fn test_scaler_noop() {
-        let scaler = VideoScale::new(640, 480, 640, 480);
-        assert!(scaler.is_noop());
-    }
-
-    #[test]
-    fn test_yuv420_size() {
-        // 640x480: Y=307200, U=76800, V=76800 = 460800
-        assert_eq!(VideoScale::yuv420_size(640, 480), 460800);
-        // 1920x1080: Y=2073600, U=518400, V=518400 = 3110400
-        assert_eq!(VideoScale::yuv420_size(1920, 1080), 3110400);
-    }
-
-    #[test]
-    fn test_scale_downscale() {
-        let mut scaler = VideoScale::new(4, 4, 2, 2);
-
-        // Create simple 4x4 Y plane (16 bytes) + U (1 byte) + V (1 byte) = 24 bytes
-        // But YUV420: Y=16, U=4, V=4 = 24 bytes for 4x4
-        let input = vec![
-            // Y plane (4x4 = 16)
-            100, 100, 200, 200, 100, 100, 200, 200, 150, 150, 250, 250, 150, 150, 250, 250,
-            // U plane (2x2 = 4)
-            128, 128, 128, 128, // V plane (2x2 = 4)
-            128, 128, 128, 128,
-        ];
-
-        let output = scaler.scale_yuv420(&input).unwrap();
-
-        // Output should be 2x2: Y=4, U=1, V=1 = 6 bytes
-        assert_eq!(output.len(), 6);
-        assert_eq!(scaler.frames_processed(), 1);
-    }
-
-    #[test]
-    fn test_scale_upscale() {
-        let mut scaler = VideoScale::new(2, 2, 4, 4);
-
-        // 2x2 YUV420: Y=4, U=1, V=1 = 6 bytes
-        let input = vec![
-            // Y plane (2x2)
-            0, 255, 128, 64,  // U plane (1x1)
-            128, // V plane (1x1)
-            128,
-        ];
-
-        let output = scaler.scale_yuv420(&input).unwrap();
-
-        // Output should be 4x4: Y=16, U=4, V=4 = 24 bytes
-        assert_eq!(output.len(), 24);
-    }
-
-    #[test]
-    fn test_scale_nearest_neighbor() {
-        let mut scaler = VideoScale::new(4, 4, 2, 2).with_mode(ScaleMode::NearestNeighbor);
-
-        let input = vec![
-            // Y plane (4x4)
-            10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160,
-            // U plane (2x2)
-            128, 128, 128, 128, // V plane (2x2)
-            128, 128, 128, 128,
-        ];
-
-        let output = scaler.scale_yuv420(&input).unwrap();
-        assert_eq!(output.len(), 6);
-    }
-
-    #[test]
-    fn test_scale_preserves_noop() {
-        let mut scaler = VideoScale::new(4, 4, 4, 4);
-
-        let input: Vec<u8> = (0..24).collect();
-        let output = scaler.scale_yuv420(&input).unwrap();
-
-        assert_eq!(output, input);
-    }
-
-    #[test]
-    fn test_scale_mode_default() {
-        let scaler = VideoScale::new(100, 100, 50, 50);
-        assert_eq!(scaler.mode, ScaleMode::Bilinear);
-    }
-
-    #[test]
-    fn test_scale_too_small_input() {
-        let mut scaler = VideoScale::new(640, 480, 320, 240);
-        let small_input = vec![0u8; 100];
-        let result = scaler.scale_yuv420(&small_input);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_element_trait() {
-        let mut scaler = VideoScale::new(4, 4, 2, 2);
-
-        // Create input buffer
-        let input_data: Vec<u8> = vec![128; 24]; // 4x4 YUV420
-        let arena = SharedArena::new(input_data.len(), 1).unwrap();
+    /// A raw frame with an exact payload.
+    fn frame_with_bytes(format: PixelFormat, w: u32, h: u32, bytes: &[u8]) -> Buffer {
+        let arena = SharedArena::new(bytes.len().max(64), 8).unwrap();
         let mut slot = arena.acquire().unwrap();
-        slot.data_mut()[..input_data.len()].copy_from_slice(&input_data);
-        let handle = MemoryHandle::with_len(slot, input_data.len());
-        let buffer = Buffer::new(handle, Metadata::new());
-
-        // Process through element
-        let result = scaler.process(buffer).unwrap();
-        assert!(result.is_some());
-
-        let output = result.unwrap();
-        assert_eq!(output.len(), 6); // 2x2 YUV420
-    }
-
-    // ========================================================================
-    // Runtime retargeting (#28)
-    // ========================================================================
-
-    /// An I420 frame carrying its geometry in metadata.
-    fn frame(width: u32, height: u32) -> Buffer {
-        let size = VideoScale::yuv420_size(width, height);
-        let arena = SharedArena::new(size, 4).unwrap();
-        let mut slot = arena.acquire().unwrap();
-        slot.data_mut()[..size].fill(0x80);
+        slot.data_mut()[..bytes.len()].copy_from_slice(bytes);
 
         let mut metadata = Metadata::new();
-        metadata.set_video_dims(width, height, PixelFormat::I420);
-        Buffer::new(MemoryHandle::with_len(slot, size), metadata)
+        metadata.set_video_dims(w, h, format);
+        Buffer::new(MemoryHandle::with_len(slot, bytes.len()), metadata)
+    }
+
+    fn scale_once(scaler: &mut VideoScale, buffer: Buffer) -> Buffer {
+        scaler.process(buffer).unwrap().expect("an output frame")
+    }
+
+    // ------------------------------------------------------------------
+    // #36 — the element used to treat every payload as planar I420
+    // ------------------------------------------------------------------
+
+    /// The headline regression. An RGB24 640x480 frame is 921 600 bytes, which
+    /// sails past the old code's I420 size floor (460 800); its first 460 800
+    /// bytes were then bilinear-scaled as if they were Y/U/V planes and emitted
+    /// stamped `I420`. Garbage, no error, no way to find out but to look at the
+    /// picture.
+    ///
+    /// Scale a frame of pure primaries with nearest-neighbour so no interpolation
+    /// can muddy the check: every output pixel must still *be* one of the input
+    /// primaries, with its channel triplet intact.
+    #[test]
+    fn rgb24_is_scaled_as_rgb_not_as_yuv_planes() {
+        const RED: [u8; 3] = [255, 0, 0];
+        const GREEN: [u8; 3] = [0, 255, 0];
+        const BLUE: [u8; 3] = [0, 0, 255];
+        const WHITE: [u8; 3] = [255, 255, 255];
+
+        // 4x2 RGB24: two rows of [R G B W]
+        let mut bytes = Vec::new();
+        for _ in 0..2 {
+            for px in [RED, GREEN, BLUE, WHITE] {
+                bytes.extend_from_slice(&px);
+            }
+        }
+
+        let mut scaler = VideoScale::new().with_mode(ScaleMode::NearestNeighbor);
+        scaler.control().set_target(2, 2);
+
+        let out = scale_once(
+            &mut scaler,
+            frame_with_bytes(PixelFormat::Rgb24, 4, 2, &bytes),
+        );
+
+        assert_eq!(out.len(), 3 * 2 * 2, "output must be RGB24-sized, not I420");
+        for px in out.as_bytes().chunks_exact(3) {
+            assert!(
+                [RED, GREEN, BLUE, WHITE].contains(&[px[0], px[1], px[2]]),
+                "output pixel {px:?} is not one of the input primaries — the bytes \
+                 were resampled as something other than RGB"
+            );
+        }
+    }
+
+    /// Scaling preserves the pixel format. The old code hardcoded `I420` into the
+    /// output metadata regardless of what went in, so a downstream element was
+    /// told a lie about bytes it could not otherwise identify.
+    #[test]
+    fn output_metadata_carries_the_input_pixel_format() {
+        for format in [PixelFormat::Rgb24, PixelFormat::Rgba, PixelFormat::Nv12] {
+            let mut scaler = VideoScale::new();
+            scaler.control().set_target(8, 8);
+
+            let out = scale_once(&mut scaler, frame(format, 16, 16));
+            assert_eq!(
+                out.metadata().video_pixel_format(),
+                Some(format),
+                "{format:?} came out labelled as something else"
+            );
+            assert_eq!(out.metadata().video_dims(), Some((8, 8)));
+        }
+    }
+
+    /// Every format the engine handles must survive a resize with the right
+    /// output length. (Structure, not fidelity: the YUYV/UYVY path is a
+    /// deliberately simplified resampler.)
+    #[test]
+    fn every_engine_format_can_be_scaled() {
+        for engine_format in converters::PixelFormat::ALL {
+            let format: PixelFormat = engine_format.into();
+
+            let mut scaler = VideoScale::new();
+            scaler.control().set_target(4, 4);
+
+            let out = scale_once(&mut scaler, frame(format, 8, 8));
+            assert_eq!(
+                out.len(),
+                engine_format.buffer_size(4, 4),
+                "{format:?} produced the wrong number of bytes"
+            );
+            assert_eq!(out.metadata().video_pixel_format(), Some(format));
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Geometry travels in-band: refuse to guess
+    // ------------------------------------------------------------------
+
+    /// A buffer with dimensions but no pixel format is not scalable: the byte
+    /// count cannot disambiguate I420 from NV12 (both w*h*3/2), and guessing
+    /// wrong scrambles chroma silently. Error instead.
+    #[test]
+    fn a_buffer_without_a_pixel_format_errors() {
+        let arena = SharedArena::new(4096, 4).unwrap();
+        let slot = arena.acquire().unwrap();
+        let mut metadata = Metadata::new();
+        metadata.set("width", 16u64); // the legacy convention, format-free
+        metadata.set("height", 16u64);
+        let buffer = Buffer::new(MemoryHandle::with_len(slot, 384), metadata);
+
+        let err = VideoScale::new().process(buffer).unwrap_err().to_string();
+        assert!(err.contains("no pixel format"), "unhelpful error: {err}");
+        assert!(err.contains("set_video_dims"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn a_buffer_without_dimensions_errors() {
+        let arena = SharedArena::new(4096, 4).unwrap();
+        let slot = arena.acquire().unwrap();
+        let buffer = Buffer::new(MemoryHandle::with_len(slot, 384), Metadata::new());
+
+        let err = VideoScale::new().process(buffer).unwrap_err().to_string();
+        assert!(
+            err.contains("no video dimensions"),
+            "unhelpful error: {err}"
+        );
+    }
+
+    /// The caps vocabulary is wider than the engine: I444 can be *named* but not
+    /// resampled. Say so, naming the format, rather than corrupting it.
+    #[test]
+    fn a_caps_only_format_errors() {
+        let arena = SharedArena::new(4096, 4).unwrap();
+        let slot = arena.acquire().unwrap();
+        let mut metadata = Metadata::new();
+        metadata.set_video_dims(16, 16, PixelFormat::I444);
+        let buffer = Buffer::new(MemoryHandle::with_len(slot, 768), metadata);
+
+        let mut scaler = VideoScale::new();
+        scaler.control().set_target(8, 8);
+
+        let err = scaler.process(buffer).unwrap_err().to_string();
+        assert!(
+            err.contains("I444"),
+            "the error must name the format: {err}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Passthrough and engine caching
+    // ------------------------------------------------------------------
+
+    /// With no target set, the buffer already describes itself correctly, so it
+    /// is forwarded untouched — no engine, no arena, no copy.
+    #[test]
+    fn passthrough_forwards_the_buffer_untouched() {
+        let mut scaler = VideoScale::new();
+        let input = frame(PixelFormat::I420, 16, 16);
+        let expected = input.as_bytes().to_vec();
+
+        let out = scale_once(&mut scaler, input);
+
+        assert_eq!(out.as_bytes(), &expected[..]);
+        assert_eq!(out.metadata().video_dims(), Some((16, 16)));
+        assert!(
+            scaler.arena.is_none(),
+            "passthrough must not allocate an output arena"
+        );
+        assert!(
+            scaler.engine.is_none(),
+            "passthrough must not build an engine"
+        );
+    }
+
+    #[test]
+    fn unchanged_geometry_reuses_the_cached_engine() {
+        let mut scaler = VideoScale::new();
+        scaler.control().set_target(8, 8);
+
+        scale_once(&mut scaler, frame(PixelFormat::I420, 16, 16));
+        let key = scaler.engine_key;
+        assert!(key.is_some());
+
+        scale_once(&mut scaler, frame(PixelFormat::I420, 16, 16));
+        assert_eq!(scaler.engine_key, key, "the engine was needlessly rebuilt");
+    }
+
+    /// A mid-stream *format* change must rebuild the engine, not just a size
+    /// change — the engine is built per (format, src, dst).
+    #[test]
+    fn a_pixel_format_change_mid_stream_rebuilds_the_engine() {
+        let mut scaler = VideoScale::new();
+        scaler.control().set_target(8, 8);
+
+        let out = scale_once(&mut scaler, frame(PixelFormat::I420, 16, 16));
+        assert_eq!(out.metadata().video_pixel_format(), Some(PixelFormat::I420));
+
+        let out = scale_once(&mut scaler, frame(PixelFormat::Rgb24, 16, 16));
+        assert_eq!(
+            out.metadata().video_pixel_format(),
+            Some(PixelFormat::Rgb24)
+        );
+        assert_eq!(out.len(), 3 * 8 * 8, "now producing RGB, not I420");
+    }
+
+    // ------------------------------------------------------------------
+    // ScaleControl (unchanged behaviour, ported to the new constructor)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn source_dimensions_come_from_buffer_metadata() {
+        let mut scaler = VideoScale::new();
+        assert_eq!(
+            scaler.src_dimensions(),
+            None,
+            "before the first buffer, the scaler does not know its geometry"
+        );
+
+        scale_once(&mut scaler, frame(PixelFormat::I420, 320, 240));
+        assert_eq!(scaler.src_dimensions(), Some((320, 240)));
     }
 
     #[test]
     fn retarget_takes_effect_on_the_next_frame() {
-        let mut scaler = VideoScale::new(640, 480, 640, 480);
+        let mut scaler = VideoScale::new();
         let control = scaler.control();
 
-        let full = scaler.process(frame(640, 480)).unwrap().unwrap();
-        assert_eq!(full.metadata().video_dims(), Some((640, 480)));
+        let out = scale_once(&mut scaler, frame(PixelFormat::I420, 320, 240));
+        assert_eq!(out.metadata().video_dims(), Some((320, 240)));
 
-        control.set_target(320, 240);
-        let small = scaler.process(frame(640, 480)).unwrap().unwrap();
-        assert_eq!(small.metadata().video_dims(), Some((320, 240)));
-        assert_eq!(
-            small.as_bytes().len(),
-            VideoScale::yuv420_size(320, 240),
-            "output must be sized for the new target, not the arena slot"
-        );
+        control.set_target(160, 120);
+        let out = scale_once(&mut scaler, frame(PixelFormat::I420, 320, 240));
+        assert_eq!(out.metadata().video_dims(), Some((160, 120)));
     }
 
     #[test]
     fn max_height_preserves_aspect_ratio() {
-        let mut scaler = VideoScale::new(1920, 1080, 1920, 1080);
-        scaler.control().set_max_height(360);
+        let mut scaler = VideoScale::new();
+        scaler.control().set_max_height(120);
 
-        let out = scaler.process(frame(1920, 1080)).unwrap().unwrap();
-        // 16:9 -> 640x360
-        assert_eq!(out.metadata().video_dims(), Some((640, 360)));
+        let out = scale_once(&mut scaler, frame(PixelFormat::I420, 640, 480));
+        assert_eq!(out.metadata().video_dims(), Some((160, 120)));
     }
 
     #[test]
     fn max_height_follows_a_source_resolution_change() {
-        // The reason the target is resolved per frame rather than at set time.
-        let mut scaler = VideoScale::new(1920, 1080, 1920, 1080);
-        scaler.control().set_max_height(240);
+        let mut scaler = VideoScale::new();
+        scaler.control().set_max_height(120);
 
-        let wide = scaler.process(frame(1920, 1080)).unwrap().unwrap();
-        assert_eq!(wide.metadata().video_dims(), Some((426, 240)));
+        let out = scale_once(&mut scaler, frame(PixelFormat::I420, 640, 480));
+        assert_eq!(out.metadata().video_dims(), Some((160, 120)));
 
-        let squarish = scaler.process(frame(640, 480)).unwrap().unwrap();
-        assert_eq!(
-            squarish.metadata().video_dims(),
-            Some((320, 240)),
-            "4:3 source must yield a 4:3 target"
-        );
+        // 16:9 source now — the width must follow, not stay at 160.
+        let out = scale_once(&mut scaler, frame(PixelFormat::I420, 640, 360));
+        assert_eq!(out.metadata().video_dims(), Some((214, 120)));
     }
 
     #[test]
     fn never_upscales() {
-        let mut scaler = VideoScale::new(320, 240, 320, 240);
+        let mut scaler = VideoScale::new();
         scaler.control().set_max_height(1080);
 
-        let out = scaler.process(frame(320, 240)).unwrap().unwrap();
+        let out = scale_once(&mut scaler, frame(PixelFormat::I420, 320, 240));
         assert_eq!(
             out.metadata().video_dims(),
             Some((320, 240)),
-            "a target above the source resolution must pass through, not invent detail"
+            "a bound above the source means 'fits already', not 'invent detail'"
         );
     }
 
     #[test]
     fn passthrough_restores_the_source_resolution() {
-        let mut scaler = VideoScale::new(640, 480, 640, 480);
+        let mut scaler = VideoScale::new();
         let control = scaler.control();
+        control.set_max_height(120);
 
-        control.set_max_height(240);
-        let small = scaler.process(frame(640, 480)).unwrap().unwrap();
-        assert_eq!(small.metadata().video_dims(), Some((320, 240)));
+        let out = scale_once(&mut scaler, frame(PixelFormat::I420, 640, 480));
+        assert_eq!(out.metadata().video_dims(), Some((160, 120)));
 
         control.passthrough();
-        let full = scaler.process(frame(640, 480)).unwrap().unwrap();
-        assert_eq!(full.metadata().video_dims(), Some((640, 480)));
+        let out = scale_once(&mut scaler, frame(PixelFormat::I420, 640, 480));
+        assert_eq!(out.metadata().video_dims(), Some((640, 480)));
     }
 
     #[test]
     fn odd_targets_round_down_to_even() {
-        // YUV420 chroma is subsampled by two; odd dimensions cannot be
-        // represented and would corrupt the planes.
         let control = ScaleControl::new();
-        control.set_target(641, 361);
-        assert_eq!(control.target(), (640, 360));
-
-        // ...including aspect-derived widths.
-        let mut scaler = VideoScale::new(1000, 500, 1000, 500);
-        scaler.control().set_max_height(101);
-        let out = scaler.process(frame(1000, 500)).unwrap().unwrap();
-        let (w, h) = out.metadata().video_dims().unwrap();
-        assert_eq!(w % 2, 0, "width {w} must be even");
-        assert_eq!(h % 2, 0, "height {h} must be even");
-    }
-
-    #[test]
-    fn source_dimensions_come_from_buffer_metadata() {
-        // Constructed for 1920x1080, but fed 640x480: the buffer wins.
-        let mut scaler = VideoScale::new(1920, 1080, 1920, 1080);
-        scaler.control().set_max_height(240);
-
-        let out = scaler.process(frame(640, 480)).unwrap().unwrap();
-        assert_eq!(scaler.src_dimensions(), (640, 480));
-        assert_eq!(out.metadata().video_dims(), Some((320, 240)));
+        control.set_target(101, 77);
+        assert_eq!(control.target(), (100, 76));
     }
 
     #[test]
     fn scaled_output_is_stamped_for_both_metadata_conventions() {
-        let mut scaler = VideoScale::new(640, 480, 320, 240);
-        let out = scaler.process(frame(640, 480)).unwrap().unwrap();
+        let mut scaler = VideoScale::new();
+        scaler.control().set_target(160, 120);
 
-        assert_eq!(out.metadata().video_pixel_format(), Some(PixelFormat::I420));
-        assert_eq!(out.metadata().get::<u64>("width"), Some(&320));
-        assert_eq!(out.metadata().get::<u64>("height"), Some(&240));
+        let out = scale_once(&mut scaler, frame(PixelFormat::I420, 320, 240));
+        let meta = out.metadata();
+
+        // The modern convention...
+        assert!(matches!(
+            meta.format,
+            Some(MediaFormat::VideoRaw(vf)) if vf.width == 160 && vf.height == 120
+        ));
+        // ...and the legacy one, which AutoVideoSink still reads.
+        assert_eq!(meta.get::<u64>("width"), Some(&160));
+        assert_eq!(meta.get::<u64>("height"), Some(&120));
+    }
+
+    #[test]
+    fn scale_mode_defaults_to_bilinear() {
+        assert_eq!(ScaleMode::default(), ScaleMode::Bilinear);
+    }
+
+    #[test]
+    fn frames_processed_counts_every_frame_including_passthrough() {
+        let mut scaler = VideoScale::new();
+        scale_once(&mut scaler, frame(PixelFormat::I420, 16, 16));
+        scaler.control().set_target(8, 8);
+        scale_once(&mut scaler, frame(PixelFormat::I420, 16, 16));
+
+        assert_eq!(scaler.frames_processed(), 2);
     }
 }

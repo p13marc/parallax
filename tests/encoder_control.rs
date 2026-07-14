@@ -94,7 +94,7 @@ async fn bitrate_and_resolution_change_on_a_running_pipeline() {
     let sink = AppSink::new();
     let sink_handle = sink.handle();
 
-    let scaler = VideoScale::new(WIDTH, HEIGHT, WIDTH, HEIGHT);
+    let scaler = VideoScale::new();
     let scale = scaler.control();
 
     let mut config = H264EncoderConfig::new(WIDTH, HEIGHT)
@@ -200,7 +200,7 @@ async fn resolution_can_be_lowered_and_restored_while_running() {
     let sink = AppSink::new();
     let sink_handle = sink.handle();
 
-    let scaler = VideoScale::new(WIDTH, HEIGHT, WIDTH, HEIGHT);
+    let scaler = VideoScale::new();
     let scale = scaler.control();
 
     let mut config = H264EncoderConfig::new(WIDTH, HEIGHT);
