@@ -19,9 +19,13 @@
 //! let scaled_yuv = scaler.scale_yuv420(&input_yuv)?;
 //! ```
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::Element;
 use crate::error::{Error, Result};
+use crate::format::PixelFormat;
 use crate::memory::SharedArena;
 use crate::metadata::Metadata;
 
@@ -40,21 +44,156 @@ pub enum ScaleMode {
 }
 
 // ============================================================================
+// Runtime Control
+// ============================================================================
+
+/// Cloneable handle to retarget a **running** [`VideoScale`].
+///
+/// Resolution is the second-biggest bandwidth lever after bitrate — cutting
+/// both dimensions in half quarters the pixel count — and the only one that
+/// also cuts encoder CPU. Like the codec control handles, this must be cloned
+/// from the element **before** `executor.start()`: elements are moved into
+/// their executor tasks at start and cannot be reached through the graph
+/// afterwards.
+///
+/// The target is resolved against the *current* source dimensions on every
+/// frame, so [`set_max_height`](Self::set_max_height) keeps working when the
+/// source itself changes resolution mid-stream.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let scaler = VideoScale::new(1920, 1080, 1920, 1080);
+/// let scale = scaler.control();          // BEFORE start
+/// pipeline.add_filter("scale", scaler);
+/// let handle = executor.start(&mut pipeline)?;
+///
+/// scale.set_max_height(360);  // downscale to 360p, aspect preserved
+/// scale.passthrough();        // back to source resolution
+/// ```
+#[derive(Clone, Debug)]
+pub struct ScaleControl(Arc<ScaleTarget>);
+
+/// The requested output size.
+///
+/// A `width` of 0 means "derive from the source aspect ratio"; a `height` of 0
+/// with a 0 width means "no scaling".
+#[derive(Debug, Default)]
+struct ScaleTarget {
+    width: AtomicU32,
+    height: AtomicU32,
+}
+
+impl ScaleControl {
+    /// Create a handle with no scaling requested (passthrough).
+    pub fn new() -> Self {
+        Self(Arc::new(ScaleTarget::default()))
+    }
+
+    /// Scale to exactly `width` x `height`.
+    ///
+    /// Odd dimensions are rounded down to even — YUV420 chroma is subsampled by
+    /// two and cannot represent an odd width or height.
+    pub fn set_target(&self, width: u32, height: u32) {
+        self.0.width.store(even(width), Ordering::Release);
+        self.0.height.store(even(height), Ordering::Release);
+    }
+
+    /// Fit the frame within `height`, preserving the source aspect ratio.
+    ///
+    /// The width is derived per frame from the *current* source, so this
+    /// survives a source resolution change. A source already at or below
+    /// `height` is passed through untouched — this never upscales.
+    pub fn set_max_height(&self, height: u32) {
+        self.0.width.store(0, Ordering::Release);
+        self.0.height.store(even(height), Ordering::Release);
+    }
+
+    /// Stop scaling: emit frames at the source resolution.
+    pub fn passthrough(&self) {
+        self.0.width.store(0, Ordering::Release);
+        self.0.height.store(0, Ordering::Release);
+    }
+
+    /// The requested target, as `(width, height)` where 0 means "unconstrained".
+    pub fn target(&self) -> (u32, u32) {
+        (
+            self.0.width.load(Ordering::Acquire),
+            self.0.height.load(Ordering::Acquire),
+        )
+    }
+
+    /// Resolve the request against a concrete source size.
+    ///
+    /// An explicit [`set_target`](Self::set_target) is honoured as given, up or
+    /// down. An aspect-preserving *bound* ([`set_max_height`](Self::set_max_height))
+    /// only ever shrinks: a bound above the source means "fits already", not
+    /// "invent detail".
+    fn resolve(&self, src_width: u32, src_height: u32) -> (u32, u32) {
+        let (want_width, want_height) = self.target();
+
+        match (want_width, want_height) {
+            (0, 0) => (src_width, src_height),
+
+            // Bounding height: derive the width from the source aspect ratio,
+            // and pass through a source that already fits.
+            (0, h) if src_height > 0 => {
+                if even(h) >= src_height || even(h) == 0 {
+                    return (src_width, src_height);
+                }
+                let w = (src_width as u64 * h as u64).div_ceil(src_height as u64) as u32;
+                (even(w).max(2), even(h))
+            }
+            // Bounding width: the mirror case.
+            (w, 0) if src_width > 0 => {
+                if even(w) >= src_width || even(w) == 0 {
+                    return (src_width, src_height);
+                }
+                let h = (src_height as u64 * w as u64).div_ceil(src_width as u64) as u32;
+                (even(w), even(h).max(2))
+            }
+
+            // Explicit target: exactly what was asked for.
+            (w, h) => (even(w).max(2), even(h).max(2)),
+        }
+    }
+}
+
+impl Default for ScaleControl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Round down to an even number (YUV420 cannot represent odd dimensions).
+fn even(value: u32) -> u32 {
+    value & !1
+}
+
+// ============================================================================
 // Video Scaler
 // ============================================================================
 
 /// Video scaling element for YUV420 planar frames.
 ///
 /// Scales video frames from source dimensions to target dimensions.
+///
+/// Both ends are dynamic: the source size is taken from each buffer's metadata
+/// (falling back to the constructor's value), and the target can be changed on
+/// a running pipeline through [`control`](Self::control). Output buffers are
+/// stamped with the dimensions actually produced, so a downstream encoder
+/// follows the change instead of encoding at a stale geometry.
 pub struct VideoScale {
-    /// Source width.
+    /// Source width (seeded by the constructor, updated from buffer metadata).
     src_width: u32,
-    /// Source height.
+    /// Source height (seeded by the constructor, updated from buffer metadata).
     src_height: u32,
-    /// Target width.
+    /// Target width, resolved from [`Self::control`] for the current source.
     dst_width: u32,
-    /// Target height.
+    /// Target height, resolved from [`Self::control`] for the current source.
     dst_height: u32,
+    /// The requested target, shared with [`Self::control`] handles.
+    control: ScaleControl,
     /// Interpolation mode.
     mode: ScaleMode,
     /// Statistics.
@@ -87,21 +226,46 @@ impl VideoScale {
     /// * `dst_width` - Target frame width.
     /// * `dst_height` - Target frame height.
     pub fn new(src_width: u32, src_height: u32, dst_width: u32, dst_height: u32) -> Self {
+        let control = ScaleControl::new();
+        control.set_target(dst_width, dst_height);
+        let (dst_width, dst_height) = control.resolve(src_width, src_height);
+
         Self {
             src_width,
             src_height,
             dst_width,
             dst_height,
+            control,
             mode: ScaleMode::default(),
             frames_processed: 0,
             arena: None,
         }
     }
 
+    /// Get a cloneable handle for retargeting this scaler at runtime.
+    ///
+    /// Clone it *before* the pipeline starts — see [`ScaleControl`].
+    pub fn control(&self) -> ScaleControl {
+        self.control.clone()
+    }
+
     /// Set the interpolation mode.
     pub fn with_mode(mut self, mode: ScaleMode) -> Self {
         self.mode = mode;
         self
+    }
+
+    /// Adopt `width` x `height` as the source size and re-resolve the target.
+    ///
+    /// Called for every buffer: the source can change (a camera renegotiating,
+    /// an upstream scaler being retargeted) and an aspect-preserving target
+    /// depends on it.
+    fn set_source(&mut self, width: u32, height: u32) {
+        self.src_width = width;
+        self.src_height = height;
+        let (dst_width, dst_height) = self.control.resolve(width, height);
+        self.dst_width = dst_width;
+        self.dst_height = dst_height;
     }
 
     /// Get source dimensions.
@@ -307,10 +471,32 @@ impl VideoScale {
 
 impl Element for VideoScale {
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
-        let input = buffer.as_bytes();
-        let metadata = buffer.metadata().clone();
+        // Resolve both ends per frame: the source may have changed, and the
+        // target may have been retargeted through a ScaleControl handle while
+        // the pipeline runs.
+        let (src_width, src_height) = buffer
+            .metadata()
+            .video_dims()
+            .unwrap_or((self.src_width, self.src_height));
 
-        let scaled_buffer = self.scale_to_buffer(input, metadata)?;
+        let previous = (self.dst_width, self.dst_height);
+        self.set_source(src_width, src_height);
+        if previous != (self.dst_width, self.dst_height) {
+            tracing::info!(
+                "VideoScale: {}x{} -> {}x{}",
+                self.src_width,
+                self.src_height,
+                self.dst_width,
+                self.dst_height
+            );
+        }
+
+        let mut metadata = buffer.metadata().clone();
+        // Tell downstream what we actually produced — without this the encoder
+        // keeps encoding at the old geometry and the resize never takes effect.
+        metadata.set_video_dims(self.dst_width, self.dst_height, PixelFormat::I420);
+
+        let scaled_buffer = self.scale_to_buffer(buffer.as_bytes(), metadata)?;
         Ok(Some(scaled_buffer))
     }
 }
@@ -511,5 +697,131 @@ mod tests {
 
         let output = result.unwrap();
         assert_eq!(output.len(), 6); // 2x2 YUV420
+    }
+
+    // ========================================================================
+    // Runtime retargeting (#28)
+    // ========================================================================
+
+    /// An I420 frame carrying its geometry in metadata.
+    fn frame(width: u32, height: u32) -> Buffer {
+        let size = VideoScale::yuv420_size(width, height);
+        let arena = SharedArena::new(size, 4).unwrap();
+        let mut slot = arena.acquire().unwrap();
+        slot.data_mut()[..size].fill(0x80);
+
+        let mut metadata = Metadata::new();
+        metadata.set_video_dims(width, height, PixelFormat::I420);
+        Buffer::new(MemoryHandle::with_len(slot, size), metadata)
+    }
+
+    #[test]
+    fn retarget_takes_effect_on_the_next_frame() {
+        let mut scaler = VideoScale::new(640, 480, 640, 480);
+        let control = scaler.control();
+
+        let full = scaler.process(frame(640, 480)).unwrap().unwrap();
+        assert_eq!(full.metadata().video_dims(), Some((640, 480)));
+
+        control.set_target(320, 240);
+        let small = scaler.process(frame(640, 480)).unwrap().unwrap();
+        assert_eq!(small.metadata().video_dims(), Some((320, 240)));
+        assert_eq!(
+            small.as_bytes().len(),
+            VideoScale::yuv420_size(320, 240),
+            "output must be sized for the new target, not the arena slot"
+        );
+    }
+
+    #[test]
+    fn max_height_preserves_aspect_ratio() {
+        let mut scaler = VideoScale::new(1920, 1080, 1920, 1080);
+        scaler.control().set_max_height(360);
+
+        let out = scaler.process(frame(1920, 1080)).unwrap().unwrap();
+        // 16:9 -> 640x360
+        assert_eq!(out.metadata().video_dims(), Some((640, 360)));
+    }
+
+    #[test]
+    fn max_height_follows_a_source_resolution_change() {
+        // The reason the target is resolved per frame rather than at set time.
+        let mut scaler = VideoScale::new(1920, 1080, 1920, 1080);
+        scaler.control().set_max_height(240);
+
+        let wide = scaler.process(frame(1920, 1080)).unwrap().unwrap();
+        assert_eq!(wide.metadata().video_dims(), Some((426, 240)));
+
+        let squarish = scaler.process(frame(640, 480)).unwrap().unwrap();
+        assert_eq!(
+            squarish.metadata().video_dims(),
+            Some((320, 240)),
+            "4:3 source must yield a 4:3 target"
+        );
+    }
+
+    #[test]
+    fn never_upscales() {
+        let mut scaler = VideoScale::new(320, 240, 320, 240);
+        scaler.control().set_max_height(1080);
+
+        let out = scaler.process(frame(320, 240)).unwrap().unwrap();
+        assert_eq!(
+            out.metadata().video_dims(),
+            Some((320, 240)),
+            "a target above the source resolution must pass through, not invent detail"
+        );
+    }
+
+    #[test]
+    fn passthrough_restores_the_source_resolution() {
+        let mut scaler = VideoScale::new(640, 480, 640, 480);
+        let control = scaler.control();
+
+        control.set_max_height(240);
+        let small = scaler.process(frame(640, 480)).unwrap().unwrap();
+        assert_eq!(small.metadata().video_dims(), Some((320, 240)));
+
+        control.passthrough();
+        let full = scaler.process(frame(640, 480)).unwrap().unwrap();
+        assert_eq!(full.metadata().video_dims(), Some((640, 480)));
+    }
+
+    #[test]
+    fn odd_targets_round_down_to_even() {
+        // YUV420 chroma is subsampled by two; odd dimensions cannot be
+        // represented and would corrupt the planes.
+        let control = ScaleControl::new();
+        control.set_target(641, 361);
+        assert_eq!(control.target(), (640, 360));
+
+        // ...including aspect-derived widths.
+        let mut scaler = VideoScale::new(1000, 500, 1000, 500);
+        scaler.control().set_max_height(101);
+        let out = scaler.process(frame(1000, 500)).unwrap().unwrap();
+        let (w, h) = out.metadata().video_dims().unwrap();
+        assert_eq!(w % 2, 0, "width {w} must be even");
+        assert_eq!(h % 2, 0, "height {h} must be even");
+    }
+
+    #[test]
+    fn source_dimensions_come_from_buffer_metadata() {
+        // Constructed for 1920x1080, but fed 640x480: the buffer wins.
+        let mut scaler = VideoScale::new(1920, 1080, 1920, 1080);
+        scaler.control().set_max_height(240);
+
+        let out = scaler.process(frame(640, 480)).unwrap().unwrap();
+        assert_eq!(scaler.src_dimensions(), (640, 480));
+        assert_eq!(out.metadata().video_dims(), Some((320, 240)));
+    }
+
+    #[test]
+    fn scaled_output_is_stamped_for_both_metadata_conventions() {
+        let mut scaler = VideoScale::new(640, 480, 320, 240);
+        let out = scaler.process(frame(640, 480)).unwrap().unwrap();
+
+        assert_eq!(out.metadata().video_pixel_format(), Some(PixelFormat::I420));
+        assert_eq!(out.metadata().get::<u64>("width"), Some(&320));
+        assert_eq!(out.metadata().get::<u64>("height"), Some(&240));
     }
 }

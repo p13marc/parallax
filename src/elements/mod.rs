@@ -154,9 +154,9 @@ pub use transform::{
     BufferPadStats, BufferSlice, BufferSplit, BufferSplitStats, BufferTrim, BufferTrimStats, Chunk,
     DuplicateFilter, DuplicateFilterStats, ExtractedMetadata, Filter, FilterMap, FilterStats,
     FlatMap, Gain, Map, MetadataExtract, MetadataFilter, MetadataInject, RangeFilter,
-    RangeFilterStats, RegexFilter, RegexFilterStats, SampleFilter, SampleMode, ScaleMode,
-    SequenceNumber, TimestampDebug, TimestampDebugLevel, TimestampDebugStats, TimestampFormat,
-    TimestampMode, Timestamper, Unbatch, UnbatchStats, VideoScale,
+    RangeFilterStats, RegexFilter, RegexFilterStats, SampleFilter, SampleMode, ScaleControl,
+    ScaleMode, SequenceNumber, TimestampDebug, TimestampDebugLevel, TimestampDebugStats,
+    TimestampFormat, TimestampMode, Timestamper, Unbatch, UnbatchStats, VideoScale,
 };
 
 // App integration
