@@ -192,6 +192,22 @@ const POLL_TIMEOUT: Duration = Duration::from_secs(2);
 ///
 /// See the [module docs](self) for usage. Not `Sync`: one pipeline element
 /// owns the device.
+///
+/// # Runtime control, and how far to trust it
+///
+/// [`set_bitrate`](VideoEncoder::set_bitrate),
+/// [`set_keyframe_interval`](VideoEncoder::set_keyframe_interval) and
+/// [`force_keyframe`](VideoEncoder::force_keyframe) work on a *streaming*
+/// encoder: V4L2's stateful encoder uAPI says the client "is allowed to use
+/// `VIDIOC_S_CTRL()` to change encoder parameters at any time".
+///
+/// What a driver *does* with them is another matter. Availability is
+/// driver-specific; a driver that will not take a change while streaming
+/// returns `-EBUSY` (which surfaces here as an `Err`). Worse, several drivers
+/// **accept the ioctl and then ignore it** mid-stream — GOP size is the usual
+/// casualty, bitrate is more widely honoured — and userspace cannot detect
+/// that, because the ioctl succeeded. Treat a live GOP change on hardware as
+/// best-effort, and verify against the driver you actually ship on.
 pub struct V4l2M2mH264Encoder {
     device: Arc<Device>,
     output_queue: Queue<Output, BuffersAllocated<Vec<MmapHandle>>>,
@@ -355,27 +371,13 @@ impl V4l2M2mH264Encoder {
     /// an unsupported knob should not prevent encoding.
     fn apply_controls(device: &Device, config: &V4l2M2mEncoderConfig) {
         if config.bitrate_bps > 0 {
-            let mut bitrate = SafeExtControl::<VideoBitrate>::from_value(config.bitrate_bps as i32);
-            if let Err(e) = ioctl::s_ext_ctrls(device, CtrlWhich::Current, &mut bitrate) {
-                tracing::debug!("V4L2 M2M: bitrate control unsupported: {e}");
-            }
-            let mut mode = SafeExtControl::<VideoBitrateMode>::from_value(
-                v4l2r::controls::codec::VideoBitrateMode::ConstantBitrate as i32,
-            );
-            if let Err(e) = ioctl::s_ext_ctrls(device, CtrlWhich::Current, &mut mode) {
-                tracing::debug!("V4L2 M2M: bitrate mode control unsupported: {e}");
-            }
+            // Ignore failures here: at open time a missing control is a
+            // property of the driver, not a user error.
+            let _ = set_bitrate_control(device, config.bitrate_bps);
         }
 
         if config.gop_size > 0 {
-            let mut i_period =
-                SafeExtControl::<VideoH264IPeriod>::from_value(config.gop_size as i32);
-            if ioctl::s_ext_ctrls(device, CtrlWhich::Current, &mut i_period).is_err() {
-                let mut gop = SafeExtControl::<VideoGopSize>::from_value(config.gop_size as i32);
-                if let Err(e) = ioctl::s_ext_ctrls(device, CtrlWhich::Current, &mut gop) {
-                    tracing::debug!("V4L2 M2M: GOP size control unsupported: {e}");
-                }
-            }
+            let _ = set_gop_control(device, config.gop_size);
         }
 
         if let Some(profile) = config.profile {
@@ -619,6 +621,67 @@ impl VideoEncoder for V4l2M2mH264Encoder {
             tracing::debug!("V4L2 M2M: FORCE_KEY_FRAME unsupported: {e}");
         }
     }
+
+    fn set_bitrate(&mut self, bps: u32) -> Result<()> {
+        set_bitrate_control(&self.device, bps)?;
+        self.config.bitrate_bps = bps;
+        tracing::info!("V4L2 M2M: bitrate set to {bps} bps");
+        Ok(())
+    }
+
+    fn set_keyframe_interval(&mut self, frames: u32) -> Result<()> {
+        set_gop_control(&self.device, frames)?;
+        self.config.gop_size = frames;
+        tracing::info!("V4L2 M2M: GOP size set to {frames} frames");
+        Ok(())
+    }
+}
+
+/// Set the target bitrate on a (possibly streaming) encoder context.
+///
+/// V4L2 permits control changes at any time — "The client is allowed to use
+/// `VIDIOC_S_CTRL()` to change encoder parameters at any time" — but which
+/// controls a driver *honours* mid-stream is driver-specific, and one that
+/// refuses returns `-EBUSY`. Shared by open-time configuration and the runtime
+/// setter so the two cannot drift apart.
+fn set_bitrate_control(device: &Device, bps: u32) -> Result<()> {
+    let mut bitrate = SafeExtControl::<VideoBitrate>::from_value(bps as i32);
+    ioctl::s_ext_ctrls(device, CtrlWhich::Current, &mut bitrate).map_err(|e| {
+        Error::Config(format!(
+            "V4L2 M2M: driver rejected a bitrate of {bps} bps: {e}"
+        ))
+    })?;
+
+    // CBR: without this the driver may treat the bitrate as an upper bound.
+    let mut mode = SafeExtControl::<VideoBitrateMode>::from_value(
+        v4l2r::controls::codec::VideoBitrateMode::ConstantBitrate as i32,
+    );
+    if let Err(e) = ioctl::s_ext_ctrls(device, CtrlWhich::Current, &mut mode) {
+        tracing::debug!("V4L2 M2M: bitrate mode control unsupported: {e}");
+    }
+    Ok(())
+}
+
+/// Set the keyframe interval, preferring `H264_I_PERIOD` and falling back to
+/// the generic `GOP_SIZE`.
+///
+/// Worth knowing: several drivers accept this ioctl and then ignore it while
+/// streaming (GOP is the usual casualty; bitrate is more widely honoured). We
+/// cannot detect that from userspace — the ioctl succeeds — so treat a live GOP
+/// change on hardware as best-effort.
+fn set_gop_control(device: &Device, frames: u32) -> Result<()> {
+    let mut i_period = SafeExtControl::<VideoH264IPeriod>::from_value(frames as i32);
+    if ioctl::s_ext_ctrls(device, CtrlWhich::Current, &mut i_period).is_ok() {
+        return Ok(());
+    }
+
+    let mut gop = SafeExtControl::<VideoGopSize>::from_value(frames as i32);
+    ioctl::s_ext_ctrls(device, CtrlWhich::Current, &mut gop).map_err(|e| {
+        Error::Config(format!(
+            "V4L2 M2M: driver rejected a GOP size of {frames}: {e}"
+        ))
+    })?;
+    Ok(())
 }
 
 impl std::fmt::Debug for V4l2M2mH264Encoder {
@@ -1028,6 +1091,55 @@ mod tests {
 
         // Repeated flush without new input is a no-op.
         assert!(encoder.flush().expect("idempotent flush").is_empty());
+    }
+
+    /// Hardware-gated: live bitrate and GOP changes on a *streaming* encoder.
+    ///
+    /// V4L2 permits control changes at any time, but honouring them is
+    /// driver-specific — this asserts the ioctls are accepted and encoding
+    /// survives them, not that the driver actually re-rates the stream (which
+    /// userspace cannot detect: the ioctl succeeds either way).
+    #[test]
+    fn hw_live_control_changes() {
+        use super::super::traits::VideoEncoder;
+
+        let Ok(device) = std::env::var("PARALLAX_V4L2_M2M_TEST_DEVICE") else {
+            println!("PARALLAX_V4L2_M2M_TEST_DEVICE not set, skipping");
+            return;
+        };
+
+        let mut encoder = open_with_any_input(&device, V4l2CodedFormat::H264);
+        let input_format = encoder.config.pixel_format;
+
+        for seq in 0..5 {
+            encoder
+                .encode(&test_frame(640, 480, input_format, seq))
+                .expect("encode");
+        }
+
+        // Mid-stream, on a live context.
+        match encoder.set_bitrate(500_000) {
+            Ok(()) => assert_eq!(encoder.config.bitrate_bps, 500_000),
+            Err(e) => println!("driver rejected a live bitrate change: {e}"),
+        }
+        match encoder.set_keyframe_interval(15) {
+            Ok(()) => assert_eq!(encoder.config.gop_size, 15),
+            Err(e) => println!("driver rejected a live GOP change: {e}"),
+        }
+
+        // Encoding must survive either outcome.
+        let mut packets = 0;
+        for seq in 5..10 {
+            packets += encoder
+                .encode(&test_frame(640, 480, input_format, seq))
+                .expect("encoding must continue after a control change")
+                .len();
+        }
+        packets += encoder.flush().expect("flush").len();
+        assert!(
+            packets > 0,
+            "encoder stopped producing after a control change"
+        );
     }
 
     /// Hardware-gated: set `PARALLAX_V4L2_M2M_TEST_DEVICE=/dev/videoN` to a
