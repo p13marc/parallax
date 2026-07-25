@@ -1,0 +1,95 @@
+name: CI
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  SENSOR_FEATURES: zenoh,h264,v4l2,rtp,rtsp,image-jpeg,hotplug
+
+jobs:
+  fmt:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@v6
+      - uses: https://github.com/dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  clippy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@v6
+      - run: sudo apt-get update && sudo apt-get install -y libudev-dev g++
+      - uses: https://github.com/dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: https://github.com/Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --features "$SENSOR_FEATURES,image-codecs,zenoh-unstable" -- -D warnings
+
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@v6
+      - run: sudo apt-get update && sudo apt-get install -y libudev-dev g++
+      - uses: https://github.com/dtolnay/rust-toolchain@stable
+      - uses: https://github.com/Swatinem/rust-cache@v2
+      - uses: https://github.com/taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - run: cargo nextest run
+      - run: cargo test --doc
+      - run: cargo check --all-targets --features "$SENSOR_FEATURES"
+      - run: cargo nextest run --features "$SENSOR_FEATURES"
+
+  msrv:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@v6
+      - run: sudo apt-get update && sudo apt-get install -y libudev-dev g++
+      - uses: https://github.com/dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95"
+      - uses: https://github.com/Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - run: cargo check --all-targets
+      - run: cargo check --all-targets --features "$SENSOR_FEATURES"
+
+  libcamera:
+    runs-on: ubuntu-24.04
+    container:
+      image: fedora:44
+    steps:
+      # no node in fedora:44 → install it first so JS actions work
+      - run: dnf install -y nodejs git gcc gcc-c++ clang-devel libcamera-devel systemd-devel pkgconf-pkg-config tar xz zstd
+      - uses: https://data.forgejo.org/actions/checkout@v6
+      - uses: https://github.com/dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: https://github.com/Swatinem/rust-cache@v2
+        with:
+          key: libcamera
+      - uses: https://github.com/taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - run: cargo clippy --all-targets --features libcamera -- -D warnings
+      - run: cargo nextest run --features libcamera -E 'test(libcamera) | test(monitor)'
+
+  docs:
+    runs-on: ubuntu-24.04
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@v6
+      - run: sudo apt-get update && sudo apt-get install -y libudev-dev g++
+      - uses: https://github.com/dtolnay/rust-toolchain@stable
+      - uses: https://github.com/Swatinem/rust-cache@v2
+      - run: cargo doc --no-deps --features "$SENSOR_FEATURES,image-codecs,zenoh-unstable"
