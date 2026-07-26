@@ -4,7 +4,7 @@
 name = "parallax-pipeline-macros"
 version = "0.1.1"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.97"
 description = "Procedural macros for Parallax, the Rust-native streaming pipeline engine"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/p13marc/parallax"

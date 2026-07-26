@@ -64,7 +64,7 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y libudev-dev g++ libclang-dev
       - uses: https://github.com/dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.95"
+          toolchain: "1.97"
       - uses: https://github.com/Swatinem/rust-cache@v2
         with:
           key: msrv
