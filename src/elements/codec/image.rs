@@ -602,6 +602,8 @@ mod png_codec {
         color_type: Option<ColorType>,
         frame_count: u64,
         arena: Option<SharedArena>,
+        /// Counters readable while the pipeline runs (shared with [`Self::stats`]).
+        stats: crate::control::EncoderStatsHandle,
     }
 
     impl PngEncoder {
@@ -613,6 +615,7 @@ mod png_codec {
                 color_type: None,
                 frame_count: 0,
                 arena: None,
+                stats: crate::control::EncoderStatsHandle::default(),
             }
         }
 
@@ -627,6 +630,18 @@ mod png_codec {
         /// Get the number of frames encoded.
         pub fn frame_count(&self) -> u64 {
             self.frame_count
+        }
+
+        /// A cloneable handle to this encoder's counters.
+        ///
+        /// Clone it *before* `executor.start()`: the element is moved into its
+        /// executor task there, so [`frame_count`](Self::frame_count) can never
+        /// be read while it is actually encoding. This handle can.
+        ///
+        /// PNG has no rate control, so `frames_dropped_by_rc` stays zero;
+        /// `frames_encoded`, `bytes_encoded` and `last_encode_ns` are live.
+        pub fn stats(&self) -> crate::control::EncoderStatsHandle {
+            self.stats.clone()
         }
 
         fn to_png_color_type(color_type: ColorType) -> png::ColorType {
@@ -665,6 +680,7 @@ mod png_codec {
             }
 
             // Encode to PNG
+            let started = std::time::Instant::now();
             let mut output = Vec::new();
             {
                 let mut encoder = png::Encoder::new(&mut output, width, height);
@@ -679,6 +695,11 @@ mod png_codec {
                     .write_image_data(&input[..expected_size])
                     .map_err(|e| Error::InvalidSegment(format!("PNG encode failed: {:?}", e)))?;
             }
+            // Same rationale as JpegEncoder: the element is moved into its
+            // executor task at start, so per-frame cost has to be readable
+            // through a handle. PNG has no rate control either.
+            self.stats
+                .record_frame(output.len(), started.elapsed().as_nanos() as u64);
 
             // Lazily initialize arena
             if self.arena.is_none() {
