@@ -12,11 +12,15 @@ use super::{Codec, GpuUsage, VideoProfile};
 /// GPU buffer handle.
 ///
 /// This is an opaque handle to GPU memory. The actual implementation
-/// depends on the backend (Vulkan, VA-API, etc.).
+/// depends on the backend (Vulkan, VA-API, etc.). The underlying GPU
+/// resources are freed when the buffer is dropped — there is no manual
+/// free call to forget.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct GpuBuffer {
     /// Backend-specific handle.
+    // Only the Vulkan backend reads it; without that feature the sole use
+    // is the Drop impl, which dead-code analysis does not count.
+    #[cfg_attr(not(feature = "vulkan-video"), allow(dead_code))]
     pub(crate) handle: GpuBufferHandle,
     /// Buffer size in bytes.
     pub size: usize,
@@ -24,8 +28,8 @@ pub struct GpuBuffer {
     pub usage: GpuUsage,
 }
 
-/// Backend-specific buffer handle.
-#[derive(Debug, Default)]
+/// Backend-specific buffer handle. Frees its GPU resources on drop.
+#[derive(Default)]
 pub(crate) enum GpuBufferHandle {
     /// Placeholder for when no backend is available.
     #[default]
@@ -35,7 +39,48 @@ pub(crate) enum GpuBufferHandle {
     Vulkan {
         memory: ash::vk::DeviceMemory,
         image: Option<ash::vk::Image>,
+        /// Keeps the function table alive so Drop can free the resources.
+        /// The `VulkanContext` never destroys the `VkDevice`, so this can
+        /// never dangle.
+        device: std::sync::Arc<ash::Device>,
     },
+}
+
+impl Drop for GpuBufferHandle {
+    fn drop(&mut self) {
+        match self {
+            Self::None => {}
+            #[cfg(feature = "vulkan-video")]
+            Self::Vulkan {
+                memory,
+                image,
+                device,
+            } => {
+                // Safety: ownership of the handle guarantees exclusive access,
+                // and Vulkan permits freeing memory/images from any thread.
+                unsafe {
+                    if let Some(image) = image.take() {
+                        device.destroy_image(image, None);
+                    }
+                    device.free_memory(*memory, None);
+                }
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for GpuBufferHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => write!(f, "GpuBufferHandle::None"),
+            #[cfg(feature = "vulkan-video")]
+            Self::Vulkan { memory, image, .. } => f
+                .debug_struct("GpuBufferHandle::Vulkan")
+                .field("memory", memory)
+                .field("image", image)
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 /// GPU video frame.
@@ -71,6 +116,17 @@ pub enum GpuPixelFormat {
     I420,
     /// I420 10-bit.
     I420p10,
+}
+
+impl From<GpuPixelFormat> for crate::format::PixelFormat {
+    fn from(format: GpuPixelFormat) -> Self {
+        match format {
+            GpuPixelFormat::Nv12 => Self::Nv12,
+            GpuPixelFormat::P010 => Self::P010,
+            GpuPixelFormat::I420 => Self::I420,
+            GpuPixelFormat::I420p10 => Self::I420_10Le,
+        }
+    }
 }
 
 impl GpuPixelFormat {
@@ -119,9 +175,6 @@ pub trait GpuMemory: Send + Sync {
         usage: GpuUsage,
     ) -> Result<GpuBuffer>;
 
-    /// Free a GPU buffer.
-    fn free(&mut self, buffer: GpuBuffer);
-
     /// Map GPU memory for CPU access (if supported).
     fn map(&self, buffer: &GpuBuffer) -> Result<*mut u8>;
 
@@ -153,6 +206,15 @@ pub trait HwVideoDecoder: Send {
 
     /// Get output pixel format.
     fn output_format(&self) -> GpuPixelFormat;
+
+    /// Copy a decoded frame's pixels into `out`.
+    ///
+    /// `out` must hold at least
+    /// `frame.format.frame_size(frame.width, frame.height)` bytes;
+    /// implementations error rather than truncate. Only the backend knows
+    /// how to reach the bytes behind a [`GpuFrame`]'s opaque handle, which
+    /// is why this lives on the decoder.
+    fn read_frame(&self, frame: &GpuFrame, out: &mut [u8]) -> Result<()>;
 
     /// Check if decoder has buffered frames.
     fn has_pending(&self) -> bool {

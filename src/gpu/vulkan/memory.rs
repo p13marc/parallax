@@ -234,6 +234,7 @@ impl GpuMemory for VulkanGpuMemory {
             handle: GpuBufferHandle::Vulkan {
                 memory,
                 image: None,
+                device: Arc::clone(&self.device),
             },
             size,
             usage: GpuUsage::default(),
@@ -292,6 +293,7 @@ impl GpuMemory for VulkanGpuMemory {
             handle: GpuBufferHandle::Vulkan {
                 memory,
                 image: None,
+                device: Arc::clone(&self.device),
             },
             size,
             usage,
@@ -332,21 +334,11 @@ impl GpuMemory for VulkanGpuMemory {
             handle: GpuBufferHandle::Vulkan {
                 memory,
                 image: Some(image),
+                device: Arc::clone(&self.device),
             },
             size,
             usage,
         })
-    }
-
-    fn free(&mut self, buffer: GpuBuffer) {
-        if let GpuBufferHandle::Vulkan { memory, image } = buffer.handle {
-            unsafe {
-                if let Some(img) = image {
-                    self.device.destroy_image(img, None);
-                }
-                self.device.free_memory(memory, None);
-            }
-        }
     }
 
     fn map(&self, buffer: &GpuBuffer) -> Result<*mut u8> {
@@ -370,11 +362,5 @@ impl GpuMemory for VulkanGpuMemory {
                 self.device.unmap_memory(*memory);
             }
         }
-    }
-}
-
-impl Drop for VulkanGpuMemory {
-    fn drop(&mut self) {
-        // Device is held by Arc, will be cleaned up when all references are dropped
     }
 }

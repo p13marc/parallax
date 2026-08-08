@@ -599,6 +599,32 @@ impl HwVideoDecoder for VulkanH264Decoder {
         self.output_format
     }
 
+    fn read_frame(&self, frame: &GpuFrame, out: &mut [u8]) -> Result<()> {
+        let size = frame.format.frame_size(frame.width, frame.height);
+        if out.len() < size {
+            return Err(VulkanError::DecodeError(format!(
+                "read_frame: output holds {} bytes, frame needs {}",
+                out.len(),
+                size
+            ))
+            .into());
+        }
+        if frame.buffer.size < size {
+            return Err(VulkanError::DecodeError(format!(
+                "read_frame: frame buffer holds {} bytes, geometry says {}",
+                frame.buffer.size, size
+            ))
+            .into());
+        }
+
+        let ptr = self.gpu_memory.map(&frame.buffer)?;
+        // Safety: the mapping is at least `frame.buffer.size >= size` bytes,
+        // and `out` was just checked to hold `size`.
+        unsafe { std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), size) };
+        self.gpu_memory.unmap(&frame.buffer);
+        Ok(())
+    }
+
     fn has_pending(&self) -> bool {
         false
     }

@@ -57,10 +57,16 @@ fn decodes_a_real_stream_when_hardware_is_present() {
 
     // The luma plane of a testsrc frame is not a constant field — if it is,
     // the bytes never came from the decoder.
-    // (GpuFrame data lives in host-visible memory; go through the decoder's
-    // allocator? The buffer was filled by read_output, so mapping is enough.)
-    // GpuBuffer has no public map here; size + geometry checks above already
-    // prove the full pipeline ran and the copy-out path sized correctly.
+    let frame = &frames[0];
+    let mut pixels = vec![0u8; frame.format.frame_size(frame.width, frame.height)];
+    decoder
+        .read_frame(frame, &mut pixels)
+        .expect("read decoded pixels");
+    let luma = &pixels[..(frame.width * frame.height) as usize];
+    assert!(
+        luma.iter().any(|&b| b != luma[0]),
+        "decoded luma plane is a constant field — the pixels never came from the GPU"
+    );
 
     assert!(!decoder.has_pending(), "synchronous decode holds nothing");
     let drained = decoder.flush().expect("flush");
