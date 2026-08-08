@@ -341,10 +341,30 @@ mod mp4_roundtrip_tests {
         let s1 = sample1.unwrap();
         assert!(s1.is_keyframe);
 
+        // The demuxer must emit Annex-B with in-band parameter sets: the mux
+        // wrote real AVCC, so the keyframe comes back as SPS, PPS, IDR.
+        let s1_types: Vec<u8> = parallax::codec::annexb::nal_units(s1.buffer.as_bytes())
+            .map(|n| n.nal_type())
+            .collect();
+        assert_eq!(
+            s1_types,
+            vec![7, 8, 5],
+            "keyframe is self-contained Annex-B"
+        );
+
         let sample2 = demux.read_sample(video_id).expect("Should read sample 2");
         assert!(sample2.is_some());
         let s2 = sample2.unwrap();
         assert!(!s2.is_keyframe);
+
+        let s2_types: Vec<u8> = parallax::codec::annexb::nal_units(s2.buffer.as_bytes())
+            .map(|n| n.nal_type())
+            .collect();
+        assert_eq!(
+            s2_types,
+            vec![1],
+            "delta frame gets no parameter-set prefix"
+        );
 
         let sample3 = demux.read_sample(video_id).expect("Should read sample 3");
         assert!(sample3.is_some());

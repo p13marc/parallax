@@ -3,8 +3,8 @@
 //! H.264 (and H.265) elementary streams are Annex-B: a sequence of NAL units,
 //! each prefixed by a `00 00 01` or `00 00 00 01` start code. Every part of a
 //! pipeline that touches an encoded stream ends up needing the same three
-//! things — *is there an IDR in here*, *what are the SPS/PPS*, and *turn the
-//! start codes into length prefixes for MP4*. They were reimplemented three
+//! things — *is there an IDR in here*, *what are the SPS/PPS*, and *convert
+//! between start codes and MP4's length prefixes* (both directions). They were reimplemented three
 //! separate times in this crate and exported zero times, with the two most
 //! useful ones stranded on an MP4 *file sink* behind the `mp4-demux` feature.
 //!
@@ -160,6 +160,52 @@ pub fn annex_b_to_avcc(data: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Convert an AVCC (length-prefixed) sample to Annex-B start-code form —
+/// the reverse of [`annex_b_to_avcc`], for feeding demuxed MP4 samples to a
+/// decoder.
+///
+/// `length_size` is `lengthSizeMinusOne + 1` from the avcC box and must be
+/// 1, 2 or 4 (ISO/IEC 14496-15 forbids 3). Zero-length NALs are skipped;
+/// a truncated length prefix or a NAL length overrunning the sample is an
+/// error — silently emitting a torn NAL would corrupt the stream downstream.
+pub fn avcc_to_annex_b(data: &[u8], length_size: u8) -> crate::error::Result<Vec<u8>> {
+    if !matches!(length_size, 1 | 2 | 4) {
+        return Err(crate::error::Error::Config(format!(
+            "invalid AVCC length_size {length_size} (must be 1, 2 or 4)"
+        )));
+    }
+    let length_size = length_size as usize;
+
+    let mut out = Vec::with_capacity(data.len() + 16);
+    let mut i = 0usize;
+    while i < data.len() {
+        if i + length_size > data.len() {
+            return Err(crate::error::Error::Config(format!(
+                "truncated AVCC NAL length prefix at offset {i}"
+            )));
+        }
+        let mut len = 0usize;
+        for &byte in &data[i..i + length_size] {
+            len = (len << 8) | byte as usize;
+        }
+        i += length_size;
+
+        if len > data.len() - i {
+            return Err(crate::error::Error::Config(format!(
+                "AVCC NAL length {len} overruns sample ({} bytes left)",
+                data.len() - i
+            )));
+        }
+        if len > 0 {
+            out.extend_from_slice(&[0, 0, 0, 1]);
+            out.extend_from_slice(&data[i..i + len]);
+        }
+        i += len;
+    }
+
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,5 +291,49 @@ mod tests {
         let nals: Vec<_> = nal_units(&data).collect();
         assert_eq!(nals.len(), 1);
         assert_eq!(nals[0].nal_type(), 1);
+    }
+
+    #[test]
+    fn avcc_round_trips_with_annex_b_to_avcc() {
+        let avcc = annex_b_to_avcc(&keyframe());
+        let back = avcc_to_annex_b(&avcc, 4).unwrap();
+
+        let orig: Vec<_> = nal_units(&keyframe()).map(|n| n.data.to_vec()).collect();
+        let round: Vec<_> = nal_units(&back).map(|n| n.data.to_vec()).collect();
+        assert_eq!(round, orig, "payloads survive the round trip");
+        let types: Vec<_> = nal_units(&back).map(|n| n.nal_type()).collect();
+        assert_eq!(types, vec![NAL_SPS, NAL_PPS, NAL_IDR]);
+    }
+
+    #[test]
+    fn avcc_to_annex_b_handles_short_length_prefixes() {
+        // length_size 2: one 3-byte NAL.
+        let out = avcc_to_annex_b(&[0, 3, 0x41, 0x9A, 0x02], 2).unwrap();
+        assert_eq!(out, vec![0, 0, 0, 1, 0x41, 0x9A, 0x02]);
+
+        // length_size 1: two NALs back to back.
+        let out = avcc_to_annex_b(&[2, 0x41, 0x9A, 1, 0x65], 1).unwrap();
+        let types: Vec<_> = nal_units(&out).map(|n| n.nal_type()).collect();
+        assert_eq!(types, vec![1, NAL_IDR]);
+    }
+
+    #[test]
+    fn avcc_to_annex_b_rejects_truncation() {
+        // Length claims 9 bytes, only 2 remain.
+        assert!(avcc_to_annex_b(&[0, 0, 0, 9, 0x41, 0x9A], 4).is_err());
+        // A 3-byte tail where a 4-byte prefix should be.
+        assert!(avcc_to_annex_b(&[0, 0, 0, 2, 0x41, 0x9A, 0, 0, 0], 4).is_err());
+    }
+
+    #[test]
+    fn avcc_to_annex_b_rejects_bad_length_sizes() {
+        assert!(avcc_to_annex_b(&[0, 0, 1, 0x41], 3).is_err());
+        assert!(avcc_to_annex_b(&[0x41], 0).is_err());
+    }
+
+    #[test]
+    fn avcc_to_annex_b_skips_zero_length_nals() {
+        let out = avcc_to_annex_b(&[0, 0, 0, 0, 0, 0, 0, 1, 0x65], 4).unwrap();
+        assert_eq!(out, vec![0, 0, 0, 1, 0x65]);
     }
 }
