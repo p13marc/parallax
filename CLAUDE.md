@@ -120,7 +120,7 @@ Two coexisting generations:
 - `Sink::consume(&mut self, ctx: &ConsumeContext) -> Result<()>`
 - `Element::process(&mut self, buffer: Buffer) -> Result<Option<Buffer>>` (1-to-0/1)
 - `Transform::transform(&mut self, buffer) -> Result<Output>` (multi-output; blanket impl for all `Element`)
-- `AsyncSource`/`AsyncSink`/`AsyncTransform` (async variants), `Demuxer` (1-to-N via `RoutedOutput`), `Muxer` (N-to-1 via `MuxerInput`), `SyncElement` (RT path)
+- `AsyncSource`/`AsyncSink`/`AsyncTransform` (async variants), `Demuxer` (1-to-N via `RoutedOutput`), `Muxer` (N-to-1 via `MuxerInput`), `SyncElement` (RT path). Muxer/demuxer nodes are the only ones whose executor task keeps channels **per pad**; every other type flattens them. Note `take_inputs`/`take_outputs` *drain* the per-pad map, so a task spawner must take one form or the other, never both.
 - Optional methods: `output_caps()`, `output_media_caps()`/`input_media_caps()`, `execution_hints()`, `flush()`, `handle_upstream_event()`/`handle_downstream_event()`, `is_seekable()`, `query_position()`/`query_duration()`, `flow_policy()`, `handle_flow_signal()`, `as_clock_provider()`
 - Adapters wrap author traits into the type-erased runtime trait: `SourceAdapter` (also `with_arena`/`with_pool`), `SinkAdapter`, `ElementAdapter`, `TransformAdapter`, `MuxerAdapter`, etc. → `DynAsyncElement` (dynosaur-generated)
 
@@ -276,6 +276,7 @@ Muxer sync: `MuxerSyncState`/`MuxerSyncConfig::new().with_mode(SyncMode::{Auto|S
 9. **Vulkan Video (`vulkan-video`) is a scaffold**: context/session/DPB/DMA-BUF memory are real, but `VulkanH264Decoder::decode_frame` does NOT submit hardware decode commands — it returns a `GpuFrame` over uninitialised memory; no encode; H.265/AV1 absent. Tracked in #3, which also records that Mesa ANV only exposes Vulkan Video on Gen12+ (so a Gen9.5 iGPU cannot even smoke-test it; RADV is the target). The empty `gpu` feature flag and the never-referenced `gpu-allocator` dependency have been removed.
 10. **Every example file has an `[[example]]` entry in Cargo.toml**, feature-gated ones carrying `required-features`. Add one when you add an example: without it, cargo builds the file under default features and there is nowhere to hang the gate — which is how 42/43/44 ended up hand-rolling `#[cfg(not(feature))]` stub `main`s that printed a message instead of failing.
 11. **benches/memory_pool.rs and benches/throughput.rs are stubs** (pending rewrite after a memory-API refactor); only `colorspace` is a real bench.
+11b. **`elements::codec::hw_encoder`/`hw_decoder` need `vulkan-video` AND a codec feature** (the latter to compile `elements::codec` at all). No CI job sets both, so they had rotted un-compiled for a long time. Check them with `cargo check --features image-jpeg,vulkan-video`.
 12. **`AlignmentStrategy::Interpolate` needs `B: Lerp`** — it resamples the *right* stream onto the left's timestamps, and only `TemporalJoin::try_emit_interpolated` honours it. Plain `try_emit` returns `None` for that variant (it used to silently run `Nearest(10ms)`, discarding the caller's `Duration`).
 13. Types that do NOT exist (stale docs may mention them): `CpuArena`, `HeapSegment`, `MemoryPool`, `SharedMemorySegment`, `PipelineExecutor`, `ElementSandbox`, `Affinity`, `parallax-launch`/`parallax-inspect`/`parallax-top` binaries.
 

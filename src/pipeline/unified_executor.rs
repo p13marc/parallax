@@ -982,8 +982,15 @@ impl Executor {
         // Set bus handle so elements can post messages
         element.set_bus(pipeline.bus_handle().for_element(&node_name));
 
-        let inputs = channels.take_inputs(node_id);
-        let outputs = channels.take_outputs(node_id);
+        // Take the channels this element type actually needs, inside the match.
+        //
+        // These used to be hoisted out of the match, which quietly broke both
+        // N-ary element types: `take_inputs`/`take_outputs` *drain* the maps
+        // (they are `take_*_by_pad().into_values().flatten()`), so by the time
+        // the Muxer arm called `take_inputs_by_pad` it got an empty map and the
+        // muxer received no inputs at all — likewise the Demuxer arm's
+        // `take_outputs_by_pad`. Muxers and demuxers added through
+        // `add_muxer`/`add_demuxer` therefore never moved a single buffer.
         let events_clone = events.clone();
         let probes = pipeline.probe_registry().clone();
         let tracers = pipeline.tracer_registry().clone();
@@ -993,7 +1000,7 @@ impl Executor {
                 node_name,
                 node_id,
                 element,
-                outputs,
+                channels.take_outputs(node_id),
                 output_bridges,
                 events_clone,
                 probes,
@@ -1004,7 +1011,7 @@ impl Executor {
                 node_name,
                 node_id,
                 element,
-                inputs,
+                channels.take_inputs(node_id),
                 input_bridges,
                 events_clone,
                 probes,
@@ -1014,8 +1021,8 @@ impl Executor {
                 node_name,
                 node_id,
                 element,
-                inputs,
-                outputs,
+                channels.take_inputs(node_id),
+                channels.take_outputs(node_id),
                 input_bridges,
                 output_bridges,
                 events_clone,
@@ -1023,24 +1030,33 @@ impl Executor {
                 tracers,
             ),
             ElementType::Demuxer => {
+                // Inputs flattened (one sink pad), outputs kept per pad — that
+                // is the whole point of a demuxer.
+                let inputs = channels.take_inputs(node_id);
                 let outputs_by_pad = channels.take_outputs_by_pad(node_id);
                 spawn_demuxer_task(
                     node_name,
+                    node_id,
                     element,
                     inputs,
                     outputs_by_pad,
                     events_clone,
+                    probes,
                     tracers,
                 )
             }
             ElementType::Muxer => {
+                // Mirror image: inputs per pad, outputs flattened.
                 let inputs_by_pad = channels.take_inputs_by_pad(node_id);
+                let outputs = channels.take_outputs(node_id);
                 spawn_muxer_task(
                     node_name,
+                    node_id,
                     element,
                     inputs_by_pad,
                     outputs,
                     events_clone,
+                    probes,
                     tracers,
                 )
             }
@@ -1418,12 +1434,20 @@ fn spawn_sink_task(
                 }
             }
         } else if let Some(bridge) = input_bridges.into_iter().next() {
-            // Bridge path: read from RT→Async bridge
+            // Bridge path: read from RT→Async bridge. Observability mirrors the
+            // channel path above; it used to be missing here entirely.
             loop {
                 // Drain all available buffers
                 while let Some(buffer) = bridge.try_pop() {
                     count += 1;
-                    if let Err(e) = element.process(Some(buffer)).await {
+                    match probe_registry.invoke_buffer(&sink_pad, &buffer) {
+                        ProbeReturn::Drop | ProbeReturn::Handled => continue,
+                        _ => {}
+                    }
+                    tracers.notify_buffer(&name, &buffer);
+                    let result = element.process(Some(buffer)).await;
+                    tracers.notify_buffer_processed(&name);
+                    if let Err(e) = result {
                         events.send_error(e.to_string(), Some(name.clone()));
                         return Err(e);
                     }
@@ -1588,12 +1612,32 @@ fn spawn_transform_task(
                 }
             }
         } else if let Some(bridge) = input_bridges.into_iter().next() {
-            // Bridge path: read from RT→Async bridge
+            // Bridge path: read from RT→Async bridge.
+            //
+            // Observability here mirrors the channel path above, including the
+            // notify_buffer_processed-before-send_output ordering. It used to
+            // be absent entirely, so putting an element on an RT thread — the
+            // elements most worth measuring — made it invisible to probes and
+            // to LatencyTracer.
             loop {
                 while let Some(buffer) = bridge.try_pop() {
                     count += 1;
-                    match element.process(Some(buffer)).await {
+
+                    match probe_registry.invoke_buffer(&sink_pad, &buffer) {
+                        ProbeReturn::Drop | ProbeReturn::Handled => continue,
+                        _ => {}
+                    }
+
+                    tracers.notify_buffer(&name, &buffer);
+                    let result = element.process(Some(buffer)).await;
+                    tracers.notify_buffer_processed(&name);
+
+                    match result {
                         Ok(Some(out)) => {
+                            match probe_registry.invoke_buffer(&src_pad, &out) {
+                                ProbeReturn::Drop | ProbeReturn::Handled => continue,
+                                _ => {}
+                            }
                             send_output(out, &outputs, &output_bridges, &tracers).await;
                         }
                         Ok(None) => {}
@@ -1638,18 +1682,23 @@ fn spawn_transform_task(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_demuxer_task(
     name: String,
+    node_id: NodeId,
     mut element: Box<DynAsyncElement<'static>>,
     inputs: Vec<AsyncReceiver<Message>>,
     outputs_by_pad: HashMap<String, Vec<OutputBranch>>,
     events: EventSender,
+    probe_registry: ProbeRegistry,
     tracers: TracerRegistry,
 ) -> JoinHandle<Result<()>> {
     tokio::spawn(async move {
         tracing::debug!("demuxer '{}' started", name);
         events.send_node_started(&name);
 
+        let sink_pad = crate::pipeline::probe::PadRef::sink(node_id);
+        let src_pad = crate::pipeline::probe::PadRef::src(node_id);
         let mut count: u64 = 0;
 
         if let Some(rx) = inputs.into_iter().next() {
@@ -1657,8 +1706,26 @@ fn spawn_demuxer_task(
                 match rx.recv().await {
                     Ok(Message::Buffer(buffer)) => {
                         count += 1;
-                        match element.process(Some(buffer)).await {
+
+                        match probe_registry.invoke_buffer(&sink_pad, &buffer) {
+                            ProbeReturn::Drop | ProbeReturn::Handled => continue,
+                            _ => {}
+                        }
+
+                        // Same ordering rule as spawn_transform_task: the
+                        // processed notification must land before the
+                        // broadcast, or downstream back-pressure is billed as
+                        // demux time.
+                        tracers.notify_buffer(&name, &buffer);
+                        let result = element.process(Some(buffer)).await;
+                        tracers.notify_buffer_processed(&name);
+
+                        match result {
                             Ok(Some(out)) => {
+                                match probe_registry.invoke_buffer(&src_pad, &out) {
+                                    ProbeReturn::Drop | ProbeReturn::Handled => continue,
+                                    _ => {}
+                                }
                                 for branches in outputs_by_pad.values() {
                                     broadcast(branches, out.clone(), &tracers).await;
                                 }
@@ -1706,10 +1773,12 @@ fn spawn_demuxer_task(
 #[allow(clippy::too_many_arguments)]
 fn spawn_muxer_task(
     name: String,
+    node_id: NodeId,
     mut element: Box<DynAsyncElement<'static>>,
     inputs_by_pad: HashMap<String, Vec<AsyncReceiver<Message>>>,
     outputs: Vec<OutputBranch>,
     events: EventSender,
+    probe_registry: ProbeRegistry,
     tracers: TracerRegistry,
 ) -> JoinHandle<Result<()>> {
     use futures::stream::{FuturesUnordered, StreamExt};
@@ -1718,27 +1787,73 @@ fn spawn_muxer_task(
         tracing::debug!("muxer '{}' started", name);
         events.send_node_started(&name);
 
+        // A muxer has several sink pads, but probes are registered per node
+        // rather than per named pad here, so all inputs share one PadRef —
+        // consistent with how a transform's single sink pad is handled.
+        let sink_pad = crate::pipeline::probe::PadRef::sink(node_id);
+        let src_pad = crate::pipeline::probe::PadRef::src(node_id);
         let mut count: u64 = 0;
+
+        // One pending receive per input, re-armed after each message.
+        //
+        // `FuturesUnordered` drops a future once it resolves, so the previous
+        // version — which collected one `rx.recv()` future per input and never
+        // pushed another — delivered exactly *one* buffer per input pad and
+        // then fell out of the loop. A two-input muxer muxed two buffers,
+        // whatever the stream length.
+        async fn recv_one(
+            pad: String,
+            rx: AsyncReceiver<Message>,
+        ) -> (String, AsyncReceiver<Message>, Option<Message>) {
+            let msg = rx.recv().await.ok();
+            (pad, rx, msg)
+        }
 
         let mut receivers: FuturesUnordered<_> = inputs_by_pad
             .into_iter()
             .flat_map(|(pad, rxs)| {
-                rxs.into_iter().map(move |rx| {
-                    let p = pad.clone();
-                    async move { (p, rx.recv().await) }
-                })
+                rxs.into_iter()
+                    .map(move |rx| recv_one(pad.clone(), rx))
+                    .collect::<Vec<_>>()
             })
             .collect();
 
         let total = receivers.len();
         let mut eos_count = 0;
 
-        while let Some((_, msg)) = receivers.next().await {
+        while let Some((pad, rx, msg)) = receivers.next().await {
+            // Keep listening on this input unless it just ended; the EOS and
+            // error arms deliberately let it drop.
+            if matches!(msg, Some(Message::Buffer(_))) {
+                receivers.push(recv_one(pad, rx));
+            }
+            let msg = match msg {
+                Some(m) => Ok(m),
+                None => Err(()),
+            };
             match msg {
                 Ok(Message::Buffer(buffer)) => {
                     count += 1;
-                    match element.process(Some(buffer)).await {
+
+                    match probe_registry.invoke_buffer(&sink_pad, &buffer) {
+                        ProbeReturn::Drop | ProbeReturn::Handled => continue,
+                        _ => {}
+                    }
+
+                    // Muxers buffer and interleave, so most inputs produce no
+                    // output — LatencyTracer sees the pair regardless, which is
+                    // what makes "how long is this muxer taking" answerable at
+                    // all. It previously had no instrumentation whatsoever.
+                    tracers.notify_buffer(&name, &buffer);
+                    let result = element.process(Some(buffer)).await;
+                    tracers.notify_buffer_processed(&name);
+
+                    match result {
                         Ok(Some(out)) => {
+                            match probe_registry.invoke_buffer(&src_pad, &out) {
+                                ProbeReturn::Drop | ProbeReturn::Handled => continue,
+                                _ => {}
+                            }
                             broadcast(&outputs, out, &tracers).await;
                         }
                         Ok(None) => {}

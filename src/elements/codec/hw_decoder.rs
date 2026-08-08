@@ -28,7 +28,7 @@ use crate::buffer::{Buffer, MemoryHandle};
 use crate::clock::ClockTime;
 use crate::element::{ExecutionHints, Output, Transform};
 use crate::error::{Error, Result};
-use crate::gpu::traits::{GpuFrame, GpuMemory, GpuPixelFormat, HwVideoDecoder};
+use crate::gpu::{GpuFrame, GpuPixelFormat, HwVideoDecoder};
 use crate::memory::SharedArena;
 use std::collections::VecDeque;
 
@@ -207,7 +207,8 @@ impl<D: HwVideoDecoder + 'static> Transform for HwDecoderElement<D> {
         let pts = buffer
             .metadata()
             .pts
-            .as_nanos()
+            .to_option()
+            .map(|t| t.nanos())
             .unwrap_or(self.frames_out * 33_333_333) as i64; // Default 30fps
 
         self.packets_in += 1;

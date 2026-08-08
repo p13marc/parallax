@@ -29,9 +29,7 @@ use crate::buffer::{Buffer, MemoryHandle};
 use crate::clock::ClockTime;
 use crate::element::{ExecutionHints, Output, Transform};
 use crate::error::{Error, Result};
-use crate::gpu::traits::{
-    GpuBuffer, GpuBufferHandle, GpuFrame, GpuPixelFormat, GpuUsage, HwVideoEncoder,
-};
+use crate::gpu::{GpuBuffer, GpuBufferHandle, GpuFrame, GpuPixelFormat, GpuUsage, HwVideoEncoder};
 use crate::memory::SharedArena;
 use std::collections::VecDeque;
 
@@ -82,6 +80,8 @@ pub struct HwEncoderElement<E: HwVideoEncoder> {
     arena: Option<SharedArena>,
     /// Pending runtime keyframe requests (shared with [`Self::keyframe_handle`]).
     keyframe_requests: super::KeyframeHandle,
+    /// Counters readable while the pipeline runs (shared with [`Self::stats`]).
+    stats: crate::control::EncoderStatsHandle,
     /// Expected input width.
     width: u32,
     /// Expected input height.
@@ -106,6 +106,7 @@ impl<E: HwVideoEncoder> HwEncoderElement<E> {
             packets_out: 0,
             arena: None,
             keyframe_requests: super::KeyframeHandle::new(),
+            stats: crate::control::EncoderStatsHandle::default(),
             width: 0,
             height: 0,
             format: GpuPixelFormat::Nv12,
@@ -123,6 +124,7 @@ impl<E: HwVideoEncoder> HwEncoderElement<E> {
             packets_out: 0,
             arena: None,
             keyframe_requests: super::KeyframeHandle::new(),
+            stats: crate::control::EncoderStatsHandle::default(),
             width,
             height,
             format,
@@ -146,6 +148,15 @@ impl<E: HwVideoEncoder> HwEncoderElement<E> {
     /// Get the number of frames received.
     pub fn frames_in(&self) -> u64 {
         self.frames_in
+    }
+
+    /// A cloneable handle to this encoder's counters.
+    ///
+    /// Clone it *before* `executor.start()`: the element is moved into its
+    /// executor task there, so the plain `&self` counters above can never be
+    /// read while it is actually encoding. This handle can.
+    pub fn stats(&self) -> crate::control::EncoderStatsHandle {
+        self.stats.clone()
     }
 
     /// Get the number of packets produced.
@@ -193,7 +204,8 @@ impl<E: HwVideoEncoder> HwEncoderElement<E> {
         let pts = buffer
             .metadata()
             .pts
-            .as_nanos()
+            .to_option()
+            .map(|t| t.nanos())
             .unwrap_or(self.frames_in * 33_333_333) as i64;
 
         let is_keyframe = buffer
@@ -238,7 +250,7 @@ impl<E: HwVideoEncoder> HwEncoderElement<E> {
 
         let arena = self.arena.as_mut().unwrap();
         arena.reclaim();
-        let slot = arena
+        let mut slot = arena
             .acquire()
             .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
 
@@ -281,7 +293,8 @@ impl<E: HwVideoEncoder + 'static> Transform for HwEncoderElement<E> {
         let pts = buffer
             .metadata()
             .pts
-            .as_nanos()
+            .to_option()
+            .map(|t| t.nanos())
             .unwrap_or(self.frames_in * 33_333_333) as i64;
 
         // Check for keyframe request from upstream or the runtime handle
@@ -301,15 +314,22 @@ impl<E: HwVideoEncoder + 'static> Transform for HwEncoderElement<E> {
         let frame = self.buffer_to_frame(&buffer)?;
 
         // Encode frame
+        let started = std::time::Instant::now();
         let packets = self.encoder.encode(&frame)?;
+        let elapsed_ns = started.elapsed().as_nanos() as u64;
 
-        // If no packets, encoder is buffering
+        // If no packets, the encoder is buffering (B-frame reorder) or rate
+        // control swallowed the frame. Either way nothing came out for this
+        // input, which is exactly the event a sender-side bitrate loop needs
+        // to see.
         if packets.is_empty() {
+            self.stats.record_rc_drop(elapsed_ns);
             return Ok(Output::None);
         }
 
         // Convert packets to buffers
         let mut buffers = Vec::with_capacity(packets.len());
+        let mut encoded_bytes = 0usize;
         for (i, packet) in packets.into_iter().enumerate() {
             let is_keyframe = i == 0
                 && buffer
@@ -317,9 +337,12 @@ impl<E: HwVideoEncoder + 'static> Transform for HwEncoderElement<E> {
                     .get::<bool>("video/keyframe")
                     .copied()
                     .unwrap_or(false);
-            buffers.push(self.packet_to_buffer(packet.as_ref().to_vec(), pts, is_keyframe)?);
+            let data = packet.as_ref().to_vec();
+            encoded_bytes += data.len();
+            buffers.push(self.packet_to_buffer(data, pts, is_keyframe)?);
             self.packets_out += 1;
         }
+        self.stats.record_frame(encoded_bytes, elapsed_ns);
 
         Ok(Output::from(buffers))
     }

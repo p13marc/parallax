@@ -275,6 +275,8 @@ mod jpeg_codec {
         quality: std::sync::Arc<std::sync::atomic::AtomicU8>,
         frame_count: u64,
         arena: Option<SharedArena>,
+        /// Counters readable while the pipeline runs (shared with [`Self::stats`]).
+        stats: crate::control::EncoderStatsHandle,
     }
 
     /// Cloneable handle to change a running [`JpegEncoder`]'s quality.
@@ -311,6 +313,7 @@ mod jpeg_codec {
                 quality: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(80)),
                 frame_count: 0,
                 arena: None,
+                stats: crate::control::EncoderStatsHandle::default(),
             }
         }
 
@@ -338,6 +341,18 @@ mod jpeg_codec {
         /// Get the number of frames encoded.
         pub fn frame_count(&self) -> u64 {
             self.frame_count
+        }
+
+        /// A cloneable handle to this encoder's counters.
+        ///
+        /// Clone it *before* `executor.start()`: the element is moved into its
+        /// executor task there, so [`frame_count`](Self::frame_count) can never
+        /// be read while it is actually encoding. This handle can.
+        ///
+        /// JPEG has no rate control, so `frames_dropped_by_rc` stays zero;
+        /// `frames_encoded`, `bytes_encoded` and `last_encode_ns` are live.
+        pub fn stats(&self) -> crate::control::EncoderStatsHandle {
+            self.stats.clone()
         }
 
         fn to_jpeg_color_type(color_type: ColorType) -> Result<jpeg_encoder::ColorType> {
@@ -398,6 +413,7 @@ mod jpeg_codec {
             let mut output = Vec::new();
             // Read per frame: a JpegQualityControl handle may have changed it
             // while the pipeline runs.
+            let started = std::time::Instant::now();
             let encoder = jpeg_encoder::Encoder::new(&mut output, self.quality());
             encoder
                 .encode(
@@ -407,6 +423,12 @@ mod jpeg_codec {
                     Self::to_jpeg_color_type(color_type)?,
                 )
                 .map_err(|e| Error::InvalidSegment(format!("JPEG encode failed: {:?}", e)))?;
+            // A preview branch is a real per-viewer cost, and quality is the
+            // knob operators reach for — so bytes-per-frame and encode time
+            // need to be readable while the pipeline runs, not just after.
+            // JPEG has no rate control, so frames_dropped_by_rc stays zero.
+            self.stats
+                .record_frame(output.len(), started.elapsed().as_nanos() as u64);
 
             // Lazily initialize arena
             if self.arena.is_none() {
@@ -749,6 +771,45 @@ mod tests {
             // Geometry travels in-band, so a test frame describes itself too.
             metadata.set_video_dims(W, H, crate::format::PixelFormat::Rgb24);
             Buffer::new(MemoryHandle::with_len(slot, data.len()), metadata)
+        }
+
+        /// #44: the preview branch's byte cost must be readable on a running
+        /// pipeline, not only after it stops.
+        ///
+        /// `frame_count()` is `&self` on the element, and `Executor::start`
+        /// moves elements into their tasks — so it can never be read while the
+        /// encoder is encoding. The stats handle is cloned before start and
+        /// can be.
+        #[test]
+        fn stats_track_frames_and_bytes() {
+            let mut encoder = JpegEncoder::new();
+            let stats = encoder.stats();
+
+            assert_eq!(stats.snapshot().frames_encoded, 0);
+
+            let data = gradient_rgb();
+            let first = encoder
+                .process(rgb_buffer(&data))
+                .unwrap()
+                .expect("encoder output");
+            let first_len = first.as_bytes().len();
+
+            let snap = stats.snapshot();
+            assert_eq!(snap.frames_encoded, 1);
+            assert_eq!(
+                snap.bytes_encoded as usize, first_len,
+                "bytes_encoded must match what actually came out"
+            );
+            assert!(snap.last_encode_ns > 0, "encode duration must be recorded");
+            assert_eq!(
+                snap.frames_dropped_by_rc, 0,
+                "JPEG has no rate control, so this counter stays zero"
+            );
+
+            encoder.process(rgb_buffer(&data)).unwrap();
+            let snap = stats.snapshot();
+            assert_eq!(snap.frames_encoded, 2);
+            assert!(snap.bytes_encoded as usize > first_len, "bytes accumulate");
         }
 
         /// Preview quality is a live knob: a viewer on a thin link asks for a
