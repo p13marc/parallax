@@ -96,7 +96,9 @@ src/
 │                       #   driver.rs, parser.rs, factory.rs, bus.rs, events.rs, tags.rs,
 │                       #   seek.rs, probe.rs, tracer.rs, typefind.rs, flow.rs, builder.rs
 ├── negotiation/        # NegotiationSolver (per-link), ConverterRegistry, builtin registry
-├── converters/         # REAL VideoConvert/AudioConvert/AudioResample/VideoScale impls
+├── converters/         # REAL VideoConvert/AudioConvert/AudioResample/ScaleEngine impls
+│                       #   (ScaleEngine is the slice-level scaler; the VideoScale *element*
+│                       #   wraps it — one ScaleMode enum shared by both)
 ├── link/               # LocalLink (kanal), IpcPublisher/IpcSubscriber (memfd+SCM_RIGHTS),
 │                       #   NetworkSender/Receiver (TCP+rkyv, "PRLX" magic)
 ├── typed/              # TypedSource/Sink/Transform, pipeline builder (>> operator), operators,

@@ -3,7 +3,7 @@
 //! Scales raw video frames, preserving their pixel format. Every format the
 //! conversion engines handle works here — I420, NV12, YUYV, UYVY, RGB24, BGR24,
 //! RGBA, BGRA and Gray8 — because this element is a thin pipeline wrapper around
-//! [`converters::VideoScale`](crate::converters::VideoScale), which does the
+//! [`converters::ScaleEngine`](crate::converters::ScaleEngine), which does the
 //! actual resampling.
 //!
 //! # Geometry travels in-band
@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::buffer::{Buffer, MemoryHandle};
-use crate::converters::{self, ScaleAlgorithm};
+use crate::converters;
 use crate::element::Element;
 use crate::error::{Error, Result};
 use crate::format::{
@@ -46,15 +46,12 @@ use crate::metadata::Metadata;
 // Scale Mode
 // ============================================================================
 
-/// Scaling interpolation mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ScaleMode {
-    /// Bilinear interpolation (smoother, slower).
-    #[default]
-    Bilinear,
-    /// Nearest neighbor (faster, pixelated).
-    NearestNeighbor,
-}
+/// The one interpolation-mode enum, shared with the engine.
+///
+/// Lives in [`crate::converters`] (the element depends on the engine, never
+/// the other way around) and is re-exported here so element users need not
+/// know the split exists.
+pub use crate::converters::ScaleMode;
 
 // ============================================================================
 // Runtime Control
@@ -190,7 +187,7 @@ fn even(value: u32) -> u32 {
 /// Video scaling element.
 ///
 /// Resamples raw video frames to a target size, **preserving the pixel format**.
-/// The work is delegated to [`converters::VideoScale`], so every format that
+/// The work is delegated to [`converters::ScaleEngine`], so every format that
 /// engine supports works here: I420, NV12, YUYV, UYVY, RGB24, BGR24, RGBA, BGRA
 /// and Gray8.
 ///
@@ -209,7 +206,7 @@ pub struct VideoScale {
     /// Interpolation mode, fixed at construction.
     mode: ScaleMode,
     /// Cached engine, rebuilt whenever `engine_key` changes.
-    engine: Option<converters::VideoScale>,
+    engine: Option<converters::ScaleEngine>,
     /// The `(format, src_w, src_h, dst_w, dst_h)` the cached engine was built
     /// for. A change in *any* of them rebuilds it.
     engine_key: Option<(converters::PixelFormat, u32, u32, u32, u32)>,
@@ -335,12 +332,8 @@ impl VideoScale {
             return Ok(());
         }
 
-        let algorithm = match self.mode {
-            ScaleMode::Bilinear => ScaleAlgorithm::Bilinear,
-            ScaleMode::NearestNeighbor => ScaleAlgorithm::NearestNeighbor,
-        };
-        let engine = converters::VideoScale::new(src_w, src_h, dst_w, dst_h, format)?
-            .with_algorithm(algorithm);
+        let engine =
+            converters::ScaleEngine::new(src_w, src_h, dst_w, dst_h, format)?.with_mode(self.mode);
 
         self.scratch.clear();
         self.scratch.resize(format.buffer_size(dst_w, dst_h), 0);

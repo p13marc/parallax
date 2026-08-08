@@ -7,7 +7,7 @@
 //! # Video Converters
 //!
 //! - [`VideoConvert`]: Pixel format conversion (YUV ↔ RGB)
-//! - [`VideoScale`]: Resolution scaling (bilinear, nearest neighbor)
+//! - [`ScaleEngine`]: Resolution scaling (bilinear, nearest neighbor)
 //!
 //! # Audio Converters
 //!
@@ -38,4 +38,4 @@ mod scale;
 pub use audio::{AudioChannelMix, AudioConvert, ChannelLayout, SampleFormat};
 pub use colorspace::{ColorMatrix, PixelFormat, UnsupportedPixelFormat, VideoConvert};
 pub use resample::{AudioResample, ResampleQuality};
-pub use scale::{ScaleAlgorithm, VideoScale};
+pub use scale::{ScaleEngine, ScaleMode};

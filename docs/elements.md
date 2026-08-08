@@ -270,4 +270,4 @@ Attach KLV to buffers via `metadata.set_klv(bytes)` and mux it as a private data
 
 ## Converters — `parallax::converters`
 
-Not elements themselves, but the engines behind `VideoConvertElement`/`AudioConvertElement`/`AudioResampleElement`: `VideoConvert` (YUV↔RGB, SIMD with feature `simd-colorspace`), `AudioConvert`, `AudioResample`, `VideoScale`. See [formats.md](formats.md#converters).
+Not elements themselves, but the engines behind `VideoConvertElement`/`AudioConvertElement`/`AudioResampleElement`: `VideoConvert` (YUV↔RGB, SIMD with feature `simd-colorspace`), `AudioConvert`, `AudioResample`, `ScaleEngine` (behind the `VideoScale` element). See [formats.md](formats.md#converters).

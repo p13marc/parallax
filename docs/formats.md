@@ -173,9 +173,9 @@ cargo bench --bench colorspace                              # scalar comparison
 - `AudioConvert` — sample-format conversion (U8/S16/S32/F32/F64, both endiannesses) with `AudioChannelMix`/`ChannelLayout` (mono, stereo, 2.1, 5.1, 7.1).
 - `AudioResample` — rate conversion (`ResampleQuality::Fast` = linear, `Medium` = cubic). Pure Rust.
 
-### VideoScale
+### ScaleEngine
 
-Nearest-neighbor or bilinear resize of raw frames, in any of I420, NV12, RGB24, BGR24, RGBA, BGRA, Gray8, YUYV, UYVY. The `VideoScale` *element* reads the pixel format and geometry from each buffer's metadata and rebuilds its engine when either changes; a target equal to the source is a zero-copy passthrough.
+Nearest-neighbor or bilinear resize of raw frames, in any of I420, NV12, RGB24, BGR24, RGBA, BGRA, Gray8, YUYV, UYVY. The `VideoScale` element wraps this engine: it reads the pixel format and geometry from each buffer's metadata and rebuilds its engine when either changes; a target equal to the source is a zero-copy passthrough.
 
 (The YUYV/UYVY paths are low-quality by the engine's own admission — assert structure and size on them, not pixel fidelity.)
 

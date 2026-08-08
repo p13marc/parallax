@@ -80,7 +80,7 @@ The built-in element library — full catalog in [elements.md](elements.md).
 
 ### `parallax::converters`
 
-`VideoConvert`, `AudioConvert`/`AudioChannelMix`/`ChannelLayout`, `AudioResample`/`ResampleQuality`, `VideoScale`/`ScaleAlgorithm`, plus this module's own `PixelFormat`/`SampleFormat`/`ColorMatrix` (distinct from `format::` — see [formats.md](formats.md#pitfalls)).
+`VideoConvert`, `AudioConvert`/`AudioChannelMix`/`ChannelLayout`, `AudioResample`/`ResampleQuality`, `ScaleEngine`/`ScaleMode`, plus this module's own `PixelFormat`/`SampleFormat`/`ColorMatrix` (distinct from `format::` — see [formats.md](formats.md#pitfalls)).
 
 ### `parallax::link`
 

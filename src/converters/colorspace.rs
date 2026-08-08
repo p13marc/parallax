@@ -275,7 +275,7 @@ impl Packed422 {
 /// Video format converter.
 ///
 /// Converts between pixel formats while maintaining the same resolution.
-/// For resolution changes, use [`VideoScale`](super::VideoScale).
+/// For resolution changes, use [`ScaleEngine`](super::ScaleEngine).
 pub struct VideoConvert {
     input_format: PixelFormat,
     output_format: PixelFormat,

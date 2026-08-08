@@ -1,34 +1,46 @@
 //! Video scaling (resolution conversion).
 //!
 //! Provides pure Rust implementations of video scaling algorithms.
+//!
+//! [`ScaleEngine`] is the slice-level engine; the pipeline element wrapping it
+//! is [`VideoScale`](crate::elements::transform::VideoScale). There is exactly
+//! one type per job — the engine resamples bytes, the element reads geometry
+//! from [`Metadata`](crate::metadata::Metadata) and drives the engine.
 
 use crate::error::{Error, Result};
 
 use super::PixelFormat;
 
-/// Scaling algorithm.
+/// Scaling interpolation mode.
+///
+/// Shared by [`ScaleEngine`] and the
+/// [`VideoScale`](crate::elements::transform::VideoScale) element — one enum,
+/// one meaning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ScaleAlgorithm {
-    /// Nearest neighbor - fastest, pixelated results.
-    NearestNeighbor,
-    /// Bilinear interpolation - good quality/speed balance.
+pub enum ScaleMode {
+    /// Bilinear interpolation (smoother, slower).
     #[default]
     Bilinear,
+    /// Nearest neighbor (faster, pixelated).
+    NearestNeighbor,
 }
 
-/// Video scaler.
+/// Video scaling engine.
 ///
-/// Scales video frames between different resolutions.
-pub struct VideoScale {
+/// Scales video frames between different resolutions, operating on plain byte
+/// slices. Built for one exact `(format, source, target)` conversion; the
+/// [`VideoScale`](crate::elements::transform::VideoScale) element caches and
+/// rebuilds engines as the stream's geometry changes.
+pub struct ScaleEngine {
     input_width: u32,
     input_height: u32,
     output_width: u32,
     output_height: u32,
     format: PixelFormat,
-    algorithm: ScaleAlgorithm,
+    mode: ScaleMode,
 }
 
-impl VideoScale {
+impl ScaleEngine {
     /// Create a new video scaler.
     pub fn new(
         input_width: u32,
@@ -57,13 +69,13 @@ impl VideoScale {
             output_width,
             output_height,
             format,
-            algorithm: ScaleAlgorithm::default(),
+            mode: ScaleMode::default(),
         })
     }
 
-    /// Set the scaling algorithm.
-    pub fn with_algorithm(mut self, algorithm: ScaleAlgorithm) -> Self {
-        self.algorithm = algorithm;
+    /// Set the interpolation mode.
+    pub fn with_mode(mut self, mode: ScaleMode) -> Self {
+        self.mode = mode;
         self
     }
 
@@ -128,8 +140,8 @@ impl VideoScale {
         let out_w = self.output_width as usize;
         let out_h = self.output_height as usize;
 
-        match self.algorithm {
-            ScaleAlgorithm::NearestNeighbor => {
+        match self.mode {
+            ScaleMode::NearestNeighbor => {
                 for out_y in 0..out_h {
                     let in_y = (out_y * in_h / out_h).min(in_h - 1);
 
@@ -144,7 +156,7 @@ impl VideoScale {
                     }
                 }
             }
-            ScaleAlgorithm::Bilinear => {
+            ScaleMode::Bilinear => {
                 let x_ratio = (in_w as f32 - 1.0) / (out_w as f32).max(1.0);
                 let y_ratio = (in_h as f32 - 1.0) / (out_h as f32).max(1.0);
 
@@ -218,8 +230,8 @@ impl VideoScale {
 
         // YUYV: Y0 U Y1 V (4 bytes per 2 pixels)
         // Simplest approach: nearest neighbor scaling treating as macro-pixels
-        match self.algorithm {
-            ScaleAlgorithm::NearestNeighbor => {
+        match self.mode {
+            ScaleMode::NearestNeighbor => {
                 for out_y in 0..out_h {
                     let in_y = (out_y * in_h / out_h).min(in_h - 1);
 
@@ -239,7 +251,7 @@ impl VideoScale {
                     }
                 }
             }
-            ScaleAlgorithm::Bilinear => {
+            ScaleMode::Bilinear => {
                 // For bilinear, we do a simple approximation by interpolating Y values
                 // and using nearest-neighbor for U/V
                 let x_ratio = (in_w as f32 - 1.0) / (out_w as f32).max(1.0);
@@ -324,8 +336,8 @@ impl VideoScale {
         out_w: usize,
         out_h: usize,
     ) {
-        match self.algorithm {
-            ScaleAlgorithm::NearestNeighbor => {
+        match self.mode {
+            ScaleMode::NearestNeighbor => {
                 for out_y in 0..out_h {
                     let in_y = (out_y * in_h / out_h).min(in_h - 1);
 
@@ -335,7 +347,7 @@ impl VideoScale {
                     }
                 }
             }
-            ScaleAlgorithm::Bilinear => {
+            ScaleMode::Bilinear => {
                 let x_ratio = (in_w as f32 - 1.0) / (out_w as f32).max(1.0);
                 let y_ratio = (in_h as f32 - 1.0) / (out_h as f32).max(1.0);
 
@@ -377,8 +389,8 @@ impl VideoScale {
         out_w: usize,
         out_h: usize,
     ) {
-        match self.algorithm {
-            ScaleAlgorithm::NearestNeighbor => {
+        match self.mode {
+            ScaleMode::NearestNeighbor => {
                 for out_y in 0..out_h {
                     let in_y = (out_y * in_h / out_h).min(in_h - 1);
 
@@ -394,7 +406,7 @@ impl VideoScale {
                     }
                 }
             }
-            ScaleAlgorithm::Bilinear => {
+            ScaleMode::Bilinear => {
                 let x_ratio = (in_w as f32 - 1.0) / (out_w as f32).max(1.0);
                 let y_ratio = (in_h as f32 - 1.0) / (out_h as f32).max(1.0);
 
@@ -444,9 +456,9 @@ mod tests {
 
     #[test]
     fn test_scale_nearest_2x() {
-        let scaler = VideoScale::new(2, 2, 4, 4, PixelFormat::Gray8)
+        let scaler = ScaleEngine::new(2, 2, 4, 4, PixelFormat::Gray8)
             .unwrap()
-            .with_algorithm(ScaleAlgorithm::NearestNeighbor);
+            .with_mode(ScaleMode::NearestNeighbor);
 
         let input = [0, 255, 255, 0]; // 2x2 checkerboard
         let mut output = vec![0u8; 16];
@@ -466,9 +478,9 @@ mod tests {
 
     #[test]
     fn test_scale_nearest_half() {
-        let scaler = VideoScale::new(4, 4, 2, 2, PixelFormat::Gray8)
+        let scaler = ScaleEngine::new(4, 4, 2, 2, PixelFormat::Gray8)
             .unwrap()
-            .with_algorithm(ScaleAlgorithm::NearestNeighbor);
+            .with_mode(ScaleMode::NearestNeighbor);
 
         #[rustfmt::skip]
         let input = [
@@ -488,9 +500,9 @@ mod tests {
 
     #[test]
     fn test_scale_bilinear_2x() {
-        let scaler = VideoScale::new(2, 2, 4, 4, PixelFormat::Gray8)
+        let scaler = ScaleEngine::new(2, 2, 4, 4, PixelFormat::Gray8)
             .unwrap()
-            .with_algorithm(ScaleAlgorithm::Bilinear);
+            .with_mode(ScaleMode::Bilinear);
 
         let input = [0, 100, 100, 200];
         let mut output = vec![0u8; 16];
@@ -519,9 +531,9 @@ mod tests {
 
     #[test]
     fn test_scale_rgb24() {
-        let scaler = VideoScale::new(2, 2, 4, 4, PixelFormat::Rgb24)
+        let scaler = ScaleEngine::new(2, 2, 4, 4, PixelFormat::Rgb24)
             .unwrap()
-            .with_algorithm(ScaleAlgorithm::NearestNeighbor);
+            .with_mode(ScaleMode::NearestNeighbor);
 
         #[rustfmt::skip]
         let input = [
@@ -543,9 +555,9 @@ mod tests {
 
     #[test]
     fn test_scale_i420() {
-        let scaler = VideoScale::new(4, 4, 8, 8, PixelFormat::I420)
+        let scaler = ScaleEngine::new(4, 4, 8, 8, PixelFormat::I420)
             .unwrap()
-            .with_algorithm(ScaleAlgorithm::NearestNeighbor);
+            .with_mode(ScaleMode::NearestNeighbor);
 
         // Create a simple I420 frame (4x4)
         // Y plane: 16 bytes, U plane: 4 bytes, V plane: 4 bytes
@@ -568,13 +580,13 @@ mod tests {
 
     #[test]
     fn test_error_on_zero_dimension() {
-        let result = VideoScale::new(0, 100, 200, 200, PixelFormat::Rgb24);
+        let result = ScaleEngine::new(0, 100, 200, 200, PixelFormat::Rgb24);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_error_on_odd_yuv_dimension() {
-        let result = VideoScale::new(3, 4, 6, 8, PixelFormat::I420);
+        let result = ScaleEngine::new(3, 4, 6, 8, PixelFormat::I420);
         assert!(result.is_err());
     }
 }
