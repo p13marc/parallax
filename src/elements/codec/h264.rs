@@ -485,12 +485,15 @@ impl H264Encoder {
 
     /// Rebuild the OpenH264 encoder for the current config, keeping the arena.
     ///
-    /// OpenH264 exposes no bitrate setter, so a live change means a new
-    /// encoder. That is cheap (a few ms) and forces a fresh SPS/PPS + IDR —
-    /// which is what you want on a rate step anyway, since decoders need the
-    /// new parameter sets and a mid-GOP rate change looks bad. The **arena is
-    /// deliberately reused**: allocating a fresh 64 MiB of slots on every
-    /// bitrate step would be a silent memory leak in a long-running sensor.
+    /// This is the path for GOP, QP, rate-control mode and frame-skip changes,
+    /// where a fresh parameter set is wanted anyway: decoders need the new SPS
+    /// / PPS, so the forced IDR is a feature rather than a cost. **Bitrate does
+    /// not come through here** — [`set_bitrate_live`](Self::set_bitrate_live)
+    /// changes it on the running encoder with no IDR.
+    ///
+    /// The **arena is deliberately reused**: allocating a fresh 64 MiB of slots
+    /// on every parameter step would be a silent memory leak in a long-running
+    /// sensor.
     fn rebuild_encoder(&mut self) -> Result<()> {
         self.encoder = build_encoder(&self.config)?;
         // A new encoder starts a new sequence; make its first frame an IDR so
@@ -929,7 +932,17 @@ impl super::traits::VideoEncoder for H264Encoder {
         // 0 is not "unset" here: it selects quality mode, where rate control is
         // driven by the QP band instead of a target (see build_encoder).
         self.config.bitrate_bps = bps;
-        self.rebuild_encoder()
+        // Same seamless path as the control-handle route: a bitrate step must
+        // not cost an IDR just because the caller reached this encoder through
+        // the VideoEncoder trait (i.e. wrapped in an EncoderElement) rather
+        // than through EncoderControl.
+        if self.set_bitrate_live(bps) {
+            tracing::info!("H264Encoder: bitrate -> {bps} bps (seamless, no IDR)");
+            Ok(())
+        } else {
+            tracing::warn!("H264Encoder: live bitrate change rejected, rebuilding");
+            self.rebuild_encoder()
+        }
     }
 
     fn set_keyframe_interval(&mut self, frames: u32) -> Result<()> {
