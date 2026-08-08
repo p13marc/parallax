@@ -20,7 +20,7 @@ jobs:
   fmt:
     runs-on: ubuntu-24.04
     steps:
-      - uses: https://data.forgejo.org/actions/checkout@v6
+      - uses: https://data.forgejo.org/actions/checkout@v7.0.1
       - uses: https://github.com/dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -29,7 +29,7 @@ jobs:
   clippy:
     runs-on: ubuntu-24.04
     steps:
-      - uses: https://data.forgejo.org/actions/checkout@v6
+      - uses: https://data.forgejo.org/actions/checkout@v7.0.1
       - run: sudo apt-get update && sudo apt-get install -y libudev-dev g++ libclang-dev
       - uses: https://github.com/dtolnay/rust-toolchain@stable
         with:
@@ -43,7 +43,7 @@ jobs:
   test:
     runs-on: ubuntu-24.04
     steps:
-      - uses: https://data.forgejo.org/actions/checkout@v6
+      - uses: https://data.forgejo.org/actions/checkout@v7.0.1
       - run: sudo apt-get update && sudo apt-get install -y libudev-dev g++ libclang-dev
       - uses: https://github.com/dtolnay/rust-toolchain@stable
       - uses: https://github.com/Swatinem/rust-cache@v2
@@ -60,7 +60,7 @@ jobs:
   msrv:
     runs-on: ubuntu-24.04
     steps:
-      - uses: https://data.forgejo.org/actions/checkout@v6
+      - uses: https://data.forgejo.org/actions/checkout@v7.0.1
       - run: sudo apt-get update && sudo apt-get install -y libudev-dev g++ libclang-dev
       - uses: https://github.com/dtolnay/rust-toolchain@master
         with:
@@ -79,7 +79,7 @@ jobs:
     steps:
       # no node in fedora:44 → install it first so JS actions work
       - run: dnf install -y nodejs git gcc gcc-c++ clang-devel libcamera-devel systemd-devel pkgconf-pkg-config tar xz zstd
-      - uses: https://data.forgejo.org/actions/checkout@v6
+      - uses: https://data.forgejo.org/actions/checkout@v7.0.1
       - uses: https://github.com/dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -98,7 +98,7 @@ jobs:
     env:
       RUSTDOCFLAGS: -D warnings
     steps:
-      - uses: https://data.forgejo.org/actions/checkout@v6
+      - uses: https://data.forgejo.org/actions/checkout@v7.0.1
       - run: sudo apt-get update && sudo apt-get install -y libudev-dev g++ libclang-dev
       - uses: https://github.com/dtolnay/rust-toolchain@stable
       - uses: https://github.com/Swatinem/rust-cache@v2
