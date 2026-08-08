@@ -26,10 +26,10 @@
 //! slice headers on the GPU, so `ref_pic_list_modification` works as long as
 //! every needed reference is bound). A `frame_num` gap (lost reference) is
 //! detected per 7.4.3: the first offending picture errors, the rest are
-//! skipped until the next IDR — \"non-existing\" frame synthesis (8.2.5.2) is
-//! not implemented. Out of scope: interlaced/PAFF/MBAFF,
-//! scaling matrices, DMA-BUF export
-//! of decoded frames, and multi-frame-in-flight pipelining. Every failure
+//! skipped until the next IDR — "non-existing" frame synthesis (8.2.5.2) is
+//! not implemented. Scaling matrices are marshalled. Out of scope:
+//! interlaced/PAFF/MBAFF, DMA-BUF export of decoded frames, and
+//! multi-frame-in-flight pipelining. Every failure
 //! path returns `Err` — a frame over uninitialised memory is never returned.
 
 use super::context::VulkanContext;
@@ -263,13 +263,20 @@ impl VulkanH264Decoder {
             .as_ref()
             .expect("ensure_params is called with a live session");
 
+        // The std structs point into these boxes for scaling matrices; keep
+        // them alive across new_h264 (the driver copies at creation — see the
+        // VideoSessionParameters::new_h264 docs).
+        let mut keep_alive: Vec<Box<ash::vk::native::StdVideoH264ScalingLists>> = Vec::new();
+
         let mut std_sps = Vec::new();
         for sps in self.param_sets.all_sps() {
             let full = self
                 .param_sets
                 .full_sps(sps.sps_id)
                 .ok_or_else(|| VulkanError::DecodeError("SPS missing from context".to_string()))?;
-            std_sps.push(h264_std::std_sps(full)?);
+            let (converted, lists) = h264_std::std_sps(full)?;
+            std_sps.push(converted);
+            keep_alive.extend(lists);
         }
         let mut std_pps = Vec::new();
         for pps in self.param_sets.all_pps() {
@@ -277,12 +284,15 @@ impl VulkanH264Decoder {
                 .param_sets
                 .full_pps(pps.pps_id)
                 .ok_or_else(|| VulkanError::DecodeError("PPS missing from context".to_string()))?;
-            std_pps.push(h264_std::std_pps(full)?);
+            let (converted, lists) = h264_std::std_pps(full)?;
+            std_pps.push(converted);
+            keep_alive.extend(lists);
         }
 
         self.session_params = Some(VideoSessionParameters::new_h264(
             session, &std_sps, &std_pps,
         )?);
+        drop(keep_alive); // the driver copied the parameter sets at creation
         self.built_param_generation = self.param_generation;
         Ok(())
     }
@@ -398,7 +408,7 @@ impl VulkanH264Decoder {
                     "frame_num gap: got {got}, expected {expected} — a reference frame was \
                      lost{}; dropping pictures until the next IDR",
                     if gaps_allowed {
-                        " (stream allows gaps; \"non-existing\" frame synthesis is not implemented)"
+                        " (stream allows gaps; non-existing-frame synthesis is not implemented)"
                     } else {
                         ""
                     }

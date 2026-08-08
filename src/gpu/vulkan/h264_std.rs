@@ -1,11 +1,13 @@
 //! Conversions from `h264_reader` parameter sets to the `vk::native`
 //! `StdVideoH264*` structs Vulkan Video session parameters consume.
 //!
-//! The std structs carry raw pointers (`pScalingLists`,
-//! `pSequenceParameterSetVui`, `pOffsetForRefFrame`); v1 leaves them null —
-//! streams with scaling matrices are rejected upstream, VUI is ignorable for
-//! decode, and POC type 1's offset array is only read by *our* POC code, not
-//! by the driver's parameter object.
+//! The std structs carry raw pointers. Scaling matrices are marshalled into
+//! owned [`StdVideoH264ScalingLists`](std_video::StdVideoH264ScalingLists)
+//! boxes the caller must keep alive across the session-parameter creation
+//! call (the driver copies at creation). `pSequenceParameterSetVui` and
+//! `pOffsetForRefFrame` stay null — VUI is ignorable for decode, and POC
+//! type 1's offset array is only read by *our* POC code, not by the driver's
+//! parameter object.
 
 use super::error::VulkanError;
 use crate::error::Result;
@@ -53,17 +55,24 @@ pub fn std_level_idc(level_idc: u8) -> std_video::StdVideoH264LevelIdc {
 
 /// Convert a full `h264_reader` SPS to `StdVideoH264SequenceParameterSet`.
 ///
-/// Streams carrying scaling matrices are rejected — v1 does not marshal
-/// `pScalingLists`, and silently dropping them would corrupt every frame.
-pub fn std_sps(sps: &SeqParameterSet) -> Result<std_video::StdVideoH264SequenceParameterSet> {
-    if sps.chroma_info.scaling_matrix.is_some() {
-        return Err(VulkanError::DecodeError(
-            "SPS carries scaling matrices, which this decoder does not support yet".to_string(),
-        )
-        .into());
-    }
+/// When the SPS carries scaling matrices, the second element of the pair
+/// owns their std representation and `pScalingLists` points into it — the
+/// box must stay alive until the session parameters have been created (the
+/// driver copies at creation).
+pub fn std_sps(
+    sps: &SeqParameterSet,
+) -> Result<(
+    std_video::StdVideoH264SequenceParameterSet,
+    Option<Box<std_video::StdVideoH264ScalingLists>>,
+)> {
+    let scaling_lists = sps
+        .chroma_info
+        .scaling_matrix
+        .as_ref()
+        .map(|m| Box::new(std_scaling_lists(&m.scaling_list4x4, &m.scaling_list8x8)));
 
     let mut flags: std_video::StdVideoH264SpsFlags = unsafe { std::mem::zeroed() };
+    flags.set_seq_scaling_matrix_present_flag(scaling_lists.is_some().into());
     let frame_mbs_only = matches!(
         sps.frame_mbs_flags,
         h264_reader::nal::sps::FrameMbsFlags::Frames
@@ -150,7 +159,7 @@ pub fn std_sps(sps: &SeqParameterSet) -> Result<std_video::StdVideoH264SequenceP
         None => (0, 0, 0, 0),
     };
 
-    Ok(std_video::StdVideoH264SequenceParameterSet {
+    let sps_struct = std_video::StdVideoH264SequenceParameterSet {
         flags,
         profile_idc: std_profile_idc(u8::from(sps.profile_idc) as u32)?,
         level_idc: std_level_idc(sps.level_idc),
@@ -173,28 +182,41 @@ pub fn std_sps(sps: &SeqParameterSet) -> Result<std_video::StdVideoH264SequenceP
         frame_crop_top_offset: crop_top,
         frame_crop_bottom_offset: crop_bottom,
         reserved2: 0,
-        // v1: POC type 1 offset arrays, scaling lists and VUI are not
-        // marshalled (nulls are legal; the flags above agree).
+        // POC type 1 offset arrays and VUI are not marshalled (nulls are
+        // legal; the flags above agree). Scaling lists point into the box
+        // returned alongside — a Box'ed value has a stable heap address.
         pOffsetForRefFrame: std::ptr::null(),
-        pScalingLists: std::ptr::null(),
+        pScalingLists: scaling_lists
+            .as_deref()
+            .map_or(std::ptr::null(), |lists| lists as *const _),
         pSequenceParameterSetVui: std::ptr::null(),
-    })
+    };
+    Ok((sps_struct, scaling_lists))
 }
 
 /// Convert a full `h264_reader` PPS to `StdVideoH264PictureParameterSet`.
-pub fn std_pps(pps: &PicParameterSet) -> Result<std_video::StdVideoH264PictureParameterSet> {
-    if pps
+///
+/// Same ownership contract as [`std_sps`]: keep the returned scaling-list
+/// box alive until the session parameters have been created.
+pub fn std_pps(
+    pps: &PicParameterSet,
+) -> Result<(
+    std_video::StdVideoH264PictureParameterSet,
+    Option<Box<std_video::StdVideoH264ScalingLists>>,
+)> {
+    let scaling_lists = pps
         .extension
         .as_ref()
-        .is_some_and(|e| e.pic_scaling_matrix.is_some())
-    {
-        return Err(VulkanError::DecodeError(
-            "PPS carries scaling matrices, which this decoder does not support yet".to_string(),
-        )
-        .into());
-    }
+        .and_then(|e| e.pic_scaling_matrix.as_ref())
+        .map(|m| {
+            Box::new(std_scaling_lists(
+                &m.scaling_list4x4,
+                m.scaling_list8x8.as_deref().unwrap_or(&[]),
+            ))
+        });
 
     let mut flags: std_video::StdVideoH264PpsFlags = unsafe { std::mem::zeroed() };
+    flags.set_pic_scaling_matrix_present_flag(scaling_lists.is_some().into());
     flags.set_entropy_coding_mode_flag(pps.entropy_coding_mode_flag.into());
     flags.set_bottom_field_pic_order_in_frame_present_flag(
         pps.bottom_field_pic_order_in_frame_present_flag.into(),
@@ -209,7 +231,7 @@ pub fn std_pps(pps: &PicParameterSet) -> Result<std_video::StdVideoH264PicturePa
         flags.set_transform_8x8_mode_flag(ext.transform_8x8_mode_flag.into());
     }
 
-    Ok(std_video::StdVideoH264PictureParameterSet {
+    let pps_struct = std_video::StdVideoH264PictureParameterSet {
         flags,
         seq_parameter_set_id: pps.seq_parameter_set_id.id(),
         pic_parameter_set_id: pps.pic_parameter_set_id.id(),
@@ -224,8 +246,61 @@ pub fn std_pps(pps: &PicParameterSet) -> Result<std_video::StdVideoH264PicturePa
             .as_ref()
             .map(|e| e.second_chroma_qp_index_offset as i8)
             .unwrap_or(pps.chroma_qp_index_offset as i8),
-        pScalingLists: std::ptr::null(),
-    })
+        pScalingLists: scaling_lists
+            .as_deref()
+            .map_or(std::ptr::null(), |lists| lists as *const _),
+    };
+    Ok((pps_struct, scaling_lists))
+}
+
+/// Marshal parsed scaling lists into the std struct.
+///
+/// Bits 0–5 of each mask are the six 4x4 lists, bits 6–11 the six 8x8 lists,
+/// mirroring the bitstream's `*_scaling_list_present_flag[i]` /
+/// `use_default_scaling_matrix_flag[i]`. Entries beyond the coded vectors
+/// keep their mask bits clear ("not present in the bitstream"); applying the
+/// Table 7-2 fall-back rules from the masks is the driver's job.
+fn std_scaling_lists(
+    list4x4: &[h264_reader::nal::sps::ScalingList<16>],
+    list8x8: &[h264_reader::nal::sps::ScalingList<64>],
+) -> std_video::StdVideoH264ScalingLists {
+    use h264_reader::nal::sps::ScalingList;
+
+    let mut out: std_video::StdVideoH264ScalingLists = unsafe { std::mem::zeroed() };
+
+    for (i, list) in list4x4.iter().enumerate().take(6) {
+        match list {
+            ScalingList::NotPresent => {}
+            ScalingList::UseDefault => {
+                out.scaling_list_present_mask |= 1 << i;
+                out.use_default_scaling_matrix_mask |= 1 << i;
+            }
+            ScalingList::List(values) => {
+                out.scaling_list_present_mask |= 1 << i;
+                for (j, v) in values.iter().enumerate() {
+                    out.ScalingList4x4[i][j] = v.get();
+                }
+            }
+        }
+    }
+
+    for (i, list) in list8x8.iter().enumerate().take(6) {
+        match list {
+            ScalingList::NotPresent => {}
+            ScalingList::UseDefault => {
+                out.scaling_list_present_mask |= 1 << (6 + i);
+                out.use_default_scaling_matrix_mask |= 1 << (6 + i);
+            }
+            ScalingList::List(values) => {
+                out.scaling_list_present_mask |= 1 << (6 + i);
+                for (j, v) in values.iter().enumerate() {
+                    out.ScalingList8x8[i][j] = v.get();
+                }
+            }
+        }
+    }
+
+    out
 }
 
 #[cfg(test)]
@@ -289,7 +364,8 @@ mod tests {
 
     #[test]
     fn sps_converts_with_matching_geometry() {
-        let std = std_sps(&test_sps()).expect("convertible");
+        let (std, lists) = std_sps(&test_sps()).expect("convertible");
+        assert!(lists.is_none(), "no scaling matrix in the test SPS");
         assert_eq!(std.profile_idc, 100);
         assert_eq!(std.seq_parameter_set_id, 0);
         assert_eq!((std.pic_width_in_mbs_minus1 + 1) * 16, 64);
@@ -305,15 +381,86 @@ mod tests {
     }
 
     #[test]
-    fn sps_with_scaling_matrix_is_rejected() {
+    fn sps_with_scaling_matrix_is_marshalled() {
+        use h264_reader::nal::sps::{ScalingList, SeqScalingMatrix};
+        use std::num::NonZeroU8;
+
         let mut sps = test_sps();
-        sps.chroma_info.scaling_matrix = Some(h264_reader::nal::sps::SeqScalingMatrix::default());
-        assert!(std_sps(&sps).is_err(), "scaling lists are not marshalled");
+        let coded: [NonZeroU8; 16] = std::array::from_fn(|i| NonZeroU8::new(i as u8 + 1).unwrap());
+        sps.chroma_info.scaling_matrix = Some(SeqScalingMatrix {
+            scaling_list4x4: vec![
+                ScalingList::List(coded),
+                ScalingList::UseDefault,
+                ScalingList::NotPresent,
+            ],
+            scaling_list8x8: vec![ScalingList::UseDefault],
+        });
+
+        let (std, lists) = std_sps(&sps).expect("marshalled, not rejected");
+        let lists = lists.expect("scaling lists come back owned");
+        assert_eq!(
+            std.pScalingLists, &*lists as *const _,
+            "SPS points at the box"
+        );
+        // 4x4: idx0 List (bit 0), idx1 UseDefault (bit 1); 8x8: idx0 UseDefault (bit 6).
+        assert_eq!(lists.scaling_list_present_mask, 0b100_0011);
+        assert_eq!(lists.use_default_scaling_matrix_mask, 0b100_0010);
+        assert_eq!(lists.ScalingList4x4[0][0], 1);
+        assert_eq!(lists.ScalingList4x4[0][15], 16);
+        assert_eq!(
+            lists.ScalingList4x4[2], [0u8; 16],
+            "NotPresent stays zeroed"
+        );
+    }
+
+    #[test]
+    fn short_scaling_vectors_leave_high_entries_not_present() {
+        use h264_reader::nal::sps::{ScalingList, SeqScalingMatrix};
+
+        let mut sps = test_sps();
+        sps.chroma_info.scaling_matrix = Some(SeqScalingMatrix {
+            scaling_list4x4: vec![ScalingList::UseDefault, ScalingList::UseDefault],
+            scaling_list8x8: vec![],
+        });
+
+        let (_, lists) = std_sps(&sps).expect("marshalled");
+        let lists = lists.unwrap();
+        assert_eq!(lists.scaling_list_present_mask, 0b11, "only bits 0 and 1");
+        assert_eq!(lists.use_default_scaling_matrix_mask, 0b11);
+    }
+
+    #[test]
+    fn pps_with_scaling_matrix_is_marshalled() {
+        use h264_reader::nal::pps::{PicParameterSetExtra, PicScalingMatrix};
+        use h264_reader::nal::sps::ScalingList;
+
+        let mut pps = test_pps();
+        pps.extension = Some(PicParameterSetExtra {
+            transform_8x8_mode_flag: true,
+            pic_scaling_matrix: Some(PicScalingMatrix {
+                scaling_list4x4: vec![ScalingList::UseDefault; 6],
+                scaling_list8x8: None,
+            }),
+            second_chroma_qp_index_offset: 0,
+        });
+
+        let (std, lists) = std_pps(&pps).expect("marshalled, not rejected");
+        let lists = lists.expect("scaling lists come back owned");
+        assert_eq!(
+            std.pScalingLists, &*lists as *const _,
+            "PPS points at the box"
+        );
+        assert_eq!(
+            lists.scaling_list_present_mask, 0b11_1111,
+            "all six 4x4 lists"
+        );
+        assert_eq!(lists.use_default_scaling_matrix_mask, 0b11_1111);
     }
 
     #[test]
     fn pps_converts_against_its_sps() {
-        let std = std_pps(&test_pps()).expect("convertible");
+        let (std, lists) = std_pps(&test_pps()).expect("convertible");
+        assert!(lists.is_none(), "no scaling matrix in the test PPS");
         assert_eq!(std.pic_parameter_set_id, 0);
         assert_eq!(std.seq_parameter_set_id, 0);
         assert_eq!(
