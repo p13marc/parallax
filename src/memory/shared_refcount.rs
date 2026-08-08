@@ -84,6 +84,7 @@ use rustix::mm::{MapFlags, ProtFlags};
 use std::ffi::CString;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::ptr::NonNull;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Magic number to identify valid arena headers.
@@ -543,8 +544,16 @@ fn calculate_layout_aligned(
 /// to a lock-free MPSC queue in shared memory. The owner drains this queue
 /// in O(k) time where k is the number of released slots.
 pub struct SharedArena {
-    /// The memfd file descriptor.
-    fd: OwnedFd,
+    /// The memfd file descriptor, shared between clones.
+    ///
+    /// `Arc`, not `OwnedFd`: `SharedSlotRef` holds a `SharedArena` by value, so
+    /// every `Buffer::clone` clones an arena. Duplicating the fd there made a
+    /// buffer clone cost an `fcntl` and a `close` per branch — two syscalls on
+    /// the hot path of a feature (fan-out) whose whole premise is that sharing
+    /// a buffer is nearly free. One handle shared by all clones is equally
+    /// correct: there is exactly one owner, so no double-close, and the mmap
+    /// keeps the file alive independently of the descriptor.
+    fd: Arc<OwnedFd>,
     /// Base pointer to the mmap'd region.
     base: NonNull<u8>,
     /// Total size of the arena.
@@ -679,7 +688,7 @@ impl SharedArena {
         }
 
         Ok(Self {
-            fd,
+            fd: Arc::new(fd),
             base,
             total_size,
             header,
@@ -812,7 +821,7 @@ impl SharedArena {
         };
 
         Ok(Self {
-            fd,
+            fd: Arc::new(fd),
             base,
             total_size,
             header,
@@ -1073,15 +1082,11 @@ impl Clone for SharedArena {
             panic!("SharedArena refcount overflow");
         }
 
-        // Duplicate the fd so each clone has its own handle
-        let new_fd = rustix::io::fcntl_dupfd_cloexec(&self.fd, 0).expect("failed to dup arena fd");
-
-        // Share the same mmap - don't create a new one!
-        // This is safe because the mmap is MAP_SHARED and all clones
-        // share the same refcount. The mmap is only unmapped when
-        // the refcount drops to 0.
+        // Share the fd and the mmap — don't create new ones. Safe because the
+        // mapping is MAP_SHARED, all clones share the arena-level refcount, and
+        // the region is only unmapped when that refcount drops to 0.
         Self {
-            fd: new_fd,
+            fd: Arc::clone(&self.fd),
             base: self.base,
             total_size: self.total_size,
             header: self.header,
@@ -1110,7 +1115,9 @@ impl Drop for SharedArena {
                 let _ = rustix::mm::munmap(self.base.as_ptr().cast(), self.total_size);
             }
         }
-        // fd is dropped automatically, closing our dup'd handle
+        // The fd closes when the last clone drops its Arc. That may happen
+        // before or after the munmap above; either order is fine, because the
+        // mapping holds its own reference to the file.
     }
 }
 

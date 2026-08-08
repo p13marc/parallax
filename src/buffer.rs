@@ -199,7 +199,8 @@ impl std::fmt::Debug for MemoryHandle {
 /// let handle = MemoryHandle::new(slot);
 /// let buffer = Buffer::<()>::new(handle, Metadata::from_sequence(0));
 ///
-/// // Clone is O(1) - just atomic increment in shared memory
+/// // Clone is O(1): two atomic increments (slot refcount + arena refcount)
+/// // in shared memory, plus a Metadata clone. No payload copy, no syscall.
 /// let buffer2 = buffer.clone();
 /// ```
 pub struct Buffer<T = ()> {

@@ -90,7 +90,7 @@ Arena format **v4** records `slot_stride` and `alignment` in the header, so a cl
 
 A `Buffer` is a `MemoryHandle` (slot reference + offset + length) plus `Metadata`:
 
-- `Clone` is an atomic refcount increment — O(1), no data copy.
+- `Clone` is O(1) — two atomic refcount increments (slot and arena) plus a `Metadata` clone. No data copy, and no syscall.
 - `slice(offset, len)` produces a zero-copy sub-buffer (shares the slot).
 - `as_bytes()` / `as_bytes_mut()` access the data directly in the mapped arena.
 - `Buffer<()>` is the dynamic form used by pipelines; `Buffer<T>` adds a compile-time type tag (`into_dynamic()` erases it).
@@ -159,11 +159,21 @@ All implement the `MemorySegment` trait (`as_ptr`, `len`, `memory_type`, `ipc_ha
 
 ## Performance characteristics
 
-| Operation | Cost |
-|-----------|------|
-| `Buffer::clone` (any process) | O(1) atomic increment |
-| Slot acquire | O(n) scan over slot headers (n = pool size; pools pre-reclaim) |
-| Slot release | O(1) lock-free queue push |
-| Owner reclaim | O(k), k = released slots |
-| Cross-process send | O(1) after one-time arena fd pass |
-| `Buffer::slice` | O(1), zero-copy |
+Measured by `cargo bench --bench memory_pool` and `--bench throughput`; the
+figures below are from a CometLake-U laptop, so treat them as orders of
+magnitude rather than targets.
+
+| Operation | Cost | Measured |
+|-----------|------|----------|
+| `SharedSlotRef::clone` | O(1), two atomic increments, no syscall | ~60 ns, flat in slot size |
+| `Buffer::clone` (any process) | the above plus a `Metadata` clone | ~90 ns empty metadata |
+| Slot acquire + release + reclaim | O(n) scan (n = pool size; pools pre-reclaim) | ~280 ns, flat in slot size |
+| Slot release | O(1) lock-free queue push | — |
+| Owner reclaim | O(k), k = released slots | — |
+| Cross-process send | O(1) after one-time arena fd pass | ~13 µs to map an arena |
+| `Buffer::slice` | O(1), zero-copy | — |
+
+> `Buffer::clone` used to cost an `fcntl` **and** a `close` per clone, because
+> `SharedSlotRef` holds a `SharedArena` by value and `SharedArena::clone` dup'd
+> the fd. Sharing the fd through an `Arc` removed both syscalls and made clones
+> ~90% faster; `benches/memory_pool.rs` guards against the regression.

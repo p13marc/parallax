@@ -87,18 +87,22 @@ fn bench_arena_batch_reclaim(c: &mut Criterion) {
 
 /// What one fan-out branch actually costs.
 ///
-/// The payload is genuinely shared: no bytes move, and the cost does not scale
-/// with slot size. What it *is* dominated by is syscalls —
-/// `SharedSlotRef` holds a `SharedArena` by value, and `SharedArena::clone`
-/// dups the arena fd, so each clone costs an `fcntl` and each drop a `close`.
-/// Measured with `strace -c`: 1000 `Buffer::clone`s issue ~2000 `fcntl` and
-/// ~1000 `close` calls. That is why these numbers are hundreds of nanoseconds
-/// rather than the handful the "clone is just an atomic increment" claim
-/// implies, and it is multiplied by every fan-out branch.
+/// The payload is genuinely shared: no bytes move, and the cost is flat in
+/// slot size — a 1080p frame clones as fast as a 256-byte control message.
 ///
-/// `slot_ref_only` vs `buffer_empty_meta` also separates the memory handle
-/// from the `Metadata` clone: `Metadata` derives `Clone` and carries a
+/// This benchmark is the reason that is true. It originally reported hundreds
+/// of nanoseconds that grew with the arena, because `SharedSlotRef` holds a
+/// `SharedArena` by value and `SharedArena::clone` dup'd the arena fd: `strace
+/// -c` over 1000 clones showed ~2000 `fcntl` and ~1000 `close` calls, i.e. two
+/// syscalls per branch on the hot path of the feature whose premise is that
+/// sharing is free. The fd is now shared via `Arc` and the syscalls are gone.
+/// Keep an eye on these numbers: a regression here means something started
+/// duplicating an owned resource per clone again.
+///
+/// `slot_ref_only` vs `buffer_empty_meta` separates the memory handle from the
+/// `Metadata` clone — `Metadata` derives `Clone` and carries a
 /// `HashMap<&'static str, MetaBox>`, so a branch copies the metadata too.
+/// `buffer_rich_meta` prices a populated custom map.
 ///
 /// Deliberately no `Throughput::Bytes`: no payload bytes move, so a bytes/sec
 /// figure would be a fiction.
