@@ -70,7 +70,7 @@ async fn main() -> Result<()> {
     let arena = SharedArena::new(FRAME_SIZE, 16)
         .map_err(|e| parallax::error::Error::Element(format!("arena: {e}")))?;
     for seq in 0..10 {
-        src_handle.push_buffer(i420_frame(&arena, seq))?;
+        src_handle.push_buffer(i420_frame(&arena, seq)).await?;
     }
     src_handle.end_stream();
 

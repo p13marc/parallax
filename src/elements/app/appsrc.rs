@@ -25,8 +25,9 @@ use tokio::sync::Notify;
 /// let app_src = AppSrc::new();
 /// let handle = app_src.handle();
 ///
-/// // In another thread or async task:
-/// handle.push_buffer(buffer)?;
+/// // From an async task (the primary form; from a plain thread use
+/// // `push_buffer_blocking()`):
+/// handle.push_buffer(buffer).await?;
 ///
 /// // Signal end of stream when done:
 /// handle.end_stream();
@@ -159,15 +160,64 @@ impl Source for AppSrc {
 }
 
 impl AppSrcHandle {
-    /// Push a buffer into the source.
+    /// Push a buffer, awaiting queue space if the queue is full.
     ///
-    /// This may block if the internal queue is full.
-    pub fn push_buffer(&self, buffer: Buffer) -> Result<()> {
-        self.push_buffer_timeout(buffer, None)
+    /// Async-first: this is the primary form, because the application boundary
+    /// of a tokio-first crate is very often a tokio task — it yields instead of
+    /// parking the worker thread. From a plain thread, use
+    /// [`push_buffer_blocking`](Self::push_buffer_blocking).
+    pub async fn push_buffer(&self, buffer: Buffer) -> Result<()> {
+        loop {
+            // Register for the wakeup before checking, or a `produce()` draining
+            // the queue between the check and the await would be missed.
+            let notified = self.inner.space_available_async.notified();
+
+            {
+                let mut state = self.inner.state.lock().unwrap();
+                if state.eos {
+                    return Err(Error::Element("appsrc is at EOS".into()));
+                }
+                if state.flushing {
+                    return Err(Error::Element("appsrc is flushing".into()));
+                }
+                if state.queue.len() < state.max_buffers {
+                    state.queue.push_back(buffer);
+                    state.total_pushed += 1;
+                    self.inner.data_available.notify_one();
+                    return Ok(());
+                }
+            }
+
+            notified.await;
+        }
     }
 
-    /// Push a buffer with a timeout.
-    pub fn push_buffer_timeout(&self, buffer: Buffer, timeout: Option<Duration>) -> Result<()> {
+    /// Push a buffer, giving up after `timeout` if no queue space appears.
+    ///
+    /// Errors with "appsrc push timeout" on expiry, matching the blocking form.
+    pub async fn push_buffer_timeout(&self, buffer: Buffer, timeout: Duration) -> Result<()> {
+        match tokio::time::timeout(timeout, self.push_buffer(buffer)).await {
+            Ok(result) => result,
+            Err(_) => Err(Error::Element("appsrc push timeout".into())),
+        }
+    }
+
+    /// Push a buffer, parking the calling thread while the queue is full.
+    ///
+    /// The blocking twin of [`push_buffer`](Self::push_buffer), for producers
+    /// that live on a plain thread. Never call it from inside a tokio runtime —
+    /// it parks the worker.
+    pub fn push_buffer_blocking(&self, buffer: Buffer) -> Result<()> {
+        self.push_wait(buffer, None)
+    }
+
+    /// Push a buffer on a plain thread, giving up after `timeout`.
+    pub fn push_buffer_timeout_blocking(&self, buffer: Buffer, timeout: Duration) -> Result<()> {
+        self.push_wait(buffer, Some(timeout))
+    }
+
+    /// The one blocking wait both `_blocking` forms share.
+    fn push_wait(&self, buffer: Buffer, timeout: Option<Duration>) -> Result<()> {
         let mut state = self.inner.state.lock().unwrap();
 
         if state.eos {
@@ -200,37 +250,6 @@ impl AppSrcHandle {
 
         self.inner.data_available.notify_one();
         Ok(())
-    }
-
-    /// Push a buffer, awaiting queue space instead of blocking the thread.
-    ///
-    /// The async twin of [`push_buffer`](Self::push_buffer). Use this from a
-    /// tokio task: the blocking version parks the whole worker thread while the
-    /// queue is full.
-    pub async fn push_buffer_async(&self, buffer: Buffer) -> Result<()> {
-        loop {
-            // Register for the wakeup before checking, or a `produce()` draining
-            // the queue between the check and the await would be missed.
-            let notified = self.inner.space_available_async.notified();
-
-            {
-                let mut state = self.inner.state.lock().unwrap();
-                if state.eos {
-                    return Err(Error::Element("appsrc is at EOS".into()));
-                }
-                if state.flushing {
-                    return Err(Error::Element("appsrc is flushing".into()));
-                }
-                if state.queue.len() < state.max_buffers {
-                    state.queue.push_back(buffer);
-                    state.total_pushed += 1;
-                    self.inner.data_available.notify_one();
-                    return Ok(());
-                }
-            }
-
-            notified.await;
-        }
     }
 
     /// Statistics for this source.
@@ -340,8 +359,8 @@ mod tests {
         let mut src = AppSrc::new();
         let handle = src.handle();
 
-        handle.push_buffer(create_test_buffer(0)).unwrap();
-        handle.push_buffer(create_test_buffer(1)).unwrap();
+        handle.push_buffer_blocking(create_test_buffer(0)).unwrap();
+        handle.push_buffer_blocking(create_test_buffer(1)).unwrap();
 
         assert_eq!(src.queue_len(), 2);
 
@@ -365,7 +384,7 @@ mod tests {
         let mut src = AppSrc::new();
         let handle = src.handle();
 
-        handle.push_buffer(create_test_buffer(0)).unwrap();
+        handle.push_buffer_blocking(create_test_buffer(0)).unwrap();
         handle.end_stream();
 
         assert!(src.is_eos());
@@ -386,7 +405,7 @@ mod tests {
 
         handle.end_stream();
 
-        let result = handle.push_buffer(create_test_buffer(0));
+        let result = handle.push_buffer_blocking(create_test_buffer(0));
         assert!(result.is_err());
     }
 
@@ -397,7 +416,7 @@ mod tests {
 
         let producer = thread::spawn(move || {
             for i in 0..10 {
-                handle.push_buffer(create_test_buffer(i)).unwrap();
+                handle.push_buffer_blocking(create_test_buffer(i)).unwrap();
             }
             handle.end_stream();
         });
@@ -426,7 +445,7 @@ mod tests {
         let src = AppSrc::new();
         let handle = src.handle();
 
-        handle.push_buffer(create_test_buffer(0)).unwrap();
+        handle.push_buffer_blocking(create_test_buffer(0)).unwrap();
         handle.end_stream();
 
         assert!(src.is_eos());
@@ -443,8 +462,8 @@ mod tests {
         let mut src = AppSrc::new();
         let handle = src.handle();
 
-        handle.push_buffer(create_test_buffer(0)).unwrap();
-        handle.push_buffer(create_test_buffer(1)).unwrap();
+        handle.push_buffer_blocking(create_test_buffer(0)).unwrap();
+        handle.push_buffer_blocking(create_test_buffer(1)).unwrap();
         let _ = produce_buffer(&mut src).unwrap();
 
         let stats = src.stats();
@@ -454,17 +473,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn push_buffer_async_waits_for_space_instead_of_blocking() {
+    async fn push_buffer_waits_for_space_instead_of_blocking() {
         let mut src = AppSrc::with_max_buffers(1);
         let handle = src.handle();
 
-        handle.push_buffer(create_test_buffer(0)).unwrap();
+        handle.push_buffer_blocking(create_test_buffer(0)).unwrap();
         assert!(handle.is_full());
 
         // The queue is full: this must await, not park the worker thread.
         let pushed = tokio::spawn({
             let handle = handle.clone();
-            async move { handle.push_buffer_async(create_test_buffer(1)).await }
+            async move { handle.push_buffer(create_test_buffer(1)).await }
         });
 
         tokio::task::yield_now().await;
@@ -480,16 +499,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn push_buffer_async_fails_at_eos() {
+    async fn push_buffer_fails_at_eos() {
         let src = AppSrc::new();
         let handle = src.handle();
         handle.end_stream();
 
-        assert!(
-            handle
-                .push_buffer_async(create_test_buffer(0))
-                .await
-                .is_err()
-        );
+        assert!(handle.push_buffer(create_test_buffer(0)).await.is_err());
     }
 }

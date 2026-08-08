@@ -52,7 +52,7 @@ async fn main() -> Result<()> {
         for i in 0..5u64 {
             let msg = format!("Message {}", i);
             src_handle
-                .push_buffer(make_buffer(&producer_arena, msg.as_bytes(), i))
+                .push_buffer_blocking(make_buffer(&producer_arena, msg.as_bytes(), i))
                 .unwrap();
             println!("[Producer] Pushed: {}", msg);
             thread::sleep(Duration::from_millis(10));
@@ -64,7 +64,7 @@ async fn main() -> Result<()> {
     // Spawn consumer thread
     let consumer = thread::spawn(move || {
         loop {
-            match sink_handle.pull_buffer() {
+            match sink_handle.pull_buffer_blocking() {
                 Ok(Some(buffer)) => {
                     let text = std::str::from_utf8(buffer.as_bytes()).unwrap_or("<invalid>");
                     println!("[Consumer] Received: {}", text);

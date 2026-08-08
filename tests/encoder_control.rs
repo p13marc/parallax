@@ -122,7 +122,7 @@ async fn bitrate_and_resolution_change_on_a_running_pipeline() {
 
     // Phase 1: 640x480 at 4 Mbps.
     for seq in 0..10 {
-        src_handle.push_buffer(yuv_frame(seq)).unwrap();
+        src_handle.push_buffer(yuv_frame(seq)).await.unwrap();
     }
     wait_for(&sink_handle, 10).await;
 
@@ -133,7 +133,7 @@ async fn bitrate_and_resolution_change_on_a_running_pipeline() {
 
     // Phase 2: 320x240 at 400 kbps.
     for seq in 10..20 {
-        src_handle.push_buffer(yuv_frame(seq)).unwrap();
+        src_handle.push_buffer(yuv_frame(seq)).await.unwrap();
     }
     src_handle.end_stream();
     handle.wait().await.unwrap();
@@ -219,15 +219,15 @@ async fn resolution_can_be_lowered_and_restored_while_running() {
     let executor = Executor::new();
     let handle = executor.start(&mut pipeline).unwrap();
 
-    src_handle.push_buffer(yuv_frame(0)).unwrap();
+    src_handle.push_buffer(yuv_frame(0)).await.unwrap();
     wait_for(&sink_handle, 1).await;
 
     scale.set_max_height(120);
-    src_handle.push_buffer(yuv_frame(1)).unwrap();
+    src_handle.push_buffer(yuv_frame(1)).await.unwrap();
     wait_for(&sink_handle, 2).await;
 
     scale.passthrough();
-    src_handle.push_buffer(yuv_frame(2)).unwrap();
+    src_handle.push_buffer(yuv_frame(2)).await.unwrap();
     src_handle.end_stream();
     handle.wait().await.unwrap();
 
@@ -280,14 +280,14 @@ async fn run_with_change(
     let handle = executor.start(&mut pipeline).unwrap();
 
     for seq in 0..change_at {
-        src_handle.push_buffer(yuv_frame(seq)).unwrap();
+        src_handle.push_buffer(yuv_frame(seq)).await.unwrap();
     }
     wait_for(&sink_handle, change_at as usize).await;
 
     change(&control);
 
     for seq in change_at..frames {
-        src_handle.push_buffer(yuv_frame(seq)).unwrap();
+        src_handle.push_buffer(yuv_frame(seq)).await.unwrap();
     }
     src_handle.end_stream();
     handle.wait().await.unwrap();
@@ -425,7 +425,7 @@ async fn encoder_stats_are_readable_on_a_running_pipeline() {
     assert_eq!(stats.frames_encoded(), 0);
 
     for seq in 0..8 {
-        src_handle.push_buffer(yuv_frame(seq)).unwrap();
+        src_handle.push_buffer(yuv_frame(seq)).await.unwrap();
     }
     wait_for(&sink_handle, 8).await;
 

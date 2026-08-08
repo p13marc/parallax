@@ -173,7 +173,7 @@ Every controllable element implements `Controllable`, so the accessor is always 
 | `JpegQualityControl` | `JpegEncoder::control()` | `set_quality(1..=100)` |
 | `ValveControl` | `Valve::control()` | `open()` / `close()` |
 | `FlowStateHandle` | `Queue::control()` | backpressure signalling to live sources |
-| `AppSinkHandle` / `AppSrcHandle` | `AppSink::handle()` / `AppSrc::handle()` | `pull_buffer_async`, `push_buffer_async`, `stats()` |
+| `AppSinkHandle` / `AppSrcHandle` | `AppSink::handle()` / `AppSrc::handle()` | async-first `pull_buffer`/`push_buffer` (+`_timeout`; `*_blocking` twins for plain threads), `try_pull_buffer`, `stats()` |
 
 ```rust,ignore
 use parallax::control::Controllable;

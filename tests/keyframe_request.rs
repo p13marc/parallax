@@ -102,7 +102,7 @@ async fn keyframe_handle_reaches_running_encoder() {
     // Phase 1: five frames, then wait until the sink has all of them —
     // at that point the encoder is provably idle.
     for seq in 0..5 {
-        src_handle.push_buffer(yuv_frame(seq)).unwrap();
+        src_handle.push_buffer(yuv_frame(seq)).await.unwrap();
     }
     let deadline = Instant::now() + Duration::from_secs(10);
     while sink_handle.queue_len() < 5 {
@@ -114,7 +114,7 @@ async fn keyframe_handle_reaches_running_encoder() {
     keyframes.request();
 
     for seq in 5..10 {
-        src_handle.push_buffer(yuv_frame(seq)).unwrap();
+        src_handle.push_buffer(yuv_frame(seq)).await.unwrap();
     }
     src_handle.end_stream();
     handle.wait().await.unwrap();
@@ -164,7 +164,7 @@ async fn in_band_metadata_flag_forces_idr() {
         if seq == 3 {
             buffer.metadata_mut().set(KEYFRAME_REQUEST, true);
         }
-        src_handle.push_buffer(buffer).unwrap();
+        src_handle.push_buffer(buffer).await.unwrap();
     }
     src_handle.end_stream();
     handle.wait().await.unwrap();

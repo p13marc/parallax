@@ -25,8 +25,9 @@ use tokio::sync::Notify;
 ///
 /// // Pipeline pushes data to sink...
 ///
-/// // In application code:
-/// while let Some(buffer) = handle.pull_buffer()? {
+/// // In application code (async-first; from a plain thread use
+/// // `pull_buffer_blocking()`):
+/// while let Some(buffer) = handle.pull_buffer().await? {
 ///     // Process buffer
 /// }
 /// ```
@@ -210,17 +211,70 @@ impl Sink for AppSink {
 }
 
 impl AppSinkHandle {
-    /// Pull a buffer from the sink.
+    /// Pull a buffer, awaiting one if the queue is empty.
     ///
-    /// Returns `Ok(None)` when EOS is reached and no more buffers are available.
-    pub fn pull_buffer(&self) -> Result<Option<Buffer>> {
-        self.pull_buffer_timeout(None)
+    /// Async-first: this is the primary form, because the application boundary
+    /// of a tokio-first crate is very often a tokio task — it yields instead of
+    /// parking the thread, so a consumer can `select!` over it. From a plain
+    /// thread, use [`pull_buffer_blocking`](Self::pull_buffer_blocking).
+    ///
+    /// Returns `Ok(None)` at EOS with an empty queue.
+    pub async fn pull_buffer(&self) -> Result<Option<Buffer>> {
+        loop {
+            // Register for the wakeup *before* looking at the queue, or a push
+            // landing between the check and the await would be missed.
+            let notified = self.inner.data_available_async.notified();
+
+            {
+                let mut state = self.inner.state.lock().unwrap();
+                if state.flushing {
+                    return Err(Error::Element("appsink is flushing".into()));
+                }
+                if let Some(buffer) = state.queue.pop_front() {
+                    state.total_pulled += 1;
+                    self.inner.space_available.notify_one();
+                    self.inner.space_available_async.notify_one();
+                    return Ok(Some(buffer));
+                }
+                if state.eos {
+                    return Ok(None);
+                }
+            }
+
+            notified.await;
+        }
     }
 
-    /// Pull a buffer with a timeout.
+    /// Pull a buffer, giving up after `timeout`.
+    ///
+    /// Returns `Ok(None)` on timeout or at EOS.
+    pub async fn pull_buffer_timeout(&self, timeout: Duration) -> Result<Option<Buffer>> {
+        match tokio::time::timeout(timeout, self.pull_buffer()).await {
+            Ok(result) => result,
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Pull a buffer, parking the calling thread until one arrives.
+    ///
+    /// The blocking twin of [`pull_buffer`](Self::pull_buffer), for consumers
+    /// that live on a plain thread. Never call it from inside a tokio runtime —
+    /// it parks the worker.
+    ///
+    /// Returns `Ok(None)` when EOS is reached and no more buffers are available.
+    pub fn pull_buffer_blocking(&self) -> Result<Option<Buffer>> {
+        self.pull_wait(None)
+    }
+
+    /// Pull a buffer on a plain thread, giving up after `timeout`.
     ///
     /// Returns `Ok(None)` on timeout or EOS.
-    pub fn pull_buffer_timeout(&self, timeout: Option<Duration>) -> Result<Option<Buffer>> {
+    pub fn pull_buffer_timeout_blocking(&self, timeout: Duration) -> Result<Option<Buffer>> {
+        self.pull_wait(Some(timeout))
+    }
+
+    /// The one blocking wait both `_blocking` forms share.
+    fn pull_wait(&self, timeout: Option<Duration>) -> Result<Option<Buffer>> {
         let mut state = self.inner.state.lock().unwrap();
 
         // Wait for data
@@ -247,47 +301,6 @@ impl AppSinkHandle {
             Ok(Some(buffer))
         } else {
             Ok(None)
-        }
-    }
-
-    /// Pull a buffer, awaiting one if the queue is empty.
-    ///
-    /// The async twin of [`pull_buffer`](Self::pull_buffer): it yields the task
-    /// instead of parking the thread, so a consumer can `select!` over it.
-    /// Returns `Ok(None)` at EOS with an empty queue.
-    pub async fn pull_buffer_async(&self) -> Result<Option<Buffer>> {
-        loop {
-            // Register for the wakeup *before* looking at the queue, or a push
-            // landing between the check and the await would be missed.
-            let notified = self.inner.data_available_async.notified();
-
-            {
-                let mut state = self.inner.state.lock().unwrap();
-                if state.flushing {
-                    return Err(Error::Element("appsink is flushing".into()));
-                }
-                if let Some(buffer) = state.queue.pop_front() {
-                    state.total_pulled += 1;
-                    self.inner.space_available.notify_one();
-                    self.inner.space_available_async.notify_one();
-                    return Ok(Some(buffer));
-                }
-                if state.eos {
-                    return Ok(None);
-                }
-            }
-
-            notified.await;
-        }
-    }
-
-    /// Pull a buffer asynchronously, giving up after `timeout`.
-    ///
-    /// Returns `Ok(None)` on timeout or at EOS.
-    pub async fn pull_buffer_timeout_async(&self, timeout: Duration) -> Result<Option<Buffer>> {
-        match tokio::time::timeout(timeout, self.pull_buffer_async()).await {
-            Ok(result) => result,
-            Err(_) => Ok(None),
         }
     }
 
@@ -417,13 +430,13 @@ mod tests {
         assert_eq!(handle.queue_len(), 2);
 
         let buf = handle
-            .pull_buffer_timeout(Some(Duration::from_millis(100)))
+            .pull_buffer_timeout_blocking(Duration::from_millis(100))
             .unwrap();
         assert!(buf.is_some());
         assert_eq!(buf.unwrap().metadata().sequence, 0);
 
         let buf = handle
-            .pull_buffer_timeout(Some(Duration::from_millis(100)))
+            .pull_buffer_timeout_blocking(Duration::from_millis(100))
             .unwrap();
         assert!(buf.is_some());
         assert_eq!(buf.unwrap().metadata().sequence, 1);
@@ -442,11 +455,11 @@ mod tests {
         assert!(sink.is_eos());
 
         // Should still get the buffered data
-        let buf = handle.pull_buffer().unwrap();
+        let buf = handle.pull_buffer_blocking().unwrap();
         assert!(buf.is_some());
 
         // Now should get None for EOS
-        let buf = handle.pull_buffer().unwrap();
+        let buf = handle.pull_buffer_blocking().unwrap();
         assert!(buf.is_none());
     }
 
@@ -502,7 +515,7 @@ mod tests {
         });
 
         let mut received = Vec::new();
-        while let Ok(Some(buf)) = handle.pull_buffer() {
+        while let Ok(Some(buf)) = handle.pull_buffer_blocking() {
             received.push(buf.metadata().sequence);
         }
 
@@ -550,12 +563,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pull_buffer_async_wakes_when_a_buffer_arrives() {
+    async fn pull_buffer_wakes_when_a_buffer_arrives() {
         let mut sink = AppSink::new();
         let handle = sink.handle();
 
         // Nothing queued yet: the pull must wait, not spin or return None.
-        let pull = tokio::spawn(async move { handle.pull_buffer_async().await });
+        let pull = tokio::spawn(async move { handle.pull_buffer().await });
 
         tokio::task::yield_now().await;
 
@@ -568,11 +581,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pull_buffer_async_returns_none_at_eos() {
+    async fn pull_buffer_returns_none_at_eos() {
         let sink = AppSink::new();
         let handle = sink.handle();
 
-        let pull = tokio::spawn(async move { handle.pull_buffer_async().await });
+        let pull = tokio::spawn(async move { handle.pull_buffer().await });
         tokio::task::yield_now().await;
 
         sink.send_eos();
@@ -580,12 +593,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pull_buffer_timeout_async_gives_up() {
+    async fn pull_buffer_timeout_gives_up() {
         let sink = AppSink::new();
         let handle = sink.handle();
 
         let result = handle
-            .pull_buffer_timeout_async(Duration::from_millis(20))
+            .pull_buffer_timeout(Duration::from_millis(20))
             .await
             .unwrap();
         assert!(
