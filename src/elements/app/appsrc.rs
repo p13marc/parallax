@@ -202,6 +202,32 @@ impl AppSrcHandle {
         }
     }
 
+    /// Try to push a buffer without blocking.
+    ///
+    /// Returns `Ok(None)` when the buffer was queued, `Ok(Some(buffer))` when
+    /// the queue is full — the buffer is handed back so the caller can retry —
+    /// and `Err` when the source is at EOS or flushing, the same errors
+    /// [`push_buffer`](Self::push_buffer) raises. A full queue is the expected
+    /// retry case, not an error; EOS and flushing are errors, unlike
+    /// `AppSink::try_pull_buffer`, which cannot distinguish "empty" from
+    /// "over".
+    pub fn try_push_buffer(&self, buffer: Buffer) -> Result<Option<Buffer>> {
+        let mut state = self.inner.state.lock().unwrap();
+        if state.eos {
+            return Err(Error::Element("appsrc is at EOS".into()));
+        }
+        if state.flushing {
+            return Err(Error::Element("appsrc is flushing".into()));
+        }
+        if state.queue.len() >= state.max_buffers {
+            return Ok(Some(buffer));
+        }
+        state.queue.push_back(buffer);
+        state.total_pushed += 1;
+        self.inner.data_available.notify_one();
+        Ok(None)
+    }
+
     /// Push a buffer, parking the calling thread while the queue is full.
     ///
     /// The blocking twin of [`push_buffer`](Self::push_buffer), for producers
@@ -505,5 +531,46 @@ mod tests {
         handle.end_stream();
 
         assert!(handle.push_buffer(create_test_buffer(0)).await.is_err());
+    }
+
+    #[test]
+    fn try_push_buffer_pushes_when_space() {
+        let src = AppSrc::new();
+        let handle = src.handle();
+
+        let result = handle.try_push_buffer(create_test_buffer(0)).unwrap();
+        assert!(result.is_none(), "buffer was queued");
+        assert_eq!(handle.queue_len(), 1);
+        assert_eq!(handle.stats().total_pushed, 1);
+    }
+
+    #[test]
+    fn try_push_buffer_returns_the_buffer_when_full() {
+        let src = AppSrc::with_max_buffers(1);
+        let handle = src.handle();
+        handle.push_buffer_blocking(create_test_buffer(0)).unwrap();
+
+        let returned = handle
+            .try_push_buffer(create_test_buffer(42))
+            .unwrap()
+            .expect("queue is full, buffer comes back");
+        assert_eq!(returned.metadata().sequence, 42, "the same buffer returns");
+        assert_eq!(handle.stats().total_pushed, 1, "nothing was queued");
+    }
+
+    #[test]
+    fn try_push_buffer_errors_at_eos() {
+        let src = AppSrc::new();
+        let handle = src.handle();
+        handle.end_stream();
+        assert!(handle.try_push_buffer(create_test_buffer(0)).is_err());
+    }
+
+    #[test]
+    fn try_push_buffer_errors_when_flushing() {
+        let src = AppSrc::new();
+        let handle = src.handle();
+        handle.set_flushing(true);
+        assert!(handle.try_push_buffer(create_test_buffer(0)).is_err());
     }
 }
