@@ -545,6 +545,92 @@ impl RefTracker {
     }
 }
 
+/// Outcome of a `frame_num` continuity check for one picture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GapCheck {
+    /// Continuity holds — decode the picture.
+    Decode,
+    /// A `frame_num` gap was just detected: a reference frame was lost.
+    GapDetected {
+        /// The `frame_num` carried by the offending picture.
+        got: u32,
+        /// The largest legal value, `(prev_ref_frame_num + 1) % max_frame_num`.
+        expected: u32,
+    },
+    /// Still inside a gap: skip this picture and wait for an IDR.
+    SkipUntilIdr,
+}
+
+/// Detects `frame_num` discontinuities (spec 7.4.3) so the decoder can refuse
+/// to predict from a DPB that is missing a reference frame.
+///
+/// A non-IDR picture's `frame_num` must equal `PrevRefFrameNum` (the
+/// non-reference-B-with-the-same-frame_num-as-its-anchor case) or
+/// `(PrevRefFrameNum + 1) % MaxFrameNum`; `PrevRefFrameNum` advances only on
+/// reference pictures. Anything else means a reference was lost — decoding on
+/// would produce silently corrupt output, so the caller drops pictures until
+/// the next IDR, which starts a clean prediction chain.
+#[derive(Debug, Default)]
+pub struct FrameNumGapDetector {
+    prev_ref_frame_num: Option<u32>,
+    awaiting_idr: bool,
+}
+
+impl FrameNumGapDetector {
+    /// Fresh detector.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Forget everything (decoder reset / new session).
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Check one picture, in decode order, and update the rolling state.
+    pub fn check(
+        &mut self,
+        frame_num: u32,
+        is_idr: bool,
+        is_reference: bool,
+        max_frame_num: u32,
+    ) -> GapCheck {
+        if is_idr {
+            // An IDR starts a clean prediction chain regardless of history.
+            self.awaiting_idr = false;
+            self.prev_ref_frame_num = Some(frame_num);
+            return GapCheck::Decode;
+        }
+
+        if self.awaiting_idr {
+            return GapCheck::SkipUntilIdr;
+        }
+
+        let Some(prev) = self.prev_ref_frame_num else {
+            // Stream joined mid-GOP: the DPB emptiness check downstream is
+            // the arbiter for whether prediction is possible at all.
+            if is_reference {
+                self.prev_ref_frame_num = Some(frame_num);
+            }
+            return GapCheck::Decode;
+        };
+
+        let next = (prev + 1) % max_frame_num.max(1);
+        if frame_num == prev || frame_num == next {
+            if is_reference {
+                self.prev_ref_frame_num = Some(frame_num);
+            }
+            return GapCheck::Decode;
+        }
+
+        self.awaiting_idr = true;
+        GapCheck::GapDetected {
+            got: frame_num,
+            expected: next,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -839,5 +925,64 @@ mod tests {
         released.sort_unstable();
         assert_eq!(released, vec![0, 1]);
         assert_eq!(t.references().len(), 1, "only the current picture remains");
+    }
+
+    #[test]
+    fn gap_detector_accepts_increment_and_repeat() {
+        let mut d = FrameNumGapDetector::new();
+        assert_eq!(d.check(0, true, true, 16), GapCheck::Decode); // IDR
+        assert_eq!(d.check(1, false, true, 16), GapCheck::Decode); // P ref
+        // A non-reference B with the same frame_num as its anchor: legal.
+        assert_eq!(d.check(1, false, false, 16), GapCheck::Decode);
+        assert_eq!(d.check(2, false, true, 16), GapCheck::Decode);
+    }
+
+    #[test]
+    fn gap_detector_flags_a_missing_reference() {
+        let mut d = FrameNumGapDetector::new();
+        d.check(0, true, true, 16);
+        d.check(1, false, true, 16);
+        assert_eq!(
+            d.check(3, false, true, 16),
+            GapCheck::GapDetected {
+                got: 3,
+                expected: 2
+            }
+        );
+        // Everything after the gap is skipped...
+        assert_eq!(d.check(4, false, true, 16), GapCheck::SkipUntilIdr);
+        assert_eq!(d.check(5, false, false, 16), GapCheck::SkipUntilIdr);
+    }
+
+    #[test]
+    fn gap_detector_idr_clears_the_gap() {
+        let mut d = FrameNumGapDetector::new();
+        d.check(0, true, true, 16);
+        d.check(2, false, true, 16); // gap
+        assert_eq!(d.check(0, true, true, 16), GapCheck::Decode, "IDR recovers");
+        assert_eq!(d.check(1, false, true, 16), GapCheck::Decode);
+    }
+
+    #[test]
+    fn gap_detector_handles_frame_num_wraparound() {
+        let mut d = FrameNumGapDetector::new();
+        d.check(14, true, true, 16);
+        assert_eq!(d.check(15, false, true, 16), GapCheck::Decode);
+        assert_eq!(
+            d.check(0, false, true, 16),
+            GapCheck::Decode,
+            "15 wraps to 0"
+        );
+    }
+
+    #[test]
+    fn gap_detector_non_reference_does_not_advance_prev() {
+        let mut d = FrameNumGapDetector::new();
+        d.check(0, true, true, 16);
+        // Non-ref at frame_num 1 (next): allowed, but prev stays 0...
+        assert_eq!(d.check(1, false, false, 16), GapCheck::Decode);
+        // ...so a reference at 1 is still the legal successor.
+        assert_eq!(d.check(1, false, true, 16), GapCheck::Decode);
+        assert_eq!(d.check(2, false, true, 16), GapCheck::Decode);
     }
 }

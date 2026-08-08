@@ -24,8 +24,11 @@
 //! Progressive frames only; Baseline/Main/High profiles; default reference
 //! list order is delegated to the driver (Vulkan H.264 decode re-parses the
 //! slice headers on the GPU, so `ref_pic_list_modification` works as long as
-//! every needed reference is bound). Out of scope: interlaced/PAFF/MBAFF,
-//! scaling matrices, error concealment for `frame_num` gaps, DMA-BUF export
+//! every needed reference is bound). A `frame_num` gap (lost reference) is
+//! detected per 7.4.3: the first offending picture errors, the rest are
+//! skipped until the next IDR — \"non-existing\" frame synthesis (8.2.5.2) is
+//! not implemented. Out of scope: interlaced/PAFF/MBAFF,
+//! scaling matrices, DMA-BUF export
 //! of decoded frames, and multi-frame-in-flight pipelining. Every failure
 //! path returns `Err` — a frame over uninitialised memory is never returned.
 
@@ -34,7 +37,9 @@ use super::decode_commands::{DecodeCommandRecorder, FrameDecodeInfo, RefSlotDesc
 use super::dpb::Dpb;
 use super::error::VulkanError;
 use super::h264_parser::{H264ParameterSets, ParsedSliceHeader, parse_annexb};
-use super::h264_refs::{CurrentPicture, PictureId, PocParams, PocState, RefTracker};
+use super::h264_refs::{
+    CurrentPicture, FrameNumGapDetector, GapCheck, PictureId, PocParams, PocState, RefTracker,
+};
 use super::h264_std;
 use super::session::{VideoSession, VideoSessionConfig, VideoSessionParameters};
 use crate::error::Result;
@@ -93,6 +98,8 @@ pub struct VulkanH264Decoder {
     built_param_generation: u64,
     /// POC state (8.2.1).
     poc_state: PocState,
+    /// frame_num continuity watchdog (7.4.3): a gap means a lost reference.
+    gap_detector: FrameNumGapDetector,
     /// Reference bookkeeping (8.2.5).
     ref_tracker: RefTracker,
     /// Display (cropped) dimensions from the active SPS.
@@ -139,6 +146,7 @@ impl VulkanH264Decoder {
             param_generation: 0,
             built_param_generation: 0,
             poc_state: PocState::new(),
+            gap_detector: FrameNumGapDetector::new(),
             ref_tracker: RefTracker::new(),
             width: 0,
             height: 0,
@@ -199,6 +207,7 @@ impl VulkanH264Decoder {
             let _ = slot; // DPB is gone with the stack
         }
         self.poc_state.reset();
+        self.gap_detector.reset();
 
         let config = VideoSessionConfig {
             profile: self.profile.clone(),
@@ -341,12 +350,16 @@ impl VulkanH264Decoder {
     }
 
     /// Decode one picture: the given slices form exactly one frame.
+    ///
+    /// Returns `Ok(None)` for pictures skipped inside a `frame_num` gap —
+    /// after a lost reference, non-IDR pictures are dropped until the next
+    /// IDR starts a clean prediction chain.
     fn decode_picture(
         &mut self,
         slices: &[&[u8]],
         psh: &ParsedSliceHeader,
         pts: i64,
-    ) -> Result<GpuFrame> {
+    ) -> Result<Option<GpuFrame>> {
         if psh.header.field_pic != FieldPic::Frame {
             return Err(VulkanError::DecodeError(
                 "Field-coded (interlaced) pictures are not supported".to_string(),
@@ -365,6 +378,45 @@ impl VulkanH264Decoder {
         let max_frame_num = poc_params.max_frame_num;
 
         let pic = Self::picture_id(psh);
+
+        // frame_num continuity (7.4.3) — checked BEFORE the POC state
+        // advances, so a skipped picture leaves no trace. The first violation
+        // is an honest error naming the gap; everything after it is quietly
+        // skipped until the IDR that recovers the stream.
+        match self
+            .gap_detector
+            .check(pic.frame_num, pic.is_idr, pic.is_reference, max_frame_num)
+        {
+            GapCheck::Decode => {}
+            GapCheck::GapDetected { got, expected } => {
+                let gaps_allowed = self
+                    .param_sets
+                    .full_sps(psh.sps_id)
+                    .map(|s| s.gaps_in_frame_num_value_allowed_flag)
+                    .unwrap_or(false);
+                tracing::warn!(
+                    "frame_num gap: got {got}, expected {expected} — a reference frame was \
+                     lost{}; dropping pictures until the next IDR",
+                    if gaps_allowed {
+                        " (stream allows gaps; \"non-existing\" frame synthesis is not implemented)"
+                    } else {
+                        ""
+                    }
+                );
+                return Err(VulkanError::DecodeError(format!(
+                    "frame_num gap: got {got}, expected {expected}; waiting for an IDR"
+                ))
+                .into());
+            }
+            GapCheck::SkipUntilIdr => {
+                tracing::debug!(
+                    "skipping non-IDR picture (frame_num {}) inside a frame_num gap",
+                    pic.frame_num
+                );
+                return Ok(None);
+            }
+        }
+
         let poc = self.poc_state.advance(&poc_params, &pic);
 
         // IDR: the whole DPB retires before the picture decodes.
@@ -497,7 +549,7 @@ impl VulkanH264Decoder {
 
         self.frame_count += 1;
 
-        Ok(GpuFrame {
+        Ok(Some(GpuFrame {
             buffer,
             format: self.output_format,
             width: self.width,
@@ -505,7 +557,7 @@ impl VulkanH264Decoder {
             stride: self.width,
             pts,
             is_keyframe: pic.is_idr,
-        })
+        }))
     }
 }
 
@@ -544,7 +596,9 @@ impl HwVideoDecoder for VulkanH264Decoder {
             let psh = self.param_sets.parse_slice_header(slice)?;
             if psh.header.first_mb_in_slice == 0 && !group.is_empty() {
                 let header = group_header.take().expect("non-empty group has a header");
-                frames.push(self.decode_picture(&group, &header, pts)?);
+                if let Some(frame) = self.decode_picture(&group, &header, pts)? {
+                    frames.push(frame);
+                }
                 group.clear();
             }
             if group.is_empty() {
@@ -554,7 +608,9 @@ impl HwVideoDecoder for VulkanH264Decoder {
         }
         if !group.is_empty() {
             let header = group_header.take().expect("non-empty group has a header");
-            frames.push(self.decode_picture(&group, &header, pts)?);
+            if let Some(frame) = self.decode_picture(&group, &header, pts)? {
+                frames.push(frame);
+            }
         }
 
         Ok(frames)
@@ -576,6 +632,7 @@ impl HwVideoDecoder for VulkanH264Decoder {
             dpb.clear();
         }
         self.poc_state.reset();
+        self.gap_detector.reset();
         if let Some(recorder) = self.recorder.as_mut() {
             recorder.request_session_reset();
         }
