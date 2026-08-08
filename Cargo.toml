@@ -5,7 +5,7 @@ members = [".", "parallax-macros", "examples/example-plugin"]
 # Package is `parallax-pipeline` on crates.io (the bare name is squatted);
 # the lib target below keeps the import name `parallax`.
 name = "parallax-pipeline"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.97"
 description = "Parallax: a Rust-native streaming pipeline engine with zero-copy multi-process support"
