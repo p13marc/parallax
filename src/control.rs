@@ -26,7 +26,7 @@
 //! | [`KeyframeHandle`] | `…::keyframe_handle()` | force the next frame to be an IDR |
 //! | [`ScaleControl`] | `VideoScale` | target resolution (`set_max_height`, `passthrough`) |
 //! | [`ThrottleControl`] | `Throttle` | framerate (drop-based) |
-//! | [`JpegQualityControl`] | `JpegEncoder` | JPEG quality 1..=100 |
+//! | `JpegQualityControl` | `JpegEncoder` | JPEG quality 1..=100 |
 //! | [`ValveControl`] | `Valve` | open / close |
 //! | [`FlowStateHandle`] | `Queue` | backpressure signalling to live sources |
 //!
