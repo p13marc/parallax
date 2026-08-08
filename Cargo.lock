@@ -3472,7 +3472,7 @@ dependencies = [
 
 [[package]]
 name = "parallax-pipeline"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "alsa",
  "anyhow",
@@ -3538,7 +3538,7 @@ dependencies = [
 
 [[package]]
 name = "parallax-pipeline-macros"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "proc-macro2",
  "quote",
