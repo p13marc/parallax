@@ -82,7 +82,7 @@ The `IpcSrc`/`IpcSink` elements (and `link::IpcPublisher`/`IpcSubscriber`) imple
 
 `memory::ipc` primitives: `send_fds`/`recv_fds` (up to 4 fds per message via `SCM_RIGHTS`), `send_segment_handle`/`recv_segment_handle` (fd + size pair).
 
-> **Caveat:** `SharedArena::from_fd` currently reconstructs slot positions assuming the default 64-byte stride. Arenas created with `new_avx` (32-byte alignment) should not be shared cross-process until this is fixed.
+Arena format **v4** records `slot_stride` and `alignment` in the header, so a client reads the true stride instead of assuming 64-byte rounding — arenas from `new_avx` (32-byte alignment) are safe to share cross-process. `from_fd` validates the recorded stride against `slot_size` and `alignment` and that every slot fits the mapping, refusing the arena rather than handing back one that mis-addresses slots.
 
 ## Buffers and metadata
 
@@ -153,7 +153,7 @@ All implement the `MemorySegment` trait (`as_ptr`, `len`, `memory_type`, `ipc_ha
 |------|---------|-----|-------|
 | `DmaBufSegment` | DMA-BUF fd (V4L2 `VIDIOC_EXPBUF`, DRM, GPU export) | fd | `DmaBufBuffer` wraps it with metadata; `into_fd()` recovers the fd; `to_buffer(arena)` copies into CPU memory when needed |
 | `MappedFileSegment` | file `MAP_SHARED` | by path | persistent buffers; `sync()`/`resize()` |
-| `HugePageSegment` | anonymous `MAP_HUGETLB` (2 MB / 1 GB) | **not currently** — `ipc_handle()` returns `None` | `new_or_fallback()` degrades to normal pages |
+| `HugePageSegment` | `memfd_create(MFD_HUGETLB)` + `MAP_SHARED` (2 MB / 1 GB) | fd | `new()` errors when the hugetlb pool is empty; `new_or_fallback()` degrades to normal pages and *says so* — `fell_back()`, `memory_type()` reports `Cpu`, and `page_count()`/`prefault()` use `effective_page_size()` |
 
 `MemoryType` (`Cpu`, `HugePages`, `MappedFile`, `DmaBuf`, `GpuAccessible`, `GpuDevice`, `RdmaRegistered`) participates in caps negotiation, so pipelines can select DMA-BUF vs CPU paths per link — see [formats.md](formats.md).
 

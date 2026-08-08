@@ -90,7 +90,13 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 const ARENA_MAGIC: u64 = 0x504C585F4152454E; // "PLX_AREN" in ASCII
 
 /// Current arena format version.
-const ARENA_VERSION: u32 = 3; // Bumped for arena-level refcount
+///
+/// v4 added `slot_stride` and `alignment` to [`ArenaHeader`]. Before that a
+/// client mapping the arena had to *guess* the stride, and guessed 64-byte
+/// rounding — silently mis-addressing every slot of a 32-byte-aligned arena
+/// whose slot size was not already a multiple of 64. The bump is required
+/// rather than cosmetic: a v3 writer leaves those bytes zeroed.
+const ARENA_VERSION: u32 = 4;
 
 /// Size of the release queue (must be power of 2 for efficient modulo).
 /// This limits how many slots can be pending release at once.
@@ -361,8 +367,19 @@ struct ArenaHeader {
     /// Arena-level reference count (for cross-process lifetime management).
     /// When this reaches 0, the arena can be unmapped.
     refcount: AtomicU32,
+    /// Distance in bytes between consecutive slots' data regions.
+    ///
+    /// This is `slot_size` rounded up to `alignment`, and it is **not**
+    /// derivable from `slot_size` alone — which is exactly why it lives here.
+    /// Added in format v4.
+    slot_stride: AtomicU32,
+    /// Alignment the slot data was laid out for (32 for AVX, 64 for AVX-512).
+    ///
+    /// Recorded so a client can validate the stride rather than trust it.
+    /// Added in format v4.
+    alignment: AtomicU32,
     /// Reserved for future use.
-    _reserved: [u8; 16],
+    _reserved: [u8; 8],
 }
 
 impl ArenaHeader {
@@ -636,6 +653,8 @@ impl SharedArena {
             h.arena_id.store(arena_id, Ordering::Release);
             h.slot_headers_offset
                 .store(slot_headers_offset as u32, Ordering::Release);
+            h.slot_stride.store(slot_stride as u32, Ordering::Release);
+            h.alignment.store(alignment as u32, Ordering::Release);
             h.refcount.store(1, Ordering::Release); // Initial refcount = 1
         }
 
@@ -725,7 +744,7 @@ impl SharedArena {
         }
 
         // Read layout from header and increment refcount
-        let (slot_count, slot_size, data_offset, arena_id, slot_headers_offset) = unsafe {
+        let (slot_count, slot_size, data_offset, arena_id, slot_headers_offset, slot_stride, align) = unsafe {
             let h = header.as_ref();
             // Increment arena refcount (cross-process safe)
             let old_refcount = h.refcount.fetch_add(1, Ordering::AcqRel);
@@ -742,8 +761,46 @@ impl SharedArena {
                 h.data_offset.load(Ordering::Acquire) as usize,
                 h.arena_id.load(Ordering::Acquire),
                 h.slot_headers_offset.load(Ordering::Acquire) as usize,
+                h.slot_stride.load(Ordering::Acquire) as usize,
+                h.alignment.load(Ordering::Acquire) as usize,
             )
         };
+
+        // Validate the stride the owner recorded (format v4). This used to be
+        // recomputed here as `(slot_size + 63) & !63`, which is right only when
+        // the owner happened to use 64-byte alignment: an arena built with
+        // `new_avx` (32) and a slot size that is a multiple of 32 but not of 64
+        // got a client stride larger than the owner's, mis-addressing every
+        // slot after the first and reading past the mapping at the last.
+        //
+        // On any inconsistency, unmap and refuse rather than hand back an arena
+        // that silently corrupts data.
+        let reject = |msg: String| -> Error {
+            unsafe {
+                header.as_ref().refcount.fetch_sub(1, Ordering::AcqRel);
+                let _ = rustix::mm::munmap(base.as_ptr().cast(), total_size);
+            }
+            Error::InvalidSegment(msg)
+        };
+
+        if align == 0 || !align.is_power_of_two() {
+            return Err(reject(format!(
+                "arena declares a non-power-of-two slot alignment: {align}"
+            )));
+        }
+        let expected_stride = slot_size.div_ceil(align) * align;
+        if slot_stride != expected_stride {
+            return Err(reject(format!(
+                "arena slot_stride {slot_stride} disagrees with slot_size {slot_size} \
+                 rounded up to alignment {align} ({expected_stride})"
+            )));
+        }
+        if data_offset + slot_stride * slot_count > total_size {
+            return Err(reject(format!(
+                "arena slots do not fit the mapping: data_offset {data_offset} + \
+                 {slot_count} x stride {slot_stride} > {total_size} bytes"
+            )));
+        }
 
         let queue_offset = std::mem::size_of::<ArenaHeader>();
         let release_queue = unsafe {
@@ -753,10 +810,6 @@ impl SharedArena {
         let slot_headers = unsafe {
             NonNull::new_unchecked(base.as_ptr().add(slot_headers_offset).cast::<SlotHeader>())
         };
-
-        // Calculate slot stride assuming 64-byte alignment (default for new arenas)
-        // This ensures each slot starts at a 64-byte aligned offset
-        let slot_stride = (slot_size + 63) & !63;
 
         Ok(Self {
             fd,
@@ -1577,6 +1630,98 @@ mod tests {
         let reclaimed = arena.reclaim();
         assert_eq!(reclaimed, 1);
         assert_eq!(arena.free_count(), 4);
+    }
+
+    /// Regression for #1: a client must read the slot stride from the header,
+    /// not guess it.
+    ///
+    /// `from_fd` used to recompute the stride as `(slot_size + 63) & !63`,
+    /// which is only correct for 64-byte-aligned arenas. `new_avx` uses 32, so
+    /// a slot size that is a multiple of 32 but not of 64 gave the client a
+    /// *larger* stride than the owner: slot `i` was read at `data_offset +
+    /// i*128` where the owner wrote it at `data_offset + i*96`. Silent
+    /// cross-process corruption, and an out-of-bounds read at the last slot.
+    #[test]
+    fn from_fd_reads_a_non_64_byte_stride_from_the_header() {
+        const SLOT_SIZE: usize = 96; // multiple of 32, not of 64
+        const SLOT_COUNT: usize = 8;
+
+        let arena = SharedArena::with_alignment("avx32-stride", SLOT_SIZE, SLOT_COUNT, 32).unwrap();
+        assert_eq!(arena.slot_stride, 96, "owner stride");
+        assert_ne!(
+            arena.slot_stride,
+            SLOT_SIZE.div_ceil(64) * 64,
+            "test is pointless unless the 64-rounded guess differs"
+        );
+
+        // Owner writes a distinct pattern into every slot and keeps the refs so
+        // nothing is recycled underneath us.
+        let mut slots = Vec::new();
+        for i in 0..SLOT_COUNT {
+            let mut slot = arena.acquire().expect("slot available");
+            slot.data_mut().fill(i as u8 + 1);
+            slots.push(slot);
+        }
+
+        let dup_fd = rustix::io::fcntl_dupfd_cloexec(&arena.fd, 0).unwrap();
+        let client = unsafe { SharedArena::from_fd(dup_fd).unwrap() };
+        assert_eq!(client.slot_stride, arena.slot_stride, "client stride");
+
+        // Every slot must read back exactly what the owner wrote, including the
+        // last one — which under the old guess sat past the end of the mapping.
+        for (i, slot) in slots.iter().enumerate() {
+            let client_slot = client.slot_from_ipc(&slot.ipc_ref()).unwrap();
+            let data = client_slot.data();
+            assert_eq!(data.len(), SLOT_SIZE, "slot {i} length");
+            assert!(
+                data.iter().all(|&b| b == i as u8 + 1),
+                "slot {i} read back as {:?}, expected all {}",
+                &data[..8.min(data.len())],
+                i as u8 + 1
+            );
+        }
+    }
+
+    /// The default 64-byte path must keep working across the version bump.
+    #[test]
+    fn from_fd_still_handles_the_default_alignment() {
+        let arena = SharedArena::new(1000, 4).unwrap();
+        let mut slot = arena.acquire().unwrap();
+        slot.data_mut()[0] = 200;
+
+        let dup_fd = rustix::io::fcntl_dupfd_cloexec(&arena.fd, 0).unwrap();
+        let client = unsafe { SharedArena::from_fd(dup_fd).unwrap() };
+
+        assert_eq!(client.slot_stride, 1024);
+        assert_eq!(
+            client.slot_from_ipc(&slot.ipc_ref()).unwrap().data()[0],
+            200
+        );
+    }
+
+    /// A header whose stride contradicts its own slot size / alignment is
+    /// rejected instead of producing a mis-indexed arena.
+    #[test]
+    fn from_fd_rejects_an_inconsistent_stride() {
+        let arena = SharedArena::with_alignment("bad-stride", 96, 4, 32).unwrap();
+
+        // Corrupt the recorded stride the way a mismatched writer would.
+        unsafe {
+            arena
+                .header
+                .as_ref()
+                .slot_stride
+                .store(128, Ordering::Release);
+        }
+
+        let dup_fd = rustix::io::fcntl_dupfd_cloexec(&arena.fd, 0).unwrap();
+        match unsafe { SharedArena::from_fd(dup_fd) } {
+            Ok(_) => panic!("an inconsistent stride must be rejected"),
+            Err(e) => assert!(
+                e.to_string().contains("slot_stride"),
+                "expected a stride complaint, got: {e}"
+            ),
+        }
     }
 
     #[test]
