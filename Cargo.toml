@@ -86,8 +86,9 @@ winit = { version = "0.30", optional = true }
 softbuffer = { version = "0.4", optional = true }
 
 # Vulkan Video (optional)
+# Note: no gpu-allocator. src/gpu/vulkan/memory.rs allocates directly against
+# the queried memory types, so the crate was declared but never referenced.
 ash = { version = "0.38", optional = true }
-gpu-allocator = { version = "0.28", optional = true }
 
 # H.264 bitstream parsing (optional)
 h264-reader = { version = "0.8", optional = true }
@@ -167,9 +168,8 @@ tempfile = "3.24.0"
 default = []
 macros = ["parallax-macros"]  # Plugin authoring macros
 huge-pages = []       # MAP_HUGETLB support
-gpu = []              # Future: CUDA/Vulkan pinned memory
 rdma = []             # Future: RDMA support
-vulkan-video = ["dep:ash", "dep:gpu-allocator", "dep:h264-reader"]  # Vulkan Video codecs
+vulkan-video = ["dep:ash", "dep:h264-reader"]  # Vulkan Video codecs
 software-codecs = ["av1-encode", "av1-decode", "h264"]  # All software video codecs
 av1-encode = ["dep:rav1e"]  # AV1 encoder (requires nasm on x86_64)
 av1-decode = ["dep:dav1d"]  # AV1 decoder (requires libdav1d system library)
@@ -224,6 +224,12 @@ harness = false
 
 # Examples - one concept per file, numbered for learning order
 # Run with: cargo run --example <name> [--features <feature>]
+#
+# Every example file gets an [[example]] entry, even the feature-free ones.
+# Leaving one out is how 42/43/44 ended up hand-rolling `#[cfg(not(feature))]`
+# stub `main`s that printed a shrug instead of failing (#9): with no entry,
+# cargo builds them under default features and there is nowhere to hang
+# `required-features`.
 
 # Basic examples (01-12): no special features required
 [[example]]
@@ -258,6 +264,13 @@ name = "10_builder"
 
 [[example]]
 name = "11_buffer_pool"
+
+# Caps / conversion examples: no special features required
+[[example]]
+name = "17_multi_format_caps"
+
+[[example]]
+name = "41_format_converters"
 
 # Codec examples (13-16): require feature flags
 [[example]]
@@ -298,6 +311,18 @@ name = "24_autovideosink"
 required-features = ["display"]
 
 [[example]]
+name = "42_pipewire_audio"
+required-features = ["pipewire"]
+
+[[example]]
+name = "43_alsa_audio"
+required-features = ["alsa"]
+
+[[example]]
+name = "44_libcamera_capture"
+required-features = ["libcamera"]
+
+[[example]]
 name = "45_dmabuf_negotiation"
 required-features = ["v4l2"]
 
@@ -319,3 +344,34 @@ name = "25_hls_output"
 
 [[example]]
 name = "26_dash_output"
+
+# Pipeline-facility examples (47-56): no special features required
+[[example]]
+name = "47_flow_control"
+
+[[example]]
+name = "48_clock_provider"
+
+[[example]]
+name = "49_element_retrieval"
+
+[[example]]
+name = "50_hybrid_pipeline"
+
+[[example]]
+name = "51_bus_messages"
+
+[[example]]
+name = "52_seeking"
+
+[[example]]
+name = "53_pad_probes"
+
+[[example]]
+name = "54_tracers"
+
+[[example]]
+name = "55_queue2_buffering"
+
+[[example]]
+name = "56_typefind"

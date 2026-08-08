@@ -759,6 +759,114 @@ async fn test_hybrid_falls_back_to_async_when_no_rt() {
 }
 
 // ============================================================================
+// Test: SchedulingMode::RealTime is actually applied (#6)
+// ============================================================================
+
+/// `RtConfig::realtime()` takes any RT-safe node, without also requiring a low
+/// latency hint the way `hybrid()` does.
+#[tokio::test]
+async fn realtime_mode_takes_every_rt_safe_node() {
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_source("src", NullSource::new(10));
+    let rt_elem = pipeline.add_filter("rt", RtDoubler::new("rt", Arc::new(AtomicU64::new(0))));
+    let sink = pipeline.add_sink("sink", NullSink::new());
+    pipeline.link(src, rt_elem).unwrap();
+    pipeline.link(rt_elem, sink).unwrap();
+
+    let scheduler = RtScheduler::new(RtConfig::realtime());
+    let partition = scheduler.partition_graph(&pipeline).unwrap();
+
+    assert_eq!(partition.rt_nodes.len(), 1, "RT-safe filter belongs in RT");
+    assert_eq!(partition.async_nodes.len(), 2, "source and sink stay async");
+}
+
+/// Regression for #6: `with_scheduling(RealTime)` alone must be enough.
+///
+/// The executor reads its partition from `RtConfig::mode`, which
+/// `with_scheduling` does not touch — so before the fix, this configuration
+/// left `rt.mode` at its `Async` default, every node was classified async, the
+/// partition came back empty, and the pipeline silently ran fully async no
+/// matter how many RT-safe elements it held. Nothing observable failed, which
+/// is what made it a trap.
+#[tokio::test]
+async fn realtime_scheduling_does_not_need_rt_config_set_separately() {
+    let rt_count = Arc::new(AtomicU64::new(0));
+    let sink_count = Arc::new(AtomicU64::new(0));
+    let num_buffers = 20;
+
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_source("src", NullSource::new(num_buffers));
+    let rt_elem = pipeline.add_filter("rt", RtDoubler::new("rt", rt_count.clone()));
+    let sink = pipeline.add_sink("sink", CountingSink::new(sink_count.clone()));
+    pipeline.link(src, rt_elem).unwrap();
+    pipeline.link(rt_elem, sink).unwrap();
+
+    // Note: only `scheduling` is set. `rt` is left at its default.
+    let config = ExecutorConfig::default().with_scheduling(SchedulingMode::RealTime);
+    let executor = Executor::with_config(config);
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        executor.run(&mut pipeline).await
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => {
+            assert_eq!(
+                sink_count.load(Ordering::Relaxed),
+                num_buffers,
+                "every buffer should still reach the sink"
+            );
+            assert_eq!(
+                rt_count.load(Ordering::Relaxed),
+                num_buffers,
+                "the RT element should have processed every buffer"
+            );
+        }
+        Ok(Err(e)) => panic!("Pipeline error: {}", e),
+        Err(_) => panic!("Pipeline timed out"),
+    }
+}
+
+/// `RealTime` with nothing RT-safe to schedule still runs — it does not error.
+///
+/// The executor logs a warning and falls back to async. The doc comment on
+/// `SchedulingMode::RealTime` used to claim non-RT-safe nodes "will cause an
+/// error", which was never true; this pins the behaviour the docs now
+/// describe.
+#[tokio::test]
+async fn realtime_with_no_rt_safe_nodes_still_runs() {
+    let async_count = Arc::new(AtomicU64::new(0));
+    let sink_count = Arc::new(AtomicU64::new(0));
+    let num_buffers = 10;
+
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_source("src", NullSource::new(num_buffers));
+    // AsyncCounter reports default hints, i.e. not RT-safe.
+    let filter = pipeline.add_filter("async_filter", AsyncCounter::new("f", async_count.clone()));
+    let sink = pipeline.add_sink("sink", CountingSink::new(sink_count.clone()));
+    pipeline.link(src, filter).unwrap();
+    pipeline.link(filter, sink).unwrap();
+
+    let config = ExecutorConfig::default().with_scheduling(SchedulingMode::RealTime);
+    let executor = Executor::with_config(config);
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        executor.run(&mut pipeline).await
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => {
+            assert_eq!(sink_count.load(Ordering::Relaxed), num_buffers);
+            assert_eq!(async_count.load(Ordering::Relaxed), num_buffers);
+        }
+        Ok(Err(e)) => panic!("RealTime with no RT-safe node must fall back, not error: {e}"),
+        Err(_) => panic!("Pipeline timed out"),
+    }
+}
+
+// ============================================================================
 // Test: ManualDriver gated processing
 // ============================================================================
 

@@ -13,12 +13,10 @@
 //! cargo run --example 43_alsa_audio --features alsa
 //! ```
 
-#[cfg(feature = "alsa")]
 use parallax::elements::device::alsa::{
     AlsaFormat, AlsaSampleFormat, AlsaSink, AlsaSrc, enumerate_devices, is_available,
 };
 
-#[cfg(feature = "alsa")]
 fn main() {
     println!("=== ALSA Audio Example ===\n");
 
@@ -99,10 +97,4 @@ fn main() {
     println!("  let sink = pipeline.add_async_sink(\"speaker\", sink);");
     println!("  pipeline.link(src, sink)?;");
     println!("  pipeline.run().await?;");
-}
-
-#[cfg(not(feature = "alsa"))]
-fn main() {
-    eprintln!("This example requires the 'alsa' feature.");
-    eprintln!("Run with: cargo run --example 43_alsa_audio --features alsa");
 }

@@ -177,7 +177,7 @@ p.link_pads(xfm, "src", sink, "sink")?;
 - `ExecutorConfig { scheduling: SchedulingMode::{Async|Hybrid|RealTime}, auto_strategy: bool (default true), channel_capacity, rt: RtConfig{quantum, rt_priority, data_threads, bridge_capacity}, driver }`. Presets: `low_latency_audio()`, `video(fps)`, `hybrid()`.
 - **`ElementStrategy` has exactly two variants: `Async` and `RealTime`.** Auto rule: `rt_safe && latency ∈ {UltraLow, Low}` → RealTime; else Async. `trust_level`/`uses_native_code` are currently IGNORED (process isolation was removed in commit da6df59 — never document an "isolated process" strategy).
 - Hybrid mode: `RtScheduler::partition_graph` splits nodes, boundary edges get `AsyncRtBridge` (lock-free SPSC + eventfd), RT threads use PipeWire-style `ActivationRecord`s, paced by `TimerDriver`/`ManualDriver`.
-- `SchedulingMode::RealTime` with zero RT-safe nodes silently falls back to fully-async (does not error).
+- `SchedulingMode::RealTime` with zero RT-safe nodes falls back to fully-async and logs a `warn!` (it does not error). `ExecutorConfig::scheduling` is authoritative — the executor overrides `RtConfig::mode` from it, so `with_scheduling(RealTime)` works on its own. `auto_strategy` only *reports* that RT-safe elements exist; it does not promote an Async config to Hybrid.
 
 ### Bus & events
 
@@ -273,10 +273,10 @@ Muxer sync: `MuxerSyncState`/`MuxerSyncConfig::new().with_mode(SyncMode::{Auto|S
 6. **`Executor::start` is sync**; only `run()` is async.
 7. **`SharedArena::from_fd` assumes 64-byte slot stride** — arenas created with `new_avx` (32-byte alignment) will be mis-indexed by a client mapping them. Known latent bug; don't advertise cross-process AVX-32 arenas.
 8. **`HugePageSegment::ipc_handle()` returns `None`** even though `MemoryType::HugePages.supports_ipc()` claims true — huge-page arenas are not currently fd-shareable.
-9. **Vulkan Video (`vulkan-video`) is a scaffold**: context/session/DPB/DMA-BUF memory are real, but `VulkanH264Decoder::decode_frame` does NOT submit hardware decode commands; no encode; H.265/AV1 absent. The `gpu` feature flag is an empty placeholder.
-10. **Examples 42/43/44 (pipewire/alsa/libcamera) are not `required-features`-gated** — they compile with default features via internal `#[cfg]` stubs; device examples 22/23/24 use `required-features` instead.
+9. **Vulkan Video (`vulkan-video`) is a scaffold**: context/session/DPB/DMA-BUF memory are real, but `VulkanH264Decoder::decode_frame` does NOT submit hardware decode commands — it returns a `GpuFrame` over uninitialised memory; no encode; H.265/AV1 absent. Tracked in #3, which also records that Mesa ANV only exposes Vulkan Video on Gen12+ (so a Gen9.5 iGPU cannot even smoke-test it; RADV is the target). The empty `gpu` feature flag and the never-referenced `gpu-allocator` dependency have been removed.
+10. **Every example file has an `[[example]]` entry in Cargo.toml**, feature-gated ones carrying `required-features`. Add one when you add an example: without it, cargo builds the file under default features and there is nowhere to hang the gate — which is how 42/43/44 ended up hand-rolling `#[cfg(not(feature))]` stub `main`s that printed a message instead of failing.
 11. **benches/memory_pool.rs and benches/throughput.rs are stubs** (pending rewrite after a memory-API refactor); only `colorspace` is a real bench.
-12. **`AlignmentStrategy::Interpolate` falls back to `Nearest(10ms)`** — not actually implemented.
+12. **`AlignmentStrategy::Interpolate` needs `B: Lerp`** — it resamples the *right* stream onto the left's timestamps, and only `TemporalJoin::try_emit_interpolated` honours it. Plain `try_emit` returns `None` for that variant (it used to silently run `Nearest(10ms)`, discarding the caller's `Duration`).
 13. Types that do NOT exist (stale docs may mention them): `CpuArena`, `HeapSegment`, `MemoryPool`, `SharedMemorySegment`, `PipelineExecutor`, `ElementSandbox`, `Affinity`, `parallax-launch`/`parallax-inspect`/`parallax-top` binaries.
 
 ## Code Style

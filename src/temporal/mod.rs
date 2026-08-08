@@ -18,5 +18,7 @@
 mod alignment;
 mod timestamp;
 
-pub use alignment::{AlignmentStrategy, JoinResult, JoinWindow, TemporalJoin, TimestampedItem};
+pub use alignment::{
+    AlignmentStrategy, JoinResult, JoinWindow, Lerp, TemporalJoin, TimestampedItem,
+};
 pub use timestamp::{ClockSource, TimeRange, Timestamp};

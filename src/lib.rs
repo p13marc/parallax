@@ -78,6 +78,14 @@ pub mod prelude {
     pub use crate::clock::{
         Clock, ClockFlags, ClockProvider, ClockTime, PipelineClock, SystemClock,
     };
+    // Runtime control. `Controllable` is what makes `element.control()` resolve,
+    // so it belongs in the prelude of a crate whose headline feature is changing
+    // parameters on a running pipeline. See [`crate::control`] for the
+    // clone-before-`start()` invariant that governs every handle here.
+    pub use crate::control::{
+        Controllable, EncoderControl, EncoderParams, EncoderStats, EncoderStatsHandle,
+        KeyframeHandle, RateControlMode, ScaleControl, ThrottleControl, ValveControl,
+    };
     pub use crate::element::{
         AsyncElementDyn, AsyncSink, AsyncSource, AsyncTransform, DynAsyncElement, Element, Output,
         Sink, Source, Transform,

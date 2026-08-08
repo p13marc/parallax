@@ -127,7 +127,7 @@ let pipeline = PipelineBuilder::new()
     .build()?;
 ```
 
-The builder is typestate-checked (`Empty → HasSource → Complete`) and supports `tee(|t| t.branch(...))` for fan-out. See `examples/10_builder.rs`.
+The builder is typestate-checked (`Empty → HasSource → Complete`) and supports `fanout(|f| f.branch(...))` for fan-out — which inserts a plain `Inspect` junction and starts every branch from it, so the duplication comes from the node's src-pad being 1:N, not from any element. See `examples/10_builder.rs`.
 
 ## States
 

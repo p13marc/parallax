@@ -15,12 +15,10 @@
 //! cargo run --example 44_libcamera_capture --features libcamera
 //! ```
 
-#[cfg(feature = "libcamera")]
 use parallax::elements::device::libcamera::{
     LibCameraConfig, LibCameraSrc, enumerate_cameras, is_available,
 };
 
-#[cfg(feature = "libcamera")]
 fn main() {
     println!("=== libcamera Video Capture Example ===\n");
 
@@ -83,10 +81,4 @@ fn main() {
             eprintln!("Failed to enumerate cameras: {}", e);
         }
     }
-}
-
-#[cfg(not(feature = "libcamera"))]
-fn main() {
-    eprintln!("This example requires the 'libcamera' feature.");
-    eprintln!("Run with: cargo run --example 44_libcamera_capture --features libcamera");
 }

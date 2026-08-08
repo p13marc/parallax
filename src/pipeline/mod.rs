@@ -95,6 +95,6 @@ pub use unified_executor::{Executor, ExecutorConfig, PipelineHandle};
 
 // Builder API
 pub use builder::{
-    BranchBuilder, BuiltPipeline, ChainedTransform, ChainedTransform2, FromSource, PipelineBuilder,
-    PipelineFragment, TeeBuilder, ToSink, from, to,
+    BranchBuilder, BuiltPipeline, ChainedTransform, ChainedTransform2, FanoutBuilder, FromSource,
+    PipelineBuilder, PipelineFragment, ToSink, from, to,
 };

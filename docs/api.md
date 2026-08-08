@@ -134,7 +134,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 | Bridge | `source_to_dyn`, `sink_to_dyn`, `transform_to_dyn`, `DynamicPipelineBuilder` — connect typed stages into dynamic pipelines |
 | Caps markers | `Bytes`, `Typed<T>`, `Video<F, W, H, FPS>`, `Audio<F, RATE>`, `TypedBuffer<C>` |
 
-`parallax::temporal`: `Timestamp` (ns + `ClockSource`; **a separate type from `clock::ClockTime`**), `TimeRange`, `TemporalJoin`, `JoinWindow`, `AlignmentStrategy` (`Exact`/`Tolerance`/`Nearest`; `Interpolate` currently falls back to `Nearest`), `JoinResult`, `TimestampedItem`.
+`parallax::temporal`: `Timestamp` (ns + `ClockSource`; **a separate type from `clock::ClockTime`**), `TimeRange`, `TemporalJoin`, `JoinWindow`, `AlignmentStrategy` (`Exact`/`Tolerance`/`Nearest`/`Interpolate`), `Lerp`, `JoinResult`, `TimestampedItem`. `Interpolate` resamples the **right** stream onto the left stream's timestamps and is honoured by `TemporalJoin::try_emit_interpolated`, available when `B: Lerp`; the unbounded `try_emit` declines that variant rather than substituting another strategy.
 
 ## Environment variables
 

@@ -339,17 +339,25 @@ impl PipelineBuilder<HasSource> {
         }
     }
 
-    /// Create a tee (branch point) in the pipeline.
+    /// Create a fan-out (branch point) in the pipeline.
     ///
-    /// The tee duplicates buffers to all branches. Each branch must end with
-    /// a sink.
+    /// Every branch receives every buffer, as a refcounted clone rather than a
+    /// copy. Each branch must end with a sink.
+    ///
+    /// There is no fan-out *element* doing the duplication: this inserts a
+    /// plain [`Inspect`](crate::elements::Inspect) junction node and starts
+    /// every branch from it, and the executor broadcasts because that node's
+    /// src-pad has several links leaving it. See
+    /// [`Pipeline::link_lossy`](crate::pipeline::Pipeline::link_lossy) for the
+    /// same mechanism spelled out by hand, including the per-branch drop policy
+    /// this builder does not yet expose.
     ///
     /// # Example
     ///
     /// ```rust,ignore
     /// let pipeline = PipelineBuilder::new()
     ///     .source(src)
-    ///     .tee(|t| {
+    ///     .fanout(|t| {
     ///         t.branch(|b| b
     ///             .then(scale_720p)
     ///             .sink(file_720p));
@@ -359,40 +367,40 @@ impl PipelineBuilder<HasSource> {
     ///     })
     ///     .build()?;
     /// ```
-    pub fn tee<F>(mut self, f: F) -> PipelineBuilder<Complete>
+    pub fn fanout<F>(mut self, f: F) -> PipelineBuilder<Complete>
     where
-        F: FnOnce(&mut TeeBuilder),
+        F: FnOnce(&mut FanoutBuilder),
     {
         use crate::elements::Inspect;
 
         // The junction node. It is a plain passthrough — the fan-out comes from
         // the *node's* src-pad being 1:N, not from anything the element does.
-        let tee_name = format!("tee_{}", self.name_counter);
+        let junction_name = format!("fanout_{}", self.name_counter);
         self.name_counter += 1;
         let adapter = ElementAdapter::new(Inspect::new());
-        let tee_id = self
+        let junction_id = self
             .pipeline
-            .add_node(&tee_name, DynAsyncElement::new_box(adapter));
+            .add_node(&junction_name, DynAsyncElement::new_box(adapter));
 
-        // Link previous element to tee
+        // Link previous element to the junction
         if let Some(prev) = self.current_node {
             self.pipeline
-                .link(prev, tee_id)
-                .expect("failed to link to tee");
+                .link(prev, junction_id)
+                .expect("failed to link to fan-out junction");
         }
 
         // Build branches
-        let mut tee_builder = TeeBuilder {
+        let mut fanout_builder = FanoutBuilder {
             pipeline: &mut self.pipeline,
-            tee_node: tee_id,
+            junction_node: junction_id,
             name_counter: &mut self.name_counter,
             arena: self.arena.clone(),
         };
-        f(&mut tee_builder);
+        f(&mut fanout_builder);
 
         PipelineBuilder {
             pipeline: self.pipeline,
-            current_node: Some(tee_id),
+            current_node: Some(junction_id),
             name_counter: self.name_counter,
             arena: self.arena,
             _state: PhantomData,
@@ -425,31 +433,32 @@ impl PipelineBuilder<Complete> {
 }
 
 // ============================================================================
-// TeeBuilder
+// FanoutBuilder
 // ============================================================================
 
-/// Builder for tee branches.
+/// Builder for fan-out branches.
 ///
-/// Used inside the `tee()` callback to define branches.
-pub struct TeeBuilder<'a> {
+/// Used inside the [`PipelineBuilder::fanout`] callback to define branches.
+pub struct FanoutBuilder<'a> {
     pipeline: &'a mut Pipeline,
-    tee_node: NodeId,
+    junction_node: NodeId,
     name_counter: &'a mut u64,
     arena: Option<SharedArena>,
 }
 
-impl<'a> TeeBuilder<'a> {
-    /// Add a branch from the tee point.
+impl<'a> FanoutBuilder<'a> {
+    /// Add a branch from the fan-out point.
     ///
-    /// Each branch receives a copy of every buffer that passes through the tee.
+    /// Each branch receives every buffer that reaches the junction, as a
+    /// refcounted clone rather than a copy.
     pub fn branch<F>(&mut self, f: F)
     where
         F: FnOnce(BranchBuilder<'_>) -> BranchBuilder<'_, Complete>,
     {
         let branch = BranchBuilder {
             pipeline: self.pipeline,
-            start_node: self.tee_node,
-            current_node: self.tee_node,
+            start_node: self.junction_node,
+            current_node: self.junction_node,
             name_counter: self.name_counter,
             arena: self.arena.clone(),
             _state: PhantomData,
@@ -462,7 +471,7 @@ impl<'a> TeeBuilder<'a> {
 // BranchBuilder
 // ============================================================================
 
-/// Builder for a single branch in a tee.
+/// Builder for a single branch of a fan-out.
 pub struct BranchBuilder<'a, State = Empty> {
     pipeline: &'a mut Pipeline,
     start_node: NodeId,

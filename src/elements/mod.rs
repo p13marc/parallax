@@ -132,6 +132,19 @@ pub use rtp::{
     RtspStats, RtspTransport, StreamInfo, StreamSelection,
 };
 
+// Runtime control.
+//
+// These are defined in [`crate::control`], the one module that documents the
+// clone-before-`start()` invariant, and re-exported here so that every runtime
+// handle is reachable from a single `use parallax::elements::*`. They are
+// deliberately re-exported from `crate::control` rather than from
+// [`codec`], because `codec` is only compiled when a codec feature is enabled
+// while the handles themselves always are.
+pub use crate::control::{
+    Controllable, EncoderControl, EncoderParams, EncoderStats, EncoderStatsHandle,
+    KEYFRAME_REQUEST, KeyframeHandle, RateControlMode,
+};
+
 // I/O
 pub use io::{ConsoleFormat, ConsoleSink, FdSink, FdSrc, FileSink, FileSrc};
 
@@ -211,8 +224,8 @@ pub use codec::{PixelFormat as CodecPixelFormat, VideoFrame};
 // Video codecs - H.264
 #[cfg(feature = "h264")]
 pub use codec::{
-    Complexity, DecodedFrame, H264Decoder, H264Encoder, H264EncoderConfig, Profile,
-    RateControlMode, SpsPpsStrategy, UsageType,
+    Complexity, DecodedFrame, H264Decoder, H264Encoder, H264EncoderConfig, Profile, SpsPpsStrategy,
+    UsageType,
 };
 
 // Video codecs - V4L2 M2M hardware H.264
@@ -301,5 +314,6 @@ pub use device::{AlsaDeviceInfo, AlsaFormat, AlsaSampleFormat, AlsaSink, AlsaSrc
 
 // Streaming protocols
 pub use streaming::{
-    HlsConfig, HlsSink, HlsVariant, SegmentBoundaryDetector, SegmentInfo, SegmentWriter,
+    DashAdaptationSet, DashConfig, DashRepresentation, DashSink, DashStats, HlsConfig, HlsSink,
+    HlsStats, HlsVariant, SegmentBoundaryDetector, SegmentInfo, SegmentWriter,
 };

@@ -13,10 +13,8 @@
 //! cargo run --example 42_pipewire_audio --features pipewire
 //! ```
 
-#[cfg(feature = "pipewire")]
 use parallax::elements::device::pipewire::{PipeWireSrc, enumerate_audio_nodes, is_available};
 
-#[cfg(feature = "pipewire")]
 fn main() {
     println!("=== PipeWire Audio Example ===\n");
 
@@ -69,10 +67,4 @@ fn main() {
             eprintln!("This may be normal if no microphone is available.");
         }
     }
-}
-
-#[cfg(not(feature = "pipewire"))]
-fn main() {
-    eprintln!("This example requires the 'pipewire' feature.");
-    eprintln!("Run with: cargo run --example 42_pipewire_audio --features pipewire");
 }

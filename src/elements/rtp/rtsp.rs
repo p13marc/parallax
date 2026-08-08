@@ -3,21 +3,44 @@
 //! This module provides an RTSP source that connects to cameras and streaming
 //! servers, receiving RTP streams and demuxing them into video/audio frames.
 //!
-//! # Example
+//! # Example: as a pipeline source
+//!
+//! [`RtspSession`] implements [`AsyncSource`](crate::element::AsyncSource), so
+//! it is an ordinary graph node. Note it is `add_async_source`, not
+//! `add_source` — RTSP is inherently async and cannot satisfy the sync
+//! [`Source`](crate::element::Source) trait.
 //!
 //! ```rust,ignore
-//! use parallax::elements::RtspSrc;
+//! use parallax::elements::{RtspSrc, RtspTransport};
 //!
-//! // Connect to an RTSP camera
-//! let src = RtspSrc::new("rtsp://192.168.1.100/stream1")
+//! let session = RtspSrc::new("rtsp://192.168.1.100/stream1")
 //!     .with_transport(RtspTransport::TcpInterleaved)
-//!     .with_credentials("admin", "password");
+//!     .with_credentials("admin", "password")
+//!     .connect()
+//!     .await?;
 //!
-//! // Run in async context
-//! let mut src = src.connect().await?;
+//! let mut pipeline = Pipeline::new();
+//! let src = pipeline.add_async_source("rtsp", session);
+//! let sink = pipeline.add_async_sink("out", my_sink);
+//! pipeline.link(src, sink)?;
+//! pipeline.run().await?;
+//! ```
 //!
-//! // Receive frames
-//! while let Some(frame) = src.next_frame().await? {
+//! With the default [`RtspFrameFormat::AnnexB`], the buffers this produces feed
+//! an `H264Decoder` directly — SPS/PPS ride in-band on every keyframe. Use
+//! [`RtspFrameFormat::LengthPrefixed`] when muxing to MP4 instead. See
+//! `examples/58_rtsp_display.rs`.
+//!
+//! # Example: owning the pump yourself
+//!
+//! The manual path remains available for callers who want to drive the session
+//! by hand rather than hand it to an executor — see
+//! `examples/57_rtsp_capture.rs`.
+//!
+//! ```rust,ignore
+//! let mut session = RtspSrc::new("rtsp://192.168.1.100/stream1").connect().await?;
+//!
+//! while let Some(frame) = session.next_frame().await? {
 //!     match frame {
 //!         RtspFrame::Video(buf) => { /* H.264/H.265 access unit */ },
 //!         RtspFrame::Audio(buf) => { /* AAC/Opus frame */ },

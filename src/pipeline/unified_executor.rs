@@ -471,18 +471,21 @@ impl Executor {
         // PipelineHandle::stop).
         let stop = Arc::new(AtomicBool::new(false));
 
-        // Analyze pipeline for automatic strategy if enabled
-        let plan = if self.config.auto_strategy {
+        // Report what the element hints suggest. This is advisory only — see
+        // the note on `effective_scheduling` below for why the suggestion is
+        // not acted on automatically.
+        if self.config.auto_strategy {
             let plan = analyze_pipeline(pipeline);
-            tracing::info!(
-                "Auto-detected execution plan: {} async, {} RT",
-                plan.async_nodes.len(),
-                plan.rt_nodes.len(),
-            );
-            Some(plan)
-        } else {
-            None
-        };
+            if plan.needs_rt && self.config.scheduling == SchedulingMode::Async {
+                tracing::info!(
+                    "{} of {} elements report RT-safe, low-latency hints. The pipeline is \
+                     running async; pass ExecutorConfig::with_scheduling(SchedulingMode::Hybrid) \
+                     to put them on RT threads.",
+                    plan.rt_nodes.len(),
+                    plan.rt_nodes.len() + plan.async_nodes.len(),
+                );
+            }
+        }
 
         // State transitions
         let old_state = pipeline.state();
@@ -493,23 +496,36 @@ impl Executor {
             bus_handle.post_state_changed(old_state, PipelineState::Idle);
         }
 
-        // Determine effective scheduling mode
-        let effective_scheduling = if self.config.auto_strategy {
-            if let Some(ref plan) = plan {
-                if plan.needs_rt {
-                    SchedulingMode::Hybrid
-                } else {
-                    SchedulingMode::Async
-                }
-            } else {
-                self.config.scheduling
-            }
-        } else {
-            self.config.scheduling
-        };
+        // The configured mode is the effective mode.
+        //
+        // `auto_strategy` used to recompute this from the plan, promoting a
+        // pipeline to `Hybrid` whenever any element looked RT-worthy — and
+        // then discarding the result, because the partitioner reads
+        // `RtConfig::mode`, which `auto_strategy` never touched. So the
+        // promotion has never taken effect, and honouring it now would move
+        // every pipeline containing an rt_safe low-latency element onto RT
+        // threads by default: a large behavioural change, onto the code path
+        // that still has no probes or tracers (#43). That is its own decision,
+        // not a side effect of fixing #6, so auto-promotion stays off and the
+        // plan is used for reporting only.
+        //
+        // What #6 needed is below: an explicitly configured mode is now
+        // actually applied, instead of being silently overridden here and then
+        // ignored by the partitioner.
+        let effective_scheduling = self.config.scheduling;
 
-        // Partition graph for hybrid scheduling
-        let mut scheduler = RtScheduler::new(self.config.rt.clone());
+        // Partition graph for hybrid scheduling.
+        //
+        // `ExecutorConfig::scheduling` is authoritative: `RtConfig::mode` is
+        // derived from it here rather than trusted. Without this,
+        // `ExecutorConfig::default().with_scheduling(RealTime)` left `rt.mode`
+        // at its `Async` default, `should_run_rt` rejected every node, and the
+        // pipeline *always* fell back to async no matter how many RT-safe
+        // elements it contained — the root cause behind #6, one level below
+        // the empty-partition fallback the issue described.
+        let mut rt_config = self.config.rt.clone();
+        rt_config.mode = effective_scheduling;
+        let mut scheduler = RtScheduler::new(rt_config);
         let partition = if effective_scheduling != SchedulingMode::Async {
             scheduler.partition_graph(pipeline)?
         } else {
@@ -547,7 +563,33 @@ impl Executor {
             }
             SchedulingMode::Hybrid | SchedulingMode::RealTime => {
                 if partition.rt_nodes.is_empty() {
-                    // No RT nodes, fall back to async
+                    // No node qualified, so there is nothing to schedule on an
+                    // RT thread and the whole graph runs async. That is a
+                    // legitimate outcome — but it silently discards the latency
+                    // guarantee the caller asked for, so say so (#6).
+                    //
+                    // `RealTime` gets the louder message: `Hybrid` is a
+                    // best-effort request by construction, whereas `RealTime`
+                    // is chosen precisely when RT execution is the point.
+                    let names = partition
+                        .async_nodes
+                        .iter()
+                        .filter_map(|&id| pipeline.get_node(id).map(|n| n.name().to_string()))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    if effective_scheduling == SchedulingMode::RealTime {
+                        tracing::warn!(
+                            "SchedulingMode::RealTime requested, but no element reported \
+                             ExecutionHints::rt_safe — running fully async. \
+                             Nodes: [{names}]. Implement SyncElement and return \
+                             ExecutionHints::rt_safe() from execution_hints() to opt in."
+                        );
+                    } else {
+                        tracing::warn!(
+                            "SchedulingMode::Hybrid requested, but no element is both rt_safe \
+                             and low-latency — running fully async. Nodes: [{names}]."
+                        );
+                    }
                     let tasks = self.run_async(pipeline, clock_info.as_ref(), &events, &stop)?;
                     (tasks, Vec::new(), Vec::new(), None)
                 } else {

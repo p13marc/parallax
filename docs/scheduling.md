@@ -72,7 +72,7 @@ Presets: `ExecutorConfig::auto()`, `async_only()`, `hybrid()`, `low_latency_audi
 
 - `Async` — everything in Tokio (default).
 - `Hybrid` — nodes that are `rt_safe` **and** low-latency go to RT threads; the rest stay async.
-- `RealTime` — every `rt_safe` node goes to an RT thread. Note: if *no* node qualifies, the executor silently falls back to fully-async execution rather than erroring.
+- `RealTime` — every `rt_safe` node goes to an RT thread (unlike `Hybrid`, no low-latency hint is also required). If *no* node qualifies, the executor logs a warning and falls back to fully-async execution rather than erroring. Setting this via `ExecutorConfig::with_scheduling` is sufficient: the executor derives `RtConfig::mode` from it, so the two cannot fall out of sync.
 
 ## Hybrid pipeline anatomy
 

@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! filesrc location=/path/to/file ! passthrough ! filesink location=/output
-//! nullsource count=100 ! tee ! nullsink
+//! nullsource count=100 ! inspect ! nullsink
 //! ```
 //!
 //! # Syntax
@@ -13,6 +13,18 @@
 //! - Properties are specified as `name=value` after the element name
 //! - Values can be quoted strings, numbers, or bare identifiers
 //! - Whitespace is optional around `!` and `=`
+//!
+//! # Limitations
+//!
+//! The grammar produces a **strictly linear chain**. There are no caps filters,
+//! no bins, and no pad references — so GStreamer's `tee name=t ! ... t. ! ...`
+//! branching syntax has no equivalent here and fan-out requires the
+//! programmatic API ([`Pipeline::link`](super::Pipeline::link) called several
+//! times from one src-pad, or
+//! [`PipelineBuilder::fanout`](super::PipelineBuilder::fanout)).
+//!
+//! `tee` is still accepted as a deprecated alias for `inspect`, which is a
+//! 1-in/1-out passthrough counter — it never fanned out.
 
 use crate::error::{Error, Result};
 use winnow::Parser;

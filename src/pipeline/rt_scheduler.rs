@@ -84,9 +84,25 @@ pub enum SchedulingMode {
     /// affinity and inserts bridges at async↔RT boundaries.
     Hybrid,
 
-    /// All RT-safe nodes run in RT threads (no async fallback).
+    /// Every node that *can* run on an RT thread does.
     ///
-    /// Nodes that are not RT-safe will cause an error.
+    /// This differs from [`Hybrid`](Self::Hybrid) only in being less
+    /// selective: `Hybrid` additionally requires a
+    /// [`LatencyHint`](crate::element::LatencyHint) of `UltraLow` or `Low`,
+    /// whereas `RealTime` takes any node whose
+    /// [`ExecutionHints`](crate::element::ExecutionHints) report `rt_safe`.
+    ///
+    /// # This is not a guarantee, and it does not error
+    ///
+    /// Nodes that are not RT-safe do **not** cause an error — they are placed
+    /// on Tokio tasks and bridged, exactly as under `Hybrid`. A graph in which
+    /// *no* node is RT-safe therefore runs fully async; the executor logs a
+    /// warning naming the graph rather than failing, because a pipeline that
+    /// still works is more useful than one that refuses to start.
+    ///
+    /// Note also that [`ExecutorConfig::auto_strategy`](crate::pipeline::ExecutorConfig)
+    /// only overrides the configured mode when it was left at its
+    /// [`Default`] (`Async`); setting `RealTime` explicitly is respected.
     RealTime,
 }
 
@@ -94,6 +110,12 @@ pub enum SchedulingMode {
 #[derive(Debug, Clone)]
 pub struct RtConfig {
     /// Scheduling mode.
+    ///
+    /// When this config is used through an
+    /// [`Executor`](crate::pipeline::Executor), this field is **overridden**
+    /// by [`ExecutorConfig::scheduling`](crate::pipeline::ExecutorConfig),
+    /// which is the single source of truth. It matters only when driving an
+    /// [`RtScheduler`] directly.
     pub mode: SchedulingMode,
 
     /// Quantum (samples per processing cycle).
@@ -150,6 +172,18 @@ impl RtConfig {
     pub fn hybrid() -> Self {
         Self {
             mode: SchedulingMode::Hybrid,
+            ..Default::default()
+        }
+    }
+
+    /// Create a config that puts every RT-safe node on an RT thread.
+    ///
+    /// Unlike [`hybrid`](Self::hybrid), this does not additionally require a
+    /// low latency hint. See [`SchedulingMode::RealTime`] for what it does and
+    /// does not guarantee.
+    pub fn realtime() -> Self {
+        Self {
+            mode: SchedulingMode::RealTime,
             ..Default::default()
         }
     }
