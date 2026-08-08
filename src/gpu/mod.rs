@@ -31,7 +31,7 @@
 //! // Check if GPU decoding is available
 //! if let Ok(ctx) = VulkanContext::new() {
 //!     if ctx.supports_decode(Codec::H264) {
-//!         let decoder = VulkanH264Decoder::new(&ctx)?;
+//!         let decoder = VulkanH264Decoder::new(std::sync::Arc::new(ctx))?;
 //!         // Use decoder in pipeline...
 //!     }
 //! }
@@ -53,10 +53,10 @@ pub mod vulkan;
 
 #[cfg(feature = "vulkan-video")]
 pub use vulkan::{
-    DecodeCommandRecorder, DecodeOperation, Dpb, DpbReference, DpbSlot, H264DecodeParams,
-    H264ParameterSets, ParsedPps, ParsedSps, SessionCapabilities, VideoSession, VideoSessionConfig,
-    VideoSessionParameters, VulkanContext, VulkanError, VulkanGpuMemory, VulkanH264Decoder,
-    parse_annexb,
+    DecodeCommandRecorder, Dpb, DpbReference, DpbSlot, FrameDecodeInfo, H264ParameterSets,
+    ParsedPps, ParsedSliceHeader, ParsedSps, RefSlotDesc, SessionCapabilities, VideoSession,
+    VideoSessionConfig, VideoSessionParameters, VulkanContext, VulkanError, VulkanGpuMemory,
+    VulkanH264Decoder, parse_annexb,
 };
 
 /// Video codec types.

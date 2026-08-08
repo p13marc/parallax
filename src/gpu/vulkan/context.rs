@@ -138,25 +138,25 @@ impl VulkanContext {
                 .queue_priorities(&queue_priority),
         ];
 
-        if let Some(decode_family) = decode_queue_family {
-            if decode_family != graphics_queue_family {
-                queue_create_infos.push(
-                    vk::DeviceQueueCreateInfo::default()
-                        .queue_family_index(decode_family)
-                        .queue_priorities(&queue_priority),
-                );
-            }
+        if let Some(decode_family) = decode_queue_family
+            && decode_family != graphics_queue_family
+        {
+            queue_create_infos.push(
+                vk::DeviceQueueCreateInfo::default()
+                    .queue_family_index(decode_family)
+                    .queue_priorities(&queue_priority),
+            );
         }
 
-        if let Some(encode_family) = encode_queue_family {
-            if encode_family != graphics_queue_family && Some(encode_family) != decode_queue_family
-            {
-                queue_create_infos.push(
-                    vk::DeviceQueueCreateInfo::default()
-                        .queue_family_index(encode_family)
-                        .queue_priorities(&queue_priority),
-                );
-            }
+        if let Some(encode_family) = encode_queue_family
+            && encode_family != graphics_queue_family
+            && Some(encode_family) != decode_queue_family
+        {
+            queue_create_infos.push(
+                vk::DeviceQueueCreateInfo::default()
+                    .queue_family_index(encode_family)
+                    .queue_priorities(&queue_priority),
+            );
         }
 
         // Get supported device extensions
@@ -479,6 +479,16 @@ impl VulkanContext {
     /// Get the encode queue.
     pub fn encode_queue(&self) -> Option<vk::Queue> {
         self.encode_queue
+    }
+
+    /// Get the graphics queue family index (always present).
+    pub fn graphics_queue_family(&self) -> u32 {
+        self.graphics_queue_family
+    }
+
+    /// Get the graphics queue (always present, transfer-capable).
+    pub fn graphics_queue(&self) -> vk::Queue {
+        self.graphics_queue
     }
 }
 

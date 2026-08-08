@@ -18,6 +18,7 @@
 //!
 //! This implementation uses Distinct Separate Mode for maximum compatibility.
 
+use super::context::VulkanContext;
 use super::error::VulkanError;
 use super::session::VideoSession;
 use crate::error::Result;
@@ -43,6 +44,9 @@ pub struct DpbSlot {
     pub in_use: bool,
     /// Is this a long-term reference? (H.264)
     pub is_long_term: bool,
+    /// Current image layout, tracked so barriers transition from the truth
+    /// instead of from `UNDEFINED` every frame.
+    pub layout: vk::ImageLayout,
 }
 
 /// Decoded Picture Buffer manager.
@@ -77,8 +81,13 @@ pub struct DpbReference {
 impl Dpb {
     /// Create a new DPB for the given session.
     ///
-    /// Allocates `max_slots` reference frame images.
-    pub fn new(session: &VideoSession, max_slots: Option<u32>) -> Result<Self> {
+    /// Allocates `max_slots` reference frame images, each created against the
+    /// session's video profile (required for video-usage resources).
+    pub fn new(
+        ctx: &VulkanContext,
+        session: &VideoSession,
+        max_slots: Option<u32>,
+    ) -> Result<Self> {
         let device = Arc::new(session.device().clone());
         let max_slots = max_slots
             .unwrap_or(session.max_dpb_slots())
@@ -87,10 +96,33 @@ impl Dpb {
         let format = session.picture_format();
         let extent = session.coded_extent();
 
+        let memory_properties = unsafe {
+            ctx.instance()
+                .get_physical_device_memory_properties(ctx.physical_device())
+        };
+
+        // Decode happens on the video queue but the copy-out happens on the
+        // graphics queue; CONCURRENT sharing between the two (when they are
+        // different families) avoids queue-family ownership transfers.
+        let mut sharing_families = vec![ctx.graphics_queue_family()];
+        if let Some(decode_family) = ctx.decode_queue_family()
+            && decode_family != ctx.graphics_queue_family()
+        {
+            sharing_families.push(decode_family);
+        }
+
         // Allocate DPB slots
         let mut slots = Vec::with_capacity(max_slots as usize);
         for i in 0..max_slots {
-            let slot = Self::allocate_slot(&device, session, i, format, extent)?;
+            let slot = Self::allocate_slot(
+                &device,
+                session,
+                &memory_properties,
+                &sharing_families,
+                i,
+                format,
+                extent,
+            )?;
             slots.push(slot);
         }
 
@@ -106,46 +138,73 @@ impl Dpb {
     /// Allocate a single DPB slot.
     fn allocate_slot(
         device: &ash::Device,
-        _session: &VideoSession,
+        session: &VideoSession,
+        memory_properties: &vk::PhysicalDeviceMemoryProperties,
+        sharing_families: &[u32],
         index: u32,
         format: vk::Format,
         extent: vk::Extent2D,
     ) -> Result<DpbSlot> {
-        // Create image for DPB slot
-        // DPB images need VIDEO_DECODE_DPB_KHR usage
-        let image_info = vk::ImageCreateInfo::default()
-            .image_type(vk::ImageType::TYPE_2D)
-            .format(format)
-            .extent(vk::Extent3D {
-                width: extent.width,
-                height: extent.height,
-                depth: 1,
-            })
-            .mip_levels(1)
-            .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(
-                vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR
-                    | vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR,
-            )
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .initial_layout(vk::ImageLayout::UNDEFINED);
+        // DPB images need VIDEO_DECODE_DPB_KHR usage; DST so coincident-mode
+        // drivers can decode straight into them; TRANSFER_SRC so decoded
+        // pixels can be copied out to a staging buffer. Video-usage images
+        // must name the video profile they will be used with.
+        let image = session.profile_data().with_profile_list(|profile_list| {
+            let mut profile_list = *profile_list;
+            let mut image_info = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(format)
+                .extent(vk::Extent3D {
+                    width: extent.width,
+                    height: extent.height,
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(
+                    vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR
+                        | vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR
+                        | vk::ImageUsageFlags::TRANSFER_SRC,
+                )
+                .initial_layout(vk::ImageLayout::UNDEFINED)
+                .push_next(&mut profile_list);
+            image_info = if sharing_families.len() > 1 {
+                image_info
+                    .sharing_mode(vk::SharingMode::CONCURRENT)
+                    .queue_family_indices(sharing_families)
+            } else {
+                image_info.sharing_mode(vk::SharingMode::EXCLUSIVE)
+            };
 
-        let image = unsafe {
-            device
-                .create_image(&image_info, None)
-                .map_err(VulkanError::from)?
-        };
+            unsafe {
+                device
+                    .create_image(&image_info, None)
+                    .map_err(VulkanError::from)
+            }
+        })?;
 
         // Get memory requirements
         let mem_requirements = unsafe { device.get_image_memory_requirements(image) };
 
-        // For now, use memory type 0 with device local - proper implementation
-        // would query physical device memory properties and find the best type.
+        let memory_type_index = find_memory_type(
+            memory_properties,
+            mem_requirements.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )
+        .or_else(|| {
+            find_memory_type(
+                memory_properties,
+                mem_requirements.memory_type_bits,
+                vk::MemoryPropertyFlags::empty(),
+            )
+        })
+        .ok_or_else(|| VulkanError::Other("No suitable memory type for DPB image".to_string()))?;
+
         let alloc_info = vk::MemoryAllocateInfo::default()
             .allocation_size(mem_requirements.size)
-            .memory_type_index(0);
+            .memory_type_index(memory_type_index);
 
         let memory = unsafe {
             device.allocate_memory(&alloc_info, None).map_err(|e| {
@@ -199,6 +258,7 @@ impl Dpb {
             frame_num: 0,
             in_use: false,
             is_long_term: false,
+            layout: vk::ImageLayout::UNDEFINED,
         })
     }
 
@@ -335,6 +395,20 @@ impl Dpb {
     pub fn extent(&self) -> vk::Extent2D {
         self.extent
     }
+}
+
+/// Find a memory type index matching `type_bits` and `required_flags`.
+fn find_memory_type(
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    type_bits: u32,
+    required_flags: vk::MemoryPropertyFlags,
+) -> Option<u32> {
+    (0..memory_properties.memory_type_count).find(|&i| {
+        (type_bits & (1 << i)) != 0
+            && memory_properties.memory_types[i as usize]
+                .property_flags
+                .contains(required_flags)
+    })
 }
 
 impl Drop for Dpb {

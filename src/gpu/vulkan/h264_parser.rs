@@ -9,6 +9,7 @@ use crate::error::Result;
 use h264_reader::Context;
 use h264_reader::nal::UnitType;
 use h264_reader::nal::pps::PicParameterSet;
+use h264_reader::nal::slice::SliceHeader;
 use h264_reader::nal::sps::{ChromaFormat, SeqParameterSet};
 use h264_reader::rbsp::BitReader;
 
@@ -178,7 +179,7 @@ impl H264ParameterSets {
             .map_err(|e| VulkanError::DecodeError(format!("Failed to parse SPS: {:?}", e)))?;
 
         // Extract key fields
-        let sps_id = sps.seq_parameter_set_id.id() as u8;
+        let sps_id = sps.seq_parameter_set_id.id();
         let profile_idc: u8 = sps.profile_idc.into();
         let level_idc = sps.level_idc;
         let constraint_flags: u8 = sps.constraint_flags.into();
@@ -201,7 +202,7 @@ impl H264ParameterSets {
         ) = match &sps.pic_order_cnt {
             h264_reader::nal::sps::PicOrderCntType::TypeZero {
                 log2_max_pic_order_cnt_lsb_minus4,
-            } => (*log2_max_pic_order_cnt_lsb_minus4 as u8, false, 0u8),
+            } => ((*log2_max_pic_order_cnt_lsb_minus4), false, 0u8),
             h264_reader::nal::sps::PicOrderCntType::TypeOne {
                 delta_pic_order_always_zero_flag,
                 ..
@@ -225,7 +226,7 @@ impl H264ParameterSets {
                 h264_reader::nal::sps::FrameMbsFlags::Frames
             ),
             max_num_ref_frames: sps.max_num_ref_frames as u8,
-            log2_max_frame_num_minus4: sps.log2_max_frame_num_minus4 as u8,
+            log2_max_frame_num_minus4: sps.log2_max_frame_num_minus4,
             pic_order_cnt_type,
             log2_max_pic_order_cnt_lsb_minus4,
             delta_pic_order_always_zero_flag,
@@ -256,8 +257,8 @@ impl H264ParameterSets {
         let pps = PicParameterSet::from_bits(&self.context, reader)
             .map_err(|e| VulkanError::DecodeError(format!("Failed to parse PPS: {:?}", e)))?;
 
-        let pps_id = pps.pic_parameter_set_id.id() as u8;
-        let sps_id = pps.seq_parameter_set_id.id() as u8;
+        let pps_id = pps.pic_parameter_set_id.id();
+        let sps_id = pps.seq_parameter_set_id.id();
 
         let parsed = ParsedPps {
             raw_bytes: nal_data.to_vec(),
@@ -324,8 +325,40 @@ impl H264ParameterSets {
         self.sps.iter().any(|s| s.is_some()) && self.pps.iter().any(|p| p.is_some())
     }
 
-    /// Get picture dimensions from active SPS.
+    /// Get picture dimensions from active SPS, with frame cropping applied.
+    ///
+    /// The coded size is always a whole number of macroblocks; the cropping
+    /// rectangle trims it to the real picture (a 1080p stream is coded as
+    /// 1920x1088 and cropped to 1920x1080).
     pub fn picture_dimensions(&self, sps_id: u8) -> Option<(u32, u32)> {
+        let full = self.full_sps(sps_id)?;
+        let parsed = self.get_sps(sps_id)?;
+
+        let coded_width = parsed.pic_width_in_mbs * 16;
+        let coded_height =
+            parsed.pic_height_in_map_units * 16 * (if parsed.frame_mbs_only_flag { 1 } else { 2 });
+
+        // Crop units depend on chroma subsampling (spec 7.4.2.1.1). 4:2:0
+        // frame-coded: 2x in both axes.
+        let (crop_x, crop_y) = match full.chroma_info.chroma_format {
+            ChromaFormat::Monochrome => (1, 2 - u32::from(parsed.frame_mbs_only_flag)),
+            ChromaFormat::YUV420 => (2, 2 * (2 - u32::from(parsed.frame_mbs_only_flag))),
+            ChromaFormat::YUV422 => (2, 2 - u32::from(parsed.frame_mbs_only_flag)),
+            _ => (1, 2 - u32::from(parsed.frame_mbs_only_flag)),
+        };
+
+        let (left, right, top, bottom) = match &full.frame_cropping {
+            Some(c) => (c.left_offset, c.right_offset, c.top_offset, c.bottom_offset),
+            None => (0, 0, 0, 0),
+        };
+
+        let width = coded_width.saturating_sub((left + right) * crop_x);
+        let height = coded_height.saturating_sub((top + bottom) * crop_y);
+        Some((width, height))
+    }
+
+    /// The coded (pre-crop, macroblock-aligned) dimensions from an SPS.
+    pub fn coded_dimensions(&self, sps_id: u8) -> Option<(u32, u32)> {
         self.get_sps(sps_id).map(|sps| {
             let width = sps.pic_width_in_mbs * 16;
             let height =
@@ -333,6 +366,61 @@ impl H264ParameterSets {
             (width, height)
         })
     }
+
+    /// The full `h264_reader` SPS, for std-struct conversion and slice parsing.
+    pub fn full_sps(&self, sps_id: u8) -> Option<&SeqParameterSet> {
+        h264_reader::nal::sps::SeqParamSetId::from_u32(sps_id as u32)
+            .ok()
+            .and_then(|id| self.context.sps_by_id(id))
+    }
+
+    /// The full `h264_reader` PPS, for std-struct conversion.
+    pub fn full_pps(&self, pps_id: u8) -> Option<&PicParameterSet> {
+        h264_reader::nal::pps::PicParamSetId::from_u32(pps_id as u32)
+            .ok()
+            .and_then(|id| self.context.pps_by_id(id))
+    }
+
+    /// Parse a slice header against the stored parameter sets.
+    ///
+    /// The NAL must be a coded slice (type 1 or 5) and its PPS/SPS must have
+    /// been parsed already. Returns the header plus the IDs it resolved.
+    pub fn parse_slice_header(&self, nal_data: &[u8]) -> Result<ParsedSliceHeader> {
+        if nal_data.is_empty() {
+            return Err(VulkanError::DecodeError("Empty slice NAL".to_string()).into());
+        }
+        let nal_header = h264_reader::nal::NalHeader::new(nal_data[0])
+            .map_err(|e| VulkanError::DecodeError(format!("Bad NAL header: {e:?}")))?;
+
+        let mut reader = BitReader::new(&nal_data[1..]);
+        let (header, sps, pps) = SliceHeader::from_bits(&self.context, &mut reader, nal_header)
+            .map_err(|e| {
+                VulkanError::DecodeError(format!("Failed to parse slice header: {e:?}"))
+            })?;
+
+        Ok(ParsedSliceHeader {
+            nal_ref_idc: (nal_data[0] >> 5) & 0x3,
+            is_idr: (nal_data[0] & 0x1F) == 5,
+            sps_id: sps.seq_parameter_set_id.id(),
+            pps_id: pps.pic_parameter_set_id.id(),
+            header,
+        })
+    }
+}
+
+/// A parsed slice header plus the identity it resolved against.
+#[derive(Debug)]
+pub struct ParsedSliceHeader {
+    /// The full `h264_reader` slice header.
+    pub header: SliceHeader,
+    /// `nal_ref_idc` from the NAL header (0 = not a reference picture).
+    pub nal_ref_idc: u8,
+    /// Whether the NAL is an IDR slice.
+    pub is_idr: bool,
+    /// The SPS this slice resolves to.
+    pub sps_id: u8,
+    /// The PPS this slice names.
+    pub pps_id: u8,
 }
 
 /// Parse NAL units from Annex B byte stream.
@@ -344,9 +432,9 @@ pub fn parse_annexb(data: &[u8]) -> Vec<&[u8]> {
 
     while i < data.len() {
         // Find start code
-        let start = if i + 4 <= data.len() && &data[i..i + 4] == &[0, 0, 0, 1] {
+        let start = if i + 4 <= data.len() && data[i..i + 4] == [0, 0, 0, 1] {
             i + 4
-        } else if i + 3 <= data.len() && &data[i..i + 3] == &[0, 0, 1] {
+        } else if i + 3 <= data.len() && data[i..i + 3] == [0, 0, 1] {
             i + 3
         } else {
             i += 1;
@@ -356,8 +444,8 @@ pub fn parse_annexb(data: &[u8]) -> Vec<&[u8]> {
         // Find end of NAL (next start code or end of data)
         let mut end = start;
         while end + 3 <= data.len() {
-            if &data[end..end + 3] == &[0, 0, 1]
-                || (end + 4 <= data.len() && &data[end..end + 4] == &[0, 0, 0, 1])
+            if data[end..end + 3] == [0, 0, 1]
+                || (end + 4 <= data.len() && data[end..end + 4] == [0, 0, 0, 1])
             {
                 break;
             }
@@ -377,31 +465,8 @@ pub fn parse_annexb(data: &[u8]) -> Vec<&[u8]> {
     nals
 }
 
-/// Check if a NAL unit is an IDR (keyframe).
-pub fn is_idr(nal_data: &[u8]) -> bool {
-    if nal_data.is_empty() {
-        return false;
-    }
-    (nal_data[0] & 0x1F) == 5
-}
-
-/// Check if a NAL unit is a coded slice (IDR or non-IDR).
-pub fn is_slice(nal_data: &[u8]) -> bool {
-    if nal_data.is_empty() {
-        return false;
-    }
-    let nal_type = nal_data[0] & 0x1F;
-    nal_type == 1 || nal_type == 5
-}
-
-/// Get the NAL unit type.
-pub fn nal_type(nal_data: &[u8]) -> u8 {
-    if nal_data.is_empty() {
-        0
-    } else {
-        nal_data[0] & 0x1F
-    }
-}
+// (The is_idr/is_slice/nal_type helpers that used to live here were unused
+// duplicates of `parallax::codec::annexb` — use that module instead.)
 
 #[cfg(test)]
 mod tests {
@@ -419,20 +484,5 @@ mod tests {
         assert_eq!(nals.len(), 2);
         assert_eq!(nals[0][0] & 0x1F, 7); // SPS
         assert_eq!(nals[1][0] & 0x1F, 8); // PPS
-    }
-
-    #[test]
-    fn test_nal_type() {
-        assert_eq!(nal_type(&[0x67]), 7); // SPS
-        assert_eq!(nal_type(&[0x68]), 8); // PPS
-        assert_eq!(nal_type(&[0x65]), 5); // IDR
-        assert_eq!(nal_type(&[0x41]), 1); // Non-IDR
-    }
-
-    #[test]
-    fn test_is_idr() {
-        assert!(is_idr(&[0x65])); // IDR
-        assert!(!is_idr(&[0x41])); // Non-IDR
-        assert!(!is_idr(&[0x67])); // SPS
     }
 }

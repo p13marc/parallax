@@ -17,6 +17,8 @@ pub enum VulkanError {
     FeatureNotSupported,
     /// Video codec not supported on this device.
     CodecNotSupported(crate::gpu::Codec),
+    /// H.264 profile the decoder does not handle (only Baseline/Main/High).
+    UnsupportedProfile(u32),
     /// Video format not supported.
     FormatNotSupported,
     /// Out of GPU memory.
@@ -49,6 +51,13 @@ impl fmt::Display for VulkanError {
             Self::NoVideoQueue => write!(f, "No video decode/encode queue available"),
             Self::CodecNotSupported(codec) => {
                 write!(f, "Video codec {} not supported on this device", codec)
+            }
+            Self::UnsupportedProfile(idc) => {
+                write!(
+                    f,
+                    "H.264 profile_idc {} not supported (Baseline/Main/High only)",
+                    idc
+                )
             }
             Self::FormatNotSupported => write!(f, "Video format not supported"),
             Self::OutOfMemory => write!(f, "Out of GPU memory"),
@@ -88,6 +97,12 @@ impl From<ash::vk::Result> for VulkanError {
             ash::vk::Result::ERROR_EXTENSION_NOT_PRESENT => Self::ExtensionNotSupported,
             ash::vk::Result::ERROR_FEATURE_NOT_PRESENT => Self::FeatureNotSupported,
             ash::vk::Result::ERROR_FORMAT_NOT_SUPPORTED => Self::FormatNotSupported,
+            ash::vk::Result::ERROR_VIDEO_PROFILE_OPERATION_NOT_SUPPORTED_KHR
+            | ash::vk::Result::ERROR_VIDEO_PROFILE_FORMAT_NOT_SUPPORTED_KHR
+            | ash::vk::Result::ERROR_VIDEO_PROFILE_CODEC_NOT_SUPPORTED_KHR
+            | ash::vk::Result::ERROR_VIDEO_PICTURE_LAYOUT_NOT_SUPPORTED_KHR => {
+                Self::VideoSessionError(format!("driver rejected the video profile: {:?}", result))
+            }
             _ => Self::Other(format!("Vulkan error: {:?}", result)),
         }
     }

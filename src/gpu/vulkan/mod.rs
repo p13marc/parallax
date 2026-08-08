@@ -23,66 +23,61 @@ mod decode_commands;
 mod dpb;
 mod error;
 mod h264_parser;
+mod h264_refs;
+mod h264_std;
 mod memory;
 mod session;
 
 pub use context::VulkanContext;
 pub use decode::VulkanH264Decoder;
-pub use decode_commands::{DecodeCommandRecorder, DecodeOperation, H264DecodeParams};
+pub use decode_commands::{DecodeCommandRecorder, FrameDecodeInfo, RefSlotDesc};
 pub use dpb::{Dpb, DpbReference, DpbSlot};
 pub use error::VulkanError;
-pub use h264_parser::{H264ParameterSets, ParsedPps, ParsedSps, parse_annexb};
+pub use h264_parser::{H264ParameterSets, ParsedPps, ParsedSliceHeader, ParsedSps, parse_annexb};
+pub use h264_refs::{
+    CurrentPicture, FramePoc, PictureId, PocParams, PocState, RefPicture, RefTracker,
+};
 pub use memory::VulkanGpuMemory;
-pub use session::{SessionCapabilities, VideoSession, VideoSessionConfig, VideoSessionParameters};
+pub use session::{
+    SessionCapabilities, VideoProfileData, VideoSession, VideoSessionConfig, VideoSessionParameters,
+};
 
 use ash::vk;
 
 /// Vulkan Video extension names.
 pub mod extensions {
     /// Core video queue extension.
-    pub const VIDEO_QUEUE: &std::ffi::CStr =
-        unsafe { std::ffi::CStr::from_bytes_with_nul_unchecked(b"VK_KHR_video_queue\0") };
+    pub const VIDEO_QUEUE: &std::ffi::CStr = c"VK_KHR_video_queue";
 
     /// Video decode queue extension.
-    pub const VIDEO_DECODE_QUEUE: &std::ffi::CStr =
-        unsafe { std::ffi::CStr::from_bytes_with_nul_unchecked(b"VK_KHR_video_decode_queue\0") };
+    pub const VIDEO_DECODE_QUEUE: &std::ffi::CStr = c"VK_KHR_video_decode_queue";
 
     /// Video encode queue extension.
-    pub const VIDEO_ENCODE_QUEUE: &std::ffi::CStr =
-        unsafe { std::ffi::CStr::from_bytes_with_nul_unchecked(b"VK_KHR_video_encode_queue\0") };
+    pub const VIDEO_ENCODE_QUEUE: &std::ffi::CStr = c"VK_KHR_video_encode_queue";
 
     /// H.264 decode extension.
-    pub const VIDEO_DECODE_H264: &std::ffi::CStr =
-        unsafe { std::ffi::CStr::from_bytes_with_nul_unchecked(b"VK_KHR_video_decode_h264\0") };
+    pub const VIDEO_DECODE_H264: &std::ffi::CStr = c"VK_KHR_video_decode_h264";
 
     /// H.265 decode extension.
-    pub const VIDEO_DECODE_H265: &std::ffi::CStr =
-        unsafe { std::ffi::CStr::from_bytes_with_nul_unchecked(b"VK_KHR_video_decode_h265\0") };
+    pub const VIDEO_DECODE_H265: &std::ffi::CStr = c"VK_KHR_video_decode_h265";
 
     /// AV1 decode extension.
-    pub const VIDEO_DECODE_AV1: &std::ffi::CStr =
-        unsafe { std::ffi::CStr::from_bytes_with_nul_unchecked(b"VK_KHR_video_decode_av1\0") };
+    pub const VIDEO_DECODE_AV1: &std::ffi::CStr = c"VK_KHR_video_decode_av1";
 
     /// H.264 encode extension.
-    pub const VIDEO_ENCODE_H264: &std::ffi::CStr =
-        unsafe { std::ffi::CStr::from_bytes_with_nul_unchecked(b"VK_KHR_video_encode_h264\0") };
+    pub const VIDEO_ENCODE_H264: &std::ffi::CStr = c"VK_KHR_video_encode_h264";
 
     /// H.265 encode extension.
-    pub const VIDEO_ENCODE_H265: &std::ffi::CStr =
-        unsafe { std::ffi::CStr::from_bytes_with_nul_unchecked(b"VK_KHR_video_encode_h265\0") };
+    pub const VIDEO_ENCODE_H265: &std::ffi::CStr = c"VK_KHR_video_encode_h265";
 
     /// External memory extension.
-    pub const EXTERNAL_MEMORY: &std::ffi::CStr =
-        unsafe { std::ffi::CStr::from_bytes_with_nul_unchecked(b"VK_KHR_external_memory\0") };
+    pub const EXTERNAL_MEMORY: &std::ffi::CStr = c"VK_KHR_external_memory";
 
     /// External memory FD extension.
-    pub const EXTERNAL_MEMORY_FD: &std::ffi::CStr =
-        unsafe { std::ffi::CStr::from_bytes_with_nul_unchecked(b"VK_KHR_external_memory_fd\0") };
+    pub const EXTERNAL_MEMORY_FD: &std::ffi::CStr = c"VK_KHR_external_memory_fd";
 
     /// DMA-BUF external memory extension.
-    pub const EXTERNAL_MEMORY_DMABUF: &std::ffi::CStr = unsafe {
-        std::ffi::CStr::from_bytes_with_nul_unchecked(b"VK_EXT_external_memory_dma_buf\0")
-    };
+    pub const EXTERNAL_MEMORY_DMABUF: &std::ffi::CStr = c"VK_EXT_external_memory_dma_buf";
 }
 
 /// Convert Vulkan result to our error type.

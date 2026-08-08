@@ -72,6 +72,8 @@ pub struct VideoSession {
     max_active_refs: u32,
     /// Session capabilities (queried from driver).
     capabilities: SessionCapabilities,
+    /// Owned copy of the profile chain, for video-usage resource creation.
+    profile_data: VideoProfileData,
 }
 
 /// Session parameters (codec-specific: SPS/PPS for H.264, etc.)
@@ -102,6 +104,56 @@ pub struct SessionCapabilities {
     pub std_header_version: vk::ExtensionProperties,
     /// Decode capability flags.
     pub decode_caps: vk::VideoDecodeCapabilityFlagsKHR,
+    /// Required alignment of a bitstream buffer offset.
+    pub min_bitstream_buffer_offset_alignment: u64,
+    /// Required alignment of a bitstream buffer range size.
+    pub min_bitstream_buffer_size_alignment: u64,
+}
+
+impl SessionCapabilities {
+    /// Whether the decode output picture must coincide with the DPB slot
+    /// image (Intel) rather than being a distinct image (AMD/NVIDIA).
+    pub fn output_coincides_with_dpb(&self) -> bool {
+        self.decode_caps
+            .contains(vk::VideoDecodeCapabilityFlagsKHR::DPB_AND_OUTPUT_COINCIDE)
+    }
+}
+
+/// The owned pieces of a `VkVideoProfileInfoKHR` chain, so video-usage
+/// resources (bitstream buffers, DPB images) can rebuild the profile list
+/// their create-infos are required to carry.
+#[derive(Debug, Clone, Copy)]
+pub struct VideoProfileData {
+    codec_op: vk::VideoCodecOperationFlagsKHR,
+    chroma_subsampling: vk::VideoChromaSubsamplingFlagsKHR,
+    luma_bit_depth: vk::VideoComponentBitDepthFlagsKHR,
+    chroma_bit_depth: vk::VideoComponentBitDepthFlagsKHR,
+    h264_profile_idc: vk::native::StdVideoH264ProfileIdc,
+}
+
+impl VideoProfileData {
+    /// Build the chain and hand a `VideoProfileListInfoKHR` naming it to `f`.
+    ///
+    /// The chain lives on this stack frame — the callback shape exists because
+    /// the ash structs borrow each other and cannot be returned.
+    pub fn with_profile_list<T>(&self, f: impl FnOnce(&vk::VideoProfileListInfoKHR<'_>) -> T) -> T {
+        let mut h264_profile_info = vk::VideoDecodeH264ProfileInfoKHR::default()
+            .std_profile_idc(self.h264_profile_idc)
+            .picture_layout(vk::VideoDecodeH264PictureLayoutFlagsKHR::PROGRESSIVE);
+
+        let mut profile = vk::VideoProfileInfoKHR::default()
+            .video_codec_operation(self.codec_op)
+            .chroma_subsampling(self.chroma_subsampling)
+            .luma_bit_depth(self.luma_bit_depth)
+            .chroma_bit_depth(self.chroma_bit_depth);
+        if self.codec_op == vk::VideoCodecOperationFlagsKHR::DECODE_H264 {
+            profile = profile.push_next(&mut h264_profile_info);
+        }
+
+        let profiles = [profile];
+        let list = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
+        f(&list)
+    }
 }
 
 /// Configuration for creating a video session.
@@ -172,9 +224,10 @@ impl VideoSession {
             height: config.max_height,
         };
 
-        // Build video profile
+        // Build video profile — the H.264 profile idc comes from the SPS, not
+        // a hardcoded HIGH.
         let mut h264_profile_info = vk::VideoDecodeH264ProfileInfoKHR::default()
-            .std_profile_idc(vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH)
+            .std_profile_idc(super::h264_std::std_profile_idc(config.profile.profile)?)
             .picture_layout(vk::VideoDecodeH264PictureLayoutFlagsKHR::PROGRESSIVE);
 
         let (chroma_subsampling, luma_depth, chroma_depth) =
@@ -187,6 +240,14 @@ impl VideoSession {
             Codec::Vp9 => {
                 return Err(VulkanError::CodecNotSupported(Codec::Vp9).into());
             }
+        };
+
+        let profile_data = VideoProfileData {
+            codec_op,
+            chroma_subsampling,
+            luma_bit_depth: luma_depth,
+            chroma_bit_depth: chroma_depth,
+            h264_profile_idc: super::h264_std::std_profile_idc(config.profile.profile)?,
         };
 
         let mut video_profile_info = vk::VideoProfileInfoKHR::default()
@@ -241,6 +302,7 @@ impl VideoSession {
             max_dpb_slots,
             max_active_refs,
             capabilities,
+            profile_data,
         })
     }
 
@@ -283,7 +345,7 @@ impl VideoSession {
 
         // Build profile info for capability query
         let mut h264_profile_info = vk::VideoDecodeH264ProfileInfoKHR::default()
-            .std_profile_idc(vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH)
+            .std_profile_idc(super::h264_std::std_profile_idc(config.profile.profile)?)
             .picture_layout(vk::VideoDecodeH264PictureLayoutFlagsKHR::PROGRESSIVE);
 
         let (chroma, luma_depth, chroma_depth) = Self::get_format_flags(&config.profile);
@@ -323,13 +385,23 @@ impl VideoSession {
             return Err(VulkanError::from(result).into());
         }
 
-        Ok(SessionCapabilities {
+        // Copy the scalar fields out before touching `decode_caps` again —
+        // the push_next borrow of `decode_caps` ends with this statement.
+        let min_offset_alignment = video_caps.min_bitstream_buffer_offset_alignment;
+        let min_size_alignment = video_caps.min_bitstream_buffer_size_alignment;
+        let caps = SessionCapabilities {
             min_coded_extent: video_caps.min_coded_extent,
             max_coded_extent: video_caps.max_coded_extent,
             max_dpb_slots: video_caps.max_dpb_slots,
             max_active_reference_pictures: video_caps.max_active_reference_pictures,
             std_header_version: video_caps.std_header_version,
+            decode_caps: vk::VideoDecodeCapabilityFlagsKHR::empty(),
+            min_bitstream_buffer_offset_alignment: min_offset_alignment,
+            min_bitstream_buffer_size_alignment: min_size_alignment,
+        };
+        Ok(SessionCapabilities {
             decode_caps: decode_caps.flags,
+            ..caps
         })
     }
 
@@ -488,6 +560,11 @@ impl VideoSession {
         &self.capabilities
     }
 
+    /// The owned profile chain, for creating video-usage resources.
+    pub fn profile_data(&self) -> VideoProfileData {
+        self.profile_data
+    }
+
     /// Get the video queue function pointers.
     pub fn video_queue_fp(&self) -> &ash::khr::video_queue::DeviceFn {
         &self.video_queue_fp
@@ -553,6 +630,55 @@ impl VideoSessionParameters {
     /// Get the parameters handle.
     pub fn handle(&self) -> vk::VideoSessionParametersKHR {
         self.params
+    }
+
+    /// Create H.264 session parameters carrying the given std SPS/PPS sets.
+    ///
+    /// The driver copies the arrays at creation, so the slices only need to
+    /// outlive this call. On an SPS/PPS change the caller recreates the whole
+    /// object — decode here is synchronous per frame, so nothing is in flight
+    /// and the `update_sequence_count` protocol buys nothing but complexity.
+    pub fn new_h264(
+        session: &VideoSession,
+        std_sps: &[vk::native::StdVideoH264SequenceParameterSet],
+        std_pps: &[vk::native::StdVideoH264PictureParameterSet],
+    ) -> Result<Self> {
+        let device = session.device.clone();
+        let video_queue_fp = session.video_queue_fp.clone();
+
+        let add_info = vk::VideoDecodeH264SessionParametersAddInfoKHR::default()
+            .std_sp_ss(std_sps)
+            .std_pp_ss(std_pps);
+
+        let mut h264_create_info = vk::VideoDecodeH264SessionParametersCreateInfoKHR::default()
+            .max_std_sps_count(std_sps.len().max(1) as u32)
+            .max_std_pps_count(std_pps.len().max(1) as u32)
+            .parameters_add_info(&add_info);
+
+        let create_info = vk::VideoSessionParametersCreateInfoKHR::default()
+            .video_session(session.session)
+            .push_next(&mut h264_create_info);
+
+        let mut params = vk::VideoSessionParametersKHR::null();
+        let result = unsafe {
+            (video_queue_fp.create_video_session_parameters_khr)(
+                device.handle(),
+                &create_info,
+                ptr::null(),
+                &mut params,
+            )
+        };
+
+        if result != vk::Result::SUCCESS {
+            return Err(VulkanError::from(result).into());
+        }
+
+        Ok(Self {
+            device,
+            video_queue_fp,
+            params,
+            session: session.session,
+        })
     }
 }
 

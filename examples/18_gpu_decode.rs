@@ -119,8 +119,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create H.264 decoder if supported
     if ctx.supports_decode(Codec::H264) {
-        println!("Creating H.264 decoder (1920x1080)...");
-        let _decoder = VulkanH264Decoder::new(&ctx, 1920, 1080)?;
+        println!("Creating H.264 decoder (geometry comes from the stream's SPS)...");
+        let ctx = std::sync::Arc::new(ctx);
+        let _decoder = VulkanH264Decoder::new(std::sync::Arc::clone(&ctx))?;
         println!("H.264 decoder created successfully!");
 
         // Demonstrate VideoSession creation
@@ -158,7 +159,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Create DPB (Decoded Picture Buffer)
                 println!();
                 println!("=== DPB Management ===");
-                match Dpb::new(&session, None) {
+                match Dpb::new(&ctx, &session, None) {
                     Ok(mut dpb) => {
                         println!("DPB created with {} slots", dpb.max_slots());
                         println!("  Format: {:?}", dpb.format());

@@ -17,8 +17,8 @@
 //! use parallax::gpu::{VulkanContext, VulkanH264Decoder};
 //! use parallax::elements::codec::HwDecoderElement;
 //!
-//! let ctx = VulkanContext::new()?;
-//! let decoder = VulkanH264Decoder::new(&ctx, 1920, 1080)?;
+//! let ctx = std::sync::Arc::new(VulkanContext::new()?);
+//! let decoder = VulkanH264Decoder::new(ctx)?;
 //! let element = HwDecoderElement::new(decoder);
 //!
 //! pipeline.add_node("hw_decoder", DynAsyncElement::new_box(TransformAdapter::new(element)));
@@ -51,9 +51,9 @@ use std::collections::VecDeque;
 /// # Usage
 ///
 /// ```rust,ignore
-/// // Create Vulkan context and decoder
-/// let ctx = VulkanContext::new()?;
-/// let decoder = VulkanH264Decoder::new(&ctx, 1920, 1080)?;
+/// // Create Vulkan context and decoder (geometry comes from the SPS)
+/// let ctx = std::sync::Arc::new(VulkanContext::new()?);
+/// let decoder = VulkanH264Decoder::new(ctx)?;
 ///
 /// // Wrap in HwDecoderElement
 /// let element = HwDecoderElement::new(decoder);
