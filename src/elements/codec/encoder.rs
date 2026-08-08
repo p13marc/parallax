@@ -24,11 +24,12 @@ use super::traits::VideoEncoder;
 
 /// Configuration for the rav1e AV1 encoder.
 #[derive(Clone, Debug)]
+///
+/// Note there is **no width or height**: geometry travels in-band, in each
+/// buffer's [`Metadata`](crate::metadata::Metadata), and the encoder builds its
+/// rav1e context from the first frame it sees (#38). A default resolution here
+/// would be a claim about data that has not arrived yet.
 pub struct Rav1eConfig {
-    /// Video width.
-    pub width: usize,
-    /// Video height.
-    pub height: usize,
     /// Speed preset (0-10, higher = faster but lower quality).
     pub speed: usize,
     /// Quantizer (0-255, lower = higher quality).
@@ -48,8 +49,6 @@ pub struct Rav1eConfig {
 impl Default for Rav1eConfig {
     fn default() -> Self {
         Self {
-            width: 1920,
-            height: 1080,
             speed: 6,
             quantizer: 100,
             bitrate: 0,
@@ -62,25 +61,6 @@ impl Default for Rav1eConfig {
 }
 
 impl Rav1eConfig {
-    /// Set video dimensions.
-    pub fn dimensions(mut self, width: usize, height: usize) -> Self {
-        self.width = width;
-        self.height = height;
-        self
-    }
-
-    /// Set width.
-    pub fn width(mut self, width: usize) -> Self {
-        self.width = width;
-        self
-    }
-
-    /// Set height.
-    pub fn height(mut self, height: usize) -> Self {
-        self.height = height;
-        self
-    }
-
     /// Set speed preset (0-10).
     pub fn speed(mut self, speed: usize) -> Self {
         self.speed = speed.min(10);
@@ -144,7 +124,13 @@ impl Rav1eConfig {
 /// pipeline.add_node("av1enc", DynAsyncElement::new_box(ElementAdapter::new(encoder)));
 /// ```
 pub struct Rav1eEncoder {
-    context: rav1e::Context<u8>,
+    /// Built on the first frame, from that frame's dimensions.
+    ///
+    /// rav1e fixes the resolution when the context is created, so a
+    /// mid-stream resize means a new context — see [`Self::ensure_context`].
+    context: Option<rav1e::Context<u8>>,
+    /// The geometry `context` was built for.
+    dims: Option<(usize, usize)>,
     config: Rav1eConfig,
     frame_count: u64,
     /// Arena for output buffer allocation.
@@ -157,14 +143,13 @@ pub struct Rav1eEncoder {
 
 impl Rav1eEncoder {
     /// Create a new rav1e encoder.
+    ///
+    /// The rav1e context itself is built from the first frame, because that is
+    /// the first point at which the resolution is actually known.
     pub fn new(config: Rav1eConfig) -> Result<Self> {
-        let enc_config = Self::build_config(&config)?;
-        let context = enc_config
-            .new_context()
-            .map_err(|e| Error::Config(format!("Failed to create rav1e context: {:?}", e)))?;
-
         Ok(Self {
-            context,
+            context: None,
+            dims: None,
             config,
             frame_count: 0,
             arena: None,
@@ -173,11 +158,11 @@ impl Rav1eEncoder {
         })
     }
 
-    fn build_config(config: &Rav1eConfig) -> Result<rav1e::Config> {
+    fn build_config(config: &Rav1eConfig, width: usize, height: usize) -> Result<rav1e::Config> {
         let mut enc = rav1e::EncoderConfig::default();
 
-        enc.width = config.width;
-        enc.height = config.height;
+        enc.width = width;
+        enc.height = height;
         enc.speed_settings = rav1e::config::SpeedSettings::from_preset(config.speed as u8);
         enc.quantizer = config.quantizer;
         enc.bitrate = config.bitrate as i32;
@@ -190,6 +175,41 @@ impl Rav1eEncoder {
         Ok(cfg)
     }
 
+    /// Ensure a context exists and matches `width`x`height`.
+    ///
+    /// On a resize, the old context is drained first so its lookahead is not
+    /// silently lost — those packets join `pending_flush` and come out of
+    /// `Element::flush`.
+    fn ensure_context(&mut self, width: usize, height: usize) -> Result<()> {
+        if self.dims == Some((width, height)) && self.context.is_some() {
+            return Ok(());
+        }
+
+        if self.context.is_some() {
+            tracing::debug!(
+                "rav1e input resized {:?} -> {width}x{height}, rebuilding context",
+                self.dims
+            );
+            let tail = self.flush_internal()?;
+            self.pending_flush.extend(tail);
+        }
+
+        let context = Self::build_config(&self.config, width, height)?
+            .new_context()
+            .map_err(|e| Error::Config(format!("Failed to create rav1e context: {:?}", e)))?;
+        self.context = Some(context);
+        self.dims = Some((width, height));
+        self.flushed = false;
+        Ok(())
+    }
+
+    /// The context, or an error naming why there isn't one.
+    fn context_mut(&mut self) -> Result<&mut rav1e::Context<u8>> {
+        self.context
+            .as_mut()
+            .ok_or_else(|| Error::Element("Rav1eEncoder: no frame has been encoded yet".into()))
+    }
+
     /// Get the configuration.
     pub fn config(&self) -> &Rav1eConfig {
         &self.config
@@ -200,14 +220,19 @@ impl Rav1eEncoder {
         self.frame_count
     }
 
-    /// Encode a frame from raw I420 data.
-    fn encode_frame(&mut self, input: &[u8], _pts: u64) -> Result<Option<Vec<u8>>> {
-        // Create rav1e frame
-        let mut frame = self.context.new_frame();
+    /// Encode a frame from raw I420 data at the given geometry.
+    fn encode_frame(
+        &mut self,
+        input: &[u8],
+        width: usize,
+        height: usize,
+        _pts: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        self.ensure_context(width, height)?;
 
-        // Calculate plane sizes
-        let width = self.config.width;
-        let height = self.config.height;
+        // Create rav1e frame
+        let mut frame = self.context_mut()?.new_frame();
+
         let y_size = width * height;
         let uv_size = (width / 2) * (height / 2);
 
@@ -245,12 +270,12 @@ impl Rav1eEncoder {
         }
 
         // Send frame to encoder
-        self.context
+        self.context_mut()?
             .send_frame(frame)
             .map_err(|e| Error::InvalidSegment(format!("rav1e send_frame failed: {:?}", e)))?;
 
         // Try to receive encoded packet
-        match self.context.receive_packet() {
+        match self.context_mut()?.receive_packet() {
             Ok(packet) => {
                 self.frame_count += 1;
                 Ok(Some(packet.data))
@@ -269,11 +294,15 @@ impl Rav1eEncoder {
 
     /// Flush remaining frames from the encoder (internal implementation).
     fn flush_internal(&mut self) -> Result<Vec<Vec<u8>>> {
-        self.context.flush();
+        // No context means no frame ever arrived, so there is nothing buffered.
+        let Some(context) = self.context.as_mut() else {
+            return Ok(Vec::new());
+        };
+        context.flush();
 
         let mut packets = Vec::new();
         loop {
-            match self.context.receive_packet() {
+            match context.receive_packet() {
                 Ok(packet) => {
                     self.frame_count += 1;
                     packets.push(packet.data);
@@ -298,7 +327,19 @@ impl Element for Rav1eEncoder {
         let input = buffer.as_bytes();
         let pts = buffer.metadata().pts.nanos();
 
-        match self.encode_frame(input, pts)? {
+        // Geometry travels in-band. There is no constructor size to fall back
+        // on, deliberately: a stale one would silently encode the wrong
+        // rectangle the moment a scaler appeared upstream (#38).
+        let (width, height) = buffer.metadata().video_dims().ok_or_else(|| {
+            Error::Element(
+                "Rav1eEncoder: buffer carries no video dimensions. Geometry travels \
+                 in-band — set Metadata::set_video_dims() upstream, or insert an element \
+                 that does (VideoScale, VideoConvert, a device source)."
+                    .into(),
+            )
+        })?;
+
+        match self.encode_frame(input, width as usize, height as usize, pts)? {
             Some(packet) => {
                 // Initialize arena on first use
                 if self.arena.is_none() {
@@ -387,17 +428,16 @@ impl VideoEncoder for Rav1eEncoder {
             )));
         }
 
-        // Validate dimensions match config
-        if frame.width as usize != self.config.width || frame.height as usize != self.config.height
-        {
-            return Err(Error::InvalidSegment(format!(
-                "Frame dimensions {}x{} don't match encoder config {}x{}",
-                frame.width, frame.height, self.config.width, self.config.height
-            )));
-        }
+        // No config dimensions to disagree with: the frame is authoritative,
+        // and ensure_context rebuilds if it differs from the last one.
 
         // Encode the frame
-        match self.encode_frame(&frame.data, frame.pts as u64)? {
+        match self.encode_frame(
+            &frame.data,
+            frame.width as usize,
+            frame.height as usize,
+            frame.pts as u64,
+        )? {
             Some(packet) => Ok(vec![packet]),
             None => Ok(vec![]), // Encoder buffering
         }
@@ -420,17 +460,50 @@ mod tests {
 
     #[test]
     fn test_rav1e_config_builder() {
-        let config = Rav1eConfig::default()
-            .dimensions(1280, 720)
-            .speed(8)
-            .quantizer(150)
-            .framerate(60);
+        let config = Rav1eConfig::default().speed(8).quantizer(150).framerate(60);
 
-        assert_eq!(config.width, 1280);
-        assert_eq!(config.height, 720);
         assert_eq!(config.speed, 8);
         assert_eq!(config.quantizer, 150);
         assert_eq!(config.timebase_den, 60);
+    }
+
+    /// #38: the encoder takes its geometry from the frame, and says so when
+    /// the frame does not carry any.
+    #[test]
+    fn geometry_comes_from_the_buffer_not_the_config() {
+        use crate::buffer::MemoryHandle;
+        use crate::memory::SharedArena;
+        use crate::metadata::Metadata;
+
+        const W: u32 = 64;
+        const H: u32 = 64;
+        let frame_size = (W * H) as usize * 3 / 2;
+
+        let mut encoder = Rav1eEncoder::new(Rav1eConfig::default().speed(10)).unwrap();
+
+        // A frame with no declared geometry is an error, not a guess.
+        let arena = SharedArena::new(frame_size, 4).unwrap();
+        let bare = Buffer::new(
+            MemoryHandle::with_len(arena.acquire().unwrap(), frame_size),
+            Metadata::from_sequence(0),
+        );
+        let err = encoder.process(bare).unwrap_err();
+        assert!(
+            err.to_string().contains("no video dimensions"),
+            "expected a geometry complaint, got: {err}"
+        );
+
+        // With geometry in-band, it builds its context from the frame.
+        let mut metadata = Metadata::from_sequence(1);
+        metadata.set_video_dims(W, H, crate::format::PixelFormat::I420);
+        let described = Buffer::new(
+            MemoryHandle::with_len(arena.acquire().unwrap(), frame_size),
+            metadata,
+        );
+        encoder
+            .process(described)
+            .expect("encode with in-band dims");
+        assert_eq!(encoder.dims, Some((W as usize, H as usize)));
     }
 
     #[test]

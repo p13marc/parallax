@@ -409,24 +409,42 @@ mod av1_encode_tests {
 
     #[test]
     fn test_rav1e_encoder_creation() {
-        let config = Rav1eConfig::default()
-            .dimensions(64, 64)
-            .speed(10)
-            .quantizer(100);
+        let config = Rav1eConfig::default().speed(10).quantizer(100);
 
         let encoder = Rav1eEncoder::new(config);
         assert!(encoder.is_ok(), "Should create encoder");
     }
 
+    /// #38: zero dimensions are now rejected when the *frame* declares them,
+    /// because that is the only place they exist. The config carries none.
     #[test]
     fn test_rav1e_encoder_invalid_dimensions() {
-        let config = Rav1eConfig::default()
-            .dimensions(0, 0)
-            .speed(10)
-            .quantizer(100);
+        let config = Rav1eConfig::default().speed(10).quantizer(100);
+        let mut encoder = Rav1eEncoder::new(config).expect("Should create encoder");
 
-        let encoder = Rav1eEncoder::new(config);
-        assert!(encoder.is_err(), "Should fail with zero dimensions");
+        let frame_data = create_yuv420_frame(64, 64);
+        let input = create_video_buffer(&frame_data, 0, 0, parallax::format::PixelFormat::I420);
+
+        assert!(
+            encoder.process(input).is_err(),
+            "Should fail with zero dimensions"
+        );
+    }
+
+    /// A frame that declares no geometry is an error, not a guess.
+    #[test]
+    fn test_rav1e_requires_in_band_geometry() {
+        let config = Rav1eConfig::default().speed(10).quantizer(100);
+        let mut encoder = Rav1eEncoder::new(config).expect("Should create encoder");
+
+        let frame_data = create_yuv420_frame(64, 64);
+        let err = encoder
+            .process(create_test_buffer(&frame_data))
+            .expect_err("a frame without dimensions must be rejected");
+        assert!(
+            err.to_string().contains("no video dimensions"),
+            "expected a geometry complaint, got: {err}"
+        );
     }
 
     #[test]
@@ -434,16 +452,18 @@ mod av1_encode_tests {
         let width = 64;
         let height = 64;
 
-        let config = Rav1eConfig::default()
-            .dimensions(width, height)
-            .speed(10)
-            .quantizer(100);
+        let config = Rav1eConfig::default().speed(10).quantizer(100);
 
         let mut encoder = Rav1eEncoder::new(config).expect("Should create encoder");
 
-        // Create a YUV420 frame
+        // Create a YUV420 frame that describes its own geometry.
         let frame_data = create_yuv420_frame(width, height);
-        let input = create_test_buffer(&frame_data);
+        let input = create_video_buffer(
+            &frame_data,
+            width as u32,
+            height as u32,
+            parallax::format::PixelFormat::I420,
+        );
 
         // First frame may not produce immediate output (encoder buffering)
         let result = encoder.process(input);

@@ -35,6 +35,13 @@ fn i420_frame(arena: &SharedArena, seq: u64) -> Buffer {
     }
     let mut metadata = Metadata::from_sequence(seq);
     metadata.pts = parallax::clock::ClockTime::from_millis(seq * 33);
+    // Geometry travels in-band: the encoder takes its size from the frame,
+    // not from a number handed to a constructor at startup.
+    metadata.set_video_dims(
+        WIDTH as u32,
+        HEIGHT as u32,
+        parallax::format::PixelFormat::I420,
+    );
     Buffer::new(MemoryHandle::with_len(slot, FRAME_SIZE), metadata)
 }
 
@@ -46,10 +53,7 @@ async fn main() -> Result<()> {
     let output_path = dir.path().join("output.av1");
 
     // AV1 encoder: fastest speed preset, low quality for demo speed
-    let config = Rav1eConfig::default()
-        .dimensions(WIDTH, HEIGHT)
-        .speed(10)
-        .quantizer(200);
+    let config = Rav1eConfig::default().speed(10).quantizer(200);
     let encoder = Rav1eEncoder::new(config)?;
 
     let src = AppSrc::new();

@@ -66,10 +66,14 @@ pub mod app;
 pub mod codec;
 pub mod demux;
 
+// Also compiled for `v4l2-m2m`: the hardware encoder reports `DeviceError`
+// for a busy/missing/forbidden node, and that enum lives here.
 #[cfg(any(
     feature = "pipewire",
     feature = "libcamera",
+    feature = "screen-capture",
     feature = "v4l2",
+    feature = "v4l2-m2m",
     feature = "alsa"
 ))]
 pub mod device;

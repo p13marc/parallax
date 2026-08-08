@@ -59,7 +59,8 @@ pub enum Error {
         feature = "libcamera",
         feature = "screen-capture",
         feature = "v4l2",
-        feature = "alsa"
+        feature = "alsa",
+        feature = "v4l2-m2m"
     ))]
     #[error("device error: {0}")]
     Device(#[from] crate::elements::device::DeviceError),

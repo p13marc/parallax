@@ -93,6 +93,10 @@ pub struct HwEncoderElement<E: HwVideoEncoder> {
 impl<E: HwVideoEncoder> HwEncoderElement<E> {
     /// Create a new hardware encoder element wrapper.
     ///
+    /// Takes **no dimensions**: geometry travels in-band, in each buffer's
+    /// [`Metadata`](crate::metadata::Metadata). A buffer that declares none is
+    /// an error, not an invitation to reuse the last frame's size (#38).
+    ///
     /// # Arguments
     ///
     /// * `encoder` - The hardware video encoder to wrap
@@ -110,24 +114,6 @@ impl<E: HwVideoEncoder> HwEncoderElement<E> {
             width: 0,
             height: 0,
             format: GpuPixelFormat::Nv12,
-        }
-    }
-
-    /// Create with known dimensions (allows pre-allocation).
-    pub fn with_dimensions(encoder: E, width: u32, height: u32, format: GpuPixelFormat) -> Self {
-        Self {
-            encoder,
-            pending_packets: VecDeque::new(),
-            flushing: false,
-            flushed: false,
-            frames_in: 0,
-            packets_out: 0,
-            arena: None,
-            keyframe_requests: super::KeyframeHandle::new(),
-            stats: crate::control::EncoderStatsHandle::default(),
-            width,
-            height,
-            format,
         }
     }
 
@@ -188,15 +174,27 @@ impl<E: HwVideoEncoder> HwEncoderElement<E> {
     /// - Upload CPU data to GPU memory
     /// - Or import DMA-BUF for zero-copy
     fn buffer_to_frame(&mut self, buffer: &Buffer) -> Result<GpuFrame> {
-        // Geometry travels in-band; fall back to the configured size only when
-        // the buffer says nothing.
-        let (width, height) = buffer
-            .metadata()
-            .video_dims()
-            .unwrap_or((self.width, self.height));
+        // Geometry travels in-band. Reusing the previous frame's size when a
+        // buffer declares none is the silent-corruption mode #38 removes: put
+        // a scaler upstream and the encoder would quietly encode the wrong
+        // rectangle.
+        let (width, height) = buffer.metadata().video_dims().ok_or_else(|| {
+            Error::Element(
+                "HwEncoderElement: buffer carries no video dimensions. Geometry travels \
+                 in-band — set Metadata::set_video_dims() upstream, or insert an element \
+                 that does (VideoScale, VideoConvert, a device source)."
+                    .into(),
+            )
+        })?;
 
-        // Update dimensions on first frame
-        if self.width == 0 {
+        if (self.width, self.height) != (width, height) {
+            if self.width != 0 {
+                tracing::debug!(
+                    "hw encoder input resized: {}x{} -> {width}x{height}",
+                    self.width,
+                    self.height
+                );
+            }
             self.width = width;
             self.height = height;
         }

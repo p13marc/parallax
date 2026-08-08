@@ -141,8 +141,8 @@ Codec traits: `VideoEncoder`/`VideoDecoder` and `AudioEncoder`/`AudioDecoder` (a
 | Codec | Types | Feature | Notes |
 |-------|-------|---------|-------|
 | H.264 | `H264Encoder`, `H264Decoder` (impl `Element` directly) | `h264` | OpenH264 (BSD-2); needs a C++ compiler. Live bitrate/GOP/QP via `EncoderControl`; resolution follows the buffer's metadata. Knobs: `rate_control`, `skip_frames`, `max_slice_len`, `profile`, `complexity`, `usage_type` |
-| H.264 hardware encode | `V4l2M2mH264Encoder` (impl `VideoEncoder`; wrap: `EncoderElement::new(enc, VideoFormat)`) | `v4l2-m2m` | V4L2 M2M stateful encoder (RPi, i.MX, Rockchip…); locate with `find_m2m_encoder(b"H264")`; building needs libclang + kernel headers; VAAPI backend planned |
-| AV1 encode | `Rav1eEncoder` (impl `VideoEncoder`; wrap: `EncoderElement::new(enc, VideoFormat)`) | `av1-encode` | rav1e, pure Rust; install nasm for SIMD |
+| H.264 hardware encode | `V4l2M2mH264Encoder` (impl `VideoEncoder`; wrap: `EncoderElement::new(enc)`) | `v4l2-m2m` | V4L2 M2M stateful encoder (RPi, i.MX, Rockchip…); locate with `find_m2m_encoder(b"H264")`; building needs libclang + kernel headers; VAAPI backend planned |
+| AV1 encode | `Rav1eEncoder` (impl `VideoEncoder`; wrap: `EncoderElement::new(enc)`) | `av1-encode` | rav1e, pure Rust; install nasm for SIMD |
 | AV1 decode | `Dav1dDecoder` (impl `Element`) | `av1-decode` | libdav1d system library |
 | FLAC/MP3/AAC/Vorbis decode | `SymphoniaDecoder` (impl `Element`) | `audio-flac`/`-mp3`/`-aac`/`-vorbis` | Symphonia, pure Rust |
 | Opus | `OpusEncoder::new(rate, ch, bitrate, OpusApplication)`, `OpusDecoder` (impl audio traits) | `opus` | libopus; 48 kHz frame sizes 120–2880 samples |

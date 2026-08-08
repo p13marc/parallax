@@ -62,9 +62,14 @@ pub struct EncoderElement<E: VideoEncoder> {
     flushing: bool,
     /// Whether flush is complete.
     flushed: bool,
-    /// Current input format (seeded by the constructor, updated by
-    /// per-buffer format metadata).
-    format: crate::format::VideoFormat,
+    /// Current input format, learned from the first buffer's `Metadata` and
+    /// re-learned whenever it changes.
+    ///
+    /// `None` until a buffer has declared one. It is deliberately not seeded
+    /// from a constructor argument: a constructor value is a claim about data
+    /// that has not arrived yet, and on any pipeline with a scaler in it that
+    /// claim is a lie (#38).
+    format: Option<crate::format::VideoFormat>,
     /// Statistics: frames received.
     frames_in: u64,
     /// Statistics: packets produced.
@@ -77,46 +82,40 @@ pub struct EncoderElement<E: VideoEncoder> {
     stats: crate::control::EncoderStatsHandle,
     /// The control generation last applied to the encoder.
     applied_generation: u64,
-    /// Arena for output buffer allocation.
-    arena: SharedArena,
+    /// Arena for output buffer allocation, sized from the first frame.
+    arena: Option<SharedArena>,
 }
 
 impl<E: VideoEncoder> EncoderElement<E> {
     /// Create a new encoder element wrapper.
     ///
-    /// # Arguments
+    /// Takes **no format**: geometry and pixel layout travel in-band, in each
+    /// buffer's [`Metadata`](crate::metadata::Metadata), and the wrapper reads
+    /// them per frame. A buffer that declares no `VideoRaw` format is an
+    /// error rather than an invitation to guess.
     ///
-    /// * `encoder` - The video encoder to wrap
-    /// * `format` - Expected input format (width, height, pixel format,
-    ///   framerate). A buffer carrying different `VideoRaw` format metadata
-    ///   renegotiates on the fly. Only planar/semi-planar YUV formats are
-    ///   encodable — packed or RGB input needs `VideoConvert` upstream.
-    pub fn new(encoder: E, format: crate::format::VideoFormat) -> Result<Self> {
-        // Fail fast on formats no wrapped encoder can take.
-        map_pixel_format(format.pixel_format)?;
-
-        // Estimate max packet size (compressed should be smaller than raw frame)
-        let max_packet_size = (format.width as usize) * (format.height as usize) * 3;
-        let arena = SharedArena::new(max_packet_size.max(4096), 16)
-            .map_err(|e| Error::Element(format!("Failed to create arena: {}", e)))?;
-
-        Ok(Self {
+    /// Only planar/semi-planar YUV formats are encodable — packed or RGB input
+    /// needs a `VideoConvert` upstream.
+    pub fn new(encoder: E) -> Self {
+        Self {
             encoder,
             pending_packets: VecDeque::new(),
             flushing: false,
             flushed: false,
-            format,
+            format: None,
             frames_in: 0,
             packets_out: 0,
             control: super::EncoderControl::new(),
             stats: crate::control::EncoderStatsHandle::default(),
             applied_generation: 0,
-            arena,
-        })
+            arena: None,
+        }
     }
 
-    /// The current input format (may change via renegotiation).
-    pub fn format(&self) -> crate::format::VideoFormat {
+    /// The input format most recently declared by a buffer.
+    ///
+    /// `None` before the first frame arrives.
+    pub fn format(&self) -> Option<crate::format::VideoFormat> {
         self.format
     }
 
@@ -159,26 +158,51 @@ impl<E: VideoEncoder> EncoderElement<E> {
     }
 
     /// Convert input buffer to VideoFrame, honoring format renegotiation.
+    ///
+    /// The buffer is authoritative about its own geometry and layout. If it
+    /// declares nothing, this errors instead of reusing a stale value — the
+    /// silent-corruption mode #38 exists to remove.
     fn buffer_to_frame(&mut self, buffer: &Buffer) -> Result<VideoFrame> {
-        // Renegotiation: format metadata (set on the first buffer or on
-        // format changes) overrides the configured format.
-        if let Some(MediaFormat::VideoRaw(vf)) = buffer.metadata().format
-            && vf != self.format
-        {
-            tracing::debug!(
-                "encoder input renegotiated: {}x{} {:?} -> {}x{} {:?}",
-                self.format.width,
-                self.format.height,
-                self.format.pixel_format,
-                vf.width,
-                vf.height,
-                vf.pixel_format
-            );
-            self.format = vf;
+        match buffer.metadata().format {
+            Some(MediaFormat::VideoRaw(vf)) => {
+                if self.format != Some(vf) {
+                    match self.format {
+                        Some(old) => tracing::debug!(
+                            "encoder input renegotiated: {}x{} {:?} -> {}x{} {:?}",
+                            old.width,
+                            old.height,
+                            old.pixel_format,
+                            vf.width,
+                            vf.height,
+                            vf.pixel_format
+                        ),
+                        None => tracing::debug!(
+                            "encoder input format: {}x{} {:?}",
+                            vf.width,
+                            vf.height,
+                            vf.pixel_format
+                        ),
+                    }
+                    self.format = Some(vf);
+                    // The arena is sized from the frame; a new geometry needs a
+                    // new one.
+                    self.arena = None;
+                }
+            }
+            _ => {
+                return Err(Error::Element(
+                    "EncoderElement: buffer carries no VideoRaw format metadata, so its \
+                     geometry and pixel layout are unknown. Geometry travels in-band — \
+                     set Metadata::set_video_dims() upstream, or insert an element that \
+                     does (VideoScale, VideoConvert, a device source)."
+                        .into(),
+                ));
+            }
         }
 
-        let format = map_pixel_format(self.format.pixel_format)?;
-        let width = self.format.width;
+        let declared = self.format.expect("set immediately above");
+        let format = map_pixel_format(declared.pixel_format)?;
+        let width = declared.width;
         let bpc = format.bytes_per_component();
         let stride_y = width as usize * bpc;
         let (stride_u, stride_v) = match format {
@@ -191,7 +215,7 @@ impl<E: VideoEncoder> EncoderElement<E> {
 
         Ok(VideoFrame {
             width,
-            height: self.format.height,
+            height: declared.height,
             format,
             pts: buffer.metadata().pts.nanos() as i64,
             data: buffer.as_bytes().to_vec(),
@@ -201,16 +225,36 @@ impl<E: VideoEncoder> EncoderElement<E> {
         })
     }
 
+    /// The output arena, created on first use and sized from the input frame.
+    ///
+    /// A compressed frame is smaller than its raw source, so the raw size is a
+    /// safe upper bound. Sizing it lazily is what lets the constructor take no
+    /// dimensions: there is nothing to size it from until a frame arrives.
+    fn ensure_arena(&mut self) -> Result<&SharedArena> {
+        if self.arena.is_none() {
+            let (w, h) = self
+                .format
+                .map(|f| (f.width as usize, f.height as usize))
+                .unwrap_or((0, 0));
+            let max_packet_size = w * h * 3;
+            self.arena = Some(
+                SharedArena::new(max_packet_size.max(4096), 16)
+                    .map_err(|e| Error::Element(format!("Failed to create arena: {}", e)))?,
+            );
+        }
+        Ok(self.arena.as_ref().expect("set immediately above"))
+    }
+
     /// Convert encoded packet to output buffer, preserving input metadata.
     fn packet_to_buffer(
-        &self,
+        &mut self,
         data: Vec<u8>,
         pts: i64,
         input_metadata: &crate::metadata::Metadata,
     ) -> Result<Buffer> {
-        self.arena.reclaim();
-        let mut slot = self
-            .arena
+        let arena = self.ensure_arena()?;
+        arena.reclaim();
+        let mut slot = arena
             .acquire()
             .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
         slot.data_mut()[..data.len()].copy_from_slice(&data);
@@ -226,10 +270,10 @@ impl<E: VideoEncoder> EncoderElement<E> {
     }
 
     /// Convert encoded packet to output buffer during flush (no input metadata).
-    fn packet_to_buffer_flush(&self, data: Vec<u8>, pts: i64) -> Result<Buffer> {
-        self.arena.reclaim();
-        let mut slot = self
-            .arena
+    fn packet_to_buffer_flush(&mut self, data: Vec<u8>, pts: i64) -> Result<Buffer> {
+        let arena = self.ensure_arena()?;
+        arena.reclaim();
+        let mut slot = arena
             .acquire()
             .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
         slot.data_mut()[..data.len()].copy_from_slice(&data);
@@ -402,15 +446,24 @@ impl<E: VideoEncoder + 'static> Transform for EncoderElement<E> {
 
     fn input_media_caps(&self) -> crate::format::ElementMediaCaps {
         use crate::format::{
-            CapsValue, ElementMediaCaps, FormatMemoryCap, MemoryCaps, VideoFormatCaps,
+            CapsValue, ElementMediaCaps, FormatMemoryCap, MemoryCaps, PixelFormat, VideoFormatCaps,
         };
-        // Advertise the configured format so graph negotiation can catch
-        // mismatches (and auto-insert a converter) instead of failing at the
-        // first encoded frame.
+        // Pin the *pixel formats* the wrapped encoders can take, so negotiation
+        // auto-inserts a VideoConvert for RGB or packed input instead of
+        // failing at the first frame. This list mirrors `map_pixel_format`.
+        //
+        // Geometry is deliberately `Any`: the encoder does not constrain it —
+        // it encodes whatever each buffer declares. Advertising a fixed size
+        // here would be re-asserting the constructor dimensions that #38
+        // removed, and would make a scaler upstream look like a caps conflict.
         let caps = VideoFormatCaps {
-            width: CapsValue::Fixed(self.format.width),
-            height: CapsValue::Fixed(self.format.height),
-            pixel_format: CapsValue::Fixed(self.format.pixel_format),
+            pixel_format: CapsValue::List(vec![
+                PixelFormat::I420,
+                PixelFormat::I420_10Le,
+                PixelFormat::I422,
+                PixelFormat::I444,
+                PixelFormat::Nv12,
+            ]),
             ..VideoFormatCaps::any()
         };
         ElementMediaCaps::new(vec![FormatMemoryCap::new(
@@ -498,12 +551,10 @@ mod tests {
             (PixelFormat::I444, (640, 640, 640)),
             (PixelFormat::I420_10Le, (1280, 640, 640)),
         ] {
-            let mut element = EncoderElement::new(
-                RecordingEncoder { frames: vec![] },
-                video_format(640, 480, pf),
-            )
-            .unwrap();
-            element.transform(frame_buffer(None)).unwrap();
+            let mut element = EncoderElement::new(RecordingEncoder { frames: vec![] });
+            element
+                .transform(frame_buffer(Some(video_format(640, 480, pf))))
+                .unwrap();
             let (w, h, _, sy, su, sv) = element.encoder().frames[0];
             assert_eq!((w, h), (640, 480));
             assert_eq!((sy, su, sv), expect, "strides for {pf:?}");
@@ -512,12 +563,14 @@ mod tests {
 
     #[test]
     fn metadata_renegotiates_format() {
-        let mut element = EncoderElement::new(
-            RecordingEncoder { frames: vec![] },
-            video_format(640, 480, PixelFormat::I420),
-        )
-        .unwrap();
-        element.transform(frame_buffer(None)).unwrap();
+        let mut element = EncoderElement::new(RecordingEncoder { frames: vec![] });
+        element
+            .transform(frame_buffer(Some(video_format(
+                640,
+                480,
+                PixelFormat::I420,
+            ))))
+            .unwrap();
         element
             .transform(frame_buffer(Some(video_format(
                 1280,
@@ -531,29 +584,71 @@ mod tests {
         assert_eq!((frames[1].0, frames[1].1), (1280, 720));
         assert_eq!(frames[1].2, super::super::common::PixelFormat::Nv12);
         assert_eq!(
-            element.format().width,
+            element.format().unwrap().width,
             1280,
             "format sticks after renegotiation"
         );
     }
 
+    /// #38: geometry travels in-band, so a buffer that declares none is an
+    /// error — never an invitation to reuse a stale value.
+    #[test]
+    fn a_buffer_without_format_metadata_errors() {
+        let mut element = EncoderElement::new(RecordingEncoder { frames: vec![] });
+        assert!(
+            element.format().is_none(),
+            "nothing known before the first frame"
+        );
+
+        let err = element.transform(frame_buffer(None)).unwrap_err();
+        assert!(
+            err.to_string().contains("no VideoRaw format metadata"),
+            "the error must say what is missing, got: {err}"
+        );
+        assert!(element.encoder().frames.is_empty(), "nothing was encoded");
+    }
+
+    /// A format-less buffer *after* a good one is still an error: the previous
+    /// frame's geometry says nothing about this one.
+    #[test]
+    fn a_stale_format_is_not_reused() {
+        let mut element = EncoderElement::new(RecordingEncoder { frames: vec![] });
+        element
+            .transform(frame_buffer(Some(video_format(
+                640,
+                480,
+                PixelFormat::I420,
+            ))))
+            .unwrap();
+        assert!(element.transform(frame_buffer(None)).is_err());
+        assert_eq!(element.encoder().frames.len(), 1);
+    }
+
     #[test]
     fn unmappable_formats_error() {
-        // At construction:
+        // RGB input needs a VideoConvert upstream. It is now caught on the
+        // first buffer that declares it, rather than at construction.
+        let mut element = EncoderElement::new(RecordingEncoder { frames: vec![] });
         assert!(
-            EncoderElement::new(
-                RecordingEncoder { frames: vec![] },
-                video_format(640, 480, PixelFormat::Rgb24)
-            )
-            .is_err(),
+            element
+                .transform(frame_buffer(Some(video_format(
+                    640,
+                    480,
+                    PixelFormat::Rgb24
+                ))))
+                .is_err(),
             "RGB input must be rejected (needs VideoConvert)"
         );
+
         // Via renegotiation:
-        let mut element = EncoderElement::new(
-            RecordingEncoder { frames: vec![] },
-            video_format(640, 480, PixelFormat::I420),
-        )
-        .unwrap();
+        let mut element = EncoderElement::new(RecordingEncoder { frames: vec![] });
+        element
+            .transform(frame_buffer(Some(video_format(
+                640,
+                480,
+                PixelFormat::I420,
+            ))))
+            .unwrap();
         assert!(
             element
                 .transform(frame_buffer(Some(video_format(

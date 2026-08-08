@@ -10,14 +10,14 @@
 //!
 //! ```rust,ignore
 //! let device = find_m2m_encoder(b"H264").ok_or("no hardware encoder")?;
-//! let config = V4l2M2mEncoderConfig::new(1280, 720).bitrate(4_000_000);
+//! let config = V4l2M2mEncoderConfig::new().bitrate(4_000_000);
 //! let encoder = V4l2M2mH264Encoder::new(&device, config)?;
-//! let element = EncoderElement::new(encoder, VideoFormat {
-//!     width: 1280, height: 720,
-//!     pixel_format: PixelFormat::Nv12,
-//!     framerate: Framerate { num: 30, den: 1 },
-//! })?;
+//! let element = EncoderElement::new(encoder);
 //! ```
+//!
+//! Neither the config nor the wrapper takes dimensions: geometry travels
+//! in-band in each buffer's `Metadata`, and the driver queues are configured
+//! from the first frame (and reconfigured if it changes).
 //!
 //! # Memory model
 //!
@@ -103,11 +103,11 @@ impl V4l2H264Profile {
 
 /// Configuration for [`V4l2M2mH264Encoder`].
 #[derive(Debug, Clone)]
+///
+/// There is **no width or height**: geometry travels in-band, in each buffer's
+/// [`Metadata`](crate::metadata::Metadata). The driver queues are configured
+/// from the first frame and reconfigured if it changes (#38).
 pub struct V4l2M2mEncoderConfig {
-    /// Frame width in pixels.
-    pub width: u32,
-    /// Frame height in pixels.
-    pub height: u32,
     /// Raw input pixel format for the OUTPUT queue. Only [`PixelFormat::Nv12`]
     /// (most hardware) and [`PixelFormat::I420`] are supported.
     pub pixel_format: PixelFormat,
@@ -131,12 +131,12 @@ pub struct V4l2M2mEncoderConfig {
 }
 
 impl V4l2M2mEncoderConfig {
-    /// Create a config with the given dimensions and defaults: NV12 input,
-    /// H.264 output, 30 fps, driver-default bitrate and GOP.
-    pub fn new(width: u32, height: u32) -> Self {
+    /// Create a config with defaults: NV12 input, H.264 output, 30 fps,
+    /// driver-default bitrate and GOP.
+    ///
+    /// Frame dimensions come from the buffers, not from here.
+    pub fn new() -> Self {
         Self {
-            width,
-            height,
             pixel_format: PixelFormat::Nv12,
             bitrate_bps: 0,
             gop_size: 0,
@@ -185,6 +185,12 @@ impl V4l2M2mEncoderConfig {
     }
 }
 
+impl Default for V4l2M2mEncoderConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// How long to wait for the hardware before declaring it stalled.
 const POLL_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -210,14 +216,27 @@ const POLL_TIMEOUT: Duration = Duration::from_secs(2);
 /// best-effort, and verify against the driver you actually ship on.
 pub struct V4l2M2mH264Encoder {
     device: Arc<Device>,
+    config: V4l2M2mEncoderConfig,
+    /// Queue state, configured from the first frame's geometry.
+    ///
+    /// V4L2 wants `S_FMT` before buffers are allocated and the queues stream
+    /// on, which is why this used to force dimensions into the constructor.
+    /// Deferring it to the first frame is what lets geometry stay in-band
+    /// (#38); a resize drops this and rebuilds it.
+    streaming: Option<Streaming>,
+    /// Cached SPS+PPS (Annex-B) from the first keyframe packet.
+    codec_data: Option<Vec<u8>>,
+}
+
+/// The queues, poller and negotiated format for one geometry.
+struct Streaming {
     output_queue: Queue<Output, BuffersAllocated<Vec<MmapHandle>>>,
     capture_queue: Queue<Capture, BuffersAllocated<Vec<MmapHandle>>>,
     poller: Poller,
     /// OUTPUT format as applied by the driver (strides may differ from ours).
     output_format: Format,
-    config: V4l2M2mEncoderConfig,
-    /// Cached SPS+PPS (Annex-B) from the first keyframe packet.
-    codec_data: Option<Vec<u8>>,
+    /// The geometry these queues were configured for.
+    dims: (u32, u32),
     /// Set after a flush; the next encode() re-arms with `V4L2_ENC_CMD_START`.
     drained: bool,
     frames_queued: u64,
@@ -231,9 +250,53 @@ impl V4l2M2mH264Encoder {
     pub fn new(device: impl AsRef<Path>, config: V4l2M2mEncoderConfig) -> Result<Self> {
         let path = device.as_ref();
         let device = Device::open(path, DeviceConfig::new().non_blocking_dqbuf())
-            .map_err(|e| Error::Config(format!("V4L2 M2M: open {}: {e}", path.display())))?;
+            .map_err(|e| classify_open_failure(path, &e))?;
         let device = Arc::new(device);
 
+        // Reject an unencodable input format now: it is a property of the
+        // config, not of any frame, so there is no reason to wait.
+        raw_fourcc_for(config.pixel_format)?;
+
+        Ok(Self {
+            device,
+            config,
+            streaming: None,
+            codec_data: None,
+        })
+    }
+
+    /// Ensure the queues are configured and streaming at `width`x`height`.
+    ///
+    /// On a geometry change the previous `Streaming` is dropped, which streams
+    /// the queues off and frees their buffers, and a fresh one is built.
+    fn ensure_streaming(&mut self, width: u32, height: u32) -> Result<()> {
+        if let Some(s) = &self.streaming
+            && s.dims == (width, height)
+        {
+            return Ok(());
+        }
+
+        if self.streaming.is_some() {
+            tracing::info!("V4L2 M2M: input resized to {width}x{height}, reconfiguring queues");
+            self.streaming = None;
+        }
+
+        self.streaming = Some(Self::start_streaming(
+            Arc::clone(&self.device),
+            &self.config,
+            width,
+            height,
+        )?);
+        Ok(())
+    }
+
+    /// Configure both queues for one geometry and stream them on.
+    fn start_streaming(
+        device: Arc<Device>,
+        config: &V4l2M2mEncoderConfig,
+        width: u32,
+        height: u32,
+    ) -> Result<Streaming> {
         // Single-planar first (vicodec, bcm2835-codec), multi-planar fallback
         // (most SoC encoders expose only the mplane API).
         let (mut output_queue, mut capture_queue) =
@@ -277,19 +340,11 @@ impl V4l2M2mH264Encoder {
             )));
         }
 
-        let raw_fourcc: &[u8; 4] = match config.pixel_format {
-            PixelFormat::Nv12 => b"NV12",
-            PixelFormat::I420 => b"YU12",
-            other => {
-                return Err(Error::Config(format!(
-                    "V4L2 M2M: unsupported input format {other:?} (use Nv12 or I420)"
-                )));
-            }
-        };
+        let raw_fourcc = raw_fourcc_for(config.pixel_format)?;
         let output_format: Format = output_queue
             .change_format()
             .map_err(|e| Error::Config(format!("V4L2 M2M: get output format: {e}")))?
-            .set_size(config.width as usize, config.height as usize)
+            .set_size(width as usize, height as usize)
             .set_pixelformat(raw_fourcc)
             .apply()
             .map_err(|e| Error::Config(format!("V4L2 M2M: set output format: {e}")))?;
@@ -300,15 +355,15 @@ impl V4l2M2mH264Encoder {
                 output_format.pixelformat,
             )));
         }
-        if output_format.width != config.width || output_format.height != config.height {
+        if output_format.width != width || output_format.height != height {
             return Err(Error::Config(format!(
-                "V4L2 M2M: driver adjusted {}x{} to {}x{} (alignment constraints); \
-                 configure the adjusted size",
-                config.width, config.height, output_format.width, output_format.height,
+                "V4L2 M2M: driver adjusted {width}x{height} to {}x{} (alignment \
+                 constraints); scale to the adjusted size upstream",
+                output_format.width, output_format.height,
             )));
         }
 
-        Self::apply_controls(&device, &config);
+        Self::apply_controls(&device, config);
 
         // Frame rate for the driver's rate control (best-effort; vicodec
         // doesn't implement S_PARM).
@@ -353,14 +408,12 @@ impl V4l2M2mH264Encoder {
             .and_then(|_| poller.enable_event(DeviceEvent::OutputReady))
             .map_err(|e| Error::Config(format!("V4L2 M2M: enable poll events: {e}")))?;
 
-        Ok(Self {
-            device,
+        Ok(Streaming {
             output_queue,
             capture_queue,
             poller,
             output_format,
-            config,
-            codec_data: None,
+            dims: (width, height),
             drained: false,
             frames_queued: 0,
         })
@@ -396,6 +449,34 @@ impl V4l2M2mH264Encoder {
         }
     }
 
+    /// The streaming state, or an error naming why there isn't one.
+    fn streaming_mut(&mut self) -> Result<&mut Streaming> {
+        self.streaming.as_mut().ok_or_else(|| {
+            Error::Element(
+                "V4L2 M2M: no frame has been encoded yet, so the queues are not configured".into(),
+            )
+        })
+    }
+
+    /// Cache SPS/PPS from the first keyframe packet (H.264 only).
+    fn cache_codec_data(&mut self, packets: &[(Vec<u8>, BufferFlags)]) {
+        if self.codec_data.is_some() || self.config.coded_format != V4l2CodedFormat::H264 {
+            return;
+        }
+        for (data, flags) in packets {
+            if !flags.contains(BufferFlags::KEYFRAME) {
+                continue;
+            }
+            let headers = extract_sps_pps(data);
+            if !headers.is_empty() {
+                self.codec_data = Some(headers);
+                return;
+            }
+        }
+    }
+}
+
+impl Streaming {
     /// Return finished OUTPUT buffers to the free pool.
     fn reclaim_output_buffers(&self) {
         while let Ok(dqbuf) = self.output_queue.try_dequeue() {
@@ -405,7 +486,10 @@ impl V4l2M2mH264Encoder {
     }
 
     /// Drain every CAPTURE packet the hardware has ready, without blocking.
-    fn drain_capture(&mut self) -> Result<Vec<Vec<u8>>> {
+    ///
+    /// Returns each packet with its buffer flags so the caller can pick out
+    /// the keyframe that carries SPS/PPS.
+    fn drain_capture(&mut self) -> Result<Vec<(Vec<u8>, BufferFlags)>> {
         let mut packets = Vec::new();
         loop {
             match self.capture_queue.try_dequeue() {
@@ -416,9 +500,7 @@ impl V4l2M2mH264Encoder {
                             Error::Element("V4L2 M2M: map capture plane".to_string())
                         })?;
                         if !mapping.is_empty() {
-                            let data = mapping.to_vec();
-                            self.maybe_cache_codec_data(&data, flags);
-                            packets.push(data);
+                            packets.push((mapping.to_vec(), flags));
                         }
                     }
                     drop(dqbuf);
@@ -445,20 +527,6 @@ impl V4l2M2mH264Encoder {
         Ok(packets)
     }
 
-    /// Cache SPS/PPS from the first keyframe packet (H.264 only).
-    fn maybe_cache_codec_data(&mut self, data: &[u8], flags: BufferFlags) {
-        if self.codec_data.is_some()
-            || self.config.coded_format != V4l2CodedFormat::H264
-            || !flags.contains(BufferFlags::KEYFRAME)
-        {
-            return;
-        }
-        let headers = extract_sps_pps(data);
-        if !headers.is_empty() {
-            self.codec_data = Some(headers);
-        }
-    }
-
     /// Wait for a device event, mapping poll failures/timeouts to errors.
     fn wait_for_event(&mut self, context: &str) -> Result<()> {
         let events = self
@@ -475,24 +543,66 @@ impl V4l2M2mH264Encoder {
     }
 }
 
+/// Turn a device-open failure into a named error where we can.
+///
+/// `EBUSY` is *the* characteristic V4L2 failure — a second open of a node
+/// another pipeline or process already holds — and it used to land in a
+/// stringly-typed `Error::Config` catch-all here, undiagnosable without
+/// matching on the message (#47). `V4l2Src` names it; so should this.
+///
+/// v4l2r's `DeviceOpenError` does not expose the errno, so the classification
+/// re-probes with `std::fs`. That only runs on the failure path.
+fn classify_open_failure(path: &Path, original: &dyn std::fmt::Display) -> Error {
+    use crate::elements::device::DeviceError;
+
+    let display = path.display().to_string();
+    let fallback = || Error::Config(format!("V4L2 M2M: open {display}: {original}"));
+
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    {
+        Err(io) => match io.kind() {
+            std::io::ErrorKind::ResourceBusy => DeviceError::Busy(display).into(),
+            std::io::ErrorKind::NotFound => DeviceError::NotFound(display).into(),
+            std::io::ErrorKind::PermissionDenied => DeviceError::PermissionDenied(display).into(),
+            _ if io.raw_os_error() == Some(libc::EBUSY) => DeviceError::Busy(display).into(),
+            _ => fallback(),
+        },
+        // The node itself opens, so the failure was later (QUERYCAP).
+        Ok(_) => fallback(),
+    }
+}
+
+/// The V4L2 fourcc for a raw input pixel format.
+fn raw_fourcc_for(format: PixelFormat) -> Result<&'static [u8; 4]> {
+    match format {
+        PixelFormat::Nv12 => Ok(b"NV12"),
+        PixelFormat::I420 => Ok(b"YU12"),
+        other => Err(Error::Config(format!(
+            "V4L2 M2M: unsupported input format {other:?} (use Nv12 or I420)"
+        ))),
+    }
+}
+
 impl VideoEncoder for V4l2M2mH264Encoder {
     type Packet = Vec<u8>;
 
     fn encode(&mut self, frame: &VideoFrame) -> Result<Vec<Vec<u8>>> {
-        if frame.width != self.config.width
-            || frame.height != self.config.height
-            || frame.format != self.config.pixel_format
-        {
+        if frame.format != self.config.pixel_format {
             return Err(Error::Element(format!(
-                "V4L2 M2M: frame is {}x{} {:?}, encoder configured for {}x{} {:?}",
-                frame.width,
-                frame.height,
-                frame.format,
-                self.config.width,
-                self.config.height,
-                self.config.pixel_format,
+                "V4L2 M2M: frame is {:?}, encoder configured for {:?}",
+                frame.format, self.config.pixel_format,
             )));
         }
+
+        // Geometry comes from the frame. The queues are configured for it on
+        // the first frame, and reconfigured if it changes (#38).
+        self.ensure_streaming(frame.width, frame.height)?;
+
+        let device = Arc::clone(&self.device);
+        let streaming = self.streaming_mut()?;
 
         // Resume after a flush(). ENC_CMD_START clears the mem2mem stopped
         // state, but vb2's last_buffer_dequeued flag — the source of the
@@ -501,31 +611,33 @@ impl VideoEncoder for V4l2M2mH264Encoder {
         // mem2mem helper clears has_stopped before the driver checks it).
         // The spec allows CAPTURE STREAMOFF/STREAMON as an equivalent
         // resume path, so do both.
-        if self.drained {
-            ioctl::encoder_cmd::<_, ()>(&*self.device, &EncoderCommand::Start)
+        if streaming.drained {
+            ioctl::encoder_cmd::<_, ()>(&*device, &EncoderCommand::Start)
                 .map_err(|e| Error::Element(format!("V4L2 M2M: ENC_CMD_START: {e}")))?;
-            self.capture_queue
+            streaming
+                .capture_queue
                 .stream_off()
                 .map_err(|e| Error::Element(format!("V4L2 M2M: capture stream off: {e}")))?;
-            self.capture_queue
+            streaming
+                .capture_queue
                 .stream_on()
                 .map_err(|e| Error::Element(format!("V4L2 M2M: capture stream on: {e}")))?;
-            while let Ok(buffer) = self.capture_queue.try_get_free_buffer() {
+            while let Ok(buffer) = streaming.capture_queue.try_get_free_buffer() {
                 buffer.queue().map_err(|e| {
                     Error::Element(format!("V4L2 M2M: requeue capture buffer: {e}"))
                 })?;
             }
-            self.drained = false;
+            streaming.drained = false;
         }
 
-        self.reclaim_output_buffers();
+        streaming.reclaim_output_buffers();
         let qbuf = loop {
-            match self.output_queue.try_get_free_buffer() {
+            match streaming.output_queue.try_get_free_buffer() {
                 Ok(buffer) => break buffer,
                 Err(_) => {
                     // All raw-frame slots are in the hardware; wait for one.
-                    self.wait_for_event("a free output buffer")?;
-                    self.reclaim_output_buffers();
+                    streaming.wait_for_event("a free output buffer")?;
+                    streaming.reclaim_output_buffers();
                 }
             }
         };
@@ -533,22 +645,29 @@ impl VideoEncoder for V4l2M2mH264Encoder {
         let mut mapping = qbuf
             .get_plane_mapping(0)
             .ok_or_else(|| Error::Element("V4L2 M2M: map output plane".to_string()))?;
-        let bytes_used = fill_output_plane(&mut mapping, &self.output_format, frame)?;
+        let bytes_used = fill_output_plane(&mut mapping, &streaming.output_format, frame)?;
         drop(mapping);
 
         let timestamp = TimeVal::microseconds(frame.pts / 1_000);
         qbuf.set_timestamp(timestamp)
             .queue(&[bytes_used])
             .map_err(|e| Error::Element(format!("V4L2 M2M: queue output buffer: {e}")))?;
-        self.frames_queued += 1;
+        streaming.frames_queued += 1;
 
         // Non-blocking: stateful encoders have pipeline latency, so early
         // frames legitimately produce nothing (EncoderElement buffers).
-        self.drain_capture()
+        let packets = streaming.drain_capture()?;
+        self.cache_codec_data(&packets);
+        Ok(packets.into_iter().map(|(data, _)| data).collect())
     }
 
     fn flush(&mut self) -> Result<Vec<Vec<u8>>> {
-        if self.drained || self.frames_queued == 0 {
+        // No streaming state means no frame was ever queued, so there is
+        // nothing buffered in the hardware to drain.
+        let Some(streaming) = self.streaming.as_mut() else {
+            return Ok(Vec::new());
+        };
+        if streaming.drained || streaming.frames_queued == 0 {
             return Ok(Vec::new());
         }
         ioctl::encoder_cmd::<_, ()>(&*self.device, &EncoderCommand::Stop(false))
@@ -557,7 +676,7 @@ impl VideoEncoder for V4l2M2mH264Encoder {
         let mut packets = Vec::new();
         let deadline = Instant::now() + POLL_TIMEOUT;
         'drain: loop {
-            match self.capture_queue.try_dequeue() {
+            match streaming.capture_queue.try_dequeue() {
                 Ok(dqbuf) => {
                     let flags = dqbuf.data.flags();
                     let is_last = dqbuf.data.is_last();
@@ -566,9 +685,7 @@ impl VideoEncoder for V4l2M2mH264Encoder {
                             Error::Element("V4L2 M2M: map capture plane".to_string())
                         })?;
                         if !mapping.is_empty() {
-                            let data = mapping.to_vec();
-                            self.maybe_cache_codec_data(&data, flags);
-                            packets.push(data);
+                            packets.push((mapping.to_vec(), flags));
                         }
                     }
                     // Do NOT requeue during a drain: the queue must empty out.
@@ -583,7 +700,7 @@ impl VideoEncoder for V4l2M2mH264Encoder {
                     break 'drain;
                 }
                 Err(v4l2r::ioctl::IoctlConvertError::IoctlError(DqBufIoctlError::NotReady)) => {
-                    if self.capture_queue.num_queued_buffers() == 0 {
+                    if streaming.capture_queue.num_queued_buffers() == 0 {
                         // Nothing left for the driver to fill (defensive; the
                         // LAST flag is the normal exit).
                         break 'drain;
@@ -593,7 +710,7 @@ impl VideoEncoder for V4l2M2mH264Encoder {
                             "V4L2 M2M: drain timed out waiting for the LAST buffer".to_string(),
                         ));
                     }
-                    self.wait_for_event("drain completion")?;
+                    streaming.wait_for_event("drain completion")?;
                 }
                 Err(e) => {
                     return Err(Error::Element(format!("V4L2 M2M: dequeue capture: {e}")));
@@ -601,9 +718,10 @@ impl VideoEncoder for V4l2M2mH264Encoder {
             }
         }
 
-        self.reclaim_output_buffers();
-        self.drained = true;
-        Ok(packets)
+        streaming.reclaim_output_buffers();
+        streaming.drained = true;
+        self.cache_codec_data(&packets);
+        Ok(packets.into_iter().map(|(data, _)| data).collect())
     }
 
     fn codec_data(&self) -> Option<Vec<u8>> {
@@ -688,14 +806,20 @@ impl std::fmt::Debug for V4l2M2mH264Encoder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("V4l2M2mH264Encoder")
             .field("config", &self.config)
-            .field("drained", &self.drained)
-            .field("frames_queued", &self.frames_queued)
+            .field("dims", &self.streaming.as_ref().map(|s| s.dims))
+            .field("drained", &self.streaming.as_ref().map(|s| s.drained))
+            .field(
+                "frames_queued",
+                &self.streaming.as_ref().map_or(0, |s| s.frames_queued),
+            )
             .finish()
     }
 }
 
-impl Drop for V4l2M2mH264Encoder {
+impl Drop for Streaming {
     fn drop(&mut self) {
+        // Also runs when a resize replaces this state, which is what makes
+        // reconfiguring the queues safe.
         let _ = self.capture_queue.stream_off();
         let _ = self.output_queue.stream_off();
     }
@@ -854,9 +978,25 @@ pub fn find_m2m_encoder(fourcc: &[u8; 4]) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    /// #38: the config carries no geometry at all — it cannot lie about a
+    /// resolution it was never told.
+    #[test]
+    fn config_has_no_dimensions() {
+        let config = V4l2M2mEncoderConfig::new();
+        // Compile-time proof by construction: there is no width/height to
+        // read. What the config *does* carry is codec policy.
+        assert_eq!(config.pixel_format, PixelFormat::Nv12);
+        assert_eq!(config.num_output_buffers, 4);
+        // And Default agrees with new().
+        assert_eq!(
+            format!("{:?}", V4l2M2mEncoderConfig::default()),
+            format!("{config:?}")
+        );
+    }
+
     #[test]
     fn config_defaults() {
-        let config = V4l2M2mEncoderConfig::new(1280, 720);
+        let config = V4l2M2mEncoderConfig::new();
         assert_eq!(config.pixel_format, PixelFormat::Nv12);
         assert_eq!(config.coded_format, V4l2CodedFormat::H264);
         assert_eq!(config.framerate, (30, 1));
@@ -865,7 +1005,7 @@ mod tests {
 
     #[test]
     fn config_builders() {
-        let config = V4l2M2mEncoderConfig::new(640, 480)
+        let config = V4l2M2mEncoderConfig::new()
             .pixel_format(PixelFormat::I420)
             .bitrate(2_000_000)
             .gop_size(30)
@@ -1010,7 +1150,7 @@ mod tests {
     fn open_with_any_input(device: &str, coded: V4l2CodedFormat) -> V4l2M2mH264Encoder {
         let mut failures = Vec::new();
         for pf in [PixelFormat::Nv12, PixelFormat::I420] {
-            let config = V4l2M2mEncoderConfig::new(640, 480)
+            let config = V4l2M2mEncoderConfig::new()
                 .pixel_format(pf)
                 .coded_format(coded);
             match V4l2M2mH264Encoder::new(device, config) {

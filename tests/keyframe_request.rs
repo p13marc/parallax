@@ -188,13 +188,9 @@ async fn in_band_metadata_flag_forces_idr() {
 #[test]
 fn encoder_element_honors_handle_via_trait() {
     let encoder = quiet_encoder();
-    let format = parallax::format::VideoFormat {
-        width: WIDTH,
-        height: HEIGHT,
-        pixel_format: parallax::format::PixelFormat::I420,
-        framerate: parallax::format::Framerate { num: 30, den: 1 },
-    };
-    let mut element = EncoderElement::new(encoder, format).unwrap();
+    // No dimensions: yuv_frame() stamps them into the buffer's Metadata, and
+    // the wrapper reads them from there (#38).
+    let mut element = EncoderElement::new(encoder);
     let keyframes = element.keyframe_handle();
 
     use parallax::element::Transform;
