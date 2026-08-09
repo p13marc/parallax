@@ -168,7 +168,7 @@ Every controllable element implements `Controllable`, so the accessor is always 
 | `EncoderControl` | `H264Encoder::control()`, `EncoderElement::control()` | `set_bitrate`, `set_keyframe_interval`, `set_qp`, `set_rate_control`, `set_skip_frames`, `request_keyframe` |
 | `EncoderStatsHandle` | `H264Encoder::stats()`, `EncoderElement::stats()` | *read-only*: `frames_encoded`, `bytes_encoded`, `frames_dropped_by_rc`, `last_encode_ns` |
 | `KeyframeHandle` | `…::keyframe_handle()` | `request()` — force the next frame to be an IDR |
-| `ScaleControl` | `VideoScale::control()` | `set_target(w, h)`, `set_max_height(h)` (aspect-preserving, never upscales), `passthrough()` |
+| `ScaleControl` | `VideoScale::control()` | `set_target(w, h)`, `set_max_height(h)` / `set_max_width(w)` (aspect-preserving, never upscale), `passthrough()`, `resolve(src_w, src_h)` |
 | `ThrottleControl` | `Throttle::control()` | `set_rate(fps)`, `set_min_interval(d)` |
 | `JpegQualityControl` | `JpegEncoder::control()` | `set_quality(1..=100)` |
 | `ValveControl` | `Valve::control()` | `open()` / `close()` |
@@ -198,6 +198,20 @@ println!("{} frames, {} bytes", stats.frames_encoded(), stats.bytes_encoded());
 ```
 
 Both changes take effect on the next frame, with no teardown.
+
+**Predicting the scaled geometry.** If you advertise a stream's size ahead of the frames
+— a catalogue, per-tier status, wire metadata — ask the scaler rather than reimplementing
+its rounding:
+
+```rust,ignore
+let (w, h) = scale.resolve(src_width, src_height);   // exactly what process() will emit
+```
+
+`ScaleControl::resolve` is pure and `ScaleControl::new()` needs no element, so this works
+without a pipeline. The contract is committed: the derived axis is computed with
+`div_ceil`, **then** both axes round *down* to even, and a bound never upscales. Those
+first two steps round in opposite directions, which is what makes hand-mirroring the
+arithmetic go wrong — 1280×720 bounded to height 480 is **854**×480, not 852×480.
 
 **What costs an IDR and what does not:**
 

@@ -103,7 +103,10 @@ impl ScaleControl {
     /// Scale to exactly `width` x `height`.
     ///
     /// Odd dimensions are rounded down to even — YUV420 chroma is subsampled by
-    /// two and cannot represent an odd width or height.
+    /// two and cannot represent an odd width or height. A consequence at the
+    /// bottom of the range: an axis of 1 rounds to 0, which is the
+    /// "unconstrained" sentinel, so `set_target(1, 1)` is
+    /// [`passthrough`](Self::passthrough).
     pub fn set_target(&self, width: u32, height: u32) {
         self.0.width.store(even(width), Ordering::Release);
         self.0.height.store(even(height), Ordering::Release);
@@ -117,6 +120,16 @@ impl ScaleControl {
     pub fn set_max_height(&self, height: u32) {
         self.0.width.store(0, Ordering::Release);
         self.0.height.store(even(height), Ordering::Release);
+    }
+
+    /// Fit the frame within `width`, preserving the source aspect ratio.
+    ///
+    /// The mirror of [`set_max_height`](Self::set_max_height): the height is
+    /// derived per frame from the *current* source, and a source already at or
+    /// below `width` is passed through untouched.
+    pub fn set_max_width(&self, width: u32) {
+        self.0.width.store(even(width), Ordering::Release);
+        self.0.height.store(0, Ordering::Release);
     }
 
     /// Stop scaling: emit frames at the source resolution.
@@ -133,13 +146,35 @@ impl ScaleControl {
         )
     }
 
-    /// Resolve the request against a concrete source size.
+    /// The output geometry this scaler will produce for a source of
+    /// `src_width` x `src_height` under the current target.
     ///
-    /// An explicit [`set_target`](Self::set_target) is honoured as given, up or
-    /// down. An aspect-preserving *bound* ([`set_max_height`](Self::set_max_height))
-    /// only ever shrinks: a bound above the source means "fits already", not
-    /// "invent detail".
-    fn resolve(&self, src_width: u32, src_height: u32) -> (u32, u32) {
+    /// Pure, and the *same* arithmetic `process()` uses — call it to advertise
+    /// a stream's geometry ahead of the frames (a catalogue, per-tier status,
+    /// wire metadata) instead of predicting it. Because
+    /// [`new`](Self::new)/[`Default`] give a usable handle with no element
+    /// attached, this works without a pipeline.
+    ///
+    /// # Contract
+    ///
+    /// This rounding is a committed part of the API; the steps are not
+    /// interchangeable and the order matters:
+    ///
+    /// 1. A bound ([`set_max_height`](Self::set_max_height) /
+    ///    [`set_max_width`](Self::set_max_width)) derives the other axis from
+    ///    the source aspect ratio with **`div_ceil`** on a `u64` intermediate.
+    /// 2. Both axes are then rounded **down** to even (YUV420 chroma is
+    ///    subsampled by two and cannot represent an odd size), and clamped to a
+    ///    minimum of 2.
+    /// 3. A bound **never upscales**: a source already at or below the bound is
+    ///    returned unchanged. An explicit [`set_target`](Self::set_target) is
+    ///    honoured as given, up *or* down.
+    ///
+    /// Step 1 rounds up and step 2 rounds down, which is easy to get wrong in
+    /// the other direction: 1280x720 bounded to height 480 resolves to
+    /// **854**x480, not 852x480 (`1280 * 480 / 720` = 853.33, ceil 854, already
+    /// even).
+    pub fn resolve(&self, src_width: u32, src_height: u32) -> (u32, u32) {
         let (want_width, want_height) = self.target();
 
         match (want_width, want_height) {
@@ -771,6 +806,88 @@ mod tests {
         let control = ScaleControl::new();
         control.set_target(101, 77);
         assert_eq!(control.target(), (100, 76));
+    }
+
+    // ---- resolve(): the published geometry contract -----------------------
+    //
+    // The tests above drive `process()`, which is what proves the element
+    // really uses `resolve`. These pin the arithmetic itself, so a consumer
+    // advertising geometry ahead of the frames can rely on it.
+
+    #[test]
+    fn resolve_rounds_the_derived_axis_up_before_evening_it_down() {
+        // The witness from #86: a hand-mirrored `floor` gives 852 here, and
+        // the frames then arrive at 854.
+        let control = ScaleControl::new();
+        control.set_max_height(480);
+        assert_eq!(control.resolve(1280, 720), (854, 480));
+    }
+
+    #[test]
+    fn resolve_matches_what_the_element_produces() {
+        let control = ScaleControl::new();
+        control.set_max_height(120);
+
+        let mut scaler = VideoScale::new();
+        scaler.control().set_max_height(120);
+
+        for (w, h) in [(640, 480), (640, 360), (1280, 720), (100, 100)] {
+            let out = scale_once(&mut scaler, frame(PixelFormat::I420, w, h));
+            assert_eq!(
+                Some(control.resolve(w, h)),
+                out.metadata().video_dims(),
+                "resolve disagrees with process() for {w}x{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_bounds_width_as_the_mirror_of_height() {
+        let control = ScaleControl::new();
+        control.set_max_width(854);
+        assert_eq!(control.resolve(1280, 720), (854, 480));
+
+        // ...and never upscales, exactly like the height bound.
+        assert_eq!(control.resolve(320, 180), (320, 180));
+    }
+
+    #[test]
+    fn resolve_passes_through_an_unset_target() {
+        assert_eq!(ScaleControl::new().resolve(1280, 720), (1280, 720));
+    }
+
+    #[test]
+    fn resolve_honours_an_explicit_target_in_both_directions() {
+        let control = ScaleControl::new();
+        control.set_target(1920, 1080);
+        assert_eq!(
+            control.resolve(640, 360),
+            (1920, 1080),
+            "an explicit target upscales; only a bound refuses to"
+        );
+        assert_eq!(control.resolve(3840, 2160), (1920, 1080));
+    }
+
+    #[test]
+    fn a_target_below_two_is_indistinguishable_from_passthrough() {
+        // Both axes round down to even *on store*, so `set_target(1, 1)` writes
+        // (0, 0) — which is the passthrough sentinel. Surprising, but it is the
+        // shipped behaviour and a consumer predicting geometry must know it.
+        let control = ScaleControl::new();
+        control.set_target(1, 1);
+        assert_eq!(control.target(), (0, 0));
+        assert_eq!(control.resolve(1920, 1080), (1920, 1080));
+    }
+
+    #[test]
+    fn resolve_never_collapses_the_derived_axis() {
+        // An extreme bound must still yield a codable frame, not a zero axis.
+        let control = ScaleControl::new();
+        control.set_max_height(2);
+        assert_eq!(control.resolve(1920, 1080), (4, 2));
+
+        control.set_max_width(2);
+        assert_eq!(control.resolve(1920, 1080), (2, 2));
     }
 
     #[test]
