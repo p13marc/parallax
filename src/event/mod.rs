@@ -56,6 +56,7 @@ use crate::format::MediaCaps;
 /// and synchronization. They can flow downstream (with data) or
 /// upstream (against data flow).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum Event {
     // ========== Downstream Events ==========
     /// Start of a new stream.
@@ -69,6 +70,11 @@ pub enum Event {
 
     /// End of stream - no more data will be produced.
     Eos,
+
+    /// An upstream element failed. Terminal, like [`Eos`](Self::Eos), but
+    /// carrying the reason — a sink that receives this must not report a clean
+    /// end of stream to its consumer.
+    Error(crate::pipeline::StreamError),
 
     /// Caps changed mid-stream.
     CapsChanged(CapsChangedEvent),
@@ -106,6 +112,7 @@ impl Event {
                 | Event::Segment(_)
                 | Event::Tags(_)
                 | Event::Eos
+                | Event::Error(_)
                 | Event::CapsChanged(_)
                 | Event::Gap(_)
         )
@@ -139,6 +146,7 @@ impl Event {
             Event::Segment(_) => "segment",
             Event::Tags(_) => "tags",
             Event::Eos => "eos",
+            Event::Error(_) => "error",
             Event::CapsChanged(_) => "caps-changed",
             Event::Gap(_) => "gap",
             Event::Seek(_) => "seek",

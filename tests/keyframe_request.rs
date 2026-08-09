@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use parallax::buffer::{Buffer, MemoryHandle};
-use parallax::elements::app::{AppSink, AppSrc};
+use parallax::elements::app::{AppSink, AppSrc, Pulled};
 use parallax::elements::codec::{
     EncoderElement, H264Encoder, H264EncoderConfig, KEYFRAME_REQUEST, KeyframeHandle,
 };
@@ -120,7 +120,7 @@ async fn keyframe_handle_reaches_running_encoder() {
     handle.wait().await.unwrap();
 
     let mut outputs = Vec::new();
-    while let Some(buffer) = sink_handle.try_pull_buffer() {
+    while let Pulled::Buffer(buffer) = sink_handle.try_pull_buffer() {
         outputs.push(buffer);
     }
     assert_eq!(outputs.len(), 10, "one encoded output per input frame");
@@ -170,7 +170,7 @@ async fn in_band_metadata_flag_forces_idr() {
     handle.wait().await.unwrap();
 
     let mut outputs = Vec::new();
-    while let Some(buffer) = sink_handle.try_pull_buffer() {
+    while let Pulled::Buffer(buffer) = sink_handle.try_pull_buffer() {
         outputs.push(buffer);
     }
     assert_eq!(outputs.len(), 6);

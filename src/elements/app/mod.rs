@@ -10,7 +10,7 @@ mod appsrc;
 #[cfg(feature = "display")]
 mod autovideosink;
 
-pub use appsink::{AppSink, AppSinkHandle, AppSinkStats};
+pub use appsink::{AppSink, AppSinkHandle, AppSinkStats, EndReason, Pulled};
 pub use appsrc::{AppSrc, AppSrcHandle, AppSrcStats};
 
 #[cfg(feature = "display")]

@@ -177,7 +177,9 @@ pub use transform::{
 };
 
 // App integration
-pub use app::{AppSink, AppSinkHandle, AppSinkStats, AppSrc, AppSrcHandle, AppSrcStats};
+pub use app::{
+    AppSink, AppSinkHandle, AppSinkStats, AppSrc, AppSrcHandle, AppSrcStats, EndReason, Pulled,
+};
 
 #[cfg(feature = "display")]
 pub use app::AutoVideoSink;

@@ -8,6 +8,65 @@ use crate::format::Caps;
 use std::fmt;
 use tokio::sync::broadcast;
 
+/// A pipeline failure, as seen by a downstream consumer.
+///
+/// Not an [`Error`](crate::error::Error), for two reasons. One failure fans out
+/// to every downstream branch and to the pipeline handle, so the report has to
+/// be `Clone`, and `Error` is not (`io::Error` and `DeviceError` block it). And
+/// the task that failed still has to hand the *owned*, typed `Error` back
+/// through its `JoinHandle`, which it could not do if the value had been moved
+/// into an `Arc` to be shared.
+///
+/// So the typed error still reaches [`PipelineHandle::wait`]; this is the
+/// shareable report of it, and it is strictly more than the bare strings the
+/// bus and event channel carried before.
+///
+/// [`PipelineHandle::wait`]: crate::pipeline::PipelineHandle::wait
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamError {
+    node: Option<String>,
+    message: String,
+}
+
+impl StreamError {
+    /// Report a failure from a named element.
+    pub fn new(node: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            node: Some(node.into()),
+            message: message.into(),
+        }
+    }
+
+    /// Report a failure with no element to attribute it to.
+    pub fn anonymous(message: impl Into<String>) -> Self {
+        Self {
+            node: None,
+            message: message.into(),
+        }
+    }
+
+    /// The element the failure came from, if known.
+    pub fn node(&self) -> Option<&str> {
+        self.node.as_deref()
+    }
+
+    /// What went wrong.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for StreamError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.node {
+            Some(node) => write!(f, "element '{node}': {}", self.message),
+            None => f.write_str(&self.message),
+        }
+    }
+}
+
+impl std::error::Error for StreamError {}
+
 /// Events emitted by the pipeline during execution.
 #[derive(Debug, Clone)]
 pub enum PipelineEvent {

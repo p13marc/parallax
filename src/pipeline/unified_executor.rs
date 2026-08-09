@@ -45,10 +45,12 @@ use crate::pipeline::rt_scheduler::{
 use crate::pipeline::tracer::TracerRegistry;
 use crate::pipeline::{
     DriverConfig, EventReceiver, EventSender, LinkPolicy, NodeId, Pipeline, PipelineEvent,
-    PipelineState, TimerDriver,
+    PipelineState, StreamError, TimerDriver,
 };
+use futures::FutureExt;
 use kanal::{AsyncReceiver, AsyncSender, bounded_async};
 use std::collections::{HashMap, HashSet};
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1311,6 +1313,10 @@ fn is_power_of_ten(mut n: u64) -> bool {
 enum Message {
     Buffer(Buffer),
     Eos,
+    /// An upstream element failed. Terminal, and never accompanied by an `Eos`
+    /// — sending both invites the receiver to record whichever arrives second
+    /// as the reason the stream ended.
+    Error(StreamError),
 }
 
 type ChannelKey = (NodeId, String, NodeId, String);
@@ -1333,15 +1339,22 @@ impl OutputBranch {
     ///
     /// kanal's `try_send` returns `Ok(false)` when the channel is **full** (not
     /// an error) and `Err` only when it is closed — easy to get backwards.
-    async fn send_buffer(&self, buffer: Buffer, tracers: &TracerRegistry) {
+    /// Returns `false` once the branch's receiver is gone.
+    ///
+    /// The result used to be discarded, and kanal reports a closed channel
+    /// *immediately* rather than blocking — so a source feeding a sink that had
+    /// died spun at 100% CPU producing into a closed channel until the handle
+    /// was dropped. Callers use this to stop.
+    async fn send_buffer(&self, buffer: Buffer, tracers: &TracerRegistry) -> bool {
         match self.policy {
-            LinkPolicy::Block => {
-                let _ = self.tx.send(Message::Buffer(buffer)).await;
-            }
+            LinkPolicy::Block => self.tx.send(Message::Buffer(buffer)).await.is_ok(),
             LinkPolicy::Drop => match self.tx.try_send(Message::Buffer(buffer)) {
-                Ok(true) => {}
-                Ok(false) => tracers.notify_drop(&self.sink_name),
-                Err(_) => {} // closed
+                Ok(true) => true,
+                Ok(false) => {
+                    tracers.notify_drop(&self.sink_name);
+                    true
+                }
+                Err(_) => false, // closed
             },
         }
     }
@@ -1353,17 +1366,19 @@ impl OutputBranch {
 /// sequential loop makes each branch wait for the ones before it, which shows up
 /// as latency skew between equal-speed branches. The single-output case — the
 /// overwhelmingly common one — takes a direct await and allocates nothing.
-async fn broadcast(branches: &[OutputBranch], buffer: Buffer, tracers: &TracerRegistry) {
+/// Returns `false` when every branch's receiver has gone away, so the producer
+/// can stop rather than spin. A pad with no branches at all counts as live.
+async fn broadcast(branches: &[OutputBranch], buffer: Buffer, tracers: &TracerRegistry) -> bool {
     match branches {
-        [] => {}
+        [] => true,
         [only] => only.send_buffer(buffer, tracers).await,
-        many => {
-            futures::future::join_all(
-                many.iter()
-                    .map(|branch| branch.send_buffer(buffer.clone(), tracers)),
-            )
-            .await;
-        }
+        many => futures::future::join_all(
+            many.iter()
+                .map(|branch| branch.send_buffer(buffer.clone(), tracers)),
+        )
+        .await
+        .into_iter()
+        .any(|connected| connected),
     }
 }
 
@@ -1374,6 +1389,44 @@ async fn broadcast(branches: &[OutputBranch], buffer: Buffer, tracers: &TracerRe
 async fn broadcast_eos(branches: &[OutputBranch]) {
     for branch in branches {
         let _ = branch.tx.send(Message::Eos).await;
+    }
+}
+
+/// Run an element call, converting a panic into an ordinary element error.
+///
+/// A panicking task used to be invisible: it never reached its own error arm,
+/// so it never told anything downstream, and every sink below it waited
+/// forever. Turning the panic into an `Err` at the call site means the arms
+/// that already know how to report and propagate a failure handle it — the
+/// pipeline reports `Error::Panic` naming the element, and consumers see
+/// `EndReason::Error` like any other failure.
+///
+/// `AssertUnwindSafe` is required because the element is `&mut`-borrowed across
+/// await points, and is sound here for a specific reason: every caller treats
+/// the `Err` as terminal, so the element is dropped rather than re-entered. The
+/// hazard `UnwindSafe` guards against — observing state left half-updated — is
+/// structurally excluded.
+///
+/// The default panic hook still runs, so the backtrace is printed as usual.
+async fn guard<T>(node: &str, call: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    match AssertUnwindSafe(call).catch_unwind().await {
+        Ok(result) => result,
+        Err(payload) => Err(Error::Panic {
+            node: node.to_owned(),
+            message: crate::error::panic_message(payload.as_ref()),
+        }),
+    }
+}
+
+/// Send a terminal error to every branch, **always blocking**.
+///
+/// Same reasoning as [`broadcast_eos`]: a dropped terminal message wedges the
+/// branch's sink. This is what makes a failed pipeline distinguishable from a
+/// finished one at the app boundary — the sink used to receive a plain EOS and
+/// report a clean end of stream.
+async fn broadcast_error(branches: &[OutputBranch], error: &StreamError) {
+    for branch in branches {
+        let _ = branch.tx.send(Message::Error(error.clone())).await;
     }
 }
 
@@ -1516,7 +1569,7 @@ fn spawn_source_task(
                 break;
             }
             tracing::trace!("source '{}': calling process_source", name);
-            match element.process_source().await {
+            match guard(&name, element.process_source()).await {
                 Ok(SourceResult::Buffer(buffer)) => {
                     let buffer = *buffer;
                     count += 1;
@@ -1537,9 +1590,20 @@ fn spawn_source_task(
                         count,
                         buffer.len()
                     );
-                    broadcast(&outputs, buffer.clone(), &tracers).await;
+                    let connected = broadcast(&outputs, buffer.clone(), &tracers).await;
                     for bridge in &output_bridges {
                         let _ = bridge.push_async(buffer.clone()).await;
+                    }
+                    if !connected && output_bridges.is_empty() {
+                        // Every downstream receiver is gone (a sink failed, or
+                        // the pipeline is being torn down). Producing further
+                        // buffers would be a busy loop into a closed channel.
+                        tracing::info!(
+                            "source '{}': downstream is gone after {} buffers, stopping",
+                            name,
+                            count
+                        );
+                        break;
                     }
                 }
                 Ok(SourceResult::WouldBlock) => {
@@ -1565,12 +1629,13 @@ fn spawn_source_task(
                 Err(e) => {
                     tracing::error!("source '{}': error: {}", name, e);
                     events.send_error(e.to_string(), Some(name.clone()));
-                    // A failed source will never produce again — propagate EOS
-                    // downstream (like the Eos arm) so sinks terminate instead
-                    // of waiting forever on a wedged pipeline.
-                    broadcast_eos(&outputs).await;
+                    // A failed source will never produce again. Downstream gets
+                    // the reason: this used to send a plain EOS, which a sink
+                    // could not tell apart from the stream simply ending.
+                    let err = StreamError::new(&name, e.to_string());
+                    broadcast_error(&outputs, &err).await;
                     for bridge in &output_bridges {
-                        bridge.signal_eos();
+                        bridge.signal_error(err.clone());
                     }
                     return Err(e);
                 }
@@ -1614,7 +1679,7 @@ fn spawn_sink_task(
                             _ => {}
                         }
                         tracers.notify_buffer(&name, &buffer);
-                        if let Err(e) = element.process(Some(buffer)).await {
+                        if let Err(e) = guard(&name, element.process(Some(buffer))).await {
                             events.send_error(e.to_string(), Some(name.clone()));
                             return Err(e);
                         }
@@ -1627,7 +1692,17 @@ fn spawn_sink_task(
                         let _ = element.handle_downstream_event(crate::event::Event::Eos);
                         break;
                     }
+                    Ok(Message::Error(err)) => {
+                        // The whole point of #85: the consumer learns the
+                        // pipeline *failed*, not that the stream ended.
+                        tracing::error!("sink '{}': upstream failed: {}", name, err);
+                        let _ = element.handle_downstream_event(crate::event::Event::Error(err));
+                        break;
+                    }
                     Err(e) => {
+                        // Upstream now sends a terminal message before dropping
+                        // its sender, so a bare close means the pipeline was
+                        // aborted rather than that it ended.
                         tracing::debug!("sink '{}': channel closed after {}: {}", name, count, e);
                         let _ = element.handle_downstream_event(crate::event::Event::Eos);
                         break;
@@ -1646,7 +1721,7 @@ fn spawn_sink_task(
                         _ => {}
                     }
                     tracers.notify_buffer(&name, &buffer);
-                    let result = element.process(Some(buffer)).await;
+                    let result = guard(&name, element.process(Some(buffer))).await;
                     tracers.notify_buffer_processed(&name);
                     if let Err(e) = result {
                         events.send_error(e.to_string(), Some(name.clone()));
@@ -1655,8 +1730,20 @@ fn spawn_sink_task(
                 }
                 // Check if we're done (EOS + empty)
                 if bridge.is_done() {
-                    tracing::info!("sink '{}': bridge EOS after {} buffers", name, count);
-                    let _ = element.handle_downstream_event(crate::event::Event::Eos);
+                    // Same distinction as the channel path: an RT producer that
+                    // failed left a reason on the bridge, and reporting a clean
+                    // EOS instead would re-hide it for hybrid pipelines.
+                    let event = match bridge.take_error() {
+                        Some(err) => {
+                            tracing::error!("sink '{}': upstream RT failed: {}", name, err);
+                            crate::event::Event::Error(err)
+                        }
+                        None => {
+                            tracing::info!("sink '{}': bridge EOS after {} buffers", name, count);
+                            crate::event::Event::Eos
+                        }
+                    };
+                    let _ = element.handle_downstream_event(event);
                     break;
                 }
                 // Wait for more data or EOS signal
@@ -1718,6 +1805,18 @@ fn spawn_transform_task(
             }
         }
 
+        /// Helper to send a terminal error downstream, in place of EOS.
+        async fn send_error(
+            outputs: &[OutputBranch],
+            output_bridges: &[Arc<AsyncRtBridge>],
+            error: &StreamError,
+        ) {
+            broadcast_error(outputs, error).await;
+            for bridge in output_bridges {
+                bridge.signal_error(error.clone());
+            }
+        }
+
         if let Some(rx) = inputs.into_iter().next() {
             // Standard path: read from kanal channel
             loop {
@@ -1744,7 +1843,7 @@ fn spawn_transform_task(
                         // send().await sits between them and back-pressure gets
                         // billed as this element's processing time.
                         tracers.notify_buffer(&name, &buffer);
-                        let result = element.process(Some(buffer)).await;
+                        let result = guard(&name, element.process(Some(buffer))).await;
                         tracers.notify_buffer_processed(&name);
 
                         match result {
@@ -1779,12 +1878,21 @@ fn spawn_transform_task(
                             Err(e) => {
                                 tracing::error!("transform '{}': error: {}", name, e);
                                 events.send_error(e.to_string(), Some(name.clone()));
-                                // A failed transform stops processing — propagate
-                                // EOS downstream so sinks terminate cleanly.
-                                send_eos(&outputs, &output_bridges).await;
+                                // A failed transform stops processing. Downstream
+                                // gets the *reason*, not a bare EOS that would
+                                // read as a clean end of stream.
+                                let err = StreamError::new(&name, e.to_string());
+                                send_error(&outputs, &output_bridges, &err).await;
                                 return Err(e);
                             }
                         }
+                    }
+                    Ok(Message::Error(err)) => {
+                        // Terminal: pass the reason on rather than flushing and
+                        // reporting a clean end.
+                        tracing::error!("transform '{}': upstream failed: {}", name, err);
+                        send_error(&outputs, &output_bridges, &err).await;
+                        break;
                     }
                     Ok(Message::Eos) => {
                         tracing::info!(
@@ -1793,7 +1901,7 @@ fn spawn_transform_task(
                             count
                         );
                         // Flush any buffered data before propagating EOS
-                        match element.flush().await {
+                        match guard(&name, element.flush()).await {
                             Ok(output) => {
                                 let buffers = match output {
                                     Output::None => vec![],
@@ -1840,7 +1948,7 @@ fn spawn_transform_task(
                     }
 
                     tracers.notify_buffer(&name, &buffer);
-                    let result = element.process(Some(buffer)).await;
+                    let result = guard(&name, element.process(Some(buffer))).await;
                     tracers.notify_buffer_processed(&name);
 
                     match result {
@@ -1859,13 +1967,17 @@ fn spawn_transform_task(
                         }
                         Err(e) => {
                             events.send_error(e.to_string(), Some(name.clone()));
+                            // This arm used to return without telling anyone
+                            // downstream, so every sink below it hung.
+                            let err = StreamError::new(&name, e.to_string());
+                            send_error(&outputs, &output_bridges, &err).await;
                             return Err(e);
                         }
                     }
                 }
                 if bridge.is_done() {
                     // Flush
-                    match element.flush().await {
+                    match guard(&name, element.flush()).await {
                         Ok(output) => {
                             let buffers = match output {
                                 Output::None => vec![],
@@ -1880,7 +1992,10 @@ fn spawn_transform_task(
                             tracing::warn!("flush error in '{}': {}", name, e);
                         }
                     }
-                    send_eos(&outputs, &output_bridges).await;
+                    match bridge.take_error() {
+                        Some(err) => send_error(&outputs, &output_bridges, &err).await,
+                        None => send_eos(&outputs, &output_bridges).await,
+                    }
                     break;
                 }
                 match bridge.data_eventfd().wait_async().await {
@@ -1933,7 +2048,7 @@ fn spawn_demuxer_task(
                         // broadcast, or downstream back-pressure is billed as
                         // demux time.
                         tracers.notify_buffer(&name, &buffer);
-                        let result = element.process(Some(buffer)).await;
+                        let result = guard(&name, element.process(Some(buffer))).await;
                         tracers.notify_buffer_processed(&name);
 
                         match result {
@@ -1949,13 +2064,26 @@ fn spawn_demuxer_task(
                             Ok(None) => {}
                             Err(e) => {
                                 events.send_error(e.to_string(), Some(name.clone()));
+                                // Used to return without telling any of the
+                                // output pads, so every branch below hung.
+                                let err = StreamError::new(&name, e.to_string());
+                                for branches in outputs_by_pad.values() {
+                                    broadcast_error(branches, &err).await;
+                                }
                                 return Err(e);
                             }
                         }
                     }
+                    Ok(Message::Error(err)) => {
+                        tracing::error!("demuxer '{}': upstream failed: {}", name, err);
+                        for branches in outputs_by_pad.values() {
+                            broadcast_error(branches, &err).await;
+                        }
+                        break;
+                    }
                     Ok(Message::Eos) | Err(_) => {
                         // Flush any buffered data before propagating EOS
-                        match element.flush().await {
+                        match guard(&name, element.flush()).await {
                             Ok(output) => {
                                 let buffers = match output {
                                     Output::None => vec![],
@@ -2061,7 +2189,7 @@ fn spawn_muxer_task(
                     // what makes "how long is this muxer taking" answerable at
                     // all. It previously had no instrumentation whatsoever.
                     tracers.notify_buffer(&name, &buffer);
-                    let result = element.process(Some(buffer)).await;
+                    let result = guard(&name, element.process(Some(buffer))).await;
                     tracers.notify_buffer_processed(&name);
 
                     match result {
@@ -2075,19 +2203,31 @@ fn spawn_muxer_task(
                         Ok(None) => {}
                         Err(e) => {
                             events.send_error(e.to_string(), Some(name.clone()));
+                            // Used to return without telling the output, so the
+                            // sink below hung.
+                            let err = StreamError::new(&name, e.to_string());
+                            broadcast_error(&outputs, &err).await;
                             return Err(e);
                         }
                     }
+                }
+                Ok(Message::Error(err)) => {
+                    // One failed input dooms the muxed stream: the output would
+                    // be missing a track from here on. Pass the reason on
+                    // immediately rather than waiting for the other inputs.
+                    tracing::error!("muxer '{}': an input failed: {}", name, err);
+                    broadcast_error(&outputs, &err).await;
+                    break;
                 }
                 Ok(Message::Eos) | Err(_) => {
                     eos_count += 1;
                     if eos_count >= total {
                         // Flush any remaining data from final processing
-                        if let Ok(Some(out)) = element.process(None).await {
+                        if let Ok(Some(out)) = guard(&name, element.process(None)).await {
                             broadcast(&outputs, out, &tracers).await;
                         }
                         // Flush any buffered data before propagating EOS
-                        match element.flush().await {
+                        match guard(&name, element.flush()).await {
                             Ok(output) => {
                                 let buffers = match output {
                                     Output::None => vec![],

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use parallax::buffer::{Buffer, MemoryHandle};
 use parallax::element::{ProduceContext, ProduceResult, Source};
-use parallax::elements::{AppSink, AppSinkHandle};
+use parallax::elements::{AppSink, AppSinkHandle, EndReason};
 use parallax::error::{Error, Result};
 use parallax::memory::SharedArena;
 use parallax::metadata::Metadata;
@@ -55,15 +55,29 @@ impl Source for InfiniteSource {
     }
 }
 
+/// Wait for the sink to learn the stream ended, and assert it ended cleanly.
+///
+/// `end_reason()`, not `ended()`: nobody pulls in these tests, so the queue
+/// never drains and `ended()` — which waits for that, so a `select!` consumer
+/// loses nothing — would never fire. Knowing *that* it stopped and waiting
+/// until everything has been consumed are different questions.
 async fn wait_for_eos(handle: &AppSinkHandle, what: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !handle.is_eos() {
+    let reason = loop {
+        if let Some(reason) = handle.end_reason() {
+            break reason;
+        }
         assert!(
             Instant::now() < deadline,
-            "sink never reached EOS after {what}"
+            "sink never terminated after {what}"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    };
+    assert_eq!(
+        reason,
+        EndReason::Eos,
+        "a cooperative stop should read as a clean end of stream"
+    );
 }
 
 /// Assert the source's produce loop goes quiet within a bound.

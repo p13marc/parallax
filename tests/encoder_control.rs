@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use parallax::buffer::{Buffer, MemoryHandle};
 use parallax::control::Controllable;
-use parallax::elements::app::{AppSink, AppSrc};
+use parallax::elements::app::{AppSink, AppSrc, Pulled};
 use parallax::elements::codec::{H264Decoder, H264Encoder, H264EncoderConfig, RateControlMode};
 use parallax::elements::transform::VideoScale;
 use parallax::format::PixelFormat;
@@ -139,7 +139,7 @@ async fn bitrate_and_resolution_change_on_a_running_pipeline() {
     handle.wait().await.unwrap();
 
     let mut outputs = Vec::new();
-    while let Some(buffer) = sink_handle.try_pull_buffer() {
+    while let Pulled::Buffer(buffer) = sink_handle.try_pull_buffer() {
         outputs.push(buffer);
     }
     assert_eq!(outputs.len(), 20, "one encoded frame per input frame");
@@ -232,7 +232,7 @@ async fn resolution_can_be_lowered_and_restored_while_running() {
     handle.wait().await.unwrap();
 
     let mut outputs = Vec::new();
-    while let Some(buffer) = sink_handle.try_pull_buffer() {
+    while let Pulled::Buffer(buffer) = sink_handle.try_pull_buffer() {
         outputs.push(buffer);
     }
     assert_eq!(outputs.len(), 3);
@@ -293,7 +293,7 @@ async fn run_with_change(
     handle.wait().await.unwrap();
 
     let mut outputs = Vec::new();
-    while let Some(buffer) = sink_handle.try_pull_buffer() {
+    while let Pulled::Buffer(buffer) = sink_handle.try_pull_buffer() {
         outputs.push(buffer);
     }
     outputs
@@ -453,7 +453,7 @@ async fn encoder_stats_are_readable_on_a_running_pipeline() {
 
 fn sink_handle_total(sink: &parallax::elements::app::AppSinkHandle) -> u64 {
     let mut total = 0;
-    while let Some(buffer) = sink.try_pull_buffer() {
+    while let Pulled::Buffer(buffer) = sink.try_pull_buffer() {
         total += buffer.as_bytes().len() as u64;
     }
     total

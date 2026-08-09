@@ -5,10 +5,71 @@
 use crate::buffer::Buffer;
 use crate::element::{ConsumeContext, Sink};
 use crate::error::{Error, Result};
+use crate::pipeline::StreamError;
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
+
+/// Why a stream ended.
+///
+/// Terminal and sticky: the first reason recorded is the one reported, so a
+/// clean EOS arriving after a failure cannot paper over it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EndReason {
+    /// Every upstream source ran to completion.
+    Eos,
+    /// An element failed. No more buffers are coming.
+    Error(StreamError),
+    /// The pipeline was torn down mid-stream.
+    ///
+    /// Only [`PipelineHandle::ended`] produces this; an `AppSink` never sees it,
+    /// because an aborted task cannot deliver anything.
+    ///
+    /// [`PipelineHandle::ended`]: crate::pipeline::PipelineHandle
+    Aborted,
+}
+
+/// The outcome of a pull. Every way one can end, named.
+///
+/// This exists because `Ok(None)` used to mean three different things — timed
+/// out, ended cleanly, and died — and a consumer could not tell them apart
+/// without polling a side channel.
+#[derive(Debug)]
+// Intentional, and the same trade the executor's `Message` enum makes: boxing
+// the buffer would put an allocation on the pull path, which every delivered
+// frame goes through, to shrink the three outcomes nobody returns in a loop.
+#[allow(clippy::large_enum_variant)]
+pub enum Pulled {
+    /// A buffer was dequeued.
+    Buffer(Buffer),
+    /// Nothing available *yet*; the stream is still live.
+    ///
+    /// [`try_pull_buffer`](AppSinkHandle::try_pull_buffer) returns this
+    /// immediately on an empty queue; the `_timeout` forms return it when the
+    /// timeout expired. The blocking and async forms without a timeout never do.
+    Empty,
+    /// The handle is flushing. Not terminal — turn flushing off and pull again.
+    Flushing,
+    /// The stream is over *and* the queue is drained. Sticky: every later pull
+    /// returns the same reason.
+    Ended(EndReason),
+}
+
+impl Pulled {
+    /// The buffer, if there was one.
+    pub fn buffer(self) -> Option<Buffer> {
+        match self {
+            Pulled::Buffer(b) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// Whether this outcome is terminal.
+    pub fn is_ended(&self) -> bool {
+        matches!(self, Pulled::Ended(_))
+    }
+}
 
 /// A sink element that allows applications to extract buffers from a pipeline.
 ///
@@ -79,7 +140,8 @@ fn wait_ok<T>(result: std::sync::LockResult<T>) -> T {
 struct AppSinkState {
     queue: VecDeque<Buffer>,
     max_buffers: usize,
-    eos: bool,
+    /// Why the stream ended, once it has. First writer wins.
+    end: Option<EndReason>,
     flushing: bool,
     drop_on_full: bool,
     total_received: u64,
@@ -109,7 +171,7 @@ impl AppSink {
                 state: Mutex::new(AppSinkState {
                     queue: VecDeque::with_capacity(max_buffers.min(256)),
                     max_buffers,
-                    eos: false,
+                    end: None,
                     flushing: false,
                     drop_on_full: false,
                     total_received: 0,
@@ -150,9 +212,14 @@ impl AppSink {
         self.inner.lock().queue.len()
     }
 
-    /// Check if end-of-stream has been received.
-    pub fn is_eos(&self) -> bool {
-        self.inner.lock().eos
+    /// Whether the stream has ended, for any reason.
+    pub fn is_ended(&self) -> bool {
+        self.inner.lock().end.is_some()
+    }
+
+    /// Why the stream ended, or `None` while it is still live.
+    pub fn end_reason(&self) -> Option<EndReason> {
+        self.inner.lock().end.clone()
     }
 
     /// Get statistics.
@@ -163,14 +230,32 @@ impl AppSink {
             total_received: state.total_received,
             total_pulled: state.total_pulled,
             total_dropped: state.total_dropped,
-            eos: state.eos,
+            ended: state.end.is_some(),
         }
     }
 
-    /// Signal end of stream from the pipeline side.
+    /// Signal a clean end of stream from the pipeline side.
     pub fn send_eos(&self) {
+        self.end(EndReason::Eos);
+    }
+
+    /// Signal that the pipeline failed.
+    ///
+    /// Consumers see [`Pulled::Ended(EndReason::Error(..))`](Pulled::Ended)
+    /// once the queue drains — buffers already delivered are still valid and
+    /// are handed over first.
+    pub fn send_error(&self, error: StreamError) {
+        self.end(EndReason::Error(error));
+    }
+
+    /// Record the terminal reason. The first one wins: an EOS arriving after a
+    /// failure must not overwrite why it really stopped.
+    fn end(&self, reason: EndReason) {
         let mut state = self.inner.lock();
-        state.eos = true;
+        if state.end.is_none() {
+            state.end = Some(reason);
+        }
+        drop(state);
         self.inner.data_available.notify_all();
         self.inner.data_available_async.notify_waiters();
     }
@@ -230,8 +315,10 @@ impl Sink for AppSink {
         // Pipeline EOS (including a source/transform error upstream, which the
         // executor converts to EOS) must reach consumers blocked on
         // `pull_buffer` — flip the handle-visible EOS flag.
-        if matches!(event, crate::event::Event::Eos) {
-            self.send_eos();
+        match &event {
+            crate::event::Event::Eos => self.send_eos(),
+            crate::event::Event::Error(err) => self.send_error(err.clone()),
+            _ => {}
         }
         Some(event)
     }
@@ -245,27 +332,16 @@ impl AppSinkHandle {
     /// parking the thread, so a consumer can `select!` over it. From a plain
     /// thread, use [`pull_buffer_blocking`](Self::pull_buffer_blocking).
     ///
-    /// Returns `Ok(None)` at EOS with an empty queue.
-    pub async fn pull_buffer(&self) -> Result<Option<Buffer>> {
+    /// Never returns [`Pulled::Empty`]: with no timeout there is nothing to
+    /// give up on.
+    pub async fn pull_buffer(&self) -> Pulled {
         loop {
             // Register for the wakeup *before* looking at the queue, or a push
             // landing between the check and the await would be missed.
             let notified = self.inner.data_available_async.notified();
 
-            {
-                let mut state = self.inner.lock();
-                if state.flushing {
-                    return Err(Error::Element("appsink is flushing".into()));
-                }
-                if let Some(buffer) = state.queue.pop_front() {
-                    state.total_pulled += 1;
-                    self.inner.space_available.notify_one();
-                    self.inner.space_available_async.notify_one();
-                    return Ok(Some(buffer));
-                }
-                if state.eos {
-                    return Ok(None);
-                }
+            if let Some(outcome) = self.take_or_end() {
+                return outcome;
             }
 
             notified.await;
@@ -274,11 +350,13 @@ impl AppSinkHandle {
 
     /// Pull a buffer, giving up after `timeout`.
     ///
-    /// Returns `Ok(None)` on timeout or at EOS.
-    pub async fn pull_buffer_timeout(&self, timeout: Duration) -> Result<Option<Buffer>> {
+    /// [`Pulled::Empty`] means the timeout expired and the stream is still
+    /// live; [`Pulled::Ended`] means it is over. Telling those two apart is the
+    /// whole point — they used to both be `Ok(None)`.
+    pub async fn pull_buffer_timeout(&self, timeout: Duration) -> Pulled {
         match tokio::time::timeout(timeout, self.pull_buffer()).await {
-            Ok(result) => result,
-            Err(_) => Ok(None),
+            Ok(outcome) => outcome,
+            Err(_) => Pulled::Empty,
         }
     }
 
@@ -287,48 +365,138 @@ impl AppSinkHandle {
     /// The blocking twin of [`pull_buffer`](Self::pull_buffer), for consumers
     /// that live on a plain thread. Never call it from inside a tokio runtime —
     /// it parks the worker.
-    ///
-    /// Returns `Ok(None)` when EOS is reached and no more buffers are available.
-    pub fn pull_buffer_blocking(&self) -> Result<Option<Buffer>> {
+    pub fn pull_buffer_blocking(&self) -> Pulled {
         self.pull_wait(None)
     }
 
     /// Pull a buffer on a plain thread, giving up after `timeout`.
-    ///
-    /// Returns `Ok(None)` on timeout or EOS.
-    pub fn pull_buffer_timeout_blocking(&self, timeout: Duration) -> Result<Option<Buffer>> {
+    pub fn pull_buffer_timeout_blocking(&self, timeout: Duration) -> Pulled {
         self.pull_wait(Some(timeout))
     }
 
-    /// The one blocking wait both `_blocking` forms share.
-    fn pull_wait(&self, timeout: Option<Duration>) -> Result<Option<Buffer>> {
+    /// Take the head of the queue, or report a terminal state.
+    ///
+    /// `None` means "nothing yet, but still live" — the caller should wait.
+    /// Note the ordering: queued buffers are handed over *before* the end is
+    /// reported, because buffers that arrived before an element died are still
+    /// perfectly good.
+    fn take_or_end(&self) -> Option<Pulled> {
         let mut state = self.inner.lock();
-
-        // Wait for data
-        while state.queue.is_empty() && !state.eos && !state.flushing {
-            state = if let Some(t) = timeout {
-                let (s, result) = wait_ok(self.inner.data_available.wait_timeout(state, t));
-                if result.timed_out() {
-                    return Ok(None);
-                }
-                s
-            } else {
-                wait_ok(self.inner.data_available.wait(state))
-            };
-        }
-
         if state.flushing {
-            return Err(Error::Element("appsink is flushing".into()));
+            return Some(Pulled::Flushing);
         }
-
         if let Some(buffer) = state.queue.pop_front() {
             state.total_pulled += 1;
+            let drained = state.queue.is_empty() && state.end.is_some();
+            drop(state);
             self.inner.space_available.notify_one();
             self.inner.space_available_async.notify_one();
-            Ok(Some(buffer))
-        } else {
-            Ok(None)
+            if drained {
+                // That was the last one: wake anyone waiting on `ended()`.
+                self.inner.data_available.notify_all();
+                self.inner.data_available_async.notify_waiters();
+            }
+            return Some(Pulled::Buffer(buffer));
         }
+        state.end.clone().map(Pulled::Ended)
+    }
+
+    /// The one blocking wait both `_blocking` forms share.
+    fn pull_wait(&self, timeout: Option<Duration>) -> Pulled {
+        let deadline = timeout.map(|t| std::time::Instant::now() + t);
+
+        loop {
+            {
+                let state = self.inner.lock();
+                if !state.flushing && state.queue.is_empty() && state.end.is_none() {
+                    // Nothing to report yet — wait below, still holding nothing.
+                    let remaining = match deadline {
+                        Some(d) => match d.checked_duration_since(std::time::Instant::now()) {
+                            Some(r) if !r.is_zero() => Some(r),
+                            _ => return Pulled::Empty,
+                        },
+                        None => None,
+                    };
+                    let state = match remaining {
+                        Some(r) => {
+                            let (s, result) =
+                                wait_ok(self.inner.data_available.wait_timeout(state, r));
+                            if result.timed_out()
+                                && s.queue.is_empty()
+                                && s.end.is_none()
+                                && !s.flushing
+                            {
+                                return Pulled::Empty;
+                            }
+                            s
+                        }
+                        None => wait_ok(self.inner.data_available.wait(state)),
+                    };
+                    drop(state);
+                    continue;
+                }
+            }
+
+            if let Some(outcome) = self.take_or_end() {
+                return outcome;
+            }
+        }
+    }
+
+    /// Wait until the stream has ended **and** the queue is drained.
+    ///
+    /// Resolves exactly when a pull would return [`Pulled::Ended`], which is
+    /// what makes this safe to `select!` against [`pull_buffer`](Self::pull_buffer)
+    /// without losing buffers:
+    ///
+    /// ```rust,ignore
+    /// loop {
+    ///     tokio::select! {
+    ///         Pulled::Buffer(b) = sink.pull_buffer() => handle(b),
+    ///         reason = sink.ended() => break reason,
+    ///         _ = shutdown.cancelled() => break EndReason::Aborted,
+    ///     }
+    /// }
+    /// ```
+    pub async fn ended(&self) -> EndReason {
+        loop {
+            let notified = self.inner.data_available_async.notified();
+            {
+                let state = self.inner.lock();
+                if state.queue.is_empty()
+                    && let Some(reason) = state.end.clone()
+                {
+                    return reason;
+                }
+            }
+            notified.await;
+        }
+    }
+
+    /// The blocking twin of [`ended`](Self::ended).
+    pub fn ended_blocking(&self) -> EndReason {
+        let mut state = self.inner.lock();
+        loop {
+            if state.queue.is_empty()
+                && let Some(reason) = state.end.clone()
+            {
+                return reason;
+            }
+            state = wait_ok(self.inner.data_available.wait(state));
+        }
+    }
+
+    /// Why the stream ended, without waiting for the queue to drain.
+    ///
+    /// `Some` as soon as the reason is known, even with buffers still queued —
+    /// use it to react early; use [`ended`](Self::ended) to wait for the drain.
+    pub fn end_reason(&self) -> Option<EndReason> {
+        self.inner.lock().end.clone()
+    }
+
+    /// Whether the terminal reason is known yet.
+    pub fn is_ended(&self) -> bool {
+        self.inner.lock().end.is_some()
     }
 
     /// Statistics for this sink.
@@ -344,22 +512,17 @@ impl AppSinkHandle {
             total_received: state.total_received,
             total_pulled: state.total_pulled,
             total_dropped: state.total_dropped,
-            eos: state.eos,
+            ended: state.end.is_some(),
         }
     }
 
-    /// Try to pull a buffer without blocking.
-    pub fn try_pull_buffer(&self) -> Option<Buffer> {
-        let mut state = self.inner.lock();
-
-        if let Some(buffer) = state.queue.pop_front() {
-            state.total_pulled += 1;
-            self.inner.space_available.notify_one();
-            self.inner.space_available_async.notify_one();
-            Some(buffer)
-        } else {
-            None
-        }
+    /// Take a buffer if one is queued, without waiting.
+    ///
+    /// Returns [`Pulled::Empty`] when the queue is empty but the stream is
+    /// still live, and [`Pulled::Ended`] when it is over — a distinction the
+    /// old bare `Option<Buffer>` could not express at all.
+    pub fn try_pull_buffer(&self) -> Pulled {
+        self.take_or_end().unwrap_or(Pulled::Empty)
     }
 
     /// Set flushing mode.
@@ -378,18 +541,18 @@ impl AppSinkHandle {
     pub fn clear(&self) {
         let mut state = self.inner.lock();
         state.queue.clear();
+        drop(state);
         self.inner.space_available.notify_all();
         self.inner.space_available_async.notify_waiters();
+        // A clear can be what drains the last buffer, so `ended()` waiters need
+        // the same nudge a final pull would have given them.
+        self.inner.data_available.notify_all();
+        self.inner.data_available_async.notify_waiters();
     }
 
     /// Get the current queue length.
     pub fn queue_len(&self) -> usize {
         self.inner.lock().queue.len()
-    }
-
-    /// Check if EOS has been reached.
-    pub fn is_eos(&self) -> bool {
-        self.inner.lock().eos
     }
 
     /// Check if there are buffers available.
@@ -409,8 +572,9 @@ pub struct AppSinkStats {
     pub total_pulled: u64,
     /// Total buffers dropped (when drop_on_full is enabled).
     pub total_dropped: u64,
-    /// Whether EOS has been received.
-    pub eos: bool,
+    /// Whether the stream has ended, for any reason. The reason itself lives
+    /// on [`AppSinkHandle::end_reason`].
+    pub ended: bool,
 }
 
 #[cfg(test)]
@@ -438,7 +602,7 @@ mod tests {
     fn test_appsink_creation() {
         let sink = AppSink::new();
         assert_eq!(sink.queue_len(), 0);
-        assert!(!sink.is_eos());
+        assert!(!sink.is_ended());
     }
 
     #[test]
@@ -458,15 +622,15 @@ mod tests {
 
         let buf = handle
             .pull_buffer_timeout_blocking(Duration::from_millis(100))
-            .unwrap();
-        assert!(buf.is_some());
-        assert_eq!(buf.unwrap().metadata().sequence, 0);
+            .buffer()
+            .expect("first buffer");
+        assert_eq!(buf.metadata().sequence, 0);
 
         let buf = handle
             .pull_buffer_timeout_blocking(Duration::from_millis(100))
-            .unwrap();
-        assert!(buf.is_some());
-        assert_eq!(buf.unwrap().metadata().sequence, 1);
+            .buffer()
+            .expect("second buffer");
+        assert_eq!(buf.metadata().sequence, 1);
     }
 
     #[test]
@@ -479,15 +643,16 @@ mod tests {
         sink.consume(&ctx0).unwrap();
         sink.send_eos();
 
-        assert!(sink.is_eos());
+        assert!(sink.is_ended());
 
-        // Should still get the buffered data
-        let buf = handle.pull_buffer_blocking().unwrap();
-        assert!(buf.is_some());
+        // Buffers queued before the end are still valid and come first.
+        assert!(matches!(handle.pull_buffer_blocking(), Pulled::Buffer(_)));
 
-        // Now should get None for EOS
-        let buf = handle.pull_buffer_blocking().unwrap();
-        assert!(buf.is_none());
+        // Only once drained does the end get reported.
+        assert!(matches!(
+            handle.pull_buffer_blocking(),
+            Pulled::Ended(EndReason::Eos)
+        ));
     }
 
     #[test]
@@ -495,16 +660,14 @@ mod tests {
         let mut sink = AppSink::new();
         let handle = sink.handle();
 
-        // No data - should return None immediately
-        assert!(handle.try_pull_buffer().is_none());
+        // Empty but live — distinct from ended, which is the whole point.
+        assert!(matches!(handle.try_pull_buffer(), Pulled::Empty));
 
         let buf0 = create_test_buffer(0);
         let ctx0 = ConsumeContext::new(&buf0);
         sink.consume(&ctx0).unwrap();
 
-        // Now should get data
-        let buf = handle.try_pull_buffer();
-        assert!(buf.is_some());
+        assert!(matches!(handle.try_pull_buffer(), Pulled::Buffer(_)));
     }
 
     #[test]
@@ -542,7 +705,7 @@ mod tests {
         });
 
         let mut received = Vec::new();
-        while let Ok(Some(buf)) = handle.pull_buffer_blocking() {
+        while let Pulled::Buffer(buf) = handle.pull_buffer_blocking() {
             received.push(buf.metadata().sequence);
         }
 
@@ -603,12 +766,12 @@ mod tests {
         let ctx = ConsumeContext::new(&buf);
         sink.consume(&ctx).unwrap();
 
-        let pulled = pull.await.unwrap().unwrap().expect("a buffer");
+        let pulled = pull.await.unwrap().buffer().expect("a buffer");
         assert_eq!(pulled.metadata().sequence, 7);
     }
 
     #[tokio::test]
-    async fn pull_buffer_returns_none_at_eos() {
+    async fn pull_buffer_reports_eos_as_a_reason() {
         let sink = AppSink::new();
         let handle = sink.handle();
 
@@ -616,7 +779,7 @@ mod tests {
         tokio::task::yield_now().await;
 
         sink.send_eos();
-        assert!(pull.await.unwrap().unwrap().is_none());
+        assert!(matches!(pull.await.unwrap(), Pulled::Ended(EndReason::Eos)));
     }
 
     #[tokio::test]
@@ -624,13 +787,10 @@ mod tests {
         let sink = AppSink::new();
         let handle = sink.handle();
 
-        let result = handle
-            .pull_buffer_timeout(Duration::from_millis(20))
-            .await
-            .unwrap();
+        let result = handle.pull_buffer_timeout(Duration::from_millis(20)).await;
         assert!(
-            result.is_none(),
-            "no data and no EOS: time out, do not hang"
+            matches!(result, Pulled::Empty),
+            "a timeout is not an end of stream: got {result:?}"
         );
     }
 
@@ -674,8 +834,8 @@ mod tests {
 
         // Every one of these used to panic.
         assert_eq!(handle.queue_len(), 0);
-        assert!(!handle.is_eos());
-        assert!(handle.try_pull_buffer().is_none());
+        assert!(!handle.is_ended());
+        assert!(matches!(handle.try_pull_buffer(), Pulled::Empty));
         let _ = handle.stats();
         handle.set_flushing(true);
         handle.set_flushing(false);

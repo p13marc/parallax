@@ -10,7 +10,7 @@
 //! Run: `cargo run --example 06_appsrc`
 
 use parallax::buffer::{Buffer, MemoryHandle};
-use parallax::elements::{AppSink, AppSrc};
+use parallax::elements::{AppSink, AppSrc, EndReason, Pulled};
 use parallax::error::Result;
 use parallax::memory::SharedArena;
 use parallax::metadata::Metadata;
@@ -64,19 +64,28 @@ async fn main() -> Result<()> {
     // Spawn consumer thread
     let consumer = thread::spawn(move || {
         loop {
+            // Every way a pull can end has a name, so the consumer can react
+            // to each one differently instead of guessing what `None` meant.
             match sink_handle.pull_buffer_blocking() {
-                Ok(Some(buffer)) => {
+                Pulled::Buffer(buffer) => {
                     let text = std::str::from_utf8(buffer.as_bytes()).unwrap_or("<invalid>");
                     println!("[Consumer] Received: {}", text);
                 }
-                Ok(None) => {
-                    println!("[Consumer] Got EOS");
+                Pulled::Ended(EndReason::Eos) => {
+                    println!("[Consumer] Stream ended cleanly");
                     break;
                 }
-                Err(e) => {
-                    println!("[Consumer] Error: {}", e);
+                Pulled::Ended(EndReason::Error(err)) => {
+                    println!("[Consumer] Pipeline failed: {err}");
                     break;
                 }
+                Pulled::Ended(EndReason::Aborted) => {
+                    println!("[Consumer] Pipeline aborted");
+                    break;
+                }
+                // The blocking pull has no timeout, so neither of these can
+                // happen here; a `_timeout` variant would return Empty.
+                Pulled::Empty | Pulled::Flushing => continue,
             }
         }
     });

@@ -27,8 +27,52 @@ For the element *trait system* (how to write your own), see [getting-started.md]
 | Element | Description |
 |---------|-------------|
 | `AppSrc` (+ `AppSrcHandle`) | Push buffers from application code into a pipeline |
-| `AppSink` (+ `AppSinkHandle`) | Pull buffers out of a pipeline into application code |
+| `AppSink` (+ `AppSinkHandle`) | Pull buffers out of a pipeline into application code — see [Reading the end of a stream](#reading-the-end-of-a-stream) |
 | `AutoVideoSink` `[display]` | Display video in a window (winit + softbuffer); frame dimensions from per-buffer `width`/`height` metadata when present, else guessed from RGBA buffer size |
+
+### Reading the end of a stream
+
+A pull returns a `Pulled`, not an `Option`, because there are four distinct ways
+one can end and a consumer needs to act differently on each:
+
+```rust,ignore
+match handle.pull_buffer_timeout(Duration::from_millis(100)).await {
+    Pulled::Buffer(buf) => process(buf),
+    Pulled::Empty      => {}                    // timed out; the stream is still live
+    Pulled::Flushing   => {}                    // app-initiated, recoverable
+    Pulled::Ended(EndReason::Eos)        => break,
+    Pulled::Ended(EndReason::Error(err)) => return Err(err),
+}
+```
+
+`EndReason` is sticky and first-writer-wins, so a clean EOS arriving after a
+failure cannot hide it. Buffers queued before an element died are still valid and
+are handed over **before** the end is reported.
+
+Two ways to observe termination, and the difference matters:
+
+- `end_reason()` — `Some` as soon as the reason is known, even with buffers still
+  queued. Use it to react early (tear down, report status).
+- `ended()` — resolves only once the queue is *also* drained, i.e. exactly when a
+  pull would return `Pulled::Ended`. That is what makes it safe to `select!`
+  against `pull_buffer()` without losing frames:
+
+```rust,ignore
+loop {
+    tokio::select! {
+        pulled = handle.pull_buffer() => match pulled {
+            Pulled::Buffer(b) => process(b),
+            Pulled::Ended(reason) => break reason,
+            _ => continue,
+        },
+        reason = handle.ended() => break reason,
+        _ = shutdown.cancelled() => break EndReason::Aborted,
+    }
+}
+```
+
+No polling, and no watchdog: an element that panics is caught and reported as
+`EndReason::Error` like any other failure.
 
 ## Network — `elements::network`
 

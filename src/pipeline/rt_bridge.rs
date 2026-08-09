@@ -411,6 +411,14 @@ pub struct AsyncRtBridge {
 
     /// End-of-stream flag. Set by producer when no more data will be pushed.
     eos: std::sync::atomic::AtomicBool,
+
+    /// Why the stream ended, when it ended badly.
+    ///
+    /// Separate from `eos` rather than folded into it: the consumer still has
+    /// to drain what is already in the ring before it reacts, and it reads the
+    /// reason at that point. Without this, a hybrid pipeline reports every
+    /// failure downstream of an RT thread as a clean end of stream.
+    error: std::sync::Mutex<Option<crate::pipeline::StreamError>>,
 }
 
 impl AsyncRtBridge {
@@ -425,6 +433,7 @@ impl AsyncRtBridge {
             space_available: EventFd::new()?,
             config,
             eos: std::sync::atomic::AtomicBool::new(false),
+            error: std::sync::Mutex::new(None),
         })
     }
 
@@ -541,6 +550,26 @@ impl AsyncRtBridge {
         self.eos.store(true, std::sync::atomic::Ordering::Release);
         // Wake up consumer so it can notice the EOS flag
         let _ = self.data_available.notify();
+    }
+
+    /// Signal that the producer failed.
+    ///
+    /// Implies EOS — nothing more is coming either way — but records why, so
+    /// the consumer can pass on a failure instead of a clean end. The first
+    /// reason wins; a later EOS cannot overwrite it.
+    pub fn signal_error(&self, error: crate::pipeline::StreamError) {
+        {
+            let mut slot = self.error.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.is_none() {
+                *slot = Some(error);
+            }
+        }
+        self.signal_eos();
+    }
+
+    /// Take the failure reason, if the producer set one.
+    pub fn take_error(&self) -> Option<crate::pipeline::StreamError> {
+        self.error.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 
     /// Check if the producer has signaled end-of-stream.
