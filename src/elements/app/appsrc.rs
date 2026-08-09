@@ -47,6 +47,24 @@ struct AppSrcInner {
     space_available_async: Notify,
 }
 
+impl AppSrcInner {
+    /// Lock the state, ignoring poison.
+    ///
+    /// AppSrc's contract is that every failure mode is an `Err`; honouring
+    /// poison would break exactly that, turning a panic elsewhere in the
+    /// pipeline into a panic inside `push_buffer`. There is nothing to protect
+    /// either — the state is a `VecDeque` plus counters, mutated one push or
+    /// pop at a time. Same reasoning as `AppSinkInner::lock`.
+    fn lock(&self) -> std::sync::MutexGuard<'_, AppSrcState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Unwrap a condvar wait, ignoring poison — see [`AppSrcInner::lock`].
+fn wait_ok<T>(result: std::sync::LockResult<T>) -> T {
+    result.unwrap_or_else(|e| e.into_inner())
+}
+
 struct AppSrcState {
     queue: VecDeque<Buffer>,
     max_buffers: usize,
@@ -104,17 +122,17 @@ impl AppSrc {
 
     /// Get the current queue length.
     pub fn queue_len(&self) -> usize {
-        self.inner.state.lock().unwrap().queue.len()
+        self.inner.lock().queue.len()
     }
 
     /// Check if end-of-stream has been signaled.
     pub fn is_eos(&self) -> bool {
-        self.inner.state.lock().unwrap().eos
+        self.inner.lock().eos
     }
 
     /// Get statistics.
     pub fn stats(&self) -> AppSrcStats {
-        let state = self.inner.state.lock().unwrap();
+        let state = self.inner.lock();
         AppSrcStats {
             queued_buffers: state.queue.len(),
             total_pushed: state.total_pushed,
@@ -136,7 +154,7 @@ impl Source for AppSrc {
         // condvar wait would pin the runtime worker thread (parking sibling
         // tasks woken into its LIFO slot with it). Returning WouldBlock lets
         // the executor retry without stalling the pipeline.
-        let mut state = self.inner.state.lock().unwrap();
+        let mut state = self.inner.lock();
 
         if state.flushing {
             return Err(Error::Element("appsrc is flushing".into()));
@@ -173,7 +191,7 @@ impl AppSrcHandle {
             let notified = self.inner.space_available_async.notified();
 
             {
-                let mut state = self.inner.state.lock().unwrap();
+                let mut state = self.inner.lock();
                 if state.eos {
                     return Err(Error::Element("appsrc is at EOS".into()));
                 }
@@ -212,7 +230,7 @@ impl AppSrcHandle {
     /// `AppSink::try_pull_buffer`, which cannot distinguish "empty" from
     /// "over".
     pub fn try_push_buffer(&self, buffer: Buffer) -> Result<Option<Buffer>> {
-        let mut state = self.inner.state.lock().unwrap();
+        let mut state = self.inner.lock();
         if state.eos {
             return Err(Error::Element("appsrc is at EOS".into()));
         }
@@ -244,7 +262,7 @@ impl AppSrcHandle {
 
     /// The one blocking wait both `_blocking` forms share.
     fn push_wait(&self, buffer: Buffer, timeout: Option<Duration>) -> Result<()> {
-        let mut state = self.inner.state.lock().unwrap();
+        let mut state = self.inner.lock();
 
         if state.eos {
             return Err(Error::Element("appsrc is at EOS".into()));
@@ -257,13 +275,13 @@ impl AppSrcHandle {
         // Wait if queue is full
         while state.queue.len() >= state.max_buffers && !state.flushing {
             state = if let Some(t) = timeout {
-                let (s, result) = self.inner.data_available.wait_timeout(state, t).unwrap();
+                let (s, result) = wait_ok(self.inner.data_available.wait_timeout(state, t));
                 if result.timed_out() {
                     return Err(Error::Element("appsrc push timeout".into()));
                 }
                 s
             } else {
-                self.inner.data_available.wait(state).unwrap()
+                wait_ok(self.inner.data_available.wait(state))
             };
         }
 
@@ -283,7 +301,7 @@ impl AppSrcHandle {
     /// The element is moved into its executor task at `start()`, so
     /// `AppSrc::stats()` cannot be called on a running pipeline. This can.
     pub fn stats(&self) -> AppSrcStats {
-        let state = self.inner.state.lock().unwrap();
+        let state = self.inner.lock();
         AppSrcStats {
             queued_buffers: state.queue.len(),
             total_pushed: state.total_pushed,
@@ -296,7 +314,7 @@ impl AppSrcHandle {
     ///
     /// After calling this, no more buffers can be pushed.
     pub fn end_stream(&self) {
-        let mut state = self.inner.state.lock().unwrap();
+        let mut state = self.inner.lock();
         state.eos = true;
         self.inner.data_available.notify_all();
         self.inner.space_available_async.notify_waiters();
@@ -304,7 +322,7 @@ impl AppSrcHandle {
 
     /// Set flushing mode.
     pub fn set_flushing(&self, flushing: bool) {
-        let mut state = self.inner.state.lock().unwrap();
+        let mut state = self.inner.lock();
         state.flushing = flushing;
         if flushing {
             self.inner.data_available.notify_all();
@@ -314,7 +332,7 @@ impl AppSrcHandle {
 
     /// Clear the queue and reset EOS state.
     pub fn reset(&self) {
-        let mut state = self.inner.state.lock().unwrap();
+        let mut state = self.inner.lock();
         state.queue.clear();
         state.eos = false;
         state.flushing = false;
@@ -323,12 +341,12 @@ impl AppSrcHandle {
 
     /// Get the current queue length.
     pub fn queue_len(&self) -> usize {
-        self.inner.state.lock().unwrap().queue.len()
+        self.inner.lock().queue.len()
     }
 
     /// Check if the queue is full.
     pub fn is_full(&self) -> bool {
-        let state = self.inner.state.lock().unwrap();
+        let state = self.inner.lock();
         state.queue.len() >= state.max_buffers
     }
 }

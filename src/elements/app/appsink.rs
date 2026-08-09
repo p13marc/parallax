@@ -49,6 +49,33 @@ struct AppSinkInner {
     space_available_async: Notify,
 }
 
+impl AppSinkInner {
+    /// Lock the state, ignoring poison.
+    ///
+    /// Poison would turn one panic into a cascade on the *application's* side
+    /// of the boundary: `consume` waits on a condvar holding this lock, so a
+    /// panicking element task poisons it, and every subsequent `pull_buffer`,
+    /// `stats` or `queue_len` would then panic too — the opposite of telling
+    /// the application what went wrong.
+    ///
+    /// Ignoring it is sound here because there is no invariant to break.
+    /// `AppSinkState` is a `VecDeque` plus counters, and every mutation is a
+    /// single push/pop and a counter bump; no observer can see a half-finished
+    /// multi-step update, so the poison flag carries no information.
+    fn lock(&self) -> std::sync::MutexGuard<'_, AppSinkState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Unwrap a condvar wait, ignoring poison — see [`AppSinkInner::lock`].
+///
+/// These are the calls that matter: a waiter parked here is *holding* the lock
+/// a panicking task poisoned, so honouring poison would make the wakeup itself
+/// panic.
+fn wait_ok<T>(result: std::sync::LockResult<T>) -> T {
+    result.unwrap_or_else(|e| e.into_inner())
+}
+
 struct AppSinkState {
     queue: VecDeque<Buffer>,
     max_buffers: usize,
@@ -107,7 +134,7 @@ impl AppSink {
     ///
     /// If false (default), the sink will block when full.
     pub fn drop_on_full(self, drop: bool) -> Self {
-        self.inner.state.lock().unwrap().drop_on_full = drop;
+        self.inner.lock().drop_on_full = drop;
         self
     }
 
@@ -120,17 +147,17 @@ impl AppSink {
 
     /// Get the current queue length.
     pub fn queue_len(&self) -> usize {
-        self.inner.state.lock().unwrap().queue.len()
+        self.inner.lock().queue.len()
     }
 
     /// Check if end-of-stream has been received.
     pub fn is_eos(&self) -> bool {
-        self.inner.state.lock().unwrap().eos
+        self.inner.lock().eos
     }
 
     /// Get statistics.
     pub fn stats(&self) -> AppSinkStats {
-        let state = self.inner.state.lock().unwrap();
+        let state = self.inner.lock();
         AppSinkStats {
             queued_buffers: state.queue.len(),
             total_received: state.total_received,
@@ -142,7 +169,7 @@ impl AppSink {
 
     /// Signal end of stream from the pipeline side.
     pub fn send_eos(&self) {
-        let mut state = self.inner.state.lock().unwrap();
+        let mut state = self.inner.lock();
         state.eos = true;
         self.inner.data_available.notify_all();
         self.inner.data_available_async.notify_waiters();
@@ -157,7 +184,7 @@ impl Default for AppSink {
 
 impl Sink for AppSink {
     fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
-        let mut state = self.inner.state.lock().unwrap();
+        let mut state = self.inner.lock();
 
         if state.flushing {
             return Err(Error::Element("appsink is flushing".into()));
@@ -176,7 +203,7 @@ impl Sink for AppSink {
                 state.total_dropped += 1;
                 return Ok(());
             }
-            state = self.inner.space_available.wait(state).unwrap();
+            state = wait_ok(self.inner.space_available.wait(state));
         }
 
         if state.flushing {
@@ -226,7 +253,7 @@ impl AppSinkHandle {
             let notified = self.inner.data_available_async.notified();
 
             {
-                let mut state = self.inner.state.lock().unwrap();
+                let mut state = self.inner.lock();
                 if state.flushing {
                     return Err(Error::Element("appsink is flushing".into()));
                 }
@@ -275,18 +302,18 @@ impl AppSinkHandle {
 
     /// The one blocking wait both `_blocking` forms share.
     fn pull_wait(&self, timeout: Option<Duration>) -> Result<Option<Buffer>> {
-        let mut state = self.inner.state.lock().unwrap();
+        let mut state = self.inner.lock();
 
         // Wait for data
         while state.queue.is_empty() && !state.eos && !state.flushing {
             state = if let Some(t) = timeout {
-                let (s, result) = self.inner.data_available.wait_timeout(state, t).unwrap();
+                let (s, result) = wait_ok(self.inner.data_available.wait_timeout(state, t));
                 if result.timed_out() {
                     return Ok(None);
                 }
                 s
             } else {
-                self.inner.data_available.wait(state).unwrap()
+                wait_ok(self.inner.data_available.wait(state))
             };
         }
 
@@ -311,7 +338,7 @@ impl AppSinkHandle {
     /// which is what makes `total_dropped`, the number a live consumer actually
     /// cares about, readable at all.
     pub fn stats(&self) -> AppSinkStats {
-        let state = self.inner.state.lock().unwrap();
+        let state = self.inner.lock();
         AppSinkStats {
             queued_buffers: state.queue.len(),
             total_received: state.total_received,
@@ -323,7 +350,7 @@ impl AppSinkHandle {
 
     /// Try to pull a buffer without blocking.
     pub fn try_pull_buffer(&self) -> Option<Buffer> {
-        let mut state = self.inner.state.lock().unwrap();
+        let mut state = self.inner.lock();
 
         if let Some(buffer) = state.queue.pop_front() {
             state.total_pulled += 1;
@@ -337,7 +364,7 @@ impl AppSinkHandle {
 
     /// Set flushing mode.
     pub fn set_flushing(&self, flushing: bool) {
-        let mut state = self.inner.state.lock().unwrap();
+        let mut state = self.inner.lock();
         state.flushing = flushing;
         if flushing {
             self.inner.data_available.notify_all();
@@ -349,7 +376,7 @@ impl AppSinkHandle {
 
     /// Clear the queue.
     pub fn clear(&self) {
-        let mut state = self.inner.state.lock().unwrap();
+        let mut state = self.inner.lock();
         state.queue.clear();
         self.inner.space_available.notify_all();
         self.inner.space_available_async.notify_waiters();
@@ -357,17 +384,17 @@ impl AppSinkHandle {
 
     /// Get the current queue length.
     pub fn queue_len(&self) -> usize {
-        self.inner.state.lock().unwrap().queue.len()
+        self.inner.lock().queue.len()
     }
 
     /// Check if EOS has been reached.
     pub fn is_eos(&self) -> bool {
-        self.inner.state.lock().unwrap().eos
+        self.inner.lock().eos
     }
 
     /// Check if there are buffers available.
     pub fn has_buffer(&self) -> bool {
-        !self.inner.state.lock().unwrap().queue.is_empty()
+        !self.inner.lock().queue.is_empty()
     }
 }
 
@@ -623,5 +650,35 @@ mod tests {
         let stats = handle.stats();
         assert_eq!(stats.total_received, 1);
         assert_eq!(stats.total_dropped, 2);
+    }
+
+    #[test]
+    fn a_panic_while_holding_the_lock_does_not_cascade() {
+        // `consume` waits on a condvar *holding* this mutex, so a panicking
+        // element task poisons it. If that poison were honoured, every call on
+        // the application's side — the side trying to find out what went wrong
+        // — would panic instead of answering.
+        let sink = AppSink::new();
+        let handle = sink.handle();
+
+        let inner = Arc::clone(&sink.inner);
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = inner.lock();
+            panic!("element task died mid-update");
+        }));
+        assert!(poisoned.is_err(), "the test's own panic never happened");
+        assert!(
+            inner.state.lock().is_err(),
+            "the mutex should really be poisoned, or this proves nothing"
+        );
+
+        // Every one of these used to panic.
+        assert_eq!(handle.queue_len(), 0);
+        assert!(!handle.is_eos());
+        assert!(handle.try_pull_buffer().is_none());
+        let _ = handle.stats();
+        handle.set_flushing(true);
+        handle.set_flushing(false);
+        handle.clear();
     }
 }
