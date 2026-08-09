@@ -255,7 +255,7 @@ Muxer sync: `MuxerSyncState`/`MuxerSyncConfig::new().with_mode(SyncMode::{Auto|S
 
 ## Plugin System
 
-- ABI: `PluginDescriptor`/`ElementDescriptor` (`#[repr(C)]`), `PARALLAX_ABI_VERSION = 1`, entry symbol `parallax_plugin_descriptor`, loaded with libloading. Element instances cross the boundary as double-boxed `DynAsyncElement` raw pointers.
+- ABI: `PluginDescriptor`/`ElementDescriptor` (`#[repr(C)]`), `PARALLAX_ABI_VERSION = 2`, entry symbol `parallax_plugin_descriptor`, loaded with libloading. Element instances cross the boundary as double-boxed `DynAsyncElement` raw pointers — so **adding a method to `AsyncElementDyn` changes the vtable and requires an ABI bump** (that is what took it to 2). `tests/pipeline_integration.rs::test_plugin_abi_version` pins the constant to force the decision.
 - Authoring: `define_plugin!` macro_rules (uses `paste`; what `examples/example-plugin` uses) or `parallax-macros` proc-macros (`#[pipeline_element(...)]` + `plugin!{}`, feature `macros`).
 - `PluginLoader::load_from_path` (unsafe) validates ABI version + descriptor; `PluginRegistry` indexes elements and can back `Pipeline::parse` names.
 - Search paths for `load_by_name`: `.`, `/usr/lib/parallax/plugins`, `/usr/local/lib/parallax/plugins`.

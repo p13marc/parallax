@@ -888,12 +888,17 @@ fn test_element_factory_with_plugin_registry() {
 }
 
 /// Test plugin ABI version constant.
+///
+/// Pinned deliberately: element instances cross the plugin boundary as
+/// `Box<DynAsyncElement>`, so a change to that trait's vtable must come with a
+/// bump here. If this assertion fails because the trait grew a method, bump the
+/// constant — do not just update the number.
 #[test]
 fn test_plugin_abi_version() {
     use parallax::plugin::PARALLAX_ABI_VERSION;
 
-    // ABI version should be 1 for this initial implementation
-    assert_eq!(PARALLAX_ABI_VERSION, 1);
+    // 2: AsyncElementDyn::set_output_budget (executor-sized output arenas)
+    assert_eq!(PARALLAX_ABI_VERSION, 2);
 }
 
 /// Test plugin descriptor struct sizes are non-zero.

@@ -140,10 +140,60 @@ let stats  = pool.stats();           // acquisitions, waits, availability
 ```
 
 - `PooledBuffer` returns its slot on drop, or `into_buffer()` detaches it into a free-standing `Buffer`.
-- Attach to sources with `pipeline.add_source_with_pool(...)` or let the pipeline size a pool from negotiated caps: `pipeline.create_pool_from_caps(count)`.
+- Attach to sources with `pipeline.add_source_with_pool(...)`.
 - Inside `Source::produce`, `ctx.acquire_buffer()` uses the attached pool.
 
+**Blocking `acquire()` is for sources only.** Element tasks run on the Tokio
+runtime, so a transform that blocked here would park a worker — possibly the one
+that would have drained the channel it is waiting on, which deadlocks rather than
+merely stalling. Elements that allocate their own output buffers use an arena
+sized up front instead; see [Output arenas](#output-arenas) below.
+
+Note also that the pool's condvar only fires for *undetached* returns. A buffer
+sent downstream has been through `into_buffer()`, so its slot comes back via the
+arena's release queue and nothing rings the bell; `acquire()` therefore polls as
+well as waiting.
+
 Sensible slot sizes/counts for common media (1080p YUV, encoded video, audio periods, TS/MP4 mux buffers, …) are provided as constants in `parallax::memory::defaults`.
+
+## Output arenas
+
+An element that produces buffers owns an arena, and every buffer it emits pins a
+slot until the last downstream reference drops. Size that arena below what the
+graph can hold in flight and the element runs out of slots the first time a
+consumer hesitates.
+
+Only the executor knows the number — link capacity is its configuration — so it
+computes an `OutputBudget` per node and hands it over before the element builds
+anything:
+
+```rust,ignore
+impl Element for MyEncoder {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.budget = Some(budget);          // store it; the arena is built lazily
+    }
+}
+
+// ...on the first frame, and again after a resize rebuild:
+let slots = self.budget.unwrap_or_default()
+    .resolve(defaults::VIDEO_ENCODER_SLOT_COUNT, slot_size);
+self.arena = Some(SharedArena::new(slot_size, slots)?);
+```
+
+The invariant is `slots ≥ max(downstream link capacity) + IN_FLIGHT_MARGIN`.
+Per src pad it is the **maximum** over that pad's links, not the sum: fan-out
+clones a `Buffer`, and a clone is a refcount bump on the *same* slot, so three
+branches holding one buffer pin one slot. Across separate src pads (a demuxer's)
+it *is* summed, because those carry different buffers. `resolve()` also clamps
+the total to `MAX_OUTPUT_ARENA_BYTES`, since slot count and slot size are chosen
+independently and 200 × 4K RGBA would otherwise ask for 6.6 GB.
+
+**The budget is a floor, not a guarantee.** It bounds what the *channels* hold,
+not what downstream *elements* hold: an `AppSink` queues up to its `max_buffers`,
+a `Queue` up to its depth, and an application can retain every `Buffer` it pulls.
+None of that is visible to the executor, so exhaustion stays possible — and is
+handled where it happens rather than prevented here. See
+[Running out of slots](#running-out-of-slots).
 
 ## Other segment types
 

@@ -7,7 +7,19 @@ use crate::element::DynAsyncElement;
 use std::ffi::{CStr, c_char, c_int, c_void};
 
 /// Current ABI version. Plugins must match this version to be loaded.
-pub const PARALLAX_ABI_VERSION: u32 = 1;
+///
+/// Bump this whenever the shape of what crosses the boundary changes. Element
+/// instances cross as `Box<DynAsyncElement<'static>>`, so **adding a method to
+/// `AsyncElementDyn` counts**: it changes the generated vtable layout, and a
+/// plugin built against the old one would have its methods dispatched through
+/// the wrong slots. The check in [`PluginDescriptor::validate`] is the only
+/// thing standing between a stale `.so` and a memory-safety bug, so a missed
+/// bump is not a compatibility inconvenience — it is undefined behaviour.
+///
+/// History:
+/// - **2**: `AsyncElementDyn::set_output_budget` (executor-sized output arenas).
+/// - **1**: initial hand-rolled `#[repr(C)]` descriptor ABI.
+pub const PARALLAX_ABI_VERSION: u32 = 2;
 
 /// Function pointer type for creating element instances.
 ///
@@ -378,7 +390,9 @@ mod tests {
 
     #[test]
     fn test_abi_version() {
-        assert_eq!(PARALLAX_ABI_VERSION, 1);
+        // Pinned so a vtable change to AsyncElementDyn has to be a decision.
+        // 2: set_output_budget.
+        assert_eq!(PARALLAX_ABI_VERSION, 2);
     }
 
     #[test]

@@ -35,6 +35,7 @@ use crate::element::{
     ProcessingHint, SourceResult,
 };
 use crate::error::{Error, Result};
+use crate::memory::{OutputBudget, defaults};
 use crate::pipeline::bus::{Bus, BusHandle};
 use crate::pipeline::probe::{ProbeRegistry, ProbeReturn};
 use crate::pipeline::rt_bridge::AsyncRtBridge;
@@ -715,12 +716,50 @@ impl Executor {
 
         // --- Spawn RT data thread ---
 
-        // Extract RT elements from the pipeline graph
+        // Extract RT elements from the pipeline graph.
+        //
+        // These bypass `spawn_node_task_with_bridges`, so the setters it
+        // applies have to be repeated here — until this was noticed, an element
+        // scheduled onto an RT thread silently received no clock, no bus and no
+        // arena budget, and behaved differently from the same element in an
+        // async graph.
+        //
+        // Budgets are computed up front because `children()` borrows the
+        // pipeline shared while `get_node_mut` needs it mutable.
+        let rt_budgets: HashMap<NodeId, OutputBudget> = partition
+            .rt_nodes
+            .iter()
+            .map(|&node_id| {
+                let bridged = partition.boundary_edges.iter().any(|e| {
+                    e.source == node_id && matches!(e.direction, BoundaryDirection::RtToAsync)
+                });
+                (
+                    node_id,
+                    self.output_slot_budget(pipeline, node_id, usize::from(bridged)),
+                )
+            })
+            .collect();
+
         let mut rt_elements: HashMap<NodeId, Box<DynAsyncElement<'static>>> = HashMap::new();
         for &node_id in &partition.rt_nodes {
+            let node_name = pipeline
+                .get_node(node_id)
+                .map(|n| n.name().to_string())
+                .unwrap_or_default();
+            let bus = pipeline.bus_handle().for_element(&node_name);
+
             if let Some(node) = pipeline.get_node_mut(node_id)
-                && let Some(element) = node.take_element()
+                && let Some(mut element) = node.take_element()
             {
+                if node.element_type() == ElementType::Source
+                    && let Some((clock, base_time)) = clock_info
+                {
+                    element.set_clock(clock.clone(), *base_time);
+                }
+                element.set_bus(bus);
+                if let Some(budget) = rt_budgets.get(&node_id) {
+                    element.set_output_budget(*budget);
+                }
                 rt_elements.insert(node_id, element);
             }
         }
@@ -787,6 +826,47 @@ impl Executor {
         let rt_handles = vec![rt_handle];
 
         Ok((tasks, rt_handles, bridges, Some(driver_task)))
+    }
+
+    /// How many buffers the graph downstream of `node_id` can hold at once.
+    ///
+    /// Elements that allocate their own output buffers need an arena at least
+    /// this big, or they run out of slots the moment a consumer falls behind —
+    /// which used to kill the pipeline. Only the executor knows the number:
+    /// link capacity is its configuration.
+    ///
+    /// **Per pad it is the maximum, not the sum.** Fan-out clones a `Buffer`,
+    /// and a clone is a refcount bump on the same slot, so three branches each
+    /// holding the same buffer pin one slot between them. The producer stalls on
+    /// whichever `Block` branch fills first, so the deepest link bounds the pad.
+    /// Summing would over-allocate by up to N×.
+    ///
+    /// **Across pads it is the sum**, because separate src pads (a demuxer's)
+    /// carry genuinely different buffers.
+    ///
+    /// A bridged edge contributes `RtConfig::bridge_capacity` the same way — the
+    /// bridge is a queue like any other.
+    fn output_slot_budget(
+        &self,
+        pipeline: &Pipeline,
+        node_id: NodeId,
+        output_bridges: usize,
+    ) -> OutputBudget {
+        let mut per_pad: HashMap<String, usize> = HashMap::new();
+
+        for (_child_id, link) in pipeline.children(node_id) {
+            let capacity = link.capacity.unwrap_or(self.config.channel_capacity);
+            let deepest = per_pad.entry(link.src_pad.clone()).or_insert(0);
+            *deepest = (*deepest).max(capacity);
+        }
+
+        let mut downstream_capacity: usize = per_pad.values().sum();
+        if output_bridges > 0 {
+            downstream_capacity =
+                downstream_capacity.saturating_add(self.config.rt.bridge_capacity);
+        }
+
+        OutputBudget::new(downstream_capacity, defaults::IN_FLIGHT_MARGIN)
     }
 
     /// Build channel network recursively.
@@ -961,6 +1041,10 @@ impl Executor {
         events: &EventSender,
         stop: &Arc<AtomicBool>,
     ) -> Result<JoinHandle<Result<()>>> {
+        // Before `get_node_mut` borrows the pipeline mutably: `children()` needs
+        // it shared.
+        let budget = self.output_slot_budget(pipeline, node_id, output_bridges.len());
+
         let node = pipeline
             .get_node_mut(node_id)
             .ok_or_else(|| Error::InvalidSegment("node not found".into()))?;
@@ -981,6 +1065,10 @@ impl Executor {
 
         // Set bus handle so elements can post messages
         element.set_bus(pipeline.bus_handle().for_element(&node_name));
+
+        // Tell the element how much the graph below it can hold, so it can size
+        // its output arena before the first frame builds it.
+        element.set_output_budget(budget);
 
         // Take the channels this element type actually needs, inside the match.
         //
@@ -2105,5 +2193,98 @@ mod tests {
         // without_auto_strategy should disable it
         let config = ExecutorConfig::default().without_auto_strategy();
         assert!(!config.auto_strategy);
+    }
+
+    // ---- output_slot_budget ----------------------------------------------
+
+    /// A source, and `branches` sinks hanging off its single src pad with the
+    /// given per-link capacities.
+    fn fan_out(capacities: &[Option<usize>]) -> (Pipeline, NodeId) {
+        let mut pipeline = Pipeline::new();
+        let src = pipeline.add_source("src", CountingSource { count: 0, max: 0 });
+        for (i, capacity) in capacities.iter().enumerate() {
+            let sink = pipeline.add_sink(
+                format!("sink{i}"),
+                CountingSink {
+                    received: Arc::new(AtomicU64::new(0)),
+                },
+            );
+            pipeline
+                .link_pads_full(src, "src", sink, "sink", LinkPolicy::Block, *capacity)
+                .unwrap();
+        }
+        (pipeline, src)
+    }
+
+    #[test]
+    fn a_sink_gets_no_downstream_capacity() {
+        let (pipeline, src) = fan_out(&[None]);
+        let executor = Executor::new();
+        let sink = pipeline.node_ids().into_iter().find(|&n| n != src).unwrap();
+
+        let budget = executor.output_slot_budget(&pipeline, sink, 0);
+        assert_eq!(budget.downstream_capacity, 0);
+        assert_eq!(budget.in_flight_margin, defaults::IN_FLIGHT_MARGIN);
+    }
+
+    #[test]
+    fn one_link_takes_the_configured_channel_capacity() {
+        let (pipeline, src) = fan_out(&[None]);
+        let executor = Executor::with_config(ExecutorConfig::default().with_channel_capacity(64));
+
+        assert_eq!(
+            executor.output_slot_budget(&pipeline, src, 0).slots(),
+            64 + defaults::IN_FLIGHT_MARGIN
+        );
+    }
+
+    #[test]
+    fn a_per_link_capacity_override_is_honoured() {
+        let (pipeline, src) = fan_out(&[Some(128)]);
+        let executor = Executor::new();
+
+        assert_eq!(
+            executor.output_slot_budget(&pipeline, src, 0).slots(),
+            128 + defaults::IN_FLIGHT_MARGIN
+        );
+    }
+
+    #[test]
+    fn fan_out_on_one_pad_takes_the_max_not_the_sum() {
+        // Three branches off the same src pad share each buffer — a clone is a
+        // refcount bump on the same slot — so the deepest link bounds the pad.
+        // Summing would ask for 8 + 64 + 16 = 88 slots for 64 slots of work.
+        let (pipeline, src) = fan_out(&[Some(8), Some(64), Some(16)]);
+        let executor = Executor::new();
+
+        let budget = executor.output_slot_budget(&pipeline, src, 0);
+        assert_eq!(budget.downstream_capacity, 64);
+        assert_eq!(budget.slots(), 64 + defaults::IN_FLIGHT_MARGIN);
+    }
+
+    #[test]
+    fn a_bridged_edge_adds_the_bridge_capacity() {
+        let (pipeline, src) = fan_out(&[Some(8)]);
+        let executor = Executor::new();
+        let bridge_capacity = executor.config.rt.bridge_capacity;
+
+        let budget = executor.output_slot_budget(&pipeline, src, 1);
+        assert_eq!(budget.downstream_capacity, 8 + bridge_capacity);
+    }
+
+    #[test]
+    fn a_deep_link_outgrows_the_codec_floor() {
+        // The point of the whole exercise: the arena must track the channel, so
+        // a consumer holding a full channel cannot starve the producer.
+        let (pipeline, src) = fan_out(&[None]);
+        let executor = Executor::with_config(ExecutorConfig::default().with_channel_capacity(256));
+
+        let slots = executor
+            .output_slot_budget(&pipeline, src, 0)
+            .resolve(defaults::MIN_OUTPUT_SLOT_COUNT, 4096);
+        assert!(
+            slots > 256,
+            "{slots} slots cannot outlive a 256-deep channel"
+        );
     }
 }

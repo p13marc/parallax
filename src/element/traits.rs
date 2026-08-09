@@ -958,6 +958,35 @@ pub trait Element: Send {
         // Default: ignore
     }
 
+    /// How many buffers the downstream graph can hold in flight.
+    ///
+    /// Called by the executor before the pipeline starts. Override it if this
+    /// element owns an output [`SharedArena`](crate::memory::SharedArena):
+    /// store the budget and size the arena from it, because an arena smaller
+    /// than what the links can hold will run out of slots as soon as a consumer
+    /// falls behind.
+    ///
+    /// Arenas are usually built lazily from the first frame's geometry, so
+    /// store the budget rather than acting on it here — and consult it again on
+    /// the rebuild that follows a resolution change:
+    ///
+    /// ```rust,ignore
+    /// fn set_output_budget(&mut self, budget: OutputBudget) {
+    ///     self.budget = Some(budget);
+    /// }
+    ///
+    /// // ...later, on the first frame:
+    /// let slots = self.budget.unwrap_or_default().resolve(
+    ///     defaults::VIDEO_ENCODER_SLOT_COUNT, slot_size);
+    /// self.arena = Some(SharedArena::new(slot_size, slots)?);
+    /// ```
+    ///
+    /// Default: ignore, which is right for any element that does not allocate
+    /// its own output buffers.
+    fn set_output_budget(&mut self, _budget: crate::memory::OutputBudget) {
+        // Default: ignore
+    }
+
     /// Get the name of this element (for debugging/logging).
     fn name(&self) -> &str {
         std::any::type_name::<Self>()
@@ -1112,6 +1141,14 @@ pub trait Transform: Send {
     fn handle_upstream_event(&mut self, _event: &Event) -> EventResult {
         EventResult::NotHandled
     }
+
+    /// How many buffers the downstream graph can hold in flight.
+    ///
+    /// See [`Element::set_output_budget`] — same contract, same reason to
+    /// override it: this transform owns the arena its output buffers come from.
+    fn set_output_budget(&mut self, _budget: crate::memory::OutputBudget) {
+        // Default: ignore
+    }
 }
 
 /// An async transform element.
@@ -1185,6 +1222,14 @@ pub trait AsyncTransform: Send {
     fn handle_upstream_event(&mut self, _event: &Event) -> EventResult {
         EventResult::NotHandled
     }
+
+    /// How many buffers the downstream graph can hold in flight.
+    ///
+    /// See [`Element::set_output_budget`] — same contract, same reason to
+    /// override it: this transform owns the arena its output buffers come from.
+    fn set_output_budget(&mut self, _budget: crate::memory::OutputBudget) {
+        // Default: ignore
+    }
 }
 
 // Blanket implementation: Element implements Transform
@@ -1203,6 +1248,10 @@ impl<T: Element> Transform for T {
 
     fn output_caps(&self) -> Caps {
         Element::output_caps(self)
+    }
+
+    fn set_output_budget(&mut self, budget: crate::memory::OutputBudget) {
+        Element::set_output_budget(self, budget);
     }
 }
 
@@ -1611,6 +1660,18 @@ pub trait AsyncElementDyn {
     /// Default implementation does nothing. Adapters override this to
     /// store the handle and pass it to element contexts.
     fn set_bus(&mut self, _bus: crate::pipeline::bus::BusHandle) {
+        // Default: do nothing
+    }
+
+    /// Tell this element how many buffers the downstream graph can hold.
+    ///
+    /// Called by the executor when starting the pipeline, before the element
+    /// moves into its task. Elements that own an output arena size it from
+    /// this; see [`Element::set_output_budget`].
+    ///
+    /// Default implementation does nothing. Adapters override this to forward
+    /// to the element they wrap.
+    fn set_output_budget(&mut self, _budget: crate::memory::OutputBudget) {
         // Default: do nothing
     }
 
@@ -2232,6 +2293,10 @@ impl<E: Element + Send + 'static> SendAsyncElementDyn for ElementAdapter<E> {
         self.inner.set_bus(bus);
     }
 
+    fn set_output_budget(&mut self, budget: crate::memory::OutputBudget) {
+        self.inner.set_output_budget(budget);
+    }
+
     async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
         match input {
             Some(buffer) => self.inner.process(buffer),
@@ -2314,6 +2379,10 @@ impl SendAsyncElementDyn for BoxedElementAdapter {
         self.inner.set_bus(bus);
     }
 
+    fn set_output_budget(&mut self, budget: crate::memory::OutputBudget) {
+        self.inner.set_output_budget(budget);
+    }
+
     async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
         match input {
             Some(buffer) => self.inner.process(buffer),
@@ -2379,6 +2448,10 @@ impl<T: Transform + Send + 'static> SendAsyncElementDyn for TransformAdapter<T> 
 
     fn element_type(&self) -> ElementType {
         ElementType::Transform
+    }
+
+    fn set_output_budget(&mut self, budget: crate::memory::OutputBudget) {
+        self.inner.set_output_budget(budget);
     }
 
     async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
@@ -2791,6 +2864,10 @@ impl<T: AsyncTransform + Send + 'static> SendAsyncElementDyn for AsyncTransformA
 
     fn element_type(&self) -> ElementType {
         ElementType::Transform
+    }
+
+    fn set_output_budget(&mut self, budget: crate::memory::OutputBudget) {
+        self.inner.set_output_budget(budget);
     }
 
     async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {

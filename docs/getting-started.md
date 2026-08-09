@@ -162,12 +162,13 @@ use parallax::memory::FixedBufferPool;
 
 let pool = FixedBufferPool::new(1024 * 1024, 10)?; // 10 × 1 MiB
 let src = pipeline.add_source_with_pool("src", my_source, pool);
-
-// or size the pool automatically from negotiated caps:
-pipeline.create_pool_from_caps(10)?;
 ```
 
 Inside `produce()`, call `ctx.acquire_buffer()` — it blocks when the pool is exhausted, giving you backpressure for free. See `examples/11_buffer_pool.rs`.
+
+This is for **sources** only: blocking parks a thread, which a source can afford
+and an element task cannot. Elements that allocate their own output buffers get
+sized by the executor instead — see [memory.md](memory.md#output-arenas).
 
 ## Watching pipeline messages
 
