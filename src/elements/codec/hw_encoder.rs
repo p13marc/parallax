@@ -30,7 +30,7 @@ use crate::clock::ClockTime;
 use crate::element::{ExecutionHints, Output, Transform};
 use crate::error::{Error, Result};
 use crate::gpu::{GpuBuffer, GpuBufferHandle, GpuFrame, GpuPixelFormat, GpuUsage, HwVideoEncoder};
-use crate::memory::SharedArena;
+use crate::memory::{OutputArena, OutputBudget, defaults};
 use std::collections::VecDeque;
 
 /// Wraps a [`HwVideoEncoder`] to work as a pipeline [`Transform`] element.
@@ -77,7 +77,7 @@ pub struct HwEncoderElement<E: HwVideoEncoder> {
     /// Statistics: packets produced.
     packets_out: u64,
     /// Arena for output buffer allocation.
-    arena: Option<SharedArena>,
+    output: OutputArena,
     /// Pending runtime keyframe requests (shared with [`Self::keyframe_handle`]).
     keyframe_requests: super::KeyframeHandle,
     /// Counters readable while the pipeline runs (shared with [`Self::stats`]).
@@ -108,7 +108,8 @@ impl<E: HwVideoEncoder> HwEncoderElement<E> {
             flushed: false,
             frames_in: 0,
             packets_out: 0,
-            arena: None,
+            output: OutputArena::new(defaults::VIDEO_ENCODER_SLOT_COUNT)
+                .with_min_slot_size(256 * 1024),
             keyframe_requests: super::KeyframeHandle::new(),
             stats: crate::control::EncoderStatsHandle::default(),
             width: 0,
@@ -236,32 +237,10 @@ impl<E: HwVideoEncoder> HwEncoderElement<E> {
     fn packet_to_buffer(&mut self, packet: Vec<u8>, pts: i64, is_keyframe: bool) -> Result<Buffer> {
         let packet_size = packet.len();
 
-        // Initialize arena on first use (size for typical encoded packet)
-        if self.arena.is_none() {
-            // Allocate space for up to 256KB packets
-            let max_packet_size = 256 * 1024;
-            self.arena = Some(
-                SharedArena::new(max_packet_size, 16)
-                    .map_err(|e| Error::Element(format!("Failed to create arena: {}", e)))?,
-            );
-        }
-
-        let arena = self.arena.as_mut().unwrap();
-        arena.reclaim();
-        let mut slot = arena
-            .acquire()
-            .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
-
-        // Copy packet data to slot
-        let data = slot.data_mut();
-        if packet_size > data.len() {
-            return Err(Error::Element(format!(
-                "Packet size {} exceeds arena slot size {}",
-                packet_size,
-                data.len()
-            )));
-        }
-        data[..packet_size].copy_from_slice(&packet);
+        // `acquire` sizes the arena on first use and rejects an oversized
+        // packet with a message naming the cause.
+        let mut slot = self.output.acquire(packet_size, "hwencoderelement")?;
+        slot.data_mut()[..packet_size].copy_from_slice(&packet);
 
         let mut metadata = crate::metadata::Metadata::new();
         metadata.pts = ClockTime::from_nanos(pts as u64);
@@ -287,6 +266,10 @@ impl<E: HwVideoEncoder> super::Controllable for HwEncoderElement<E> {
 }
 
 impl<E: HwVideoEncoder + 'static> Transform for HwEncoderElement<E> {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn transform(&mut self, buffer: Buffer) -> Result<Output> {
         let pts = buffer
             .metadata()

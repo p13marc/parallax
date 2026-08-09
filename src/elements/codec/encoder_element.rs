@@ -27,7 +27,7 @@ use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{ExecutionHints, Output, Transform};
 use crate::error::{Error, Result};
 use crate::format::MediaFormat;
-use crate::memory::SharedArena;
+use crate::memory::{OutputArena, OutputBudget, defaults};
 use std::collections::VecDeque;
 
 /// Wraps a [`VideoEncoder`] to work as a pipeline [`Transform`] element.
@@ -82,8 +82,9 @@ pub struct EncoderElement<E: VideoEncoder> {
     stats: crate::control::EncoderStatsHandle,
     /// The control generation last applied to the encoder.
     applied_generation: u64,
-    /// Arena for output buffer allocation, sized from the first frame.
-    arena: Option<SharedArena>,
+    /// Arena for output buffer allocation, sized from the first frame and
+    /// from the executor's link-capacity budget.
+    output: OutputArena,
 }
 
 impl<E: VideoEncoder> EncoderElement<E> {
@@ -108,7 +109,7 @@ impl<E: VideoEncoder> EncoderElement<E> {
             control: super::EncoderControl::new(),
             stats: crate::control::EncoderStatsHandle::default(),
             applied_generation: 0,
-            arena: None,
+            output: OutputArena::new(defaults::VIDEO_ENCODER_SLOT_COUNT),
         }
     }
 
@@ -186,7 +187,7 @@ impl<E: VideoEncoder> EncoderElement<E> {
                     self.format = Some(vf);
                     // The arena is sized from the frame; a new geometry needs a
                     // new one.
-                    self.arena = None;
+                    self.output.reset();
                 }
             }
             _ => {
@@ -230,19 +231,12 @@ impl<E: VideoEncoder> EncoderElement<E> {
     /// A compressed frame is smaller than its raw source, so the raw size is a
     /// safe upper bound. Sizing it lazily is what lets the constructor take no
     /// dimensions: there is nothing to size it from until a frame arrives.
-    fn ensure_arena(&mut self) -> Result<&SharedArena> {
-        if self.arena.is_none() {
-            let (w, h) = self
-                .format
-                .map(|f| (f.width as usize, f.height as usize))
-                .unwrap_or((0, 0));
-            let max_packet_size = w * h * 3;
-            self.arena = Some(
-                SharedArena::new(max_packet_size.max(4096), 16)
-                    .map_err(|e| Error::Element(format!("Failed to create arena: {}", e)))?,
-            );
-        }
-        Ok(self.arena.as_ref().expect("set immediately above"))
+    fn slot_ceiling(&self) -> usize {
+        let (w, h) = self
+            .format
+            .map(|f| (f.width as usize, f.height as usize))
+            .unwrap_or((0, 0));
+        (w * h * 3).max(4096)
     }
 
     /// Convert encoded packet to output buffer, preserving input metadata.
@@ -252,11 +246,8 @@ impl<E: VideoEncoder> EncoderElement<E> {
         pts: i64,
         input_metadata: &crate::metadata::Metadata,
     ) -> Result<Buffer> {
-        let arena = self.ensure_arena()?;
-        arena.reclaim();
-        let mut slot = arena
-            .acquire()
-            .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+        self.output.set_min_slot_size(self.slot_ceiling());
+        let mut slot = self.output.acquire(data.len(), "encoderelement")?;
         slot.data_mut()[..data.len()].copy_from_slice(&data);
 
         // Preserve input metadata and update PTS
@@ -271,11 +262,8 @@ impl<E: VideoEncoder> EncoderElement<E> {
 
     /// Convert encoded packet to output buffer during flush (no input metadata).
     fn packet_to_buffer_flush(&mut self, data: Vec<u8>, pts: i64) -> Result<Buffer> {
-        let arena = self.ensure_arena()?;
-        arena.reclaim();
-        let mut slot = arena
-            .acquire()
-            .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+        self.output.set_min_slot_size(self.slot_ceiling());
+        let mut slot = self.output.acquire(data.len(), "encoderelement")?;
         slot.data_mut()[..data.len()].copy_from_slice(&data);
 
         let metadata =
@@ -356,7 +344,18 @@ impl<E: VideoEncoder + 'static> EncoderElement<E> {
 }
 
 impl<E: VideoEncoder + 'static> Transform for EncoderElement<E> {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn transform(&mut self, buffer: Buffer) -> Result<Output> {
+        // Admission control before the frame enters the encoder. This is not an
+        // optimisation: a frame pushed into the GOP whose packet is then shed
+        // leaves a hole the decoder cannot fill until the next IDR. Skipping the
+        // input keeps the bitstream coherent and just lowers the frame rate,
+        // which is what the existing `skip_frames` knob does deliberately.
+        self.output.admit()?;
+
         // Runtime reconfiguration (bitrate / GOP / QP) from the control handle.
         self.apply_pending_control();
 

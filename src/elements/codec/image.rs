@@ -30,7 +30,7 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{Element, ExecutionHints};
 use crate::error::{Error, Result};
-use crate::memory::SharedArena;
+use crate::memory::{OutputArena, OutputBudget, defaults};
 
 /// Color type for image data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -165,15 +165,23 @@ mod jpeg_codec {
     /// Decodes JPEG images to raw RGB pixel data.
     pub struct JpegDecoder {
         frame_count: u64,
-        arena: Option<SharedArena>,
+        output: OutputArena,
     }
 
     impl JpegDecoder {
+        /// The output arena, sized by the executor at start.
+        ///
+        /// A 1 MiB floor on the slot: compressed frame sizes vary, and the
+        /// slot size is fixed when the arena is built from the first one.
+        fn new_output_arena() -> OutputArena {
+            OutputArena::new(defaults::VIDEO_DECODER_SLOT_COUNT).with_min_slot_size(1024 * 1024)
+        }
+
         /// Create a new JPEG decoder.
         pub fn new() -> Self {
             Self {
                 frame_count: 0,
-                arena: None,
+                output: Self::new_output_arena(),
             }
         }
 
@@ -190,6 +198,10 @@ mod jpeg_codec {
     }
 
     impl Element for JpegDecoder {
+        fn set_output_budget(&mut self, budget: OutputBudget) {
+            self.output.set_budget(budget);
+        }
+
         fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
             let input = buffer.as_bytes();
 
@@ -219,20 +231,7 @@ mod jpeg_codec {
                 _ => crate::format::PixelFormat::Rgb24,
             };
 
-            // Lazily initialize arena
-            if self.arena.is_none() {
-                self.arena = Some(
-                    SharedArena::new(pixels.len().max(1024 * 1024), 16)
-                        .map_err(|e| Error::Element(format!("Failed to create arena: {}", e)))?,
-                );
-            }
-            let arena = self.arena.as_mut().unwrap();
-
-            arena.reclaim();
-
-            let mut slot = arena
-                .acquire()
-                .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+            let mut slot = self.output.acquire(pixels.len(), "jpegdecoder")?;
             slot.data_mut()[..pixels.len()].copy_from_slice(&pixels);
 
             self.frame_count += 1;
@@ -274,7 +273,7 @@ mod jpeg_codec {
         /// change it.
         quality: std::sync::Arc<std::sync::atomic::AtomicU8>,
         frame_count: u64,
-        arena: Option<SharedArena>,
+        output: OutputArena,
         /// Counters readable while the pipeline runs (shared with [`Self::stats`]).
         stats: crate::control::EncoderStatsHandle,
     }
@@ -304,6 +303,14 @@ mod jpeg_codec {
     }
 
     impl JpegEncoder {
+        /// The output arena, sized by the executor at start.
+        ///
+        /// A 1 MiB floor on the slot: compressed frame sizes vary, and the
+        /// slot size is fixed when the arena is built from the first one.
+        fn new_output_arena() -> OutputArena {
+            OutputArena::new(defaults::VIDEO_ENCODER_SLOT_COUNT).with_min_slot_size(1024 * 1024)
+        }
+
         /// Create a new JPEG encoder.
         ///
         /// Geometry and pixel layout come from each buffer's [`Metadata`](crate::metadata::Metadata).
@@ -312,7 +319,7 @@ mod jpeg_codec {
                 color_type: None,
                 quality: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(80)),
                 frame_count: 0,
-                arena: None,
+                output: Self::new_output_arena(),
                 stats: crate::control::EncoderStatsHandle::default(),
             }
         }
@@ -387,7 +394,17 @@ mod jpeg_codec {
     }
 
     impl Element for JpegEncoder {
+        fn set_output_budget(&mut self, budget: OutputBudget) {
+            self.output.set_budget(budget);
+        }
+
         fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
+            // Admission control before the encode: if downstream is still
+            // holding every output slot, spending CPU on a frame with
+            // nowhere to go helps nobody. The executor sheds it and the
+            // next frame proceeds normally.
+            self.output.admit()?;
+
             let input = buffer.as_bytes();
 
             // Geometry travels in-band. Both the size *and* the pixel layout come
@@ -430,20 +447,7 @@ mod jpeg_codec {
             self.stats
                 .record_frame(output.len(), started.elapsed().as_nanos() as u64);
 
-            // Lazily initialize arena
-            if self.arena.is_none() {
-                self.arena = Some(
-                    SharedArena::new(output.len().max(1024 * 1024), 16)
-                        .map_err(|e| Error::Element(format!("Failed to create arena: {}", e)))?,
-                );
-            }
-            let arena = self.arena.as_mut().unwrap();
-
-            arena.reclaim();
-
-            let mut slot = arena
-                .acquire()
-                .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+            let mut slot = self.output.acquire(output.len(), "jpegencoder")?;
             slot.data_mut()[..output.len()].copy_from_slice(&output);
 
             self.frame_count += 1;
@@ -483,15 +487,23 @@ mod png_codec {
     /// Decodes PNG images to raw pixel data.
     pub struct PngDecoder {
         frame_count: u64,
-        arena: Option<SharedArena>,
+        output: OutputArena,
     }
 
     impl PngDecoder {
+        /// The output arena, sized by the executor at start.
+        ///
+        /// A 1 MiB floor on the slot: compressed frame sizes vary, and the
+        /// slot size is fixed when the arena is built from the first one.
+        fn new_output_arena() -> OutputArena {
+            OutputArena::new(defaults::VIDEO_DECODER_SLOT_COUNT).with_min_slot_size(1024 * 1024)
+        }
+
         /// Create a new PNG decoder.
         pub fn new() -> Self {
             Self {
                 frame_count: 0,
-                arena: None,
+                output: Self::new_output_arena(),
             }
         }
 
@@ -508,6 +520,10 @@ mod png_codec {
     }
 
     impl Element for PngDecoder {
+        fn set_output_budget(&mut self, budget: OutputBudget) {
+            self.output.set_budget(budget);
+        }
+
         fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
             let input = buffer.as_bytes();
 
@@ -528,20 +544,7 @@ mod png_codec {
             // Truncate to actual size
             pixels.truncate(info.buffer_size());
 
-            // Lazily initialize arena
-            if self.arena.is_none() {
-                self.arena = Some(
-                    SharedArena::new(pixels.len().max(1024 * 1024), 16)
-                        .map_err(|e| Error::Element(format!("Failed to create arena: {}", e)))?,
-                );
-            }
-            let arena = self.arena.as_mut().unwrap();
-
-            arena.reclaim();
-
-            let mut slot = arena
-                .acquire()
-                .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+            let mut slot = self.output.acquire(pixels.len(), "pngdecoder")?;
             slot.data_mut()[..pixels.len()].copy_from_slice(&pixels);
 
             self.frame_count += 1;
@@ -601,12 +604,20 @@ mod png_codec {
         /// Colour-type hint, used only when the buffer declares no pixel format.
         color_type: Option<ColorType>,
         frame_count: u64,
-        arena: Option<SharedArena>,
+        output: OutputArena,
         /// Counters readable while the pipeline runs (shared with [`Self::stats`]).
         stats: crate::control::EncoderStatsHandle,
     }
 
     impl PngEncoder {
+        /// The output arena, sized by the executor at start.
+        ///
+        /// A 1 MiB floor on the slot: compressed frame sizes vary, and the
+        /// slot size is fixed when the arena is built from the first one.
+        fn new_output_arena() -> OutputArena {
+            OutputArena::new(defaults::VIDEO_ENCODER_SLOT_COUNT).with_min_slot_size(1024 * 1024)
+        }
+
         /// Create a new PNG encoder.
         ///
         /// Geometry and pixel layout come from each buffer's [`Metadata`](crate::metadata::Metadata).
@@ -614,7 +625,7 @@ mod png_codec {
             Self {
                 color_type: None,
                 frame_count: 0,
-                arena: None,
+                output: Self::new_output_arena(),
                 stats: crate::control::EncoderStatsHandle::default(),
             }
         }
@@ -661,7 +672,17 @@ mod png_codec {
     }
 
     impl Element for PngEncoder {
+        fn set_output_budget(&mut self, budget: OutputBudget) {
+            self.output.set_budget(budget);
+        }
+
         fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
+            // Admission control before the encode: if downstream is still
+            // holding every output slot, spending CPU on a frame with
+            // nowhere to go helps nobody. The executor sheds it and the
+            // next frame proceeds normally.
+            self.output.admit()?;
+
             let input = buffer.as_bytes();
 
             // Geometry travels in-band: size and layout come from the same
@@ -701,21 +722,7 @@ mod png_codec {
             self.stats
                 .record_frame(output.len(), started.elapsed().as_nanos() as u64);
 
-            // Lazily initialize arena
-            if self.arena.is_none() {
-                // PNG compression varies; allocate generous size
-                self.arena = Some(
-                    SharedArena::new(output.len().max(1024 * 1024), 16)
-                        .map_err(|e| Error::Element(format!("Failed to create arena: {}", e)))?,
-                );
-            }
-            let arena = self.arena.as_mut().unwrap();
-
-            arena.reclaim();
-
-            let mut slot = arena
-                .acquire()
-                .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+            let mut slot = self.output.acquire(output.len(), "pngencoder")?;
             slot.data_mut()[..output.len()].copy_from_slice(&output);
 
             self.frame_count += 1;

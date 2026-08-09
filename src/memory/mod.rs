@@ -59,7 +59,7 @@ mod segment;
 mod shared_refcount;
 
 pub use bitmap::AtomicBitmap;
-pub use budget::OutputBudget;
+pub use budget::{OutputArena, OutputBudget};
 pub use buffer_pool::{BufferPool, FixedBufferPool, PoolStats, PooledBuffer};
 pub use dmabuf::DmaBufSegment;
 pub use huge_pages::{HugePageSegment, HugePageSize};

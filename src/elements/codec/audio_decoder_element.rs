@@ -24,8 +24,8 @@
 use super::audio_traits::AudioDecoder;
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{ExecutionHints, Output, Transform};
-use crate::error::{Error, Result};
-use crate::memory::SharedArena;
+use crate::error::Result;
+use crate::memory::{OutputArena, OutputBudget, defaults};
 
 /// Wraps an [`AudioDecoder`] to work as a pipeline [`Transform`] element.
 ///
@@ -48,7 +48,7 @@ pub struct AudioDecoderElement<D: AudioDecoder> {
     /// Current timestamp in nanoseconds.
     current_pts: i64,
     /// Arena for output buffer allocation.
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl<D: AudioDecoder> AudioDecoderElement<D> {
@@ -65,7 +65,7 @@ impl<D: AudioDecoder> AudioDecoderElement<D> {
             packets_in: 0,
             frames_out: 0,
             current_pts: 0,
-            arena: None,
+            output: OutputArena::new(defaults::AUDIO_SLOT_COUNT).with_min_slot_size(64 * 1024),
         }
     }
 
@@ -89,24 +89,27 @@ impl<D: AudioDecoder> AudioDecoderElement<D> {
         &mut self.decoder
     }
 
-    /// Ensure arena is initialized with appropriate size.
-    fn ensure_arena(&mut self, min_size: usize) -> Result<()> {
-        if self.arena.is_none()
-            || self.arena.as_ref().map(|a| a.slot_size()).unwrap_or(0) < min_size
+    /// Widen the arena when a decoded frame outgrows its slots.
+    ///
+    /// Slot size is fixed at build time, so a longer packet than anything seen
+    /// so far needs a rebuild.
+    fn ensure_arena(&mut self, min_size: usize) {
+        if self
+            .output
+            .arena()
+            .is_some_and(|a| a.slot_size() < min_size)
         {
-            // Allocate arena for decoded audio
-            // Typical max: 120ms at 48kHz, stereo, 16-bit = 5760 * 2 * 2 = 23040 bytes
-            let size = min_size.max(64 * 1024);
-            self.arena = Some(
-                SharedArena::new(size, 16)
-                    .map_err(|e| Error::Element(format!("Failed to create arena: {}", e)))?,
-            );
+            self.output.reset();
         }
-        Ok(())
+        self.output.set_min_slot_size(min_size.max(64 * 1024));
     }
 }
 
 impl<D: AudioDecoder + 'static> Transform for AudioDecoderElement<D> {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn transform(&mut self, buffer: Buffer) -> Result<Output> {
         let packet = buffer.as_bytes();
         let input_pts = buffer.metadata().pts.nanos() as i64;
@@ -127,14 +130,10 @@ impl<D: AudioDecoder + 'static> Transform for AudioDecoderElement<D> {
         self.frames_out += 1;
 
         // Ensure arena is large enough
-        self.ensure_arena(samples.data.len())?;
-        let arena = self.arena.as_ref().unwrap();
-        arena.reclaim();
-
-        // Copy to output buffer
-        let mut slot = arena
-            .acquire()
-            .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+        self.ensure_arena(samples.data.len());
+        let mut slot = self
+            .output
+            .acquire(samples.data.len(), "audiodecoderelement")?;
         slot.data_mut()[..samples.data.len()].copy_from_slice(&samples.data);
 
         // Preserve input metadata and update PTS/duration
@@ -162,13 +161,10 @@ impl<D: AudioDecoder + 'static> Transform for AudioDecoderElement<D> {
             Some(samples) => {
                 self.frames_out += 1;
 
-                self.ensure_arena(samples.data.len())?;
-                let arena = self.arena.as_ref().unwrap();
-                arena.reclaim();
-
-                let mut slot = arena
-                    .acquire()
-                    .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+                self.ensure_arena(samples.data.len());
+                let mut slot = self
+                    .output
+                    .acquire(samples.data.len(), "audiodecoderelement")?;
                 slot.data_mut()[..samples.data.len()].copy_from_slice(&samples.data);
 
                 let mut metadata = crate::metadata::Metadata::new();

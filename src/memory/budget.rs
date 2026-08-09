@@ -28,6 +28,8 @@
 //! [`channel_capacity`]: crate::pipeline::ExecutorConfig::channel_capacity
 
 use super::defaults;
+use super::shared_refcount::{SharedArena, SharedSlotRef};
+use crate::error::{Error, Result};
 
 /// The slot count an element's output arena should have, as computed by the
 /// executor from the graph it is about to run.
@@ -75,7 +77,7 @@ impl OutputBudget {
     ///
     /// - the `floor` wins when it is larger, so an element that knows it needs
     ///   depth (a lookahead encoder) keeps it even in a shallow graph;
-    /// - the total is clamped to [`MAX_OUTPUT_ARENA_BYTES`] slots' worth. A 4K
+    /// - the total is clamped to [`defaults::MAX_OUTPUT_ARENA_BYTES`] slots' worth. A 4K
     ///   RGBA frame is 33 MB, so an unclamped `channel_capacity: 200` would ask
     ///   for 6.6 GB. Degrading to fewer slots sheds frames; allocating 6.6 GB
     ///   takes the machine down.
@@ -124,6 +126,188 @@ impl OutputBudget {
             );
         }
         explicit
+    }
+}
+
+/// A lazily-built output arena that sizes itself from the executor's budget.
+///
+/// Elements that emit buffers nearly all want the same thing: an arena built on
+/// the first frame (because only then is the payload size known), rebuilt on a
+/// resize, sized from the budget, and reporting exhaustion in the one way the
+/// executor treats as recoverable. Before this existed each of them spelled it
+/// out by hand with a hard-coded slot count, which is precisely how a dozen
+/// elements ended up with 16-slot arenas behind a 16-deep channel.
+///
+/// ```rust,ignore
+/// struct MyEncoder {
+///     output: OutputArena,
+/// }
+///
+/// impl MyEncoder {
+///     fn new() -> Self {
+///         Self { output: OutputArena::new(defaults::VIDEO_ENCODER_SLOT_COUNT) }
+///     }
+/// }
+///
+/// impl Element for MyEncoder {
+///     fn set_output_budget(&mut self, budget: OutputBudget) {
+///         self.output.set_budget(budget);
+///     }
+///
+///     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
+///         self.output.admit()?;                     // before irreversible work
+///         let encoded = self.encode(&buffer)?;
+///         let mut slot = self.output.acquire(encoded.len(), "myencoder")?;
+///         slot.data_mut()[..encoded.len()].copy_from_slice(&encoded);
+///         // ...
+///     }
+/// }
+/// ```
+pub struct OutputArena {
+    arena: Option<SharedArena>,
+    budget: Option<OutputBudget>,
+    explicit: Option<usize>,
+    floor: usize,
+    min_slot_size: usize,
+}
+
+impl std::fmt::Debug for OutputArena {
+    // Hand-written because SharedArena is not Debug, and the useful facts here
+    // are the shape of the arena rather than its mapping.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OutputArena")
+            .field("built", &self.arena.is_some())
+            .field("slots", &self.arena.as_ref().map(|a| a.slot_count()))
+            .field("slot_size", &self.arena.as_ref().map(|a| a.slot_size()))
+            .field("budget", &self.budget)
+            .field("explicit", &self.explicit)
+            .field("floor", &self.floor)
+            .finish()
+    }
+}
+
+impl OutputArena {
+    /// A new, unbuilt arena. `floor` is the slot count to use when no executor
+    /// budget arrives — pick one of the `memory::defaults` counts.
+    pub fn new(floor: usize) -> Self {
+        Self {
+            arena: None,
+            budget: None,
+            explicit: None,
+            floor,
+            min_slot_size: 0,
+        }
+    }
+
+    /// Never build slots smaller than `bytes`.
+    ///
+    /// Slot size is fixed when the arena is built, from the first frame — but a
+    /// compressed frame's size varies, and the *next* one may well be bigger.
+    /// Encoders should set this to a generous ceiling so a slightly larger
+    /// frame does not have to rebuild the arena (or, worse, fail to fit).
+    pub fn with_min_slot_size(mut self, bytes: usize) -> Self {
+        self.min_slot_size = bytes;
+        self
+    }
+
+    /// [`with_min_slot_size`](Self::with_min_slot_size) after construction, for
+    /// elements that only learn their upper bound from the first frame's
+    /// geometry. Takes effect on the next build, so pair it with
+    /// [`reset`](Self::reset) to re-size an existing arena.
+    pub fn set_min_slot_size(&mut self, bytes: usize) {
+        self.min_slot_size = bytes;
+    }
+
+    /// Adopt the executor's budget. Wire this to `set_output_budget`.
+    pub fn set_budget(&mut self, budget: OutputBudget) {
+        self.budget = Some(budget);
+    }
+
+    /// Pin the slot count explicitly, overriding the budget.
+    pub fn set_slots(&mut self, slots: usize) {
+        self.explicit = Some(slots);
+    }
+
+    /// Whether the arena has been built yet.
+    pub fn is_built(&self) -> bool {
+        self.arena.is_some()
+    }
+
+    /// The built arena, if any.
+    pub fn arena(&self) -> Option<&SharedArena> {
+        self.arena.as_ref()
+    }
+
+    /// Drop the arena so the next [`acquire`](Self::acquire) rebuilds it.
+    ///
+    /// For a geometry change: the new frames need differently-sized slots, and
+    /// the budget is re-consulted on the way through.
+    pub fn reset(&mut self) {
+        self.arena = None;
+    }
+
+    /// Admission control: is there room for another output buffer?
+    ///
+    /// Call this **before** doing work that cannot be undone — pushing a frame
+    /// into an encoder's GOP, advancing a muxer's continuity counter. On
+    /// [`Error::PoolExhausted`] the caller should return immediately, leaving
+    /// its state untouched; the executor sheds the buffer and the next one
+    /// proceeds normally.
+    ///
+    /// Succeeds trivially before the arena exists — there is nothing to be full
+    /// yet, and the first [`acquire`](Self::acquire) will build it.
+    pub fn admit(&mut self) -> Result<()> {
+        let Some(arena) = self.arena.as_mut() else {
+            return Ok(());
+        };
+        arena.reclaim();
+        if arena.has_free() {
+            Ok(())
+        } else {
+            Err(Error::PoolExhausted)
+        }
+    }
+
+    /// Acquire a slot big enough for `len` bytes, building the arena if needed.
+    ///
+    /// The arena's slot size is fixed at build time, from `len` and
+    /// [`with_min_slot_size`](Self::with_min_slot_size); later frames must fit
+    /// within it. Call [`reset`](Self::reset) when the geometry changes.
+    ///
+    /// Returns [`Error::PoolExhausted`] when every slot is taken, which the
+    /// executor treats as a shed buffer rather than a fatal error. A frame too
+    /// big for the slot is a plain error naming the cause — the hand-written
+    /// versions of this used to index straight into the slot and panic.
+    pub fn acquire(&mut self, len: usize, element: &str) -> Result<SharedSlotRef> {
+        if self.arena.is_none() {
+            let slot_size = len.max(self.min_slot_size).max(1);
+            let budget = self.budget.unwrap_or_default();
+            let slots = budget.resolve_with_override(self.explicit, self.floor, slot_size, element);
+
+            tracing::debug!(
+                "{element}: output arena {slots} slots x {slot_size} bytes \
+                 (budget {} + {})",
+                budget.downstream_capacity,
+                budget.in_flight_margin,
+            );
+            self.arena =
+                Some(SharedArena::new(slot_size, slots).map_err(|e| {
+                    Error::AllocationFailed(format!("{element}: output arena: {e}"))
+                })?);
+        }
+
+        let arena = self.arena.as_mut().expect("built immediately above");
+        arena.reclaim();
+
+        let slot = arena.acquire().ok_or(Error::PoolExhausted)?;
+        if slot.len() < len {
+            return Err(Error::InvalidSegment(format!(
+                "{element}: output slot is {} bytes but the frame needs {len} — the arena was \
+                 built for a smaller payload; call reset() on a geometry change",
+                slot.len(),
+            )));
+        }
+        Ok(slot)
     }
 }
 
@@ -202,5 +386,93 @@ mod tests {
     fn an_explicit_zero_is_raised_to_one() {
         let budget = OutputBudget::new(16, 4);
         assert_eq!(budget.resolve_with_override(Some(0), 64, 1024, "t"), 1);
+    }
+
+    // ---- OutputArena ------------------------------------------------------
+
+    #[test]
+    fn the_arena_is_built_on_first_acquire_and_sized_from_the_budget() {
+        let mut out = OutputArena::new(defaults::MIN_OUTPUT_SLOT_COUNT);
+        out.set_budget(OutputBudget::new(32, 4));
+        assert!(!out.is_built());
+
+        let slot = out.acquire(1024, "t").unwrap();
+        assert!(out.is_built());
+        assert_eq!(out.arena().unwrap().slot_count(), 36);
+        assert!(slot.len() >= 1024);
+    }
+
+    #[test]
+    fn without_a_budget_the_arena_falls_back_to_its_floor() {
+        let mut out = OutputArena::new(8);
+        out.acquire(1024, "t").unwrap();
+        assert_eq!(out.arena().unwrap().slot_count(), 8);
+    }
+
+    #[test]
+    fn admit_passes_before_the_arena_exists() {
+        let mut out = OutputArena::new(2);
+        assert!(
+            out.admit().is_ok(),
+            "nothing can be full before it is built"
+        );
+    }
+
+    #[test]
+    fn a_full_arena_reports_pool_exhausted_from_both_paths() {
+        let mut out = OutputArena::new(2);
+        out.set_slots(2);
+
+        let held: Vec<_> = (0..2).map(|_| out.acquire(64, "t").unwrap()).collect();
+
+        assert!(matches!(out.admit(), Err(Error::PoolExhausted)));
+        assert!(matches!(out.acquire(64, "t"), Err(Error::PoolExhausted)));
+
+        // Releasing is not enough — the owner has to reclaim, which both
+        // admit() and acquire() do for the caller.
+        drop(held);
+        assert!(out.admit().is_ok());
+        assert!(out.acquire(64, "t").is_ok());
+    }
+
+    #[test]
+    fn reset_rebuilds_at_the_new_size() {
+        let mut out = OutputArena::new(4);
+        out.acquire(1024, "t").unwrap();
+        let small = out.arena().unwrap().slot_count();
+
+        out.reset();
+        assert!(!out.is_built());
+        let slot = out.acquire(64 * 1024, "t").unwrap();
+        assert!(
+            slot.len() >= 64 * 1024,
+            "a resize must widen the slot, not reuse the old one"
+        );
+        assert_eq!(out.arena().unwrap().slot_count(), small);
+    }
+
+    #[test]
+    fn a_min_slot_size_leaves_headroom_for_a_bigger_next_frame() {
+        // Compressed frame sizes vary, and slot size is fixed at build time.
+        let mut out = OutputArena::new(4).with_min_slot_size(1024 * 1024);
+
+        let slot = out.acquire(900, "t").unwrap();
+        assert!(slot.len() >= 1024 * 1024, "no headroom: {}", slot.len());
+        drop(slot);
+
+        // A later, much larger frame still fits.
+        assert!(out.acquire(900_000, "t").is_ok());
+    }
+
+    #[test]
+    fn a_frame_larger_than_the_slot_is_an_error_not_a_silent_truncation() {
+        let mut out = OutputArena::new(4);
+        out.acquire(64, "t").unwrap();
+
+        let err = out.acquire(1024 * 1024, "t").unwrap_err();
+        assert!(
+            format!("{err}").contains("geometry change"),
+            "unhelpful message: {err}"
+        );
     }
 }

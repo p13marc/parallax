@@ -24,7 +24,7 @@ use crate::buffer::{Buffer, MemoryHandle};
 use crate::clock::ClockTime;
 use crate::element::{Element, ExecutionHints};
 use crate::error::{Error, Result};
-use crate::memory::SharedArena;
+use crate::memory::{OutputArena, OutputBudget, defaults};
 
 use super::common::{PixelFormat, VideoFrame};
 
@@ -48,7 +48,7 @@ pub struct Dav1dDecoder {
     decoder: dav1d::Decoder,
     frame_count: u64,
     /// Arena for output buffer allocation.
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl Dav1dDecoder {
@@ -61,7 +61,7 @@ impl Dav1dDecoder {
         Ok(Self {
             decoder,
             frame_count: 0,
-            arena: None,
+            output: OutputArena::new(defaults::VIDEO_DECODER_SLOT_COUNT),
         })
     }
 
@@ -73,7 +73,7 @@ impl Dav1dDecoder {
         Ok(Self {
             decoder,
             frame_count: 0,
-            arena: None,
+            output: OutputArena::new(defaults::VIDEO_DECODER_SLOT_COUNT),
         })
     }
 
@@ -156,24 +156,18 @@ impl Dav1dDecoder {
 }
 
 impl Element for Dav1dDecoder {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
+    // Decoders never skip an input: it would be a reference frame the
+    // decoder never sees. Shed the output copy instead.
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         let input = buffer.as_bytes();
 
         match self.decode_frame(input)? {
             Some(frame) => {
-                // Initialize arena on first use with frame size
-                if self.arena.is_none() {
-                    self.arena =
-                        Some(SharedArena::new(frame.data.len(), 16).map_err(|e| {
-                            Error::Element(format!("Failed to create arena: {}", e))
-                        })?);
-                }
-
-                let arena = self.arena.as_mut().unwrap();
-                arena.reclaim();
-                let mut slot = arena
-                    .acquire()
-                    .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+                let mut slot = self.output.acquire(frame.data.len(), "dav1ddecoder")?;
                 slot.data_mut()[..frame.data.len()].copy_from_slice(&frame.data);
 
                 let mut metadata = buffer.metadata().clone();

@@ -56,6 +56,7 @@ let config = ExecutorConfig {
         ..Default::default()
     },
     driver: None,                         // Some(DriverConfig) for explicit pacing
+    shed_fatal_after: None,               // None = shed forever (right for live media)
 };
 
 let executor = Executor::with_config(config);
@@ -67,6 +68,13 @@ handle.wait().await?;
 ```
 
 Presets: `ExecutorConfig::auto()`, `async_only()`, `hybrid()`, `low_latency_audio()` (quantum 64, priority 50), `video(fps)`.
+
+`channel_capacity` does double duty: besides the channel depth, the executor uses
+it to size each element's **output arena**, so an element cannot run out of slots
+just because the channel it feeds is full. Raising it therefore costs memory in
+two places — see [memory.md § Output arenas](memory.md#output-arenas), which also
+explains why exhaustion sheds a buffer rather than failing the pipeline, and what
+`shed_fatal_after` is for.
 
 `SchedulingMode` semantics:
 

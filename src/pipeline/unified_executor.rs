@@ -78,6 +78,18 @@ pub struct ExecutorConfig {
     /// When true (default), the executor analyzes ExecutionHints to determine
     /// optimal scheduling per element.
     pub auto_strategy: bool,
+
+    /// Fail the pipeline after this many buffers shed back-to-back.
+    ///
+    /// An element whose output arena is exhausted sheds the buffer and carries
+    /// on (see [`Error::PoolExhausted`]), which is what a live capture wants:
+    /// a dropped frame beats a dead pipeline. `None`, the default, means it
+    /// never gives up.
+    ///
+    /// Set it for work where silent degradation is the worse outcome — a batch
+    /// transcode producing a file with gaps in it should stop and say so rather
+    /// than finish and look successful.
+    pub shed_fatal_after: Option<u64>,
 }
 
 impl Default for ExecutorConfig {
@@ -88,6 +100,7 @@ impl Default for ExecutorConfig {
             rt: RtConfig::default(),
             driver: None,
             auto_strategy: true, // Enable automatic by default
+            shed_fatal_after: None,
         }
     }
 }
@@ -151,6 +164,15 @@ impl ExecutorConfig {
     /// Set channel capacity.
     pub fn with_channel_capacity(mut self, capacity: usize) -> Self {
         self.channel_capacity = capacity;
+        self
+    }
+
+    /// Fail the pipeline after `limit` buffers shed back-to-back.
+    ///
+    /// See [`shed_fatal_after`](Self::shed_fatal_after). The default is to shed
+    /// indefinitely, which is right for live media and wrong for batch work.
+    pub fn with_shed_fatal_after(mut self, limit: u64) -> Self {
+        self.shed_fatal_after = Some(limit);
         self
     }
 
@@ -1116,6 +1138,7 @@ impl Executor {
                 events_clone,
                 probes,
                 tracers,
+                ShedTracker::new(self.config.shed_fatal_after),
             ),
             ElementType::Demuxer => {
                 // Inputs flattened (one sink pad), outputs kept per pad — that
@@ -1192,6 +1215,79 @@ impl Default for Executor {
 // ============================================================================
 // Internal Types
 // ============================================================================
+
+/// Bookkeeping for buffers shed because an element's output arena was full.
+///
+/// [`Error::PoolExhausted`] is the one error the executor does not treat as
+/// fatal. An arena runs dry when downstream is holding more buffers than the
+/// budget anticipated — an application sitting on everything it pulled, a deep
+/// queue — and for a live pipeline the right answer is to drop a buffer and keep
+/// going, not to tear the graph down. Frames are recoverable; a dead capture
+/// session is not.
+///
+/// It still has to be *visible*, or a pipeline silently delivering half its
+/// frames looks healthy. Every shed increments the drop tracer and the
+/// `parallax_buffers_dropped` metric; the log is rate-limited to the 1st, 10th,
+/// 100th... consecutive shed, because the failure mode is high-frequency by
+/// nature and a per-frame warning would bury everything else.
+struct ShedTracker {
+    consecutive: u64,
+    total: u64,
+    fatal_after: Option<u64>,
+}
+
+impl ShedTracker {
+    fn new(fatal_after: Option<u64>) -> Self {
+        Self {
+            consecutive: 0,
+            total: 0,
+            fatal_after,
+        }
+    }
+
+    /// Record one shed buffer. `Err` means the configured limit was reached and
+    /// the caller should fail the task after all.
+    fn record(&mut self, name: &str, tracers: &TracerRegistry) -> Result<()> {
+        self.consecutive += 1;
+        self.total += 1;
+
+        tracers.notify_drop(name);
+        crate::observability::record_buffer_dropped("pipeline", name);
+
+        if is_power_of_ten(self.consecutive) {
+            tracing::warn!(
+                "{name}: output arena exhausted, shedding buffers ({} in a row, {} total) — \
+                 downstream is holding more than the link capacity accounts for",
+                self.consecutive,
+                self.total,
+            );
+        }
+
+        match self.fatal_after {
+            Some(limit) if self.consecutive >= limit => Err(Error::Element(format!(
+                "{name}: shed {} buffers in a row (shed_fatal_after = {limit})",
+                self.consecutive
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    /// A buffer got through: the burst is over.
+    fn reset(&mut self) {
+        self.consecutive = 0;
+    }
+}
+
+/// `1, 10, 100, ...` — the rate-limit ladder for shed warnings.
+fn is_power_of_ten(mut n: u64) -> bool {
+    if n == 0 {
+        return false;
+    }
+    while n.is_multiple_of(10) {
+        n /= 10;
+    }
+    n == 1
+}
 
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)] // Intentional: avoid heap allocation on hot path
@@ -1574,6 +1670,7 @@ fn spawn_transform_task(
     events: EventSender,
     probe_registry: ProbeRegistry,
     tracers: TracerRegistry,
+    mut shed: ShedTracker,
 ) -> JoinHandle<Result<()>> {
     tokio::spawn(async move {
         tracing::debug!("transform '{}' started", name);
@@ -1644,6 +1741,7 @@ fn spawn_transform_task(
                                     ProbeReturn::Drop | ProbeReturn::Handled => continue,
                                     _ => {}
                                 }
+                                shed.reset();
                                 send_output(out, &outputs, &output_bridges, &tracers).await;
                             }
                             Ok(None) => {
@@ -1652,6 +1750,14 @@ fn spawn_transform_task(
                                     name,
                                     count
                                 );
+                                shed.reset();
+                            }
+                            // Arena exhaustion is flow control, not failure: the
+                            // element had nowhere to put this buffer because
+                            // downstream is still holding the last ones. Shed it
+                            // and keep the pipeline alive.
+                            Err(Error::PoolExhausted) => {
+                                shed.record(&name, &tracers)?;
                             }
                             Err(e) => {
                                 tracing::error!("transform '{}': error: {}", name, e);
@@ -1726,9 +1832,14 @@ fn spawn_transform_task(
                                 ProbeReturn::Drop | ProbeReturn::Handled => continue,
                                 _ => {}
                             }
+                            shed.reset();
                             send_output(out, &outputs, &output_bridges, &tracers).await;
                         }
-                        Ok(None) => {}
+                        Ok(None) => shed.reset(),
+                        // Shed rather than die — see the channel path above.
+                        Err(Error::PoolExhausted) => {
+                            shed.record(&name, &tracers)?;
+                        }
                         Err(e) => {
                             events.send_error(e.to_string(), Some(name.clone()));
                             return Err(e);
@@ -2193,6 +2304,48 @@ mod tests {
         // without_auto_strategy should disable it
         let config = ExecutorConfig::default().without_auto_strategy();
         assert!(!config.auto_strategy);
+    }
+
+    // ---- ShedTracker ------------------------------------------------------
+
+    #[test]
+    fn the_warning_ladder_is_powers_of_ten() {
+        let on: Vec<u64> = (0..=1000).filter(|&n| is_power_of_ten(n)).collect();
+        assert_eq!(on, vec![1, 10, 100, 1000]);
+        assert!(!is_power_of_ten(0), "zero sheds is not a shed");
+    }
+
+    #[test]
+    fn shedding_is_not_fatal_by_default() {
+        let tracers = TracerRegistry::new();
+        let mut shed = ShedTracker::new(None);
+        for _ in 0..10_000 {
+            shed.record("t", &tracers)
+                .expect("shedding must never fail by default");
+        }
+        assert_eq!(shed.total, 10_000);
+    }
+
+    #[test]
+    fn shed_fatal_after_fires_on_consecutive_sheds_only() {
+        let tracers = TracerRegistry::new();
+        let mut shed = ShedTracker::new(Some(3));
+
+        assert!(shed.record("t", &tracers).is_ok());
+        assert!(shed.record("t", &tracers).is_ok());
+        // A buffer got through: the burst is over and the count restarts.
+        shed.reset();
+
+        assert!(shed.record("t", &tracers).is_ok());
+        assert!(shed.record("t", &tracers).is_ok());
+        let err = shed
+            .record("t", &tracers)
+            .expect_err("3 in a row should trip the limit");
+        assert!(format!("{err}").contains("shed"), "unhelpful: {err}");
+        assert_eq!(
+            shed.total, 5,
+            "the total counts every shed, not just the run"
+        );
     }
 
     // ---- output_slot_budget ----------------------------------------------

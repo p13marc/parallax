@@ -28,7 +28,7 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{Element, ExecutionHints};
 use crate::error::{Error, Result};
-use crate::memory::SharedArena;
+use crate::memory::{OutputArena, OutputBudget, defaults};
 
 /// Supported audio formats.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,7 +126,7 @@ mod symphonia_decoder {
         /// Channel count from last decoded frame.
         last_channels: Option<u16>,
         /// Arena for output buffers.
-        arena: Option<SharedArena>,
+        output: OutputArena,
     }
 
     impl SymphoniaDecoder {
@@ -138,7 +138,7 @@ mod symphonia_decoder {
                 input_buffer: Vec::new(),
                 last_sample_rate: None,
                 last_channels: None,
-                arena: None,
+                output: OutputArena::new(defaults::AUDIO_SLOT_COUNT).with_min_slot_size(64 * 1024),
             })
         }
 
@@ -162,7 +162,7 @@ mod symphonia_decoder {
                 input_buffer: Vec::new(),
                 last_sample_rate: None,
                 last_channels: None,
-                arena: None,
+                output: OutputArena::new(defaults::AUDIO_SLOT_COUNT).with_min_slot_size(64 * 1024),
             })
         }
 
@@ -277,6 +277,10 @@ mod symphonia_decoder {
     }
 
     impl Element for SymphoniaDecoder {
+        fn set_output_budget(&mut self, budget: OutputBudget) {
+            self.output.set_budget(budget);
+        }
+
         fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
             let input = buffer.as_bytes();
 
@@ -285,19 +289,7 @@ mod symphonia_decoder {
                     // Convert f32 samples to bytes
                     let byte_len = samples.len() * 4;
 
-                    // Lazily initialize arena
-                    if self.arena.is_none() {
-                        self.arena =
-                            Some(SharedArena::new(byte_len.max(64 * 1024), 16).map_err(|e| {
-                                Error::Element(format!("Failed to create arena: {}", e))
-                            })?);
-                    }
-                    let arena = self.arena.as_ref().unwrap();
-                    arena.reclaim();
-
-                    let mut slot = arena.acquire().ok_or_else(|| {
-                        Error::Element("Failed to acquire buffer slot".to_string())
-                    })?;
+                    let mut slot = self.output.acquire(byte_len, "symphoniadecoder")?;
 
                     // Copy f32 samples as bytes
                     let src_bytes = unsafe {

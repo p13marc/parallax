@@ -24,8 +24,8 @@
 use super::audio_traits::{AudioEncoder, AudioSampleFormat, AudioSamples};
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{ExecutionHints, Output, Transform};
-use crate::error::{Error, Result};
-use crate::memory::SharedArena;
+use crate::error::Result;
+use crate::memory::{OutputArena, OutputBudget, defaults};
 use std::collections::VecDeque;
 
 /// Wraps an [`AudioEncoder`] to work as a pipeline [`Transform`] element.
@@ -57,7 +57,7 @@ pub struct AudioEncoderElement<E: AudioEncoder> {
     /// Current timestamp in nanoseconds.
     current_pts: i64,
     /// Arena for output buffer allocation.
-    arena: SharedArena,
+    output: OutputArena,
 }
 
 impl<E: AudioEncoder> AudioEncoderElement<E> {
@@ -75,10 +75,10 @@ impl<E: AudioEncoder> AudioEncoderElement<E> {
         channels: u32,
         format: AudioSampleFormat,
     ) -> Result<Self> {
-        // Estimate max packet size (typical Opus max is ~4000 bytes)
-        let max_packet_size = 8192;
-        let arena = SharedArena::new(max_packet_size, 32)
-            .map_err(|e| Error::Element(format!("Failed to create arena: {}", e)))?;
+        // Sized by the executor from link capacity; the slot floor is a
+        // generous ceiling for a compressed audio packet (Opus tops out near
+        // 4000 bytes).
+        let output = OutputArena::new(defaults::AUDIO_SLOT_COUNT).with_min_slot_size(8192);
 
         Ok(Self {
             encoder,
@@ -91,7 +91,7 @@ impl<E: AudioEncoder> AudioEncoderElement<E> {
             frames_in: 0,
             packets_out: 0,
             current_pts: 0,
-            arena,
+            output,
         })
     }
 
@@ -141,16 +141,12 @@ impl<E: AudioEncoder> AudioEncoderElement<E> {
 
     /// Convert encoded packet to output buffer, preserving input metadata.
     fn packet_to_buffer(
-        &self,
+        &mut self,
         data: Vec<u8>,
         pts: i64,
         input_metadata: &crate::metadata::Metadata,
     ) -> Result<Buffer> {
-        self.arena.reclaim();
-        let mut slot = self
-            .arena
-            .acquire()
-            .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+        let mut slot = self.output.acquire(data.len(), "audioencoderelement")?;
         slot.data_mut()[..data.len()].copy_from_slice(&data);
 
         // Preserve input metadata and update PTS
@@ -164,12 +160,8 @@ impl<E: AudioEncoder> AudioEncoderElement<E> {
     }
 
     /// Convert encoded packet to output buffer during flush (no input metadata).
-    fn packet_to_buffer_flush(&self, data: Vec<u8>, pts: i64) -> Result<Buffer> {
-        self.arena.reclaim();
-        let mut slot = self
-            .arena
-            .acquire()
-            .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+    fn packet_to_buffer_flush(&mut self, data: Vec<u8>, pts: i64) -> Result<Buffer> {
+        let mut slot = self.output.acquire(data.len(), "audioencoderelement")?;
         slot.data_mut()[..data.len()].copy_from_slice(&data);
 
         let metadata =
@@ -183,6 +175,10 @@ impl<E: AudioEncoder> AudioEncoderElement<E> {
 }
 
 impl<E: AudioEncoder + 'static> Transform for AudioEncoderElement<E> {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn transform(&mut self, buffer: Buffer) -> Result<Output> {
         // Convert buffer to samples
         let samples = self.buffer_to_samples(&buffer);

@@ -192,8 +192,32 @@ independently and 200 × 4K RGBA would otherwise ask for 6.6 GB.
 not what downstream *elements* hold: an `AppSink` queues up to its `max_buffers`,
 a `Queue` up to its depth, and an application can retain every `Buffer` it pulls.
 None of that is visible to the executor, so exhaustion stays possible — and is
-handled where it happens rather than prevented here. See
-[Running out of slots](#running-out-of-slots).
+handled where it happens rather than prevented here.
+
+`OutputArena` packages the whole pattern (lazy build, budget sizing, rebuild on
+resize, `Error::PoolExhausted` on exhaustion), which is what the built-in codecs
+use. Reach for it rather than hand-rolling an arena field.
+
+## Running out of slots
+
+`Error::PoolExhausted` is the **one error the executor does not treat as fatal**.
+When an element cannot acquire an output slot, the executor drops that buffer,
+counts it on the `DropTracer` and the `parallax_buffers_dropped` metric, logs a
+rate-limited warning (1st, 10th, 100th… consecutive), and carries on. For live
+media that is the correct trade: a dropped frame is recoverable, a dead capture
+session is not. Set `ExecutorConfig::shed_fatal_after` to opt back into failing —
+a batch transcode should stop rather than quietly write a file with gaps.
+
+Every other `Err` from `process()` still terminates the element.
+
+What an element should do on exhaustion depends on what it would corrupt:
+
+| Element | On a full arena |
+|---|---|
+| Encoders | Call `OutputArena::admit()` **before** encoding and return early. A frame pushed into the GOP whose packet is then shed leaves a reference the decoder never receives — corrupt until the next IDR. Skipping the input only lowers the frame rate, which is what `skip_frames` already does deliberately. |
+| Decoders | **Never** skip an input: it is a reference frame, and everything after it decodes wrong. Decode, then shed the output copy; the decoder's own state stays intact. |
+| Muxers | Neither — a lost batch breaks continuity counters and PCR. Rely on the budget. |
+| Stateless transforms | Shed freely. |
 
 ## Other segment types
 

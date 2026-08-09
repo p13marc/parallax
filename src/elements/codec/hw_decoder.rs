@@ -29,9 +29,9 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::clock::ClockTime;
 use crate::element::{ExecutionHints, Output, Transform};
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::gpu::{GpuFrame, HwVideoDecoder};
-use crate::memory::SharedArena;
+use crate::memory::{OutputArena, OutputBudget, defaults};
 use std::collections::VecDeque;
 
 /// Wraps a [`HwVideoDecoder`] to work as a pipeline [`Transform`] element.
@@ -80,7 +80,7 @@ pub struct HwDecoderElement<D: HwVideoDecoder> {
     /// Statistics: frames produced.
     frames_out: u64,
     /// Arena for output buffer allocation (CPU fallback).
-    arena: Option<SharedArena>,
+    output: OutputArena,
     /// Expected output width (for arena sizing).
     width: u32,
     /// Expected output height (for arena sizing).
@@ -101,7 +101,7 @@ impl<D: HwVideoDecoder> HwDecoderElement<D> {
             flushed: false,
             packets_in: 0,
             frames_out: 0,
-            arena: None,
+            output: OutputArena::new(defaults::VIDEO_DECODER_SLOT_COUNT),
             width: 0,
             height: 0,
         }
@@ -147,21 +147,14 @@ impl<D: HwVideoDecoder> HwDecoderElement<D> {
         // (Re)build the arena when the frame no longer fits — a mid-stream
         // resolution change must not truncate frames into stale slots.
         if self
-            .arena
-            .as_ref()
-            .is_none_or(|a| a.slot_size() < frame_size)
+            .output
+            .arena()
+            .is_some_and(|a| a.slot_size() < frame_size)
         {
-            self.arena = Some(
-                SharedArena::new(frame_size, 8)
-                    .map_err(|e| Error::Element(format!("Failed to create arena: {}", e)))?,
-            );
+            self.output.reset();
         }
 
-        let arena = self.arena.as_mut().expect("just ensured");
-        arena.reclaim();
-        let mut slot = arena
-            .acquire()
-            .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+        let mut slot = self.output.acquire(frame_size, "hwdecoderelement")?;
 
         // The actual bridge: decoded pixels land in shared memory here.
         self.decoder
@@ -185,6 +178,10 @@ impl<D: HwVideoDecoder> HwDecoderElement<D> {
 }
 
 impl<D: HwVideoDecoder + 'static> Transform for HwDecoderElement<D> {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn transform(&mut self, buffer: Buffer) -> Result<Output> {
         let packet = buffer.as_bytes();
         let pts = buffer
@@ -276,8 +273,10 @@ impl<D: HwVideoDecoder> std::fmt::Debug for HwDecoderElement<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::Error;
     use crate::format::{MediaFormat, PixelFormat};
     use crate::gpu::{Codec, GpuBuffer, GpuPixelFormat, GpuUsage, VideoProfile};
+    use crate::memory::SharedArena;
     use crate::metadata::{BufferFlags, Metadata};
     use std::collections::HashMap;
 

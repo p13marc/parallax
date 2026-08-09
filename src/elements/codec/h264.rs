@@ -34,7 +34,7 @@ use crate::buffer::Buffer;
 use crate::control::{EncoderStatsHandle, RateControlMode};
 use crate::element::Element;
 use crate::error::{Error, Result};
-use crate::memory::SharedArena;
+use crate::memory::{OutputArena, OutputBudget, defaults};
 use crate::metadata::Metadata;
 
 use openh264::OpenH264API;
@@ -385,8 +385,8 @@ pub struct H264Encoder {
     control: super::EncoderControl,
     /// The control generation last applied to the encoder.
     applied_generation: u64,
-    /// Arena for output buffer allocation.
-    arena: SharedArena,
+    /// Arena for output buffer allocation, sized by the executor at start.
+    output: OutputArena,
 }
 
 /// Build an OpenH264 encoder from our config.
@@ -459,10 +459,11 @@ impl H264Encoder {
     pub fn new(config: H264EncoderConfig) -> Result<Self> {
         let encoder = build_encoder(&config)?;
 
-        // Create arena for encoded output buffers (typically < 1MB per frame)
-        // Use 64 slots to handle buffering when downstream is slower than encoding
-        let arena = SharedArena::new(1024 * 1024, 64)
-            .map_err(|e| Error::Config(format!("Failed to create arena: {}", e)))?;
+        // Sized by the executor from link capacity, with a 1 MiB slot floor:
+        // an encoded frame is usually well under that, but a keyframe at high
+        // bitrate is not, and slot size is fixed once the arena is built.
+        let output =
+            OutputArena::new(defaults::VIDEO_ENCODER_SLOT_COUNT).with_min_slot_size(1024 * 1024);
 
         Ok(Self {
             encoder,
@@ -471,7 +472,7 @@ impl H264Encoder {
             dims: None,
             control: super::EncoderControl::new(),
             applied_generation: 0,
-            arena,
+            output,
         })
     }
 
@@ -778,7 +779,18 @@ fn contains_idr(data: &[u8]) -> bool {
 
 /// Element trait implementation for H264Encoder.
 impl Element for H264Encoder {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
+        // Admission control before the frame enters the GOP. Encoding a frame
+        // whose packet is then shed would leave the decoder with a reference it
+        // never received, corrupt until the next IDR; skipping the input just
+        // lowers the frame rate, which is recoverable and what `skip_frames`
+        // already does on purpose.
+        self.output.admit()?;
+
         // Runtime reconfiguration (bitrate / keyframe interval / QP). Costs one
         // relaxed load when nothing changed; rebuilds the encoder when it did.
         self.apply_pending_control()?;
@@ -828,16 +840,7 @@ impl Element for H264Encoder {
         }
         let is_keyframe = contains_idr(&encoded);
 
-        // Reclaim any released slots before acquiring
-        self.arena.reclaim();
-
-        // Acquire slot from arena and copy encoded data
-        let mut slot = self
-            .arena
-            .acquire()
-            .ok_or_else(|| Error::Config("Failed to acquire buffer slot".to_string()))?;
-
-        // Copy encoded data to slot
+        let mut slot = self.output.acquire(encoded.len(), "h264encoder")?;
         slot.data_mut()[..encoded.len()].copy_from_slice(&encoded);
 
         let handle = crate::buffer::MemoryHandle::with_len(slot, encoded.len());
@@ -974,8 +977,10 @@ pub struct H264Decoder {
     decoder: Decoder,
     frame_count: u64,
     bytes_decoded: u64,
-    /// Arena for output buffer allocation.
-    arena: SharedArena,
+    /// Arena for output buffer allocation, sized by the executor at start.
+    output: OutputArena,
+    /// Geometry of the last decoded frame, to spot a mid-stream resize.
+    last_dims: Option<(u32, u32)>,
 }
 
 impl H264Decoder {
@@ -984,15 +989,18 @@ impl H264Decoder {
         let decoder = Decoder::new()
             .map_err(|e| Error::Config(format!("Failed to create H.264 decoder: {:?}", e)))?;
 
-        // Create arena for decoded YUV frames (1080p YUV420 = ~3MB per frame)
-        let arena = SharedArena::new(4 * 1024 * 1024, 8)
-            .map_err(|e| Error::Config(format!("Failed to create arena: {}", e)))?;
+        // Slot size comes from the first decoded frame, so 4K works without
+        // the hard-coded 4 MiB ceiling this used to carry; the floor keeps a
+        // 1080p arena from being rebuilt for a slightly larger frame.
+        let output = OutputArena::new(defaults::VIDEO_DECODER_SLOT_COUNT)
+            .with_min_slot_size(4 * 1024 * 1024);
 
         Ok(Self {
             decoder,
             frame_count: 0,
             bytes_decoded: 0,
-            arena,
+            output,
+            last_dims: None,
         })
     }
 
@@ -1053,6 +1061,14 @@ impl std::fmt::Debug for H264Decoder {
 
 /// Element trait implementation for H264Decoder.
 impl Element for H264Decoder {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
+    // No admission control here, deliberately: a skipped input is a
+    // reference frame the decoder never sees, so everything after it
+    // decodes wrong. Decode, then shed the output copy if there is
+    // nowhere to put it — the decoder's own state stays intact.
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         let input_data = buffer.as_bytes();
 
@@ -1060,14 +1076,20 @@ impl Element for H264Decoder {
             Some(frame) => {
                 let yuv_data = frame.to_yuv420_planar();
 
-                // Reclaim released slots and acquire new one
-                self.arena.reclaim();
-                let mut slot = self
-                    .arena
-                    .acquire()
-                    .ok_or_else(|| Error::Config("Failed to acquire buffer slot".to_string()))?;
+                // A resize needs a differently-sized slot, and the arena's is
+                // fixed once built.
+                let dims = (frame.width() as u32, frame.height() as u32);
+                if self.last_dims.is_some_and(|last| last != dims) {
+                    tracing::info!(
+                        "h264decoder: resolution changed to {}x{}, rebuilding the output arena",
+                        dims.0,
+                        dims.1
+                    );
+                    self.output.reset();
+                }
+                self.last_dims = Some(dims);
 
-                // Copy YUV data to slot
+                let mut slot = self.output.acquire(yuv_data.len(), "h264decoder")?;
                 slot.data_mut()[..yuv_data.len()].copy_from_slice(&yuv_data);
 
                 let handle = crate::buffer::MemoryHandle::with_len(slot, yuv_data.len());
@@ -1249,6 +1271,7 @@ impl<'a> YUVSource for YuvFrame<'a> {
 mod tests {
     use super::*;
     use crate::control::Controllable;
+    use crate::memory::SharedArena;
 
     #[test]
     fn test_encoder_config_default() {

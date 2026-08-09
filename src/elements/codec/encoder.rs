@@ -17,7 +17,7 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{Element, ExecutionHints};
 use crate::error::{Error, Result};
-use crate::memory::SharedArena;
+use crate::memory::{OutputArena, OutputBudget, defaults};
 
 use super::common::{PixelFormat, VideoFrame};
 use super::traits::VideoEncoder;
@@ -134,7 +134,7 @@ pub struct Rav1eEncoder {
     config: Rav1eConfig,
     frame_count: u64,
     /// Arena for output buffer allocation.
-    arena: Option<SharedArena>,
+    output: OutputArena,
     /// Packets drained at EOS, returned one per Element::flush call.
     pending_flush: std::collections::VecDeque<Vec<u8>>,
     /// Whether the rav1e context has been flushed.
@@ -152,7 +152,8 @@ impl Rav1eEncoder {
             dims: None,
             config,
             frame_count: 0,
-            arena: None,
+            output: OutputArena::new(defaults::VIDEO_ENCODER_SLOT_COUNT)
+                .with_min_slot_size(1024 * 1024),
             pending_flush: std::collections::VecDeque::new(),
             flushed: false,
         })
@@ -323,6 +324,13 @@ impl Rav1eEncoder {
 }
 
 impl Element for Rav1eEncoder {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
+    // No admission control on the input: rav1e holds a lookahead window,
+    // so a skipped frame is not a skipped *output* — it desynchronises the
+    // whole window. The output copy is shed instead.
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         let input = buffer.as_bytes();
         let pts = buffer.metadata().pts.nanos();
@@ -341,21 +349,7 @@ impl Element for Rav1eEncoder {
 
         match self.encode_frame(input, width as usize, height as usize, pts)? {
             Some(packet) => {
-                // Initialize arena on first use
-                if self.arena.is_none() {
-                    // Allocate enough for typical compressed frames
-                    let arena_size = packet.len().max(1024 * 1024); // At least 1MB
-                    self.arena =
-                        Some(SharedArena::new(arena_size, 16).map_err(|e| {
-                            Error::Element(format!("Failed to create arena: {}", e))
-                        })?);
-                }
-
-                let arena = self.arena.as_mut().unwrap();
-                arena.reclaim();
-                let mut slot = arena
-                    .acquire()
-                    .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+                let mut slot = self.output.acquire(packet.len(), "rav1eencoder")?;
                 slot.data_mut()[..packet.len()].copy_from_slice(&packet);
 
                 let metadata = buffer.metadata().clone();
@@ -384,18 +378,7 @@ impl Element for Rav1eEncoder {
             return Ok(None);
         };
 
-        if self.arena.is_none() {
-            let arena_size = packet.len().max(1024 * 1024);
-            self.arena = Some(
-                SharedArena::new(arena_size, 16)
-                    .map_err(|e| Error::Element(format!("Failed to create arena: {}", e)))?,
-            );
-        }
-        let arena = self.arena.as_mut().unwrap();
-        arena.reclaim();
-        let mut slot = arena
-            .acquire()
-            .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+        let mut slot = self.output.acquire(packet.len(), "rav1eencoder")?;
         slot.data_mut()[..packet.len()].copy_from_slice(&packet);
 
         Ok(Some(Buffer::new(
