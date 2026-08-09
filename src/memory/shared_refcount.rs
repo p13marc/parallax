@@ -933,6 +933,28 @@ impl SharedArena {
         self.slot_count
     }
 
+    /// Whether [`acquire`](Self::acquire) would succeed right now.
+    ///
+    /// Like `free_count() > 0`, but stops at the first free slot instead of
+    /// scanning all of them. This is for *admission control*: an encoder can
+    /// check before doing irreversible work (pushing a frame into a GOP) and
+    /// skip the input cleanly, rather than encoding and then discovering it has
+    /// nowhere to put the result.
+    ///
+    /// Call [`reclaim`](Self::reclaim) first — a slot released downstream stays
+    /// `Allocated` until the owner reclaims it.
+    ///
+    /// Always `false` for a client (non-owner) arena, which cannot acquire.
+    pub fn has_free(&self) -> bool {
+        if !self.is_owner {
+            return false;
+        }
+        (0..self.slot_count).any(|i| {
+            let sh = unsafe { &*self.slot_headers.as_ptr().add(i) };
+            sh.state() == SlotState::Free
+        })
+    }
+
     /// Get the number of free slots.
     pub fn free_count(&self) -> usize {
         let mut count = 0;
@@ -1571,6 +1593,27 @@ mod tests {
 
         // Arena is full
         assert!(arena.acquire().is_none());
+    }
+
+    #[test]
+    fn has_free_agrees_with_acquire() {
+        let arena = SharedArena::new(4096, 2).unwrap();
+        assert!(arena.has_free());
+
+        let slot1 = arena.acquire().unwrap();
+        assert!(arena.has_free(), "one of two slots is still free");
+
+        let _slot2 = arena.acquire().unwrap();
+        assert!(!arena.has_free());
+        assert!(arena.acquire().is_none(), "has_free lied about exhaustion");
+
+        // A released slot only counts once the owner reclaims it — which is
+        // exactly why admission control has to reclaim before it asks.
+        drop(slot1);
+        assert!(!arena.has_free(), "release alone must not free the slot");
+        arena.reclaim();
+        assert!(arena.has_free());
+        assert!(arena.acquire().is_some());
     }
 
     #[test]

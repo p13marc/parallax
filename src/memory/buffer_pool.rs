@@ -41,6 +41,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
+/// How long a blocked `acquire` sleeps before re-checking the arena.
+///
+/// A slot detached by [`PooledBuffer::into_buffer`] returns through the arena's
+/// release queue, which notifies nobody, so waiting purely on the condvar can
+/// sleep through a slot becoming free. Short enough to be invisible next to a
+/// frame interval, long enough that the re-check costs nothing.
+const DETACH_POLL: Duration = Duration::from_millis(2);
+
 // ============================================================================
 // BufferPool Trait
 // ============================================================================
@@ -55,6 +63,16 @@ use std::time::Duration;
 /// When all buffers are in use, `acquire()` blocks until one is returned.
 /// This provides natural backpressure in the pipeline - fast producers
 /// wait for slow consumers.
+///
+/// # Blocking is for sources only
+///
+/// `acquire()` blocks the calling thread, and element tasks run on the Tokio
+/// runtime, so only [`Source::produce`](crate::element::Source::produce) — via
+/// [`ProduceContext::acquire_buffer`](crate::element::ProduceContext::acquire_buffer)
+/// — should reach it. A transform that blocked here would park a runtime worker,
+/// possibly the one that would have drained the channel it is waiting on.
+/// Elements that own an output arena size it up front instead; see
+/// [`OutputBudget`](super::OutputBudget).
 pub trait BufferPool: Send + Sync {
     /// Acquire a buffer from the pool.
     ///
@@ -370,8 +388,17 @@ impl BufferPool for FixedBufferPool {
                 return Ok(buffer);
             }
 
-            // Wait for notification (with spurious wakeup handling)
-            guard = self.inner.notify.wait(guard).unwrap();
+            // Poll rather than wait outright, because not every returning slot
+            // rings the bell: `into_buffer()` detaches, so the slot comes back
+            // through `SharedSlotRef::drop` -> the arena's release queue, and
+            // `PooledBuffer::drop` — the only thing that notifies — never runs.
+            // Detaching is the *normal* path for a buffer sent downstream, so a
+            // pure `wait()` here sleeps through the common case.
+            //
+            // The notify still fires for undetached returns and keeps those
+            // immediate; this bounds the damage for the rest.
+            let (g, _) = self.inner.notify.wait_timeout(guard, DETACH_POLL).unwrap();
+            guard = g;
         }
     }
 
@@ -413,14 +440,15 @@ impl BufferPool for FixedBufferPool {
                 return Ok(None);
             }
 
-            let (new_guard, timeout_result) =
-                self.inner.notify.wait_timeout(guard, remaining).unwrap();
+            // Capped for the same reason `acquire` polls: a detached slot
+            // returns without a notify, and waiting out the caller's full
+            // timeout would report failure with a free slot sitting there.
+            let (new_guard, _) = self
+                .inner
+                .notify
+                .wait_timeout(guard, remaining.min(DETACH_POLL))
+                .unwrap();
             guard = new_guard;
-
-            if timeout_result.timed_out() {
-                // Try one more time
-                return Ok(self.try_acquire());
-            }
         }
     }
 
@@ -653,5 +681,65 @@ mod tests {
         let pool = FixedBufferPool::new(1024, 4).unwrap();
         let mut buf = pool.acquire().unwrap();
         buf.set_len(2048); // Should panic
+    }
+
+    #[test]
+    fn a_detached_buffer_still_unblocks_a_waiter() {
+        // `into_buffer()` is what every source does before sending downstream,
+        // and it detaches: the slot returns through the arena's release queue,
+        // so `PooledBuffer::drop` — the only code that notifies — never runs.
+        // A waiter that trusted the condvar alone would sleep forever here.
+        let pool = FixedBufferPool::new(1024, 2).unwrap();
+
+        let detached: Vec<Buffer> = (0..2)
+            .map(|_| pool.acquire().unwrap().into_buffer())
+            .collect();
+        assert!(pool.try_acquire().is_none(), "pool should be exhausted");
+
+        let waiter = {
+            let pool = Arc::clone(&pool);
+            std::thread::spawn(move || pool.acquire().map(|b| b.capacity()))
+        };
+
+        // Give the waiter time to park before freeing anything, so this
+        // exercises the wake path rather than the fast path.
+        std::thread::sleep(Duration::from_millis(20));
+        drop(detached);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !waiter.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "acquire() never woke after detached slots were released"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(waiter.join().unwrap().unwrap(), 1024);
+    }
+
+    #[test]
+    fn acquire_timeout_sees_a_detached_slot_before_its_deadline() {
+        let pool = FixedBufferPool::new(1024, 1).unwrap();
+        let detached = pool.acquire().unwrap().into_buffer();
+
+        let waiter = {
+            let pool = Arc::clone(&pool);
+            std::thread::spawn(move || {
+                let started = std::time::Instant::now();
+                let got = pool.acquire_timeout(Duration::from_secs(30)).unwrap();
+                (got.is_some(), started.elapsed())
+            })
+        };
+
+        std::thread::sleep(Duration::from_millis(20));
+        drop(detached);
+
+        let (acquired, elapsed) = waiter.join().unwrap();
+        assert!(acquired, "the freed slot was never picked up");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "waited {elapsed:?} for a slot freed almost immediately — the \
+             timeout was slept out instead of polled"
+        );
     }
 }

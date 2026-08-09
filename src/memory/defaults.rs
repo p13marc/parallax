@@ -114,6 +114,33 @@ pub const MP4_DEMUX_SLOT_COUNT: usize = 32;
 pub const TEST_SLOT_COUNT: usize = 64;
 
 // =============================================================================
+// Output arena budgets
+// =============================================================================
+
+/// Floor for any element's output arena.
+///
+/// The executor normally computes something larger from the graph's link
+/// capacity (see [`OutputBudget`](super::OutputBudget)); this is what an element
+/// gets when it is driven by hand, with no executor to ask.
+pub const MIN_OUTPUT_SLOT_COUNT: usize = 16;
+
+/// Slots to add on top of what the downstream links can hold.
+///
+/// Covers the buffers that are in neither the arena's free list nor a channel:
+/// one in the consumer's hand, one in the producer's between `process()`
+/// returning and the send completing, and one for a probe or tracer holding a
+/// clone — plus one of slop.
+pub const IN_FLIGHT_MARGIN: usize = 4;
+
+/// Ceiling on a single element's output arena, in bytes.
+///
+/// Slot count times slot size is unbounded otherwise, and the two are chosen
+/// independently: a 4K RGBA frame is 33 MB, so a 200-deep link would ask for
+/// 6.6 GB. Past this point the budget degrades to fewer slots, which sheds
+/// frames — strictly better than an allocation that takes the machine down.
+pub const MAX_OUTPUT_ARENA_BYTES: usize = 512 * 1024 * 1024;
+
+// =============================================================================
 // Convenience Functions
 // =============================================================================
 
