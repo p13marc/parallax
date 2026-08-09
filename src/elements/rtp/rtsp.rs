@@ -31,6 +31,27 @@
 //! [`RtspFrameFormat::LengthPrefixed`] when muxing to MP4 instead. See
 //! `examples/58_rtsp_display.rs`.
 //!
+//! # Geometry is not always known at connect time
+//!
+//! Plenty of cameras ship an SDP with no `a=framesize` and no usable
+//! `sprop-parameter-sets`, so [`StreamInfo::dimensions`] is `None` when
+//! `connect()` returns. The stream still announces its geometry — in the first
+//! in-band SPS — and parallax adopts it as soon as it arrives, typically within
+//! one keyframe.
+//!
+//! So a consumer that needs the frame size must be able to *wait* for it rather
+//! than read once and treat `None` as permanent. Because adding the session to a
+//! pipeline moves it, take an [`RtspStreamInfoHandle`] first:
+//!
+//! ```rust,ignore
+//! let session = RtspSrc::new(url).connect().await?;
+//! let info = session.stream_info_handle();   // BEFORE the move
+//! pipeline.add_async_source("rtsp", session);
+//!
+//! let (width, height) = info.wait_for_dimensions(0).await
+//!     .ok_or("session ended before the first parameter set")?;
+//! ```
+//!
 //! # Example: owning the pump yourself
 //!
 //! The manual path remains available for callers who want to drive the session
@@ -59,7 +80,9 @@ use futures::StreamExt;
 use retina::client::{Demuxed, Session, SessionOptions, SetupOptions};
 use retina::codec::{AudioFrame, CodecItem, VideoFrame};
 use std::num::NonZeroU32;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::watch;
 use url::Url;
 
 // ============================================================================
@@ -225,6 +248,76 @@ pub struct StreamInfo {
     /// start codes under [`RtspFrameFormat::AnnexB`], a decoder configuration
     /// record under [`RtspFrameFormat::LengthPrefixed`].
     pub codec_data: Option<Vec<u8>>,
+}
+
+/// Observe an [`RtspSession`]'s stream metadata while the session is running.
+///
+/// [`RtspSession`] implements [`AsyncSource`](crate::element::AsyncSource), so
+/// adding it to a pipeline **moves** it and [`RtspSession::streams`] is no
+/// longer reachable. Clone this handle out of the session *before* the move —
+/// the same rule the runtime control handles follow.
+///
+/// This matters because geometry is not always known at connect time. Plenty of
+/// cameras ship an SDP with no `a=framesize` and no usable
+/// `sprop-parameter-sets`, so [`StreamInfo::dimensions`] starts out `None` and
+/// is only filled in once the first in-band SPS arrives. Use
+/// [`wait_for_dimensions`](Self::wait_for_dimensions) rather than reading once
+/// and giving up.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let session = RtspSrc::new(url).connect().await?;
+/// let info = session.stream_info_handle();   // BEFORE the move
+/// pipeline.add_async_source("rtsp", session);
+/// let handle = executor.start(&mut pipeline)?;
+///
+/// // Resolves at connect time if the SDP had geometry, otherwise one
+/// // keyframe later.
+/// if let Some((w, h)) = info.wait_for_dimensions(0).await {
+///     println!("{w}x{h}");
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct RtspStreamInfoHandle {
+    rx: watch::Receiver<Arc<Vec<StreamInfo>>>,
+}
+
+impl RtspStreamInfoHandle {
+    /// A snapshot of what is currently known about every stream.
+    pub fn streams(&self) -> Arc<Vec<StreamInfo>> {
+        self.rx.borrow().clone()
+    }
+
+    /// A snapshot of one stream, by index.
+    pub fn stream(&self, index: usize) -> Option<StreamInfo> {
+        self.rx.borrow().get(index).cloned()
+    }
+
+    /// Wait until the dimensions of stream `index` are known.
+    ///
+    /// Returns immediately when they already are — including at connect time,
+    /// for an SDP that carried geometry. Otherwise it resolves when the first
+    /// in-band parameter set arrives, typically within one keyframe.
+    ///
+    /// Returns `None` if the session is dropped first, or if `index` names no
+    /// stream, so a caller awaiting a dead session is not left hanging.
+    pub async fn wait_for_dimensions(&self, index: usize) -> Option<(u32, u32)> {
+        let mut rx = self.rx.clone();
+        loop {
+            {
+                let streams = rx.borrow_and_update();
+                // An out-of-range index can never resolve: stop rather than
+                // wait forever for a stream that does not exist.
+                let stream = streams.get(index)?;
+                if let Some(dimensions) = stream.dimensions {
+                    return Some(dimensions);
+                }
+            }
+            // Err means every sender is gone, i.e. the session ended.
+            rx.changed().await.ok()?;
+        }
+    }
 }
 
 /// Media type of a stream.
@@ -433,8 +526,12 @@ fn split_url_credentials(url_str: &str) -> Result<(Url, Option<RtspCredentials>)
 pub struct RtspSession {
     /// The demuxed session.
     session: Demuxed,
-    /// Stream information.
+    /// Stream information. Authoritative copy; the hot path reads it directly
+    /// and [`RtspSession::publish_streams`] mirrors it to observers.
     streams: Vec<StreamInfo>,
+    /// Mirror of `streams` for [`RtspStreamInfoHandle`]s, which outlive the
+    /// move of this session into a pipeline.
+    stream_info_tx: watch::Sender<Arc<Vec<StreamInfo>>>,
     /// Statistics.
     stats: RtspStats,
     /// Selected stream indices.
@@ -584,9 +681,12 @@ impl RtspSession {
             .demuxed()
             .map_err(|e| Error::Element(format!("Failed to demux RTSP session: {}", e)))?;
 
+        let (stream_info_tx, _) = watch::channel(Arc::new(streams.clone()));
+
         Ok(Self {
             session,
             streams,
+            stream_info_tx,
             stats: RtspStats {
                 connected_at: Some(std::time::Instant::now()),
                 ..Default::default()
@@ -599,8 +699,81 @@ impl RtspSession {
     }
 
     /// Get information about available streams.
+    ///
+    /// Unreachable once the session has been moved into a pipeline — take a
+    /// [`stream_info_handle`](Self::stream_info_handle) beforehand for that.
     pub fn streams(&self) -> &[StreamInfo] {
         &self.streams
+    }
+
+    /// A cloneable handle that keeps reporting stream metadata after this
+    /// session has been moved into a pipeline.
+    ///
+    /// Take it *before* `pipeline.add_async_source(session)`; see
+    /// [`RtspStreamInfoHandle`].
+    pub fn stream_info_handle(&self) -> RtspStreamInfoHandle {
+        RtspStreamInfoHandle {
+            rx: self.stream_info_tx.subscribe(),
+        }
+    }
+
+    /// Mirror `self.streams` to every live [`RtspStreamInfoHandle`].
+    fn publish_streams(&self) {
+        self.stream_info_tx
+            .send_replace(Arc::new(self.streams.clone()));
+    }
+
+    /// Adopt parameters retina parsed from the bitstream.
+    ///
+    /// The SDP is not always honest — no `a=framesize`, no usable
+    /// `sprop-parameter-sets` — in which case `connect()` leaves
+    /// [`StreamInfo::dimensions`] `None` even though the stream announces its
+    /// geometry in the very first in-band SPS. retina re-parses parameter sets
+    /// as they arrive on the wire, so the information is already there; this
+    /// copies it across whenever a frame reports it changed.
+    ///
+    /// Also covers a mid-stream resolution change, which updates the same way.
+    fn refresh_stream_info(&mut self, index: usize) {
+        // Read everything out of `self.session` first: the borrow it hands back
+        // has to be gone before we can touch `self.streams` and publish.
+        let parsed =
+            self.session
+                .streams()
+                .get(index)
+                .and_then(|stream| match stream.parameters() {
+                    Some(retina::codec::ParametersRef::Video(video)) => {
+                        Some((video.pixel_dimensions(), video.extra_data().to_vec()))
+                    }
+                    _ => None,
+                });
+
+        let Some((dimensions, extra)) = parsed else {
+            return;
+        };
+        let Some(info) = self.streams.get_mut(index) else {
+            return;
+        };
+
+        let mut changed = false;
+        if info.dimensions != Some(dimensions) {
+            tracing::debug!(
+                "rtspsrc: stream {} dimensions {:?} -> {}x{} (in-band parameter sets)",
+                index,
+                info.dimensions,
+                dimensions.0,
+                dimensions.1
+            );
+            info.dimensions = Some(dimensions);
+            changed = true;
+        }
+        if !extra.is_empty() && info.codec_data.as_deref() != Some(extra.as_slice()) {
+            info.codec_data = Some(extra);
+            changed = true;
+        }
+
+        if changed {
+            self.publish_streams();
+        }
     }
 
     /// Get the selected stream indices.
@@ -622,6 +795,13 @@ impl RtspSession {
                 Some(Ok(item)) => {
                     match item {
                         CodecItem::VideoFrame(frame) => {
+                            // retina re-parses in-band SPS/PPS and flags the
+                            // frame that carried them. For a stream whose SDP
+                            // had no geometry, this is where dimensions first
+                            // become known.
+                            if frame.has_new_parameters() {
+                                self.refresh_stream_info(frame.stream_id());
+                            }
                             let buffer = self.video_frame_to_buffer(frame)?;
                             self.stats.video_frames += 1;
                             self.stats.bytes_received += buffer.len() as u64;
@@ -922,5 +1102,83 @@ mod tests {
 
         let prefixed: retina::codec::FrameFormat = RtspFrameFormat::LengthPrefixed.into();
         assert_eq!(prefixed, retina::codec::FrameFormat::MP4);
+    }
+
+    // ---- RtspStreamInfoHandle -------------------------------------------
+    //
+    // Driving a real session needs a server (see `just rtsp-server` and
+    // examples 57/58). These cover the handle itself, which is the part that
+    // has to behave when the SDP was silent.
+
+    fn video_stream(dimensions: Option<(u32, u32)>) -> StreamInfo {
+        StreamInfo {
+            index: 0,
+            media_type: MediaType::Video,
+            codec: "h264".into(),
+            clock_rate: 90_000,
+            dimensions,
+            channels: None,
+            sample_rate: None,
+            framerate: None,
+            codec_data: None,
+        }
+    }
+
+    fn handle_over(
+        streams: Vec<StreamInfo>,
+    ) -> (watch::Sender<Arc<Vec<StreamInfo>>>, RtspStreamInfoHandle) {
+        let (tx, rx) = watch::channel(Arc::new(streams));
+        (tx, RtspStreamInfoHandle { rx })
+    }
+
+    #[tokio::test]
+    async fn dimensions_from_the_sdp_resolve_immediately() {
+        let (_tx, handle) = handle_over(vec![video_stream(Some((1920, 1080)))]);
+        assert_eq!(handle.wait_for_dimensions(0).await, Some((1920, 1080)));
+        assert_eq!(handle.stream(0).unwrap().dimensions, Some((1920, 1080)));
+    }
+
+    #[tokio::test]
+    async fn a_silent_sdp_resolves_once_the_sps_arrives() {
+        let (tx, handle) = handle_over(vec![video_stream(None)]);
+
+        // Nothing known yet: the wait must not resolve.
+        assert!(handle.stream(0).unwrap().dimensions.is_none());
+        let waiter = tokio::spawn(async move { handle.wait_for_dimensions(0).await });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "resolved before any SPS arrived");
+
+        // ...and does once the first in-band parameter set lands.
+        tx.send_replace(Arc::new(vec![video_stream(Some((1280, 720)))]));
+        assert_eq!(waiter.await.unwrap(), Some((1280, 720)));
+    }
+
+    #[tokio::test]
+    async fn a_dead_session_does_not_leave_a_waiter_hanging() {
+        let (tx, handle) = handle_over(vec![video_stream(None)]);
+        let waiter = tokio::spawn(async move { handle.wait_for_dimensions(0).await });
+        tokio::task::yield_now().await;
+
+        drop(tx);
+        assert_eq!(
+            waiter.await.unwrap(),
+            None,
+            "a dropped session must end the wait, not stall it"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_stream_index_gives_up_rather_than_waiting() {
+        let (_tx, handle) = handle_over(vec![video_stream(None)]);
+        assert_eq!(handle.wait_for_dimensions(7).await, None);
+        assert!(handle.stream(7).is_none());
+    }
+
+    #[test]
+    fn the_handle_snapshots_every_stream() {
+        let (_tx, handle) = handle_over(vec![video_stream(Some((640, 480)))]);
+        let streams = handle.streams();
+        assert_eq!(streams.len(), 1);
+        assert_eq!(streams[0].dimensions, Some((640, 480)));
     }
 }

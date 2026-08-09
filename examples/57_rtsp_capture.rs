@@ -159,6 +159,18 @@ async fn main() -> Result<()> {
     }
 
     file.flush()?;
+
+    // Geometry the SDP did not advertise is picked up from the first in-band
+    // SPS, so `streams()` can say more now than it did at connect time.
+    if video.dimensions.is_none()
+        && let Some((w, h)) = session
+            .streams()
+            .get(video.index)
+            .and_then(|s| s.dimensions)
+    {
+        println!("\nGeometry learned from the in-band SPS: {w}x{h}");
+    }
+
     let stats = session.stats();
     println!(
         "\nDone: {} frames ({} keyframes), {:.2} MiB written to {}",

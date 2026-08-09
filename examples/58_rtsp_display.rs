@@ -73,8 +73,14 @@ async fn main() -> Result<()> {
     let dims = video
         .dimensions
         .map(|(w, h)| format!("{w}x{h}"))
-        .unwrap_or_else(|| "unknown (will use decoder metadata)".into());
+        .unwrap_or_else(|| "not in the SDP — waiting for the first SPS".into());
     println!("Connected: h264 {dims}. Close the window to stop.\n");
+
+    // The session is about to be moved into the pipeline, so take the metadata
+    // handle now. A camera whose SDP carries no geometry announces it in the
+    // first in-band SPS instead, which arrives once frames start flowing.
+    let info = session.stream_info_handle();
+    let index = video.index;
 
     // Build the playback pipeline. VideoConvert gets I420 pinned (the decoder's
     // output); dimensions come from the SDP if present, otherwise from the
@@ -94,6 +100,17 @@ async fn main() -> Result<()> {
     pipeline.link(src, dec)?;
     pipeline.link(dec, cvt)?;
     pipeline.link(cvt, sink)?;
+
+    // Report the real geometry as soon as it is known. For an SDP that already
+    // carried it this resolves at once; otherwise it waits one keyframe. The
+    // task ends by itself when the session drops.
+    if video.dimensions.is_none() {
+        tokio::spawn(async move {
+            if let Some((w, h)) = info.wait_for_dimensions(index).await {
+                println!("Stream geometry from the in-band SPS: {w}x{h}");
+            }
+        });
+    }
 
     let result = pipeline.run().await;
 

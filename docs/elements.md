@@ -66,6 +66,28 @@ directly; `LengthPrefixed` emits 4-byte-length NALs for MP4 muxing. See
 `AppSrc → H264Decoder → VideoConvert → AutoVideoSink`). A local test stream is
 one command away: `just rtsp-server` (= `scripts/rtsp_test_server.py`).
 
+**Dimensions can arrive after `connect()`.** Many cameras ship an SDP with no
+`a=framesize` and no usable `sprop-parameter-sets`, leaving
+`StreamInfo::dimensions` as `None`. The stream still announces its geometry in the
+first in-band SPS, and parallax adopts it as soon as it arrives — usually within
+one keyframe — so `None` is a "not yet", not a permanent property of the stream.
+
+Because `RtspSession` is an `AsyncSource`, adding it to a pipeline moves it and
+`session.streams()` becomes unreachable. Take a handle first, exactly as you would
+a control handle:
+
+```rust,ignore
+let session = RtspSrc::new(url).connect().await?;
+let info = session.stream_info_handle();      // BEFORE the move
+pipeline.add_async_source("rtsp", session);
+
+// Resolves at once if the SDP had geometry, otherwise one keyframe later.
+// `None` means the session ended first.
+let (w, h) = info.wait_for_dimensions(0).await.ok_or("session ended")?;
+```
+
+`RtspStreamInfoHandle` also has `streams()` and `stream(index)` for a snapshot.
+
 ## Flow — `elements::flow`
 
 | Element | Description |
