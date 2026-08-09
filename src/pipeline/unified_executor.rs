@@ -340,7 +340,18 @@ impl PipelineHandle {
                     }
                 }
                 Err(e) => {
-                    let err = Error::InvalidSegment(format!("task panicked: {e}"));
+                    // Belt and braces. Tasks catch their own panics and turn
+                    // them into Error::Panic with the element's name attached,
+                    // so reaching here means the task was cancelled or the
+                    // catch itself failed — no node name is available.
+                    let err = if e.is_panic() {
+                        Error::Panic {
+                            node: "<unknown>".into(),
+                            message: crate::error::panic_message(e.into_panic().as_ref()),
+                        }
+                    } else {
+                        Error::Pipeline(format!("element task did not finish: {e}"))
+                    };
                     self.events.send_error(err.to_string(), None);
                     if first_error.is_none() {
                         first_error = Some(err);
@@ -368,8 +379,14 @@ impl PipelineHandle {
                 }
                 Err(e) => {
                     if first_error.is_none() {
-                        first_error =
-                            Some(Error::InvalidSegment(format!("RT join task panicked: {e}")));
+                        first_error = Some(if e.is_panic() {
+                            Error::Panic {
+                                node: "<rt-join>".into(),
+                                message: crate::error::panic_message(e.into_panic().as_ref()),
+                            }
+                        } else {
+                            Error::Pipeline(format!("RT thread join did not finish: {e}"))
+                        });
                     }
                 }
                 Ok(Ok(())) => {}

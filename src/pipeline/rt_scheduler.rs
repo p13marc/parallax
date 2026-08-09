@@ -678,6 +678,9 @@ pub struct DataThreadHandle {
     /// Thread join handle.
     handle: Option<JoinHandle<Result<()>>>,
 
+    /// Thread name, so a panic can say which one died.
+    name: String,
+
     /// Signal to stop the thread.
     stop_signal: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -697,9 +700,13 @@ impl DataThreadHandle {
     /// Wait for the thread to finish.
     pub fn join(mut self) -> Result<()> {
         if let Some(handle) = self.handle.take() {
-            handle
-                .join()
-                .map_err(|_| Error::InvalidSegment("data thread panicked".into()))?
+            let name = self.name.clone();
+            handle.join().unwrap_or_else(|payload| {
+                Err(Error::Panic {
+                    node: name,
+                    message: crate::error::panic_message(payload.as_ref()),
+                })
+            })
         } else {
             Ok(())
         }
@@ -731,6 +738,7 @@ pub fn spawn_data_thread(
     let stop_signal = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop_signal_clone = stop_signal.clone();
 
+    let thread_name = name.clone();
     let handle = std::thread::Builder::new()
         .name(name.clone())
         .spawn(move || {
@@ -916,6 +924,7 @@ pub fn spawn_data_thread(
 
     Ok(DataThreadHandle {
         handle: Some(handle),
+        name: thread_name,
         stop_signal,
     })
 }
