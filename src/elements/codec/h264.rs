@@ -37,6 +37,8 @@ use crate::error::{Error, Result};
 use crate::memory::{OutputArena, OutputBudget, defaults};
 use crate::metadata::Metadata;
 
+use std::collections::VecDeque;
+
 use openh264::OpenH264API;
 use openh264::decoder::{DecodedYUV, Decoder};
 use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, QpRange};
@@ -981,7 +983,30 @@ pub struct H264Decoder {
     output: OutputArena,
     /// Geometry of the last decoded frame, to spot a mid-stream resize.
     last_dims: Option<(u32, u32)>,
+    /// Access-unit metadata waiting for its decoded frame.
+    ///
+    /// The decoder is driven through openh264's `decode_frame_no_delay`, so a
+    /// `decode()` call returns at most one frame — but not necessarily the one
+    /// belonging to the AU just fed: a reordered stream buffers pictures and
+    /// hands back an earlier one. Output is in *display* order, so the entry to
+    /// stamp a frame with is the one with the smallest PTS still in flight,
+    /// which degenerates to plain FIFO for a stream without B-frames.
+    pending: VecDeque<Metadata>,
+    /// Frames drained by [`Element::flush`], handed out one per call.
+    ///
+    /// `None` until the first flush; `Some(empty)` afterwards, so the decoder
+    /// is drained exactly once.
+    flushed: Option<VecDeque<DecodedFrame>>,
+    /// Buffers emitted so far, the source of the output sequence number.
+    frames_out: u64,
 }
+
+/// Cap on in-flight access-unit metadata.
+///
+/// A stream that feeds parameter sets and never produces a picture would
+/// otherwise grow this queue without bound. Real reorder depth is a handful of
+/// frames; past this the oldest entry is the one that will never be claimed.
+const MAX_PENDING_METADATA: usize = 64;
 
 impl H264Decoder {
     /// Create a new H.264 decoder.
@@ -1001,7 +1026,72 @@ impl H264Decoder {
             bytes_decoded: 0,
             output,
             last_dims: None,
+            pending: VecDeque::new(),
+            flushed: None,
+            frames_out: 0,
         })
+    }
+
+    /// Claim the metadata belonging to the frame just emitted.
+    ///
+    /// See [`pending`](Self::pending): frames come out in display order, so the
+    /// smallest PTS still in flight is the right one. `ClockTime::NONE` is
+    /// `u64::MAX`, so un-timestamped entries sort last and are consumed FIFO
+    /// among themselves.
+    fn take_pending_metadata(&mut self) -> Option<Metadata> {
+        let oldest = self
+            .pending
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, meta)| meta.pts)
+            .map(|(index, _)| index)?;
+        self.pending.remove(oldest)
+    }
+
+    /// Build an output buffer for a decoded frame, carrying `source` forward.
+    ///
+    /// `source` is the originating access unit's metadata when there is one.
+    /// Timestamps, duration and flags ride along; sequence and geometry are the
+    /// decoder's to set.
+    fn frame_to_buffer(
+        &mut self,
+        frame: &DecodedFrame,
+        source: Option<Metadata>,
+    ) -> Result<Buffer> {
+        let yuv_data = frame.to_yuv420_planar();
+
+        // A resize needs a differently-sized slot, and the arena's is
+        // fixed once built.
+        let dims = (frame.width() as u32, frame.height() as u32);
+        if self.last_dims.is_some_and(|last| last != dims) {
+            tracing::info!(
+                "h264decoder: resolution changed to {}x{}, rebuilding the output arena",
+                dims.0,
+                dims.1
+            );
+            self.output.reset();
+        }
+        self.last_dims = Some(dims);
+
+        let mut slot = self.output.acquire(yuv_data.len(), "h264decoder")?;
+        slot.data_mut()[..yuv_data.len()].copy_from_slice(&yuv_data);
+
+        let handle = crate::buffer::MemoryHandle::with_len(slot, yuv_data.len());
+
+        // The input AU's timing is the frame's timing — regenerating it here
+        // is what used to make a decoded stream unschedulable downstream (#64).
+        let mut metadata = source.unwrap_or_default();
+        // Counted separately from `frame_count`: the inherent `flush` bumps
+        // that one in a single step, which would stamp every drained frame
+        // with the same sequence number.
+        metadata.sequence = self.frames_out;
+        self.frames_out += 1;
+        // Geometry travels in-band. `to_yuv420_planar` is in the name:
+        // whatever the bitstream was, what we emit is I420. This also
+        // rewrites `format` from `Video(H264)` to `VideoRaw`.
+        metadata.set_video_dims(dims.0, dims.1, crate::format::PixelFormat::I420);
+
+        Ok(Buffer::new(handle, metadata))
     }
 
     /// Decode H.264 NAL units.
@@ -1070,38 +1160,38 @@ impl Element for H264Decoder {
     // decodes wrong. Decode, then shed the output copy if there is
     // nowhere to put it — the decoder's own state stays intact.
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
+        // Remember this AU's timing before decoding: the frame that comes out
+        // may belong to an earlier one.
+        if self.pending.len() >= MAX_PENDING_METADATA {
+            self.pending.pop_front();
+        }
+        self.pending.push_back(buffer.metadata().clone());
+
         let input_data = buffer.as_bytes();
 
         match self.decode(input_data)? {
             Some(frame) => {
-                let yuv_data = frame.to_yuv420_planar();
+                let source = self.take_pending_metadata();
+                Ok(Some(self.frame_to_buffer(&frame, source)?))
+            }
+            None => Ok(None),
+        }
+    }
 
-                // A resize needs a differently-sized slot, and the arena's is
-                // fixed once built.
-                let dims = (frame.width() as u32, frame.height() as u32);
-                if self.last_dims.is_some_and(|last| last != dims) {
-                    tracing::info!(
-                        "h264decoder: resolution changed to {}x{}, rebuilding the output arena",
-                        dims.0,
-                        dims.1
-                    );
-                    self.output.reset();
-                }
-                self.last_dims = Some(dims);
+    /// Drain pictures openh264 still holds when the stream ends.
+    ///
+    /// Without this the tail of every stream — everything the decoder had
+    /// buffered for reordering — was silently discarded at EOS.
+    fn flush(&mut self) -> Result<Option<Buffer>> {
+        if self.flushed.is_none() {
+            let frames = H264Decoder::flush(self)?;
+            self.flushed = Some(frames.into());
+        }
 
-                let mut slot = self.output.acquire(yuv_data.len(), "h264decoder")?;
-                slot.data_mut()[..yuv_data.len()].copy_from_slice(&yuv_data);
-
-                let handle = crate::buffer::MemoryHandle::with_len(slot, yuv_data.len());
-                let mut metadata = Metadata::from_sequence(self.frame_count - 1);
-                // Geometry travels in-band. `to_yuv420_planar` is in the name:
-                // whatever the bitstream was, what we emit is I420.
-                metadata.set_video_dims(
-                    frame.width() as u32,
-                    frame.height() as u32,
-                    crate::format::PixelFormat::I420,
-                );
-                Ok(Some(Buffer::new(handle, metadata)))
+        match self.flushed.as_mut().and_then(VecDeque::pop_front) {
+            Some(frame) => {
+                let source = self.take_pending_metadata();
+                Ok(Some(self.frame_to_buffer(&frame, source)?))
             }
             None => Ok(None),
         }
@@ -1270,6 +1360,7 @@ impl<'a> YUVSource for YuvFrame<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::ClockTime;
     use crate::control::Controllable;
     use crate::memory::SharedArena;
 
@@ -2083,5 +2174,179 @@ mod tests {
         let decoder = H264Decoder::new().expect("Failed to create decoder");
         assert_eq!(decoder.frame_count(), 0);
         assert_eq!(decoder.bytes_decoded(), 0);
+    }
+
+    // ------------------------------------------------------------------
+    // Decoder timestamp passthrough (#64)
+    // ------------------------------------------------------------------
+
+    /// Wrap an Annex-B access unit in a Buffer stamped like a real demuxer
+    /// would stamp it.
+    fn au_buffer(data: &[u8], pts_ns: u64, duration_ns: u64) -> Buffer {
+        use crate::buffer::MemoryHandle;
+
+        let arena = SharedArena::new(data.len().max(1), 4).unwrap();
+        let mut slot = arena.acquire().unwrap();
+        slot.data_mut()[..data.len()].copy_from_slice(data);
+
+        let mut metadata = Metadata::new();
+        metadata.pts = ClockTime::from_nanos(pts_ns);
+        metadata.dts = ClockTime::from_nanos(pts_ns);
+        metadata.duration = ClockTime::from_nanos(duration_ns);
+        Buffer::new(MemoryHandle::with_len(slot, data.len()), metadata)
+    }
+
+    /// Encode `count` frames and push them through the decoder as an element,
+    /// returning (input timing, output timing) as `(pts, dts, duration)`.
+    #[allow(clippy::type_complexity)]
+    fn decode_timestamped(count: u64) -> (Vec<(u64, u64, u64)>, Vec<(u64, u64, u64)>) {
+        const FRAME_NS: u64 = 40_000_000; // 25 fps
+        let (width, height) = (64usize, 64usize);
+
+        let mut encoder = H264Encoder::new(H264EncoderConfig::new()).unwrap();
+        let mut decoder = H264Decoder::new().unwrap();
+
+        let mut fed = Vec::new();
+        let mut out = Vec::new();
+
+        for i in 0..count {
+            let frame = detailed_frame(width, height, i as u8);
+            let au = encoder
+                .encode_yuv420_at(&frame, width as u32, height as u32)
+                .unwrap();
+            if au.is_empty() {
+                continue;
+            }
+
+            let pts = i * FRAME_NS;
+            fed.push((pts, pts, FRAME_NS));
+
+            if let Some(decoded) = decoder.process(au_buffer(&au, pts, FRAME_NS)).unwrap() {
+                let meta = decoded.metadata();
+                out.push((meta.pts.nanos(), meta.dts.nanos(), meta.duration.nanos()));
+            }
+        }
+
+        (fed, out)
+    }
+
+    #[test]
+    fn decoded_frames_carry_the_input_timestamps() {
+        let (fed, out) = decode_timestamped(10);
+
+        assert!(
+            !out.is_empty(),
+            "decoder produced no frames — the test stream is broken, not the timing"
+        );
+        // openh264 is driven with `decode_frame_no_delay` and this stream has
+        // no B-frames, so output order is input order: the decoded timings must
+        // be a prefix of what was fed, not a regenerated sequence.
+        assert_eq!(out, fed[..out.len()]);
+    }
+
+    #[test]
+    fn decoded_frames_still_declare_their_geometry() {
+        let (width, height) = (64usize, 64usize);
+        let mut encoder = H264Encoder::new(H264EncoderConfig::new()).unwrap();
+        let mut decoder = H264Decoder::new().unwrap();
+
+        let mut saw_frame = false;
+        for i in 0..5u64 {
+            let frame = detailed_frame(width, height, i as u8);
+            let au = encoder
+                .encode_yuv420_at(&frame, width as u32, height as u32)
+                .unwrap();
+            if au.is_empty() {
+                continue;
+            }
+            if let Some(decoded) = decoder.process(au_buffer(&au, i, 1)).unwrap() {
+                // Cloning the input metadata must not lose the geometry the
+                // decoder stamps on — nor leave `format` as `Video(H264)`.
+                assert_eq!(
+                    decoded.metadata().video_dims(),
+                    Some((width as u32, height as u32))
+                );
+                assert_eq!(
+                    decoded.metadata().video_pixel_format(),
+                    Some(crate::format::PixelFormat::I420)
+                );
+                saw_frame = true;
+            }
+        }
+        assert!(saw_frame);
+    }
+
+    #[test]
+    fn output_sequence_numbers_still_count_from_zero() {
+        let (width, height) = (64usize, 64usize);
+        let mut encoder = H264Encoder::new(H264EncoderConfig::new()).unwrap();
+        let mut decoder = H264Decoder::new().unwrap();
+
+        let mut sequences = Vec::new();
+        for i in 0..6u64 {
+            let frame = detailed_frame(width, height, i as u8);
+            let au = encoder
+                .encode_yuv420_at(&frame, width as u32, height as u32)
+                .unwrap();
+            if au.is_empty() {
+                continue;
+            }
+            // Input sequence numbers are deliberately nonsense: the decoder
+            // owns this field, the demuxer does not.
+            let mut buffer = au_buffer(&au, i, 1);
+            buffer.metadata_mut().sequence = 900 + i;
+            if let Some(decoded) = decoder.process(buffer).unwrap() {
+                sequences.push(decoded.metadata().sequence);
+            }
+        }
+
+        assert!(!sequences.is_empty());
+        assert_eq!(sequences, (0..sequences.len() as u64).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn flush_drains_the_decoder_exactly_once() {
+        let (width, height) = (64usize, 64usize);
+        let mut encoder = H264Encoder::new(H264EncoderConfig::new()).unwrap();
+        let mut decoder = H264Decoder::new().unwrap();
+
+        for i in 0..5u64 {
+            let frame = detailed_frame(width, height, i as u8);
+            let au = encoder
+                .encode_yuv420_at(&frame, width as u32, height as u32)
+                .unwrap();
+            if !au.is_empty() {
+                let _ = decoder.process(au_buffer(&au, i * 40_000_000, 40_000_000));
+            }
+        }
+
+        // The executor calls flush until it returns None. Whatever openh264 was
+        // still holding comes out here — and every drained frame is a real one,
+        // geometry and all.
+        let mut drained = 0;
+        while let Some(buffer) = Element::flush(&mut decoder).unwrap() {
+            assert_eq!(
+                buffer.metadata().video_dims(),
+                Some((width as u32, height as u32))
+            );
+            drained += 1;
+            assert!(drained < 64, "flush never terminated");
+        }
+
+        // Draining is one-shot: a second round must not re-enter the decoder.
+        assert!(Element::flush(&mut decoder).unwrap().is_none());
+    }
+
+    #[test]
+    fn pending_metadata_cannot_grow_without_bound() {
+        let mut decoder = H264Decoder::new().unwrap();
+
+        // Junk that never yields a picture: without the cap this queue would
+        // grow one entry per access unit, forever.
+        for i in 0..(MAX_PENDING_METADATA * 2) {
+            let _ = decoder.process(au_buffer(&[0, 0, 0, 1, 0x09, 0x10], i as u64, 1));
+        }
+
+        assert_eq!(decoder.pending.len(), MAX_PENDING_METADATA);
     }
 }
