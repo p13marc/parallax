@@ -28,7 +28,7 @@ For the element *trait system* (how to write your own), see [getting-started.md]
 |---------|-------------|
 | `AppSrc` (+ `AppSrcHandle`) | Push buffers from application code into a pipeline |
 | `AppSink` (+ `AppSinkHandle`) | Pull buffers out of a pipeline into application code — see [Reading the end of a stream](#reading-the-end-of-a-stream) |
-| `AutoVideoSink` `[display]` | Display video in a window (winit + softbuffer); frame dimensions from per-buffer `width`/`height` metadata when present, else guessed from RGBA buffer size |
+| `AutoVideoSink` `[display]` | Display video in a window (winit + softbuffer); frame dimensions from per-buffer metadata (`Metadata::video_dims`, both conventions) when present, else guessed from RGBA buffer size. `sync=true` paces presentation — see below |
 
 ### Reading the end of a stream
 
@@ -222,6 +222,35 @@ Codec traits: `VideoEncoder`/`VideoDecoder` and `AudioEncoder`/`AudioDecoder` (a
 | JPEG | `JpegEncoder` / `JpegDecoder` | `image-jpeg` | zune-jpeg + jpeg-encoder, pure Rust |
 | PNG | `PngEncoder` / `PngDecoder` | `image-png` | png crate, pure Rust |
 | GPU H.264 decode | `HwDecoderElement` | `vulkan-video` | **experimental scaffold** — does not perform real hardware decode yet |
+
+### Playing at the stream's speed, not the decoder's
+
+`AutoVideoSink` blits every frame the moment it arrives, so playback speed equals
+decode speed — right for a camera preview, wrong for a media player. `sync=true`
+(off by default) makes it hold each frame until its PTS comes round on the pipeline
+clock:
+
+```rust,ignore
+Pipeline::parse("filesrc location=clip.h264 ! … ! autovideosink sync=true max-lateness-ms=40")?
+// or programmatically
+AutoVideoSink::new().with_sync(true).with_max_lateness(Duration::from_millis(40))
+```
+
+Three things to know:
+
+- **The wait is blocking, and that is the mechanism.** Holding the sink's task is
+  what back-pressures the decoder and the source down to real time.
+- **Late frames are dropped, not shown.** Past `max-lateness-ms` (default 40 ms —
+  one frame at 25 fps) the frame is shed and counted via `parallax_buffers_dropped`,
+  because showing it would also cost the *next* frame its slot.
+- **It degrades rather than stalling.** No clock, no PTS, or `sync=false` all keep
+  the historical blit-on-arrival path, and a PTS that jumps more than a second into
+  the future is presented instead of slept through.
+
+The first frame anchors the stream — its PTS is pinned to the running time at which
+it arrived — so a stream whose timestamps do not start at zero plays immediately
+instead of stalling for its start offset. A PTS that goes *backwards* (a seek)
+re-anchors rather than condemning every later frame to look eternally late.
 
 ## Reading the clock from an element
 

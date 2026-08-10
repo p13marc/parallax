@@ -219,6 +219,16 @@ fn create_autovideosink(
         sink = sink.with_size(w as u32, h as u32);
     }
 
+    // `sync=true` plays the stream at its own speed instead of as fast as it
+    // decodes. Off by default so capture previews are unaffected.
+    if let Some(sync) = props.get("sync").and_then(|v| v.as_bool()) {
+        sink = sink.with_sync(sync);
+    }
+
+    if let Some(ms) = props.get("max-lateness-ms").and_then(|v| v.as_u64()) {
+        sink = sink.with_max_lateness(std::time::Duration::from_millis(ms));
+    }
+
     Ok(DynAsyncElement::new_box(SinkAdapter::new(sink)))
 }
 

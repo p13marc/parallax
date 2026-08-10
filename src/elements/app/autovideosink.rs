@@ -24,6 +24,7 @@
 //! This design mirrors GStreamer's xvimagesink which also runs its own
 //! X11 event thread.
 
+use crate::clock::ClockTime;
 use crate::element::{ConsumeContext, Sink};
 use crate::error::{Error, Result};
 use crate::format::{Caps, PixelFormat};
@@ -32,6 +33,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 /// Frame data sent to the display thread.
 struct DisplayFrame {
@@ -41,6 +43,81 @@ struct DisplayFrame {
     width: u32,
     /// Frame height in pixels
     height: u32,
+}
+
+/// Default lateness past which a frame is dropped rather than shown.
+///
+/// One frame at 25 fps. A frame this late is already superseded by the one
+/// behind it, so showing it costs the *next* frame its slot too.
+const DEFAULT_MAX_LATENESS: Duration = Duration::from_millis(40);
+
+/// Longest single wait the pacer will ask for.
+///
+/// A stream whose timestamps jump forward (a bad demuxer, a wrapped RTP clock)
+/// must not park the sink for minutes. Past this the frame is shown instead.
+const MAX_WAIT: Duration = Duration::from_secs(1);
+
+/// What to do with a frame whose presentation time is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pace {
+    /// Show it now.
+    Present,
+    /// Show it after this long.
+    Wait(Duration),
+    /// Too late to be useful — drop it.
+    DropLate,
+}
+
+/// Maps buffer PTS onto pipeline running time.
+///
+/// There are no `SegmentEvent`s anywhere in the tree yet (the executor's
+/// inter-element `Message` carries only buffers, EOS and errors), so the
+/// segment mapping in [`SegmentEvent::to_running_time`] has nothing to feed it.
+/// Instead the first frame anchors the stream: its PTS is pinned to the running
+/// time at which it arrived, and every later frame is scheduled at that anchor
+/// plus its PTS offset. A stream that does not start at zero therefore plays
+/// from wherever it starts, without a leading stall.
+///
+/// [`SegmentEvent::to_running_time`]: crate::event::SegmentEvent::to_running_time
+#[derive(Debug, Default)]
+struct PtsPacer {
+    /// `(first PTS, running time when it arrived)`.
+    anchor: Option<(ClockTime, ClockTime)>,
+}
+
+impl PtsPacer {
+    /// Decide what to do with a frame stamped `pts`, given the clock now reads
+    /// `now` in running time.
+    ///
+    /// Both times must be known; the caller checks that before asking.
+    fn schedule(&mut self, pts: ClockTime, now: ClockTime, max_lateness: Duration) -> Pace {
+        let (first_pts, anchor_running) = *self.anchor.get_or_insert((pts, now));
+
+        // A PTS before the anchor means the stream went backwards (a seek, a
+        // reordered first frame). Re-anchor rather than dropping everything.
+        let Some(offset) = pts.nanos().checked_sub(first_pts.nanos()) else {
+            self.anchor = Some((pts, now));
+            return Pace::Present;
+        };
+
+        let target = anchor_running.nanos().saturating_add(offset);
+        let now = now.nanos();
+
+        if target > now {
+            let wait = Duration::from_nanos(target - now);
+            return if wait > MAX_WAIT {
+                Pace::Present
+            } else {
+                Pace::Wait(wait)
+            };
+        }
+
+        if now - target > max_lateness.as_nanos() as u64 {
+            Pace::DropLate
+        } else {
+            Pace::Present
+        }
+    }
 }
 
 /// A video sink that automatically creates a window and displays frames.
@@ -81,6 +158,14 @@ pub struct AutoVideoSink {
     height: Arc<AtomicU32>,
     /// Element name
     name: String,
+    /// Present frames at their PTS instead of as fast as they arrive.
+    sync: bool,
+    /// How late a frame may be and still be shown, when `sync` is on.
+    max_lateness: Duration,
+    /// PTS → running-time mapping, built from the first frame.
+    pacer: PtsPacer,
+    /// Frames dropped for being late or for a full display channel.
+    dropped: u64,
 }
 
 impl AutoVideoSink {
@@ -94,6 +179,10 @@ impl AutoVideoSink {
             width: Arc::new(AtomicU32::new(0)),
             height: Arc::new(AtomicU32::new(0)),
             name: "autovideosink".to_string(),
+            sync: false,
+            max_lateness: DEFAULT_MAX_LATENESS,
+            pacer: PtsPacer::default(),
+            dropped: 0,
         }
     }
 
@@ -101,6 +190,42 @@ impl AutoVideoSink {
     pub fn with_title(mut self, title: impl Into<String>) -> Self {
         self.title = title.into();
         self
+    }
+
+    /// Present frames at their PTS rather than as fast as they arrive.
+    ///
+    /// **Off by default.** A capture preview wants every frame the camera
+    /// produces, shown the moment it arrives; a media player wants the stream
+    /// to play at its own speed. Turning this on makes the sink wait until each
+    /// frame's presentation instant on the pipeline clock, which also
+    /// back-pressures everything upstream to real time.
+    ///
+    /// Frames without a PTS, and pipelines with no clock, are unaffected — they
+    /// keep the blit-as-fast-as-they-arrive behaviour.
+    pub fn with_sync(mut self, sync: bool) -> Self {
+        self.sync = sync;
+        self
+    }
+
+    /// How late a frame may be and still be shown (default 40 ms).
+    ///
+    /// Only consulted when [`with_sync`](Self::with_sync) is on. A later frame
+    /// is dropped and counted rather than displayed out of time.
+    pub fn with_max_lateness(mut self, max_lateness: Duration) -> Self {
+        self.max_lateness = max_lateness;
+        self
+    }
+
+    /// Frames dropped so far — late, or displaced by a full display channel.
+    pub fn dropped(&self) -> u64 {
+        self.dropped
+    }
+
+    /// Record a dropped frame, once, in one place.
+    fn drop_frame(&mut self, reason: &str) {
+        self.dropped += 1;
+        crate::observability::record_buffer_dropped("pipeline", &self.name);
+        tracing::debug!("autovideosink: dropping frame ({reason})");
     }
 
     /// Set expected dimensions (optional, auto-detected from first frame).
@@ -179,17 +304,38 @@ impl Sink for AutoVideoSink {
 
         tracing::debug!("AutoVideoSink: received buffer with {} bytes", data.len());
 
-        // Dimensions: prefer per-buffer metadata (decoders set "width"/"height"),
-        // fall back to guessing from the RGBA buffer size.
+        // Dimensions: prefer per-buffer metadata, fall back to guessing from
+        // the RGBA buffer size. `video_dims` reads both conventions — the
+        // `MediaFormat::VideoRaw` one and the legacy "width"/"height" keys — so
+        // an upstream element that set only one of them still works.
         let meta = ctx.metadata();
-        let (width, height) = match (meta.get::<u64>("width"), meta.get::<u64>("height")) {
-            (Some(&w), Some(&h)) if w > 0 && h > 0 && (w * h * 4) as usize == data.len() => {
-                (w as u32, h as u32)
-            }
+        let (width, height) = match meta.video_dims() {
+            Some((w, h)) if w > 0 && h > 0 && (w as usize * h as usize * 4) == data.len() => (w, h),
             _ => detect_dimensions(data.len()),
         };
 
         tracing::debug!("AutoVideoSink: detected dimensions {}x{}", width, height);
+
+        // Presentation pacing (#66). Opt-in: a clock-less pipeline, an
+        // un-timestamped stream, or plain `sync=false` all keep the historical
+        // blit-on-arrival behaviour, so capture previews do not regress.
+        if self.sync
+            && ctx.clock().is_some()
+            && let Some(pts) = meta.pts.to_option()
+            && let Some(now) = ctx.running_time().to_option()
+        {
+            match self.pacer.schedule(pts, now, self.max_lateness) {
+                Pace::Present => {}
+                // Blocking here is the point: it is what back-pressures the
+                // decoder and the source down to real time. Other sync sinks
+                // block on their I/O for the same reason.
+                Pace::Wait(delay) => thread::sleep(delay),
+                Pace::DropLate => {
+                    self.drop_frame("late");
+                    return Ok(());
+                }
+            }
+        }
 
         // Start display thread on first frame
         if self.sender.is_none() {
@@ -214,16 +360,13 @@ impl Sink for AutoVideoSink {
             height,
         };
 
-        // Try to send frame - if display is slow, drop old frames to keep up
-        // This prevents pipeline stalls when display can't keep up
+        // A full channel means the display cannot keep up. Shed this frame and
+        // count it — the previous code logged "drain one old frame", drained
+        // nothing, and retried the same send with the result discarded.
         match sender.try_send(frame) {
             Ok(()) => Ok(()),
-            Err(mpsc::TrySendError::Full(frame)) => {
-                // Channel full - drain one old frame and send new one
-                // This keeps latency low at the cost of dropped frames
-                tracing::debug!("autovideosink: dropping frame (display too slow)");
-                // Just try again - if still full, that's fine, we'll drop this frame
-                let _ = sender.try_send(frame);
+            Err(mpsc::TrySendError::Full(_)) => {
+                self.drop_frame("display too slow");
                 Ok(())
             }
             Err(mpsc::TrySendError::Disconnected(_)) => {
@@ -502,5 +645,141 @@ mod tests {
     fn test_sink_with_title() {
         let sink = AutoVideoSink::new().with_title("My Video");
         assert_eq!(sink.title, "My Video");
+    }
+
+    // ------------------------------------------------------------------
+    // PTS-paced presentation (#66)
+    // ------------------------------------------------------------------
+
+    const FRAME_25FPS: u64 = 40_000_000;
+
+    fn ns(n: u64) -> ClockTime {
+        ClockTime::from_nanos(n)
+    }
+
+    #[test]
+    fn pacing_is_off_by_default() {
+        // Every pipeline has a started clock, so the property — not the
+        // presence of a clock — is what turns pacing on. Examples 23/24/58
+        // depend on this.
+        let sink = AutoVideoSink::new();
+        assert!(!sink.sync);
+        assert_eq!(sink.max_lateness, DEFAULT_MAX_LATENESS);
+    }
+
+    #[test]
+    fn the_first_frame_anchors_the_stream() {
+        let mut pacer = PtsPacer::default();
+
+        // A stream that starts at 10s of PTS must not stall for 10s: the
+        // anchor pins that PTS to the running time it arrived at.
+        assert_eq!(
+            pacer.schedule(ns(10_000_000_000), ns(5_000_000), DEFAULT_MAX_LATENESS),
+            Pace::Present
+        );
+        // ...and the next frame is one frame interval after it.
+        assert_eq!(
+            pacer.schedule(
+                ns(10_000_000_000 + FRAME_25FPS),
+                ns(5_000_000),
+                DEFAULT_MAX_LATENESS
+            ),
+            Pace::Wait(Duration::from_nanos(FRAME_25FPS))
+        );
+    }
+
+    #[test]
+    fn a_25fps_stream_waits_one_frame_interval() {
+        let mut pacer = PtsPacer::default();
+        let start = 1_000_000_000;
+
+        assert_eq!(
+            pacer.schedule(ns(0), ns(start), DEFAULT_MAX_LATENESS),
+            Pace::Present
+        );
+
+        // Decoder runs flat out: the clock has barely moved, so each frame is
+        // held back to its own presentation instant.
+        for frame in 1..10u64 {
+            assert_eq!(
+                pacer.schedule(ns(frame * FRAME_25FPS), ns(start), DEFAULT_MAX_LATENESS),
+                Pace::Wait(Duration::from_nanos(frame * FRAME_25FPS)),
+                "frame {frame}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_frame_that_is_on_time_is_presented() {
+        let mut pacer = PtsPacer::default();
+        pacer.schedule(ns(0), ns(0), DEFAULT_MAX_LATENESS);
+
+        // Arrived 39 ms late — inside the 40 ms budget, so still worth showing.
+        assert_eq!(
+            pacer.schedule(
+                ns(FRAME_25FPS),
+                ns(FRAME_25FPS + 39_000_000),
+                DEFAULT_MAX_LATENESS
+            ),
+            Pace::Present
+        );
+    }
+
+    #[test]
+    fn a_frame_past_the_lateness_budget_is_dropped() {
+        let mut pacer = PtsPacer::default();
+        pacer.schedule(ns(0), ns(0), DEFAULT_MAX_LATENESS);
+
+        assert_eq!(
+            pacer.schedule(
+                ns(FRAME_25FPS),
+                ns(FRAME_25FPS + 41_000_000),
+                DEFAULT_MAX_LATENESS
+            ),
+            Pace::DropLate
+        );
+    }
+
+    #[test]
+    fn the_lateness_budget_is_configurable() {
+        let generous = Duration::from_millis(500);
+        let mut pacer = PtsPacer::default();
+        pacer.schedule(ns(0), ns(0), generous);
+
+        // The same 41 ms of lateness that the default drops, this one shows.
+        assert_eq!(
+            pacer.schedule(ns(FRAME_25FPS), ns(FRAME_25FPS + 41_000_000), generous),
+            Pace::Present
+        );
+    }
+
+    #[test]
+    fn an_absurd_pts_jump_does_not_park_the_sink() {
+        let mut pacer = PtsPacer::default();
+        pacer.schedule(ns(0), ns(0), DEFAULT_MAX_LATENESS);
+
+        // An hour into the future — a wrapped RTP clock or a broken demuxer.
+        // Show it rather than sleeping through the rest of the stream.
+        assert_eq!(
+            pacer.schedule(ns(3_600_000_000_000), ns(0), DEFAULT_MAX_LATENESS),
+            Pace::Present
+        );
+    }
+
+    #[test]
+    fn a_backwards_pts_re_anchors_instead_of_dropping_the_stream() {
+        let mut pacer = PtsPacer::default();
+        pacer.schedule(ns(10 * FRAME_25FPS), ns(0), DEFAULT_MAX_LATENESS);
+
+        // A seek back to the start: without re-anchoring, every frame from
+        // here on would look eternally late and be dropped forever.
+        assert_eq!(
+            pacer.schedule(ns(0), ns(500_000_000), DEFAULT_MAX_LATENESS),
+            Pace::Present
+        );
+        assert_eq!(
+            pacer.schedule(ns(FRAME_25FPS), ns(500_000_000), DEFAULT_MAX_LATENESS),
+            Pace::Wait(Duration::from_nanos(FRAME_25FPS))
+        );
     }
 }
