@@ -24,7 +24,7 @@ use crate::buffer::Buffer;
 use crate::clock::ClockTime;
 use crate::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
 use crate::error::{Error, Result};
-use crate::memory::SharedArena;
+use crate::memory::{OutputArena, OutputBudget, defaults};
 use crate::metadata::{BufferFlags, Metadata, RtpMeta};
 
 use bytes::Bytes;
@@ -85,7 +85,7 @@ pub struct RtpSrc {
     stats: RtpSrcStats,
 
     // Arena for output buffers
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 /// Statistics for RtpSrc.
@@ -122,7 +122,8 @@ impl RtpSrc {
             ssrc_filter: None,
             clock_rate: 90000, // Default video clock rate
             stats: RtpSrcStats::default(),
-            arena: None,
+            output: OutputArena::new(defaults::RTP_PACKET_SLOT_COUNT)
+                .with_min_slot_size(MAX_RTP_PACKET_SIZE),
         })
     }
 
@@ -239,6 +240,10 @@ impl RtpSrc {
 }
 
 impl Source for RtpSrc {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn produce(&mut self, _ctx: &mut ProduceContext) -> Result<ProduceResult> {
         // Allocate receive buffer
         let mut recv_buf = vec![0u8; self.buffer_size];
@@ -265,20 +270,9 @@ impl Source for RtpSrc {
         let payload_len = payload.len();
         self.stats.bytes_received += payload_len as u64;
 
-        // Lazily initialize arena
-        if self.arena.is_none() {
-            self.arena = Some(
-                SharedArena::new(MAX_RTP_PACKET_SIZE, 64)
-                    .map_err(|e| Error::Element(format!("Failed to create arena: {}", e)))?,
-            );
-        }
-        let arena = self.arena.as_mut().unwrap();
-
-        arena.reclaim();
-
-        let mut slot = arena
-            .acquire()
-            .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+        let Some(mut slot) = self.output.try_acquire(payload_len, "rtpsrc")? else {
+            return Ok(ProduceResult::WouldBlock);
+        };
         slot.data_mut()[..payload_len].copy_from_slice(payload.as_ref());
 
         let handle = crate::buffer::MemoryHandle::with_len(slot, payload_len);
@@ -535,7 +529,7 @@ pub struct AsyncRtpSrc {
     stats: RtpSrcStats,
 
     // Arena for output buffers
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl AsyncRtpSrc {
@@ -559,7 +553,8 @@ impl AsyncRtpSrc {
             ssrc_filter: None,
             clock_rate: 90000,
             stats: RtpSrcStats::default(),
-            arena: None,
+            output: OutputArena::new(defaults::RTP_PACKET_SLOT_COUNT)
+                .with_min_slot_size(MAX_RTP_PACKET_SIZE),
         })
     }
 
@@ -649,20 +644,12 @@ impl AsyncRtpSrc {
         let payload_len = payload.len();
         self.stats.bytes_received += payload_len as u64;
 
-        // Lazily initialize arena
-        if self.arena.is_none() {
-            self.arena = Some(
-                SharedArena::new(MAX_RTP_PACKET_SIZE, 64)
-                    .map_err(|e| Error::Element(format!("Failed to create arena: {}", e)))?,
-            );
-        }
-        let arena = self.arena.as_mut().unwrap();
-
-        arena.reclaim();
-
-        let mut slot = arena
-            .acquire()
-            .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+        // `None` here means no output slot was free — the datagram is lost, the
+        // same as any other RTP loss, and the stream recovers. Dying would not.
+        let Some(mut slot) = self.output.try_acquire(payload_len, "asyncrtpsrc")? else {
+            self.stats.packets_dropped += 1;
+            return Ok(None);
+        };
         slot.data_mut()[..payload_len].copy_from_slice(payload.as_ref());
 
         let handle = crate::buffer::MemoryHandle::with_len(slot, payload_len);
@@ -869,6 +856,7 @@ fn rand_timestamp() -> u32 {
 mod tests {
     use super::*;
     use crate::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
+    use crate::memory::SharedArena;
     use std::sync::OnceLock;
     use std::thread;
     use std::time::Duration;

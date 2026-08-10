@@ -26,7 +26,7 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{AsyncSink, AsyncSource, ConsumeContext, ProduceContext, ProduceResult};
 use crate::error::{Error, Result};
-use crate::memory::SharedArena;
+use crate::memory::{OutputArena, OutputBudget, defaults};
 use crate::metadata::{BufferFlags, Metadata};
 use std::time::Duration;
 use zenoh::Session;
@@ -110,7 +110,8 @@ impl From<ZenohReliability> for zenoh::qos::Reliability {
 
 /// Default arena slot size for received samples (grows on demand).
 const DEFAULT_ARENA_SLOT: usize = 64 * 1024;
-const ARENA_SLOTS: usize = 32;
+/// Slots for a querier, which holds every reply to one query at once.
+const QUERIER_SLOT_COUNT: usize = 64;
 
 /// A Zenoh source that subscribes to a key expression.
 ///
@@ -148,7 +149,7 @@ pub struct ZenohSrc {
     last_wire_sequence: Option<u64>,
     warned_foreign: bool,
     timeout: Option<Duration>,
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl ZenohSrc {
@@ -190,7 +191,7 @@ impl ZenohSrc {
             last_wire_sequence: None,
             warned_foreign: false,
             timeout: None,
-            arena: None,
+            output: OutputArena::new(defaults::SOURCE_SLOT_COUNT).grow_to_fit(),
         })
     }
 
@@ -230,24 +231,21 @@ impl ZenohSrc {
         }
     }
 
-    /// Ensure the arena exists and its slots fit `len` bytes.
-    fn ensure_arena(&mut self, len: usize) -> Result<&SharedArena> {
-        let needs_new = match &self.arena {
-            Some(arena) => arena.slot_size() < len,
-            None => true,
-        };
-        if needs_new {
-            let slot_size = len.next_power_of_two().max(DEFAULT_ARENA_SLOT);
-            self.arena = Some(
-                SharedArena::new(slot_size, ARENA_SLOTS)
-                    .map_err(|e| Error::Element(format!("Failed to create arena: {}", e)))?,
-            );
-        }
-        Ok(self.arena.as_ref().unwrap())
+    /// Acquire a slot for `len` bytes, or `None` if every slot is taken.
+    ///
+    /// Rounding up to a power of two is what stops growth from reallocating on
+    /// every slightly-larger sample.
+    fn acquire(&mut self, len: usize) -> Result<Option<crate::memory::SharedSlotRef>> {
+        self.output
+            .set_min_slot_size(len.next_power_of_two().max(DEFAULT_ARENA_SLOT));
+        self.output.try_acquire(len, "zenohsrc")
     }
 
     /// Build a buffer from a received sample.
-    fn sample_to_buffer(&mut self, sample: zenoh::sample::Sample) -> Result<Buffer> {
+    /// `None` means no output slot was free. The sample is already off the
+    /// wire, so it is lost — the same as any other zenoh congestion drop, and
+    /// the receiver's DISCONT tracking already reports it.
+    fn sample_to_buffer(&mut self, sample: zenoh::sample::Sample) -> Result<Option<Buffer>> {
         let data = sample.payload().to_bytes().into_owned();
         self.bytes_received += data.len() as u64;
         self.samples_received += 1;
@@ -288,40 +286,45 @@ impl ZenohSrc {
             metadata.set(KEY_EXPR_META, key.to_string());
         }
 
-        let arena = self.ensure_arena(data.len())?;
-        arena.reclaim();
-        let mut slot = arena
-            .acquire()
-            .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+        let Some(mut slot) = self.acquire(data.len())? else {
+            return Ok(None);
+        };
         slot.data_mut()[..data.len()].copy_from_slice(&data);
 
-        Ok(Buffer::new(
+        Ok(Some(Buffer::new(
             MemoryHandle::with_len(slot, data.len()),
             metadata,
-        ))
+        )))
     }
 
     /// An empty TIMEOUT-flagged buffer (produced when `with_timeout` fires).
-    fn timeout_buffer(&mut self) -> Result<Buffer> {
-        let arena = self.ensure_arena(0)?;
-        arena.reclaim();
-        let slot = arena
-            .acquire()
-            .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+    fn timeout_buffer(&mut self) -> Result<Option<Buffer>> {
+        let Some(slot) = self.acquire(0)? else {
+            return Ok(None);
+        };
         let mut metadata = Metadata::from_sequence(self.sequence);
         self.sequence += 1;
         metadata.flags |= BufferFlags::TIMEOUT;
-        Ok(Buffer::new(MemoryHandle::with_len(slot, 0), metadata))
+        Ok(Some(Buffer::new(MemoryHandle::with_len(slot, 0), metadata)))
     }
 }
 
 impl AsyncSource for ZenohSrc {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     async fn produce(&mut self, _ctx: &mut ProduceContext<'_>) -> Result<ProduceResult> {
         let sample = if let Some(timeout) = self.timeout {
             match tokio::time::timeout(timeout, self.receiver.recv()).await {
                 Ok(Some(sample)) => sample,
                 Ok(None) => return Ok(ProduceResult::Eos),
-                Err(_) => return Ok(ProduceResult::OwnBuffer(self.timeout_buffer()?)),
+                Err(_) => {
+                    return Ok(match self.timeout_buffer()? {
+                        Some(b) => ProduceResult::OwnBuffer(b),
+                        None => ProduceResult::WouldBlock,
+                    });
+                }
             }
         } else {
             match self.receiver.recv().await {
@@ -330,7 +333,10 @@ impl AsyncSource for ZenohSrc {
             }
         };
 
-        Ok(ProduceResult::OwnBuffer(self.sample_to_buffer(sample)?))
+        Ok(match self.sample_to_buffer(sample)? {
+            Some(b) => ProduceResult::OwnBuffer(b),
+            None => ProduceResult::WouldBlock,
+        })
     }
 
     fn name(&self) -> &str {
@@ -749,7 +755,7 @@ pub struct ZenohQuerier {
     timeout: Duration,
     queries_sent: u64,
     replies_received: u64,
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl ZenohQuerier {
@@ -770,7 +776,10 @@ impl ZenohQuerier {
             timeout: Duration::from_secs(10),
             queries_sent: 0,
             replies_received: 0,
-            arena: None,
+            // 64, not one of the `defaults` floors: a query holds every reply
+            // simultaneously, and nothing sizes this from the graph because a
+            // querier is not an element.
+            output: OutputArena::new(QUERIER_SLOT_COUNT).grow_to_fit(),
         }
     }
 
@@ -841,23 +850,12 @@ impl ZenohQuerier {
                 .unwrap_or_else(|| Metadata::from_sequence(seq));
             seq += 1;
 
-            // Grow the arena if a reply doesn't fit.
-            let needs_new = match &self.arena {
-                Some(arena) => arena.slot_size() < data.len(),
-                None => true,
-            };
-            if needs_new {
-                let slot_size = data.len().next_power_of_two().max(DEFAULT_ARENA_SLOT);
-                self.arena = Some(
-                    SharedArena::new(slot_size, 64)
-                        .map_err(|e| Error::Element(format!("Failed to create arena: {}", e)))?,
-                );
-            }
-            let arena = self.arena.as_ref().unwrap();
-            arena.reclaim();
-            let mut slot = arena
-                .acquire()
-                .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+            // `ZenohQuerier` is not an element, so no budget ever reaches it —
+            // the floor is all it gets, and `acquire`'s `PoolExhausted` reaches
+            // application code that can handle it.
+            self.output
+                .set_min_slot_size(data.len().next_power_of_two().max(DEFAULT_ARENA_SLOT));
+            let mut slot = self.output.acquire(data.len(), "zenohquerier")?;
             slot.data_mut()[..data.len()].copy_from_slice(&data);
 
             buffers.push(Buffer::new(

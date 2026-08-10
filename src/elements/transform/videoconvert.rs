@@ -7,7 +7,7 @@ use crate::converters::{PixelFormat, VideoConvert};
 use crate::element::Element;
 use crate::error::{Error, Result};
 use crate::format::Caps;
-use crate::memory::SharedArena;
+use crate::memory::{OutputArena, OutputBudget, defaults};
 use crate::metadata::Metadata;
 
 /// Video format conversion element.
@@ -49,7 +49,7 @@ pub struct VideoConvertElement {
     /// Element name
     name: String,
     /// Arena for output buffers
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl VideoConvertElement {
@@ -66,7 +66,10 @@ impl VideoConvertElement {
             converter_key: None,
             output_buffer: Vec::new(),
             name: "videoconvert".to_string(),
-            arena: None,
+            // `SharedArena::new` aligns every slot to a cache line, which is
+            // stronger than the 32 bytes the AVX paths need — this used to ask
+            // for `new_avx` and got *less* alignment than it does now.
+            output: OutputArena::new(defaults::TRANSFORM_SLOT_COUNT).grow_to_fit(),
         }
     }
 
@@ -217,6 +220,10 @@ impl Default for VideoConvertElement {
 }
 
 impl Element for VideoConvertElement {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         let input_data = buffer.as_bytes();
 
@@ -240,16 +247,7 @@ impl Element for VideoConvertElement {
         // Create output buffer with AVX-aligned arena for SIMD efficiency
         let output_size = self.output_buffer.len();
 
-        if self.arena.is_none() || self.arena.as_ref().unwrap().slot_size() < output_size {
-            // Use AVX-aligned arena (32-byte alignment) for SIMD operations
-            self.arena = Some(SharedArena::new_avx(output_size, 32)?);
-        }
-
-        let arena = self.arena.as_mut().unwrap();
-        arena.reclaim();
-        let mut slot = arena
-            .acquire()
-            .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+        let mut slot = self.output.acquire(output_size, "videoconvert")?;
 
         // Copy converted data
         slot.data_mut()[..output_size].copy_from_slice(&self.output_buffer);
@@ -335,6 +333,7 @@ impl Element for VideoConvertElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::SharedArena;
 
     #[test]
     fn test_detect_yuyv_640x480() {

@@ -73,7 +73,7 @@ use crate::buffer::{Buffer, MemoryHandle};
 use crate::clock::ClockTime;
 use crate::element::ProduceResult;
 use crate::error::{Error, Result};
-use crate::memory::SharedArena;
+use crate::memory::{OutputArena, OutputBudget, defaults};
 use crate::metadata::{BufferFlags, Metadata, RtpMeta};
 
 use futures::StreamExt;
@@ -389,6 +389,12 @@ pub struct RtspStats {
     pub video_keyframes: u64,
     /// RTCP packets received.
     pub rtcp_packets: u64,
+    /// Frames shed because the output arena was full.
+    ///
+    /// Downstream is holding every slot, so the frame was dropped rather than
+    /// ending the session. A non-zero count here means the consumer cannot keep
+    /// up with the camera.
+    pub frames_dropped: u64,
     /// Connection start time.
     pub connected_at: Option<std::time::Instant>,
 }
@@ -537,7 +543,7 @@ pub struct RtspSession {
     /// Selected stream indices.
     selected_streams: Vec<usize>,
     /// Arena for output buffers.
-    arena: Option<SharedArena>,
+    output: OutputArena,
     /// Drop video frames until the first keyframe (see
     /// [`RtspConfig::skip_until_keyframe`]).
     skip_until_keyframe: bool,
@@ -692,7 +698,9 @@ impl RtspSession {
                 ..Default::default()
             },
             selected_streams,
-            arena: None,
+            output: OutputArena::new(defaults::SOURCE_SLOT_COUNT)
+                .with_min_slot_size(1024 * 1024)
+                .grow_to_fit(),
             skip_until_keyframe: config.skip_until_keyframe,
             saw_keyframe: false,
         })
@@ -802,7 +810,10 @@ impl RtspSession {
                             if frame.has_new_parameters() {
                                 self.refresh_stream_info(frame.stream_id());
                             }
-                            let buffer = self.video_frame_to_buffer(frame)?;
+                            let Some(buffer) = self.video_frame_to_buffer(frame)? else {
+                                self.stats.frames_dropped += 1;
+                                continue;
+                            };
                             self.stats.video_frames += 1;
                             self.stats.bytes_received += buffer.len() as u64;
                             if buffer.metadata().is_keyframe() {
@@ -811,7 +822,10 @@ impl RtspSession {
                             return Ok(Some(RtspFrame::Video(buffer)));
                         }
                         CodecItem::AudioFrame(frame) => {
-                            let buffer = self.audio_frame_to_buffer(frame)?;
+                            let Some(buffer) = self.audio_frame_to_buffer(frame)? else {
+                                self.stats.frames_dropped += 1;
+                                continue;
+                            };
                             self.stats.audio_frames += 1;
                             self.stats.bytes_received += buffer.len() as u64;
                             return Ok(Some(RtspFrame::Audio(buffer)));
@@ -836,7 +850,7 @@ impl RtspSession {
     }
 
     /// Convert a retina VideoFrame to a Parallax Buffer.
-    fn video_frame_to_buffer(&mut self, frame: VideoFrame) -> Result<Buffer> {
+    fn video_frame_to_buffer(&mut self, frame: VideoFrame) -> Result<Option<Buffer>> {
         let data = frame.data();
         let is_keyframe = frame.is_random_access_point();
         let timestamp = frame.timestamp();
@@ -875,7 +889,7 @@ impl RtspSession {
     }
 
     /// Convert a retina AudioFrame to a Parallax Buffer.
-    fn audio_frame_to_buffer(&mut self, frame: AudioFrame) -> Result<Buffer> {
+    fn audio_frame_to_buffer(&mut self, frame: AudioFrame) -> Result<Option<Buffer>> {
         let data = frame.data();
         let timestamp = frame.timestamp();
 
@@ -907,29 +921,22 @@ impl RtspSession {
     }
 
     /// Create a buffer from bytes with the given metadata.
+    ///
+    /// `None` means no output slot was free. The caller sheds that frame and
+    /// asks for the next one — a live stream that dies because a decoder
+    /// hesitated is worse than a live stream that skips a frame.
     fn create_buffer_from_bytes_with_metadata(
         &mut self,
         data: &[u8],
         metadata: Metadata,
-    ) -> Result<Buffer> {
-        // Lazily initialize arena
-        if self.arena.is_none() {
-            self.arena = Some(
-                SharedArena::new(1024 * 1024, 32)
-                    .map_err(|e| Error::Element(format!("Failed to create arena: {}", e)))?,
-            );
-        }
-        let arena = self.arena.as_mut().unwrap();
-
-        arena.reclaim();
-
-        let mut slot = arena
-            .acquire()
-            .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+    ) -> Result<Option<Buffer>> {
+        let Some(mut slot) = self.output.try_acquire(data.len(), "rtspsrc")? else {
+            return Ok(None);
+        };
         slot.data_mut()[..data.len()].copy_from_slice(data);
 
         let handle = MemoryHandle::with_len(slot, data.len());
-        Ok(Buffer::new(handle, metadata))
+        Ok(Some(Buffer::new(handle, metadata)))
     }
 }
 
@@ -979,6 +986,10 @@ impl RtspSession {
 /// pipeline.link(src, dec)?;
 /// ```
 impl crate::element::AsyncSource for RtspSession {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     async fn produce(
         &mut self,
         _ctx: &mut crate::element::ProduceContext<'_>,

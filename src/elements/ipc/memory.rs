@@ -4,8 +4,8 @@
 
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
-use crate::error::{Error, Result};
-use crate::memory::SharedArena;
+use crate::error::Result;
+use crate::memory::{OutputArena, OutputBudget, defaults};
 use crate::metadata::Metadata;
 use std::sync::{Arc, Mutex};
 
@@ -31,7 +31,7 @@ pub struct MemorySrc {
     position: usize,
     chunk_size: usize,
     sequence: u64,
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl MemorySrc {
@@ -43,7 +43,7 @@ impl MemorySrc {
             position: 0,
             chunk_size: 4096,
             sequence: 0,
-            arena: None,
+            output: OutputArena::new(defaults::SOURCE_SLOT_COUNT),
         }
     }
 
@@ -92,6 +92,10 @@ impl MemorySrc {
 }
 
 impl Source for MemorySrc {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
         if self.position >= self.data.len() {
             return Ok(ProduceResult::Eos);
@@ -101,14 +105,9 @@ impl Source for MemorySrc {
         let chunk_len = remaining.min(self.chunk_size);
 
         // Create our own buffer using SharedArena
-        if self.arena.is_none() {
-            self.arena = Some(SharedArena::new(self.chunk_size, 32)?);
-        }
-        let arena = self.arena.as_mut().unwrap();
-        arena.reclaim();
-        let mut slot = arena
-            .acquire()
-            .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+        let Some(mut slot) = self.output.try_acquire(self.chunk_size, "memorysrc")? else {
+            return Ok(ProduceResult::WouldBlock);
+        };
 
         // Copy data to slot
         slot.data_mut()[..chunk_len]
@@ -319,6 +318,7 @@ impl Sink for SharedMemorySink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::SharedArena;
 
     /// Helper to produce from a source using the context-based API.
     fn produce_buffer(src: &mut MemorySrc) -> Result<Option<Buffer>> {

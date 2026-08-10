@@ -1,9 +1,9 @@
 //! File-based source and sink elements.
 
 use crate::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::event::{Event, EventResult, SeekEvent, SeekType, SegmentFormat};
-use crate::memory::SharedArena;
+use crate::memory::{OutputArena, OutputBudget, defaults};
 use crate::pipeline::seek::{DurationQuery, PositionQuery};
 use std::fs::File;
 use std::io::{Read, Seek, Write};
@@ -43,7 +43,7 @@ pub struct FileSrc {
     chunk_size: usize,
     sequence: u64,
     bytes_read: u64,
-    arena: Option<SharedArena>,
+    output: OutputArena,
     /// Cached file size (set on first open).
     file_size: Option<u64>,
 }
@@ -65,7 +65,7 @@ impl FileSrc {
             chunk_size: Self::DEFAULT_CHUNK_SIZE,
             sequence: 0,
             bytes_read: 0,
-            arena: None,
+            output: OutputArena::new(defaults::SOURCE_SLOT_COUNT),
             file_size: None,
         }
     }
@@ -85,7 +85,7 @@ impl FileSrc {
             chunk_size: Self::DEFAULT_CHUNK_SIZE,
             sequence: 0,
             bytes_read: 0,
-            arena: None,
+            output: OutputArena::new(defaults::SOURCE_SLOT_COUNT),
             file_size,
         })
     }
@@ -118,6 +118,10 @@ impl FileSrc {
 }
 
 impl Source for FileSrc {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
         // Copy chunk_size before borrowing self mutably
         let chunk_size = self.chunk_size;
@@ -146,14 +150,9 @@ impl Source for FileSrc {
             use crate::buffer::{Buffer, MemoryHandle};
             use crate::metadata::Metadata;
 
-            if self.arena.is_none() {
-                self.arena = Some(SharedArena::new(chunk_size, 32)?);
-            }
-            let arena = self.arena.as_mut().unwrap();
-            arena.reclaim();
-            let mut slot = arena
-                .acquire()
-                .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+            let Some(mut slot) = self.output.try_acquire(chunk_size, "filesrc")? else {
+                return Ok(ProduceResult::WouldBlock);
+            };
 
             let file = self.file.as_mut().unwrap();
             let bytes_read = file.read(&mut slot.data_mut()[..chunk_size])?;

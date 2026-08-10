@@ -10,7 +10,7 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{AsyncSource, ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
 use crate::error::{Error, Result};
-use crate::memory::SharedArena;
+use crate::memory::{OutputArena, OutputBudget, defaults};
 use crate::metadata::Metadata;
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -376,7 +376,7 @@ pub struct AsyncUnixSrc {
     bytes_read: u64,
     sequence: u64,
     /// Arena for buffer allocation.
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl AsyncUnixSrc {
@@ -392,7 +392,7 @@ impl AsyncUnixSrc {
             buffer_size: 64 * 1024,
             bytes_read: 0,
             sequence: 0,
-            arena: None,
+            output: OutputArena::new(defaults::SOURCE_SLOT_COUNT),
         }
     }
 
@@ -408,7 +408,7 @@ impl AsyncUnixSrc {
             buffer_size: 64 * 1024,
             bytes_read: 0,
             sequence: 0,
-            arena: None,
+            output: OutputArena::new(defaults::SOURCE_SLOT_COUNT),
         }
     }
 
@@ -431,6 +431,10 @@ impl AsyncUnixSrc {
 }
 
 impl AsyncSource for AsyncUnixSrc {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     async fn produce(&mut self, ctx: &mut ProduceContext<'_>) -> Result<ProduceResult> {
         // For async, we use std blocking I/O wrapped in spawn_blocking
         // A full async implementation would use tokio::net::UnixStream
@@ -473,16 +477,9 @@ impl AsyncSource for AsyncUnixSrc {
         } else {
             // Fall back to creating our own buffer from arena
             // Initialize arena lazily if needed
-            if self.arena.is_none() {
-                self.arena = Some(SharedArena::new(self.buffer_size, 32)?);
-            }
-            let arena = self.arena.as_mut().unwrap();
-
-            arena.reclaim();
-
-            let mut slot = arena
-                .acquire()
-                .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+            let Some(mut slot) = self.output.try_acquire(self.buffer_size, "unixsrc")? else {
+                return Ok(ProduceResult::WouldBlock);
+            };
             slot.data_mut()[..result.len()].copy_from_slice(&result);
 
             let handle = MemoryHandle::with_len(slot, result.len());
@@ -575,6 +572,7 @@ impl AsyncUnixSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::SharedArena;
     use std::sync::OnceLock;
     use std::thread;
     use tempfile::tempdir;

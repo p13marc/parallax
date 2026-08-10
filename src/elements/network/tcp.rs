@@ -8,7 +8,7 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{AsyncSource, ConsumeContext, ProduceContext, ProduceResult};
 use crate::error::{Error, Result};
-use crate::memory::SharedArena;
+use crate::memory::{OutputArena, OutputBudget, defaults};
 use crate::metadata::Metadata;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -49,7 +49,7 @@ pub struct TcpSrc {
     sequence: u64,
     read_timeout: Option<Duration>,
     /// Arena for buffer allocation.
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl TcpSrc {
@@ -72,7 +72,7 @@ impl TcpSrc {
             bytes_read: 0,
             sequence: 0,
             read_timeout: None,
-            arena: None,
+            output: OutputArena::new(defaults::SOURCE_SLOT_COUNT),
         })
     }
 
@@ -97,7 +97,7 @@ impl TcpSrc {
             bytes_read: 0,
             sequence: 0,
             read_timeout: None,
-            arena: None,
+            output: OutputArena::new(defaults::SOURCE_SLOT_COUNT),
         })
     }
 
@@ -167,6 +167,10 @@ impl TcpSrc {
 }
 
 impl crate::element::Source for TcpSrc {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
         self.ensure_connected()?;
 
@@ -195,15 +199,9 @@ impl crate::element::Source for TcpSrc {
         } else {
             // No buffer provided, allocate from arena
             // Initialize arena lazily if needed
-            if self.arena.is_none() {
-                self.arena = Some(SharedArena::new(self.buffer_size, 32)?);
-            }
-            let arena = self.arena.as_mut().unwrap();
-            arena.reclaim();
-
-            let mut slot = arena
-                .acquire()
-                .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+            let Some(mut slot) = self.output.try_acquire(self.buffer_size, "tcpsrc")? else {
+                return Ok(ProduceResult::WouldBlock);
+            };
             let slice = slot.data_mut();
 
             match stream.read(slice) {
@@ -241,7 +239,7 @@ pub struct AsyncTcpSrc {
     bytes_read: u64,
     sequence: u64,
     /// Arena for buffer allocation.
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl AsyncTcpSrc {
@@ -261,7 +259,7 @@ impl AsyncTcpSrc {
             connected: false,
             bytes_read: 0,
             sequence: 0,
-            arena: None,
+            output: OutputArena::new(defaults::SOURCE_SLOT_COUNT),
         })
     }
 
@@ -283,7 +281,7 @@ impl AsyncTcpSrc {
             connected: false,
             bytes_read: 0,
             sequence: 0,
-            arena: None,
+            output: OutputArena::new(defaults::SOURCE_SLOT_COUNT),
         })
     }
 
@@ -328,6 +326,10 @@ impl AsyncTcpSrc {
 }
 
 impl AsyncSource for AsyncTcpSrc {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     async fn produce(&mut self, ctx: &mut ProduceContext<'_>) -> Result<ProduceResult> {
         use tokio::io::AsyncReadExt;
 
@@ -358,16 +360,9 @@ impl AsyncSource for AsyncTcpSrc {
         } else {
             // No buffer provided, allocate from arena
             // Initialize arena lazily if needed
-            if self.arena.is_none() {
-                self.arena = Some(SharedArena::new(self.buffer_size, 32)?);
-            }
-            let arena = self.arena.as_mut().unwrap();
-
-            arena.reclaim();
-
-            let mut slot = arena
-                .acquire()
-                .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+            let Some(mut slot) = self.output.try_acquire(self.buffer_size, "tcpsrc")? else {
+                return Ok(ProduceResult::WouldBlock);
+            };
             let slice = slot.data_mut();
 
             match stream.read(slice).await {
@@ -642,6 +637,7 @@ impl crate::element::AsyncSink for AsyncTcpSink {
 mod tests {
     use super::*;
     use crate::element::Source;
+    use crate::memory::SharedArena;
     use std::thread;
 
     #[test]
@@ -669,7 +665,6 @@ mod tests {
 
     #[test]
     fn test_tcp_roundtrip() {
-        use crate::memory::SharedArena;
         use std::sync::OnceLock;
 
         fn test_arena() -> &'static SharedArena {
@@ -714,7 +709,6 @@ mod tests {
     #[test]
     fn test_tcp_sink_roundtrip() {
         use crate::element::Sink;
-        use crate::memory::SharedArena;
         use std::io::Read;
         use std::sync::OnceLock;
 
@@ -770,7 +764,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_async_tcp_roundtrip() {
-        use crate::memory::SharedArena;
         use std::sync::OnceLock;
         use tokio::io::AsyncWriteExt;
 

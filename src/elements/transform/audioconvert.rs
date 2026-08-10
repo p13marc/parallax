@@ -5,9 +5,9 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::converters::{AudioConvert, SampleFormat};
 use crate::element::Element;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::format::Caps;
-use crate::memory::SharedArena;
+use crate::memory::{OutputArena, OutputBudget, defaults};
 
 /// Audio format conversion element.
 ///
@@ -37,7 +37,7 @@ pub struct AudioConvertElement {
     /// Element name
     name: String,
     /// Arena for output buffers
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl AudioConvertElement {
@@ -52,7 +52,9 @@ impl AudioConvertElement {
             converter: None,
             output_buffer: Vec::new(),
             name: "audioconvert".to_string(),
-            arena: None,
+            output: OutputArena::new(defaults::TRANSFORM_SLOT_COUNT)
+                .with_min_slot_size(defaults::AUDIO_SLOT_SIZE)
+                .grow_to_fit(),
         }
     }
 
@@ -101,6 +103,10 @@ impl Default for AudioConvertElement {
 }
 
 impl Element for AudioConvertElement {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         let input_data = buffer.as_bytes();
 
@@ -122,15 +128,7 @@ impl Element for AudioConvertElement {
         let written = converter.convert(input_data, &mut self.output_buffer)?;
 
         // Create output buffer
-        if self.arena.is_none() || self.arena.as_ref().unwrap().slot_size() < written {
-            self.arena = Some(SharedArena::new(written.max(4096), 32)?);
-        }
-
-        let arena = self.arena.as_mut().unwrap();
-        arena.reclaim();
-        let mut slot = arena
-            .acquire()
-            .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+        let mut slot = self.output.acquire(written, &self.name)?;
 
         // Copy converted data
         slot.data_mut()[..written].copy_from_slice(&self.output_buffer[..written]);
@@ -161,6 +159,7 @@ impl Element for AudioConvertElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::SharedArena;
     use crate::metadata::Metadata;
 
     #[test]

@@ -645,6 +645,14 @@ pub trait Source: Send {
     fn flow_policy(&self) -> crate::pipeline::flow::FlowPolicy {
         crate::pipeline::flow::FlowPolicy::Block // Safe default
     }
+
+    /// How many buffers the downstream graph can hold in flight.
+    ///
+    /// See [`Element::set_output_budget`] — same contract, same reason to
+    /// override it: this source owns the arena its output buffers come from.
+    fn set_output_budget(&mut self, _budget: crate::memory::OutputBudget) {
+        // Default: ignore
+    }
 }
 
 /// An async source element that produces buffers asynchronously.
@@ -746,6 +754,14 @@ pub trait AsyncSource: Send {
     /// Default is `Block` which waits when downstream is busy.
     fn flow_policy(&self) -> crate::pipeline::flow::FlowPolicy {
         crate::pipeline::flow::FlowPolicy::Block
+    }
+
+    /// How many buffers the downstream graph can hold in flight.
+    ///
+    /// See [`Element::set_output_budget`] — same contract, same reason to
+    /// override it: this source owns the arena its output buffers come from.
+    fn set_output_budget(&mut self, _budget: crate::memory::OutputBudget) {
+        // Default: ignore
     }
 }
 
@@ -1404,6 +1420,14 @@ pub trait Demuxer: Send {
     fn execution_hints(&self) -> ExecutionHints {
         ExecutionHints::default()
     }
+
+    /// How many buffers the downstream graph can hold in flight.
+    ///
+    /// See [`Element::set_output_budget`] — same contract, same reason to
+    /// override it: this demuxer owns the arena its output buffers come from.
+    fn set_output_budget(&mut self, _budget: crate::memory::OutputBudget) {
+        // Default: ignore
+    }
 }
 
 /// Input from a specific pad for muxers.
@@ -1492,6 +1516,14 @@ pub trait Muxer: Send {
     /// Get execution hints for automatic scheduling decisions.
     fn execution_hints(&self) -> ExecutionHints {
         ExecutionHints::default()
+    }
+
+    /// How many buffers the downstream graph can hold in flight.
+    ///
+    /// See [`Element::set_output_budget`] — same contract, same reason to
+    /// override it: this muxer owns the arena its output buffers come from.
+    fn set_output_budget(&mut self, _budget: crate::memory::OutputBudget) {
+        // Default: ignore
     }
 }
 
@@ -1757,6 +1789,14 @@ pub trait SyncElement: Send {
     fn flush_sync(&mut self) -> Result<Option<Buffer>> {
         Ok(None)
     }
+
+    /// How many buffers the downstream graph can hold in flight.
+    ///
+    /// See [`Element::set_output_budget`] — same contract, same reason to
+    /// override it: this element owns the arena its output buffers come from.
+    fn set_output_budget(&mut self, _budget: crate::memory::OutputBudget) {
+        // Default: ignore
+    }
 }
 
 // Blanket impl: every sync Element is also a SyncElement.
@@ -1769,6 +1809,10 @@ impl<T: Element> SyncElement for T {
 
     fn flush_sync(&mut self) -> Result<Option<Buffer>> {
         self.flush()
+    }
+
+    fn set_output_budget(&mut self, budget: crate::memory::OutputBudget) {
+        Element::set_output_budget(self, budget);
     }
 }
 
@@ -1803,6 +1847,10 @@ impl<T: SyncElement> SyncElementAdapter<T> {
 }
 
 impl<T: SyncElement + 'static> SendAsyncElementDyn for SyncElementAdapter<T> {
+    fn set_output_budget(&mut self, budget: crate::memory::OutputBudget) {
+        self.inner.set_output_budget(budget);
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -1932,6 +1980,10 @@ impl<S: Source> SourceAdapter<S> {
 }
 
 impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
+    fn set_output_budget(&mut self, budget: crate::memory::OutputBudget) {
+        self.inner.set_output_budget(budget);
+    }
+
     fn name(&self) -> &str {
         self.inner.name()
     }
@@ -2608,6 +2660,10 @@ impl<S: AsyncSource> AsyncSourceAdapter<S> {
 }
 
 impl<S: AsyncSource + Send + 'static> SendAsyncElementDyn for AsyncSourceAdapter<S> {
+    fn set_output_budget(&mut self, budget: crate::memory::OutputBudget) {
+        self.inner.set_output_budget(budget);
+    }
+
     fn name(&self) -> &str {
         self.inner.name()
     }
@@ -2990,6 +3046,10 @@ impl<D: Demuxer> DemuxerAdapter<D> {
 }
 
 impl<D: Demuxer + Send + 'static> SendAsyncElementDyn for DemuxerAdapter<D> {
+    fn set_output_budget(&mut self, budget: crate::memory::OutputBudget) {
+        self.inner.set_output_budget(budget);
+    }
+
     fn name(&self) -> &str {
         self.inner.name()
     }
@@ -3114,6 +3174,10 @@ impl<M: Muxer> MuxerAdapter<M> {
 }
 
 impl<M: Muxer + Send + 'static> SendAsyncElementDyn for MuxerAdapter<M> {
+    fn set_output_budget(&mut self, budget: crate::memory::OutputBudget) {
+        self.inner.set_output_budget(budget);
+    }
+
     fn name(&self) -> &str {
         self.inner.name()
     }

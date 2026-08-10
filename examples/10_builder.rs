@@ -10,13 +10,15 @@ use parallax::element::{
     ConsumeContext, Output, ProduceContext, ProduceResult, Sink, Source, Transform,
 };
 use parallax::error::Result;
-use parallax::memory::SharedArena;
+use parallax::memory::{OutputArena, OutputBudget, defaults};
 use parallax::pipeline::{FromSource, PipelineBuilder, to};
 
 struct NumberSource {
     current: u32,
     max: u32,
-    arena: SharedArena,
+    /// Sized by the executor from link capacity; the floor below only applies
+    /// when nothing is driving this element.
+    output: OutputArena,
 }
 
 impl NumberSource {
@@ -24,20 +26,28 @@ impl NumberSource {
         Ok(Self {
             current: 0,
             max,
-            arena: SharedArena::new(64, 8)?,
+            output: OutputArena::new(defaults::SOURCE_SLOT_COUNT),
         })
     }
 }
 
 impl Source for NumberSource {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn produce(&mut self, _ctx: &mut ProduceContext) -> Result<ProduceResult> {
         if self.current >= self.max {
             return Ok(ProduceResult::Eos);
         }
-        self.current += 1;
 
-        // Allocate from our own arena
-        let mut slot = self.arena.acquire().expect("source arena exhausted");
+        // `try_acquire`, because this is a source: nothing sheds a source's
+        // `PoolExhausted`, so a full arena means "wait", not "fail".
+        let Some(mut slot) = self.output.try_acquire(4, "numbers")? else {
+            return Ok(ProduceResult::WouldBlock);
+        };
+        // The counter advances only once the slot is secured.
+        self.current += 1;
         slot.data_mut()[..4].copy_from_slice(&self.current.to_le_bytes());
 
         let buffer = Buffer::new(MemoryHandle::with_len(slot, 4), Default::default());
@@ -46,23 +56,27 @@ impl Source for NumberSource {
 }
 
 struct SquareTransform {
-    arena: SharedArena,
+    output: OutputArena,
 }
 
 impl SquareTransform {
     fn new() -> Result<Self> {
         Ok(Self {
-            arena: SharedArena::new(64, 8)?,
+            output: OutputArena::new(defaults::TRANSFORM_SLOT_COUNT),
         })
     }
 }
 
 impl Transform for SquareTransform {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn transform(&mut self, buffer: Buffer) -> Result<Output> {
         let value = u32::from_le_bytes(buffer.as_bytes()[..4].try_into().unwrap());
         let squared = value * value;
 
-        let mut slot = self.arena.acquire().expect("transform arena exhausted");
+        let mut slot = self.output.acquire(4, "square")?;
         slot.data_mut()[..4].copy_from_slice(&squared.to_le_bytes());
 
         Ok(Output::Single(Buffer::new(

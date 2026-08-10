@@ -54,7 +54,7 @@ use crate::error::Result;
 use crate::format::{
     Caps, CapsValue, ElementMediaCaps, FormatMemoryCap, MemoryCaps, PixelFormat, VideoFormatCaps,
 };
-use crate::memory::{DmaBufSegment, SharedArena};
+use crate::memory::{DmaBufSegment, OutputArena, OutputBudget, defaults};
 use crate::metadata::Metadata;
 use crate::pipeline::flow::{FlowPolicy, FlowSignal, FlowStateHandle};
 
@@ -234,7 +234,7 @@ pub struct V4l2Src {
     /// fallback (compressed MJPG frames routinely exceed width*height).
     driver_buffer_size: Option<usize>,
     /// Arena for buffer allocation (per-source to avoid contention).
-    arena: Option<SharedArena>,
+    output: OutputArena,
     /// Whether to export buffers as DMA-BUF file descriptors.
     dmabuf_export: bool,
     /// Exported DMA-BUF file descriptors (one per buffer, when dmabuf_export is true).
@@ -391,7 +391,7 @@ impl V4l2Src {
             framerate,
             frame_duration,
             driver_buffer_size,
-            arena: None,
+            output: OutputArena::new(defaults::VIDEO_CAPTURE_SLOT_COUNT),
             dmabuf_export: config.dmabuf_export,
             exported_fds,
             exported_sizes,
@@ -600,6 +600,10 @@ impl Drop for V4l2Src {
 }
 
 impl Source for V4l2Src {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
         // Check for downstream backpressure before capturing
         // V4L2 is a live source - dropping frames is better than accumulating lag
@@ -662,13 +666,12 @@ impl Source for V4l2Src {
             )));
         }
 
-        // Standard mmap path: lazily initialize per-source arena if needed
-        if self.arena.is_none() {
-            let slot_size = self
-                .preferred_buffer_size()
-                .unwrap_or(self.width as usize * self.height as usize * 4);
-            self.arena = Some(SharedArena::new(slot_size, 32)?);
-        }
+        // The slot size follows the driver's negotiated sizeimage, and the
+        // arena is built lazily on the first frame.
+        let slot_size = self
+            .preferred_buffer_size()
+            .unwrap_or(self.width as usize * self.height as usize * 4);
+        self.output.set_min_slot_size(slot_size);
 
         let stream = self
             .stream
@@ -688,23 +691,13 @@ impl Source for V4l2Src {
         let pts = self.calculate_pts(&timestamp);
 
         if !ctx.has_buffer() || len > ctx.capacity() {
-            // No buffer provided or buffer too small, return our own buffer from arena
-            let arena = self.arena.as_mut().unwrap();
-            arena.reclaim();
-
-            let mut slot = arena
-                .acquire()
-                .ok_or_else(|| crate::error::Error::Element("V4L2 arena exhausted".to_string()))?;
-
-            // A frame larger than the slot means the driver exceeded its own
-            // sizeimage (or reported none and the estimate was short) — error
-            // out instead of panicking on the slice copy.
-            if len > slot.data_mut().len() {
-                return Err(crate::error::Error::Element(format!(
-                    "V4L2 frame ({len} bytes) exceeds arena slot ({} bytes)",
-                    slot.data_mut().len()
-                )));
-            }
+            // No buffer provided or buffer too small, return our own buffer
+            // from the arena. `acquire` vets the length, so a frame larger than
+            // the driver's own sizeimage errors instead of panicking on the
+            // copy — the manual check this replaces did the same job by hand.
+            let Some(mut slot) = self.output.try_acquire(len, "v4l2src")? else {
+                return Ok(ProduceResult::WouldBlock);
+            };
             slot.data_mut()[..len].copy_from_slice(&frame_data);
 
             let handle = MemoryHandle::with_len(slot, len);

@@ -15,7 +15,7 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
 use crate::error::{Error, Result};
-use crate::memory::SharedArena;
+use crate::memory::{OutputArena, OutputBudget, defaults};
 use crate::metadata::Metadata;
 use std::io::Read;
 use std::time::Duration;
@@ -67,7 +67,7 @@ pub struct HttpSrc {
     bytes_read: u64,
     sequence: u64,
     status_code: Option<u16>,
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl HttpSrc {
@@ -85,7 +85,7 @@ impl HttpSrc {
             bytes_read: 0,
             sequence: 0,
             status_code: None,
-            arena: None,
+            output: OutputArena::new(defaults::SOURCE_SLOT_COUNT),
         })
     }
 
@@ -161,6 +161,10 @@ impl HttpSrc {
 }
 
 impl Source for HttpSrc {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn produce(&mut self, _ctx: &mut ProduceContext) -> Result<ProduceResult> {
         self.ensure_connected()?;
 
@@ -169,20 +173,9 @@ impl Source for HttpSrc {
             .as_mut()
             .ok_or_else(|| Error::Element("not connected".into()))?;
 
-        // Lazily initialize arena
-        if self.arena.is_none() {
-            self.arena = Some(
-                SharedArena::new(self.chunk_size, 16)
-                    .map_err(|e| Error::Element(format!("Failed to create arena: {}", e)))?,
-            );
-        }
-        let arena = self.arena.as_mut().unwrap();
-
-        arena.reclaim();
-
-        let mut slot = arena
-            .acquire()
-            .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+        let Some(mut slot) = self.output.try_acquire(self.chunk_size, "httpsrc")? else {
+            return Ok(ProduceResult::WouldBlock);
+        };
 
         match reader.read(slot.data_mut()) {
             Ok(0) => Ok(ProduceResult::Eos),

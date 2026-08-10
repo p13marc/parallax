@@ -413,3 +413,259 @@ async fn an_explicit_slot_count_overrides_the_budget() {
 
     assert_eq!(slots.load(Ordering::Relaxed), 3);
 }
+
+// ---------------------------------------------------------------------------
+// #91: the same budget, for the element kinds that could not receive one.
+//
+// `set_output_budget` lived only on `Element`/`Transform`, so a `Source`, an
+// `AsyncSource` and a `Muxer` all ran on whatever slot count they hard-coded.
+// And a source cannot use the transform's answer to exhaustion: nothing sheds a
+// source's `PoolExhausted`, so it has to stall via `try_acquire` -> `WouldBlock`
+// instead.
+// ---------------------------------------------------------------------------
+
+/// Slots for the stalling source's arena. Small enough that the sink below can
+/// exhaust it by holding, big enough that holding still leaves one in flight.
+const SOURCE_SLOTS: usize = 4;
+
+/// A `Source` with its own `OutputArena`, pinned small so exhaustion is
+/// reachable, that stalls rather than failing when the arena is full.
+struct StallingSource {
+    output: OutputArena,
+    emitted: u64,
+    count: u64,
+    stalls: Arc<AtomicUsize>,
+    built_slots: Arc<AtomicUsize>,
+}
+
+impl StallingSource {
+    fn new(count: u64) -> Self {
+        Self {
+            output: OutputArena::new(defaults::MIN_OUTPUT_SLOT_COUNT),
+            emitted: 0,
+            count,
+            stalls: Arc::new(AtomicUsize::new(0)),
+            built_slots: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn with_output_slots(mut self, slots: usize) -> Self {
+        self.output.set_slots(slots);
+        self
+    }
+}
+
+impl Source for StallingSource {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
+    fn produce(&mut self, _ctx: &mut ProduceContext) -> Result<ProduceResult> {
+        if self.emitted >= self.count {
+            return Ok(ProduceResult::Eos);
+        }
+
+        let Some(slot) = self.output.try_acquire(64, "stalling-source")? else {
+            self.stalls.fetch_add(1, Ordering::Relaxed);
+            return Ok(ProduceResult::WouldBlock);
+        };
+        if let Some(arena) = self.output.arena() {
+            self.built_slots
+                .store(arena.slot_count(), Ordering::Relaxed);
+        }
+
+        // The sequence advances only once the slot is secured. Incrementing
+        // before the stall would leave a hole for a frame never emitted.
+        let buffer = Buffer::new(
+            MemoryHandle::with_len(slot, 8),
+            Metadata::from_sequence(self.emitted),
+        );
+        self.emitted += 1;
+        Ok(ProduceResult::OwnBuffer(buffer))
+    }
+
+    fn name(&self) -> &str {
+        "stalling-source"
+    }
+}
+
+/// Records the sequence number of everything it receives, and holds on to the
+/// buffers so the source's arena really does run dry.
+struct SequenceSink {
+    held: Vec<Buffer>,
+    seen: Arc<std::sync::Mutex<Vec<u64>>>,
+}
+
+impl SequenceSink {
+    fn new() -> Self {
+        Self {
+            held: Vec::new(),
+            seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+}
+
+impl Sink for SequenceSink {
+    fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push(ctx.buffer().metadata().sequence);
+        // Hold all but one of the source's slots, then let go. The source
+        // runs dry while the sink is holding and recovers when it clears —
+        // strictly fewer than the arena has, or neither side can progress.
+        if self.held.len() < SOURCE_SLOTS - 1 {
+            self.held.push(ctx.buffer().clone());
+        } else {
+            self.held.clear();
+        }
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "sequence-sink"
+    }
+}
+
+/// The #91 headline for sources: a full arena must stall, not kill the run —
+/// and stalling must not skip a sequence number.
+#[tokio::test]
+async fn a_source_with_a_full_arena_stalls_instead_of_dying() {
+    let frames = 40u64;
+    // Small enough that the sink's hold guarantees exhaustion.
+    let source = StallingSource::new(frames).with_output_slots(SOURCE_SLOTS);
+    let stalls = Arc::clone(&source.stalls);
+
+    let sink = SequenceSink::new();
+    let seen = Arc::clone(&sink.seen);
+
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_source("src", source);
+    let snk = pipeline.add_sink("sink", sink);
+    pipeline.link(src, snk).unwrap();
+
+    let executor = Executor::with_config(ExecutorConfig::default());
+    let handle = executor.start(&mut pipeline).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), handle.wait())
+        .await
+        .expect("a stalled source hung the pipeline")
+        .expect("a full source arena killed the pipeline");
+
+    assert!(
+        stalls.load(Ordering::Relaxed) > 0,
+        "the arena never ran dry, so this test proves nothing"
+    );
+
+    let seen = seen.lock().unwrap();
+    let expected: Vec<u64> = (0..frames).collect();
+    assert_eq!(
+        *seen, expected,
+        "stalling lost or skipped a sequence number"
+    );
+}
+
+/// The proof that `SourceAdapter` forwards the budget: a plain `Source` must
+/// end up with an arena deeper than the channel it feeds.
+#[tokio::test]
+async fn the_budget_reaches_a_plain_source() {
+    let capacity = 64;
+    let source = StallingSource::new(4);
+    let built = Arc::clone(&source.built_slots);
+
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_source("src", source);
+    let snk = pipeline.add_sink("sink", GatedSink::prompt());
+    pipeline
+        .link_pads_full(src, "src", snk, "sink", LinkPolicy::Block, Some(capacity))
+        .unwrap();
+
+    let executor = Executor::with_config(ExecutorConfig::default());
+    let handle = executor.start(&mut pipeline).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), handle.wait())
+        .await
+        .expect("pipeline hung")
+        .unwrap();
+
+    assert_eq!(
+        built.load(Ordering::Relaxed),
+        capacity + defaults::IN_FLIGHT_MARGIN,
+        "the budget never reached the Source"
+    );
+}
+
+/// An element whose output size follows its input has no ceiling to enforce.
+/// Before `grow_to_fit` the hand-rolled version of this indexed straight into a
+/// too-small slot and panicked — which is what all eleven RTP pay/depayloaders
+/// did behind a fixed 256 KiB slot.
+struct GrowingTransform {
+    output: OutputArena,
+}
+
+impl GrowingTransform {
+    fn new(grow: bool) -> Self {
+        let mut output = OutputArena::new(defaults::MIN_OUTPUT_SLOT_COUNT).with_min_slot_size(1024);
+        output.set_grow_to_fit(grow);
+        Self { output }
+    }
+}
+
+impl Element for GrowingTransform {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
+    fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
+        // Output grows with the sequence number: buffer N is (N + 1) KiB.
+        let want = (buffer.metadata().sequence as usize + 1) * 1024;
+        let mut slot = self.output.acquire(want, "growing-transform")?;
+        slot.data_mut()[..want].fill(0xAB);
+        Ok(Some(Buffer::new(
+            MemoryHandle::with_len(slot, want),
+            buffer.metadata().clone(),
+        )))
+    }
+
+    fn name(&self) -> &str {
+        "growing-transform"
+    }
+}
+
+async fn run_growing(grow: bool) -> Result<()> {
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_source("src", CountingSource::new(8));
+    let xfm = pipeline.add_filter("xfm", GrowingTransform::new(grow));
+    let snk = pipeline.add_sink("sink", GatedSink::prompt());
+    pipeline.link(src, xfm).unwrap();
+    pipeline.link(xfm, snk).unwrap();
+
+    let executor = Executor::with_config(ExecutorConfig::default());
+    let handle = executor.start(&mut pipeline).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), handle.wait())
+        .await
+        .expect("pipeline hung")
+}
+
+#[tokio::test]
+async fn an_oversized_payload_grows_the_arena_rather_than_panicking() {
+    run_growing(true)
+        .await
+        .expect("grow_to_fit must widen the arena, not fail");
+}
+
+/// The strict half: without growth an oversized payload is a plain error naming
+/// the cause, never a panic indexing off the end of a slot.
+#[tokio::test]
+async fn without_grow_to_fit_an_oversized_payload_is_an_error_not_a_panic() {
+    let err = run_growing(false)
+        .await
+        .expect_err("a fixed-size arena must reject a payload it cannot hold");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("output slot") && msg.contains("needs"),
+        "expected a slot-size error, got: {msg}"
+    );
+    assert!(
+        !msg.contains("panicked"),
+        "an oversized payload must not panic: {msg}"
+    );
+}

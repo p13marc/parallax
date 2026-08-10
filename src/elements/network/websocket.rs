@@ -14,7 +14,7 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
 use crate::error::{Error, Result};
-use crate::memory::SharedArena;
+use crate::memory::{OutputArena, OutputBudget, defaults};
 use crate::metadata::Metadata;
 use std::net::TcpStream;
 use tungstenite::stream::MaybeTlsStream;
@@ -49,7 +49,7 @@ pub struct WebSocketSrc {
     bytes_read: u64,
     messages_received: u64,
     sequence: u64,
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl WebSocketSrc {
@@ -66,7 +66,9 @@ impl WebSocketSrc {
             bytes_read: 0,
             messages_received: 0,
             sequence: 0,
-            arena: None,
+            output: OutputArena::new(defaults::SOURCE_SLOT_COUNT)
+                .with_min_slot_size(defaults::NETWORK_SLOT_SIZE)
+                .grow_to_fit(),
         })
     }
 
@@ -136,40 +138,36 @@ impl WebSocketSrc {
     }
 
     /// Copy one received message payload into an arena buffer.
-    fn buffer_from_message(&mut self, data: &[u8]) -> Result<Buffer> {
+    ///
+    /// `None` means no output slot was free. The message is already off the
+    /// socket, so it is lost — but a WebSocket source that died on a full arena
+    /// would lose the rest of the stream with it.
+    fn buffer_from_message(&mut self, data: &[u8]) -> Result<Option<Buffer>> {
+        // A message has no MTU, so the arena grows to whatever arrives; the
+        // explicit oversize check this replaces is now `acquire`'s job.
+        let Some(mut slot) = self.output.try_acquire(data.len(), "websocketsrc")? else {
+            return Ok(None);
+        };
+
+        // Counters advance only once the slot is secured, or a dropped message
+        // leaves a permanent hole in the sequence.
         self.bytes_read += data.len() as u64;
         self.messages_received += 1;
         let seq = self.sequence;
         self.sequence += 1;
 
-        // Lazily initialize arena
-        if self.arena.is_none() {
-            self.arena = Some(
-                SharedArena::new(64 * 1024, 32)
-                    .map_err(|e| Error::Element(format!("Failed to create arena: {}", e)))?,
-            );
-        }
-        let arena = self.arena.as_ref().unwrap();
-        arena.reclaim();
-
-        let mut slot = arena
-            .acquire()
-            .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
-        if data.len() > slot.data_mut().len() {
-            return Err(Error::Element(format!(
-                "WebSocket message ({} bytes) exceeds arena slot ({} bytes)",
-                data.len(),
-                slot.data_mut().len()
-            )));
-        }
         slot.data_mut()[..data.len()].copy_from_slice(data);
 
         let handle = MemoryHandle::with_len(slot, data.len());
-        Ok(Buffer::new(handle, Metadata::from_sequence(seq)))
+        Ok(Some(Buffer::new(handle, Metadata::from_sequence(seq))))
     }
 }
 
 impl Source for WebSocketSrc {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn produce(&mut self, _ctx: &mut ProduceContext) -> Result<ProduceResult> {
         self.ensure_connected()?;
 
@@ -181,11 +179,15 @@ impl Source for WebSocketSrc {
 
             match socket.read() {
                 Ok(Message::Binary(data)) => {
-                    let buffer = self.buffer_from_message(&data)?;
+                    let Some(buffer) = self.buffer_from_message(&data)? else {
+                        return Ok(ProduceResult::WouldBlock);
+                    };
                     return Ok(ProduceResult::OwnBuffer(buffer));
                 }
                 Ok(Message::Text(text)) => {
-                    let buffer = self.buffer_from_message(text.as_bytes())?;
+                    let Some(buffer) = self.buffer_from_message(text.as_bytes())? else {
+                        return Ok(ProduceResult::WouldBlock);
+                    };
                     return Ok(ProduceResult::OwnBuffer(buffer));
                 }
                 Ok(Message::Close(_)) => {

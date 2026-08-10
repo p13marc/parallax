@@ -6,8 +6,8 @@
 
 use crate::clock::ClockTime;
 use crate::element::{ProduceContext, ProduceResult, Source};
-use crate::error::{Error, Result};
-use crate::memory::SharedArena;
+use crate::error::Result;
+use crate::memory::{OutputArena, OutputBudget, defaults};
 use std::time::{Duration, Instant};
 
 /// Video test pattern types.
@@ -149,7 +149,7 @@ pub struct VideoTestSrc {
     ball_radius: f32,
     rng_state: u64,
     /// Arena for allocating buffers when no ProduceContext buffer is available.
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl VideoTestSrc {
@@ -178,7 +178,7 @@ impl VideoTestSrc {
             ball_vy: 2.0,
             ball_radius: 30.0,
             rng_state: 0x853c49e6748fea9b,
-            arena: None,
+            output: OutputArena::new(defaults::VIDEO_CAPTURE_SLOT_COUNT),
         }
     }
 
@@ -312,7 +312,7 @@ impl VideoTestSrc {
         self.last_produce = None;
         self.ball_x = self.width as f32 / 4.0;
         self.ball_y = self.height as f32 / 4.0;
-        self.arena = None;
+        self.output.reset();
     }
 
     // Simple xorshift64 PRNG
@@ -592,6 +592,10 @@ impl Default for VideoTestSrc {
 }
 
 impl Source for VideoTestSrc {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
         use crate::buffer::{Buffer, MemoryHandle};
         use crate::metadata::Metadata;
@@ -613,16 +617,18 @@ impl Source for VideoTestSrc {
             (self.sequence * self.framerate_den as u64 * 1_000_000_000) / self.framerate_num as u64,
         );
 
-        self.sequence += 1;
-        self.frames_produced += 1;
+        let seq = self.sequence;
 
         // Check if context has a buffer, otherwise allocate our own
         if ctx.has_buffer() {
+            self.sequence += 1;
+            self.frames_produced += 1;
+
             let output = ctx.output();
             let write_size = output.len().min(frame_size);
             self.fill_frame(&mut output[..write_size]);
 
-            ctx.set_sequence(self.sequence - 1);
+            ctx.set_sequence(seq);
             ctx.set_pts(pts);
             ctx.metadata_mut().duration = self.frame_duration();
             ctx.set_keyframe();
@@ -630,24 +636,21 @@ impl Source for VideoTestSrc {
 
             Ok(ProduceResult::Produced(write_size))
         } else {
-            // No buffer provided - allocate our own using SharedArena
-            if self.arena.is_none() {
-                // Use enough slots for typical video pipeline buffering
-                self.arena = Some(SharedArena::new(frame_size, 64)?);
-            }
-            let arena = self.arena.as_mut().unwrap();
-            // Reclaim any freed slots before acquiring
-            arena.reclaim();
-            let mut slot = arena
-                .acquire()
-                .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+            // The slot comes first, and the counters advance only once it is
+            // secured. Incrementing before a WouldBlock would leave a permanent
+            // hole in the sequence for a frame that was never emitted.
+            let Some(mut slot) = self.output.try_acquire(frame_size, "videotestsrc")? else {
+                return Ok(ProduceResult::WouldBlock);
+            };
+            self.sequence += 1;
+            self.frames_produced += 1;
 
             // Fill the frame data
             self.fill_frame(slot.data_mut());
 
             let handle = MemoryHandle::with_len(slot, frame_size);
             let mut metadata = Metadata::default()
-                .with_sequence(self.sequence - 1)
+                .with_sequence(seq)
                 .with_pts(pts)
                 .with_duration(self.frame_duration())
                 .keyframe();

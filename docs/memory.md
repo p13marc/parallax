@@ -165,20 +165,52 @@ consumer hesitates.
 
 Only the executor knows the number — link capacity is its configuration — so it
 computes an `OutputBudget` per node and hands it over before the element builds
-anything:
+anything. **Use `OutputArena`**, which packages the whole pattern; every built-in
+element does, and hand-rolling the field is what #84 and #91 existed to undo.
 
 ```rust,ignore
-impl Element for MyEncoder {
-    fn set_output_budget(&mut self, budget: OutputBudget) {
-        self.budget = Some(budget);          // store it; the arena is built lazily
+struct MyEncoder { output: OutputArena }
+
+impl MyEncoder {
+    fn new() -> Self {
+        Self {
+            output: OutputArena::new(defaults::VIDEO_ENCODER_SLOT_COUNT)
+                .with_min_slot_size(1024 * 1024),   // headroom for a big keyframe
+        }
     }
 }
 
-// ...on the first frame, and again after a resize rebuild:
-let slots = self.budget.unwrap_or_default()
-    .resolve(defaults::VIDEO_ENCODER_SLOT_COUNT, slot_size);
-self.arena = Some(SharedArena::new(slot_size, slots)?);
+impl Element for MyEncoder {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);      // stored; the arena is built lazily
+    }
+
+    fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
+        self.output.admit()?;                // before irreversible work
+        let encoded = self.encode(&buffer)?;
+        let mut slot = self.output.acquire(encoded.len(), "myencoder")?;
+        // ...
+    }
+}
 ```
+
+The surface, and when to reach for each:
+
+| | |
+|---|---|
+| `acquire(len, name)` | The default. Builds on first use, vets the length, `Error::PoolExhausted` when full. |
+| `try_acquire(len, name)` | **Sources only.** `Ok(None)` instead of `PoolExhausted`, so a source can answer `ProduceResult::WouldBlock` — see below for why it must. |
+| `admit()` | Encoders: check for room *before* doing work that cannot be undone. |
+| `reset()` | A geometry change: the new frames need differently-sized slots. |
+| `grow_to_fit()` | For an element whose output size follows its **input** and has no ceiling — a `Map`, an RTP depayloader. Leave it off where the size is genuinely fixed, so an oversize is reported rather than absorbed. |
+| `set_slots(n)` | Pin the count, overriding the budget. Rarely right; warns when below it. |
+
+Every slot is 64-byte aligned — `SharedArena::new` asks for a cache line, which
+also satisfies `MemoryLayout::{SSE, AVX, AVX512}`. Nothing needs `new_avx`.
+
+`set_output_budget` is on `Element`, `Transform`, `AsyncTransform`, `Source`,
+`AsyncSource`, `Muxer`, `Demuxer`, `SyncElement`, `PipelineElement` and the three
+`Simple*` traits — every kind of element that can emit a buffer.
 
 The invariant is `slots ≥ max(downstream link capacity) + IN_FLIGHT_MARGIN`.
 Per src pad it is the **maximum** over that pad's links, not the sum: fan-out
@@ -194,21 +226,21 @@ a `Queue` up to its depth, and an application can retain every `Buffer` it pulls
 None of that is visible to the executor, so exhaustion stays possible — and is
 handled where it happens rather than prevented here.
 
-`OutputArena` packages the whole pattern (lazy build, budget sizing, rebuild on
-resize, `Error::PoolExhausted` on exhaustion), which is what the built-in codecs
-use. Reach for it rather than hand-rolling an arena field.
-
 ## Running out of slots
 
-`Error::PoolExhausted` is the **one error the executor does not treat as fatal**.
-When an element cannot acquire an output slot, the executor drops that buffer,
+`Error::PoolExhausted` is the **one error the executor does not treat as fatal**
+— in a *transform* task. When a transform cannot acquire an output slot, the
+executor drops that buffer,
 counts it on the `DropTracer` and the `parallax_buffers_dropped` metric, logs a
 rate-limited warning (1st, 10th, 100th… consecutive), and carries on. For live
 media that is the correct trade: a dropped frame is recoverable, a dead capture
 session is not. Set `ExecutorConfig::shed_fatal_after` to opt back into failing —
 a batch transcode should stop rather than quietly write a file with gaps.
 
-Every other `Err` from `process()` still terminates the element.
+Every other `Err` from `process()` still terminates the element. So do *all*
+errors from a source, sink, demuxer or muxer task, which have no shed arm — which
+is why a source must use `try_acquire` and stall rather than reporting
+exhaustion at all.
 
 What an element should do on exhaustion depends on what it would corrupt:
 
@@ -216,7 +248,8 @@ What an element should do on exhaustion depends on what it would corrupt:
 |---|---|
 | Encoders | Call `OutputArena::admit()` **before** encoding and return early. A frame pushed into the GOP whose packet is then shed leaves a reference the decoder never receives — corrupt until the next IDR. Skipping the input only lowers the frame rate, which is what `skip_frames` already does deliberately. |
 | Decoders | **Never** skip an input: it is a reference frame, and everything after it decodes wrong. Decode, then shed the output copy; the decoder's own state stays intact. |
-| Muxers | Neither — a lost batch breaks continuity counters and PCR. Rely on the budget. |
+| Muxers | Neither — a lost batch breaks continuity counters and PCR. Rely on the budget, which since #91 actually arrives. |
+| Sources | `try_acquire`, and return `ProduceResult::WouldBlock` on `None`. The executor sleeps briefly and asks again. Where the slot is taken *before* the read — file, socket — stalling costs nothing at all; where the data has already been consumed it sheds that one frame, and the sequence counter must advance only after the slot is secured or the gap is permanent. |
 | Stateless transforms | Shed freely. |
 
 ## Other segment types

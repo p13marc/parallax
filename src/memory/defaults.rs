@@ -94,6 +94,29 @@ pub const AUDIO_SLOT_COUNT: usize = 64;
 /// 32 slots is typically sufficient for network I/O.
 pub const NETWORK_SLOT_COUNT: usize = 32;
 
+/// Floor for a generic transform's output arena.
+///
+/// What the hand-rolled `Option<SharedArena>` fields in `elements/transform/`
+/// used before #91. Under the executor the budget almost always exceeds it;
+/// this is the standalone case, and it exists so that converting those elements
+/// did not quietly change what they get when nobody is driving them.
+pub const TRANSFORM_SLOT_COUNT: usize = 32;
+
+/// Floor for a source that allocates its own output buffers.
+///
+/// A source normally writes into the slot the executor's `ProduceContext`
+/// hands it; this is the fallback arena for when there is no pool and no
+/// arena attached, which every built-in source carries. 32 is what they all
+/// hard-coded before #91.
+pub const SOURCE_SLOT_COUNT: usize = 32;
+
+/// Slot count for an RTP source's packet arena.
+///
+/// Higher than [`NETWORK_SLOT_COUNT`] because RTP arrives as a burst of small
+/// datagrams — one video frame is a few dozen of them — and a source that runs
+/// out stalls the whole capture rather than one buffer.
+pub const RTP_PACKET_SLOT_COUNT: usize = 64;
+
 /// Slot count for metadata processing.
 /// 32 slots for KLV, SEI, and other metadata.
 pub const METADATA_SLOT_COUNT: usize = 32;

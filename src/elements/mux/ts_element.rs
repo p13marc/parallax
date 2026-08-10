@@ -31,7 +31,7 @@ use crate::element::{Muxer, MuxerInput, PadAddedCallback, PadId};
 use crate::elements::mux::{TsMux, TsMuxConfig, TsMuxStreamType, TsMuxTrack};
 use crate::error::{Error, Result};
 use crate::format::{AudioCodec, Caps, MediaFormat, VideoCodec};
-use crate::memory::SharedArena;
+use crate::memory::{OutputArena, OutputBudget, defaults};
 use crate::metadata::Metadata;
 
 use std::collections::HashMap;
@@ -99,7 +99,7 @@ pub struct TsMuxElement {
     audio_count: u32,
     data_count: u32,
     /// Arena for output buffer allocation.
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl TsMuxElement {
@@ -160,7 +160,9 @@ impl TsMuxElement {
             video_count,
             audio_count,
             data_count,
-            arena: None,
+            output: OutputArena::new(defaults::TS_MUX_SLOT_COUNT)
+                .with_min_slot_size(188 * 64)
+                .grow_to_fit(),
         })
     }
 
@@ -264,21 +266,11 @@ impl TsMuxElement {
             return Ok(None);
         }
 
-        // Initialize arena on first use (typical TS packet output is ~188 * N bytes)
-        if self.arena.is_none() {
-            // Allocate enough for typical muxer output (multiple TS packets)
-            let arena_size = ts_data.len().max(188 * 64); // At least 64 TS packets
-            self.arena = Some(
-                SharedArena::new(arena_size, 16)
-                    .map_err(|e| Error::Element(format!("Failed to create arena: {}", e)))?,
-            );
-        }
-
-        let arena = self.arena.as_mut().unwrap();
-        arena.reclaim();
-        let mut slot = arena
-            .acquire()
-            .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+        // `acquire`, not `try_acquire`: a muxer must not shed. A lost batch
+        // breaks continuity counters and PCR, so it relies on the budget being
+        // big enough — which, now that `Muxer` carries `set_output_budget`, it
+        // actually is. Exhaustion stays fatal, exactly as it was before.
+        let mut slot = self.output.acquire(ts_data.len(), "tsmux")?;
         slot.data_mut()[..ts_data.len()].copy_from_slice(&ts_data);
 
         let handle = MemoryHandle::with_len(slot, ts_data.len());
@@ -365,6 +357,10 @@ impl TsMuxElement {
 }
 
 impl Muxer for TsMuxElement {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn mux(&mut self, input: MuxerInput) -> Result<Option<Buffer>> {
         // Push the buffer
         self.push(input)?;

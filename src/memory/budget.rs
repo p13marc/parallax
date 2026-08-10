@@ -163,12 +163,17 @@ impl OutputBudget {
 ///     }
 /// }
 /// ```
+/// Every slot is 64-byte aligned — [`SharedArena::new`] asks for a cache line,
+/// which also satisfies `MemoryLayout::{SSE, AVX, AVX512}`. An element that used
+/// to reach for `SharedArena::new_avx` for its 32-byte alignment gets a stronger
+/// guarantee here, not a weaker one.
 pub struct OutputArena {
     arena: Option<SharedArena>,
     budget: Option<OutputBudget>,
     explicit: Option<usize>,
     floor: usize,
     min_slot_size: usize,
+    grow: bool,
 }
 
 impl std::fmt::Debug for OutputArena {
@@ -182,6 +187,7 @@ impl std::fmt::Debug for OutputArena {
             .field("budget", &self.budget)
             .field("explicit", &self.explicit)
             .field("floor", &self.floor)
+            .field("grow", &self.grow)
             .finish()
     }
 }
@@ -196,7 +202,35 @@ impl OutputArena {
             explicit: None,
             floor,
             min_slot_size: 0,
+            grow: false,
         }
+    }
+
+    /// Rebuild the arena when a payload outgrows the slot, instead of failing.
+    ///
+    /// Slot size is fixed when the arena is built, so the default is strict: an
+    /// oversized payload is a bug and [`acquire`](Self::acquire) says so. That
+    /// is right for an element whose output size is *bounded* — an encoder
+    /// writing under a ceiling, a capture source copying a frame of the driver's
+    /// negotiated `sizeimage`.
+    ///
+    /// It is wrong for an element whose output size follows its **input**: a
+    /// `Map` over arbitrary bytes, an RTP depayloader that meets a bigger
+    /// keyframe than the last one. Those have no ceiling to enforce, and failing
+    /// on the first large frame would shed every large frame after it — a live
+    /// stream that never recovers. Pair this with
+    /// [`with_min_slot_size`](Self::with_min_slot_size) so the common case still
+    /// builds once.
+    ///
+    /// Growth is one-way: a smaller payload reuses the slot it already fits in.
+    pub fn grow_to_fit(mut self) -> Self {
+        self.grow = true;
+        self
+    }
+
+    /// [`grow_to_fit`](Self::grow_to_fit) after construction.
+    pub fn set_grow_to_fit(&mut self, grow: bool) {
+        self.grow = grow;
     }
 
     /// Never build slots smaller than `bytes`.
@@ -278,7 +312,33 @@ impl OutputArena {
     /// executor treats as a shed buffer rather than a fatal error. A frame too
     /// big for the slot is a plain error naming the cause — the hand-written
     /// versions of this used to index straight into the slot and panic.
+    ///
+    /// Sources want [`try_acquire`](Self::try_acquire) instead: nothing sheds a
+    /// source's `PoolExhausted`, so returning it would kill the pipeline.
     pub fn acquire(&mut self, len: usize, element: &str) -> Result<SharedSlotRef> {
+        self.try_acquire(len, element)?.ok_or(Error::PoolExhausted)
+    }
+
+    /// [`acquire`](Self::acquire), but a full arena is `Ok(None)` rather than an
+    /// error.
+    ///
+    /// For **sources**. `Error::PoolExhausted` is only shed inside the
+    /// executor's transform task; a source that returned it would take its own
+    /// pipeline down. `Ok(None)` lets the source answer
+    /// `ProduceResult::WouldBlock` instead, which the executor already
+    /// understands — it sleeps briefly and asks again — so the source stalls
+    /// until downstream releases a slot and then carries on.
+    ///
+    /// Note what does *not* become `Ok(None)`: a frame too large for the slot,
+    /// and a failed mapping, are still errors. Reporting those as "try again"
+    /// would spin forever on a condition retrying cannot fix.
+    pub fn try_acquire(&mut self, len: usize, element: &str) -> Result<Option<SharedSlotRef>> {
+        // A payload past the slot size needs a differently-sized arena, and the
+        // budget is re-consulted on the way through.
+        if self.grow && self.arena.as_ref().is_some_and(|a| a.slot_size() < len) {
+            self.reset();
+        }
+
         if self.arena.is_none() {
             let slot_size = len.max(self.min_slot_size).max(1);
             let budget = self.budget.unwrap_or_default();
@@ -299,15 +359,18 @@ impl OutputArena {
         let arena = self.arena.as_mut().expect("built immediately above");
         arena.reclaim();
 
-        let slot = arena.acquire().ok_or(Error::PoolExhausted)?;
+        let Some(slot) = arena.acquire() else {
+            return Ok(None);
+        };
         if slot.len() < len {
             return Err(Error::InvalidSegment(format!(
                 "{element}: output slot is {} bytes but the frame needs {len} — the arena was \
-                 built for a smaller payload; call reset() on a geometry change",
+                 built for a smaller payload; call reset() on a geometry change, or \
+                 grow_to_fit() if the size follows the input",
                 slot.len(),
             )));
         }
-        Ok(slot)
+        Ok(Some(slot))
     }
 }
 
@@ -473,6 +536,75 @@ mod tests {
         assert!(
             format!("{err}").contains("geometry change"),
             "unhelpful message: {err}"
+        );
+    }
+
+    #[test]
+    fn try_acquire_reports_a_full_arena_as_none_not_an_error() {
+        // What lets a source answer WouldBlock instead of dying: nothing sheds
+        // a source's PoolExhausted.
+        let mut out = OutputArena::new(2);
+        out.set_slots(2);
+
+        let held: Vec<_> = (0..2)
+            .map(|_| out.try_acquire(64, "t").unwrap().unwrap())
+            .collect();
+        assert!(matches!(out.try_acquire(64, "t"), Ok(None)));
+
+        drop(held);
+        assert!(out.try_acquire(64, "t").unwrap().is_some());
+    }
+
+    #[test]
+    fn try_acquire_still_errors_on_an_oversized_frame() {
+        // Not Ok(None): retrying cannot make the frame smaller, so a source
+        // told to try again would spin forever.
+        let mut out = OutputArena::new(4);
+        out.try_acquire(64, "t").unwrap().unwrap();
+
+        assert!(matches!(
+            out.try_acquire(1024 * 1024, "t"),
+            Err(Error::InvalidSegment(_))
+        ));
+    }
+
+    #[test]
+    fn grow_to_fit_rebuilds_instead_of_erroring() {
+        let mut out = OutputArena::new(4).grow_to_fit();
+        out.acquire(64, "t").unwrap();
+
+        let slot = out
+            .acquire(1024 * 1024, "t")
+            .expect("grow_to_fit must widen rather than fail");
+        assert!(slot.len() >= 1024 * 1024);
+    }
+
+    #[test]
+    fn growth_is_one_way() {
+        let mut out = OutputArena::new(4).grow_to_fit();
+        out.acquire(1024 * 1024, "t").unwrap();
+        let wide = out.arena().unwrap().slot_size();
+
+        out.acquire(64, "t").unwrap();
+        assert_eq!(
+            out.arena().unwrap().slot_size(),
+            wide,
+            "a smaller payload must reuse the slot it fits in, not shrink it"
+        );
+    }
+
+    #[test]
+    fn slots_are_aligned_for_avx512() {
+        // `SharedArena::new` asks for a cache line, which covers every
+        // MemoryLayout an element can request. Elements that used to reach for
+        // `new_avx` (32-byte) rely on this being at least as strong.
+        let mut out = OutputArena::new(4);
+        let slot = out.acquire(4096, "t").unwrap();
+
+        assert_eq!(
+            slot.data().as_ptr() as usize % 64,
+            0,
+            "output slots must stay 64-byte aligned"
         );
     }
 }

@@ -10,8 +10,8 @@
 
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::Element;
-use crate::error::{Error, Result};
-use crate::memory::SharedArena;
+use crate::error::Result;
+use crate::memory::{OutputArena, OutputBudget, defaults};
 use crate::metadata::Metadata;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -468,7 +468,7 @@ pub struct BufferSplit {
     sequence_offset: u64,
     input_count: AtomicU64,
     output_count: AtomicU64,
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl BufferSplit {
@@ -483,7 +483,7 @@ impl BufferSplit {
             sequence_offset: 0,
             input_count: AtomicU64::new(0),
             output_count: AtomicU64::new(0),
-            arena: None,
+            output: OutputArena::new(defaults::TRANSFORM_SLOT_COUNT).grow_to_fit(),
         }
     }
 
@@ -527,15 +527,7 @@ impl BufferSplit {
                 continue;
             }
 
-            if self.arena.is_none() || self.arena.as_ref().unwrap().slot_size() < part.len() {
-                self.arena = Some(SharedArena::new(part.len(), 32)?);
-            }
-
-            let arena = self.arena.as_mut().unwrap();
-            arena.reclaim();
-            let mut slot = arena
-                .acquire()
-                .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+            let mut slot = self.output.acquire(part.len(), "buffersplit")?;
 
             slot.data_mut()[..part.len()].copy_from_slice(&part);
 
@@ -585,6 +577,10 @@ impl BufferSplit {
 }
 
 impl Element for BufferSplit {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         // If we have pending outputs, return them first
         if !self.pending.is_empty() {
@@ -593,15 +589,7 @@ impl Element for BufferSplit {
                 return Ok(None);
             }
 
-            if self.arena.is_none() || self.arena.as_ref().unwrap().slot_size() < part.len() {
-                self.arena = Some(SharedArena::new(part.len(), 32)?);
-            }
-
-            let arena = self.arena.as_mut().unwrap();
-            arena.reclaim();
-            let mut slot = arena
-                .acquire()
-                .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+            let mut slot = self.output.acquire(part.len(), "buffersplit")?;
 
             slot.data_mut()[..part.len()].copy_from_slice(&part);
 
@@ -631,15 +619,7 @@ impl Element for BufferSplit {
         }
 
         let alloc_size = part.len().max(1);
-        if self.arena.is_none() || self.arena.as_ref().unwrap().slot_size() < alloc_size {
-            self.arena = Some(SharedArena::new(alloc_size, 32)?);
-        }
-
-        let arena = self.arena.as_mut().unwrap();
-        arena.reclaim();
-        let mut slot = arena
-            .acquire()
-            .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+        let mut slot = self.output.acquire(alloc_size, "buffersplit")?;
 
         if !part.is_empty() {
             slot.data_mut()[..part.len()].copy_from_slice(&part);
@@ -689,7 +669,7 @@ pub struct BufferJoin {
     pending_size: usize,
     input_count: AtomicU64,
     output_count: AtomicU64,
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl BufferJoin {
@@ -703,7 +683,7 @@ impl BufferJoin {
             pending_size: 0,
             input_count: AtomicU64::new(0),
             output_count: AtomicU64::new(0),
-            arena: None,
+            output: OutputArena::new(defaults::TRANSFORM_SLOT_COUNT).grow_to_fit(),
         }
     }
 
@@ -747,15 +727,7 @@ impl BufferJoin {
         let total_size = self.pending_size + (self.pending.len() - 1) * self.delimiter.len();
         let alloc_size = total_size.max(1);
 
-        if self.arena.is_none() || self.arena.as_ref().unwrap().slot_size() < alloc_size {
-            self.arena = Some(SharedArena::new(alloc_size, 32)?);
-        }
-
-        let arena = self.arena.as_mut().unwrap();
-        arena.reclaim();
-        let mut slot = arena
-            .acquire()
-            .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+        let mut slot = self.output.acquire(alloc_size, "bufferjoin")?;
 
         let data = slot.data_mut();
         let mut offset = 0;
@@ -782,6 +754,10 @@ impl BufferJoin {
 }
 
 impl Element for BufferJoin {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         self.input_count.fetch_add(1, Ordering::Relaxed);
 
@@ -836,7 +812,7 @@ pub struct BufferConcat {
     pending_count: usize,
     input_count: AtomicU64,
     output_count: AtomicU64,
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl BufferConcat {
@@ -850,7 +826,7 @@ impl BufferConcat {
             pending_count: 0,
             input_count: AtomicU64::new(0),
             output_count: AtomicU64::new(0),
-            arena: None,
+            output: OutputArena::new(defaults::TRANSFORM_SLOT_COUNT).grow_to_fit(),
         }
     }
 
@@ -894,15 +870,7 @@ impl BufferConcat {
 
         let len = self.pending.len();
 
-        if self.arena.is_none() || self.arena.as_ref().unwrap().slot_size() < len {
-            self.arena = Some(SharedArena::new(len, 32)?);
-        }
-
-        let arena = self.arena.as_mut().unwrap();
-        arena.reclaim();
-        let mut slot = arena
-            .acquire()
-            .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+        let mut slot = self.output.acquire(len, "bufferconcat")?;
 
         slot.data_mut()[..len].copy_from_slice(&self.pending);
 
@@ -923,6 +891,10 @@ impl Default for BufferConcat {
 }
 
 impl Element for BufferConcat {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         self.input_count.fetch_add(1, Ordering::Relaxed);
 
@@ -978,6 +950,7 @@ pub struct BufferConcatStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::SharedArena;
     use std::sync::OnceLock;
 
     fn test_arena() -> &'static SharedArena {

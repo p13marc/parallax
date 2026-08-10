@@ -50,7 +50,7 @@ use crate::error::{Error, Result};
 use crate::format::{
     CapsValue, ElementMediaCaps, FormatMemoryCap, MemoryCaps, PixelFormat, VideoFormatCaps,
 };
-use crate::memory::SharedArena;
+use crate::memory::{OutputArena, OutputBudget, defaults};
 use crate::metadata::Metadata;
 use crate::pipeline::flow::{FlowPolicy, FlowSignal, FlowStateHandle};
 
@@ -198,7 +198,7 @@ pub struct ScreenCaptureSrc {
     /// Capture info (set after session is started).
     info: Option<ScreenCaptureInfo>,
     /// Arena for output buffers.
-    arena: Option<SharedArena>,
+    output: OutputArena,
     /// Whether the session has been initialized.
     initialized: bool,
     /// Frame counter for PipeWire thread (debugging).
@@ -292,7 +292,7 @@ impl ScreenCaptureSrc {
             shutdown_sender: None,
             capture_thread: None,
             info: None,
-            arena: None,
+            output: OutputArena::new(defaults::VIDEO_CAPTURE_SLOT_COUNT).grow_to_fit(),
             initialized: false,
             frame_count: Arc::new(AtomicU32::new(0)),
             frames_produced: 0,
@@ -854,9 +854,14 @@ impl ScreenCaptureSrc {
         self.initialized
     }
 
-    /// Set the arena for output buffers.
-    pub fn set_arena(&mut self, arena: SharedArena) {
-        self.arena = Some(arena);
+    /// Pin the output arena's slot count, overriding the executor's budget.
+    ///
+    /// Rarely needed — the executor sizes the arena from link capacity, and a
+    /// count below what the graph can hold just sheds frames. This used to take
+    /// a whole pre-built `SharedArena`, which let a caller install one the
+    /// budget could not reason about.
+    pub fn set_output_slots(&mut self, slots: usize) {
+        self.output.set_slots(slots);
     }
 
     /// Get the number of frames captured so far.
@@ -914,6 +919,10 @@ impl ScreenCaptureSrc {
 }
 
 impl Source for ScreenCaptureSrc {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn produce(&mut self, _ctx: &mut ProduceContext) -> Result<ProduceResult> {
         // Check if we've reached the frame limit (check frames we've actually output)
         if let Some(max) = self.config.max_frames {
@@ -960,46 +969,15 @@ impl Source for ScreenCaptureSrc {
             }
         }
 
-        // Ensure we have an arena large enough for this frame
-        // The actual frame size may differ from portal-reported dimensions
+        // The actual frame size may differ from the portal-reported dimensions,
+        // so the arena grows to whatever arrives. A full arena is not fatal: the
+        // frame is lost, the next one is not, and dropping frames when the
+        // encoder falls behind is what a screen capture should do.
         let frame_size = frame.data.len();
-        if self.arena.is_none()
-            || self.arena.as_ref().map(|a| a.slot_size()).unwrap_or(0) < frame_size
-        {
-            tracing::debug!(
-                "Creating arena for frame size: {} bytes ({}x{})",
-                frame_size,
-                frame.width,
-                frame.height
-            );
-            // Default to 200 slots to buffer ~6 seconds at 30fps
-            // This is needed because downstream elements (encoders) may be slower
-            // than capture rate. For production, use set_arena() with appropriate size.
-            let arena = SharedArena::new(frame_size, 200)
-                .map_err(|e| Error::AllocationFailed(format!("Failed to create arena: {}", e)))?;
-            self.arena = Some(arena);
-        }
-
-        let arena = self.arena.as_ref().unwrap();
-
-        // Reclaim any slots that have been released by downstream elements
-        arena.reclaim();
-
-        let frame_size = frame.data.len();
-        let mut slot = arena.acquire().ok_or_else(|| {
-            Error::AllocationFailed(format!(
-                "No slots available in arena (need {} bytes)",
-                frame_size
-            ))
-        })?;
-
-        if slot.len() < frame_size {
-            return Err(Error::AllocationFailed(format!(
-                "Arena slot too small: {} < {}",
-                slot.len(),
-                frame_size
-            )));
-        }
+        let Some(mut slot) = self.output.try_acquire(frame_size, "screencapturesrc")? else {
+            self.frames_dropped += 1;
+            return Ok(ProduceResult::WouldBlock);
+        };
 
         slot.data_mut()[..frame_size].copy_from_slice(&frame.data);
 

@@ -8,8 +8,8 @@ use crate::element::{
     ConsumeContext, DynAsyncElement, ElementAdapter, ProduceContext, ProduceResult, SinkAdapter,
     SourceAdapter,
 };
-use crate::error::{Error, Result};
-use crate::memory::SharedArena;
+use crate::error::Result;
+use crate::memory::{OutputArena, OutputBudget, defaults};
 use crate::metadata::Metadata;
 use crate::pipeline::Pipeline;
 
@@ -26,7 +26,7 @@ pub struct TypedSourceBridge<S: TypedSource> {
     inner: S,
     sequence: u64,
     /// Arena for allocating buffers when context doesn't provide one.
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl<S: TypedSource> TypedSourceBridge<S> {
@@ -35,7 +35,7 @@ impl<S: TypedSource> TypedSourceBridge<S> {
         Self {
             inner: source,
             sequence: 0,
-            arena: None,
+            output: OutputArena::new(defaults::TRANSFORM_SLOT_COUNT).grow_to_fit(),
         }
     }
 }
@@ -45,6 +45,10 @@ where
     S: TypedSource,
     S::Output: Into<Vec<u8>>,
 {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
         match self.inner.produce()? {
             Some(output) => {
@@ -59,20 +63,15 @@ where
                     self.sequence += 1;
                     Ok(ProduceResult::Produced(bytes.len()))
                 } else {
-                    // Fall back to creating our own buffer using SharedArena
-                    let slot_size = bytes.len().max(4096).next_power_of_two();
-                    if self.arena.is_none()
-                        || self.arena.as_ref().map(|a| a.slot_size()).unwrap_or(0) < bytes.len()
-                    {
-                        self.arena = Some(SharedArena::new(slot_size, 32)?);
-                    }
-
-                    let arena = self.arena.as_mut().unwrap();
-                    // Reclaim any released slots first
-                    arena.reclaim();
-                    let mut slot = arena
-                        .acquire()
-                        .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+                    // Fall back to creating our own buffer. Rounding up to a
+                    // power of two makes growth converge instead of
+                    // reallocating on every slightly-larger item.
+                    self.output
+                        .set_min_slot_size(bytes.len().max(4096).next_power_of_two());
+                    let Some(mut slot) = self.output.try_acquire(bytes.len(), "typedsource")?
+                    else {
+                        return Ok(ProduceResult::WouldBlock);
+                    };
 
                     // Copy data to slot
                     slot.data_mut()[..bytes.len()].copy_from_slice(&bytes);
@@ -142,7 +141,7 @@ where
 pub struct TypedTransformBridge<T: TypedTransform> {
     inner: T,
     /// Arena for allocating output buffers.
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl<T: TypedTransform> TypedTransformBridge<T> {
@@ -150,7 +149,7 @@ impl<T: TypedTransform> TypedTransformBridge<T> {
     pub fn new(transform: T) -> Self {
         Self {
             inner: transform,
-            arena: None,
+            output: OutputArena::new(defaults::TRANSFORM_SLOT_COUNT).grow_to_fit(),
         }
     }
 }
@@ -162,6 +161,10 @@ where
     T::Output: Into<Vec<u8>>,
     <T::Input as TryFrom<Vec<u8>>>::Error: std::fmt::Debug,
 {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         let bytes = buffer.as_bytes().to_vec();
         let metadata = buffer.metadata().clone();
@@ -173,20 +176,9 @@ where
             Some(output) => {
                 let out_bytes: Vec<u8> = output.into();
 
-                // Ensure we have an arena with sufficient slot size
-                let slot_size = out_bytes.len().max(4096).next_power_of_two();
-                if self.arena.is_none()
-                    || self.arena.as_ref().map(|a| a.slot_size()).unwrap_or(0) < out_bytes.len()
-                {
-                    self.arena = Some(SharedArena::new(slot_size, 32)?);
-                }
-
-                let arena = self.arena.as_mut().unwrap();
-                // Reclaim any released slots first
-                arena.reclaim();
-                let mut slot = arena
-                    .acquire()
-                    .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+                self.output
+                    .set_min_slot_size(out_bytes.len().max(4096).next_power_of_two());
+                let mut slot = self.output.acquire(out_bytes.len(), "typedtransform")?;
 
                 // Copy data to slot
                 slot.data_mut()[..out_bytes.len()].copy_from_slice(&out_bytes);

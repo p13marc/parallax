@@ -4,8 +4,8 @@
 
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::Element;
-use crate::error::{Error, Result};
-use crate::memory::SharedArena;
+use crate::error::Result;
+use crate::memory::{OutputArena, OutputBudget, defaults};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -40,7 +40,7 @@ pub struct Batch {
     sequence: u64,
     batches_produced: AtomicU64,
     buffers_received: AtomicU64,
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl Batch {
@@ -57,7 +57,7 @@ impl Batch {
             sequence: 0,
             batches_produced: AtomicU64::new(0),
             buffers_received: AtomicU64::new(0),
-            arena: None,
+            output: OutputArena::new(defaults::TRANSFORM_SLOT_COUNT).grow_to_fit(),
         }
     }
 
@@ -74,7 +74,7 @@ impl Batch {
             sequence: 0,
             batches_produced: AtomicU64::new(0),
             buffers_received: AtomicU64::new(0),
-            arena: None,
+            output: OutputArena::new(defaults::TRANSFORM_SLOT_COUNT).grow_to_fit(),
         }
     }
 
@@ -91,7 +91,7 @@ impl Batch {
             sequence: 0,
             batches_produced: AtomicU64::new(0),
             buffers_received: AtomicU64::new(0),
-            arena: None,
+            output: OutputArena::new(defaults::TRANSFORM_SLOT_COUNT).grow_to_fit(),
         }
     }
 
@@ -141,21 +141,7 @@ impl Batch {
         let total_len = self.pending_bytes;
         let alloc_size = total_len.max(1);
 
-        if self.arena.is_none() {
-            self.arena = Some(SharedArena::new(alloc_size, 32)?);
-        }
-
-        // Ensure arena slot is large enough
-        let arena = self.arena.as_ref().unwrap();
-        if arena.slot_size() < alloc_size {
-            self.arena = Some(SharedArena::new(alloc_size, 32)?);
-        }
-
-        let arena = self.arena.as_mut().unwrap();
-        arena.reclaim();
-        let mut slot = arena
-            .acquire()
-            .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+        let mut slot = self.output.acquire(alloc_size, "batch")?;
 
         if total_len > 0 {
             let mut offset = 0;
@@ -223,6 +209,10 @@ impl Batch {
 }
 
 impl Element for Batch {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         self.buffers_received.fetch_add(1, Ordering::Relaxed);
 
@@ -276,7 +266,7 @@ pub struct Unbatch {
     pending_chunks: VecDeque<Buffer>,
     count: AtomicU64,
     chunks_produced: AtomicU64,
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl Unbatch {
@@ -288,7 +278,7 @@ impl Unbatch {
             pending_chunks: VecDeque::new(),
             count: AtomicU64::new(0),
             chunks_produced: AtomicU64::new(0),
-            arena: None,
+            output: OutputArena::new(defaults::TRANSFORM_SLOT_COUNT).grow_to_fit(),
         }
     }
 
@@ -313,19 +303,12 @@ impl Unbatch {
         let mut offset = 0;
         let mut seq = 0u64;
 
-        // Ensure arena is created with appropriate chunk size
-        if self.arena.is_none() {
-            self.arena = Some(SharedArena::new(self.chunk_size, 32)?);
-        }
+        self.output.set_min_slot_size(self.chunk_size);
 
         while offset < data.len() {
             let chunk_len = (data.len() - offset).min(self.chunk_size);
 
-            let arena = self.arena.as_mut().unwrap();
-            arena.reclaim();
-            let mut slot = arena
-                .acquire()
-                .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+            let mut slot = self.output.acquire(chunk_len, "unbatch")?;
 
             slot.data_mut()[..chunk_len].copy_from_slice(&data[offset..offset + chunk_len]);
 
@@ -356,6 +339,10 @@ impl Unbatch {
 }
 
 impl Element for Unbatch {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         // If we have pending chunks, return the next one
         if let Some(chunk) = self.pending_chunks.pop_front() {
@@ -393,6 +380,7 @@ pub struct UnbatchStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::SharedArena;
     use crate::metadata::Metadata;
     use std::sync::OnceLock;
 

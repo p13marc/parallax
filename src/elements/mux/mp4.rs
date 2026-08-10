@@ -1082,7 +1082,11 @@ impl Element for Mp4MuxTransform {
                 return Ok(None);
             }
 
-            // Create an arena for the output buffer
+            // Deliberately a bare one-slot arena rather than an `OutputArena`
+            // (#91): it is sized to the finalized MP4 and acquired immediately,
+            // so `PoolExhausted` is unreachable — and routing a whole-file
+            // output through the executor's shed path would silently truncate
+            // the file, which is far worse than failing.
             let arena = SharedArena::new(mp4_data.len(), 1)
                 .map_err(|e| Error::AllocationFailed(format!("Failed to create arena: {}", e)))?;
 

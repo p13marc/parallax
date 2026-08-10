@@ -39,7 +39,7 @@ use crate::error::{Error, Result};
 use crate::format::{
     CapsValue, ElementMediaCaps, FormatMemoryCap, MemoryCaps, PixelFormat, VideoFormatCaps,
 };
-use crate::memory::SharedArena;
+use crate::memory::{OutputArena, OutputBudget, defaults};
 use crate::metadata::Metadata;
 
 // ============================================================================
@@ -253,8 +253,8 @@ pub struct VideoScale {
     last_target: Option<(u32, u32)>,
     /// Statistics.
     frames_processed: u64,
-    /// Arena for output buffers.
-    arena: Option<SharedArena>,
+    /// Arena for output buffers, sized by the executor at start.
+    output: OutputArena,
 }
 
 impl std::fmt::Debug for VideoScale {
@@ -265,7 +265,7 @@ impl std::fmt::Debug for VideoScale {
             .field("last_source", &self.last_source)
             .field("last_target", &self.last_target)
             .field("frames_processed", &self.frames_processed)
-            .field("arena", &self.arena.as_ref().map(|_| "SharedArena(...)"))
+            .field("output", &self.output)
             .finish()
     }
 }
@@ -285,7 +285,9 @@ impl VideoScale {
             last_source: None,
             last_target: None,
             frames_processed: 0,
-            arena: None,
+            // A retarget changes the output size, and grow_to_fit is what
+            // rebuilds for it — the same thing the hand-rolled check did.
+            output: OutputArena::new(defaults::TRANSFORM_SLOT_COUNT).grow_to_fit(),
         }
     }
 
@@ -436,6 +438,10 @@ impl crate::control::Controllable for VideoScale {
 }
 
 impl Element for VideoScale {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         // What is this buffer? Ask it — do not infer.
         let (caps_format, src_w, src_h) = Self::resolve_input(buffer.metadata())?;
@@ -461,18 +467,7 @@ impl Element for VideoScale {
         engine.scale(buffer.as_bytes(), &mut self.scratch)?;
 
         let output_size = self.scratch.len();
-        if self
-            .arena
-            .as_ref()
-            .is_none_or(|a| a.slot_size() < output_size)
-        {
-            self.arena = Some(SharedArena::new(output_size, 32)?);
-        }
-        let arena = self.arena.as_mut().expect("just ensured");
-        arena.reclaim();
-        let mut slot = arena
-            .acquire()
-            .ok_or_else(|| Error::Element("VideoScale: arena exhausted".into()))?;
+        let mut slot = self.output.acquire(output_size, "videoscale")?;
         slot.data_mut()[..output_size].copy_from_slice(&self.scratch);
 
         let mut metadata = buffer.metadata().clone();
@@ -500,6 +495,7 @@ impl Element for VideoScale {
 mod tests {
     use super::*;
     use crate::format::MediaFormat;
+    use crate::memory::SharedArena;
 
     /// A raw frame of `format` at `w`x`h`, describing itself the way any real
     /// source or decoder now does.
@@ -682,7 +678,7 @@ mod tests {
         assert_eq!(out.as_bytes(), &expected[..]);
         assert_eq!(out.metadata().video_dims(), Some((16, 16)));
         assert!(
-            scaler.arena.is_none(),
+            !scaler.output.is_built(),
             "passthrough must not allocate an output arena"
         );
         assert!(

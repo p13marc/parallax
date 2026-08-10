@@ -434,6 +434,15 @@ pub trait PipelineElement {
     fn handle_upstream_event(&mut self, _event: &Event) -> EventResult {
         EventResult::NotHandled
     }
+
+    /// How many buffers the downstream graph can hold in flight.
+    ///
+    /// See [`Element::set_output_budget`](crate::element::Element::set_output_budget)
+    /// — same contract, same reason to override it: this element owns the arena
+    /// its output buffers come from.
+    fn set_output_budget(&mut self, _budget: crate::memory::OutputBudget) {
+        // Default: ignore
+    }
 }
 
 // ============================================================================
@@ -486,6 +495,14 @@ pub trait SimpleSource: Send {
     fn handle_upstream_event(&mut self, _event: &Event) -> EventResult {
         EventResult::NotHandled
     }
+
+    /// How many buffers the downstream graph can hold in flight.
+    ///
+    /// See [`Element::set_output_budget`](crate::element::Element::set_output_budget).
+    /// Override it if this source owns an [`OutputArena`](crate::memory::OutputArena).
+    fn set_output_budget(&mut self, _budget: crate::memory::OutputBudget) {
+        // Default: ignore
+    }
 }
 
 /// A simple sink that consumes buffers.
@@ -528,6 +545,14 @@ pub trait SimpleSink: Send {
     /// Handle downstream events (e.g., EOS).
     fn handle_downstream_event(&mut self, event: Event) -> Option<Event> {
         Some(event)
+    }
+
+    /// How many buffers the downstream graph can hold in flight.
+    ///
+    /// See [`Element::set_output_budget`](crate::element::Element::set_output_budget).
+    /// Override it if this sink owns an [`OutputArena`](crate::memory::OutputArena).
+    fn set_output_budget(&mut self, _budget: crate::memory::OutputBudget) {
+        // Default: ignore
     }
 }
 
@@ -586,6 +611,14 @@ pub trait SimpleTransform: Send {
     fn handle_upstream_event(&mut self, _event: &Event) -> EventResult {
         EventResult::NotHandled
     }
+
+    /// How many buffers the downstream graph can hold in flight.
+    ///
+    /// See [`Element::set_output_budget`](crate::element::Element::set_output_budget).
+    /// Override it if this transform owns an [`OutputArena`](crate::memory::OutputArena).
+    fn set_output_budget(&mut self, _budget: crate::memory::OutputBudget) {
+        // Default: ignore
+    }
 }
 
 // ============================================================================
@@ -603,6 +636,10 @@ pub trait SimpleTransform: Send {
 pub struct Src<T: SimpleSource>(pub T);
 
 impl<T: SimpleSource + 'static> SendPipelineElement for Src<T> {
+    fn set_output_budget(&mut self, budget: crate::memory::OutputBudget) {
+        self.0.set_output_budget(budget);
+    }
+
     fn element_type(&self) -> ElementType {
         ElementType::Source
     }
@@ -643,6 +680,10 @@ impl<T: SimpleSource + 'static> SendPipelineElement for Src<T> {
 pub struct Snk<T: SimpleSink>(pub T);
 
 impl<T: SimpleSink + 'static> SendPipelineElement for Snk<T> {
+    fn set_output_budget(&mut self, budget: crate::memory::OutputBudget) {
+        self.0.set_output_budget(budget);
+    }
+
     fn element_type(&self) -> ElementType {
         ElementType::Sink
     }
@@ -689,6 +730,10 @@ impl<T: SimpleSink + 'static> SendPipelineElement for Snk<T> {
 pub struct Xfm<T: SimpleTransform>(pub T);
 
 impl<T: SimpleTransform + 'static> SendPipelineElement for Xfm<T> {
+    fn set_output_budget(&mut self, budget: crate::memory::OutputBudget) {
+        self.0.set_output_budget(budget);
+    }
+
     fn element_type(&self) -> ElementType {
         ElementType::Transform
     }
@@ -774,6 +819,10 @@ impl<T: SendPipelineElement> PipelineElementAdapter<T> {
 impl<T: SendPipelineElement + 'static> super::traits::SendAsyncElementDyn
     for PipelineElementAdapter<T>
 {
+    fn set_output_budget(&mut self, budget: crate::memory::OutputBudget) {
+        self.inner.set_output_budget(budget);
+    }
+
     fn name(&self) -> &str {
         self.inner.name()
     }

@@ -4,8 +4,8 @@
 
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::Element;
-use crate::error::{Error, Result};
-use crate::memory::SharedArena;
+use crate::error::Result;
+use crate::memory::{OutputArena, OutputBudget, defaults};
 use crate::metadata::Metadata;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -35,7 +35,7 @@ where
     name: String,
     transform: F,
     count: AtomicU64,
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl<F> Map<F>
@@ -48,7 +48,7 @@ where
             name: "map".to_string(),
             transform,
             count: AtomicU64::new(0),
-            arena: None,
+            output: OutputArena::new(defaults::TRANSFORM_SLOT_COUNT).grow_to_fit(),
         }
     }
 
@@ -68,6 +68,10 @@ impl<F> Element for Map<F>
 where
     F: FnMut(&[u8]) -> Vec<u8> + Send,
 {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         self.count.fetch_add(1, Ordering::Relaxed);
 
@@ -75,15 +79,7 @@ where
         let output = (self.transform)(input);
 
         let alloc_size = output.len().max(1);
-        if self.arena.is_none() || self.arena.as_ref().unwrap().slot_size() < alloc_size {
-            self.arena = Some(SharedArena::new(alloc_size, 32)?);
-        }
-
-        let arena = self.arena.as_mut().unwrap();
-        arena.reclaim();
-        let mut slot = arena
-            .acquire()
-            .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+        let mut slot = self.output.acquire(alloc_size, "map")?;
 
         if !output.is_empty() {
             slot.data_mut()[..output.len()].copy_from_slice(&output);
@@ -122,7 +118,7 @@ where
     transform: F,
     passed: AtomicU64,
     filtered: AtomicU64,
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl<F> FilterMap<F>
@@ -136,7 +132,7 @@ where
             transform,
             passed: AtomicU64::new(0),
             filtered: AtomicU64::new(0),
-            arena: None,
+            output: OutputArena::new(defaults::TRANSFORM_SLOT_COUNT).grow_to_fit(),
         }
     }
 
@@ -161,6 +157,10 @@ impl<F> Element for FilterMap<F>
 where
     F: FnMut(&[u8]) -> Option<Vec<u8>> + Send,
 {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         let input = buffer.as_bytes();
 
@@ -169,15 +169,7 @@ where
                 self.passed.fetch_add(1, Ordering::Relaxed);
 
                 let alloc_size = output.len().max(1);
-                if self.arena.is_none() || self.arena.as_ref().unwrap().slot_size() < alloc_size {
-                    self.arena = Some(SharedArena::new(alloc_size, 32)?);
-                }
-
-                let arena = self.arena.as_mut().unwrap();
-                arena.reclaim();
-                let mut slot = arena
-                    .acquire()
-                    .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+                let mut slot = self.output.acquire(alloc_size, "filtermap")?;
 
                 if !output.is_empty() {
                     slot.data_mut()[..output.len()].copy_from_slice(&output);
@@ -225,7 +217,7 @@ pub struct Chunk {
     sequence_offset: u64,
     count: AtomicU64,
     chunks_produced: AtomicU64,
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl Chunk {
@@ -239,7 +231,7 @@ impl Chunk {
             sequence_offset: 0,
             count: AtomicU64::new(0),
             chunks_produced: AtomicU64::new(0),
-            arena: None,
+            output: OutputArena::new(defaults::TRANSFORM_SLOT_COUNT).grow_to_fit(),
         }
     }
 
@@ -277,21 +269,12 @@ impl Chunk {
             self.pending_metadata = Some(base_metadata);
         }
 
-        // Ensure arena is created with chunk size
-        if self.arena.is_none() {
-            self.arena = Some(SharedArena::new(self.chunk_size, 32)?);
-        }
-
         let mut chunks = Vec::new();
 
         while self.pending.len() >= self.chunk_size {
             let chunk_data: Vec<u8> = self.pending.drain(..self.chunk_size).collect();
 
-            let arena = self.arena.as_mut().unwrap();
-            arena.reclaim();
-            let mut slot = arena
-                .acquire()
-                .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+            let mut slot = self.output.acquire(self.chunk_size, "chunk")?;
 
             slot.data_mut()[..self.chunk_size].copy_from_slice(&chunk_data);
 
@@ -315,15 +298,7 @@ impl Chunk {
 
         let len = self.pending.len();
 
-        if self.arena.is_none() || self.arena.as_ref().unwrap().slot_size() < len {
-            self.arena = Some(SharedArena::new(len, 32)?);
-        }
-
-        let arena = self.arena.as_mut().unwrap();
-        arena.reclaim();
-        let mut slot = arena
-            .acquire()
-            .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+        let mut slot = self.output.acquire(len, "chunk")?;
 
         slot.data_mut()[..len].copy_from_slice(&self.pending);
 
@@ -340,6 +315,10 @@ impl Chunk {
 }
 
 impl Element for Chunk {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         // For Element trait, we process and return first chunk if available
         let mut chunks = self.process_all(buffer)?;
@@ -384,7 +363,7 @@ where
     pending: Vec<Vec<u8>>,
     pending_metadata: Option<Metadata>,
     sequence_offset: u64,
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl<F> FlatMap<F>
@@ -401,7 +380,7 @@ where
             pending: Vec::new(),
             pending_metadata: None,
             sequence_offset: 0,
-            arena: None,
+            output: OutputArena::new(defaults::TRANSFORM_SLOT_COUNT).grow_to_fit(),
         }
     }
 
@@ -433,15 +412,7 @@ where
 
         for output in outputs {
             let alloc_size = output.len().max(1);
-            if self.arena.is_none() || self.arena.as_ref().unwrap().slot_size() < alloc_size {
-                self.arena = Some(SharedArena::new(alloc_size, 32)?);
-            }
-
-            let arena = self.arena.as_mut().unwrap();
-            arena.reclaim();
-            let mut slot = arena
-                .acquire()
-                .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+            let mut slot = self.output.acquire(alloc_size, "flatmap")?;
 
             if !output.is_empty() {
                 slot.data_mut()[..output.len()].copy_from_slice(&output);
@@ -468,15 +439,7 @@ where
         let output = self.pending.remove(0);
         let alloc_size = output.len().max(1);
 
-        if self.arena.is_none() || self.arena.as_ref().unwrap().slot_size() < alloc_size {
-            self.arena = Some(SharedArena::new(alloc_size, 32)?);
-        }
-
-        let arena = self.arena.as_mut().unwrap();
-        arena.reclaim();
-        let mut slot = arena
-            .acquire()
-            .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+        let mut slot = self.output.acquire(alloc_size, "flatmap")?;
 
         if !output.is_empty() {
             slot.data_mut()[..output.len()].copy_from_slice(&output);
@@ -496,6 +459,10 @@ impl<F> Element for FlatMap<F>
 where
     F: FnMut(&[u8]) -> Vec<Vec<u8>> + Send,
 {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         // If we have pending outputs, return them first
         if !self.pending.is_empty() {
@@ -527,6 +494,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::SharedArena;
     use std::sync::OnceLock;
 
     fn test_arena() -> &'static SharedArena {

@@ -8,7 +8,7 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{ConsumeContext, ProduceContext, ProduceResult};
 use crate::error::{Error, Result};
-use crate::memory::SharedArena;
+use crate::memory::{OutputArena, OutputBudget, defaults};
 use crate::metadata::Metadata;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::Duration;
@@ -39,7 +39,7 @@ pub struct UdpSrc {
     read_timeout: Option<Duration>,
     last_sender: Option<SocketAddr>,
     /// Arena for buffer allocation.
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl UdpSrc {
@@ -56,7 +56,7 @@ impl UdpSrc {
             sequence: 0,
             read_timeout: None,
             last_sender: None,
-            arena: None,
+            output: OutputArena::new(defaults::SOURCE_SLOT_COUNT),
         })
     }
 
@@ -136,6 +136,10 @@ impl UdpSrc {
 }
 
 impl crate::element::Source for UdpSrc {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
         if ctx.has_buffer() {
             // Use the provided buffer
@@ -162,16 +166,9 @@ impl crate::element::Source for UdpSrc {
         } else {
             // No buffer provided, allocate from arena
             // Initialize arena lazily if needed
-            if self.arena.is_none() {
-                self.arena = Some(SharedArena::new(self.buffer_size, 32)?);
-            }
-            let arena = self.arena.as_mut().unwrap();
-
-            arena.reclaim();
-
-            let mut slot = arena
-                .acquire()
-                .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+            let Some(mut slot) = self.output.try_acquire(self.buffer_size, "udpsrc")? else {
+                return Ok(ProduceResult::WouldBlock);
+            };
             let slice = slot.data_mut();
 
             // Receive datagram
@@ -361,7 +358,7 @@ pub struct AsyncUdpSrc {
     sequence: u64,
     last_sender: Option<SocketAddr>,
     /// Arena for buffer allocation.
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl AsyncUdpSrc {
@@ -382,7 +379,7 @@ impl AsyncUdpSrc {
             bytes_read: 0,
             sequence: 0,
             last_sender: None,
-            arena: None,
+            output: OutputArena::new(defaults::SOURCE_SLOT_COUNT),
         })
     }
 
@@ -430,18 +427,14 @@ impl AsyncUdpSrc {
     }
 
     /// Receive a datagram asynchronously (convenience method).
+    ///
+    /// `None` means no output slot was free — every buffer this source has
+    /// produced is still held downstream. Nothing was read from the socket, so
+    /// retrying loses nothing.
     pub async fn recv(&mut self) -> Result<Option<Buffer>> {
-        // Initialize arena lazily if needed
-        if self.arena.is_none() {
-            self.arena = Some(SharedArena::new(self.buffer_size, 32)?);
-        }
-        let arena = self.arena.as_mut().unwrap();
-
-        arena.reclaim();
-
-        let mut slot = arena
-            .acquire()
-            .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+        let Some(mut slot) = self.output.try_acquire(self.buffer_size, "udpsrc")? else {
+            return Ok(None);
+        };
         let slice = slot.data_mut();
 
         // Receive datagram
@@ -458,6 +451,10 @@ impl AsyncUdpSrc {
 }
 
 impl crate::element::AsyncSource for AsyncUdpSrc {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     async fn produce(&mut self, ctx: &mut ProduceContext<'_>) -> Result<ProduceResult> {
         if ctx.has_buffer() {
             // Use the provided buffer
@@ -476,16 +473,9 @@ impl crate::element::AsyncSource for AsyncUdpSrc {
         } else {
             // No buffer provided, allocate from arena
             // Initialize arena lazily if needed
-            if self.arena.is_none() {
-                self.arena = Some(SharedArena::new(self.buffer_size, 32)?);
-            }
-            let arena = self.arena.as_mut().unwrap();
-
-            arena.reclaim();
-
-            let mut slot = arena
-                .acquire()
-                .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+            let Some(mut slot) = self.output.try_acquire(self.buffer_size, "udpsrc")? else {
+                return Ok(ProduceResult::WouldBlock);
+            };
             let slice = slot.data_mut();
 
             // Receive datagram

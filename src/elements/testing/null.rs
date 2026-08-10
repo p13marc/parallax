@@ -1,8 +1,13 @@
 //! Null elements - NullSink and NullSource.
 
 use crate::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
-use crate::error::{Error, Result};
-use crate::memory::SharedArena;
+use crate::error::Result;
+use crate::memory::{OutputArena, OutputBudget};
+
+/// Deliberately generous, and deliberately not one of the `memory::defaults`
+/// floors: `benches/throughput.rs` drives `NullSource` at a channel capacity of
+/// 16, so a smaller floor would quietly change what the benchmark measures.
+const NULL_SOURCE_SLOTS: usize = 256;
 
 /// A sink that discards all buffers.
 ///
@@ -120,7 +125,7 @@ pub struct NullSource {
     /// Size of each buffer in bytes.
     buffer_size: usize,
     /// Arena for allocating buffers when no ProduceContext buffer is available.
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl NullSource {
@@ -131,7 +136,7 @@ impl NullSource {
             count,
             current: 0,
             buffer_size: 64,
-            arena: None,
+            output: OutputArena::new(NULL_SOURCE_SLOTS),
         }
     }
 
@@ -142,7 +147,7 @@ impl NullSource {
             count,
             current: 0,
             buffer_size: 64,
-            arena: None,
+            output: OutputArena::new(NULL_SOURCE_SLOTS),
         }
     }
 
@@ -159,6 +164,10 @@ impl NullSource {
 }
 
 impl Source for NullSource {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
         if self.current >= self.count {
             return Ok(ProduceResult::Eos);
@@ -177,16 +186,9 @@ impl Source for NullSource {
             use crate::buffer::{Buffer, MemoryHandle};
             use crate::metadata::Metadata;
 
-            if self.arena.is_none() {
-                // Use a reasonable number of slots for test/benchmark workloads
-                self.arena = Some(SharedArena::new(self.buffer_size, 256)?);
-            }
-            let arena = self.arena.as_mut().unwrap();
-            // Reclaim any freed slots before acquiring
-            arena.reclaim();
-            let slot = arena
-                .acquire()
-                .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+            let Some(slot) = self.output.try_acquire(self.buffer_size, "nullsource")? else {
+                return Ok(ProduceResult::WouldBlock);
+            };
             // SharedArena slots are already zero-initialized
             let handle = MemoryHandle::with_len(slot, self.buffer_size);
             let buffer = Buffer::new(handle, Metadata::from_sequence(self.current));
@@ -208,6 +210,7 @@ impl Source for NullSource {
 mod tests {
     use super::*;
     use crate::buffer::{Buffer, MemoryHandle};
+    use crate::memory::SharedArena;
     use crate::metadata::Metadata;
 
     #[test]
@@ -233,7 +236,6 @@ mod tests {
 
     #[test]
     fn test_null_source_produces_count() {
-        use crate::memory::SharedArena;
         use std::sync::OnceLock;
 
         fn test_arena() -> &'static SharedArena {
@@ -269,7 +271,6 @@ mod tests {
 
     #[test]
     fn test_null_source_buffer_size() {
-        use crate::memory::SharedArena;
         use std::sync::OnceLock;
 
         fn test_arena() -> &'static SharedArena {

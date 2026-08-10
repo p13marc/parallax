@@ -34,7 +34,7 @@ use crate::buffer::Buffer;
 use crate::element::Element;
 use crate::error::{Error, Result};
 use crate::format::{MediaFormat, RtpEncoding, RtpFormat, VideoCodec};
-use crate::memory::SharedArena;
+use crate::memory::{OutputArena, OutputBudget, defaults};
 use crate::metadata::BufferFlags;
 
 use bytes::Bytes;
@@ -76,7 +76,7 @@ pub struct RtpH264Depay {
     name: String,
     depacketizer: H264Packet,
     stats: DepayStats,
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl RtpH264Depay {
@@ -86,7 +86,9 @@ impl RtpH264Depay {
             name: "rtp-h264-depay".into(),
             depacketizer: H264Packet::default(),
             stats: DepayStats::default(),
-            arena: None,
+            output: OutputArena::new(defaults::TRANSFORM_SLOT_COUNT)
+                .with_min_slot_size(defaults::VIDEO_ENCODED_SLOT_SIZE)
+                .grow_to_fit(),
         }
     }
 
@@ -115,6 +117,10 @@ impl Default for RtpH264Depay {
 }
 
 impl Element for RtpH264Depay {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         let payload = Bytes::copy_from_slice(buffer.as_bytes());
         self.stats.packets_in += 1;
@@ -129,20 +135,7 @@ impl Element for RtpH264Depay {
                 self.stats.frames_out += 1;
                 self.stats.bytes_out += output.len() as u64;
 
-                // Lazily initialize arena
-                if self.arena.is_none() {
-                    self.arena =
-                        Some(SharedArena::new(256 * 1024, 32).map_err(|e| {
-                            Error::Element(format!("Failed to create arena: {}", e))
-                        })?);
-                }
-                let arena = self.arena.as_mut().unwrap();
-
-                arena.reclaim();
-
-                let mut slot = arena
-                    .acquire()
-                    .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+                let mut slot = self.output.acquire(output.len(), "rtph264depay")?;
                 slot.data_mut()[..output.len()].copy_from_slice(output.as_ref());
 
                 let handle = crate::buffer::MemoryHandle::with_len(slot, output.len());
@@ -199,7 +192,7 @@ pub struct RtpH264Pay {
     payloader: H264Payloader,
     mtu: usize,
     stats: PayStats,
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl RtpH264Pay {
@@ -210,7 +203,9 @@ impl RtpH264Pay {
             payloader: H264Payloader::default(),
             mtu: DEFAULT_MTU,
             stats: PayStats::default(),
-            arena: None,
+            output: OutputArena::new(defaults::TRANSFORM_SLOT_COUNT)
+                .with_min_slot_size(defaults::VIDEO_ENCODED_SLOT_SIZE)
+                .grow_to_fit(),
         }
     }
 
@@ -239,6 +234,10 @@ impl Default for RtpH264Pay {
 }
 
 impl Element for RtpH264Pay {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         let payload = Bytes::copy_from_slice(buffer.as_bytes());
         self.stats.frames_in += 1;
@@ -255,20 +254,7 @@ impl Element for RtpH264Pay {
                 self.stats.packets_out += packets.len() as u64;
                 self.stats.bytes_out += total_len as u64;
 
-                // Lazily initialize arena
-                if self.arena.is_none() {
-                    self.arena =
-                        Some(SharedArena::new(256 * 1024, 32).map_err(|e| {
-                            Error::Element(format!("Failed to create arena: {}", e))
-                        })?);
-                }
-                let arena = self.arena.as_mut().unwrap();
-
-                arena.reclaim();
-
-                let mut slot = arena
-                    .acquire()
-                    .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+                let mut slot = self.output.acquire(total_len, "rtph264pay")?;
 
                 let mut offset = 0;
                 for packet in &packets {
@@ -306,7 +292,7 @@ pub struct RtpH265Depay {
     name: String,
     depacketizer: H265Packet,
     stats: DepayStats,
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl RtpH265Depay {
@@ -316,7 +302,9 @@ impl RtpH265Depay {
             name: "rtp-h265-depay".into(),
             depacketizer: H265Packet::default(),
             stats: DepayStats::default(),
-            arena: None,
+            output: OutputArena::new(defaults::TRANSFORM_SLOT_COUNT)
+                .with_min_slot_size(defaults::VIDEO_ENCODED_SLOT_SIZE)
+                .grow_to_fit(),
         }
     }
 
@@ -339,6 +327,10 @@ impl Default for RtpH265Depay {
 }
 
 impl Element for RtpH265Depay {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         let payload = Bytes::copy_from_slice(buffer.as_bytes());
         self.stats.packets_in += 1;
@@ -352,20 +344,7 @@ impl Element for RtpH265Depay {
                 self.stats.frames_out += 1;
                 self.stats.bytes_out += output.len() as u64;
 
-                // Lazily initialize arena
-                if self.arena.is_none() {
-                    self.arena =
-                        Some(SharedArena::new(256 * 1024, 32).map_err(|e| {
-                            Error::Element(format!("Failed to create arena: {}", e))
-                        })?);
-                }
-                let arena = self.arena.as_mut().unwrap();
-
-                arena.reclaim();
-
-                let mut slot = arena
-                    .acquire()
-                    .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+                let mut slot = self.output.acquire(output.len(), "rtph265depay")?;
                 slot.data_mut()[..output.len()].copy_from_slice(output.as_ref());
 
                 let handle = crate::buffer::MemoryHandle::with_len(slot, output.len());
@@ -397,7 +376,7 @@ pub struct RtpH265Pay {
     payloader: HevcPayloader,
     mtu: usize,
     stats: PayStats,
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl RtpH265Pay {
@@ -408,7 +387,9 @@ impl RtpH265Pay {
             payloader: HevcPayloader::default(),
             mtu: DEFAULT_MTU,
             stats: PayStats::default(),
-            arena: None,
+            output: OutputArena::new(defaults::TRANSFORM_SLOT_COUNT)
+                .with_min_slot_size(defaults::VIDEO_ENCODED_SLOT_SIZE)
+                .grow_to_fit(),
         }
     }
 
@@ -437,6 +418,10 @@ impl Default for RtpH265Pay {
 }
 
 impl Element for RtpH265Pay {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         let payload = Bytes::copy_from_slice(buffer.as_bytes());
         self.stats.frames_in += 1;
@@ -452,20 +437,7 @@ impl Element for RtpH265Pay {
                 self.stats.packets_out += packets.len() as u64;
                 self.stats.bytes_out += total_len as u64;
 
-                // Lazily initialize arena
-                if self.arena.is_none() {
-                    self.arena =
-                        Some(SharedArena::new(256 * 1024, 32).map_err(|e| {
-                            Error::Element(format!("Failed to create arena: {}", e))
-                        })?);
-                }
-                let arena = self.arena.as_mut().unwrap();
-
-                arena.reclaim();
-
-                let mut slot = arena
-                    .acquire()
-                    .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+                let mut slot = self.output.acquire(total_len, "rtph265pay")?;
 
                 let mut offset = 0;
                 for packet in &packets {
@@ -501,7 +473,7 @@ pub struct RtpVp8Depay {
     name: String,
     depacketizer: Vp8Packet,
     stats: DepayStats,
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl RtpVp8Depay {
@@ -511,7 +483,9 @@ impl RtpVp8Depay {
             name: "rtp-vp8-depay".into(),
             depacketizer: Vp8Packet::default(),
             stats: DepayStats::default(),
-            arena: None,
+            output: OutputArena::new(defaults::TRANSFORM_SLOT_COUNT)
+                .with_min_slot_size(defaults::VIDEO_ENCODED_SLOT_SIZE)
+                .grow_to_fit(),
         }
     }
 
@@ -534,6 +508,10 @@ impl Default for RtpVp8Depay {
 }
 
 impl Element for RtpVp8Depay {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         let payload = Bytes::copy_from_slice(buffer.as_bytes());
         self.stats.packets_in += 1;
@@ -547,20 +525,7 @@ impl Element for RtpVp8Depay {
                 self.stats.frames_out += 1;
                 self.stats.bytes_out += output.len() as u64;
 
-                // Lazily initialize arena
-                if self.arena.is_none() {
-                    self.arena =
-                        Some(SharedArena::new(256 * 1024, 32).map_err(|e| {
-                            Error::Element(format!("Failed to create arena: {}", e))
-                        })?);
-                }
-                let arena = self.arena.as_mut().unwrap();
-
-                arena.reclaim();
-
-                let mut slot = arena
-                    .acquire()
-                    .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+                let mut slot = self.output.acquire(output.len(), "rtpvp8depay")?;
                 slot.data_mut()[..output.len()].copy_from_slice(output.as_ref());
 
                 let handle = crate::buffer::MemoryHandle::with_len(slot, output.len());
@@ -597,7 +562,7 @@ pub struct RtpVp8Pay {
     payloader: Vp8Payloader,
     mtu: usize,
     stats: PayStats,
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl RtpVp8Pay {
@@ -608,7 +573,9 @@ impl RtpVp8Pay {
             payloader: Vp8Payloader::default(),
             mtu: DEFAULT_MTU,
             stats: PayStats::default(),
-            arena: None,
+            output: OutputArena::new(defaults::TRANSFORM_SLOT_COUNT)
+                .with_min_slot_size(defaults::VIDEO_ENCODED_SLOT_SIZE)
+                .grow_to_fit(),
         }
     }
 
@@ -637,6 +604,10 @@ impl Default for RtpVp8Pay {
 }
 
 impl Element for RtpVp8Pay {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         let payload = Bytes::copy_from_slice(buffer.as_bytes());
         self.stats.frames_in += 1;
@@ -651,20 +622,7 @@ impl Element for RtpVp8Pay {
                 self.stats.packets_out += packets.len() as u64;
                 self.stats.bytes_out += total_len as u64;
 
-                // Lazily initialize arena
-                if self.arena.is_none() {
-                    self.arena =
-                        Some(SharedArena::new(256 * 1024, 32).map_err(|e| {
-                            Error::Element(format!("Failed to create arena: {}", e))
-                        })?);
-                }
-                let arena = self.arena.as_mut().unwrap();
-
-                arena.reclaim();
-
-                let mut slot = arena
-                    .acquire()
-                    .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+                let mut slot = self.output.acquire(total_len, "rtpvp8pay")?;
 
                 let mut offset = 0;
                 for packet in &packets {
@@ -704,7 +662,7 @@ pub struct RtpVp9Depay {
     name: String,
     depacketizer: Vp9Packet,
     stats: DepayStats,
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl RtpVp9Depay {
@@ -714,7 +672,9 @@ impl RtpVp9Depay {
             name: "rtp-vp9-depay".into(),
             depacketizer: Vp9Packet::default(),
             stats: DepayStats::default(),
-            arena: None,
+            output: OutputArena::new(defaults::TRANSFORM_SLOT_COUNT)
+                .with_min_slot_size(defaults::VIDEO_ENCODED_SLOT_SIZE)
+                .grow_to_fit(),
         }
     }
 
@@ -737,6 +697,10 @@ impl Default for RtpVp9Depay {
 }
 
 impl Element for RtpVp9Depay {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         let payload = Bytes::copy_from_slice(buffer.as_bytes());
         self.stats.packets_in += 1;
@@ -750,20 +714,7 @@ impl Element for RtpVp9Depay {
                 self.stats.frames_out += 1;
                 self.stats.bytes_out += output.len() as u64;
 
-                // Lazily initialize arena
-                if self.arena.is_none() {
-                    self.arena =
-                        Some(SharedArena::new(256 * 1024, 32).map_err(|e| {
-                            Error::Element(format!("Failed to create arena: {}", e))
-                        })?);
-                }
-                let arena = self.arena.as_mut().unwrap();
-
-                arena.reclaim();
-
-                let mut slot = arena
-                    .acquire()
-                    .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+                let mut slot = self.output.acquire(output.len(), "rtpvp9depay")?;
                 slot.data_mut()[..output.len()].copy_from_slice(output.as_ref());
 
                 let handle = crate::buffer::MemoryHandle::with_len(slot, output.len());
@@ -795,7 +746,7 @@ pub struct RtpVp9Pay {
     payloader: Vp9Payloader,
     mtu: usize,
     stats: PayStats,
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl RtpVp9Pay {
@@ -806,7 +757,9 @@ impl RtpVp9Pay {
             payloader: Vp9Payloader::default(),
             mtu: DEFAULT_MTU,
             stats: PayStats::default(),
-            arena: None,
+            output: OutputArena::new(defaults::TRANSFORM_SLOT_COUNT)
+                .with_min_slot_size(defaults::VIDEO_ENCODED_SLOT_SIZE)
+                .grow_to_fit(),
         }
     }
 
@@ -835,6 +788,10 @@ impl Default for RtpVp9Pay {
 }
 
 impl Element for RtpVp9Pay {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         let payload = Bytes::copy_from_slice(buffer.as_bytes());
         self.stats.frames_in += 1;
@@ -849,20 +806,7 @@ impl Element for RtpVp9Pay {
                 self.stats.packets_out += packets.len() as u64;
                 self.stats.bytes_out += total_len as u64;
 
-                // Lazily initialize arena
-                if self.arena.is_none() {
-                    self.arena =
-                        Some(SharedArena::new(256 * 1024, 32).map_err(|e| {
-                            Error::Element(format!("Failed to create arena: {}", e))
-                        })?);
-                }
-                let arena = self.arena.as_mut().unwrap();
-
-                arena.reclaim();
-
-                let mut slot = arena
-                    .acquire()
-                    .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+                let mut slot = self.output.acquire(total_len, "rtpvp9pay")?;
 
                 let mut offset = 0;
                 for packet in &packets {
@@ -902,7 +846,7 @@ pub struct RtpOpusDepay {
     name: String,
     depacketizer: OpusPacket,
     stats: DepayStats,
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl RtpOpusDepay {
@@ -912,7 +856,9 @@ impl RtpOpusDepay {
             name: "rtp-opus-depay".into(),
             depacketizer: OpusPacket,
             stats: DepayStats::default(),
-            arena: None,
+            output: OutputArena::new(defaults::TRANSFORM_SLOT_COUNT)
+                .with_min_slot_size(defaults::NETWORK_SLOT_SIZE)
+                .grow_to_fit(),
         }
     }
 
@@ -935,6 +881,10 @@ impl Default for RtpOpusDepay {
 }
 
 impl Element for RtpOpusDepay {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         let payload = Bytes::copy_from_slice(buffer.as_bytes());
         self.stats.packets_in += 1;
@@ -948,20 +898,7 @@ impl Element for RtpOpusDepay {
                 self.stats.frames_out += 1;
                 self.stats.bytes_out += output.len() as u64;
 
-                // Lazily initialize arena
-                if self.arena.is_none() {
-                    self.arena =
-                        Some(SharedArena::new(64 * 1024, 32).map_err(|e| {
-                            Error::Element(format!("Failed to create arena: {}", e))
-                        })?);
-                }
-                let arena = self.arena.as_mut().unwrap();
-
-                arena.reclaim();
-
-                let mut slot = arena
-                    .acquire()
-                    .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+                let mut slot = self.output.acquire(output.len(), "rtpopusdepay")?;
                 slot.data_mut()[..output.len()].copy_from_slice(output.as_ref());
 
                 let handle = crate::buffer::MemoryHandle::with_len(slot, output.len());
@@ -1004,7 +941,7 @@ pub struct RtpOpusPay {
     payloader: OpusPayloader,
     mtu: usize,
     stats: PayStats,
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl RtpOpusPay {
@@ -1015,7 +952,9 @@ impl RtpOpusPay {
             payloader: OpusPayloader,
             mtu: DEFAULT_MTU,
             stats: PayStats::default(),
-            arena: None,
+            output: OutputArena::new(defaults::TRANSFORM_SLOT_COUNT)
+                .with_min_slot_size(defaults::NETWORK_SLOT_SIZE)
+                .grow_to_fit(),
         }
     }
 
@@ -1044,6 +983,10 @@ impl Default for RtpOpusPay {
 }
 
 impl Element for RtpOpusPay {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         let payload = Bytes::copy_from_slice(buffer.as_bytes());
         self.stats.frames_in += 1;
@@ -1058,20 +1001,7 @@ impl Element for RtpOpusPay {
                 self.stats.packets_out += packets.len() as u64;
                 self.stats.bytes_out += total_len as u64;
 
-                // Lazily initialize arena
-                if self.arena.is_none() {
-                    self.arena =
-                        Some(SharedArena::new(64 * 1024, 32).map_err(|e| {
-                            Error::Element(format!("Failed to create arena: {}", e))
-                        })?);
-                }
-                let arena = self.arena.as_mut().unwrap();
-
-                arena.reclaim();
-
-                let mut slot = arena
-                    .acquire()
-                    .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+                let mut slot = self.output.acquire(total_len, "rtpopuspay")?;
 
                 let mut offset = 0;
                 for packet in &packets {
@@ -1112,7 +1042,7 @@ pub struct RtpAv1Pay {
     payloader: Av1Payloader,
     mtu: usize,
     stats: PayStats,
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl RtpAv1Pay {
@@ -1123,7 +1053,9 @@ impl RtpAv1Pay {
             payloader: Av1Payloader {},
             mtu: DEFAULT_MTU,
             stats: PayStats::default(),
-            arena: None,
+            output: OutputArena::new(defaults::TRANSFORM_SLOT_COUNT)
+                .with_min_slot_size(defaults::VIDEO_ENCODED_SLOT_SIZE)
+                .grow_to_fit(),
         }
     }
 
@@ -1152,6 +1084,10 @@ impl Default for RtpAv1Pay {
 }
 
 impl Element for RtpAv1Pay {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         let payload = Bytes::copy_from_slice(buffer.as_bytes());
         self.stats.frames_in += 1;
@@ -1166,20 +1102,7 @@ impl Element for RtpAv1Pay {
                 self.stats.packets_out += packets.len() as u64;
                 self.stats.bytes_out += total_len as u64;
 
-                // Lazily initialize arena
-                if self.arena.is_none() {
-                    self.arena =
-                        Some(SharedArena::new(256 * 1024, 32).map_err(|e| {
-                            Error::Element(format!("Failed to create arena: {}", e))
-                        })?);
-                }
-                let arena = self.arena.as_mut().unwrap();
-
-                arena.reclaim();
-
-                let mut slot = arena
-                    .acquire()
-                    .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
+                let mut slot = self.output.acquire(total_len, "rtpav1pay")?;
 
                 let mut offset = 0;
                 for packet in &packets {
@@ -1248,6 +1171,7 @@ pub struct PayStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::SharedArena;
     use crate::metadata::Metadata;
     use std::sync::OnceLock;
 

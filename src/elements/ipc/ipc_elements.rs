@@ -50,6 +50,12 @@ pub struct IpcSink {
     /// Connected socket (if any).
     socket: Option<UnixStream>,
     /// Shared memory arena for buffers (refcount in shared memory).
+    ///
+    /// **Not an output arena**, despite the shape: nothing ever calls
+    /// `acquire()` on it. It exists so its fd can be handed to the peer via
+    /// SCM_RIGHTS (`send_arena_registration`), and `consume()` reuses the
+    /// incoming buffer's slot ref. So it is deliberately not an `OutputArena`
+    /// and there is nothing for a budget to size (#91).
     arena: Option<SharedArena>,
     /// Whether we're the server (created the socket).
     is_server: bool,

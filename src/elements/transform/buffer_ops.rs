@@ -4,8 +4,8 @@
 
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::Element;
-use crate::error::{Error, Result};
-use crate::memory::SharedArena;
+use crate::error::Result;
+use crate::memory::{OutputArena, OutputBudget, defaults};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Trims buffers to a maximum size.
@@ -26,7 +26,7 @@ pub struct BufferTrim {
     count: AtomicU64,
     trimmed_count: AtomicU64,
     bytes_trimmed: AtomicU64,
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl BufferTrim {
@@ -38,7 +38,7 @@ impl BufferTrim {
             count: AtomicU64::new(0),
             trimmed_count: AtomicU64::new(0),
             bytes_trimmed: AtomicU64::new(0),
-            arena: None,
+            output: OutputArena::new(defaults::TRANSFORM_SLOT_COUNT),
         }
     }
 
@@ -69,6 +69,10 @@ impl BufferTrim {
 }
 
 impl Element for BufferTrim {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         self.count.fetch_add(1, Ordering::Relaxed);
 
@@ -82,15 +86,8 @@ impl Element for BufferTrim {
         self.bytes_trimmed
             .fetch_add(bytes_removed as u64, Ordering::Relaxed);
 
-        if self.arena.is_none() {
-            self.arena = Some(SharedArena::new(self.max_size, 32)?);
-        }
-
-        let arena = self.arena.as_mut().unwrap();
-        arena.reclaim();
-        let mut slot = arena
-            .acquire()
-            .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+        self.output.set_min_slot_size(self.max_size);
+        let mut slot = self.output.acquire(self.max_size, "buffertrim")?;
 
         let src_data = buffer.as_bytes();
         slot.data_mut()[..self.max_size].copy_from_slice(&src_data[..self.max_size]);
@@ -138,7 +135,7 @@ pub struct BufferSlice {
     length: Option<usize>,
     count: AtomicU64,
     skip_short: bool,
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl BufferSlice {
@@ -154,7 +151,7 @@ impl BufferSlice {
             length: Some(length),
             count: AtomicU64::new(0),
             skip_short: false,
-            arena: None,
+            output: OutputArena::new(defaults::TRANSFORM_SLOT_COUNT).grow_to_fit(),
         }
     }
 
@@ -166,7 +163,7 @@ impl BufferSlice {
             length: None,
             count: AtomicU64::new(0),
             skip_short: false,
-            arena: None,
+            output: OutputArena::new(defaults::TRANSFORM_SLOT_COUNT).grow_to_fit(),
         }
     }
 
@@ -199,6 +196,10 @@ impl BufferSlice {
 }
 
 impl Element for BufferSlice {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         self.count.fetch_add(1, Ordering::Relaxed);
 
@@ -210,14 +211,7 @@ impl Element for BufferSlice {
                 return Ok(None);
             }
             // Return empty buffer (allocate minimum 1 byte)
-            if self.arena.is_none() {
-                self.arena = Some(SharedArena::new(1, 32)?);
-            }
-            let arena = self.arena.as_mut().unwrap();
-            arena.reclaim();
-            let slot = arena
-                .acquire()
-                .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+            let slot = self.output.acquire(0, "bufferslice")?;
             let handle = MemoryHandle::with_len(slot, 0);
             return Ok(Some(Buffer::new(handle, buffer.metadata().clone())));
         }
@@ -234,27 +228,12 @@ impl Element for BufferSlice {
         };
 
         if slice_len == 0 {
-            if self.arena.is_none() {
-                self.arena = Some(SharedArena::new(1, 32)?); // Minimum 1 byte
-            }
-            let arena = self.arena.as_mut().unwrap();
-            arena.reclaim();
-            let slot = arena
-                .acquire()
-                .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+            let slot = self.output.acquire(0, "bufferslice")?;
             let handle = MemoryHandle::with_len(slot, 0);
             return Ok(Some(Buffer::new(handle, buffer.metadata().clone())));
         }
 
-        if self.arena.is_none() || self.arena.as_ref().unwrap().slot_size() < slice_len {
-            self.arena = Some(SharedArena::new(slice_len, 32)?);
-        }
-
-        let arena = self.arena.as_mut().unwrap();
-        arena.reclaim();
-        let mut slot = arena
-            .acquire()
-            .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+        let mut slot = self.output.acquire(slice_len, "bufferslice")?;
 
         let src_data = buffer.as_bytes();
         slot.data_mut()[..slice_len]
@@ -294,7 +273,7 @@ pub struct BufferPad {
     fill_byte: u8,
     count: AtomicU64,
     padded_count: AtomicU64,
-    arena: Option<SharedArena>,
+    output: OutputArena,
 }
 
 impl BufferPad {
@@ -306,7 +285,7 @@ impl BufferPad {
             fill_byte,
             count: AtomicU64::new(0),
             padded_count: AtomicU64::new(0),
-            arena: None,
+            output: OutputArena::new(defaults::TRANSFORM_SLOT_COUNT),
         }
     }
 
@@ -336,6 +315,10 @@ impl BufferPad {
 }
 
 impl Element for BufferPad {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         self.count.fetch_add(1, Ordering::Relaxed);
 
@@ -345,15 +328,8 @@ impl Element for BufferPad {
 
         self.padded_count.fetch_add(1, Ordering::Relaxed);
 
-        if self.arena.is_none() {
-            self.arena = Some(SharedArena::new(self.min_size, 32)?);
-        }
-
-        let arena = self.arena.as_mut().unwrap();
-        arena.reclaim();
-        let mut slot = arena
-            .acquire()
-            .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+        self.output.set_min_slot_size(self.min_size);
+        let mut slot = self.output.acquire(self.min_size, "bufferpad")?;
 
         let src_data = buffer.as_bytes();
         let data = slot.data_mut();
@@ -385,6 +361,7 @@ pub struct BufferPadStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::SharedArena;
     use crate::metadata::Metadata;
     use std::sync::OnceLock;
 

@@ -14,7 +14,7 @@ use parallax::element::{
     ConsumeContext, Output, ProduceContext, ProduceResult, Sink, Source, Transform,
 };
 use parallax::error::Result;
-use parallax::memory::SharedArena;
+use parallax::memory::{OutputArena, OutputBudget, SharedArena, defaults};
 use parallax::pipeline::Pipeline;
 
 struct CounterSource {
@@ -35,23 +35,34 @@ impl Source for CounterSource {
 }
 
 struct DoubleTransform {
-    arena: SharedArena,
+    /// An element that emits its own buffers owns an `OutputArena`. It is built
+    /// on the first buffer and sized by the executor from the graph's link
+    /// capacity — hard-coding a slot count is how an element ends up running
+    /// out the moment a consumer hesitates.
+    output: OutputArena,
 }
 
 impl DoubleTransform {
     fn new() -> Result<Self> {
         Ok(Self {
-            arena: SharedArena::new(64, 8)?,
+            // The floor is only used when nothing is driving the element.
+            output: OutputArena::new(defaults::TRANSFORM_SLOT_COUNT),
         })
     }
 }
 
 impl Transform for DoubleTransform {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn transform(&mut self, buffer: Buffer) -> Result<Output> {
         let value = u32::from_le_bytes(buffer.as_bytes()[..4].try_into().unwrap());
         let doubled = value * 2;
 
-        let mut slot = self.arena.acquire().expect("transform arena exhausted");
+        // `?`, not `expect`: a full arena is `Error::PoolExhausted`, which the
+        // executor sheds rather than treating as fatal.
+        let mut slot = self.output.acquire(4, "double")?;
         slot.data_mut()[..4].copy_from_slice(&doubled.to_le_bytes());
 
         Ok(Output::Single(Buffer::new(
