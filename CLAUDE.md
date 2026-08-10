@@ -8,7 +8,6 @@ This file provides guidance to Claude Code when working with code in this reposi
 
 - Edition **2024**, MSRV **1.95** (enforced by the CI `msrv` job; do not claim 1.75 or 1.85 — both stale).
 - Default features are empty; most media functionality is feature-gated.
-- ~61k lines of Rust; 1100+ tests, all passing with default features.
 
 ### Core Principles
 
@@ -20,99 +19,18 @@ This file provides guidance to Claude Code when working with code in this reposi
 
 ### Key Design Decisions
 
+Dependencies are in `Cargo.toml`; these two are the ones the code alone would mislead you about:
+
 | Aspect | Choice |
 |--------|--------|
-| Async runtime | Tokio |
-| Channels | kanal (MPMC sync+async) for local links; SPSC ring + eventfd for async↔RT bridges |
-| Graph | daggy (enforces DAG) |
-| Parser | winnow |
-| Serialization | rkyv (network links, IPC types) |
-| Errors | thiserror (`Error` enum in `src/error.rs`, `#[non_exhaustive]`) |
-| Metrics/logging | metrics-rs + tracing |
-| Linux APIs | rustix (memfd, mmap, SCM_RIGHTS, eventfd) |
 | Plugin ABI | **Hand-rolled `#[repr(C)]` descriptor + `extern "C"` fns, loaded via libloading.** NOT stabby (old docs claiming stabby are wrong; stabby appears in Cargo.lock only as a transitive dep of zenoh). |
-| Object-safe async traits | trait-variant + dynosaur (`DynAsyncElement`) |
 | GPU | Vulkan Video via ash — **experimental scaffold** (see Gotchas) |
 
 ## Build & Test Commands
 
-```bash
-just test          # cargo nextest run
-just test-one NAME # single test
-just lint          # clippy -D warnings
-just lint-all      # clippy --all-features
-just check         # fmt-check + lint + test
-just check-sensor  # check+test+clippy the sensor combo (zenoh,h264,v4l2,rtp,rtsp,image-jpeg,hotplug — mirrors CI)
-just bench         # criterion benchmarks
-just watch         # auto-run tests on change
-just coverage      # cargo llvm-cov nextest
-
-# Direct cargo
-cargo nextest run
-cargo clippy -- -D warnings
-cargo doc --no-deps
-cargo check --all-targets              # default features
-cargo check --features "h264,mpeg-ts"  # etc. for gated code
-```
+Recipes live in `justfile` (`just --list`); `just check-sensor` mirrors the CI sensor combo.
 
 Feature-gated code is NOT compiled by default — after touching gated modules (codecs, devices, rtp, vulkan…), check with the relevant features enabled. CI (`.github/workflows/ci.yml`) runs default tests plus the sensor combo; it deliberately does NOT run `--all-features` (dav1d/alsa/pipewire/libcamera need system libs, and vulkan-video carries lint debt tracked in #3).
-
-## Source Tree
-
-```
-src/
-├── lib.rs              # module decls + prelude
-├── error.rs            # Error/Result (variants: PoolExhausted, BufferPool, AllocationFailed,
-│                       #   InvalidSegment, ValidationFailed, InvalidCaps, Config, Pipeline,
-│                       #   Element, Io, System, Device[feature-gated])
-├── buffer.rs           # Buffer<T=()>, MemoryHandle, DmaBufBuffer
-├── metadata.rs         # Metadata (pts/dts/duration/sequence/stream_id/flags/rtp/format/offset
-│                       #   + typed custom map), BufferFlags, RtpMeta
-├── clock.rs            # ClockTime (NONE sentinel), Clock, ClockProvider, SystemClock, PipelineClock
-├── codec/annexb.rs     # Annex-B helpers (nal_units/has_idr/extract_param_sets/annex_b_to_avcc)
-│                       #   — ALWAYS compiled, no codec feature needed
-├── control.rs          # Controllable trait + every runtime handle (EncoderControl,
-│                       #   EncoderStatsHandle, RateControlMode, KeyframeHandle, ScaleControl, …)
-├── format.rs           # CapsValue, Video/AudioFormat(+Caps), PixelFormat, MediaFormat,
-│                       #   MemoryCaps, MemoryLayout, FormatMemoryCap, ElementMediaCaps, Caps
-├── event/              # Event enum (StreamStart/Segment/Tags/Eos/CapsChanged/Gap | Seek/Qos/
-│                       #   LatencyQuery | FlushStart/FlushStop/Custom), PipelineItem, TagList
-├── memory/             # SharedArena, SharedSlotRef, SharedIpcSlotRef, SharedArenaCache,
-│                       #   BufferPool/FixedBufferPool/PooledBuffer, DmaBufSegment,
-│                       #   HugePageSegment, MappedFileSegment, AtomicBitmap, ipc (SCM_RIGHTS),
-│                       #   defaults (slot size/count constants)
-├── element/            # traits.rs (Source/Sink/Element/Transform/Async*/Demuxer/Muxer/
-│                       #   SyncElement, ExecutionHints, adapters, AsyncElementDyn/DynAsyncElement)
-│                       # pipeline_element.rs (PipelineElement, ProcessOutput, SimpleSource/
-│                       #   SimpleSink/SimpleTransform, Src/Snk/Xfm wrappers)
-│                       # context.rs (ProduceContext/ConsumeContext/ProcessContext, ProduceResult)
-│                       # pad.rs, muxer.rs (MuxerSyncState/SyncMode/PadInfo/StreamType)
-├── elements/           # Built-ins by category: io, testing, network, rtp, flow, transform,
-│                       #   metadata (KLV), app, ipc, timing, util, demux, mux, codec, device,
-│                       #   streaming (HLS/DASH)
-├── pipeline/           # graph.rs (Pipeline, states, ConverterPolicy, DOT/JSON export, probes/
-│                       #   seek surface), unified_executor.rs (Executor/ExecutorConfig/
-│                       #   PipelineHandle/ElementStrategy), rt_scheduler.rs, rt_bridge.rs,
-│                       #   driver.rs, parser.rs, factory.rs, bus.rs, events.rs, tags.rs,
-│                       #   seek.rs, probe.rs, tracer.rs, typefind.rs, flow.rs, builder.rs
-├── negotiation/        # NegotiationSolver (per-link), ConverterRegistry, builtin registry
-├── converters/         # REAL VideoConvert/AudioConvert/AudioResample/ScaleEngine impls
-│                       #   (ScaleEngine is the slice-level scaler; the VideoScale *element*
-│                       #   wraps it — one ScaleMode enum shared by both)
-├── link/               # LocalLink (kanal), IpcPublisher/IpcSubscriber (memfd+SCM_RIGHTS),
-│                       #   NetworkSender/Receiver (TCP+rkyv, "PRLX" magic)
-├── typed/              # TypedSource/Sink/Transform, pipeline builder (>> operator), operators,
-│                       #   multi_source (merge/zip/join/temporal_join), bridge to dynamic
-├── temporal/           # Timestamp (SEPARATE from ClockTime), TimeRange, TemporalJoin,
-│                       #   AlignmentStrategy, JoinWindow
-├── gpu/                # Vulkan Video H.264 decode (real submission; h264_refs POC/ref logic,
-│                       #   h264_std conversions; hardware validation pending — see Gotcha 9)
-├── plugin/             # descriptor.rs (#[repr(C)] ABI, define_plugin!), loader.rs (libloading),
-│                       #   registry.rs; entry symbol: parallax_plugin_descriptor; ABI version 1
-└── observability/      # metrics-rs helpers (parallax_* metric names), tracing spans
-```
-
-Docs live in `docs/` (user guides + `docs/research/` for historical design notes); implementation plans in `plans/`.
 
 ## Element System
 
@@ -283,7 +201,9 @@ Muxer sync: `MuxerSyncState`/`MuxerSyncConfig::new().with_mode(SyncMode::{Auto|S
 11b. **`elements::codec::hw_encoder`/`hw_decoder` need `vulkan-video` AND a codec feature** (the latter to compile `elements::codec` at all). No CI job sets both, so they had rotted un-compiled for a long time. Check them with `cargo check --features image-jpeg,vulkan-video`.
 12. **`AlignmentStrategy::Interpolate` needs `B: Lerp`** — it resamples the *right* stream onto the left's timestamps, and only `TemporalJoin::try_emit_interpolated` honours it. Plain `try_emit` returns `None` for that variant (it used to silently run `Nearest(10ms)`, discarding the caller's `Duration`).
 13. **`Error::PoolExhausted` is recoverable; every other `Err` from `process()` kills the element task.** The executor sheds that buffer (DropTracer + `parallax_buffers_dropped` + a rate-limited warn at the 1st/10th/100th consecutive) and continues, because a dropped frame beats a dead live pipeline. `ExecutorConfig::shed_fatal_after` opts back into failing for batch work. Encoders must call `OutputArena::admit()` *before* encoding — shedding an encoded packet leaves a `frame_num` gap the decoder cannot recover from until the next IDR — while decoders must never skip an input and shed the output copy instead.
-14. Types that do NOT exist (stale docs may mention them): `CpuArena`, `HeapSegment`, `MemoryPool`, `SharedMemorySegment`, `PipelineExecutor`, `ElementSandbox`, `Affinity`, `parallax-launch`/`parallax-inspect`/`parallax-top` binaries.
+14b. **`src/codec/annexb.rs` is ALWAYS compiled** — the Annex-B helpers (`nal_units`/`has_idr`/`extract_param_sets`/`annex_b_to_avcc`) need no codec feature, unlike `elements::codec` (Gotcha above). Don't feature-gate code that only uses them.
+14c. **`ScaleEngine` (converters/) is the slice-level scaler; the `VideoScale` *element* wraps it** — one `ScaleMode` enum is shared by both, so a change to scaling behaviour touches both surfaces.
+15. Types that do NOT exist (stale docs may mention them): `CpuArena`, `HeapSegment`, `MemoryPool`, `SharedMemorySegment`, `PipelineExecutor`, `ElementSandbox`, `Affinity`, `parallax-launch`/`parallax-inspect`/`parallax-top` binaries.
 
 ## Code Style
 
@@ -294,8 +214,5 @@ Muxer sync: `MuxerSyncState`/`MuxerSyncConfig::new().with_mode(SyncMode::{Auto|S
 
 ## Documentation Map
 
-- `docs/README.md` — index
-- `docs/getting-started.md`, `architecture.md`, `pipeline.md`, `scheduling.md`, `memory.md`, `elements.md`, `formats.md`, `plugins.md`, `api.md`, `security.md` — user guides
-- `docs/design.md` — design rationale + competitive landscape
-- `docs/research/` — historical research/design notes (may describe superseded designs)
-- `plans/` — active implementation plans (`plans/README.md` for status)
+User guides in `docs/` (`docs/README.md` is the index; `docs/design.md` carries the design rationale).
+`docs/research/` is **historical** — it may describe superseded designs. Active implementation plans in `plans/` (`plans/README.md` for status).
