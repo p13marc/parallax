@@ -14,8 +14,8 @@ use parallax::buffer::{Buffer, MemoryHandle};
 use parallax::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
 use parallax::error::Result;
 use parallax::format::{
-    CapsValue, ElementMediaCaps, FormatMemoryCap, Framerate, MemoryCaps, PixelFormat, VideoFormat,
-    VideoFormatCaps,
+    AudioFormatCaps, CapsValue, ElementMediaCaps, FormatMemoryCap, Framerate, MemoryCaps,
+    PixelFormat, SampleFormat, VideoFormat, VideoFormatCaps,
 };
 use parallax::memory::SharedArena;
 use parallax::metadata::Metadata;
@@ -283,4 +283,155 @@ fn the_default_policy_refuses_and_explains() {
     let error = pipeline.prepare().unwrap_err().to_string();
     assert!(error.contains("videoscale"), "got: {error}");
     assert!(error.contains("videoconvert"), "got: {error}");
+}
+
+// ---------------------------------------------------------------------------
+// Audio: a device that pins its sample format (#70)
+// ---------------------------------------------------------------------------
+
+/// Caps pinning one rate, channel count and sample format, the way an ALSA
+/// device does — it is opened in exactly one configuration.
+fn pinned_audio(rate: u32, channels: u16, sample_format: SampleFormat) -> ElementMediaCaps {
+    ElementMediaCaps::single(FormatMemoryCap::new(
+        AudioFormatCaps {
+            sample_rate: CapsValue::Fixed(rate),
+            channels: CapsValue::Fixed(channels),
+            sample_format: CapsValue::Fixed(sample_format),
+        }
+        .into(),
+        MemoryCaps::cpu_only(),
+    ))
+}
+
+/// An audio source that declares the format it emits.
+struct PinnedAudioSource {
+    rate: u32,
+    channels: u16,
+    sample_format: SampleFormat,
+    remaining: usize,
+    arena: SharedArena,
+}
+
+impl PinnedAudioSource {
+    fn new(rate: u32, channels: u16, sample_format: SampleFormat, buffers: usize) -> Self {
+        Self {
+            rate,
+            channels,
+            sample_format,
+            remaining: buffers,
+            arena: SharedArena::new(4096, 16).unwrap(),
+        }
+    }
+}
+
+impl Source for PinnedAudioSource {
+    fn produce(&mut self, _ctx: &mut ProduceContext) -> Result<ProduceResult> {
+        if self.remaining == 0 {
+            return Ok(ProduceResult::Eos);
+        }
+        self.remaining -= 1;
+
+        self.arena.reclaim();
+        let mut slot = self.arena.acquire().expect("arena slot");
+        slot.data_mut().fill(0);
+
+        Ok(ProduceResult::OwnBuffer(Buffer::new(
+            MemoryHandle::with_len(slot, 4096),
+            Metadata::from_sequence(self.remaining as u64),
+        )))
+    }
+
+    fn output_media_caps(&self) -> ElementMediaCaps {
+        pinned_audio(self.rate, self.channels, self.sample_format)
+    }
+}
+
+/// An audio sink that only accepts one format — an `AlsaSink` in miniature.
+struct PinnedAudioSink {
+    rate: u32,
+    channels: u16,
+    sample_format: SampleFormat,
+}
+
+impl Sink for PinnedAudioSink {
+    fn consume(&mut self, _ctx: &ConsumeContext) -> Result<()> {
+        Ok(())
+    }
+
+    fn input_media_caps(&self) -> ElementMediaCaps {
+        pinned_audio(self.rate, self.channels, self.sample_format)
+    }
+}
+
+fn f32_into_s16_pipeline() -> Pipeline {
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_source(
+        "app",
+        PinnedAudioSource::new(48_000, 2, SampleFormat::F32, 2),
+    );
+    let sink = pipeline.add_sink(
+        "alsasink",
+        PinnedAudioSink {
+            rate: 48_000,
+            channels: 2,
+            sample_format: SampleFormat::S16,
+        },
+    );
+    pipeline.link(src, sink).unwrap();
+    pipeline
+}
+
+/// An f32 stream into an S16 device gains an `audioconvert` instead of playing
+/// reinterpreted noise. Nothing in the tree declared `FormatCaps::AudioRaw`
+/// before #70, so this path had never been exercised.
+#[test]
+fn an_audio_format_mismatch_inserts_an_audioconvert() {
+    let mut pipeline = f32_into_s16_pipeline();
+    pipeline.set_converter_policy(ConverterPolicy::Allow);
+    pipeline.prepare().unwrap();
+
+    let inserted = auto_nodes(&pipeline);
+    assert_eq!(
+        inserted.len(),
+        1,
+        "only the format axis disagrees, got {inserted:?}"
+    );
+    assert!(inserted[0].starts_with("auto_audioconvert"), "{inserted:?}");
+}
+
+/// Under the default policy the mismatch is a prepare error naming the axis,
+/// not a device quietly rendering garbage.
+#[test]
+fn an_audio_format_mismatch_is_an_error_under_deny() {
+    let mut pipeline = f32_into_s16_pipeline();
+    // Deny is the default; being explicit is the point of the test.
+    pipeline.set_converter_policy(ConverterPolicy::Deny);
+
+    let err = pipeline.prepare().unwrap_err().to_string();
+    assert!(
+        err.to_lowercase().contains("convert") || err.to_lowercase().contains("negotiat"),
+        "error should point at the missing conversion, got: {err}"
+    );
+}
+
+/// A matching format needs no converter at all.
+#[test]
+fn matching_audio_formats_insert_nothing() {
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_source(
+        "app",
+        PinnedAudioSource::new(48_000, 2, SampleFormat::S16, 2),
+    );
+    let sink = pipeline.add_sink(
+        "alsasink",
+        PinnedAudioSink {
+            rate: 48_000,
+            channels: 2,
+            sample_format: SampleFormat::S16,
+        },
+    );
+    pipeline.link(src, sink).unwrap();
+
+    pipeline.prepare().unwrap();
+    assert!(auto_nodes(&pipeline).is_empty());
 }

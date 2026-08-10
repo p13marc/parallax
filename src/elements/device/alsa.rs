@@ -34,6 +34,9 @@ use crate::element::{
     AsyncSink, AsyncSource, ConsumeContext, ExecutionHints, ProduceContext, ProduceResult,
 };
 use crate::error::Result;
+use crate::format::{
+    AudioFormatCaps, CapsValue, ElementMediaCaps, FormatCaps, FormatMemoryCap, MemoryCaps,
+};
 use crate::pipeline::flow::{FlowPolicy, FlowSignal, FlowStateHandle};
 
 use super::DeviceError;
@@ -99,6 +102,12 @@ pub fn enumerate_devices() -> Result<Vec<AlsaDeviceInfo>> {
     Ok(devices)
 }
 
+/// How many underruns one buffer may recover from before giving up.
+///
+/// A device that keeps underrunning on the same buffer is not going to start
+/// working; without a bound the write loop would spin on it forever.
+const MAX_UNDERRUN_RETRIES: u32 = 8;
+
 /// ALSA audio format configuration.
 #[derive(Debug, Clone)]
 pub struct AlsaFormat {
@@ -159,6 +168,43 @@ impl AlsaSampleFormat {
             AlsaSampleFormat::U8 => 1,
         }
     }
+
+    /// The pipeline caps sample format this maps onto.
+    ///
+    /// Parallax's [`SampleFormat`] carries no endianness — everything in the
+    /// tree is native-endian, and ALSA is configured little-endian, so on the
+    /// platforms this crate supports the two agree.
+    ///
+    /// [`SampleFormat`]: crate::format::SampleFormat
+    pub fn to_caps_format(self) -> crate::format::SampleFormat {
+        use crate::format::SampleFormat;
+        match self {
+            AlsaSampleFormat::S16LE => SampleFormat::S16,
+            AlsaSampleFormat::S32LE => SampleFormat::S32,
+            AlsaSampleFormat::F32LE => SampleFormat::F32,
+            AlsaSampleFormat::U8 => SampleFormat::U8,
+        }
+    }
+}
+
+/// The caps an ALSA device advertises: exactly what it was configured for.
+///
+/// The device is opened in one fixed rate/channel-count/sample format, so
+/// pinning all three is honest — and it is what lets the negotiation solver
+/// insert an `audioconvert`/`audioresample` in front of a mismatched upstream
+/// (or fail `prepare()` with an actionable message under the default
+/// `ConverterPolicy::Deny`) instead of the device rendering noise.
+fn alsa_media_caps(format: &AlsaFormat) -> ElementMediaCaps {
+    let caps = AudioFormatCaps {
+        sample_rate: CapsValue::Fixed(format.sample_rate),
+        channels: CapsValue::Fixed(format.channels as u16),
+        sample_format: CapsValue::Fixed(format.format.to_caps_format()),
+    };
+
+    ElementMediaCaps::new(vec![FormatMemoryCap::new(
+        FormatCaps::AudioRaw(caps),
+        MemoryCaps::cpu_only(),
+    )])
 }
 
 /// ALSA audio capture source.
@@ -271,7 +317,7 @@ impl AlsaSrc {
         // Try to get hardware timestamp from ALSA status
         if let Ok(status) = self.pcm.status() {
             let htstamp = status.get_htstamp();
-            let current_nanos = htstamp.tv_sec as i64 * 1_000_000_000 + htstamp.tv_nsec as i64;
+            let current_nanos = htstamp.tv_sec * 1_000_000_000 + htstamp.tv_nsec;
 
             // Only use hardware timestamp if it's valid (non-zero)
             if current_nanos > 0 {
@@ -325,30 +371,27 @@ impl AsyncSource for AlsaSrc {
 
         // Check for downstream backpressure before reading
         // ALSA is a live source - dropping samples is better than accumulating lag
-        if let Some(ref flow_state) = self.flow_state {
-            if !flow_state.should_produce() {
-                // Drop audio samples due to backpressure
-                self.samples_dropped += 1;
-                flow_state.record_drop();
+        if let Some(ref flow_state) = self.flow_state
+            && !flow_state.should_produce()
+        {
+            // Drop audio samples due to backpressure
+            self.samples_dropped += 1;
+            flow_state.record_drop();
 
-                if self.samples_dropped == 1 || self.samples_dropped % 100 == 0 {
-                    tracing::warn!(
-                        "ALSA: dropping audio due to backpressure (total dropped: {})",
-                        self.samples_dropped
-                    );
-                }
-
-                // Still need to drain the ALSA buffer to prevent overrun
-                // Read and discard
-                let io = self
-                    .pcm
-                    .io_i16()
-                    .map_err(|e| DeviceError::Alsa(e.to_string()))?;
-                let mut discard_buf = vec![0i16; max_frames * self.format.channels as usize];
-                let _ = io.readi(&mut discard_buf);
-
-                return Ok(ProduceResult::WouldBlock);
+            if self.samples_dropped == 1 || self.samples_dropped.is_multiple_of(100) {
+                tracing::warn!(
+                    "ALSA: dropping audio due to backpressure (total dropped: {})",
+                    self.samples_dropped
+                );
             }
+
+            // Still need to drain the ALSA buffer to prevent overrun
+            // Read and discard
+            let io = self.pcm.io_bytes();
+            let mut discard_buf = vec![0u8; max_frames * self.frame_size];
+            let _ = io.readi(&mut discard_buf);
+
+            return Ok(ProduceResult::WouldBlock);
         }
 
         // Wait for data using poll
@@ -361,22 +404,16 @@ impl AsyncSource for AlsaSrc {
             }
         }
 
-        // Read available frames
-        let io = self
-            .pcm
-            .io_i16()
-            .map_err(|e| DeviceError::Alsa(e.to_string()))?;
+        // Read available frames. Bytes, not `i16`: the device may well be
+        // configured for S32/F32/U8, and `io_bytes` converts the byte count to
+        // frames through whatever format it actually has (#70).
+        let io = self.pcm.io_bytes();
 
-        // Interpret output buffer as i16 slice
         let output = ctx.output();
-        let samples = output.len() / 2; // i16 = 2 bytes
-        let _frames = samples / self.format.channels as usize;
+        // Whole frames only — a partial frame at the tail is not readable.
+        let readable = max_frames * self.frame_size;
 
-        // Create a mutable i16 slice from the output buffer
-        let output_ptr = output.as_mut_ptr() as *mut i16;
-        let output_i16 = unsafe { std::slice::from_raw_parts_mut(output_ptr, samples) };
-
-        match io.readi(output_i16) {
+        match io.readi(&mut output[..readable]) {
             Ok(frames_read) => {
                 // Calculate PTS from ALSA timestamp or sample count
                 let pts = self.calculate_pts(frames_read);
@@ -404,6 +441,10 @@ impl AsyncSource for AlsaSrc {
 
     fn preferred_buffer_size(&self) -> Option<usize> {
         Some(self.format.period_frames as usize * self.frame_size)
+    }
+
+    fn output_media_caps(&self) -> ElementMediaCaps {
+        alsa_media_caps(&self.format)
     }
 
     fn execution_hints(&self) -> ExecutionHints {
@@ -627,33 +668,50 @@ impl AsyncSink for AlsaSink {
             }
         }
 
-        // Write frames
-        let io = self
-            .pcm
-            .io_i16()
-            .map_err(|e| DeviceError::Alsa(e.to_string()))?;
+        // Bytes, not `i16`. `io_bytes()` converts the byte count to frames
+        // through the PCM's *configured* format, so one path serves S16, S32,
+        // F32 and U8 alike — and there is no `from_raw_parts` on a buffer slice
+        // whose alignment we do not control. `io_i16()` used to be hard-coded
+        // here, which meant any other configured format simply errored on
+        // every buffer (#70).
+        let io = self.pcm.io_bytes();
 
-        // Interpret input as i16 slice
-        let samples = data.len() / 2;
-        let input_ptr = data.as_ptr() as *const i16;
-        let input_i16 = unsafe { std::slice::from_raw_parts(input_ptr, samples) };
+        // `writei` can write fewer frames than asked for. The remainder used to
+        // be silently discarded, which drops audio and makes the frame
+        // accounting the clock depends on wrong.
+        let wanted = frames * self.frame_size;
+        let mut written = 0usize;
+        let mut underruns = 0u32;
 
-        match io.writei(input_i16) {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                // Handle underrun
-                if e.errno() == libc::EPIPE {
+        while written < wanted {
+            match io.writei(&data[written..wanted]) {
+                Ok(0) => break,
+                Ok(frames_written) => written += frames_written * self.frame_size,
+                Err(e) if e.errno() == libc::EPIPE => {
+                    // Underrun: re-prepare and carry on from where we stopped.
+                    // Bounded, so a device that will not recover surfaces as an
+                    // error instead of spinning forever.
+                    underruns += 1;
+                    if underruns > MAX_UNDERRUN_RETRIES {
+                        return Err(DeviceError::Alsa(format!(
+                            "device underran {underruns} times without recovering"
+                        ))
+                        .into());
+                    }
+                    tracing::debug!("alsasink: underrun, re-preparing the device");
                     self.pcm
                         .prepare()
                         .map_err(|e| DeviceError::Alsa(e.to_string()))?;
-                    // Retry write
-                    let _ = io.writei(input_i16);
-                    Ok(())
-                } else {
-                    Err(DeviceError::Alsa(e.to_string()).into())
                 }
+                Err(e) => return Err(DeviceError::Alsa(e.to_string()).into()),
             }
         }
+
+        Ok(())
+    }
+
+    fn input_media_caps(&self) -> ElementMediaCaps {
+        alsa_media_caps(&self.format)
     }
 
     fn execution_hints(&self) -> ExecutionHints {
@@ -673,6 +731,74 @@ mod tests {
     fn test_is_available() {
         let available = is_available();
         println!("ALSA available: {}", available);
+    }
+
+    // ------------------------------------------------------------------
+    // Configured sample format is honoured (#70)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn every_alsa_format_maps_onto_a_caps_format() {
+        use crate::format::SampleFormat;
+
+        // The mapping must be total: a format with no caps equivalent would
+        // mean a device that cannot advertise what it plays.
+        for (alsa, expected, bytes) in [
+            (AlsaSampleFormat::S16LE, SampleFormat::S16, 2),
+            (AlsaSampleFormat::S32LE, SampleFormat::S32, 4),
+            (AlsaSampleFormat::F32LE, SampleFormat::F32, 4),
+            (AlsaSampleFormat::U8, SampleFormat::U8, 1),
+        ] {
+            assert_eq!(alsa.to_caps_format(), expected, "{alsa:?}");
+            assert_eq!(alsa.bytes_per_sample(), bytes, "{alsa:?}");
+        }
+    }
+
+    #[test]
+    fn caps_pin_the_configured_format_not_just_any_audio() {
+        use crate::format::SampleFormat;
+
+        let format = AlsaFormat {
+            sample_rate: 44_100,
+            channels: 1,
+            format: AlsaSampleFormat::F32LE,
+            ..AlsaFormat::default()
+        };
+
+        let caps = alsa_media_caps(&format);
+        let pair = caps.preferred().expect("one format/memory pair");
+
+        let FormatCaps::AudioRaw(audio) = &pair.format else {
+            panic!("ALSA must advertise raw audio, got {:?}", pair.format);
+        };
+
+        // All three pinned: this is what makes the solver insert a converter
+        // rather than letting `Any ∩ Fixed` pass a mismatch through.
+        assert_eq!(audio.sample_rate, CapsValue::Fixed(44_100));
+        assert_eq!(audio.channels, CapsValue::Fixed(1));
+        assert_eq!(
+            audio.sample_format,
+            CapsValue::Fixed(SampleFormat::F32),
+            "an f32 device must not advertise itself as accepting anything"
+        );
+    }
+
+    #[test]
+    fn frame_size_follows_the_configured_format() {
+        // The write loop converts frames to bytes with this, so a wrong value
+        // here silently truncates or over-reads every buffer.
+        for (format, channels, expected) in [
+            (AlsaSampleFormat::S16LE, 2, 4),
+            (AlsaSampleFormat::S32LE, 2, 8),
+            (AlsaSampleFormat::F32LE, 1, 4),
+            (AlsaSampleFormat::U8, 2, 2),
+        ] {
+            assert_eq!(
+                format.bytes_per_sample() * channels,
+                expected,
+                "{format:?} x{channels}"
+            );
+        }
     }
 
     #[test]
