@@ -64,7 +64,7 @@ pub use videoconvert::VideoConvertElement;
 // Audio processing
 pub use audioconvert::AudioConvertElement;
 pub use audioresample::AudioResampleElement;
-pub use gain::Gain;
+pub use gain::{Gain, GainControl};
 
 // Batching
 pub use batch::{Batch, BatchStats, Unbatch, UnbatchStats};

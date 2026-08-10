@@ -6,12 +6,63 @@
 use crate::buffer::Buffer;
 use crate::element::{Element, ExecutionHints, LatencyHint, ProcessingHint};
 use crate::error::Result;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+
+/// Control handle for a [`Gain`] element.
+///
+/// Clone it *before* `executor.start()` — `start` moves the element into its
+/// task, so this handle is the only way to reach a live gain. Cloneable,
+/// lock-free, safe to call from any thread.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let gain = Gain::new(1.0);
+/// let volume = gain.control();        // BEFORE start
+/// pipeline.add_filter("volume", gain);
+/// let handle = executor.start(&mut pipeline)?;
+///
+/// volume.set_db(-6.0);                // half amplitude, while playing
+/// volume.set_factor(0.0);             // mute
+/// ```
+#[derive(Clone, Debug)]
+pub struct GainControl(Arc<AtomicU32>);
+
+impl GainControl {
+    /// Set the linear gain factor (`1.0` = unity, `0.0` = mute).
+    pub fn set_factor(&self, factor: f32) {
+        self.0.store(factor.to_bits(), Ordering::Relaxed);
+    }
+
+    /// The current linear gain factor.
+    pub fn factor(&self) -> f32 {
+        f32::from_bits(self.0.load(Ordering::Relaxed))
+    }
+
+    /// Set the gain in decibels (`0.0` dB = unity, `-6.0` dB ≈ half amplitude).
+    ///
+    /// There is no dB value for silence; use `set_factor(0.0)` to mute.
+    pub fn set_db(&self, db: f32) {
+        self.set_factor(Gain::from_db(db));
+    }
+
+    /// The current gain in decibels.
+    ///
+    /// Returns `f32::NEG_INFINITY` when muted, which is what `log10(0.0)`
+    /// yields — a muted gain has no finite dB value.
+    pub fn db(&self) -> f32 {
+        Gain::to_db(self.factor())
+    }
+}
 
 /// RT-safe gain element that multiplies audio samples by a constant factor.
 ///
 /// Operates on f32 (little-endian) samples in-place. No allocation occurs
 /// during processing, making it suitable for RT data threads.
+///
+/// The factor can be changed on a running pipeline through
+/// [`control`](Self::control).
 ///
 /// # Example
 ///
@@ -29,7 +80,11 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// ```
 pub struct Gain {
     /// Gain factor stored as atomic u32 (bit-cast f32) for lock-free updates.
-    factor: AtomicU32,
+    ///
+    /// Shared with [`GainControl`] handles, so it can change while the
+    /// pipeline runs. The `Arc` is touched only when a handle is cloned —
+    /// `process` does a single relaxed load, so this stays RT-safe.
+    factor: Arc<AtomicU32>,
     name: String,
 }
 
@@ -42,9 +97,16 @@ impl Gain {
     /// - `0.5` = halve amplitude (-6 dB)
     pub fn new(factor: f32) -> Self {
         Self {
-            factor: AtomicU32::new(factor.to_bits()),
+            factor: Arc::new(AtomicU32::new(factor.to_bits())),
             name: "gain".to_string(),
         }
+    }
+
+    /// Get a cloneable handle for changing the gain at runtime.
+    ///
+    /// Clone it *before* the pipeline starts — see [`GainControl`].
+    pub fn control(&self) -> GainControl {
+        GainControl(Arc::clone(&self.factor))
     }
 
     /// Set a custom name.
@@ -79,6 +141,14 @@ impl Gain {
 impl Default for Gain {
     fn default() -> Self {
         Self::new(1.0)
+    }
+}
+
+impl crate::control::Controllable for Gain {
+    type Control = GainControl;
+
+    fn control(&self) -> GainControl {
+        GainControl(Arc::clone(&self.factor))
     }
 }
 
@@ -208,5 +278,85 @@ mod tests {
     fn test_gain_default() {
         let gain = Gain::default();
         assert!((gain.factor() - 1.0).abs() < f32::EPSILON);
+    }
+
+    // ------------------------------------------------------------------
+    // Runtime gain control (#75)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn factor_change_takes_effect_immediately() {
+        let mut gain = Gain::new(1.0);
+        let volume = gain.control();
+
+        let first = gain
+            .process(create_f32_buffer(&[0.5, -0.5], 0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(read_f32_samples(&first), vec![0.5, -0.5]);
+
+        volume.set_factor(2.0);
+
+        let second = gain
+            .process(create_f32_buffer(&[0.5, -0.5], 1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(read_f32_samples(&second), vec![1.0, -1.0]);
+    }
+
+    #[test]
+    fn control_clones_share_state() {
+        let gain = Gain::new(1.0);
+        let a = gain.control();
+        let b = a.clone();
+
+        b.set_factor(0.25);
+
+        assert!((a.factor() - 0.25).abs() < f32::EPSILON);
+        assert!((gain.factor() - 0.25).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn control_reports_the_current_gain() {
+        let gain = Gain::new(0.5);
+        let volume = gain.control();
+        assert!((volume.factor() - 0.5).abs() < f32::EPSILON);
+
+        // The element's own setter is visible through the handle, and back.
+        gain.set_factor(2.0);
+        assert!((volume.factor() - 2.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn set_db_matches_the_linear_conversion() {
+        let gain = Gain::new(1.0);
+        let volume = gain.control();
+
+        volume.set_db(-6.0);
+        assert!((volume.factor() - 0.5).abs() < 0.02);
+        assert!((volume.db() + 6.0).abs() < 0.05);
+
+        volume.set_db(0.0);
+        assert!((volume.factor() - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn muting_through_the_handle_has_no_finite_db() {
+        let gain = Gain::new(1.0);
+        let volume = gain.control();
+        volume.set_factor(0.0);
+        assert_eq!(volume.db(), f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn controllable_and_inherent_control_agree() {
+        use crate::control::Controllable;
+
+        let gain = Gain::new(1.0);
+        let inherent = Gain::control(&gain);
+        let via_trait = Controllable::control(&gain);
+
+        via_trait.set_factor(0.75);
+        assert!((inherent.factor() - 0.75).abs() < f32::EPSILON);
     }
 }

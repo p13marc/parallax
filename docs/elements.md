@@ -244,6 +244,7 @@ Every controllable element implements `Controllable`, so the accessor is always 
 | `ThrottleControl` | `Throttle::control()` | `set_rate(fps)`, `set_min_interval(d)` |
 | `JpegQualityControl` | `JpegEncoder::control()` | `set_quality(1..=100)` |
 | `ValveControl` | `Valve::control()` | `open()` / `close()` |
+| `GainControl` | `Gain::control()` | `set_factor(f)` / `set_db(db)`, `factor()` / `db()` |
 | `FlowStateHandle` | `Queue::control()` | backpressure signalling to live sources |
 | `AppSinkHandle` / `AppSrcHandle` | `AppSink::handle()` / `AppSrc::handle()` | async-first `pull_buffer`/`push_buffer` (+`_timeout`; `*_blocking` twins for plain threads), `try_pull_buffer`/`try_push_buffer`, `stats()` |
 

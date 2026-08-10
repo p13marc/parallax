@@ -28,6 +28,7 @@
 //! | [`ThrottleControl`] | `Throttle` | framerate (drop-based) |
 //! | `JpegQualityControl` | `JpegEncoder` | JPEG quality 1..=100 |
 //! | [`ValveControl`] | `Valve` | open / close |
+//! | [`GainControl`] | `Gain` | audio volume (`set_factor`, `set_db`) |
 //! | [`FlowStateHandle`] | `Queue` | backpressure signalling to live sources |
 //!
 //! # Example
@@ -474,7 +475,7 @@ pub struct EncoderStats {
 
 pub use crate::elements::flow::ValveControl;
 pub use crate::elements::timing::ThrottleControl;
-pub use crate::elements::transform::ScaleControl;
+pub use crate::elements::transform::{GainControl, ScaleControl};
 pub use crate::pipeline::flow::FlowStateHandle;
 
 #[cfg(feature = "image-jpeg")]
