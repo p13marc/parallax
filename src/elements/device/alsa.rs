@@ -23,7 +23,8 @@
 
 use std::ffi::CString;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::time::Duration;
 
 use alsa::pcm::{Access, Format, HwParams, PCM};
 use alsa::{Direction, PollDescriptors, ValueOr};
@@ -477,6 +478,10 @@ pub struct AlsaSink {
     frame_size: usize,
     /// Clock provider for automatic pipeline clock selection.
     clock_provider: AlsaSinkClockProvider,
+    /// Frames handed to the device so far.
+    written_frames: u64,
+    /// Device playback position, shared with the clock.
+    position: Arc<AlsaPosition>,
 }
 
 /// Clock provider wrapper for AlsaSink.
@@ -546,8 +551,9 @@ impl AlsaSink {
 
         let frame_size = format.format.bytes_per_sample() * format.channels as usize;
 
+        let position = Arc::new(AlsaPosition::new(format.sample_rate));
         let clock_provider = AlsaSinkClockProvider {
-            clock: Arc::new(AlsaClock::new(format.sample_rate)),
+            clock: Arc::new(AlsaClock::from_position(Arc::clone(&position))),
         };
 
         Ok(Self {
@@ -555,7 +561,33 @@ impl AlsaSink {
             format,
             frame_size,
             clock_provider,
+            written_frames: 0,
+            position,
         })
+    }
+
+    /// The device playback position this sink publishes.
+    ///
+    /// Clone it before `start()` if you want to observe playback progress from
+    /// outside the pipeline — the sink itself moves into its executor task.
+    pub fn position(&self) -> Arc<AlsaPosition> {
+        Arc::clone(&self.position)
+    }
+
+    /// Publish how far the device has actually got.
+    ///
+    /// `snd_pcm_delay` is the frames still queued ahead of the write pointer,
+    /// so written-minus-delay is what has been *played*. A failed query leaves
+    /// the last position standing rather than guessing.
+    fn publish_position(&self) {
+        let Ok(delay) = self.pcm.delay() else {
+            return;
+        };
+        let queued = delay.max(0) as u64;
+        self.position.update(
+            self.written_frames.saturating_sub(queued),
+            std::time::Instant::now(),
+        );
     }
 
     /// Get the audio format.
@@ -587,47 +619,151 @@ impl AlsaSink {
         Ok(fds)
     }
 
-    /// Create a clock based on this audio device.
+    /// Create a clock reading this device's playback position.
     ///
-    /// The returned clock uses ALSA's hardware timestamp when available,
-    /// falling back to sample rate calculation.
+    /// The same clock `select_clock` picks up automatically; this is for
+    /// callers that want to read it directly.
     pub fn create_clock(&self) -> AlsaClock {
-        AlsaClock::new(self.format.sample_rate)
+        AlsaClock::from_position(Arc::clone(&self.position))
+    }
+}
+
+/// How far the clock may extrapolate past its last position report.
+///
+/// Between two `writei` calls nothing updates the position, so the clock
+/// interpolates with elapsed wall time to stay smooth. That is only honest for
+/// about a period; beyond it the device may have stopped, and a clock that
+/// kept running would drift away from the audio actually being heard.
+const MAX_INTERPOLATION: Duration = Duration::from_millis(100);
+
+/// The device's playback position, shared between the sink and its clock.
+///
+/// `alsa::PCM` holds raw pointers and is `!Sync`, so the clock cannot hold the
+/// handle (that is why [`AlsaSinkClockProvider`] exists at all). Instead the
+/// sink publishes how many frames the device has actually consumed each time it
+/// writes, and the clock reads that — a pair of atomics across the gap rather
+/// than a shared handle.
+///
+/// All arithmetic here is plain integers over an injected `Instant`, so the
+/// behaviour under underrun and stall is unit-testable without a sound card.
+#[derive(Debug)]
+pub struct AlsaPosition {
+    /// Frames the device reports as played.
+    frames_played: AtomicU64,
+    /// Nanoseconds since `epoch` when that count was published, plus one.
+    ///
+    /// Zero means "no report yet", which is not the same as "reported zero at
+    /// the epoch": without the distinction a device that has never played a
+    /// sample would interpolate a full window off its start and hand
+    /// `PipelineClock::start` a non-zero base time.
+    updated_at_nanos: AtomicU64,
+    /// Highest time ever reported, so the clock cannot run backwards.
+    last_reported_nanos: AtomicU64,
+    /// Reference instant for the two nanosecond fields above.
+    epoch: std::time::Instant,
+    /// Configured sample rate, for frames → time.
+    sample_rate: u32,
+}
+
+impl AlsaPosition {
+    /// A position that has not seen any playback yet.
+    pub fn new(sample_rate: u32) -> Self {
+        Self {
+            frames_played: AtomicU64::new(0),
+            updated_at_nanos: AtomicU64::new(0),
+            last_reported_nanos: AtomicU64::new(0),
+            epoch: std::time::Instant::now(),
+            sample_rate: sample_rate.max(1),
+        }
+    }
+
+    /// Publish a new device position, observed at `at`.
+    pub fn update(&self, frames_played: u64, at: std::time::Instant) {
+        self.frames_played.store(frames_played, Ordering::Release);
+        self.updated_at_nanos.store(
+            (at.saturating_duration_since(self.epoch).as_nanos() as u64).saturating_add(1),
+            Ordering::Release,
+        );
+    }
+
+    /// The device's playback time as of `at`.
+    ///
+    /// Between reports this interpolates with elapsed wall time, capped at
+    /// [`MAX_INTERPOLATION`] so a stalled device stops the clock rather than
+    /// letting it run away. The result never decreases: an underrun makes the
+    /// reported position jump, and a clock that went backwards would send every
+    /// PTS-paced sink into an unrecoverable drop loop.
+    pub fn now_at(&self, at: std::time::Instant) -> ClockTime {
+        let frames = self.frames_played.load(Ordering::Acquire);
+        let Some(updated_at) = self.updated_at_nanos.load(Ordering::Acquire).checked_sub(1) else {
+            // Nothing has played yet. Report zero rather than interpolating
+            // off the epoch — see `updated_at_nanos`.
+            return ClockTime::ZERO;
+        };
+
+        let played_nanos = frames
+            .saturating_mul(1_000_000_000)
+            .checked_div(self.sample_rate as u64)
+            .unwrap_or(0);
+
+        let now_nanos = at.saturating_duration_since(self.epoch).as_nanos() as u64;
+        let since_update = now_nanos.saturating_sub(updated_at);
+        let interpolated =
+            played_nanos.saturating_add(since_update.min(MAX_INTERPOLATION.as_nanos() as u64));
+
+        // fetch_max, not a load-then-store: two threads may read the clock at
+        // once, and the loser must not publish a stale maximum.
+        let previous = self
+            .last_reported_nanos
+            .fetch_max(interpolated, Ordering::AcqRel);
+        ClockTime::from_nanos(interpolated.max(previous))
+    }
+
+    /// Frames the device has reported playing.
+    pub fn frames_played(&self) -> u64 {
+        self.frames_played.load(Ordering::Acquire)
     }
 }
 
 /// Clock implementation based on ALSA audio hardware timing.
 ///
-/// ALSA audio devices provide highly accurate timing based on the audio
-/// sample rate. This clock is preferred for A/V synchronization because
-/// the audio hardware provides a consistent, drift-free time base.
+/// The time base is what the *device* has consumed — frames written minus
+/// `snd_pcm_delay`, converted at the configured sample rate — not wall time.
+/// That is what makes it usable as the A/V master clock: when the sound card
+/// runs slightly fast or slow, or stalls, video paced against this clock
+/// follows the audio rather than drifting away from it.
+///
+/// Until #67 this was `Instant::elapsed()` wearing a `HARDWARE` badge.
 ///
 /// Priority: 150 (hardware audio clock, preferred over software clocks)
 pub struct AlsaClock {
-    /// Sample rate for fallback timing calculation.
-    sample_rate: u32,
-    /// Start time for monotonic fallback.
-    start: std::time::Instant,
+    position: Arc<AlsaPosition>,
 }
 
 impl AlsaClock {
-    /// Create a new ALSA clock with the given sample rate.
+    /// Create a clock with its own, unbound position.
+    ///
+    /// Nothing updates the returned clock, so it reads zero forever — useful
+    /// for tests and for callers that only want the trait object's shape.
+    /// [`AlsaSink`] builds a bound one, which is what `select_clock` picks up.
     pub fn new(sample_rate: u32) -> Self {
-        Self {
-            sample_rate,
-            start: std::time::Instant::now(),
-        }
+        Self::from_position(Arc::new(AlsaPosition::new(sample_rate)))
+    }
+
+    /// Create a clock reading the given device position.
+    pub fn from_position(position: Arc<AlsaPosition>) -> Self {
+        Self { position }
+    }
+
+    /// The position cell this clock reads.
+    pub fn position(&self) -> &Arc<AlsaPosition> {
+        &self.position
     }
 }
 
 impl Clock for AlsaClock {
     fn now(&self) -> ClockTime {
-        // Use monotonic clock as the time base.
-        // In a full implementation, this would query the ALSA device's
-        // hardware position and convert to time, but that requires
-        // access to the PCM handle which we don't have here.
-        // For now, use high-resolution monotonic time.
-        ClockTime::from(self.start.elapsed())
+        self.position.now_at(std::time::Instant::now())
     }
 
     fn flags(&self) -> ClockFlags {
@@ -638,7 +774,7 @@ impl Clock for AlsaClock {
     fn resolution(&self) -> u64 {
         // Resolution is one sample period: 1/sample_rate seconds
         // At 48kHz, this is ~20.8 microseconds (20833 nanoseconds)
-        1_000_000_000u64 / self.sample_rate as u64
+        1_000_000_000u64 / self.position.sample_rate as u64
     }
 
     fn name(&self) -> &str {
@@ -686,7 +822,14 @@ impl AsyncSink for AlsaSink {
         while written < wanted {
             match io.writei(&data[written..wanted]) {
                 Ok(0) => break,
-                Ok(frames_written) => written += frames_written * self.frame_size,
+                Ok(frames_written) => {
+                    written += frames_written * self.frame_size;
+                    self.written_frames += frames_written as u64;
+                    // Republish after every accepted chunk: the clock is the
+                    // pipeline's master, so it should not go stale inside a
+                    // long buffer.
+                    self.publish_position();
+                }
                 Err(e) if e.errno() == libc::EPIPE => {
                     // Underrun: re-prepare and carry on from where we stopped.
                     // Bounded, so a device that will not recover surfaces as an
@@ -781,6 +924,117 @@ mod tests {
             CapsValue::Fixed(SampleFormat::F32),
             "an f32 device must not advertise itself as accepting anything"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // The clock follows the device, not a stopwatch (#67)
+    // ------------------------------------------------------------------
+
+    /// A fixed reference instant, so tests inject time instead of sleeping.
+    fn at(position: &AlsaPosition, millis: u64) -> std::time::Instant {
+        position.epoch + Duration::from_millis(millis)
+    }
+
+    #[test]
+    fn a_silent_device_leaves_the_clock_at_zero() {
+        // The old clock was `Instant::elapsed()`, so it ran whether or not a
+        // single sample had been played.
+        let position = AlsaPosition::new(48_000);
+        assert_eq!(position.now_at(at(&position, 5_000)), ClockTime::ZERO);
+    }
+
+    #[test]
+    fn the_clock_advances_with_frames_the_device_consumed() {
+        let position = AlsaPosition::new(48_000);
+
+        // Half a second of audio played, reported at t=500ms.
+        position.update(24_000, at(&position, 500));
+        assert_eq!(
+            position.now_at(at(&position, 500)),
+            ClockTime::from_nanos(500_000_000)
+        );
+
+        // A device running 10% slow: twice the wall time, only 1.5x the audio.
+        position.update(36_000, at(&position, 1_000));
+        assert_eq!(
+            position.now_at(at(&position, 1_000)),
+            ClockTime::from_nanos(750_000_000),
+            "the clock must follow the device, not the wall"
+        );
+    }
+
+    #[test]
+    fn between_reports_the_clock_interpolates() {
+        let position = AlsaPosition::new(48_000);
+        position.update(48_000, at(&position, 1_000));
+
+        // 20 ms after the report, with no new one: smooth, not frozen.
+        assert_eq!(
+            position.now_at(at(&position, 1_020)),
+            ClockTime::from_nanos(1_020_000_000)
+        );
+    }
+
+    #[test]
+    fn a_stalled_device_stops_the_clock_rather_than_running_away() {
+        let position = AlsaPosition::new(48_000);
+        position.update(48_000, at(&position, 1_000));
+
+        // Ten seconds with no further report — the device is gone. The clock
+        // may extrapolate one interpolation window and no further, otherwise a
+        // paced sink would drop every remaining frame as hopelessly late.
+        let stalled = position.now_at(at(&position, 11_000));
+        assert_eq!(
+            stalled,
+            ClockTime::from_nanos(1_000_000_000 + MAX_INTERPOLATION.as_nanos() as u64)
+        );
+    }
+
+    #[test]
+    fn an_underrun_does_not_rewind_the_clock() {
+        let position = AlsaPosition::new(48_000);
+        position.update(48_000, at(&position, 1_000));
+        let before = position.now_at(at(&position, 1_000));
+
+        // An underrun drains the queue, so written-minus-delay can jump about;
+        // here the recovery reports a *smaller* played count than before.
+        position.update(40_000, at(&position, 1_010));
+        let after = position.now_at(at(&position, 1_010));
+
+        assert!(
+            after >= before,
+            "clock went backwards across an underrun: {before:?} then {after:?}"
+        );
+    }
+
+    #[test]
+    fn playback_resumes_forward_after_an_underrun() {
+        let position = AlsaPosition::new(48_000);
+        position.update(48_000, at(&position, 1_000));
+        position.update(40_000, at(&position, 1_010)); // underrun, clamped
+        position.update(96_000, at(&position, 2_000)); // recovered and ahead
+
+        assert_eq!(
+            position.now_at(at(&position, 2_000)),
+            ClockTime::from_nanos(2_000_000_000),
+            "once the device is genuinely ahead again the clamp must let go"
+        );
+    }
+
+    #[test]
+    fn the_clock_reports_the_position_it_was_built_from() {
+        let position = Arc::new(AlsaPosition::new(48_000));
+        let clock = AlsaClock::from_position(Arc::clone(&position));
+
+        position.update(48_000, std::time::Instant::now());
+
+        assert!(clock.now() >= ClockTime::from_nanos(1_000_000_000));
+        assert_eq!(clock.name(), "alsa-audio-clock");
+        assert!(clock.flags().contains(ClockFlags::HARDWARE));
+        assert!(clock.flags().contains(ClockFlags::CAN_BE_MASTER));
+        // One sample at 48 kHz.
+        assert_eq!(clock.resolution(), 20_833);
+        assert_eq!(position.frames_played(), 48_000);
     }
 
     #[test]

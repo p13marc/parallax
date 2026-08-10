@@ -382,7 +382,7 @@ Gated by any of `pipewire`, `libcamera`, `v4l2`, `alsa`. Backend detection/enume
 | `LibCameraSrc` | `libcamera` | Modern camera API (Raspberry Pi, embedded, UVC); configurable frame rate via `FrameDurationLimits` (best-effort — UVC pipelines may ignore it); PTS from `SensorTimestamp` |
 | `PipeWireSrc` / `PipeWireSink` | `pipewire` | Audio/video via PipeWire; PTS from `spa_meta_header` |
 | `ScreenCaptureSrc` | `screen-capture` | XDG portal ScreenCast (Wayland-safe); cursor modes, session restore tokens |
-| `AlsaSrc` / `AlsaSink` | `alsa` | Audio capture/playback; hardware timestamps; `AlsaSink` **provides a hardware clock** (priority 100) that the pipeline auto-selects |
+| `AlsaSrc` / `AlsaSink` | `alsa` | Audio capture/playback in S16/S32/F32/U8, each pinned in the element's caps so a mismatched upstream gets an `audioconvert` (or a clear `prepare()` error). `AlsaSink` **provides a hardware clock** (priority 150) that the pipeline auto-selects: its time base is frames the device actually consumed (`snd_pcm_delay`), so it stops when the device stalls and never runs backwards across an underrun |
 
 All capture sources default to a `Drop` flow policy and accept `set_flow_state(handle)` for downstream backpressure — see [pipeline.md](pipeline.md#flow-control--backpressure).
 
