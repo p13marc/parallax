@@ -74,6 +74,12 @@ loop {
 No polling, and no watchdog: an element that panics is caught and reported as
 `EndReason::Error` like any other failure.
 
+`EndReason` lives in `parallax::pipeline` (re-exported unchanged from
+`parallax::elements`) because it is the whole graph's answer as much as one
+sink's: `PipelineHandle::ended()` is the pipeline-level twin, with the same three
+outcomes. A sink only ever sees `Eos` or `Error` — an aborted task cannot deliver
+anything, so `Aborted` comes from the handle alone.
+
 ## Network — `elements::network`
 
 | Element | Description |

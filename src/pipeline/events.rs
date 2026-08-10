@@ -67,6 +67,31 @@ impl fmt::Display for StreamError {
 
 impl std::error::Error for StreamError {}
 
+/// Why a stream ended.
+///
+/// Terminal and sticky: the first reason recorded is the one reported, so a
+/// clean EOS arriving after a failure cannot paper over it.
+///
+/// Reported at two levels, with the same meaning at both:
+/// [`PipelineHandle::ended`] for the whole graph, and
+/// [`AppSinkHandle::ended`](crate::elements::AppSinkHandle::ended) for one sink.
+///
+/// [`PipelineHandle::ended`]: crate::pipeline::PipelineHandle::ended
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EndReason {
+    /// Every upstream source ran to completion.
+    Eos,
+    /// An element failed. No more buffers are coming.
+    Error(StreamError),
+    /// The pipeline was torn down mid-stream.
+    ///
+    /// Only [`PipelineHandle::ended`] produces this; an `AppSink` never sees it,
+    /// because an aborted task cannot deliver anything.
+    ///
+    /// [`PipelineHandle::ended`]: crate::pipeline::PipelineHandle::ended
+    Aborted,
+}
+
 /// Events emitted by the pipeline during execution.
 #[derive(Debug, Clone)]
 pub enum PipelineEvent {

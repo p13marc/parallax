@@ -1,6 +1,14 @@
 //! Integration tests for the pipeline bus messaging system.
 
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use parallax::buffer::{Buffer, MemoryHandle};
+use parallax::element::{ProduceContext, ProduceResult, Source};
 use parallax::elements::{NullSink, NullSource};
+use parallax::error::{Error, Result};
+use parallax::memory::SharedArena;
+use parallax::metadata::Metadata;
 use parallax::pipeline::bus::{Bus, MessageKind};
 use parallax::pipeline::{Executor, Pipeline, PipelineState};
 
@@ -164,6 +172,221 @@ async fn test_pipeline_bus_state_changes() {
         saw_idle_to_running,
         "Expected Idle->Running state change on bus"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #89: terminal messages from a real pipeline.
+//
+// Everything above `test_pipeline_bus_state_changes` posts by hand on a
+// standalone `Bus`, which is why the gap went unnoticed for so long: nothing in
+// `src/` had ever called `post_eos` or `post_error`, so
+// `Bus::wait_for_eos_or_error()` was public API that could not return and
+// `run_with_bus`'s `Error` arm was unreachable.
+//
+// The contract these pin: a run posts **exactly one** terminal message — `Eos`
+// or `Error`, never both, never twice — and `Error` is attributed to the element
+// that failed.
+// ---------------------------------------------------------------------------
+
+const LIMIT: Duration = Duration::from_secs(10);
+
+struct FailingSource;
+
+impl Source for FailingSource {
+    fn produce(&mut self, _ctx: &mut ProduceContext) -> Result<ProduceResult> {
+        Err(Error::Element("simulated device failure".into()))
+    }
+
+    fn name(&self) -> &str {
+        "failing-source"
+    }
+}
+
+/// A live source: produces forever, so only the handler can end the run.
+struct InfiniteSource {
+    sequence: u64,
+    arena: SharedArena,
+}
+
+impl InfiniteSource {
+    fn new() -> Self {
+        Self {
+            sequence: 0,
+            arena: SharedArena::new(64, 256).unwrap(),
+        }
+    }
+}
+
+impl Source for InfiniteSource {
+    fn produce(&mut self, _ctx: &mut ProduceContext) -> Result<ProduceResult> {
+        self.arena.reclaim();
+        let slot = self
+            .arena
+            .acquire()
+            .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+        let buffer = Buffer::new(
+            MemoryHandle::with_len(slot, 64),
+            Metadata::from_sequence(self.sequence),
+        );
+        self.sequence += 1;
+        Ok(ProduceResult::OwnBuffer(buffer))
+    }
+
+    fn name(&self) -> &str {
+        "infinite-source"
+    }
+}
+
+fn clean_pipeline() -> Pipeline {
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_source("src", NullSource::new(5));
+    let sink = pipeline.add_sink("sink", NullSink::new());
+    pipeline.link(src, sink).unwrap();
+    pipeline
+}
+
+fn failing_pipeline() -> Pipeline {
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_source("src", FailingSource);
+    let sink = pipeline.add_sink("sink", NullSink::new());
+    pipeline.link(src, sink).unwrap();
+    pipeline
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_clean_pipeline_posts_eos_to_the_bus() {
+    let mut pipeline = clean_pipeline();
+    let mut bus = pipeline.take_bus().unwrap();
+
+    let handle = Executor::new().start(&mut pipeline).unwrap();
+
+    let outcome = tokio::time::timeout(LIMIT, bus.wait_for_eos_or_error())
+        .await
+        .expect("wait_for_eos_or_error never returned on a clean run");
+    assert_eq!(outcome, Ok(()));
+
+    handle.wait().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failing_pipeline_posts_error_to_the_bus() {
+    let mut pipeline = failing_pipeline();
+    let mut bus = pipeline.take_bus().unwrap();
+
+    let handle = Executor::new().start(&mut pipeline).unwrap();
+
+    let outcome = tokio::time::timeout(LIMIT, bus.wait_for_eos_or_error())
+        .await
+        .expect("wait_for_eos_or_error never returned on a failing run");
+    match outcome {
+        Err(msg) => assert!(msg.contains("simulated device failure"), "got: {msg}"),
+        Ok(()) => panic!("a failing pipeline reported a clean end"),
+    }
+
+    assert!(handle.wait().await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_terminal_message_names_the_element_that_failed() {
+    let mut pipeline = failing_pipeline();
+    let mut bus = pipeline.take_bus().unwrap();
+
+    let handle = Executor::new().start(&mut pipeline).unwrap();
+    let _ = handle.wait().await;
+
+    let mut errors = Vec::new();
+    while let Some(msg) = bus.poll() {
+        if matches!(msg.kind, MessageKind::Error { .. }) {
+            errors.push(msg);
+        }
+    }
+
+    assert_eq!(errors.len(), 1, "expected exactly one Error message");
+    assert_eq!(errors[0].source, "src");
+}
+
+/// Never both. A failure must not also report the stream running out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failing_pipeline_posts_no_eos() {
+    let mut pipeline = failing_pipeline();
+    let mut bus = pipeline.take_bus().unwrap();
+
+    let handle = Executor::new().start(&mut pipeline).unwrap();
+    let _ = handle.wait().await;
+
+    while let Some(msg) = bus.poll() {
+        assert!(
+            !matches!(msg.kind, MessageKind::Eos),
+            "a failing run posted Eos as well as Error"
+        );
+    }
+}
+
+/// An aborted run is neither: there is no `MessageKind::Aborted`, and an `Eos`
+/// would claim the stream ran out when the caller cut it off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_aborted_pipeline_posts_no_terminal_message() {
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_source("src", InfiniteSource::new());
+    let sink = pipeline.add_sink("sink", NullSink::new());
+    pipeline.link(src, sink).unwrap();
+    let mut bus = pipeline.take_bus().unwrap();
+
+    let handle = Executor::new().start(&mut pipeline).unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    handle.abort();
+
+    while let Some(msg) = bus.poll() {
+        assert!(
+            !matches!(msg.kind, MessageKind::Eos | MessageKind::Error { .. }),
+            "an aborted run posted a terminal message: {:?}",
+            msg.kind
+        );
+    }
+}
+
+/// The `Error` arm of `run_with_bus` was unreachable twice over: nothing posted
+/// `Error`, and the drain ran after `handle.wait().await?` had already returned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_with_bus_surfaces_the_error_through_the_handler() {
+    let mut pipeline = failing_pipeline();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+
+    let recorder = seen.clone();
+    let result = tokio::time::timeout(
+        LIMIT,
+        pipeline.run_with_bus(move |msg| {
+            recorder.lock().unwrap().push(format!("{:?}", msg.kind));
+            true
+        }),
+    )
+    .await
+    .expect("run_with_bus never returned");
+
+    assert!(result.is_err(), "a failing pipeline returned Ok");
+    let seen = seen.lock().unwrap();
+    assert!(
+        seen.iter().any(|k| k.starts_with("Error")),
+        "the handler never saw the Error message: {seen:?}"
+    );
+}
+
+/// "Return `false` to stop the pipeline" has been documented all along and has
+/// never worked: the handler only ever ran on an already-dead pipeline, so
+/// `false` broke a drain loop and nothing else. With a live source, that is the
+/// difference between returning and hanging forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_with_bus_returning_false_stops_a_live_source() {
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_source("src", InfiniteSource::new());
+    let sink = pipeline.add_sink("sink", NullSink::new());
+    pipeline.link(src, sink).unwrap();
+
+    let result = tokio::time::timeout(LIMIT, pipeline.run_with_bus(|_| false))
+        .await
+        .expect("returning false did not stop a live pipeline");
+
+    result.unwrap();
 }
 
 /// Test that tags can be posted and received.

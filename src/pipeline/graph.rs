@@ -2621,8 +2621,11 @@ impl Pipeline {
 
     /// Run the pipeline with a bus message handler callback.
     ///
-    /// The callback is called for each bus message. Return `true` to continue,
-    /// `false` to stop the pipeline. EOS and Error are handled automatically.
+    /// The callback runs *while* the pipeline runs, on each message as it
+    /// arrives. Return `true` to continue, `false` to stop the pipeline —
+    /// a cooperative stop, so the sources end their loop and the run finishes
+    /// with EOS. `Eos` and `Error` are handled for you: an `Error` message
+    /// stops the pipeline and is returned as the call's error.
     ///
     /// # Example
     ///
@@ -2636,32 +2639,76 @@ impl Pipeline {
     where
         F: FnMut(&crate::pipeline::bus::Message) -> bool,
     {
-        let mut bus = self
-            .take_bus()
-            .unwrap_or_else(|| crate::pipeline::bus::Bus::new().0);
+        use crate::pipeline::bus::{Bus, MessageKind};
+
+        let mut bus = self.take_bus().unwrap_or_else(|| Bus::new().0);
         let executor = crate::pipeline::Executor::new();
         let handle = executor.start(self)?;
-        handle.wait().await?;
+        // Before `wait()` takes the handle by value. Without this the
+        // documented `false` could not stop anything.
+        let stopper = handle.stopper();
 
-        // Drain bus messages through the handler
-        while let Some(msg) = bus.poll() {
+        // The bus is drained *concurrently*, not afterwards. Draining after
+        // `handle.wait().await?` meant `?` returned first on exactly the runs
+        // that had something to report, so the `Error` arm below was
+        // unreachable and the handler never saw a live pipeline at all.
+        let mut waiting = std::pin::pin!(handle.wait());
+        let mut finished: Option<Result<()>> = None;
+        let mut bus_error: Option<String> = None;
+        let mut delivering = true;
+
+        let mut dispatch = |msg: &crate::pipeline::bus::Message,
+                            delivering: &mut bool,
+                            bus_error: &mut Option<String>| {
+            if !*delivering {
+                return;
+            }
             match &msg.kind {
-                crate::pipeline::bus::MessageKind::Eos => {
-                    handler(&msg);
-                    break;
+                MessageKind::Eos => {
+                    handler(msg);
+                    *delivering = false;
                 }
-                crate::pipeline::bus::MessageKind::Error { error, .. } => {
-                    handler(&msg);
-                    return Err(Error::Pipeline(error.clone()));
+                MessageKind::Error { error, .. } => {
+                    handler(msg);
+                    if bus_error.is_none() {
+                        *bus_error = Some(error.clone());
+                    }
+                    *delivering = false;
+                    stopper.stop();
                 }
                 _ => {
-                    if !handler(&msg) {
-                        break;
+                    if !handler(msg) {
+                        *delivering = false;
+                        stopper.stop();
                     }
                 }
             }
+        };
+
+        while finished.is_none() {
+            tokio::select! {
+                result = &mut waiting => finished = Some(result),
+                // The pipeline holds a `BusHandle` for the whole call, so this
+                // never yields `None` and never disables the branch.
+                Some(msg) = bus.next() => dispatch(&msg, &mut delivering, &mut bus_error),
+            }
         }
-        Ok(())
+        // Whatever landed between the last poll of the select and the tasks
+        // finishing. Never returned before `waiting` resolved: dropping a
+        // `JoinHandle` does not abort the task behind it.
+        while let Some(msg) = bus.poll() {
+            dispatch(&msg, &mut delivering, &mut bus_error);
+        }
+
+        match (
+            finished.expect("the loop only exits once it is set"),
+            bus_error,
+        ) {
+            // The typed error carries the variant; the bus message is a string.
+            (Err(e), _) => Err(e),
+            (Ok(()), Some(error)) => Err(Error::Pipeline(error)),
+            (Ok(()), None) => Ok(()),
+        }
     }
 
     /// Run the pipeline with custom executor configuration.

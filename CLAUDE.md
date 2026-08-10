@@ -93,7 +93,7 @@ p.link_pads(xfm, "src", sink, "sink")?;
 
 ### Execution
 
-- `pipeline.run().await` — run to completion. `pipeline.run_with_bus(|msg| bool).await` — with message handler.
+- `pipeline.run().await` — run to completion. `pipeline.run_with_bus(|msg| bool).await` — the handler runs *while* the pipeline runs, and returning `false` really stops it (cooperative stop → EOS).
 - `Executor::with_config(cfg)`; **`executor.start(&mut p)` is SYNC** and returns `PipelineHandle`; `handle.wait().await`. Only `executor.run()` is async. Never write `executor.start(...).await`.
 - `ExecutorConfig { scheduling: SchedulingMode::{Async|Hybrid|RealTime}, auto_strategy: bool (default true), channel_capacity, rt: RtConfig{quantum, rt_priority, data_threads, bridge_capacity}, driver }`. Presets: `low_latency_audio()`, `video(fps)`, `hybrid()`.
 - **`ElementStrategy` has exactly two variants: `Async` and `RealTime`.** Auto rule: `rt_safe && latency ∈ {UltraLow, Low}` → RealTime; else Async. `trust_level`/`uses_native_code` are currently IGNORED (process isolation was removed in commit da6df59 — never document an "isolated process" strategy).
@@ -105,6 +105,7 @@ p.link_pads(xfm, "src", sink, "sink")?;
 - `Bus`/`BusHandle`; `MessageKind::{StateChanged, Eos, Error, Warning, Info, Tag, DurationChanged, StreamCollection, Qos, LatencyChanged, Buffering, AsyncStart, AsyncDone, ClockLost, NewClock, SeekDone, Element, Application}`.
 - Consume: `bus.poll()`, `bus.next().await`, `bus.subscribe()` (broadcast), `bus.into_stream()` (`futures::Stream`, works with `select!`), `bus.wait_for_eos_or_error().await`.
 - Separate typed event channel: `PipelineHandle::subscribe() -> EventReceiver` (`pipeline/events.rs`) — distinct from the bus.
+- **Terminal outcome**: `PipelineHandle::ended() -> Ended` (a `Future<Output = EndReason>`) / `end_reason()`. Backed by a `watch`, so it **retains** the answer — a late observer still gets it. `EndReason::{Eos, Error(StreamError), Aborted}` lives in `pipeline::events` (re-exported from `elements`); `stop()` ends as `Eos`, `abort()` as `Aborted`. Prefer it to `EventReceiver::wait_eos()`, which is broadcast-backed and loses a terminal event sent before you subscribed. `PipelineHandle::stopper() -> Stopper` outlives the handle, which `wait()` consumes.
 - In-band events (`src/event/`): downstream `StreamStart/Segment/Tags/Eos/CapsChanged/Gap`, upstream `Seek/Qos/LatencyQuery`, bidirectional `FlushStart/FlushStop/Custom`; `PipelineItem::{Buffer, Event}` keeps ordering through channels.
 
 ### Seeking / probes / tracers / typefind / flow control

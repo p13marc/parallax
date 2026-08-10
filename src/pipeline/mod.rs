@@ -67,7 +67,7 @@ pub use bus::{
 pub use driver::{
     DriverConfig, DriverStats, ManualDriver, RtTimerDriverHandle, TimerDriver, TimerDriverHandle,
 };
-pub use events::{EventReceiver, EventSender, EventStream, PipelineEvent, StreamError};
+pub use events::{EndReason, EventReceiver, EventSender, EventStream, PipelineEvent, StreamError};
 pub use factory::ElementFactory;
 pub use graph::{
     ConverterPolicy, DotOptions, Link, LinkId, LinkInfo, LinkPolicy, Node, NodeId, Pipeline,
@@ -91,7 +91,7 @@ pub use typefind::{MediaType, TypeFindProbability, TypeFindRegistry, TypeFindRes
 pub use unified_executor::ExecutorConfig as UnifiedExecutorConfig;
 /// Deprecated alias for [`PipelineHandle`]; there is only one executor now.
 pub use unified_executor::PipelineHandle as UnifiedPipelineHandle;
-pub use unified_executor::{Executor, ExecutorConfig, PipelineHandle};
+pub use unified_executor::{Ended, Executor, ExecutorConfig, PipelineHandle, Stopper};
 
 // Builder API
 pub use builder::{

@@ -5,30 +5,11 @@
 use crate::buffer::Buffer;
 use crate::element::{ConsumeContext, Sink};
 use crate::error::{Error, Result};
-use crate::pipeline::StreamError;
+use crate::pipeline::{EndReason, StreamError};
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
-
-/// Why a stream ended.
-///
-/// Terminal and sticky: the first reason recorded is the one reported, so a
-/// clean EOS arriving after a failure cannot paper over it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EndReason {
-    /// Every upstream source ran to completion.
-    Eos,
-    /// An element failed. No more buffers are coming.
-    Error(StreamError),
-    /// The pipeline was torn down mid-stream.
-    ///
-    /// Only [`PipelineHandle::ended`] produces this; an `AppSink` never sees it,
-    /// because an aborted task cannot deliver anything.
-    ///
-    /// [`PipelineHandle::ended`]: crate::pipeline::PipelineHandle
-    Aborted,
-}
 
 /// The outcome of a pull. Every way one can end, named.
 ///

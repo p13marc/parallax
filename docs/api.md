@@ -18,7 +18,7 @@ brings in: `Buffer`, `Metadata`/`BufferFlags`/`RtpMeta`, clock types (`Clock`, `
 |------|---------|
 | `Pipeline` | The graph: `new()`, `parse(desc)`, `parse_with_factory`, `add_source[_with_arena/_with_pool]`, `add_sink`, `add_transform`, `add_filter`, `add_element`, `link`, `link_pads`, `get_element::<T>`, state methods (`prepare`/`activate`/`pause`/`suspend`), `run()`, `run_with_bus`, `start()`, seek/query surface, probes, `to_dot`/`to_json`, `select_clock`/`set_clock`, `set_converter_policy` |
 | `Executor`, `ExecutorConfig`, `SchedulingMode`, `RtConfig` | Execution: strategy config, hybrid RT setup; `Executor::start` (sync) → `PipelineHandle`; `run` (async) |
-| `PipelineHandle` | `wait()`, `abort()`, `subscribe()` (typed events), bus access |
+| `PipelineHandle` | `wait()`, `ended()`/`end_reason()` (terminal outcome, retained), `stop()`/`stopper()`, `abort()`, `subscribe()` (typed events), bus access |
 | `PipelineState`, `ConverterPolicy`, `DotOptions` | State enum; Deny/Warn/Allow; DOT export options |
 | `PipelineBuilder` | Typestate fluent builder (`source().then().tee().sink().build()`) |
 | `bus::{Bus, BusHandle, BusStream, Message, MessageKind, BufferingMode}` | Element→app messaging; `poll`/`next().await`/`subscribe`/`into_stream` |

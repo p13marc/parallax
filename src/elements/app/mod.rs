@@ -10,7 +10,10 @@ mod appsrc;
 #[cfg(feature = "display")]
 mod autovideosink;
 
-pub use appsink::{AppSink, AppSinkHandle, AppSinkStats, EndReason, Pulled};
+/// Re-exported from [`crate::pipeline`], where the terminal outcome now lives —
+/// it is the pipeline's answer as much as a sink's.
+pub use crate::pipeline::EndReason;
+pub use appsink::{AppSink, AppSinkHandle, AppSinkStats, Pulled};
 pub use appsrc::{AppSrc, AppSrcHandle, AppSrcStats};
 
 #[cfg(feature = "display")]

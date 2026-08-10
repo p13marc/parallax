@@ -281,7 +281,7 @@ Full catalog with feature flags in **[docs/elements.md](docs/elements.md)**. Sum
 
 ## Infrastructure at a glance
 
-- **Bus & messages** — `Message`/`MessageKind` (Eos, Error, Warning, Tag, Qos, Buffering, StateChanged, …); poll, `await`, broadcast-subscribe, or consume as a `futures::Stream` (`bus.into_stream()`); `pipeline.run_with_bus(|msg| ...)`. See `examples/51_bus_messages.rs`.
+- **Bus & messages** — `Message`/`MessageKind` (Eos, Error, Warning, Tag, Qos, Buffering, StateChanged, …); poll, `await`, broadcast-subscribe, or consume as a `futures::Stream` (`bus.into_stream()`); `pipeline.run_with_bus(|msg| ...)` delivers them live. Every run posts exactly one terminal message — `Eos`, or `Error` naming the element that failed. See `examples/51_bus_messages.rs`.
 - **Seeking** — `pipeline.seek_bytes(pos)` / `seek_time(t)`, `query_position()`, `query_duration()`, `query_seekable()`; segment events map PTS to running/stream time. See `examples/52_seeking.rs`.
 - **Pad probes** — intercept buffers/events at any pad (`ProbeType::BUFFER`, `ProbeReturn::{Ok, Drop, Remove, Handled}`). See `examples/53_pad_probes.rs`.
 - **Tracers** — `LatencyTracer`, `FramerateTracer`, `DropTracer`; activate with `PARALLAX_TRACERS="latency;framerate;drops"`; DOT graph dumps via `PARALLAX_DOT_DIR`. See `examples/54_tracers.rs`.

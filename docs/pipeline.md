@@ -152,7 +152,7 @@ Suspended <──> Idle <──> Running
 // Simplest: run to completion
 pipeline.run().await?;
 
-// With a bus handler (breaks on Eos, errors on Error messages)
+// With a live bus handler (return false to stop; Error ends the run)
 pipeline.run_with_bus(|msg| { println!("{msg}"); true }).await?;
 
 // With a custom executor config
@@ -164,7 +164,30 @@ let handle = pipeline.start()?;
 handle.wait().await?;
 ```
 
-`PipelineHandle` gives you `wait()`, `abort()`, `subscribe()` (typed `PipelineEvent` channel), and access to the bus (`bus_mut()`, `take_bus()`, `bus_handle()`).
+`PipelineHandle` gives you `wait()`, `abort()`, `stop()`, `subscribe()` (typed `PipelineEvent` channel), and access to the bus (`bus_mut()`, `take_bus()`, `bus_handle()`).
+
+### How the run ended
+
+`wait()` takes the handle by value, so the caller who keeps it to *control* the pipeline cannot use it to learn the outcome. `ended()` answers instead, and unlike `subscribe()` it **retains** the answer — an observer that arrives after the pipeline finished still gets it rather than waiting forever.
+
+```rust
+let ended = handle.ended();          // owned, so it survives `wait()`
+
+tokio::select! {
+    _ = tokio::signal::ctrl_c() => handle.abort(),
+    reason = ended => match reason {
+        EndReason::Eos           => println!("stream ran out"),
+        EndReason::Error(err)    => eprintln!("{err}"),   // names the element
+        EndReason::Aborted       => println!("torn down"),
+    },
+}
+```
+
+`end_reason()` is the non-blocking peek. `stopper()` hands out a `Stopper` that outlives the handle, for stopping a pipeline you have already `wait()`ed on elsewhere.
+
+`stop()` reports `Eos` (the sources end their loop and EOS flows downstream as usual); `abort()` reports `Aborted`. The same `EndReason` is what an `AppSink` reports for its own branch — see [elements.md](elements.md).
+
+In hybrid mode the answer waits for `wait()`/`abort()` to join the RT threads, which never end on their own.
 
 Executor configuration and the async/RT scheduling model are covered in [scheduling.md](scheduling.md).
 
@@ -208,6 +231,10 @@ let mut rx = bus.subscribe();
 `MessageKind` variants: `StateChanged`, `Eos`, `Error`, `Warning`, `Info`, `Tag` (with `TagList`), `DurationChanged`, `StreamCollection`, `Qos`, `LatencyChanged`, `Buffering` (percent + rates + `BufferingMode`), `AsyncStart`/`AsyncDone`, `ClockLost`/`NewClock`, `SeekDone`, and generic `Element`/`Application` structures.
 
 Elements post via their `BusHandle` (`ctx.post_message(...)` in produce/consume contexts, or typed helpers `post_error`, `post_tags`, `post_buffering`, …). See `examples/51_bus_messages.rs`.
+
+**Terminal messages.** A run posts exactly one — `Eos`, or `Error` with `msg.source` naming the element that failed — never both, and never twice however many elements a single failure takes down. An aborted run posts neither: there is no `Aborted` message, and an `Eos` would claim the stream ran out when the caller cut it off. That is what makes `bus.wait_for_eos_or_error()` terminate.
+
+`pipeline.run_with_bus(handler)` delivers messages to the handler *as they arrive*, not after the run; returning `false` cooperatively stops the pipeline, and an `Error` message stops it and becomes the call's error.
 
 ## In-band events
 

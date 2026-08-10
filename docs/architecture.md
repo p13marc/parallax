@@ -131,7 +131,7 @@ What happens for one buffer in `filesrc ! passthrough ! filesink`:
 3. The source task calls `FileSrc::produce(ctx)`; the file chunk is read directly into an arena slot; `Produced(n)` finalizes a `Buffer` (slot ref + metadata).
 4. The buffer moves through the channel (refcount move, no copy). Probes registered on the pads run before forwarding; tracers observe timestamps.
 5. `passthrough` returns the same buffer; `FileSink::consume(ctx)` writes it out.
-6. On EOS the source returns `ProduceResult::Eos`; downstream elements get `flush()` calls until drained; the bus posts `Eos`; `run()` resolves.
+6. On EOS the source returns `ProduceResult::Eos`; downstream elements get `flush()` calls until drained; the bus posts `Eos`; `run()` resolves. A failure takes the same shape: the bus posts `Error` naming the element instead, and `run()` resolves with it. Exactly one of the two per run.
 
 For a hybrid pipeline, step 2 additionally partitions the graph, spawns RT data threads, and connects domains with bridges; the RT side is driven in fixed quanta by the driver instead of being channel-driven.
 

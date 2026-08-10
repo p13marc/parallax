@@ -44,16 +44,20 @@ use crate::pipeline::rt_scheduler::{
 };
 use crate::pipeline::tracer::TracerRegistry;
 use crate::pipeline::{
-    DriverConfig, EventReceiver, EventSender, LinkPolicy, NodeId, Pipeline, PipelineEvent,
-    PipelineState, StreamError, TimerDriver,
+    DriverConfig, EndReason, EventReceiver, EventSender, LinkPolicy, NodeId, Pipeline,
+    PipelineEvent, PipelineState, StreamError, TimerDriver,
 };
 use futures::FutureExt;
 use kanal::{AsyncReceiver, AsyncSender, bounded_async};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::panic::AssertUnwindSafe;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 // ============================================================================
@@ -296,6 +300,211 @@ fn determine_element_strategy(hints: &ExecutionHints) -> ElementStrategy {
 }
 
 // ============================================================================
+// Terminal outcome
+// ============================================================================
+
+/// How the run ended, decided once and remembered.
+///
+/// The outcome used to be reachable only through [`PipelineHandle::wait`], which
+/// consumes the handle — so the caller who keeps the handle to control the
+/// pipeline could never learn why it stopped. The event channel could not fill
+/// the gap either: it is a `broadcast`, so a terminal event sent before you
+/// subscribed is gone.
+///
+/// Hence [`watch`]: it *retains* its value, so an observer that arrives after
+/// the pipeline is long finished still sees the answer.
+///
+/// Two rules hold everything together:
+///
+/// - **Sticky.** The first writer wins, so an error can never be papered over by
+///   a sibling's later clean EOS. [`watch::Sender::send_if_modified`] runs the
+///   closure under the write lock, which makes that an atomic compare-and-set,
+///   and its `bool` result is the "did I win" signal that gates the bus post.
+/// - **Counted.** `live` is one per spawned task plus a seed, and the *last*
+///   task out declares EOS. Without the seed, a source that finishes before its
+///   siblings are even spawned would declare EOS for the whole graph.
+struct TerminalOutcome {
+    tx: watch::Sender<Option<EndReason>>,
+    live: AtomicUsize,
+    bus: BusHandle,
+}
+
+impl TerminalOutcome {
+    fn new(bus: BusHandle) -> Arc<Self> {
+        let (tx, _) = watch::channel(None);
+        Arc::new(Self {
+            tx,
+            live: AtomicUsize::new(0),
+            bus,
+        })
+    }
+
+    /// Record the outcome if nothing has been recorded yet.
+    ///
+    /// Returns whether this call is the one that decided it.
+    fn record(&self, reason: EndReason) -> bool {
+        self.tx.send_if_modified(|slot| {
+            if slot.is_some() {
+                return false;
+            }
+            *slot = Some(reason);
+            true
+        })
+    }
+
+    /// The pipeline failed. Reports it on the bus, attributed to the element.
+    fn fail_with(&self, err: StreamError) {
+        // The bus message is gated on winning, so a run posts exactly one
+        // terminal message: a graph that loses three elements to the same cause
+        // is one failure, not three, and `Bus::wait_for_eos_or_error` would
+        // report whichever raced to the front anyway.
+        if self.record(EndReason::Error(err.clone())) {
+            match err.node() {
+                Some(node) => self.bus.for_element(node).post_error(err.message(), None),
+                None => self.bus.post_error(err.message(), None),
+            }
+        }
+    }
+
+    fn fail(&self, node: &str, err: &Error) {
+        self.fail_with(StreamError::new(node, err.to_string()));
+    }
+
+    /// Every task is done and none of them failed.
+    fn finish(&self) {
+        if self.record(EndReason::Eos) {
+            self.bus.post_eos();
+        }
+    }
+
+    /// The pipeline was torn down. Deliberately silent on the bus: there is no
+    /// `MessageKind::Aborted`, and an `Eos` here would claim the stream ran out
+    /// when the caller cut it off.
+    fn abort(&self) {
+        self.record(EndReason::Aborted);
+    }
+
+    fn peek(&self) -> Option<EndReason> {
+        self.tx.borrow().clone()
+    }
+}
+
+/// One task's share of the live count, released on drop.
+///
+/// Drop, and not an explicit call at the end of each task, because the error
+/// arms `return Err` early and an aborted task never reaches any arm at all.
+/// Drop is the only exit every path goes through.
+struct TaskGuard {
+    outcome: Arc<TerminalOutcome>,
+    node: Arc<str>,
+}
+
+impl TaskGuard {
+    /// Claim a share. Called on the spawning thread, *before* `tokio::spawn`:
+    /// spawn returns before the future is first polled, so a guard built inside
+    /// the task body would leave the count at the seed and let `start()` declare
+    /// EOS before a single element had run.
+    fn new(outcome: &Arc<TerminalOutcome>, node: &str) -> Self {
+        outcome.live.fetch_add(1, Ordering::Relaxed);
+        Self {
+            outcome: outcome.clone(),
+            node: node.into(),
+        }
+    }
+
+    fn fail(&self, err: &Error) {
+        self.outcome.fail(&self.node, err);
+    }
+}
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        // A panic that escaped `guard()` — from a probe, a tracer, or the
+        // plumbing between element calls — unwinds past every error arm, so
+        // without this the task would silently count as a clean finish while
+        // `wait()` reported `Error::Panic`. Two observers, two answers.
+        //
+        // False positives are structurally excluded: unwinding has already
+        // stopped by the time `guard()`'s `catch_unwind` returns, and task
+        // cancellation is not a panic.
+        if std::thread::panicking() {
+            self.outcome.fail_with(StreamError::new(
+                &*self.node,
+                "task panicked outside the element call",
+            ));
+        }
+
+        if self.outcome.live.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.outcome.finish();
+        }
+    }
+}
+
+/// Run a task body, recording its failure before the guard releases the count.
+///
+/// Wrapping the whole body rather than editing each error arm is deliberate:
+/// the arms disagree about what they report — the two `shed_fatal_after` paths
+/// return `Err` without telling anyone at all — and a new arm added later would
+/// have to remember. Here the ordering that makes "error beats EOS" work
+/// (record, *then* release the count) is a property of the code shape.
+async fn reporting(share: TaskGuard, body: impl Future<Output = Result<()>>) -> Result<()> {
+    let result = body.await;
+    if let Err(e) = &result {
+        share.fail(e);
+    }
+    result
+}
+
+/// The pipeline's terminal outcome, awaitable.
+///
+/// Owned rather than borrowed, so it can be created before
+/// [`PipelineHandle::wait`] consumes the handle and awaited afterwards, or
+/// raced against `wait()` in a `select!`:
+///
+/// ```rust,ignore
+/// let ended = handle.ended();
+/// tokio::select! {
+///     _ = tokio::signal::ctrl_c() => handle.abort(),
+///     reason = ended => println!("pipeline ended: {reason:?}"),
+/// }
+/// ```
+#[must_use = "Ended is a future — await it to learn how the pipeline finished"]
+pub struct Ended {
+    inner: Pin<Box<dyn Future<Output = EndReason> + Send>>,
+}
+
+impl Future for Ended {
+    type Output = EndReason;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<EndReason> {
+        self.inner.as_mut().poll(cx)
+    }
+}
+
+impl std::fmt::Debug for Ended {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Ended").finish_non_exhaustive()
+    }
+}
+
+/// Cooperative stop, detached from the handle.
+///
+/// [`PipelineHandle::wait`] takes the handle by value, so a caller that awaits
+/// it can no longer reach [`PipelineHandle::stop`]. Take one of these first and
+/// the two are independent.
+#[derive(Clone, Debug)]
+pub struct Stopper {
+    stop: Arc<AtomicBool>,
+}
+
+impl Stopper {
+    /// Ask every source to stop producing. See [`PipelineHandle::stop`].
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Release);
+    }
+}
+
+// ============================================================================
 // Handle
 // ============================================================================
 
@@ -324,6 +533,12 @@ pub struct PipelineHandle {
     /// Cooperative stop flag, checked by source tasks between `produce()`
     /// calls (see [`PipelineHandle::stop`]).
     stop: Arc<AtomicBool>,
+    /// How the run ended, once it has (see [`PipelineHandle::ended`]).
+    outcome: Arc<TerminalOutcome>,
+    /// The seed share of the live count, retained only when RT threads are
+    /// running. They loop until told to stop, so they cannot be counted like
+    /// tasks — instead the seed holds EOS back until `wait`/`abort` joins them.
+    seed: Option<TaskGuard>,
 }
 
 impl PipelineHandle {
@@ -355,6 +570,10 @@ impl PipelineHandle {
                         Error::Pipeline(format!("element task did not finish: {e}"))
                     };
                     self.events.send_error(err.to_string(), None);
+                    // The task never ran its own epilogue, so nothing has told
+                    // the outcome. (The `Ok(Err(e))` arm above needs no such
+                    // call — that task reported before it returned.)
+                    self.outcome.fail("<unknown>", &err);
                     if first_error.is_none() {
                         first_error = Some(err);
                     }
@@ -375,25 +594,35 @@ impl PipelineHandle {
             let join_result = tokio::task::spawn_blocking(move || handle.join()).await;
             match join_result {
                 Ok(Err(e)) => {
+                    // An RT thread is not a task and has no guard, so this is
+                    // the only place its failure can reach the outcome.
+                    self.outcome.fail("<rt-thread>", &e);
                     if first_error.is_none() {
                         first_error = Some(e);
                     }
                 }
                 Err(e) => {
+                    let err = if e.is_panic() {
+                        Error::Panic {
+                            node: "<rt-join>".into(),
+                            message: crate::error::panic_message(e.into_panic().as_ref()),
+                        }
+                    } else {
+                        Error::Pipeline(format!("RT thread join did not finish: {e}"))
+                    };
+                    self.outcome.fail("<rt-join>", &err);
                     if first_error.is_none() {
-                        first_error = Some(if e.is_panic() {
-                            Error::Panic {
-                                node: "<rt-join>".into(),
-                                message: crate::error::panic_message(e.into_panic().as_ref()),
-                            }
-                        } else {
-                            Error::Pipeline(format!("RT thread join did not finish: {e}"))
-                        });
+                        first_error = Some(err);
                     }
                 }
                 Ok(Ok(())) => {}
             }
         }
+
+        // Every RT thread is joined, so the seed can go — this is what lets a
+        // hybrid pipeline reach EOS at all. Async-only runs released it back in
+        // `start()` and this is a no-op.
+        drop(self.seed.take());
 
         if first_error.is_none() {
             self.events.send_eos();
@@ -402,6 +631,63 @@ impl PipelineHandle {
         match first_error {
             Some(e) => Err(e),
             None => Ok(()),
+        }
+    }
+
+    /// How the pipeline ended, awaitable — and, unlike [`wait`](Self::wait),
+    /// without consuming the handle.
+    ///
+    /// Resolves once for the run and then keeps resolving: the outcome is
+    /// retained, so an observer that arrives after the pipeline finished still
+    /// gets the answer instead of waiting forever. That is the difference from
+    /// [`subscribe`](Self::subscribe), whose broadcast channel drops anything
+    /// sent before you subscribed.
+    ///
+    /// The returned [`Ended`] is owned, so the usual shape works:
+    ///
+    /// ```rust,ignore
+    /// let ended = handle.ended();
+    /// handle.wait().await?;
+    /// assert_eq!(ended.await, EndReason::Eos);
+    /// ```
+    ///
+    /// In hybrid mode the answer waits for [`wait`](Self::wait) or
+    /// [`abort`](Self::abort) to join the RT threads, which never end on their
+    /// own.
+    pub fn ended(&self) -> Ended {
+        // Moving the Arc into the future keeps the sender alive for as long as
+        // anyone is waiting, so `wait_for` cannot fail on a dropped handle.
+        // Subscribing inside is safe: `wait_for` inspects the current value
+        // before it waits, which is exactly the late-observer guarantee.
+        let outcome = self.outcome.clone();
+        Ended {
+            inner: Box::pin(async move {
+                let mut rx = outcome.tx.subscribe();
+                match rx.wait_for(|slot| slot.is_some()).await {
+                    Ok(slot) => slot.clone().unwrap_or(EndReason::Aborted),
+                    Err(_) => {
+                        debug_assert!(false, "the outcome sender outlives every Ended");
+                        EndReason::Aborted
+                    }
+                }
+            }),
+        }
+    }
+
+    /// How the pipeline ended, or `None` if it is still running.
+    ///
+    /// The non-blocking twin of [`ended`](Self::ended).
+    pub fn end_reason(&self) -> Option<EndReason> {
+        self.outcome.peek()
+    }
+
+    /// A [`Stopper`] that outlives this handle.
+    ///
+    /// [`wait`](Self::wait) takes the handle by value; take one of these before
+    /// awaiting it if you still need to stop the pipeline.
+    pub fn stopper(&self) -> Stopper {
+        Stopper {
+            stop: self.stop.clone(),
         }
     }
 
@@ -421,11 +707,18 @@ impl PipelineHandle {
     }
 
     /// Abort all pipeline tasks.
+    ///
+    /// Reported as [`EndReason::Aborted`], distinct from the EOS that
+    /// [`stop`](Self::stop) produces: the stream did not run out, it was cut.
     pub fn abort(mut self) {
         // Best effort for live sources: tasks blocked in a synchronous
         // produce() are never re-polled by abort(), so also raise the
         // cooperative stop flag — they exit at the next loop iteration.
         self.stop.store(true, Ordering::Release);
+        // Before the aborts, not after. Cancellation is asynchronous: the tasks
+        // drop their guards on a worker thread moments later, and whichever got
+        // there first would otherwise report a clean EOS for a torn-down run.
+        self.outcome.abort();
         if let Some(task) = self.rt_driver_task.take() {
             task.abort();
         }
@@ -437,6 +730,7 @@ impl PipelineHandle {
             handle.signal_stop();
             let _ = handle.join();
         }
+        drop(self.seed.take());
 
         self.events.send(PipelineEvent::Stopped);
     }
@@ -532,6 +826,11 @@ impl Executor {
         // State transitions
         let old_state = pipeline.state();
         let bus_handle = pipeline.bus_handle().clone();
+        let outcome = TerminalOutcome::new(bus_handle.clone());
+        // The seed share, held for the whole of `start()`. Without it, a source
+        // that runs dry before its siblings are even spawned would take the live
+        // count to zero and declare EOS for the whole graph.
+        let seed = TaskGuard::new(&outcome, "<pipeline>");
         if old_state == PipelineState::Suspended {
             pipeline.prepare()?;
             events.send_state_changed(old_state, PipelineState::Idle);
@@ -600,7 +899,8 @@ impl Executor {
         // Execute based on scheduling mode
         let (tasks, rt_handles, bridges, rt_driver_task) = match effective_scheduling {
             SchedulingMode::Async => {
-                let tasks = self.run_async(pipeline, clock_info.as_ref(), &events, &stop)?;
+                let tasks =
+                    self.run_async(pipeline, clock_info.as_ref(), &events, &stop, &outcome)?;
                 (tasks, Vec::new(), Vec::new(), None)
             }
             SchedulingMode::Hybrid | SchedulingMode::RealTime => {
@@ -632,7 +932,8 @@ impl Executor {
                              and low-latency — running fully async. Nodes: [{names}]."
                         );
                     }
-                    let tasks = self.run_async(pipeline, clock_info.as_ref(), &events, &stop)?;
+                    let tasks =
+                        self.run_async(pipeline, clock_info.as_ref(), &events, &stop, &outcome)?;
                     (tasks, Vec::new(), Vec::new(), None)
                 } else {
                     self.run_hybrid(
@@ -642,6 +943,7 @@ impl Executor {
                         clock_info.as_ref(),
                         &events,
                         &stop,
+                        &outcome,
                     )?
                 }
             }
@@ -655,7 +957,12 @@ impl Executor {
 
         // Activate (Idle → Running)
         let idle_state = pipeline.state();
-        pipeline.activate()?;
+        if let Err(e) = pipeline.activate() {
+            // The tasks are already spawned. Say what happened before returning,
+            // or they drop their guards into a spurious EOS.
+            outcome.fail("<pipeline>", &e);
+            return Err(e);
+        }
         events.send_state_changed(idle_state, PipelineState::Running);
         bus_handle.post_state_changed(idle_state, PipelineState::Running);
         events.send(PipelineEvent::Started);
@@ -664,6 +971,21 @@ impl Executor {
         // Take the bus from the pipeline and store it on the handle.
         let bus = pipeline.take_bus();
         let bus_handle = Some(pipeline.bus_handle().clone());
+
+        // Release the seed share of the live count, now that every task holds
+        // its own — but only for an all-async run. RT threads loop until told to
+        // stop, so they cannot be counted; instead the seed rides on the handle
+        // and is released once `wait`/`abort` has joined them.
+        //
+        // Last, after the state change is announced: while the seed is held, a
+        // pipeline that finishes instantly cannot post EOS ahead of
+        // `StateChanged{Idle → Running}`.
+        let seed = if rt_handles.is_empty() {
+            drop(seed);
+            None
+        } else {
+            Some(seed)
+        };
 
         Ok(PipelineHandle {
             tasks,
@@ -675,16 +997,20 @@ impl Executor {
             bus,
             bus_handle,
             stop,
+            outcome,
+            seed,
         })
     }
 
     /// Run all nodes as async Tokio tasks.
+    #[allow(clippy::too_many_arguments)]
     fn run_async(
         &self,
         pipeline: &mut Pipeline,
         clock_info: Option<&(Arc<dyn Clock>, ClockTime)>,
         events: &EventSender,
         stop: &Arc<AtomicBool>,
+        outcome: &Arc<TerminalOutcome>,
     ) -> Result<Vec<JoinHandle<Result<()>>>> {
         let mut channels = ChannelNetwork::new();
 
@@ -694,10 +1020,11 @@ impl Executor {
         }
 
         // Spawn tasks
-        self.spawn_tasks(pipeline, channels, clock_info, events, stop)
+        self.spawn_tasks(pipeline, channels, clock_info, events, stop, outcome)
     }
 
     /// Run with hybrid async + RT execution.
+    #[allow(clippy::too_many_arguments)]
     fn run_hybrid(
         &self,
         pipeline: &mut Pipeline,
@@ -706,6 +1033,7 @@ impl Executor {
         clock_info: Option<&(Arc<dyn Clock>, ClockTime)>,
         events: &EventSender,
         stop: &Arc<AtomicBool>,
+        outcome: &Arc<TerminalOutcome>,
     ) -> Result<(
         Vec<JoinHandle<Result<()>>>,
         Vec<crate::pipeline::rt_scheduler::DataThreadHandle>,
@@ -745,7 +1073,7 @@ impl Executor {
 
         // Spawn async tasks for the async portion of the graph
         let tasks = self.spawn_tasks_for_partition(
-            pipeline, partition, channels, scheduler, clock_info, events, stop,
+            pipeline, partition, channels, scheduler, clock_info, events, stop, outcome,
         )?;
 
         // Collect bridges (keep alive)
@@ -974,6 +1302,7 @@ impl Executor {
     }
 
     /// Spawn tasks for all nodes.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_tasks(
         &self,
         pipeline: &mut Pipeline,
@@ -981,6 +1310,7 @@ impl Executor {
         clock_info: Option<&(Arc<dyn Clock>, ClockTime)>,
         events: &EventSender,
         stop: &Arc<AtomicBool>,
+        outcome: &Arc<TerminalOutcome>,
     ) -> Result<Vec<JoinHandle<Result<()>>>> {
         let mut tasks = Vec::new();
 
@@ -994,8 +1324,15 @@ impl Executor {
         let node_ids: Vec<NodeId> = node_ids.into_iter().filter(|id| seen.insert(*id)).collect();
 
         for node_id in node_ids {
-            let task =
-                self.spawn_node_task(pipeline, node_id, &mut channels, clock_info, events, stop)?;
+            let task = self.spawn_node_task(
+                pipeline,
+                node_id,
+                &mut channels,
+                clock_info,
+                events,
+                stop,
+                outcome,
+            )?;
             tasks.push(task);
         }
 
@@ -1013,6 +1350,7 @@ impl Executor {
         clock_info: Option<&(Arc<dyn Clock>, ClockTime)>,
         events: &EventSender,
         stop: &Arc<AtomicBool>,
+        outcome: &Arc<TerminalOutcome>,
     ) -> Result<Vec<JoinHandle<Result<()>>>> {
         let mut tasks = Vec::new();
 
@@ -1040,6 +1378,7 @@ impl Executor {
                 clock_info,
                 events,
                 stop,
+                outcome,
             )?;
             tasks.push(task);
         }
@@ -1048,6 +1387,7 @@ impl Executor {
     }
 
     /// Spawn a task for a single node.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_node_task(
         &self,
         pipeline: &mut Pipeline,
@@ -1056,6 +1396,7 @@ impl Executor {
         clock_info: Option<&(Arc<dyn Clock>, ClockTime)>,
         events: &EventSender,
         stop: &Arc<AtomicBool>,
+        outcome: &Arc<TerminalOutcome>,
     ) -> Result<JoinHandle<Result<()>>> {
         self.spawn_node_task_with_bridges(
             pipeline,
@@ -1066,6 +1407,7 @@ impl Executor {
             clock_info,
             events,
             stop,
+            outcome,
         )
     }
 
@@ -1081,6 +1423,7 @@ impl Executor {
         clock_info: Option<&(Arc<dyn Clock>, ClockTime)>,
         events: &EventSender,
         stop: &Arc<AtomicBool>,
+        outcome: &Arc<TerminalOutcome>,
     ) -> Result<JoinHandle<Result<()>>> {
         // Before `get_node_mut` borrows the pipeline mutably: `children()` needs
         // it shared.
@@ -1123,6 +1466,11 @@ impl Executor {
         let events_clone = events.clone();
         let probes = pipeline.probe_registry().clone();
         let tracers = pipeline.tracer_registry().clone();
+        // Claimed here, on this thread, and *not* inside the task body:
+        // `tokio::spawn` returns before the future is first polled, so a guard
+        // built in there would leave the live count at the seed and let
+        // `start()` declare EOS before any element had run.
+        let share = TaskGuard::new(outcome, &node_name);
 
         let task = match element_type {
             ElementType::Source => spawn_source_task(
@@ -1135,6 +1483,7 @@ impl Executor {
                 probes,
                 tracers,
                 stop.clone(),
+                share,
             ),
             ElementType::Sink => spawn_sink_task(
                 node_name,
@@ -1145,6 +1494,7 @@ impl Executor {
                 events_clone,
                 probes,
                 tracers,
+                share,
             ),
             ElementType::Transform => spawn_transform_task(
                 node_name,
@@ -1158,6 +1508,7 @@ impl Executor {
                 probes,
                 tracers,
                 ShedTracker::new(self.config.shed_fatal_after),
+                share,
             ),
             ElementType::Demuxer => {
                 // Inputs flattened (one sink pad), outputs kept per pad — that
@@ -1173,6 +1524,7 @@ impl Executor {
                     events_clone,
                     probes,
                     tracers,
+                    share,
                 )
             }
             ElementType::Muxer => {
@@ -1188,6 +1540,7 @@ impl Executor {
                     events_clone,
                     probes,
                     tracers,
+                    share,
                 )
             }
         };
@@ -1547,8 +1900,9 @@ fn spawn_source_task(
     probe_registry: ProbeRegistry,
     tracers: TracerRegistry,
     stop: Arc<AtomicBool>,
+    share: TaskGuard,
 ) -> JoinHandle<Result<()>> {
-    tokio::spawn(async move {
+    tokio::spawn(reporting(share, async move {
         tracing::debug!("source '{}' started", name);
         events.send_node_started(&name);
 
@@ -1644,7 +1998,7 @@ fn spawn_source_task(
 
         events.send_node_finished(&name, count);
         Ok(())
-    })
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1657,8 +2011,9 @@ fn spawn_sink_task(
     events: EventSender,
     probe_registry: ProbeRegistry,
     tracers: TracerRegistry,
+    share: TaskGuard,
 ) -> JoinHandle<Result<()>> {
-    tokio::spawn(async move {
+    tokio::spawn(reporting(share, async move {
         tracing::debug!("sink '{}' started", name);
         events.send_node_started(&name);
 
@@ -1759,7 +2114,7 @@ fn spawn_sink_task(
 
         events.send_node_finished(&name, count);
         Ok(())
-    })
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1775,8 +2130,9 @@ fn spawn_transform_task(
     probe_registry: ProbeRegistry,
     tracers: TracerRegistry,
     mut shed: ShedTracker,
+    share: TaskGuard,
 ) -> JoinHandle<Result<()>> {
-    tokio::spawn(async move {
+    tokio::spawn(reporting(share, async move {
         tracing::debug!("transform '{}' started", name);
         events.send_node_started(&name);
 
@@ -2010,7 +2366,7 @@ fn spawn_transform_task(
 
         events.send_node_finished(&name, count);
         Ok(())
-    })
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2023,8 +2379,9 @@ fn spawn_demuxer_task(
     events: EventSender,
     probe_registry: ProbeRegistry,
     tracers: TracerRegistry,
+    share: TaskGuard,
 ) -> JoinHandle<Result<()>> {
-    tokio::spawn(async move {
+    tokio::spawn(reporting(share, async move {
         tracing::debug!("demuxer '{}' started", name);
         events.send_node_started(&name);
 
@@ -2111,7 +2468,7 @@ fn spawn_demuxer_task(
 
         events.send_node_finished(&name, count);
         Ok(())
-    })
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2124,10 +2481,11 @@ fn spawn_muxer_task(
     events: EventSender,
     probe_registry: ProbeRegistry,
     tracers: TracerRegistry,
+    share: TaskGuard,
 ) -> JoinHandle<Result<()>> {
     use futures::stream::{FuturesUnordered, StreamExt};
 
-    tokio::spawn(async move {
+    tokio::spawn(reporting(share, async move {
         tracing::debug!("muxer '{}' started", name);
         events.send_node_started(&name);
 
@@ -2251,7 +2609,7 @@ fn spawn_muxer_task(
 
         events.send_node_finished(&name, count);
         Ok(())
-    })
+    }))
 }
 
 // ============================================================================
