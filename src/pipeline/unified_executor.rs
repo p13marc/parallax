@@ -1120,9 +1120,7 @@ impl Executor {
             if let Some(node) = pipeline.get_node_mut(node_id)
                 && let Some(mut element) = node.take_element()
             {
-                if node.element_type() == ElementType::Source
-                    && let Some((clock, base_time)) = clock_info
-                {
+                if let Some((clock, base_time)) = clock_info {
                     element.set_clock(clock.clone(), *base_time);
                 }
                 element.set_bus(bus);
@@ -1440,10 +1438,12 @@ impl Executor {
             Error::InvalidSegment(format!("element '{}' already taken", node_name))
         })?;
 
-        // Set clock on source elements so they can provide it to ProduceContext
-        if element_type == ElementType::Source
-            && let Some((clock, base_time)) = clock_info
-        {
+        // Hand every element the pipeline clock, exactly as `set_bus` below
+        // does. This used to be gated on `ElementType::Source`, which meant a
+        // sink could not see the clock at all — and so could not schedule
+        // presentation against running time (#65). The trait method defaults
+        // to a no-op, so element types that ignore the clock are unaffected.
+        if let Some((clock, base_time)) = clock_info {
             element.set_clock(clock.clone(), *base_time);
         }
 

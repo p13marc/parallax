@@ -223,6 +223,33 @@ Codec traits: `VideoEncoder`/`VideoDecoder` and `AudioEncoder`/`AudioDecoder` (a
 | PNG | `PngEncoder` / `PngDecoder` | `image-png` | png crate, pure Rust |
 | GPU H.264 decode | `HwDecoderElement` | `vulkan-video` | **experimental scaffold** — does not perform real hardware decode yet |
 
+## Reading the clock from an element
+
+The executor selects the pipeline clock before start (highest-priority
+`ClockProvider` wins) and hands it to **every** element, so both ends of a graph can
+schedule against the same time base.
+
+| Context | Accessors |
+|---------|-----------|
+| `ProduceContext` (sources) | `clock()`, `running_time()`, `clock_time()`, `base_time()` |
+| `ConsumeContext` (sinks) | `clock()`, `running_time()`, `clock_time()`, `base_time()` |
+
+`running_time()` is the one to compare a buffer's PTS against — it is `clock_time()`
+minus the base time captured when the pipeline started. Both return `ClockTime::NONE`
+when no clock is available (the pipeline was never started, or a unit test built the
+context by hand), and a sink that paces presentation must treat that as "consume as
+fast as buffers arrive" rather than stalling:
+
+```rust,ignore
+fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
+    let (Some(_), Some(pts)) = (ctx.clock(), ctx.metadata().pts.to_option()) else {
+        return self.present(ctx.input());     // no clock, or no timestamp: blit now
+    };
+    let now = ctx.running_time();
+    // ...wait until `pts`, or drop the frame if it is already too late
+}
+```
+
 ## Runtime control (bandwidth knobs)
 
 Everything here lives in one module: **`parallax::control`**.

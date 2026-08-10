@@ -2249,12 +2249,17 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
 /// Wrapper to adapt a sync [`Sink`] to [`AsyncElementDyn`].
 pub struct SinkAdapter<S: Sink> {
     inner: S,
+    /// The pipeline clock, once the executor hands it over at start.
+    clock: Option<(Arc<dyn Clock>, ClockTime)>,
 }
 
 impl<S: Sink> SinkAdapter<S> {
     /// Create a new sink adapter.
     pub fn new(sink: S) -> Self {
-        Self { inner: sink }
+        Self {
+            inner: sink,
+            clock: None,
+        }
     }
 
     /// Get a reference to the inner sink.
@@ -2279,7 +2284,10 @@ impl<S: Sink + Send + 'static> SendAsyncElementDyn for SinkAdapter<S> {
 
     async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
         if let Some(ref buffer) = input {
-            let ctx = ConsumeContext::new(buffer);
+            let mut ctx = ConsumeContext::new(buffer);
+            if let Some((clock, base_time)) = &self.clock {
+                ctx.set_clock(clock, *base_time);
+            }
             self.inner.consume(&ctx)?;
         }
         Ok(None)
@@ -2305,6 +2313,10 @@ impl<S: Sink + Send + 'static> SendAsyncElementDyn for SinkAdapter<S> {
 
     fn handle_downstream_event(&mut self, event: Event) -> Option<Event> {
         self.inner.handle_downstream_event(event)
+    }
+
+    fn set_clock(&mut self, clock: Arc<dyn Clock>, base_time: ClockTime) {
+        self.clock = Some((clock, base_time));
     }
 
     fn as_clock_provider(&self) -> Option<&dyn ClockProvider> {
@@ -2830,12 +2842,17 @@ impl<S: AsyncSource + Send + 'static> SendAsyncElementDyn for AsyncSourceAdapter
 /// Wrapper to adapt an [`AsyncSink`] to [`AsyncElementDyn`].
 pub struct AsyncSinkAdapter<S: AsyncSink> {
     inner: S,
+    /// The pipeline clock, once the executor hands it over at start.
+    clock: Option<(Arc<dyn Clock>, ClockTime)>,
 }
 
 impl<S: AsyncSink> AsyncSinkAdapter<S> {
     /// Create a new async sink adapter.
     pub fn new(sink: S) -> Self {
-        Self { inner: sink }
+        Self {
+            inner: sink,
+            clock: None,
+        }
     }
 
     /// Get a reference to the inner sink.
@@ -2860,7 +2877,10 @@ impl<S: AsyncSink + Send + 'static> SendAsyncElementDyn for AsyncSinkAdapter<S> 
 
     async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
         if let Some(ref buffer) = input {
-            let ctx = ConsumeContext::new(buffer);
+            let mut ctx = ConsumeContext::new(buffer);
+            if let Some((clock, base_time)) = &self.clock {
+                ctx.set_clock(clock, *base_time);
+            }
             self.inner.consume(&ctx).await?;
         }
         Ok(None)
@@ -2882,6 +2902,17 @@ impl<S: AsyncSink + Send + 'static> SendAsyncElementDyn for AsyncSinkAdapter<S> 
 
     fn execution_hints(&self) -> ExecutionHints {
         self.inner.execution_hints()
+    }
+
+    fn set_clock(&mut self, clock: Arc<dyn Clock>, base_time: ClockTime) {
+        self.clock = Some((clock, base_time));
+    }
+
+    // Forwarded here for the same reason `SinkAdapter` forwards it: without
+    // this an async sink never learns the stream ended, so it cannot drain or
+    // close its device on EOS.
+    fn handle_downstream_event(&mut self, event: Event) -> Option<Event> {
+        self.inner.handle_downstream_event(event)
     }
 
     fn as_clock_provider(&self) -> Option<&dyn ClockProvider> {

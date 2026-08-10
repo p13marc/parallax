@@ -567,3 +567,105 @@ fn test_manual_clock_overrides_auto() {
     pipeline.set_clock(Arc::new(ManualClock));
     assert_eq!(pipeline.clock().clock().name(), "manual-clock");
 }
+
+// ---------------------------------------------------------------------------
+// The pipeline clock reaches sinks (#65)
+// ---------------------------------------------------------------------------
+
+/// Sink that records what the clock said while each buffer was consumed.
+struct ClockObservingSink {
+    /// `(running_time, clock_time)` per buffer, in arrival order.
+    readings: Arc<Mutex<Vec<(ClockTime, ClockTime)>>>,
+    /// The clock's name, if the sink saw one at all.
+    clock_name: Arc<Mutex<Option<String>>>,
+}
+
+impl ClockObservingSink {
+    fn new() -> Self {
+        Self {
+            readings: Arc::new(Mutex::new(Vec::new())),
+            clock_name: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+impl Sink for ClockObservingSink {
+    fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
+        if let Some(clock) = ctx.clock() {
+            *self.clock_name.lock().unwrap() = Some(clock.name().to_string());
+        }
+        self.readings
+            .lock()
+            .unwrap()
+            .push((ctx.running_time(), ctx.clock_time()));
+        // Enough that the monotonic clock has to move between buffers.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "ClockObservingSink"
+    }
+}
+
+/// A sink can read the pipeline clock during `consume`, and it advances.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sink_sees_the_pipeline_clock_advance() {
+    let sink = ClockObservingSink::new();
+    let readings = Arc::clone(&sink.readings);
+    let clock_name = Arc::clone(&sink.clock_name);
+
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_source("src", TimestampedSource::new(5, 10_000_000));
+    let dst = pipeline.add_sink("sink", sink);
+    pipeline.link(src, dst).unwrap();
+
+    let executor = Executor::new();
+    let handle = executor.start(&mut pipeline).unwrap();
+    handle.wait().await.unwrap();
+
+    assert_eq!(
+        clock_name.lock().unwrap().as_deref(),
+        Some("system-monotonic"),
+        "the sink never saw a clock"
+    );
+
+    let readings = readings.lock().unwrap();
+    assert_eq!(readings.len(), 5);
+
+    for (running, absolute) in readings.iter() {
+        assert!(running.is_some(), "running time must be known");
+        assert!(absolute.is_some(), "clock time must be known");
+    }
+    // Base time is the clock reading at start, so running time is small and
+    // strictly increasing across buffers.
+    for pair in readings.windows(2) {
+        assert!(
+            pair[1].0 > pair[0].0,
+            "running time did not advance: {:?} then {:?}",
+            pair[0].0,
+            pair[1].0
+        );
+    }
+}
+
+/// The clock the executor selected — not just any clock — is what the sink sees.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sink_sees_the_selected_clock_not_the_default() {
+    let sink = ClockObservingSink::new();
+    let clock_name = Arc::clone(&sink.clock_name);
+
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_source("src", TimestampedSource::new(3, 10_000_000));
+    let dst = pipeline.add_sink("sink", sink);
+    pipeline.link(src, dst).unwrap();
+    // A provider on a second branch of the same source wins clock selection.
+    let provider = pipeline.add_sink("provider", TestClockProviderSink::new("hw-audio", 150));
+    pipeline.link(src, provider).unwrap();
+
+    let executor = Executor::new();
+    let handle = executor.start(&mut pipeline).unwrap();
+    handle.wait().await.unwrap();
+
+    assert_eq!(clock_name.lock().unwrap().as_deref(), Some("hw-audio"));
+}

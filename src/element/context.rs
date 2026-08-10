@@ -498,25 +498,83 @@ pub struct ConsumeContext<'a> {
     buffer: &'a Buffer,
     /// Optional bus handle for posting messages.
     bus: Option<&'a BusHandle>,
+    /// Optional pipeline clock, for sinks that pace presentation.
+    ///
+    /// Borrowed rather than owned: a `ConsumeContext` is built per buffer on
+    /// the hot path, and an `Arc` clone per frame buys nothing here.
+    clock: Option<&'a Arc<dyn Clock>>,
+    /// Base time (clock time when the pipeline started).
+    base_time: ClockTime,
 }
 
 impl<'a> ConsumeContext<'a> {
     /// Create a new consume context.
     pub fn new(buffer: &'a Buffer) -> Self {
-        Self { buffer, bus: None }
+        Self {
+            buffer,
+            bus: None,
+            clock: None,
+            base_time: ClockTime::NONE,
+        }
     }
 
     /// Create a new consume context with a bus handle.
     pub fn with_bus(buffer: &'a Buffer, bus: &'a BusHandle) -> Self {
         Self {
-            buffer,
             bus: Some(bus),
+            ..Self::new(buffer)
         }
+    }
+
+    /// Set the pipeline clock for this context.
+    ///
+    /// Called by the sink adapters with the clock the executor selected, so a
+    /// sink can schedule presentation against running time.
+    pub fn set_clock(&mut self, clock: &'a Arc<dyn Clock>, base_time: ClockTime) {
+        self.clock = Some(clock);
+        self.base_time = base_time;
     }
 
     /// Get the bus handle, if available.
     pub fn bus(&self) -> Option<&BusHandle> {
         self.bus
+    }
+
+    /// Get the pipeline clock, if available.
+    ///
+    /// `None` means the pipeline has no started clock — a sink that paces must
+    /// fall back to consuming as fast as buffers arrive.
+    pub fn clock(&self) -> Option<&Arc<dyn Clock>> {
+        self.clock
+    }
+
+    /// The current running time (time since the pipeline started).
+    ///
+    /// Returns `ClockTime::NONE` if no clock is configured or the pipeline has
+    /// not started. This is the value a buffer's PTS is compared against to
+    /// decide when — or whether — to present it.
+    pub fn running_time(&self) -> ClockTime {
+        if let Some(clock) = self.clock
+            && self.base_time.is_some()
+        {
+            return clock.now().saturating_sub(self.base_time);
+        }
+        ClockTime::NONE
+    }
+
+    /// The current absolute clock time.
+    ///
+    /// Returns `ClockTime::NONE` if no clock is configured.
+    pub fn clock_time(&self) -> ClockTime {
+        match self.clock {
+            Some(clock) => clock.now(),
+            None => ClockTime::NONE,
+        }
+    }
+
+    /// The pipeline's base time — the clock reading when it started.
+    pub fn base_time(&self) -> ClockTime {
+        self.base_time
     }
 
     /// Post a message to the pipeline bus.
@@ -585,6 +643,7 @@ impl std::fmt::Debug for ConsumeContext<'_> {
             .field("len", &self.len())
             .field("sequence", &self.sequence())
             .field("is_eos", &self.is_eos())
+            .field("has_clock", &self.clock.is_some())
             .finish()
     }
 }
