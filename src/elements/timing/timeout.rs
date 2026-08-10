@@ -4,19 +4,18 @@
 
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::Element;
-use crate::error::{Error, Result};
-use crate::memory::SharedArena;
+use crate::error::Result;
+use crate::memory::{OutputArena, OutputBudget, defaults};
 use crate::metadata::Metadata;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-/// Get the global timeout arena (lazily initialized).
-fn timeout_arena() -> &'static SharedArena {
-    static ARENA: OnceLock<SharedArena> = OnceLock::new();
-    // 4KB slots should be sufficient for fallback data, 32 slots for concurrency
-    ARENA.get_or_init(|| SharedArena::new(4096, 32).expect("Failed to create timeout arena"))
-}
+/// Slot size for fallback buffers when nothing larger is asked for.
+///
+/// Matches the 4 KiB slots the old process-wide arena used, so a `Timeout` with
+/// a small fallback still builds its arena exactly once.
+const FALLBACK_SLOT_SIZE: usize = 4096;
 
 /// A timeout element that produces a fallback buffer if no input arrives in time.
 ///
@@ -43,6 +42,12 @@ pub struct Timeout {
     fallback_data: Vec<u8>,
     timeouts_triggered: AtomicU64,
     buffers_passed: AtomicU64,
+    /// Per-instance output arena for fallback buffers.
+    ///
+    /// This used to be a process-wide `static`, so every `Timeout` in the
+    /// process drew from the same 32 slots and no budget could mean anything
+    /// (#95).
+    output: OutputArena,
 }
 
 impl Timeout {
@@ -55,6 +60,9 @@ impl Timeout {
             fallback_data: Vec::new(),
             timeouts_triggered: AtomicU64::new(0),
             buffers_passed: AtomicU64::new(0),
+            output: OutputArena::new(defaults::TRANSFORM_SLOT_COUNT)
+                .with_min_slot_size(FALLBACK_SLOT_SIZE)
+                .grow_to_fit(),
         }
     }
 
@@ -87,14 +95,9 @@ impl Timeout {
         Ok(None)
     }
 
-    fn create_fallback(&self) -> Result<Option<Buffer>> {
+    fn create_fallback(&mut self) -> Result<Option<Buffer>> {
         let len = self.fallback_data.len();
-        let arena = timeout_arena();
-        arena.reclaim();
-
-        let mut slot = arena
-            .acquire()
-            .ok_or_else(|| Error::Element("arena exhausted".into()))?;
+        let mut slot = self.output.acquire(len, "timeout")?;
 
         if !self.fallback_data.is_empty() {
             slot.data_mut()[..len].copy_from_slice(&self.fallback_data);
@@ -117,6 +120,10 @@ impl Timeout {
 }
 
 impl Element for Timeout {
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         self.last_buffer = Some(Instant::now());
         self.buffers_passed.fetch_add(1, Ordering::Relaxed);
@@ -439,6 +446,8 @@ pub struct ThrottleStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::SharedArena;
+    use std::sync::OnceLock;
 
     fn test_arena() -> &'static SharedArena {
         static ARENA: OnceLock<SharedArena> = OnceLock::new();
@@ -505,6 +514,44 @@ mod tests {
 
         let fallback = timeout.check_timeout().unwrap().unwrap();
         assert_eq!(fallback.as_bytes(), b"fallback");
+    }
+
+    #[test]
+    fn each_timeout_owns_its_arena() {
+        // The arena used to be a process-wide static, so two Timeouts drew
+        // from the same 32 slots (#95). They must not any more — and neither
+        // should exist before the first fallback is built.
+        let mut a = Timeout::from_millis(1).with_fallback(b"a".to_vec());
+        let mut b = Timeout::from_millis(1).with_fallback(b"b".to_vec());
+        assert!(!a.output.is_built());
+        assert!(!b.output.is_built());
+
+        a.process(create_test_buffer(0)).unwrap();
+        b.process(create_test_buffer(0)).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+
+        let from_a = a.check_timeout().unwrap().unwrap();
+        let from_b = b.check_timeout().unwrap().unwrap();
+
+        assert_eq!(from_a.as_bytes(), b"a");
+        assert_eq!(from_b.as_bytes(), b"b");
+        // Distinct arenas: two separate mappings, not one shared static.
+        assert!(!std::ptr::eq(
+            a.output.arena().unwrap(),
+            b.output.arena().unwrap()
+        ));
+    }
+
+    #[test]
+    fn a_budget_sizes_the_fallback_arena() {
+        let mut timeout = Timeout::from_millis(1).with_fallback(vec![0u8; 8]);
+        timeout.set_output_budget(OutputBudget::new(64, 4));
+
+        timeout.process(create_test_buffer(0)).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        timeout.check_timeout().unwrap().unwrap();
+
+        assert_eq!(timeout.output.arena().unwrap().slot_count(), 68);
     }
 
     // Debounce tests

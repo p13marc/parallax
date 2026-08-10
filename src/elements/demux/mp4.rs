@@ -38,19 +38,11 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::clock::ClockTime;
 use crate::error::{Error, Result};
-use crate::memory::SharedArena;
+use crate::memory::{OutputArena, OutputBudget, defaults};
 use crate::metadata::{BufferFlags, Metadata};
 
 use mp4::{MediaType, Mp4Reader, TrackType};
 use std::io::{Read, Seek};
-use std::sync::OnceLock;
-
-/// Shared arena for MP4 demuxer buffers.
-fn mp4_demux_arena() -> &'static SharedArena {
-    static ARENA: OnceLock<SharedArena> = OnceLock::new();
-    // Video frames can be large, use generous slot size
-    ARENA.get_or_init(|| SharedArena::new(4 * 1024 * 1024, 32).unwrap())
-}
 
 // ============================================================================
 // Codec Types
@@ -267,6 +259,14 @@ pub struct Mp4Demux<R: Read + Seek> {
     /// H.264 decoder configuration per track, lifted from the avcC box.
     /// Tracks in the map get their samples converted to Annex-B.
     avc_configs: std::collections::HashMap<u32, AvcDecoderConfig>,
+    /// Per-instance output arena for demuxed samples.
+    ///
+    /// This used to be a process-wide `static`, so two demuxers in one process
+    /// drew from the same 32 slots and neither could be sized for its own
+    /// stream (#95). `Mp4Demux` implements no element trait, so the executor
+    /// cannot reach it — [`set_output_budget`](Self::set_output_budget) is
+    /// there for whatever wraps it (see #76).
+    output: OutputArena,
 }
 
 /// Per-track H.264 decoder configuration from the avcC box.
@@ -395,7 +395,19 @@ impl<R: Read + Seek> Mp4Demux<R> {
             stats: Mp4DemuxStats::default(),
             sample_indices,
             avc_configs,
+            output: OutputArena::new(defaults::MP4_DEMUX_SLOT_COUNT)
+                .with_min_slot_size(defaults::MP4_DEMUX_SLOT_SIZE)
+                .grow_to_fit(),
         })
+    }
+
+    /// Size this demuxer's output arena from the graph below it.
+    ///
+    /// `Mp4Demux` implements no element trait, so nothing calls this yet — the
+    /// wrapper added by #76 will. Without it the arena falls back to
+    /// [`defaults::MP4_DEMUX_SLOT_COUNT`].
+    pub fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.output.set_budget(budget);
     }
 
     /// Convert one AVCC video sample to a self-contained Annex-B access unit.
@@ -597,26 +609,16 @@ impl<R: Read + Seek> Mp4Demux<R> {
 
     /// Create a buffer from sample data.
     fn create_buffer(
-        &self,
+        &mut self,
         data: &[u8],
         track_id: u32,
         sample: &mp4::Mp4Sample,
         track: &Mp4Track,
     ) -> Result<Buffer> {
-        let arena = mp4_demux_arena();
-        arena.reclaim();
-
-        let mut slot = arena
-            .acquire()
-            .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
-
-        if data.len() > slot.data_mut().len() {
-            return Err(Error::Element(format!(
-                "MP4 sample of {} bytes exceeds the demux arena slot ({} bytes)",
-                data.len(),
-                slot.data_mut().len()
-            )));
-        }
+        // `grow_to_fit`: a sample larger than the current slot rebuilds the
+        // arena rather than failing, because a demuxer's output size follows
+        // the file, not a ceiling it chose.
+        let mut slot = self.output.acquire(data.len(), "mp4demux")?;
         slot.data_mut()[..data.len()].copy_from_slice(data);
 
         let handle = MemoryHandle::with_len(slot, data.len());
