@@ -15,9 +15,12 @@
 //!
 //! - **Non-blocking**: No I/O, no sleeps, no mutex waits
 //! - **Fast**: Keep processing time minimal (microseconds, not milliseconds)
-//! - **Panic-safe**: A panic in a callback will abort the pipeline task
 //!
 //! For expensive operations, send data to a separate task via a channel.
+//!
+//! A callback that panics is caught, logged at `error!`, and **removed** — an
+//! observer does not get to end the run it is watching. The rest of the
+//! pipeline carries on as if the probe had never been attached.
 //!
 //! # Example
 //!
@@ -41,6 +44,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -222,10 +226,53 @@ struct ProbeRegistryInner {
     probes: HashMap<PadRef, Vec<ProbeEntry>>,
 }
 
+/// Run one probe callback, converting a panic into a request to remove it.
+///
+/// A probe is an observer. It has no business ending the run it is watching —
+/// before this, a panicking callback unwound its way out through the element
+/// task that happened to invoke it, killing that element and every sink below
+/// it, and attributing the failure to an element that had done nothing wrong.
+///
+/// Removing the offender rather than retrying it puts the pipeline back the way
+/// it was before the aid was attached, which is the least surprising thing a
+/// broken observer can do. It is loud, not silent: the panic message carries the
+/// callback's own source location.
+///
+/// `AssertUnwindSafe` is sound for the same reason it is in the executor's
+/// `guard`: the callback is dropped rather than called again, so there is no
+/// half-updated state left for anyone to observe.
+fn guarded(pad: &PadRef, data: ProbeData<'_>, probe: &mut ProbeEntry) -> ProbeReturn {
+    match std::panic::catch_unwind(AssertUnwindSafe(|| (probe.callback)(data))) {
+        Ok(ret) => ret,
+        Err(payload) => {
+            tracing::error!(
+                probe = ?probe.id,
+                pad = ?pad,
+                "probe callback panicked and has been removed: {}",
+                crate::error::panic_message(payload.as_ref())
+            );
+            ProbeReturn::Remove
+        }
+    }
+}
+
 impl ProbeRegistry {
     /// Create a new empty probe registry.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Lock the registry, ignoring poisoning.
+    ///
+    /// A panic elsewhere must not turn this registry into a second failure that
+    /// kills every element task that touches it. Callback panics are caught in
+    /// [`guarded`] before they can poison anything, so a poisoned lock here only
+    /// ever means someone else died holding it — and the probe map is a plain
+    /// `HashMap` with no invariant that a panic could have left half-applied.
+    fn lock(&self) -> std::sync::MutexGuard<'_, ProbeRegistryInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Add a probe to a pad.
@@ -242,7 +289,7 @@ impl ProbeRegistry {
             probe_type,
             callback: Box::new(callback),
         };
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock();
         inner.probes.entry(pad).or_default().push(entry);
         id
     }
@@ -251,7 +298,7 @@ impl ProbeRegistry {
     ///
     /// Returns `true` if the probe was found and removed.
     pub fn remove(&self, id: ProbeId) -> bool {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock();
         for probes in inner.probes.values_mut() {
             if let Some(pos) = probes.iter().position(|p| p.id == id) {
                 probes.remove(pos);
@@ -263,7 +310,7 @@ impl ProbeRegistry {
 
     /// Check if any probes are registered for a pad.
     pub fn has_probes(&self, pad: &PadRef) -> bool {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.lock();
         inner
             .probes
             .get(pad)
@@ -274,7 +321,7 @@ impl ProbeRegistry {
     ///
     /// Returns the probe result that determines what happens to the buffer.
     pub fn invoke_buffer(&self, pad: &PadRef, buffer: &Buffer) -> ProbeReturn {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock();
         let Some(probes) = inner.probes.get_mut(pad) else {
             return ProbeReturn::Ok;
         };
@@ -284,7 +331,7 @@ impl ProbeRegistry {
 
         for (i, probe) in probes.iter_mut().enumerate() {
             if probe.probe_type.contains(ProbeType::BUFFER) {
-                match (probe.callback)(ProbeData::Buffer(buffer)) {
+                match guarded(pad, ProbeData::Buffer(buffer), probe) {
                     ProbeReturn::Ok => continue,
                     ProbeReturn::Remove => {
                         to_remove.push(i);
@@ -320,7 +367,7 @@ impl ProbeRegistry {
             ProbeType::EVENT_FLUSH
         };
 
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock();
         let Some(probes) = inner.probes.get_mut(pad) else {
             return ProbeReturn::Ok;
         };
@@ -330,7 +377,7 @@ impl ProbeRegistry {
 
         for (i, probe) in probes.iter_mut().enumerate() {
             if probe.probe_type.contains(probe_type) {
-                match (probe.callback)(ProbeData::Event(event)) {
+                match guarded(pad, ProbeData::Event(event), probe) {
                     ProbeReturn::Ok => continue,
                     ProbeReturn::Remove => {
                         to_remove.push(i);
@@ -355,7 +402,7 @@ impl ProbeRegistry {
     ///
     /// When a pad has a BLOCK probe, data flow should be paused.
     pub fn is_blocked(&self, pad: &PadRef) -> bool {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.lock();
         inner.probes.get(pad).is_some_and(|probes| {
             probes
                 .iter()
@@ -365,7 +412,7 @@ impl ProbeRegistry {
 
     /// Invoke IDLE probes for a pad (called when no data is flowing).
     pub fn invoke_idle(&self, pad: &PadRef) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock();
         let Some(probes) = inner.probes.get_mut(pad) else {
             return;
         };
@@ -374,7 +421,7 @@ impl ProbeRegistry {
 
         for (i, probe) in probes.iter_mut().enumerate() {
             if probe.probe_type.contains(ProbeType::IDLE)
-                && (probe.callback)(ProbeData::Idle) == ProbeReturn::Remove
+                && guarded(pad, ProbeData::Idle, probe) == ProbeReturn::Remove
             {
                 to_remove.push(i);
             }
@@ -387,7 +434,7 @@ impl ProbeRegistry {
 
     /// Get the number of registered probes.
     pub fn len(&self) -> usize {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.lock();
         inner.probes.values().map(|v| v.len()).sum()
     }
 
@@ -399,7 +446,7 @@ impl ProbeRegistry {
 
 impl std::fmt::Debug for ProbeRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.lock();
         f.debug_struct("ProbeRegistry")
             .field(
                 "total_probes",

@@ -28,6 +28,7 @@
 //! pipeline.set_tracer_registry(registry);
 //! ```
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -78,76 +79,138 @@ pub struct TracerRegistry {
     inner: Arc<Mutex<Vec<Box<dyn Tracer>>>>,
 }
 
+/// A tracer's name, or a stand-in if asking for it also panics.
+///
+/// Only ever called on the failure path. A tracer broken enough that `name()`
+/// panics must still not be able to take the pipeline down through the very
+/// call that was reporting it.
+fn name_of(tracer: &dyn Tracer) -> String {
+    match catch_unwind(AssertUnwindSafe(|| tracer.name().to_string())) {
+        Ok(name) => name,
+        Err(_) => "<unnamed>".to_string(),
+    }
+}
+
 impl TracerRegistry {
     /// Create an empty registry.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Lock the registry, ignoring poisoning.
+    ///
+    /// Hook panics are caught in [`notify_each`](Self::notify_each) before they
+    /// can poison anything, so a poisoned lock here only ever means someone else
+    /// died holding it. Propagating that would turn one broken tracer into a
+    /// second failure that kills every element task that touches the registry —
+    /// exactly the fault this module is trying not to have.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Box<dyn Tracer>>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Add a tracer.
     pub fn add(&self, tracer: Box<dyn Tracer>) {
-        self.inner.lock().unwrap().push(tracer);
+        self.lock().push(tracer);
     }
 
     /// Check if any tracers are registered.
     pub fn is_empty(&self) -> bool {
-        self.inner.lock().unwrap().is_empty()
+        self.lock().is_empty()
     }
 
     /// Number of registered tracers.
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap().len()
+        self.lock().len()
+    }
+
+    /// Run one hook against every tracer, dropping any that panics.
+    ///
+    /// A tracer is an observer, and observing must not be able to end the run:
+    /// these hooks are called from inside element tasks, so a panicking one used
+    /// to kill the element that happened to invoke it — and every sink below it
+    /// — while naming that element as the culprit.
+    ///
+    /// The offender is removed rather than retried. Retrying would re-panic on
+    /// every buffer, and removal leaves the pipeline behaving as it did before
+    /// the tracer was attached. It is logged at `error!`, so nothing disappears
+    /// quietly.
+    fn notify_each(&self, hook: &'static str, call: impl Fn(&dyn Tracer)) {
+        let mut tracers = self.lock();
+        let mut failed = Vec::new();
+
+        for (i, tracer) in tracers.iter().enumerate() {
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| call(tracer.as_ref()))) {
+                tracing::error!(
+                    tracer = name_of(tracer.as_ref()),
+                    hook,
+                    "tracer panicked and has been removed: {}",
+                    crate::error::panic_message(payload.as_ref())
+                );
+                failed.push(i);
+            }
+        }
+
+        for i in failed.into_iter().rev() {
+            tracers.remove(i);
+        }
     }
 
     /// Notify all tracers of a buffer.
     pub fn notify_buffer(&self, element_name: &str, buffer: &Buffer) {
         let ts = Instant::now();
-        let tracers = self.inner.lock().unwrap();
-        for tracer in tracers.iter() {
-            tracer.on_buffer(element_name, buffer, ts);
-        }
+        self.notify_each("on_buffer", |t| t.on_buffer(element_name, buffer, ts));
     }
 
     /// Notify all tracers of a processed buffer.
     pub fn notify_buffer_processed(&self, element_name: &str) {
         let ts = Instant::now();
-        let tracers = self.inner.lock().unwrap();
-        for tracer in tracers.iter() {
-            tracer.on_buffer_processed(element_name, ts);
-        }
+        self.notify_each("on_buffer_processed", |t| {
+            t.on_buffer_processed(element_name, ts)
+        });
     }
 
     /// Notify all tracers of a dropped buffer.
     pub fn notify_drop(&self, element_name: &str) {
         let ts = Instant::now();
-        let tracers = self.inner.lock().unwrap();
-        for tracer in tracers.iter() {
-            tracer.on_drop(element_name, ts);
-        }
+        self.notify_each("on_drop", |t| t.on_drop(element_name, ts));
     }
 
     /// Notify all tracers that pipeline started.
     pub fn notify_start(&self) {
-        let tracers = self.inner.lock().unwrap();
-        for tracer in tracers.iter() {
-            tracer.on_pipeline_start();
-        }
+        self.notify_each("on_pipeline_start", |t| t.on_pipeline_start());
     }
 
     /// Notify all tracers that pipeline stopped.
     pub fn notify_stop(&self) {
-        let tracers = self.inner.lock().unwrap();
-        for tracer in tracers.iter() {
-            tracer.on_pipeline_stop();
-        }
+        self.notify_each("on_pipeline_stop", |t| t.on_pipeline_stop());
     }
 
     /// Collect reports from all tracers.
+    ///
+    /// A tracer whose `report()` panics is skipped rather than allowed to take
+    /// down the caller — reports are usually collected at shutdown, where a
+    /// panic would lose every *other* tracer's report too.
     pub fn reports(&self) -> Vec<(String, String)> {
-        let tracers = self.inner.lock().unwrap();
+        let tracers = self.lock();
         tracers
             .iter()
-            .filter_map(|t| t.report().map(|r| (t.name().to_string(), r)))
+            .filter_map(|t| {
+                match catch_unwind(AssertUnwindSafe(|| {
+                    t.report().map(|r| (t.name().to_string(), r))
+                })) {
+                    Ok(report) => report,
+                    Err(payload) => {
+                        tracing::error!(
+                            tracer = name_of(t.as_ref()),
+                            "tracer panicked while reporting: {}",
+                            crate::error::panic_message(payload.as_ref())
+                        );
+                        None
+                    }
+                }
+            })
             .collect()
     }
 }

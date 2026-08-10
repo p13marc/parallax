@@ -20,11 +20,10 @@ use parallax::element::{
 };
 use parallax::elements::{AppSink, NullSink, NullSource, PassThrough};
 use parallax::error::{Error, Result};
+use parallax::event::Event;
 use parallax::memory::SharedArena;
 use parallax::metadata::Metadata;
-use parallax::pipeline::{
-    EndReason, Executor, ExecutorConfig, PadRef, Pipeline, PipelineHandle, ProbeType,
-};
+use parallax::pipeline::{EndReason, Executor, ExecutorConfig, Pipeline, PipelineHandle};
 
 const LIMIT: Duration = Duration::from_secs(10);
 
@@ -129,6 +128,24 @@ impl Source for RtSource {
 
     fn execution_hints(&self) -> ExecutionHints {
         ExecutionHints::rt_safe()
+    }
+}
+
+/// Panics on the terminal event, which the sink task calls *outside* the
+/// `catch_unwind` that wraps `consume()`.
+struct PanickingOnEosSink;
+
+impl Sink for PanickingOnEosSink {
+    fn consume(&mut self, _ctx: &ConsumeContext) -> Result<()> {
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "panicking-on-eos-sink"
+    }
+
+    fn handle_downstream_event(&mut self, _event: Event) -> Option<Event> {
+        panic!("teardown fell over");
     }
 }
 
@@ -297,39 +314,34 @@ async fn a_panicking_element_ends_the_pipeline_with_an_error() {
     );
 }
 
-/// A probe callback runs *outside* the `catch_unwind` that wraps element calls,
-/// so a panicking one unwinds the whole task. The share of the live count is
-/// released by `Drop`, which runs during unwinding too — so without the
-/// `thread::panicking()` check the task would count as a clean finish and this
-/// run would report EOS to `ended()` while `wait()` returned `Error::Panic`.
-/// Two observers, two answers.
-///
-/// (Whether a broken probe *should* be able to end the pipeline at all is #92.
-/// This only pins that the two reports agree about what happened.)
+/// Not every element call sits inside the `catch_unwind` that turns a panic into
+/// an ordinary error: the sink task's `handle_downstream_event` is called on the
+/// terminal path and its result is discarded, so a panic there unwinds the whole
+/// task instead. The share of the live count is released by `Drop`, which runs
+/// during unwinding too — so without the `thread::panicking()` check the task
+/// would count as a clean finish and this run would report EOS to `ended()`
+/// while `wait()` returned `Error::Panic`. Two observers, two answers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_panic_outside_the_element_call_is_still_an_error() {
+async fn a_panic_outside_the_guarded_calls_is_still_an_error() {
     let mut pipeline = Pipeline::new();
     let src = pipeline.add_source("src", NullSource::new(5));
-    let snk = pipeline.add_sink("sink", NullSink::new());
+    let snk = pipeline.add_sink("sink", PanickingOnEosSink);
     pipeline.link(src, snk).unwrap();
-    let _probe = pipeline.add_probe(PadRef::src(src), ProbeType::BUFFER, |_| {
-        panic!("a debugging aid fell over");
-    });
 
     let handle = Executor::new().start(&mut pipeline).unwrap();
     let ended = handle.ended();
 
     let waited = tokio::time::timeout(LIMIT, handle.wait())
         .await
-        .expect("a panicking probe wedged the pipeline");
-    assert!(waited.is_err(), "a panicking probe must not report success");
+        .expect("the panicking sink wedged the pipeline");
+    assert!(waited.is_err(), "a panicking sink must not report success");
 
     let reason = tokio::time::timeout(LIMIT, ended)
         .await
         .expect("the panic never reached the outcome");
     assert!(
         matches!(reason, EndReason::Error(_)),
-        "a panic outside the element call reported {reason:?}"
+        "a panic outside the guarded calls reported {reason:?}"
     );
 }
 

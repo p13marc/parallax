@@ -296,6 +296,8 @@ pipeline.remove_probe(probe_id);
 
 Probes fire on **every** element's pads — a transform's `PadRef::sink(node)` (before the element sees the buffer) and `PadRef::src(node)` (after it produces one), as well as sources and sinks. See `examples/53_pad_probes.rs`.
 
+Callbacks run inline on the data path, so keep them fast and non-blocking. A callback that **panics** is caught, logged at `error!`, and removed; the run carries on and still ends with `EndReason::Eos`. An observer does not get to end the run it is watching, and the other probes on the same pad keep working. The same holds for tracers.
+
 ## Tracers & debugging
 
 ```rust
