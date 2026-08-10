@@ -36,23 +36,15 @@ Feature-gated code is NOT compiled by default — after touching gated modules (
 
 Two coexisting generations:
 
-**Legacy traits** (`element/traits.rs`) — most built-ins use these:
-- `Source::produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult>`
-- `Sink::consume(&mut self, ctx: &ConsumeContext) -> Result<()>`
-- `Element::process(&mut self, buffer: Buffer) -> Result<Option<Buffer>>` (1-to-0/1)
-- `Transform::transform(&mut self, buffer) -> Result<Output>` (multi-output; blanket impl for all `Element`)
-- `AsyncSource`/`AsyncSink`/`AsyncTransform` (async variants), `Demuxer` (1-to-N via `RoutedOutput`), `Muxer` (N-to-1 via `MuxerInput`), `SyncElement` (RT path). Muxer/demuxer nodes are the only ones whose executor task keeps channels **per pad**; every other type flattens them. Note `take_inputs`/`take_outputs` *drain* the per-pad map, so a task spawner must take one form or the other, never both.
-- Optional methods: `output_caps()`, `output_media_caps()`/`input_media_caps()`, `execution_hints()`, `flush()`, `handle_upstream_event()`/`handle_downstream_event()`, `is_seekable()`, `query_position()`/`query_duration()`, `flow_policy()`, `handle_flow_signal()`, `as_clock_provider()`
-- Adapters wrap author traits into the type-erased runtime trait: `SourceAdapter` (also `with_arena`/`with_pool`), `SinkAdapter`, `ElementAdapter`, `TransformAdapter`, `MuxerAdapter`, etc. → `DynAsyncElement` (dynosaur-generated)
+**Legacy traits** (`element/traits.rs`) — most built-ins use these. `Source`/`Sink`/`Element`/`Transform` plus async variants, `Demuxer` (1-to-N), `Muxer` (N-to-1), `SyncElement` (RT path); author traits reach the runtime through per-trait adapters (`SourceAdapter`, `SinkAdapter`, …) that erase into `DynAsyncElement`. Two things the signatures won't tell you:
+- Muxer/demuxer nodes are the only ones whose executor task keeps channels **per pad**; every other type flattens them.
+- `take_inputs`/`take_outputs` *drain* the per-pad map, so a task spawner must take one form or the other, never both.
 
-**Unified simple traits** (`element/pipeline_element.rs`) — no adapter boilerplate:
-- `SimpleSource::produce() -> Result<ProcessOutput>`, `SimpleSink::consume(&Buffer)`, `SimpleTransform::transform(Buffer) -> Result<ProcessOutput>`
-- Wrap in `Src(...)`, `Snk(...)`, `Xfm(...)` and pass to `pipeline.add_element(name, ...)`
-- `ProcessOutput::{None, Buffer(..), Buffers(..), Eos, Pending}`
+**Unified simple traits** (`element/pipeline_element.rs`) — no adapter boilerplate. Wrap a `SimpleSource`/`SimpleSink`/`SimpleTransform` in `Src(...)`, `Snk(...)`, `Xfm(...)` and pass to `pipeline.add_element(name, ...)`.
 
 **ProduceResult** (pool-aware sources): `Produced(usize)` (wrote into ctx buffer), `Eos`, `OwnBuffer(Buffer)`, `OwnDmaBuf(DmaBufBuffer)`, `WouldBlock`.
 
-**ExecutionHints** `{ rt_safe, trust_level, crash_safe, uses_native_code, processing, latency, memory }` with profiles `ExecutionHints::rt_safe()`, `io_bound()`, `cpu_intensive()`, `low_latency()`, etc. There is **no `Affinity` type/`affinity()` method** — scheduling derives purely from hints.
+**ExecutionHints** — declare via the profiles (`ExecutionHints::rt_safe()`, `io_bound()`, `cpu_intensive()`, `low_latency()`, …). There is **no `Affinity` type/`affinity()` method** — scheduling derives purely from hints.
 
 **Flush**: executor calls `flush()` repeatedly at EOS until it returns `None`/`Output::None` — implement it in encoders/muxers to drain buffered data.
 
@@ -64,18 +56,8 @@ Two coexisting generations:
 
 ### Construction
 
-```rust
-let mut p = Pipeline::parse("filesrc location=in.bin ! passthrough ! filesink location=out.bin")?;
-// or
-let mut p = Pipeline::new();
-let src  = p.add_source("src", MySource);           // also: add_source_with_arena / _with_pool
-let xfm  = p.add_transform("xfm", MyTransform);     // add_filter for Element impls
-let sink = p.add_sink("sink", MySink);
-let el   = p.add_element("el", Src(MySimpleSource)); // unified API
-p.link(src, xfm)?;                                   // = link_pads(src,"src",xfm,"sink")
-p.link_pads(xfm, "src", sink, "sink")?;
-```
-
+- Either `Pipeline::parse("…")` (see grammar limits below) or the programmatic `add_source`/`add_transform`/`add_sink`/`add_element` + `link`. `add_filter` takes `Element` impls; `add_source_with_arena`/`_with_pool` supply the source's memory.
+- `p.link(a, b)` is shorthand for `p.link_pads(a, "src", b, "sink")`.
 - `get_element::<T>(name)` / `get_element_mut::<T>(name)` downcast by node name; `name=` in parse strings sets the name, otherwise `{factory}_{index}`.
 - Fluent alternative: `PipelineBuilder` (typestate; `source().then().tee(..).sink().build()`), see `pipeline/builder.rs`.
 - `add_node` is `pub(crate)` — never show it in docs/examples.
@@ -95,28 +77,27 @@ p.link_pads(xfm, "src", sink, "sink")?;
 
 - `pipeline.run().await` — run to completion. `pipeline.run_with_bus(|msg| bool).await` — the handler runs *while* the pipeline runs, and returning `false` really stops it (cooperative stop → EOS).
 - `Executor::with_config(cfg)`; **`executor.start(&mut p)` is SYNC** and returns `PipelineHandle`; `handle.wait().await`. Only `executor.run()` is async. Never write `executor.start(...).await`.
-- `ExecutorConfig { scheduling: SchedulingMode::{Async|Hybrid|RealTime}, auto_strategy: bool (default true), channel_capacity, rt: RtConfig{quantum, rt_priority, data_threads, bridge_capacity}, driver }`. Presets: `low_latency_audio()`, `video(fps)`, `hybrid()`.
+- `ExecutorConfig` presets: `low_latency_audio()`, `video(fps)`, `hybrid()`. `auto_strategy` defaults to true.
 - **`ElementStrategy` has exactly two variants: `Async` and `RealTime`.** Auto rule: `rt_safe && latency ∈ {UltraLow, Low}` → RealTime; else Async. `trust_level`/`uses_native_code` are currently IGNORED (process isolation was removed in commit da6df59 — never document an "isolated process" strategy).
 - Hybrid mode: `RtScheduler::partition_graph` splits nodes, boundary edges get `AsyncRtBridge` (lock-free SPSC + eventfd), RT threads use PipeWire-style `ActivationRecord`s, paced by `TimerDriver`/`ManualDriver`.
 - `SchedulingMode::RealTime` with zero RT-safe nodes falls back to fully-async and logs a `warn!` (it does not error). `ExecutorConfig::scheduling` is authoritative — the executor overrides `RtConfig::mode` from it, so `with_scheduling(RealTime)` works on its own. `auto_strategy` only *reports* that RT-safe elements exist; it does not promote an Async config to Hybrid.
 
 ### Bus & events
 
-- `Bus`/`BusHandle`; `MessageKind::{StateChanged, Eos, Error, Warning, Info, Tag, DurationChanged, StreamCollection, Qos, LatencyChanged, Buffering, AsyncStart, AsyncDone, ClockLost, NewClock, SeekDone, Element, Application}`.
-- Consume: `bus.poll()`, `bus.next().await`, `bus.subscribe()` (broadcast), `bus.into_stream()` (`futures::Stream`, works with `select!`), `bus.wait_for_eos_or_error().await`.
+- `Bus`/`BusHandle` carry `MessageKind` variants. Consume with `poll()`, `next().await`, `subscribe()` (broadcast), `wait_for_eos_or_error().await`, or `into_stream()` — a `futures::Stream`, so it composes with `select!`.
 - Separate typed event channel: `PipelineHandle::subscribe() -> EventReceiver` (`pipeline/events.rs`) — distinct from the bus.
 - **Terminal outcome**: `PipelineHandle::ended() -> Ended` (a `Future<Output = EndReason>`) / `end_reason()`. Backed by a `watch`, so it **retains** the answer — a late observer still gets it. `EndReason::{Eos, Error(StreamError), Aborted}` lives in `pipeline::events` (re-exported from `elements`); `stop()` ends as `Eos`, `abort()` as `Aborted`. Prefer it to `EventReceiver::wait_eos()`, which is broadcast-backed and loses a terminal event sent before you subscribed. `PipelineHandle::stopper() -> Stopper` outlives the handle, which `wait()` consumes.
-- In-band events (`src/event/`): downstream `StreamStart/Segment/Tags/Eos/CapsChanged/Gap`, upstream `Seek/Qos/LatencyQuery`, bidirectional `FlushStart/FlushStop/Custom`; `PipelineItem::{Buffer, Event}` keeps ordering through channels.
+- In-band events live in `src/event/` (downstream, upstream, and bidirectional families). `PipelineItem::{Buffer, Event}` keeps buffers and events ordered through channels.
 
 ### Seeking / probes / tracers / typefind / flow control
 
-- Seek: `pipeline.query_seekable()/query_position()/query_duration()`, `seek_bytes(u64)`, `seek_time(ClockTime)`, `seek(&SeekEvent)`. `SegmentEvent::to_running_time/to_stream_time` for timestamp mapping. FileSrc implements `SeekableSource`.
-- Probes: `pipeline.add_probe(PadRef::src(node), ProbeType::BUFFER, |data| ProbeReturn::Ok)`; types `BUFFER, EVENT_DOWN, EVENT_UP, EVENT_FLUSH, BLOCK, IDLE`; returns `Ok/Drop/Remove/Handled`.
+- Seek: `seek_bytes`/`seek_time`/`seek(&SeekEvent)` plus the `query_*` accessors. `SegmentEvent::to_running_time/to_stream_time` map timestamps. A source opts in through the `Source` trait's optional methods (`is_seekable`, `handle_upstream_event` for `Event::Seek`, `query_position`/`query_duration`) — **not** through `pipeline::seek::SeekableSource`, which is public but has zero implementors in the tree. `FileSrc` is the only seekable built-in and handles `SegmentFormat::Bytes` only.
+- Probes: `pipeline.add_probe(PadRef::src(node), ProbeType::BUFFER, |data| ProbeReturn::Ok)`. A probe returning `Remove` unregisters itself; `Drop` sheds the buffer.
 - Tracers: `TracerRegistry` + `LatencyTracer`/`FramerateTracer`/`DropTracer`; env `PARALLAX_TRACERS="latency;framerate;drops"`; DOT dumps via `PARALLAX_DOT_DIR`; `pipeline.to_dot()`/`to_json()`; `pipeline.stats_snapshot()`.
 - **A panicking probe or tracer callback cannot kill the pipeline** (#92): caught inside `ProbeRegistry::invoke_*`/`TracerRegistry::notify_*`, logged at `error!`, and the offender is *removed*. Both registries also de-poison their mutex, so one panic cannot turn into a second failure in every element task. Element panics are different — those are real failures and still end the run (`Error::Panic`, #85).
-- Typefind: `TypeFindRegistry::with_builtins()`, `detect(&bytes)`, `detect_from_extension`, `detect_with_fallback`.
-- Flow control (`pipeline/flow.rs`): `FlowSignal::{Ready,Busy,Drop,EosAck,Pausing,Stopping}`, `FlowPolicy::{Block, Drop{..}, RingBuffer{..}, Adaptive{..}}`, `FlowStateHandle`, `WaterMarks`. Queue element: `Queue::new(n).with_flow_control()/.with_water_marks(wm)`, `queue.flow_state_handle()`; live sources accept `set_flow_state(handle)` and check `should_produce()`.
-- `Queue2` (elements/flow): `Queue2::stream(bytes)`, `::download(path, total)`, `::timeshift(path, bytes)`, `.with_watermarks(low, high)`; posts `MessageKind::Buffering`.
+- Typefind: `TypeFindRegistry::with_builtins()`, then `detect`/`detect_from_extension`/`detect_with_fallback`.
+- Flow control (`pipeline/flow.rs`): the behavioural choice is `FlowPolicy::{Block, Drop{..}, RingBuffer{..}, Adaptive{..}}`, carried over a `FlowSignal` channel. `Queue::new(n).with_flow_control()/.with_water_marks(wm)` exposes a `flow_state_handle()`; live sources accept `set_flow_state(handle)` and must check `should_produce()`.
+- `Queue2` (elements/flow) is the buffering variant — `stream`/`download`/`timeshift` constructors — and posts `MessageKind::Buffering`.
 
 ## Memory Model
 
@@ -126,7 +107,8 @@ p.link_pads(xfm, "src", sink, "sink")?;
 - **Output arenas are executor-sized** (#84, #91): `OutputBudget` = `max(link capacity per src pad, summed across pads) + IN_FLIGHT_MARGIN`, delivered via the defaulted `set_output_budget` — which is on **every** element trait that can emit: `Element`/`Transform`/`AsyncTransform`/`Source`/`AsyncSource`/`Muxer`/`Demuxer`/`SyncElement`/`PipelineElement`/`Simple*`/`AsyncElementDyn`. `max` not sum per pad — fan-out clones share one slot. **Every output arena in the tree is a `memory::OutputArena`**; a hand-rolled `Option<SharedArena>` is a bug. Its surface: `acquire` (default), `try_acquire` (**sources only** — `Ok(None)` → `ProduceResult::WouldBlock`, because nothing sheds a source's `PoolExhausted`), `admit()` (encoders, before irreversible work), `reset()` (geometry change), `grow_to_fit()` (output size follows the input, no ceiling to enforce). Slots are 64-byte aligned, so `SharedArena::new_avx` is never needed. `memory::defaults` holds the floors and the `MAX_OUTPUT_ARENA_BYTES` clamp.
 - **The last un-budgeted arenas are the five process-wide `static OnceLock<SharedArena>`s** — `mux/mpegts.rs`, `demux/mpegts.rs`, `demux/mp4.rs`, `metadata/klv.rs`, `timing/timeout.rs`. One arena shared by every instance in the process; four of the five owners are not elements. See #95. Two more are deliberately *not* `OutputArena` and say so in a comment: `IpcSink`'s (exists only to pass its fd via SCM_RIGHTS) and `Mp4MuxTransform::flush`'s (one slot, sized to the finished file).
 - `Buffer<T=()>` = `MemoryHandle` (slot+offset+len) + `Metadata`; clone = two atomic increments (slot + arena refcount) plus a `Metadata` clone — no payload copy and **no syscall** (the arena fd is shared via `Arc`, not dup'd; `benches/memory_pool.rs` guards this). `slice()` = zero-copy sub-buffer.
-- `Metadata`: fields `pts/dts/duration: ClockTime`, `sequence`, `stream_id`, `flags: BufferFlags`, `rtp`, `format`, `offset`; typed custom map `set/get/get_mut/remove` with `&'static str` keys (`"domain/type"` convention: `stanag/*`, `h264/*`, `app/*`, …); helpers `set_bytes/get_bytes`, `set_klv()/klv()`, `set_sei()/sei()`. Transforms MUST clone/propagate metadata or PTS is lost.
+- `Metadata`: timestamps plus a typed custom map keyed by `&'static str` on a `"domain/type"` convention (`stanag/*`, `h264/*`, `app/*`, …). Transforms MUST clone/propagate metadata or PTS is lost.
+- **Video dimensions in metadata**: two conventions coexist — `Metadata.format` (`MediaFormat::VideoRaw`, read by `EncoderElement`) and the legacy `"width"`/`"height"` `u64` custom keys (set by `H264Decoder`, read by `AutoVideoSink`). Use `Metadata::set_video_dims()` / `video_dims()`, which write and read **both**; updating only one leaves the other stale and silently mis-sizes frames downstream.
 - DMA-BUF: `DmaBufSegment::from_fd`, `DmaBufBuffer`, `ProduceResult::OwnDmaBuf`; V4L2 exports via `dmabuf_export: true` config.
 - IPC helpers: `memory::ipc::{send_fds, recv_fds, send_segment_handle, recv_segment_handle}` (SCM_RIGHTS, max 4 fds/message).
 
@@ -142,38 +124,15 @@ p.link_pads(xfm, "src", sink, "sink")?;
 
 ## Clock System
 
-- `ClockTime` — ns, `ZERO`/`MAX`/`NONE` sentinels, saturating+NONE-propagating arithmetic.
-- `Clock` trait (`now/flags/resolution/name`), `SystemClock` (monotonic), `PipelineClock` (base_time; `running_time()`, async `wait_until/wait_for`).
+- `ClockTime` is ns with `ZERO`/`MAX`/`NONE` sentinels; arithmetic saturates and propagates `NONE` rather than panicking.
+- `SystemClock` (monotonic) and `PipelineClock` (base_time, `running_time()`, async `wait_until`/`wait_for`) implement the `Clock` trait.
 - `ClockProvider::{provide_clock, clock_priority}` — priority bands: 0–99 software, 100–199 hardware audio, 200–299 network, 300+ PTP.
 - **Automatic selection**: executor calls `pipeline.select_clock()` before start — highest-priority element-provided clock wins (e.g. `AlsaSink` provides a hardware clock at priority 100). Manual override: `set_clock`/`use_clock_from`.
 - Sources read the clock via `ctx.clock()` / `ctx.running_time()` in `produce()`.
 
 ## Codecs & Devices (feature-gated)
 
-| What | Types | Feature |
-|------|-------|---------|
-| H.264 | `H264Encoder`/`H264Decoder` (implement `Element` directly). `H264EncoderConfig::new()` takes **no dimensions**; geometry follows `Metadata` (a resize rebuilds the encoder + IDR). Live control via `control()`: a **bitrate change is seamless** (openh264-sys2 `SetOption(ENCODER_OPTION_BITRATE)`, no IDR); GOP/QP/rate-control/skip-frames rebuild (IDR). A no-op change does nothing. Counters via `stats()` → `EncoderStatsHandle`. **Defaults**: `rate_control = Bitrate`, `bitrate_bps = 2_000_000` (Bitrate + 0 is an error), `skip_frames = false`. In Bitrate mode with skipping off, `qp` is a quality *ceiling* (the band opens to 51) | `h264` |
-| H.264 hardware | `V4l2M2mH264Encoder` (impl `VideoEncoder`, wrap in `EncoderElement`), `find_m2m_encoder(b"H264")` device probe; `V4l2CodedFormat::Fwht` is test-only (vicodec) | `v4l2-m2m` (build needs libclang + kernel headers) |
-| AV1 | `Rav1eEncoder` (impl `Element` directly AND `VideoEncoder`; drains lookahead via `Element::flush`), `Dav1dDecoder` (impl `Element`) | `av1-encode` / `av1-decode` |
-| Audio dec | `SymphoniaDecoder` (impl `Element`) | `audio-flac/mp3/aac/vorbis` |
-| Opus | `OpusEncoder::new(rate, ch, bitrate, OpusApplication)` / `OpusDecoder` (impl `AudioEncoder`/`AudioDecoder`, wrap in `AudioEncoderElement`/`AudioDecoderElement`) | `opus` |
-| AAC enc | `AacEncoder` | `aac-encode` (FDK license!) |
-| Images | `JpegEncoder`/`JpegDecoder`, `PngEncoder`/`PngDecoder` | `image-*` |
-| Containers | `TsMux`/`TsMuxElement`/`TsDemux` [`mpeg-ts`], `Mp4Mux`/`Mp4FileSink`/`Mp4Demux` [`mp4-demux`]. `Mp4Demux` converts H.264 samples to Annex-B with in-band SPS/PPS on keyframes (`annexb::avcc_to_annex_b`); H.265/VP9 pass through length-prefixed | |
-| RTP | `RtpSrc/Sink`, `RtpH264Pay/Depay`, H265/VP8/VP9 pay/depay, `RtpOpusDepay` (no Opus pay), `RtpJitterBuffer`, `RtcpHandler` | `rtp` |
-| RTSP | `RtspSrc` (client only, via retina). `connect()` returns `RtspSession`, which implements `AsyncSource` — add it with `pipeline.add_async_source()` (the manual `next_frame()` pull API also remains). `RtspFrameFormat::AnnexB` default (SPS/PPS in-band per keyframe, feeds `H264Decoder` directly; `LengthPrefixed` for MP4 mux); `connect_timeout` enforced per operation; `user:pass@` URL creds auto-lifted. **`StreamInfo::dimensions` is `None` when the SDP has no geometry and is filled in from the first in-band SPS** (retina re-parses parameter sets; no `h264-reader` dep needed) — since `add_async_source` *moves* the session, take `session.stream_info_handle()` first and `await handle.wait_for_dimensions(i)`. Local test stream: `just rtsp-server`. Examples 57 (capture) / 58 (display) | `rtsp` |
-| HLS/DASH | `HlsSink`, `DashSink` (+ configs) — NOT feature-gated | — |
-| Devices | `V4l2Src` (DMA-BUF export, `framerate` knob), `LibCameraSrc` (libcamera 0.7; `framerate` via FrameDurationLimits, best-effort on UVC; process-wide shared `CameraManager` — a second live instance is fatal in libcamera), `PipeWireSrc/Sink`, `ScreenCaptureSrc`, `AlsaSrc/Sink` (clock provider) | `v4l2`/`libcamera`/`pipewire`/`screen-capture`/`alsa` |
-| Hotplug | `DeviceMonitor` (udev `video4linux` + libcamera events folded in when both features on; one physical USB cam → one `Added` per backend) | `hotplug` (+`libcamera` for folding) |
-| KLV | `KlvEncoder`, `StanagMetadataBuilder` (elements/metadata) | — |
-
-Codec traits: `VideoEncoder`/`VideoDecoder`, `AudioEncoder`/`AudioDecoder` (with `flush()` to drain at EOS; `VideoEncoder` also has `force_keyframe()` plus defaulted `set_bitrate`/`set_keyframe_interval`/`set_qp` that `Err` when the codec cannot comply — rav1e/opus/aac do not override them). Note the inconsistency: some codecs implement the traits (rav1e, opus, aac, v4l2-m2m), others implement `Element` directly (openh264, dav1d, symphonia). `EncoderElement::new(enc)` takes no format: it reads `Metadata.format` per buffer, maps caps pixel formats to codec ones with per-format strides (I420/I422/I444/NV12/10-bit), errors on RGB/packed input (needs `VideoConvert` upstream) and on a buffer that declares no format at all, and re-sizes its arena on a geometry change. Its `input_media_caps()` pins the encodable pixel-format list with `Any` geometry, so negotiation still auto-inserts a `VideoConvert`.
-
-**Video dimensions in metadata**: two conventions coexist — `Metadata.format` (`MediaFormat::VideoRaw`, read by `EncoderElement`) and the legacy `"width"`/`"height"` `u64` custom keys (set by `H264Decoder`, read by `AutoVideoSink`). Use `Metadata::set_video_dims()` / `video_dims()`, which write and read **both**; updating only one leaves the other stale and silently mis-sizes frames downstream.
-
-**`elements::codec` is compiled only when at least one codec feature is enabled** (see the `#[cfg(any(...))]` on `pub mod codec` in `elements/mod.rs`). Consequence: unit tests inside codec modules (including the always-present `EncoderElement`) do NOT run under default features — they run in CI's sensor combo and feature-specific jobs. When adding a codec feature, add it to that cfg list or the module silently won't compile.
-
-Muxer sync: `MuxerSyncState`/`MuxerSyncConfig::new().with_mode(SyncMode::{Auto|Strict|Loose|Timed}).with_interval_ms(..)`, `PadInfo::new(name, StreamType).required()/.optional()`; `TsMuxConfig::new().add_track(TsMuxTrack::new(pid, TsMuxStreamType::H264).video())`.
+Per-codec and per-device specifics — supported types, their feature flags, encoder defaults and control semantics, and container/RTP/RTSP behaviour — live in `src/elements/CLAUDE.md`, loaded when working under that directory.
 
 ## Plugin System
 
@@ -184,8 +143,7 @@ Muxer sync: `MuxerSyncState`/`MuxerSyncConfig::new().with_mode(SyncMode::{Auto|S
 
 ## Observability
 
-- Metrics: `observability::metrics` — `init_metrics()`, `ElementMetrics`, `PipelineMetrics`, metric names `parallax_buffers_*`, `parallax_bytes_*`, `parallax_processing_time_ns`, etc.
-- Tracing: `observability::tracing_support` (`TracingConfig`, span helpers).
+- `observability::metrics` (call `init_metrics()` first) and `observability::tracing_support`. Emitted metric names are prefixed `parallax_`.
 - Env vars: `PARALLAX_TRACERS` (tracer activation), `PARALLAX_DOT_DIR` (DOT dumps on state transitions).
 
 ## Gotchas & Pitfalls (read before writing code or docs)
@@ -204,13 +162,13 @@ Muxer sync: `MuxerSyncState`/`MuxerSyncConfig::new().with_mode(SyncMode::{Auto|S
 11b. **`elements::codec::hw_encoder`/`hw_decoder` need `vulkan-video` AND a codec feature** (the latter to compile `elements::codec` at all). No CI job sets both, so they had rotted un-compiled for a long time. Check them with `cargo check --features image-jpeg,vulkan-video`.
 12. **`AlignmentStrategy::Interpolate` needs `B: Lerp`** — it resamples the *right* stream onto the left's timestamps, and only `TemporalJoin::try_emit_interpolated` honours it. Plain `try_emit` returns `None` for that variant (it used to silently run `Nearest(10ms)`, discarding the caller's `Duration`).
 13. **`Error::PoolExhausted` is recoverable; every other `Err` from `process()` kills the element task.** The executor sheds that buffer (DropTracer + `parallax_buffers_dropped` + a rate-limited warn at the 1st/10th/100th consecutive) and continues, because a dropped frame beats a dead live pipeline. `ExecutorConfig::shed_fatal_after` opts back into failing for batch work. Encoders must call `OutputArena::admit()` *before* encoding — shedding an encoded packet leaves a `frame_num` gap the decoder cannot recover from until the next IDR — while decoders must never skip an input and shed the output copy instead.
+14. **`elements::codec` is compiled only when at least one codec feature is enabled** (see the `#[cfg(any(...))]` on `pub mod codec` in `elements/mod.rs`). Consequence: unit tests inside codec modules (including the always-present `EncoderElement`) do NOT run under default features — they run in CI's sensor combo and feature-specific jobs. When adding a codec feature, add it to that cfg list or the module silently won't compile.
 14b. **`src/codec/annexb.rs` is ALWAYS compiled** — the Annex-B helpers (`nal_units`/`has_idr`/`extract_param_sets`/`annex_b_to_avcc`) need no codec feature, unlike `elements::codec` (Gotcha above). Don't feature-gate code that only uses them.
 14c. **`ScaleEngine` (converters/) is the slice-level scaler; the `VideoScale` *element* wraps it** — one `ScaleMode` enum is shared by both, so a change to scaling behaviour touches both surfaces.
 15. Types that do NOT exist (stale docs may mention them): `CpuArena`, `HeapSegment`, `MemoryPool`, `SharedMemorySegment`, `PipelineExecutor`, `ElementSandbox`, `Affinity`, `parallax-launch`/`parallax-inspect`/`parallax-top` binaries.
 
 ## Code Style
 
-- rustfmt defaults; `#![warn(missing_docs)]` is enforced — every public item needs a doc comment.
 - thiserror for errors; tracing for logs; keep element `process()` sync (async only for real I/O).
 - Derive rkyv traits for IPC-crossing types.
 - Tests colocated per module + integration tests in `tests/`; run `just check` before committing.

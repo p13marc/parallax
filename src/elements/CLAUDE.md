@@ -1,0 +1,27 @@
+# Codecs & Devices (feature-gated)
+
+Guidance for elements under `src/elements/`. The always-loaded root `CLAUDE.md` holds the
+cross-cutting invariants (Geometry-in-Metadata, `OutputArena`/`OutputBudget`, `PoolExhausted`
+shedding, the `Metadata::set_video_dims()` dual convention); this file holds the per-codec and
+per-device specifics.
+
+| What | Types | Feature |
+|------|-------|---------|
+| H.264 | `H264Encoder`/`H264Decoder` (implement `Element` directly). `H264EncoderConfig::new()` takes **no dimensions**; geometry follows `Metadata` (a resize rebuilds the encoder + IDR). Live control via `control()`: a **bitrate change is seamless** (openh264-sys2 `SetOption(ENCODER_OPTION_BITRATE)`, no IDR); GOP/QP/rate-control/skip-frames rebuild (IDR). A no-op change does nothing. Counters via `stats()` → `EncoderStatsHandle`. **Defaults**: `rate_control = Bitrate`, `bitrate_bps = 2_000_000` (Bitrate + 0 is an error), `skip_frames = false`. In Bitrate mode with skipping off, `qp` is a quality *ceiling* (the band opens to 51) | `h264` |
+| H.264 hardware | `V4l2M2mH264Encoder` (impl `VideoEncoder`, wrap in `EncoderElement`), `find_m2m_encoder(b"H264")` device probe; `V4l2CodedFormat::Fwht` is test-only (vicodec) | `v4l2-m2m` (build needs libclang + kernel headers) |
+| AV1 | `Rav1eEncoder` (impl `Element` directly AND `VideoEncoder`; drains lookahead via `Element::flush`), `Dav1dDecoder` (impl `Element`) | `av1-encode` / `av1-decode` |
+| Audio dec | `SymphoniaDecoder` (impl `Element`) | `audio-flac/mp3/aac/vorbis` |
+| Opus | `OpusEncoder::new(rate, ch, bitrate, OpusApplication)` / `OpusDecoder` (impl `AudioEncoder`/`AudioDecoder`, wrap in `AudioEncoderElement`/`AudioDecoderElement`) | `opus` |
+| AAC enc | `AacEncoder` | `aac-encode` (FDK license!) |
+| Images | `JpegEncoder`/`JpegDecoder`, `PngEncoder`/`PngDecoder` | `image-*` |
+| Containers | `TsMux`/`TsMuxElement`/`TsDemux` [`mpeg-ts`], `Mp4Mux`/`Mp4FileSink`/`Mp4Demux` [`mp4-demux`]. `Mp4Demux` converts H.264 samples to Annex-B with in-band SPS/PPS on keyframes (`annexb::avcc_to_annex_b`); H.265/VP9 pass through length-prefixed | |
+| RTP | `RtpSrc/Sink`, `RtpH264Pay/Depay`, H265/VP8/VP9 pay/depay, `RtpOpusDepay` (no Opus pay), `RtpJitterBuffer`, `RtcpHandler` | `rtp` |
+| RTSP | `RtspSrc` (client only, via retina). `connect()` returns `RtspSession`, which implements `AsyncSource` — add it with `pipeline.add_async_source()` (the manual `next_frame()` pull API also remains). `RtspFrameFormat::AnnexB` default (SPS/PPS in-band per keyframe, feeds `H264Decoder` directly; `LengthPrefixed` for MP4 mux); `connect_timeout` enforced per operation; `user:pass@` URL creds auto-lifted. **`StreamInfo::dimensions` is `None` when the SDP has no geometry and is filled in from the first in-band SPS** (retina re-parses parameter sets; no `h264-reader` dep needed) — since `add_async_source` *moves* the session, take `session.stream_info_handle()` first and `await handle.wait_for_dimensions(i)`. Local test stream: `just rtsp-server`. Examples 57 (capture) / 58 (display) | `rtsp` |
+| HLS/DASH | `HlsSink`, `DashSink` (+ configs) — NOT feature-gated | — |
+| Devices | `V4l2Src` (DMA-BUF export, `framerate` knob), `LibCameraSrc` (libcamera 0.7; `framerate` via FrameDurationLimits, best-effort on UVC; process-wide shared `CameraManager` — a second live instance is fatal in libcamera), `PipeWireSrc/Sink`, `ScreenCaptureSrc`, `AlsaSrc/Sink` (clock provider) | `v4l2`/`libcamera`/`pipewire`/`screen-capture`/`alsa` |
+| Hotplug | `DeviceMonitor` (udev `video4linux` + libcamera events folded in when both features on; one physical USB cam → one `Added` per backend) | `hotplug` (+`libcamera` for folding) |
+| KLV | `KlvEncoder`, `StanagMetadataBuilder` (elements/metadata) | — |
+
+Codec traits: `VideoEncoder`/`VideoDecoder`, `AudioEncoder`/`AudioDecoder` (with `flush()` to drain at EOS; `VideoEncoder` also has `force_keyframe()` plus defaulted `set_bitrate`/`set_keyframe_interval`/`set_qp` that `Err` when the codec cannot comply — rav1e/opus/aac do not override them). Note the inconsistency: some codecs implement the traits (rav1e, opus, aac, v4l2-m2m), others implement `Element` directly (openh264, dav1d, symphonia). `EncoderElement::new(enc)` takes no format: it reads `Metadata.format` per buffer, maps caps pixel formats to codec ones with per-format strides (I420/I422/I444/NV12/10-bit), errors on RGB/packed input (needs `VideoConvert` upstream) and on a buffer that declares no format at all, and re-sizes its arena on a geometry change. Its `input_media_caps()` pins the encodable pixel-format list with `Any` geometry, so negotiation still auto-inserts a `VideoConvert`.
+
+Muxer sync: `MuxerSyncState`/`MuxerSyncConfig::new().with_mode(SyncMode::{Auto|Strict|Loose|Timed}).with_interval_ms(..)`, `PadInfo::new(name, StreamType).required()/.optional()`; `TsMuxConfig::new().add_track(TsMuxTrack::new(pid, TsMuxStreamType::H264).video())`.
