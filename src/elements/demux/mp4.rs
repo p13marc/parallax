@@ -167,12 +167,79 @@ pub struct Mp4VideoInfo {
 }
 
 /// Audio track information.
+///
+/// For AAC tracks the esds `DecoderSpecificDescriptor` fields are lifted so a
+/// decoder can be initialized from what the demuxer provides — the audio
+/// equivalent of the avcC treatment H.264 tracks get.
 #[derive(Debug, Clone)]
 pub struct Mp4AudioInfo {
     /// Sample rate in Hz.
     pub sample_rate: u32,
     /// Number of channels.
     pub channels: u16,
+    /// AAC audio object type from the esds box (2 = AAC-LC), if present.
+    pub object_type: Option<u8>,
+    /// AAC sampling-frequency index from the esds box, if present.
+    pub freq_index: Option<u8>,
+    /// AAC channel configuration from the esds box, if present.
+    pub channel_config: Option<u8>,
+    /// The `AudioSpecificConfig` bytes an AAC decoder initializes from.
+    ///
+    /// Rebuilt from the three esds fields above (the mp4 crate parses the
+    /// descriptor into fields rather than keeping the raw bytes), which is
+    /// exact for the plain AAC family — object types 1–30 with a standard
+    /// frequency index. An explicit-frequency stream (index 15) or an ASC
+    /// with extension payloads (HE-AAC's SBR block) cannot be reconstructed
+    /// from the parsed fields, so those stay `None`.
+    pub audio_specific_config: Option<Vec<u8>>,
+}
+
+impl Mp4AudioInfo {
+    /// Build the 7-byte ADTS header for a raw AAC frame of `frame_len` bytes.
+    ///
+    /// `None` when the track carried no esds configuration, or when the frame
+    /// is too large for the 13-bit ADTS length field. See
+    /// [`Mp4Demux::with_adts_aac`] to have the demuxer prepend this to every
+    /// AAC sample instead.
+    pub fn adts_header(&self, frame_len: usize) -> Option<[u8; 7]> {
+        let object_type = self.object_type?;
+        let freq_index = self.freq_index?;
+        let chan_conf = self.channel_config?;
+
+        let full_len = frame_len.checked_add(7)?;
+        if full_len > 0x1FFF || object_type == 0 {
+            return None;
+        }
+        let len = full_len as u16;
+        // ADTS profile is the object type minus one, two bits wide.
+        let profile = (object_type - 1) & 0x3;
+
+        Some([
+            0xFF, // syncword
+            0xF1, // syncword end, MPEG-4, layer 0, no CRC
+            (profile << 6) | ((freq_index & 0xF) << 2) | ((chan_conf >> 2) & 0x1),
+            ((chan_conf & 0x3) << 6) | ((len >> 11) as u8 & 0x3),
+            (len >> 3) as u8,
+            (((len & 0x7) as u8) << 5) | 0x1F, // buffer fullness: VBR
+            0xFC,                              // buffer fullness end, 1 AAC frame
+        ])
+    }
+}
+
+/// Rebuild the two-byte `AudioSpecificConfig` from parsed esds fields.
+///
+/// Layout: 5 bits object type, 4 bits frequency index, 4 bits channel
+/// configuration, 3 zero bits (frame length 1024, no core coder, no
+/// extension). Only valid for object types 1–30 and frequency indices 0–14 —
+/// the escape encodings need bytes the parsed fields no longer carry.
+fn synthesize_asc(object_type: u8, freq_index: u8, chan_conf: u8) -> Option<Vec<u8>> {
+    if object_type == 0 || object_type > 30 || freq_index > 14 || chan_conf > 15 {
+        return None;
+    }
+    Some(vec![
+        (object_type << 3) | (freq_index >> 1),
+        ((freq_index & 1) << 7) | (chan_conf << 3),
+    ])
 }
 
 // ============================================================================
@@ -350,6 +417,8 @@ pub struct Mp4Demux<R: Read + Seek> {
     /// cannot reach it — [`set_output_budget`](Self::set_output_budget) is
     /// there for whatever wraps it (see #76).
     output: OutputArena,
+    /// Prepend an ADTS header to every AAC sample (see [`with_adts_aac`](Self::with_adts_aac)).
+    adts_aac: bool,
 }
 
 /// Per-track H.264 decoder configuration from the avcC box.
@@ -440,6 +509,18 @@ impl<R: Read + Seek> Mp4Demux<R> {
             };
 
             let audio_info = if track_type == Mp4TrackType::Audio {
+                // Lift the esds DecoderSpecificDescriptor fields directly —
+                // this is what an AAC decoder needs to initialize (#69).
+                let dec_specific = track
+                    .trak
+                    .mdia
+                    .minf
+                    .stbl
+                    .stsd
+                    .mp4a
+                    .as_ref()
+                    .and_then(|mp4a| mp4a.esds.as_ref())
+                    .map(|esds| &esds.es_desc.dec_config.dec_specific);
                 Some(Mp4AudioInfo {
                     sample_rate: track
                         .sample_freq_index()
@@ -449,6 +530,11 @@ impl<R: Read + Seek> Mp4Demux<R> {
                         .channel_config()
                         .map(|c| Self::channel_count(c))
                         .unwrap_or(2),
+                    object_type: dec_specific.map(|d| d.profile),
+                    freq_index: dec_specific.map(|d| d.freq_index),
+                    channel_config: dec_specific.map(|d| d.chan_conf),
+                    audio_specific_config: dec_specific
+                        .and_then(|d| synthesize_asc(d.profile, d.freq_index, d.chan_conf)),
                 })
             } else {
                 None
@@ -481,7 +567,20 @@ impl<R: Read + Seek> Mp4Demux<R> {
             output: OutputArena::new(defaults::MP4_DEMUX_SLOT_COUNT)
                 .with_min_slot_size(defaults::MP4_DEMUX_SLOT_SIZE)
                 .grow_to_fit(),
+            adts_aac: false,
         })
+    }
+
+    /// Wrap every AAC sample in an ADTS header on the way out.
+    ///
+    /// MP4 stores AAC raw (the configuration lives out-of-band in the esds
+    /// box); consumers that expect a self-describing stream — ADTS parsers,
+    /// files meant to be playable on their own — need the 7-byte header back
+    /// on every frame. Samples of tracks with no esds configuration pass
+    /// through unwrapped.
+    pub fn with_adts_aac(mut self, adts: bool) -> Self {
+        self.adts_aac = adts;
+        self
     }
 
     /// Size this demuxer's output arena from the graph below it.
@@ -726,7 +825,7 @@ impl<R: Read + Seek> Mp4Demux<R> {
 
         // H.264: convert the AVCC sample to a self-contained Annex-B access
         // unit; anything else passes through in container form.
-        let payload: std::borrow::Cow<'_, [u8]> = match self.avc_configs.get(&track_id) {
+        let mut payload: std::borrow::Cow<'_, [u8]> = match self.avc_configs.get(&track_id) {
             Some(cfg) => std::borrow::Cow::Owned(Self::avcc_sample_to_annex_b(
                 cfg,
                 &sample.bytes,
@@ -734,6 +833,20 @@ impl<R: Read + Seek> Mp4Demux<R> {
             )?),
             None => std::borrow::Cow::Borrowed(&sample.bytes),
         };
+
+        // AAC: optionally make each frame self-describing (see with_adts_aac).
+        if self.adts_aac
+            && track.codec == Mp4Codec::Aac
+            && let Some(header) = track
+                .audio_info
+                .as_ref()
+                .and_then(|info| info.adts_header(payload.len()))
+        {
+            let mut framed = Vec::with_capacity(payload.len() + header.len());
+            framed.extend_from_slice(&header);
+            framed.extend_from_slice(&payload);
+            payload = std::borrow::Cow::Owned(framed);
+        }
 
         // Create buffer
         let buffer = self.create_buffer(&payload, track_id, &sample, &track)?;
@@ -1023,6 +1136,69 @@ mod tests {
             (7, true),
             "no stss: everything is sync"
         );
+    }
+
+    #[test]
+    fn asc_synthesis_matches_the_spec_layout() {
+        // AAC-LC (2), 48 kHz (index 3), stereo (2):
+        // 00010 0011 0010 000 → 0x11 0x90.
+        assert_eq!(synthesize_asc(2, 3, 2), Some(vec![0x11, 0x90]));
+        // AAC-LC, 44.1 kHz (index 4), mono (1): 00010 0100 0001 000.
+        assert_eq!(synthesize_asc(2, 4, 1), Some(vec![0x12, 0x08]));
+    }
+
+    #[test]
+    fn asc_synthesis_refuses_escape_encodings() {
+        assert_eq!(synthesize_asc(31, 3, 2), None, "object-type escape");
+        assert_eq!(synthesize_asc(2, 15, 2), None, "explicit frequency");
+        assert_eq!(synthesize_asc(0, 3, 2), None, "null object type");
+    }
+
+    #[test]
+    fn adts_header_round_trips_its_fields() {
+        let info = Mp4AudioInfo {
+            sample_rate: 48000,
+            channels: 2,
+            object_type: Some(2),
+            freq_index: Some(3),
+            channel_config: Some(2),
+            audio_specific_config: synthesize_asc(2, 3, 2),
+        };
+        let header = info.adts_header(100).unwrap();
+
+        assert_eq!(header[0], 0xFF);
+        assert_eq!(header[1], 0xF1, "MPEG-4, layer 0, no CRC");
+        assert_eq!(header[2] >> 6, 1, "profile = object type - 1");
+        assert_eq!((header[2] >> 2) & 0xF, 3, "frequency index");
+        let chan = ((header[2] & 0x1) << 2) | (header[3] >> 6);
+        assert_eq!(chan, 2, "channel configuration");
+        let len =
+            ((header[3] as u16 & 0x3) << 11) | ((header[4] as u16) << 3) | (header[5] as u16 >> 5);
+        assert_eq!(len, 107, "13-bit length includes the header");
+    }
+
+    #[test]
+    fn adts_header_needs_esds_and_a_representable_length() {
+        let no_esds = Mp4AudioInfo {
+            sample_rate: 44100,
+            channels: 2,
+            object_type: None,
+            freq_index: None,
+            channel_config: None,
+            audio_specific_config: None,
+        };
+        assert_eq!(no_esds.adts_header(100), None);
+
+        let info = Mp4AudioInfo {
+            sample_rate: 48000,
+            channels: 2,
+            object_type: Some(2),
+            freq_index: Some(3),
+            channel_config: Some(2),
+            audio_specific_config: None,
+        };
+        assert!(info.adts_header(0x1FFF - 6).is_none(), "overflows 13 bits");
+        assert!(info.adts_header(0x1FFF - 7).is_some());
     }
 
     #[test]

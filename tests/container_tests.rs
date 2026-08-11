@@ -577,6 +577,55 @@ mod mp4_roundtrip_tests {
     }
 
     #[test]
+    fn test_audio_info_exposes_esds_configuration() {
+        let mp4_data = seekable_av_fixture();
+        let demux = Mp4Demux::new(Cursor::new(mp4_data.clone()), mp4_data.len() as u64)
+            .expect("Should create demuxer");
+        let audio_id = demux.audio_track_id().unwrap();
+        let info = demux.track(audio_id).unwrap().audio_info.as_ref().unwrap();
+
+        assert_eq!(info.sample_rate, 48000);
+        assert_eq!(info.channels, 2);
+        assert_eq!(info.object_type, Some(2), "AAC-LC");
+        assert_eq!(info.freq_index, Some(3), "48 kHz");
+        assert_eq!(info.channel_config, Some(2), "stereo");
+        // AudioSpecificConfig for LC/48k/stereo — what #68's decoder
+        // initializes from.
+        assert_eq!(info.audio_specific_config, Some(vec![0x11, 0x90]));
+    }
+
+    #[test]
+    fn test_adts_wrapping_makes_aac_self_describing() {
+        let mp4_data = seekable_av_fixture();
+
+        // Raw (default): samples come back exactly as written.
+        let mut demux = Mp4Demux::new(Cursor::new(mp4_data.clone()), mp4_data.len() as u64)
+            .expect("Should create demuxer");
+        let audio_id = demux.audio_track_id().unwrap();
+        let raw = demux.read_sample(audio_id).unwrap().unwrap();
+        assert_eq!(raw.buffer.as_bytes(), &[0xFF, 0xF1, 0x50, 0x80]);
+
+        // Wrapped: a 7-byte ADTS header precedes the same payload, and its
+        // length field covers header + payload.
+        let mut demux = Mp4Demux::new(Cursor::new(mp4_data.clone()), mp4_data.len() as u64)
+            .expect("Should create demuxer")
+            .with_adts_aac(true);
+        let framed = demux.read_sample(audio_id).unwrap().unwrap();
+        let bytes = framed.buffer.as_bytes();
+        assert_eq!(bytes.len(), 4 + 7);
+        assert_eq!(&bytes[..2], &[0xFF, 0xF1], "ADTS syncword");
+        let len =
+            ((bytes[3] as u16 & 0x3) << 11) | ((bytes[4] as u16) << 3) | (bytes[5] as u16 >> 5);
+        assert_eq!(len, 11);
+        assert_eq!(&bytes[7..], &[0xFF, 0xF1, 0x50, 0x80]);
+
+        // Video is untouched by the toggle.
+        let video_id = demux.video_track_id().unwrap();
+        let video = demux.read_sample(video_id).unwrap().unwrap();
+        assert!(video.is_keyframe);
+    }
+
+    #[test]
     fn test_seek_all_lands_av_together() {
         let mp4_data = seekable_av_fixture();
         let mut demux = Mp4Demux::new(Cursor::new(mp4_data.clone()), mp4_data.len() as u64)
