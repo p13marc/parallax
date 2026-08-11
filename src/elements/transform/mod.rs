@@ -47,6 +47,7 @@ mod audioresample;
 mod batch;
 mod buffer_ops;
 mod data_processing;
+mod downmix;
 mod filter;
 mod gain;
 mod generic;
@@ -64,6 +65,7 @@ pub use videoconvert::VideoConvertElement;
 // Audio processing
 pub use audioconvert::AudioConvertElement;
 pub use audioresample::AudioResampleElement;
+pub use downmix::AudioDownmix;
 pub use gain::{Gain, GainControl};
 
 // Batching

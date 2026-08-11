@@ -37,7 +37,7 @@ Phase 2 — format expansion (`video-player` label):
 | #125 | AV1/Opus in MP4 | done |
 | #126 | Vorbis audio | done |
 | #127 | E-AC-3 audio (in-decoder stereo fold-down) | done |
-| #128 | Generic 5.1 downmix element | pending |
+| #128 | Generic 5.1/7.1 downmix element | done |
 
 The core engine work the player rides on (in-pipeline MP4 demuxing with
 per-pad routing, runtime pause/seek/position, the streaming AAC decoder,
