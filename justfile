@@ -62,6 +62,10 @@ check-media-full:
     cargo nextest run --features {{media_full_features}}
     cargo clippy --all-targets --features {{media_full_features}} -- -D warnings
 
+# Media-path benchmarks (demux/decode/convert) — needs the codec system libs
+bench-media:
+    cargo bench --features h264,mkv-demux --bench media_path
+
 # Check + test + lint the V4L2 M2M hardware encoder (mirrors CI's test-v4l2-m2m job).
 # Needs libclang + kernel headers (on immutable Fedora: run inside a toolbox).
 # Live queue test: modprobe vicodec, then PARALLAX_VICODEC_TEST_DEVICE=auto just check-m2m

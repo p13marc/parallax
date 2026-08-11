@@ -236,6 +236,10 @@ name = "throughput"
 harness = false
 
 [[bench]]
+name = "media_path"
+harness = false
+
+[[bench]]
 name = "memory_pool"
 harness = false
 
