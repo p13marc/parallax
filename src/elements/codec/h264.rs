@@ -1011,7 +1011,16 @@ const MAX_PENDING_METADATA: usize = 64;
 impl H264Decoder {
     /// Create a new H.264 decoder.
     pub fn new() -> Result<Self> {
-        let decoder = Decoder::new()
+        // NoFlush is load-bearing: the wrapper's default (`Flush::Flush`)
+        // force-drains openh264's DPB on every decode call that produces no
+        // immediate picture. B-frame streams legitimately delay output for
+        // reordering, and a mid-stream force-flush corrupts the decoder's
+        // NAL bookkeeping — openh264 then fails with dsOutOfMemory a few
+        // AUs later (reproduced on H.264 Main WEB-DL streams). Delayed
+        // frames drain through `Element::flush` at EOS instead.
+        let config = openh264::decoder::DecoderConfig::new()
+            .flush_after_decode(openh264::decoder::Flush::NoFlush);
+        let decoder = Decoder::with_api_config(OpenH264API::from_source(), config)
             .map_err(|e| Error::Config(format!("Failed to create H.264 decoder: {:?}", e)))?;
 
         // Slot size comes from the first decoded frame, so 4K works without

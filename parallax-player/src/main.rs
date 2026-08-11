@@ -10,7 +10,9 @@ use clap::Parser;
 use parallax::clock::ClockTime;
 use parallax::converters::PixelFormat;
 use parallax::elements::codec::AudioDecoderElement;
-use parallax::elements::demux::{Mp4Codec, Mp4Demux, Mp4DemuxSource, Mp4TrackType};
+use parallax::elements::demux::{
+    MkvCodec, MkvDemux, MkvTrackType, Mp4Codec, Mp4Demux, Mp4DemuxSource, Mp4TrackType,
+};
 use parallax::elements::device::{AlsaFormat, AlsaSampleFormat, AlsaSink};
 use parallax::elements::transform::VideoConvertElement;
 use parallax::elements::{AacDecoder, AutoVideoSink, H264Decoder, VideoKey, VideoWindowEvent};
@@ -26,7 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Args {
-    /// The media file to play (MP4/MOV with H.264 video).
+    /// The media file to play (MP4/MOV or MKV/WebM with H.264 video).
     file: PathBuf,
 
     /// Disable the audio branch.
@@ -61,60 +63,130 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// What the audio branch needs from the container: the ASC plus the stream
-/// parameters, when the file has a playable AAC track.
-struct AudioParams {
-    asc: Vec<u8>,
+/// Video codec of the selected track, container-agnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VideoCodecKind {
+    H264,
+    Vp8,
+    Vp9,
+    Av1,
+    Other(String),
+}
+
+impl std::fmt::Display for VideoCodecKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VideoCodecKind::H264 => write!(f, "H.264"),
+            VideoCodecKind::Vp8 => write!(f, "VP8"),
+            VideoCodecKind::Vp9 => write!(f, "VP9"),
+            VideoCodecKind::Av1 => write!(f, "AV1"),
+            VideoCodecKind::Other(s) => write!(f, "{s}"),
+        }
+    }
+}
+
+/// Audio codec of the selected track, container-agnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AudioCodecKind {
+    Aac,
+    Opus,
+    Vorbis,
+    Eac3,
+    Other(String),
+}
+
+impl std::fmt::Display for AudioCodecKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AudioCodecKind::Aac => write!(f, "AAC"),
+            AudioCodecKind::Opus => write!(f, "Opus"),
+            AudioCodecKind::Vorbis => write!(f, "Vorbis"),
+            AudioCodecKind::Eac3 => write!(f, "E-AC-3"),
+            AudioCodecKind::Other(s) => write!(f, "{s}"),
+        }
+    }
+}
+
+impl From<Mp4Codec> for VideoCodecKind {
+    fn from(c: Mp4Codec) -> Self {
+        match c {
+            Mp4Codec::H264 => VideoCodecKind::H264,
+            Mp4Codec::Vp9 => VideoCodecKind::Vp9,
+            other => VideoCodecKind::Other(other.to_string()),
+        }
+    }
+}
+
+impl From<&MkvCodec> for VideoCodecKind {
+    fn from(c: &MkvCodec) -> Self {
+        match c {
+            MkvCodec::H264 => VideoCodecKind::H264,
+            MkvCodec::Vp8 => VideoCodecKind::Vp8,
+            MkvCodec::Vp9 => VideoCodecKind::Vp9,
+            MkvCodec::Av1 => VideoCodecKind::Av1,
+            other => VideoCodecKind::Other(other.to_string()),
+        }
+    }
+}
+
+impl From<&MkvCodec> for AudioCodecKind {
+    fn from(c: &MkvCodec) -> Self {
+        match c {
+            MkvCodec::Aac => AudioCodecKind::Aac,
+            MkvCodec::Opus => AudioCodecKind::Opus,
+            MkvCodec::Vorbis => AudioCodecKind::Vorbis,
+            MkvCodec::Eac3 => AudioCodecKind::Eac3,
+            other => AudioCodecKind::Other(other.to_string()),
+        }
+    }
+}
+
+/// The selected video track, container-agnostic.
+struct VideoStream {
+    codec: VideoCodecKind,
+    width: u32,
+    height: u32,
+}
+
+/// The selected audio track, container-agnostic.
+///
+/// `extradata` is the codec's out-of-band configuration: the
+/// AudioSpecificConfig for AAC (esds-synthesized for MP4, raw CodecPrivate
+/// for MKV) — later codecs put their own headers here.
+struct AudioStream {
+    codec: AudioCodecKind,
     sample_rate: u32,
     channels: u32,
+    extradata: Option<Vec<u8>>,
+}
+
+/// Container-agnostic description of what the file holds.
+struct StreamSummary {
+    video: Option<VideoStream>,
+    audio: Option<AudioStream>,
+    duration_ns: u64,
+}
+
+/// The opened demuxer, by container.
+enum ProbedSource {
+    Mp4(Mp4Demux<BufReader<File>>),
+    Mkv(MkvDemux<BufReader<File>>),
 }
 
 /// Everything `play` needs from the container probe.
 struct Probed {
-    demux: Mp4Demux<BufReader<File>>,
-    width: u32,
-    height: u32,
-    audio: Option<AudioParams>,
-    duration_ns: u64,
+    source: ProbedSource,
+    summary: StreamSummary,
 }
 
-/// Open the file and describe it; error out early on things we cannot play.
-fn open_and_probe(args: &Args) -> anyhow::Result<Probed> {
-    let mut file =
-        File::open(&args.file).with_context(|| format!("cannot open {}", args.file.display()))?;
-    let size = file.metadata()?.len();
-
-    // Name what the file actually is before the demuxer's parse error can:
-    // "Matroska detected" beats "not a readable MP4".
-    let mut head = [0u8; 8192];
-    let n = file.read(&mut head)?;
-    match TypeFindRegistry::with_builtins().detect(&head[..n]) {
-        Some(found) if found.media_type != MediaType::Mp4 => {
-            bail!(
-                "{}: {:?} detected — only MP4 is supported for now",
-                args.file.display(),
-                found.media_type
-            );
-        }
-        Some(_) => {}
-        None => bail!(
-            "{}: not a media file this player recognizes",
-            args.file.display()
-        ),
-    }
-    file.seek(SeekFrom::Start(0))?;
-
-    let demux = Mp4Demux::new(BufReader::new(file), size)
-        .with_context(|| format!("{} is not a readable MP4", args.file.display()))?;
-
+/// Probe an opened MP4: print the track table and summarize the selection.
+fn probe_mp4(args: &Args, demux: &Mp4Demux<BufReader<File>>) -> StreamSummary {
     println!(
         "{} — {:.1}s, {} track(s)",
         args.file.display(),
         demux.duration_ns() as f64 / 1e9,
         demux.tracks().len()
     );
-
-    let mut geometry = None;
     for track in demux.tracks() {
         match track.track_type {
             Mp4TrackType::Video => {
@@ -128,9 +200,6 @@ fn open_and_probe(args: &Args) -> anyhow::Result<Probed> {
                     info.and_then(|i| i.frame_rate).unwrap_or(0.0),
                     track.sample_count,
                 );
-                if track.codec == Mp4Codec::H264 {
-                    geometry = info.map(|i| (i.width, i.height));
-                }
             }
             Mp4TrackType::Audio => {
                 let info = track.audio_info.as_ref();
@@ -147,45 +216,159 @@ fn open_and_probe(args: &Args) -> anyhow::Result<Probed> {
         }
     }
 
-    let Some(video_id) = demux.video_track_id() else {
+    let video = demux
+        .video_track_id()
+        .and_then(|id| demux.track(id))
+        .map(|t| {
+            let info = t.video_info.as_ref();
+            VideoStream {
+                codec: t.codec.into(),
+                width: info.map(|i| i.width).unwrap_or(0),
+                height: info.map(|i| i.height).unwrap_or(0),
+            }
+        });
+    let audio = demux
+        .audio_track_id()
+        .and_then(|id| demux.track(id))
+        .and_then(|t| {
+            let info = t.audio_info.as_ref()?;
+            Some(AudioStream {
+                codec: match t.codec {
+                    Mp4Codec::Aac => AudioCodecKind::Aac,
+                    other => AudioCodecKind::Other(other.to_string()),
+                },
+                sample_rate: info.sample_rate,
+                channels: info.channels as u32,
+                extradata: info.audio_specific_config.clone(),
+            })
+        });
+    StreamSummary {
+        video,
+        audio,
+        duration_ns: demux.duration_ns(),
+    }
+}
+
+/// Probe an opened MKV/WebM: print the track table and summarize.
+fn probe_mkv(args: &Args, demux: &MkvDemux<BufReader<File>>) -> StreamSummary {
+    let duration_ns = demux.duration_ns().unwrap_or(0);
+    println!(
+        "{} — {:.1}s, {} track(s)",
+        args.file.display(),
+        duration_ns as f64 / 1e9,
+        demux.tracks().len()
+    );
+    let mut subtitles = 0usize;
+    for track in demux.tracks() {
+        match track.track_type {
+            MkvTrackType::Video => {
+                let info = track.video_info.as_ref();
+                println!(
+                    "  #{} video: {} {}x{} @ {:.2} fps",
+                    track.id,
+                    track.codec,
+                    info.map(|i| i.width).unwrap_or(0),
+                    info.map(|i| i.height).unwrap_or(0),
+                    info.and_then(|i| i.frame_rate).unwrap_or(0.0),
+                );
+            }
+            MkvTrackType::Audio => {
+                let info = track.audio_info.as_ref();
+                println!(
+                    "  #{} audio: {} {} Hz, {} ch",
+                    track.id,
+                    track.codec,
+                    info.map(|i| i.sample_rate).unwrap_or(0),
+                    info.map(|i| i.channels).unwrap_or(0),
+                );
+            }
+            MkvTrackType::Subtitle => subtitles += 1,
+            other => println!("  #{} {:?}: {}", track.id, other, track.codec),
+        }
+    }
+    if subtitles > 0 {
+        println!("  ({subtitles} subtitle track(s) — not rendered)");
+    }
+
+    let video = demux.video_track().map(|t| {
+        let info = t.video_info.as_ref();
+        VideoStream {
+            codec: (&t.codec).into(),
+            width: info.map(|i| i.width).unwrap_or(0),
+            height: info.map(|i| i.height).unwrap_or(0),
+        }
+    });
+    let audio = demux.audio_track().and_then(|t| {
+        let info = t.audio_info.as_ref()?;
+        Some(AudioStream {
+            codec: (&t.codec).into(),
+            sample_rate: info.sample_rate,
+            channels: info.channels as u32,
+            extradata: info.codec_private.clone(),
+        })
+    });
+    StreamSummary {
+        video,
+        audio,
+        duration_ns,
+    }
+}
+
+/// Open the file and describe it; error out early on things we cannot play.
+fn open_and_probe(args: &Args) -> anyhow::Result<Probed> {
+    let mut file =
+        File::open(&args.file).with_context(|| format!("cannot open {}", args.file.display()))?;
+    let size = file.metadata()?.len();
+
+    // Name what the file actually is before the demuxer's parse error can:
+    // "AVI detected" beats "not a readable MP4".
+    let mut head = [0u8; 8192];
+    let n = file.read(&mut head)?;
+    let media_type = match TypeFindRegistry::with_builtins().detect(&head[..n]) {
+        Some(found) => found.media_type,
+        None => bail!(
+            "{}: not a media file this player recognizes",
+            args.file.display()
+        ),
+    };
+    file.seek(SeekFrom::Start(0))?;
+
+    let (source, summary) = match media_type {
+        MediaType::Mp4 => {
+            let demux = Mp4Demux::new(BufReader::new(file), size)
+                .with_context(|| format!("{} is not a readable MP4", args.file.display()))?;
+            let summary = probe_mp4(args, &demux);
+            (ProbedSource::Mp4(demux), summary)
+        }
+        MediaType::Matroska | MediaType::WebM => {
+            let demux = MkvDemux::new(BufReader::new(file)).with_context(|| {
+                format!("{} is not a readable Matroska/WebM", args.file.display())
+            })?;
+            let summary = probe_mkv(args, &demux);
+            (ProbedSource::Mkv(demux), summary)
+        }
+        other => bail!(
+            "{}: {other:?} detected — only MP4 and MKV/WebM are supported for now",
+            args.file.display()
+        ),
+    };
+
+    let Some(video) = &summary.video else {
         bail!("no video track — nothing to play");
     };
-    let codec = demux.track(video_id).map(|t| t.codec);
-    if codec != Some(Mp4Codec::H264) {
-        let hint = match codec {
-            Some(Mp4Codec::H265) => " (H.265 decode is not wired up yet)",
-            Some(Mp4Codec::Vp9) => " (VP9 decode is not wired up yet)",
+    if video.codec != VideoCodecKind::H264 {
+        let hint = match video.codec {
+            VideoCodecKind::Vp8 | VideoCodecKind::Vp9 => " (VP8/VP9 decode is not wired up yet)",
+            VideoCodecKind::Av1 => " (AV1 decode is not wired up yet)",
             _ => "",
         };
         bail!(
             "video track is {} — only H.264 is supported for now{hint}",
-            codec.map(|c| c.to_string()).unwrap_or_default()
+            video.codec
         );
     }
-    let (width, height) = geometry.filter(|(w, h)| *w > 0 && *h > 0).unwrap_or((0, 0));
 
-    // The audio branch needs an AAC track with a usable decoder config.
-    let audio = demux
-        .audio_track_id()
-        .and_then(|id| demux.track(id))
-        .filter(|t| t.codec == Mp4Codec::Aac)
-        .and_then(|t| t.audio_info.as_ref())
-        .and_then(|info| {
-            info.audio_specific_config.as_ref().map(|asc| AudioParams {
-                asc: asc.clone(),
-                sample_rate: info.sample_rate,
-                channels: info.channels as u32,
-            })
-        });
-
-    let duration_ns = demux.duration_ns();
-    Ok(Probed {
-        demux,
-        width,
-        height,
-        audio,
-        duration_ns,
-    })
+    Ok(Probed { source, summary })
 }
 
 /// The player's control commands, from window keys or the terminal.
@@ -282,16 +465,27 @@ impl Drop for RawMode {
 /// video-only instead of failing playback.
 fn audio_branch(
     args: &Args,
-    audio: Option<AudioParams>,
+    audio: Option<&AudioStream>,
 ) -> Option<(AudioDecoderElement<AacDecoder>, AlsaSink)> {
     if args.no_audio {
         return None;
     }
-    let Some(params) = audio else {
-        println!("no playable AAC track — video only");
+    let Some(stream) = audio else {
+        println!("no audio track — video only");
         return None;
     };
-    let decoder = match AacDecoder::from_asc(&params.asc) {
+    if stream.codec != AudioCodecKind::Aac {
+        println!(
+            "audio track is {} — decode not wired up yet, video only",
+            stream.codec
+        );
+        return None;
+    }
+    let Some(asc) = &stream.extradata else {
+        println!("AAC track has no usable decoder config — video only");
+        return None;
+    };
+    let decoder = match AacDecoder::from_asc(asc) {
         Ok(d) => d,
         Err(e) => {
             println!("audio decoder unavailable ({e}) — video only");
@@ -303,8 +497,8 @@ fn audio_branch(
     // the pipeline clock (priority 150), so once this branch exists the
     // video paces off the audio hardware — that is M2's A/V sync.
     let format = AlsaFormat {
-        sample_rate: params.sample_rate,
-        channels: params.channels,
+        sample_rate: stream.sample_rate,
+        channels: stream.channels,
         format: AlsaSampleFormat::F32LE,
         ..AlsaFormat::default()
     };
@@ -319,23 +513,15 @@ fn audio_branch(
 
 /// One playback pass: build the pipeline, run it to EOS / close / Ctrl-C.
 async fn play(args: &Args) -> anyhow::Result<Outcome> {
-    let Probed {
-        demux,
-        width,
-        height,
-        audio,
-        duration_ns,
-    } = open_and_probe(args)?;
-    let audio = audio_branch(args, audio);
-
-    // Without an audio branch the video-only source keeps the audio pad from
-    // existing at all (no unlinked-pad drop warnings).
-    let source = if audio.is_some() {
-        Mp4DemuxSource::new(demux)
-    } else {
-        Mp4DemuxSource::video_only(demux)
-    }
-    .with_loop(args.loop_playback);
+    let Probed { source, summary } = open_and_probe(args)?;
+    let duration_ns = summary.duration_ns;
+    let (width, height) = summary
+        .video
+        .as_ref()
+        .map(|v| (v.width, v.height))
+        .filter(|(w, h)| *w > 0 && *h > 0)
+        .unwrap_or((0, 0));
+    let audio = audio_branch(args, summary.audio.as_ref());
 
     let mut convert = VideoConvertElement::new()
         .with_input_format(PixelFormat::I420)
@@ -359,7 +545,28 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
     pipeline
         .tracer_registry()
         .add(Box::new(DropCounter(dropped.clone())));
-    let src = pipeline.add_demuxer("mp4demux", source);
+    // Without an audio branch the video-only source keeps the audio pad from
+    // existing at all (no unlinked-pad drop warnings).
+    let src = match source {
+        ProbedSource::Mp4(demux) => {
+            let s = if audio.is_some() {
+                Mp4DemuxSource::new(demux)
+            } else {
+                Mp4DemuxSource::video_only(demux)
+            }
+            .with_loop(args.loop_playback);
+            pipeline.add_demuxer("demux", s)
+        }
+        ProbedSource::Mkv(demux) => {
+            let s = if audio.is_some() {
+                demux
+            } else {
+                demux.video_only()
+            }
+            .with_loop(args.loop_playback);
+            pipeline.add_demuxer("demux", s)
+        }
+    };
     let dec = pipeline.add_filter("decode", H264Decoder::new()?);
     let cvt = pipeline.add_filter("convert", convert);
     let snk = pipeline.add_sink("display", sink);
