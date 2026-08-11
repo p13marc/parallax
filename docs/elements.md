@@ -217,6 +217,7 @@ Codec traits: `VideoEncoder`/`VideoDecoder` and `AudioEncoder`/`AudioDecoder` (a
 | H.264 hardware encode | `V4l2M2mH264Encoder` (impl `VideoEncoder`; wrap: `EncoderElement::new(enc)`) | `v4l2-m2m` | V4L2 M2M stateful encoder (RPi, i.MX, Rockchip…); locate with `find_m2m_encoder(b"H264")`; building needs libclang + kernel headers; VAAPI backend planned |
 | AV1 encode | `Rav1eEncoder` (impl `VideoEncoder`; wrap: `EncoderElement::new(enc)`) | `av1-encode` | rav1e, pure Rust; install nasm for SIMD |
 | AV1 decode | `Dav1dDecoder` (impl `Element`) | `av1-decode` | libdav1d system library |
+| VP8/VP9 decode | `VpxDecoder::vp8()/vp9()` (impl `Element`) | `vpx` | libvpx system library (`libvpx-devel`; bindings generated via bindgen, needs libclang at build time); I420 output, display-order 1:1 timestamps, mid-stream resolution changes |
 | FLAC/MP3/AAC/Vorbis decode | `SymphoniaDecoder` (impl `Element`) | `audio-flac`/`-mp3`/`-aac`/`-vorbis` | Symphonia, pure Rust |
 | Opus | `OpusEncoder::new(rate, ch, bitrate, OpusApplication)`, `OpusDecoder` (impl audio traits) | `opus` | libopus; 48 kHz frame sizes 120–2880 samples |
 | AAC encode | `AacEncoder` (impl `AudioEncoder`) | `aac-encode` | FDK-AAC — **license restrictions for commercial use** |

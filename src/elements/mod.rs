@@ -54,6 +54,7 @@ pub mod app;
     feature = "v4l2-m2m",
     feature = "av1-encode",
     feature = "av1-decode",
+    feature = "vpx",
     feature = "audio-flac",
     feature = "audio-mp3",
     feature = "audio-aac",
@@ -247,6 +248,10 @@ pub use codec::{
 // Video codecs - AV1
 #[cfg(feature = "av1-decode")]
 pub use codec::Dav1dDecoder;
+
+// Video codecs - VP8/VP9
+#[cfg(feature = "vpx")]
+pub use codec::{VpxCodec, VpxDecoder};
 
 #[cfg(feature = "av1-encode")]
 pub use codec::{Rav1eConfig, Rav1eEncoder};

@@ -54,6 +54,14 @@ check-media:
     cargo nextest run --features {{media_features}}
     cargo clippy --all-targets --features {{media_features}} -- -D warnings
 
+# Media combo plus the system-library codecs (libvpx/libdav1d/libopus dev
+# packages + libclang required; not in CI)
+media_full_features := media_features + ",vpx,av1-decode,opus,h264"
+
+check-media-full:
+    cargo nextest run --features {{media_full_features}}
+    cargo clippy --all-targets --features {{media_full_features}} -- -D warnings
+
 # Check + test + lint the V4L2 M2M hardware encoder (mirrors CI's test-v4l2-m2m job).
 # Needs libclang + kernel headers (on immutable Fedora: run inside a toolbox).
 # Live queue test: modprobe vicodec, then PARALLAX_VICODEC_TEST_DEVICE=auto just check-m2m

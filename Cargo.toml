@@ -125,6 +125,11 @@ yuv = { version = "0.8", optional = true }
 mp4 = { version = "0.14", optional = true }
 matroska-demuxer = { version = "0.8", optional = true }
 
+# VP8/VP9 codec (bindings to system libvpx; `generate` runs bindgen against
+# the installed headers so any libvpx version works, at the cost of libclang
+# at build time)
+env-libvpx-sys = { version = "5", optional = true, features = ["generate"] }
+
 # Opus audio codec (bindings to libopus)
 opus = { version = "0.3", optional = true }
 
@@ -178,9 +183,10 @@ macros = ["parallax-macros"]  # Plugin authoring macros
 huge-pages = []       # MAP_HUGETLB support
 rdma = []             # Future: RDMA support
 vulkan-video = ["dep:ash", "dep:h264-reader"]  # Vulkan Video codecs
-software-codecs = ["av1-encode", "av1-decode", "h264"]  # All software video codecs
+software-codecs = ["av1-encode", "av1-decode", "h264", "vpx"]  # All software video codecs
 av1-encode = ["dep:rav1e"]  # AV1 encoder (requires nasm on x86_64)
 av1-decode = ["dep:dav1d"]  # AV1 decoder (requires libdav1d system library)
+vpx = ["dep:env-libvpx-sys"]  # VP8/VP9 decoder (requires libvpx system library)
 h264 = ["dep:openh264", "dep:openh264-sys2"]  # H.264 encoder/decoder (OpenH264, BSD-2 licensed)
 # Audio codecs (all pure Rust via Symphonia)
 audio-codecs = ["audio-flac", "audio-mp3", "audio-aac", "audio-vorbis"]

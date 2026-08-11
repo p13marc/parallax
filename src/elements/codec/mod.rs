@@ -177,6 +177,12 @@ mod decoder;
 #[cfg(feature = "av1-decode")]
 pub use decoder::Dav1dDecoder;
 
+// VP8/VP9 video codecs
+#[cfg(feature = "vpx")]
+mod vpx;
+#[cfg(feature = "vpx")]
+pub use vpx::{VpxCodec, VpxDecoder};
+
 #[cfg(feature = "av1-encode")]
 mod encoder;
 #[cfg(feature = "av1-encode")]
