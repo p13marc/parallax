@@ -25,7 +25,7 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::clock::ClockTime;
 use crate::error::{Error, Result};
-use crate::memory::SharedArena;
+use crate::memory::{OutputArena, OutputBudget, defaults};
 use crate::metadata::Metadata;
 
 use mpeg2ts_reader::StreamType;
@@ -36,17 +36,8 @@ use mpeg2ts_reader::demultiplex::{
 use mpeg2ts_reader::pes::{self, ElementaryStreamConsumer, PesContents, PesHeader};
 use mpeg2ts_reader::psi::pat::PAT_PID;
 
-use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::rc::Rc;
-use std::sync::OnceLock;
-
-/// Shared arena for MPEG-TS demuxer buffers.
-fn ts_demux_arena() -> &'static SharedArena {
-    static ARENA: OnceLock<SharedArena> = OnceLock::new();
-    // PES packets can be large for video, use generous slot size
-    ARENA.get_or_init(|| SharedArena::new(2 * 1024 * 1024, 64).unwrap())
-}
+use std::sync::{Arc, Mutex};
 
 /// Size of a single MPEG-TS packet.
 pub const TS_PACKET_SIZE: usize = 188;
@@ -185,8 +176,16 @@ pub struct TsDemuxStats {
 // ============================================================================
 
 /// Shared output queue for extracted frames.
-type OutputQueue = Rc<RefCell<VecDeque<TsFrame>>>;
-type SharedStats = Rc<RefCell<TsDemuxStats>>;
+type OutputQueue = Arc<Mutex<VecDeque<TsFrame>>>;
+type SharedStats = Arc<Mutex<TsDemuxStats>>;
+/// The demuxer's per-instance output arena, shared with its frame collectors.
+///
+/// This used to be a process-wide `static OnceLock<SharedArena>`: every
+/// `TsDemux` in the process drew from the same 64 slots and none could be
+/// sized for its own stream (#95). `Arc<Mutex<..>>` because the collectors
+/// live inside mpeg2ts_reader's demultiplexer state, out of reach of a plain
+/// borrow.
+type SharedOutput = Arc<Mutex<OutputArena>>;
 
 // ============================================================================
 // Elementary Stream Consumer Implementation
@@ -198,18 +197,26 @@ pub struct FrameCollector {
     stream_type: TsStreamType,
     output: OutputQueue,
     stats: SharedStats,
+    arena: SharedOutput,
     current_data: Vec<u8>,
     current_pts: Option<u64>,
     current_dts: Option<u64>,
 }
 
 impl FrameCollector {
-    fn new(pid: u16, stream_type: TsStreamType, output: OutputQueue, stats: SharedStats) -> Self {
+    fn new(
+        pid: u16,
+        stream_type: TsStreamType,
+        output: OutputQueue,
+        stats: SharedStats,
+        arena: SharedOutput,
+    ) -> Self {
         Self {
             pid,
             stream_type,
             output,
             stats,
+            arena,
             current_data: Vec::new(),
             current_pts: None,
             current_dts: None,
@@ -239,13 +246,13 @@ impl FrameCollector {
                 dts,
             };
 
-            self.output.borrow_mut().push_back(frame);
-            self.stats.borrow_mut().pes_packets += 1;
+            self.output.lock().unwrap().push_back(frame);
+            self.stats.lock().unwrap().pes_packets += 1;
 
             if self.stream_type.is_video() {
-                self.stats.borrow_mut().video_frames += 1;
+                self.stats.lock().unwrap().video_frames += 1;
             } else if self.stream_type.is_audio() {
-                self.stats.borrow_mut().audio_frames += 1;
+                self.stats.lock().unwrap().audio_frames += 1;
             }
         }
 
@@ -260,13 +267,8 @@ impl FrameCollector {
             return Err(Error::Element("Empty buffer data".into()));
         }
 
-        let arena = ts_demux_arena();
-        arena.reclaim();
-
-        let mut slot = arena
-            .acquire()
-            .ok_or_else(|| Error::Element("Failed to acquire buffer slot".to_string()))?;
-
+        let mut arena = self.arena.lock().unwrap();
+        let mut slot = arena.acquire(data.len(), "tsdemux")?;
         slot.data_mut()[..data.len()].copy_from_slice(data);
 
         let handle = MemoryHandle::with_len(slot, data.len());
@@ -388,6 +390,8 @@ pub struct TsDemuxContext {
     output: OutputQueue,
     /// Statistics.
     stats: SharedStats,
+    /// Per-instance output arena, handed to each new frame collector.
+    arena: SharedOutput,
     /// Stream type filter (None = accept all).
     stream_filter: Option<Vec<TsStreamType>>,
     /// Filter changeset for dynamic filter updates.
@@ -395,19 +399,26 @@ pub struct TsDemuxContext {
 }
 
 impl TsDemuxContext {
-    fn new(output: OutputQueue, stats: SharedStats) -> Self {
+    fn new(output: OutputQueue, stats: SharedStats, arena: SharedOutput) -> Self {
         Self {
             output,
             stats,
+            arena,
             stream_filter: None,
             changeset: FilterChangeset::default(),
         }
     }
 
-    fn with_filter(output: OutputQueue, stats: SharedStats, filter: Vec<TsStreamType>) -> Self {
+    fn with_filter(
+        output: OutputQueue,
+        stats: SharedStats,
+        arena: SharedOutput,
+        filter: Vec<TsStreamType>,
+    ) -> Self {
         Self {
             output,
             stats,
+            arena,
             stream_filter: Some(filter),
             changeset: FilterChangeset::default(),
         }
@@ -448,6 +459,7 @@ impl DemuxContext for TsDemuxContext {
                         ts_type,
                         self.output.clone(),
                         self.stats.clone(),
+                        self.arena.clone(),
                     );
                     TsPacketFilter::Pes(pes::PesPacketFilter::new(collector))
                 } else {
@@ -479,6 +491,8 @@ pub struct TsDemux {
     output: OutputQueue,
     /// Statistics.
     stats: SharedStats,
+    /// Per-instance output arena (see [`SharedOutput`]).
+    arena: SharedOutput,
     /// Partial packet buffer for handling non-aligned input.
     partial_packet: Vec<u8>,
 }
@@ -486,9 +500,14 @@ pub struct TsDemux {
 impl TsDemux {
     /// Create a new TS demuxer.
     pub fn new() -> Self {
-        let output = Rc::new(RefCell::new(VecDeque::new()));
-        let stats = Rc::new(RefCell::new(TsDemuxStats::default()));
-        let mut ctx = TsDemuxContext::new(output.clone(), stats.clone());
+        let output = Arc::new(Mutex::new(VecDeque::new()));
+        let stats = Arc::new(Mutex::new(TsDemuxStats::default()));
+        let arena = Arc::new(Mutex::new(
+            OutputArena::new(defaults::TS_DEMUX_SLOT_COUNT)
+                .with_min_slot_size(defaults::TS_DEMUX_SLOT_SIZE)
+                .grow_to_fit(),
+        ));
+        let mut ctx = TsDemuxContext::new(output.clone(), stats.clone(), arena.clone());
         let demux = demultiplex::Demultiplex::new(&mut ctx);
 
         Self {
@@ -496,15 +515,22 @@ impl TsDemux {
             ctx,
             output,
             stats,
+            arena,
             partial_packet: Vec::new(),
         }
     }
 
     /// Create a demuxer that only extracts specific stream types.
     pub fn with_stream_filter(stream_types: Vec<TsStreamType>) -> Self {
-        let output = Rc::new(RefCell::new(VecDeque::new()));
-        let stats = Rc::new(RefCell::new(TsDemuxStats::default()));
-        let mut ctx = TsDemuxContext::with_filter(output.clone(), stats.clone(), stream_types);
+        let output = Arc::new(Mutex::new(VecDeque::new()));
+        let stats = Arc::new(Mutex::new(TsDemuxStats::default()));
+        let arena = Arc::new(Mutex::new(
+            OutputArena::new(defaults::TS_DEMUX_SLOT_COUNT)
+                .with_min_slot_size(defaults::TS_DEMUX_SLOT_SIZE)
+                .grow_to_fit(),
+        ));
+        let mut ctx =
+            TsDemuxContext::with_filter(output.clone(), stats.clone(), arena.clone(), stream_types);
         let demux = demultiplex::Demultiplex::new(&mut ctx);
 
         Self {
@@ -512,6 +538,7 @@ impl TsDemux {
             ctx,
             output,
             stats,
+            arena,
             partial_packet: Vec::new(),
         }
     }
@@ -535,9 +562,17 @@ impl TsDemux {
         ])
     }
 
+    /// Size this demuxer's output arena from the graph below it.
+    ///
+    /// Called by the executor through [`TsDemuxElement`]; standalone users
+    /// fall back to [`defaults::TS_DEMUX_SLOT_COUNT`].
+    pub fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.arena.lock().unwrap().set_budget(budget);
+    }
+
     /// Get current statistics.
     pub fn stats(&self) -> TsDemuxStats {
-        self.stats.borrow().clone()
+        self.stats.lock().unwrap().clone()
     }
 
     /// Push TS data into the demuxer.
@@ -560,7 +595,7 @@ impl TsDemux {
             .position(|&b| b == 0x47)
             .unwrap_or(to_process.len());
         if start > 0 {
-            self.stats.borrow_mut().sync_errors += 1;
+            self.stats.lock().unwrap().sync_errors += 1;
         }
 
         let aligned = &to_process[start..];
@@ -572,8 +607,8 @@ impl TsDemux {
         if complete_bytes > 0 {
             // Process complete packets
             self.demux.push(&mut self.ctx, &aligned[..complete_bytes]);
-            self.stats.borrow_mut().packets_processed += complete_packets as u64;
-            self.stats.borrow_mut().bytes_processed += complete_bytes as u64;
+            self.stats.lock().unwrap().packets_processed += complete_packets as u64;
+            self.stats.lock().unwrap().bytes_processed += complete_bytes as u64;
         }
 
         // Save remaining partial packet
@@ -582,7 +617,7 @@ impl TsDemux {
         }
 
         // Collect extracted frames
-        let frames: Vec<TsFrame> = self.output.borrow_mut().drain(..).collect();
+        let frames: Vec<TsFrame> = self.output.lock().unwrap().drain(..).collect();
         Ok(frames)
     }
 
@@ -591,17 +626,17 @@ impl TsDemux {
     /// Call this at end of stream to ensure all frames are extracted.
     pub fn flush(&mut self) -> Vec<TsFrame> {
         self.partial_packet.clear();
-        self.output.borrow_mut().drain(..).collect()
+        self.output.lock().unwrap().drain(..).collect()
     }
 
     /// Reset the demuxer state.
     pub fn reset(&mut self) {
         self.partial_packet.clear();
-        self.output.borrow_mut().clear();
-        *self.stats.borrow_mut() = TsDemuxStats::default();
+        self.output.lock().unwrap().clear();
+        *self.stats.lock().unwrap() = TsDemuxStats::default();
 
         // Recreate the demuxer
-        self.ctx = TsDemuxContext::new(self.output.clone(), self.stats.clone());
+        self.ctx = TsDemuxContext::new(self.output.clone(), self.stats.clone(), self.arena.clone());
         self.demux = demultiplex::Demultiplex::new(&mut self.ctx);
     }
 }
@@ -615,6 +650,125 @@ impl Default for TsDemux {
 // ============================================================================
 // Tests
 // ============================================================================
+
+// ============================================================================
+// TsDemuxElement (pipeline Demuxer)
+// ============================================================================
+
+/// [`TsDemux`] as a pipeline element: 1 TS-byte input, routed A/V outputs.
+///
+/// Feed it from any byte source (`filesrc ! tsdemux`-style, programmatically):
+///
+/// ```rust,ignore
+/// let src = pipeline.add_source("src", FileSrc::new("capture.ts"));
+/// let demux = pipeline.add_demuxer("tsdemux", TsDemuxElement::new());
+/// pipeline.link(src, demux)?;
+/// pipeline.link_pads(demux, "video", video_branch, "sink")?;
+/// pipeline.link_pads(demux, "audio", audio_branch, "sink")?;
+/// ```
+///
+/// Video PES streams route to the `"video"` pad, audio to `"audio"`, anything
+/// else to `"data"`; a pad with no links drops its frames (the executor warns).
+/// Frame metadata carries the PID as `stream_id` plus PTS/DTS.
+pub struct TsDemuxElement {
+    demux: TsDemux,
+    outputs: Vec<(crate::element::PadId, crate::format::Caps)>,
+    /// EOS drain state: the executor calls `produce()` until Eos.
+    drained: bool,
+}
+
+impl TsDemuxElement {
+    /// Wrap a fresh [`TsDemux`].
+    pub fn new() -> Self {
+        Self::with_demux(TsDemux::new())
+    }
+
+    /// Wrap a configured [`TsDemux`] (stream filters etc.).
+    pub fn with_demux(demux: TsDemux) -> Self {
+        use crate::element::PadId;
+        use crate::format::Caps;
+        Self {
+            demux,
+            outputs: vec![
+                (PadId(0), Caps::any()),
+                (PadId(1), Caps::any()),
+                (PadId(2), Caps::any()),
+            ],
+            drained: false,
+        }
+    }
+
+    /// The wrapped demuxer.
+    pub fn demux(&self) -> &TsDemux {
+        &self.demux
+    }
+
+    fn pad_for(stream_type: TsStreamType) -> crate::element::PadId {
+        use crate::element::PadId;
+        if stream_type.is_video() {
+            PadId(0)
+        } else if stream_type.is_audio() {
+            PadId(1)
+        } else {
+            PadId(2)
+        }
+    }
+
+    fn route(frames: Vec<TsFrame>) -> crate::element::RoutedOutput {
+        let mut routed = crate::element::RoutedOutput::new();
+        for frame in frames {
+            routed.push(Self::pad_for(frame.stream_type), frame.buffer);
+        }
+        routed
+    }
+}
+
+impl Default for TsDemuxElement {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl crate::element::Demuxer for TsDemuxElement {
+    fn demux(&mut self, buffer: Buffer) -> Result<crate::element::RoutedOutput> {
+        let frames = self.demux.push(buffer.as_bytes())?;
+        Ok(Self::route(frames))
+    }
+
+    fn produce(&mut self) -> Result<crate::element::DemuxerProduce> {
+        // Reached at EOS: drain the trailing partial frames once, keeping
+        // their routing, then report end of stream.
+        if self.drained {
+            return Ok(crate::element::DemuxerProduce::Eos);
+        }
+        self.drained = true;
+        Ok(crate::element::DemuxerProduce::Routed(Self::route(
+            self.demux.flush(),
+        )))
+    }
+
+    fn pad_name(&self, pad: crate::element::PadId) -> String {
+        match pad.0 {
+            0 => "video".into(),
+            1 => "audio".into(),
+            _ => "data".into(),
+        }
+    }
+
+    fn outputs(&self) -> &[(crate::element::PadId, crate::format::Caps)] {
+        &self.outputs
+    }
+
+    fn on_pad_added(&mut self, _callback: crate::element::PadAddedCallback) {}
+
+    fn name(&self) -> &str {
+        "tsdemux"
+    }
+
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.demux.set_output_budget(budget);
+    }
+}
 
 #[cfg(test)]
 mod tests {

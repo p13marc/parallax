@@ -31,8 +31,8 @@
 use crate::buffer::Buffer;
 use crate::clock::{Clock, ClockTime};
 use crate::element::{
-    AsyncElementDyn, DynAsyncElement, ElementType, ExecutionHints, LatencyHint, Output,
-    ProcessingHint, SourceResult,
+    AsyncElementDyn, DemuxResult, DynAsyncElement, ElementType, ExecutionHints, LatencyHint,
+    Output, ProcessingHint, SourceResult,
 };
 use crate::error::{Error, Result};
 use crate::event::{Event, EventResult, FlushStopEvent, SeekEvent, SeekType, SegmentEvent};
@@ -1737,6 +1737,20 @@ impl Executor {
                 // is the whole point of a demuxer.
                 let inputs = channels.take_inputs(node_id);
                 let outputs_by_pad = channels.take_outputs_by_pad(node_id);
+                // A source-style demuxer (no input links) is a source in every
+                // sense, including runtime control: it gets a control channel
+                // so PipelineHandle::seek reaches Demuxer::handle_upstream_event.
+                let control_rx = if inputs.is_empty() {
+                    let (control_tx, control_rx) = bounded_async::<Event>(8);
+                    runtime.controls.push(SourceControl {
+                        name: node_name.clone(),
+                        tx: control_tx,
+                    });
+                    Some(control_rx)
+                } else {
+                    None
+                };
+                let bus = pipeline.bus_handle().for_element(&node_name);
                 spawn_demuxer_task(
                     node_name,
                     node_id,
@@ -1746,6 +1760,9 @@ impl Executor {
                     events_clone,
                     probes,
                     tracers,
+                    stop.clone(),
+                    control_rx,
+                    bus,
                     share,
                 )
             }
@@ -2807,6 +2824,43 @@ fn spawn_transform_task(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Deliver one routed demuxer buffer to its pad's links — and only those.
+///
+/// This is the #76 fix: buffers used to be broadcast to *every* pad, so a
+/// two-branch A/V demuxer sent audio down the video branch and vice versa.
+/// A buffer routed to a pad with no links is dropped (rate-limited warn); an
+/// empty pad name is the legacy escape hatch and broadcasts to all pads.
+async fn route_demux_buffer(
+    name: &str,
+    pad: &str,
+    buffer: Buffer,
+    outputs_by_pad: &HashMap<String, Vec<OutputBranch>>,
+    tracers: &TracerRegistry,
+    unrouted: &mut u64,
+) {
+    match outputs_by_pad.get(pad) {
+        Some(branches) => {
+            broadcast(branches, buffer, tracers).await;
+        }
+        None if pad.is_empty() => {
+            for branches in outputs_by_pad.values() {
+                broadcast(branches, buffer.clone(), tracers).await;
+            }
+        }
+        None => {
+            tracers.notify_drop(name);
+            *unrouted += 1;
+            if is_power_of_ten(*unrouted) {
+                tracing::warn!(
+                    "demuxer '{name}': no links on pad '{pad}', dropping its buffers \
+                     ({unrouted} so far) — link it with link_pads(demux, \"{pad}\", ..)"
+                );
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_demuxer_task(
     name: String,
     node_id: NodeId,
@@ -2816,6 +2870,9 @@ fn spawn_demuxer_task(
     events: EventSender,
     probe_registry: ProbeRegistry,
     tracers: TracerRegistry,
+    stop: Arc<AtomicBool>,
+    control_rx: Option<AsyncReceiver<Event>>,
+    bus: BusHandle,
     share: TaskGuard,
 ) -> JoinHandle<Result<()>> {
     tokio::spawn(reporting(share, async move {
@@ -2825,6 +2882,9 @@ fn spawn_demuxer_task(
         let sink_pad = crate::pipeline::probe::PadRef::sink(node_id);
         let src_pad = crate::pipeline::probe::PadRef::src(node_id);
         let mut count: u64 = 0;
+        let mut unrouted: u64 = 0;
+        // Control events (seek) broadcast their flush sequence to every pad.
+        let all_branches: Vec<OutputBranch> = outputs_by_pad.values().flatten().cloned().collect();
 
         if let Some(rx) = inputs.into_iter().next() {
             // Between FlushStart and FlushStop arriving buffers are stale.
@@ -2849,20 +2909,31 @@ fn spawn_demuxer_task(
                         // broadcast, or downstream back-pressure is billed as
                         // demux time.
                         tracers.notify_buffer(&name, &buffer);
-                        let result = guard(&name, element.process(Some(buffer))).await;
+                        let result = guard(&name, element.process_demux(Some(buffer))).await;
                         tracers.notify_buffer_processed(&name);
 
                         match result {
-                            Ok(Some(out)) => {
-                                match probe_registry.invoke_buffer(&src_pad, &out) {
-                                    ProbeReturn::Drop | ProbeReturn::Handled => continue,
-                                    _ => {}
-                                }
-                                for branches in outputs_by_pad.values() {
-                                    broadcast(branches, out.clone(), &tracers).await;
+                            Ok(DemuxResult::Routed(routed)) => {
+                                for (pad, out) in routed {
+                                    match probe_registry.invoke_buffer(&src_pad, &out) {
+                                        ProbeReturn::Drop | ProbeReturn::Handled => continue,
+                                        _ => {}
+                                    }
+                                    route_demux_buffer(
+                                        &name,
+                                        &pad,
+                                        out,
+                                        &outputs_by_pad,
+                                        &tracers,
+                                        &mut unrouted,
+                                    )
+                                    .await;
                                 }
                             }
-                            Ok(None) => {}
+                            // Input-driven demuxers do not signal these; treat
+                            // them as "nothing to emit" rather than inventing
+                            // an early end of stream.
+                            Ok(DemuxResult::WouldBlock | DemuxResult::Eos) => {}
                             Err(e) => {
                                 events.send_error(e.to_string(), Some(name.clone()));
                                 // Used to return without telling any of the
@@ -2909,28 +2980,108 @@ fn spawn_demuxer_task(
                         break;
                     }
                     Ok(Message::Eos) | Err(_) => {
-                        // Flush any buffered data before propagating EOS
-                        match guard(&name, element.flush()).await {
-                            Ok(output) => {
-                                let buffers = match output {
-                                    Output::None => vec![],
-                                    Output::Single(b) => vec![b],
-                                    Output::Multiple(v) => v,
-                                };
-                                for buffer in buffers {
-                                    for branches in outputs_by_pad.values() {
-                                        broadcast(branches, buffer.clone(), &tracers).await;
+                        // Drain the demuxer through the routed path
+                        // (process_demux(None) → Demuxer::produce), so a
+                        // trailing partial frame keeps its pad — the old
+                        // flush() broadcast sent it down every branch.
+                        loop {
+                            match guard(&name, element.process_demux(None)).await {
+                                Ok(DemuxResult::Routed(routed)) if !routed.is_empty() => {
+                                    for (pad, out) in routed {
+                                        route_demux_buffer(
+                                            &name,
+                                            &pad,
+                                            out,
+                                            &outputs_by_pad,
+                                            &tracers,
+                                            &mut unrouted,
+                                        )
+                                        .await;
                                     }
                                 }
-                            }
-                            Err(e) => {
-                                tracing::warn!("flush error in '{}': {}", name, e);
+                                Ok(_) => break,
+                                Err(e) => {
+                                    tracing::warn!("EOS drain error in '{}': {}", name, e);
+                                    break;
+                                }
                             }
                         }
                         for branches in outputs_by_pad.values() {
                             broadcast_eos(branches).await;
                         }
                         break;
+                    }
+                }
+            }
+        } else {
+            // Source-style demuxer: no input links, the element owns its
+            // reader (Demuxer::produce). Drive it like a source, routing
+            // each produced buffer to its pad's links.
+            loop {
+                // Cooperative stop, exactly like spawn_source_task.
+                if stop.load(Ordering::Acquire) {
+                    tracing::info!("demuxer '{}': stopped after {} buffers", name, count);
+                    for branches in outputs_by_pad.values() {
+                        broadcast_eos(branches).await;
+                    }
+                    break;
+                }
+
+                // Runtime control (seek), drained between produce calls —
+                // same polling contract as spawn_source_task.
+                if let Some(control_rx) = &control_rx {
+                    while let Ok(Some(event)) = control_rx.try_recv() {
+                        handle_source_control_event(
+                            &name,
+                            &mut element,
+                            &event,
+                            &all_branches,
+                            &src_pad,
+                            &probe_registry,
+                            &bus,
+                        )
+                        .await;
+                    }
+                }
+
+                match guard(&name, element.process_demux(None)).await {
+                    Ok(DemuxResult::Routed(routed)) => {
+                        for (pad, out) in routed {
+                            count += 1;
+                            match probe_registry.invoke_buffer(&src_pad, &out) {
+                                ProbeReturn::Drop | ProbeReturn::Handled => continue,
+                                _ => {}
+                            }
+                            tracers.notify_buffer(&name, &out);
+                            route_demux_buffer(
+                                &name,
+                                &pad,
+                                out,
+                                &outputs_by_pad,
+                                &tracers,
+                                &mut unrouted,
+                            )
+                            .await;
+                        }
+                    }
+                    Ok(DemuxResult::WouldBlock) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                    Ok(DemuxResult::Eos) => {
+                        tracing::info!("demuxer '{}': EOS after {} buffers", name, count);
+                        for branches in outputs_by_pad.values() {
+                            broadcast_eos(branches).await;
+                        }
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::error!("demuxer '{}': error: {}", name, e);
+                        events.send_error(e.to_string(), Some(name.clone()));
+                        let err = StreamError::new(&name, e.to_string());
+                        for branches in outputs_by_pad.values() {
+                            broadcast_error(branches, &err).await;
+                        }
+                        return Err(e);
                     }
                 }
             }

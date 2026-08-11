@@ -118,9 +118,11 @@ pub use traits::{
     AsyncTransformAdapter,
     // Adapter for boxed Element trait objects
     BoxedElementAdapter,
+    DemuxResult,
     // Sync element traits
     Demuxer,
     DemuxerAdapter,
+    DemuxerProduce,
     DynAsyncElement,
     Element,
     ElementAdapter,

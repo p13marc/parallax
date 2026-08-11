@@ -19,7 +19,7 @@ use std::ffi::{CStr, c_char, c_int, c_void};
 /// History:
 /// - **2**: `AsyncElementDyn::set_output_budget` (executor-sized output arenas).
 /// - **1**: initial hand-rolled `#[repr(C)]` descriptor ABI.
-pub const PARALLAX_ABI_VERSION: u32 = 2;
+pub const PARALLAX_ABI_VERSION: u32 = 3;
 
 /// Function pointer type for creating element instances.
 ///
@@ -392,7 +392,7 @@ mod tests {
     fn test_abi_version() {
         // Pinned so a vtable change to AsyncElementDyn has to be a decision.
         // 2: set_output_budget.
-        assert_eq!(PARALLAX_ABI_VERSION, 2);
+        assert_eq!(PARALLAX_ABI_VERSION, 3);
     }
 
     #[test]

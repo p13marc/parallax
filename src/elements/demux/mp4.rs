@@ -959,6 +959,180 @@ impl<R: Read + Seek> Mp4Demux<R> {
     }
 }
 
+// ============================================================================
+// Mp4DemuxSource (pipeline Demuxer)
+// ============================================================================
+
+/// [`Mp4Demux`] as a *source-style* pipeline element with routed A/V pads.
+///
+/// The demuxer owns its reader (MP4 needs `Seek` over the whole file, so it
+/// cannot be fed chunks), which makes it the pipeline's source — add it with
+/// [`add_demuxer`](crate::pipeline::Pipeline::add_demuxer) and give it no
+/// input link:
+///
+/// ```rust,ignore
+/// let file = std::fs::File::open("movie.mp4")?;
+/// let size = file.metadata()?.len();
+/// let demux = Mp4Demux::new(std::io::BufReader::new(file), size)?;
+///
+/// let node = pipeline.add_demuxer("mp4demux", Mp4DemuxSource::new(demux));
+/// pipeline.link_pads(node, "video", video_branch, "sink")?;
+/// pipeline.link_pads(node, "audio", audio_branch, "sink")?;
+/// ```
+///
+/// Samples are emitted in decode order across the selected tracks (smallest
+/// DTS first), so audio and video interleave the way the file laid them out.
+/// The first video track routes to the `"video"` pad and the first audio
+/// track to `"audio"`; further tracks are ignored. Buffer metadata carries
+/// pts/dts/duration, the keyframe flag, and the track id as `stream_id`, and
+/// H.264 keyframes arrive as self-contained Annex-B — exactly what the
+/// app-driven feeder thread used to assemble by hand.
+pub struct Mp4DemuxSource<R: Read + Seek + Send> {
+    demux: Mp4Demux<R>,
+    outputs: Vec<(crate::element::PadId, crate::format::Caps)>,
+    /// `(track_id, pad)` for each routed track.
+    tracks: Vec<(u32, crate::element::PadId)>,
+    /// Read-ahead of one sample per track, for DTS-ordered interleaving.
+    pending: Vec<Option<Mp4Sample>>,
+    primed: bool,
+}
+
+impl<R: Read + Seek + Send> Mp4DemuxSource<R> {
+    /// Wrap an opened [`Mp4Demux`], selecting its first video and first
+    /// audio track.
+    pub fn new(demux: Mp4Demux<R>) -> Self {
+        use crate::element::PadId;
+        use crate::format::Caps;
+        let mut outputs = Vec::new();
+        let mut tracks = Vec::new();
+        if let Some(id) = demux.video_track_id() {
+            outputs.push((PadId(0), Caps::any()));
+            tracks.push((id, PadId(0)));
+        }
+        if let Some(id) = demux.audio_track_id() {
+            outputs.push((PadId(1), Caps::any()));
+            tracks.push((id, PadId(1)));
+        }
+        let pending = (0..tracks.len()).map(|_| None).collect();
+        Self {
+            demux,
+            outputs,
+            tracks,
+            pending,
+            primed: false,
+        }
+    }
+
+    /// The wrapped demuxer (e.g. for `seek_all_to_time`).
+    pub fn demux_mut(&mut self) -> &mut Mp4Demux<R> {
+        &mut self.demux
+    }
+
+    /// Refill the read-ahead slot for track index `i` if it is empty.
+    fn refill(&mut self, i: usize) -> Result<()> {
+        if self.pending[i].is_none() {
+            self.pending[i] = self.demux.read_sample(self.tracks[i].0)?;
+        }
+        Ok(())
+    }
+}
+
+impl<R: Read + Seek + Send> crate::element::Demuxer for Mp4DemuxSource<R> {
+    fn demux(&mut self, _buffer: Buffer) -> Result<crate::element::RoutedOutput> {
+        Err(Error::Config(
+            "Mp4DemuxSource owns its reader; add it with no input link".into(),
+        ))
+    }
+
+    fn produce(&mut self) -> Result<crate::element::DemuxerProduce> {
+        use crate::element::{DemuxerProduce, RoutedOutput};
+
+        if !self.primed {
+            for i in 0..self.tracks.len() {
+                self.refill(i)?;
+            }
+            self.primed = true;
+        }
+
+        // Emit the pending sample with the smallest DTS.
+        let next = self
+            .pending
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| s.as_ref().map(|s| (i, s.dts_ns)))
+            .min_by_key(|(_, dts)| *dts)
+            .map(|(i, _)| i);
+
+        let Some(i) = next else {
+            return Ok(DemuxerProduce::Eos);
+        };
+        let sample = self.pending[i].take().expect("selected a pending sample");
+        self.refill(i)?;
+
+        Ok(DemuxerProduce::Routed(RoutedOutput::single(
+            self.tracks[i].1,
+            sample.buffer,
+        )))
+    }
+
+    fn pad_name(&self, pad: crate::element::PadId) -> String {
+        match pad.0 {
+            0 => "video".into(),
+            _ => "audio".into(),
+        }
+    }
+
+    fn handle_upstream_event(&mut self, event: &crate::event::Event) -> crate::event::EventResult {
+        use crate::event::{Event, EventResult, SeekType, SegmentFormat};
+
+        // PipelineHandle::seek reaches a source-style demuxer here: land all
+        // tracks on a consistent keyframe-snapped position and drop the
+        // read-ahead so the next produce() starts from the seek point. The
+        // executor then runs FlushStart → FlushStop → Segment on every pad.
+        let Event::Seek(seek) = event else {
+            return EventResult::NotHandled;
+        };
+        if seek.format != SegmentFormat::Time || seek.start.seek_type != SeekType::Set {
+            return EventResult::NotHandled;
+        }
+        match self
+            .demux
+            .seek_all_to_time(seek.start.position.max(0) as u64)
+        {
+            Ok(point) => {
+                tracing::info!(
+                    "mp4demux: seek to {} ns landed at {} ns (keyframe)",
+                    seek.start.position,
+                    point.time_ns
+                );
+                for slot in &mut self.pending {
+                    *slot = None;
+                }
+                self.primed = false;
+                EventResult::Handled
+            }
+            Err(e) => {
+                tracing::warn!("mp4demux: seek failed: {e}");
+                EventResult::Error
+            }
+        }
+    }
+
+    fn outputs(&self) -> &[(crate::element::PadId, crate::format::Caps)] {
+        &self.outputs
+    }
+
+    fn on_pad_added(&mut self, _callback: crate::element::PadAddedCallback) {}
+
+    fn name(&self) -> &str {
+        "mp4demux"
+    }
+
+    fn set_output_budget(&mut self, budget: OutputBudget) {
+        self.demux.set_output_budget(budget);
+    }
+}
+
 impl<R: Read + Seek> std::fmt::Debug for Mp4Demux<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Mp4Demux")

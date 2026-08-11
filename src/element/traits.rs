@@ -444,6 +444,39 @@ pub enum SourceResult {
     Eos,
 }
 
+/// Result of one demuxer step, with the pad routing intact.
+///
+/// This is what [`AsyncElementDyn::process_demux`] returns to the executor:
+/// unlike `process`/`process_all`, which erase *which pad* each buffer
+/// belongs on, the routed form is what makes per-pad delivery possible at
+/// all (#76).
+#[derive(Debug)]
+pub enum DemuxResult {
+    /// Buffers routed by output pad name. May be empty — this input (or this
+    /// produce step) yielded nothing to emit.
+    Routed(Vec<(String, Buffer)>),
+    /// No data available yet, try again later (source-style demuxers only).
+    WouldBlock,
+    /// End of stream reached (source-style demuxers only).
+    Eos,
+}
+
+/// Result of a source-style demuxer producing data on its own.
+///
+/// Returned by [`Demuxer::produce`] — the input-less twin of
+/// [`Demuxer::demux`] for demuxers that own their reader (a file demuxer)
+/// and act as the pipeline's source.
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // Intentional: RoutedOutput keeps small outputs inline, off the heap
+pub enum DemuxerProduce {
+    /// Routed output was produced (may be empty).
+    Routed(RoutedOutput),
+    /// No data available yet, try again later.
+    WouldBlock,
+    /// End of stream reached.
+    Eos,
+}
+
 // ============================================================================
 // Source Trait
 // ============================================================================
@@ -1301,6 +1334,7 @@ impl From<PadId> for u32 {
 /// Routed output for demuxers (buffer with destination pad).
 ///
 /// Uses SmallVec to avoid allocation for common cases (1-2 outputs).
+#[derive(Debug)]
 pub struct RoutedOutput(pub SmallVec<[(PadId, Buffer); 2]>);
 
 impl RoutedOutput {
@@ -1397,6 +1431,36 @@ pub type PadAddedCallback = Box<dyn FnMut(PadId, Caps) + Send>;
 pub trait Demuxer: Send {
     /// Process input and route to output pads.
     fn demux(&mut self, buffer: Buffer) -> Result<RoutedOutput>;
+
+    /// Produce routed output without input.
+    ///
+    /// For demuxers that own their reader (a file demuxer) and act as the
+    /// pipeline's *source*: a node added with no input links is driven
+    /// through this instead of [`demux`](Self::demux). The default reports
+    /// EOS immediately — input-driven demuxers have nothing to produce.
+    fn produce(&mut self) -> Result<DemuxerProduce> {
+        Ok(DemuxerProduce::Eos)
+    }
+
+    /// The link-level name of an output pad.
+    ///
+    /// Buffers routed to `pad` are delivered only to links attached with
+    /// this name (`pipeline.link_pads(demux, name, ..)`). The default is
+    /// `src_{n}`; demuxers with semantic pads override it (`"video"`,
+    /// `"audio"`).
+    fn pad_name(&self, pad: PadId) -> String {
+        format!("src_{}", pad.0)
+    }
+
+    /// Handle an upstream event (seek, QoS).
+    ///
+    /// A *source-style* demuxer receives runtime events exactly like a
+    /// source does — `PipelineHandle::seek` lands here. Return `Handled`
+    /// after repositioning and the executor runs the flush sequence on
+    /// every output pad.
+    fn handle_upstream_event(&mut self, _event: &Event) -> EventResult {
+        EventResult::NotHandled
+    }
 
     /// Get the name of this demuxer (for debugging/logging).
     fn name(&self) -> &str {
@@ -1670,6 +1734,23 @@ pub trait AsyncElementDyn {
     /// this to properly handle buffer production and `WouldBlock`.
     fn process_source(&mut self) -> impl std::future::Future<Output = Result<SourceResult>> + Send {
         async { Ok(SourceResult::Eos) }
+    }
+
+    /// Process a demuxer element, keeping the pad routing.
+    ///
+    /// `Some(input)` demuxes one buffer into per-pad outputs; `None` asks a
+    /// *source-style* demuxer (one that owns its reader) to produce. Only
+    /// `ElementType::Demuxer` nodes are driven through this — `process`
+    /// erases which pad a buffer belongs on, which is exactly the executor
+    /// bug this method exists to fix (#76).
+    ///
+    /// Default implementation reports EOS, like `process_source`;
+    /// [`DemuxerAdapter`] overrides it.
+    fn process_demux(
+        &mut self,
+        _input: Option<Buffer>,
+    ) -> impl std::future::Future<Output = Result<DemuxResult>> + Send {
+        async { Ok(DemuxResult::Eos) }
     }
 
     /// Set the pipeline clock for this element.
@@ -3131,6 +3212,27 @@ impl<D: Demuxer + Send + 'static> SendAsyncElementDyn for DemuxerAdapter<D> {
             }
             None => Ok(Output::None),
         }
+    }
+
+    fn handle_upstream_event(&mut self, event: &Event) -> EventResult {
+        self.inner.handle_upstream_event(event)
+    }
+
+    async fn process_demux(&mut self, input: Option<Buffer>) -> Result<DemuxResult> {
+        let routed = match input {
+            Some(buffer) => self.inner.demux(buffer)?,
+            None => match self.inner.produce()? {
+                DemuxerProduce::Routed(routed) => routed,
+                DemuxerProduce::WouldBlock => return Ok(DemuxResult::WouldBlock),
+                DemuxerProduce::Eos => return Ok(DemuxResult::Eos),
+            },
+        };
+        Ok(DemuxResult::Routed(
+            routed
+                .into_iter()
+                .map(|(pad, buffer)| (self.inner.pad_name(pad), buffer))
+                .collect(),
+        ))
     }
 
     fn input_caps(&self) -> Caps {

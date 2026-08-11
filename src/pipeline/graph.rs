@@ -1210,6 +1210,51 @@ impl Pipeline {
         )
     }
 
+    /// Add a demuxer element (1 input → N outputs) to the pipeline.
+    ///
+    /// This automatically wraps the demuxer in a
+    /// [`DemuxerAdapter`](crate::element::DemuxerAdapter). Each routed buffer
+    /// is delivered only to the links attached under its pad's name:
+    ///
+    /// ```rust,ignore
+    /// let demux = pipeline.add_demuxer("demux", my_demuxer);
+    /// pipeline.link_pads(demux, "video", video_sink, "sink")?;
+    /// pipeline.link_pads(demux, "audio", audio_sink, "sink")?;
+    /// ```
+    ///
+    /// A demuxer that owns its reader (see
+    /// [`Demuxer::produce`](crate::element::Demuxer::produce)) needs no input
+    /// link — the executor drives it as the pipeline's source.
+    pub fn add_demuxer<D: crate::element::Demuxer + Send + 'static>(
+        &mut self,
+        name: impl Into<String>,
+        demuxer: D,
+    ) -> NodeId {
+        // Register the demuxer's declared pads under their routing names, so
+        // link_pads(demux, "video", ..) validates. The default "src" pad the
+        // node constructor adds stays — it is the legacy broadcast target.
+        let pad_names: Vec<String> = demuxer
+            .outputs()
+            .iter()
+            .map(|(pad, _)| demuxer.pad_name(*pad))
+            .collect();
+        let id = self.add_node(
+            name,
+            DynAsyncElement::new_box(crate::element::DemuxerAdapter::new(demuxer)),
+        );
+        if let Some(node) = self.get_node_mut(id) {
+            for pad_name in pad_names {
+                if pad_name != "src" {
+                    node.add_output_pad(crate::element::Pad::new(
+                        pad_name,
+                        crate::element::PadDirection::Output,
+                    ));
+                }
+            }
+        }
+        id
+    }
+
     /// Add an async transform element to the pipeline.
     ///
     /// This automatically wraps the transform in an
@@ -1694,10 +1739,15 @@ impl Pipeline {
             return Err(Error::InvalidSegment("pipeline has no sink nodes".into()));
         }
 
-        // Verify all source nodes are actually Source elements
+        // Verify all source nodes can actually act as sources. Demuxers are
+        // allowed here: one that owns its reader (Demuxer::produce) is a
+        // legitimate pipeline source with routed output pads (#76).
         for src_id in &sources {
             let node = self.get_node(*src_id).unwrap();
-            if node.element_type() != ElementType::Source {
+            if !matches!(
+                node.element_type(),
+                ElementType::Source | ElementType::Demuxer
+            ) {
                 return Err(Error::InvalidSegment(format!(
                     "node '{}' has no inputs but is not a Source element",
                     node.name()
@@ -2057,6 +2107,22 @@ impl Pipeline {
         let output_media_caps = node.output_media_caps();
         if !output_media_caps.is_any() || node.element_type() != ElementType::Sink {
             element_caps.add_source_pad_multi("src", output_media_caps.clone());
+        }
+
+        // Register every *declared* pad under its real name too, so links
+        // attached to demuxer routing pads ("video"/"audio", see
+        // `add_demuxer`) negotiate instead of failing the lookup. Per-pad
+        // caps refinement stays future work — each named pad carries the
+        // element-level caps for now.
+        for pad in node.output_pads() {
+            if pad.name() != "src" {
+                element_caps.add_source_pad_multi(pad.name(), output_media_caps.clone());
+            }
+        }
+        for pad in node.input_pads() {
+            if pad.name() != "sink" {
+                element_caps.add_sink_pad_multi(pad.name(), input_media_caps.clone());
+            }
         }
 
         Ok(element_caps)

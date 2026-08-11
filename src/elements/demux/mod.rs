@@ -16,11 +16,12 @@ pub use streamid_demux::{StreamIdDemux, StreamIdDemuxStats, StreamOutput};
 
 #[cfg(feature = "mpeg-ts")]
 pub use mpegts::{
-    TS_PACKET_SIZE, TsDemux, TsDemuxStats, TsElementaryStream, TsFrame, TsProgram, TsStreamType,
+    TS_PACKET_SIZE, TsDemux, TsDemuxElement, TsDemuxStats, TsElementaryStream, TsFrame, TsProgram,
+    TsStreamType,
 };
 
 #[cfg(feature = "mp4-demux")]
 pub use mp4::{
-    Mp4AudioInfo, Mp4Codec, Mp4Demux, Mp4DemuxStats, Mp4Sample, Mp4SeekPoint, Mp4Track,
-    Mp4TrackType, Mp4VideoInfo,
+    Mp4AudioInfo, Mp4Codec, Mp4Demux, Mp4DemuxSource, Mp4DemuxStats, Mp4Sample, Mp4SeekPoint,
+    Mp4Track, Mp4TrackType, Mp4VideoInfo,
 };
