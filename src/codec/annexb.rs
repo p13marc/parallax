@@ -169,6 +169,68 @@ pub fn annex_b_to_avcc(data: &[u8]) -> Vec<u8> {
 /// a truncated length prefix or a NAL length overrunning the sample is an
 /// error — silently emitting a torn NAL would corrupt the stream downstream.
 pub fn avcc_to_annex_b(data: &[u8], length_size: u8) -> crate::error::Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(data.len() + 16);
+    avcc_to_annex_b_into(data, length_size, &mut out)?;
+    Ok(out)
+}
+
+/// The exact Annex-B size [`avcc_to_annex_b`] would produce.
+///
+/// A cheap pre-pass over the length prefixes only — lets a caller size an
+/// arena slot exactly and convert into it with
+/// [`avcc_to_annex_b_into_slice`], skipping the intermediate `Vec`.
+pub fn annex_b_len(data: &[u8], length_size: u8) -> crate::error::Result<usize> {
+    let mut total = 0usize;
+    walk_avcc(data, length_size, |nal| {
+        total += 4 + nal.len();
+        Ok(())
+    })?;
+    Ok(total)
+}
+
+/// [`avcc_to_annex_b`], appending onto a caller-provided `Vec`.
+pub fn avcc_to_annex_b_into(
+    data: &[u8],
+    length_size: u8,
+    out: &mut Vec<u8>,
+) -> crate::error::Result<()> {
+    walk_avcc(data, length_size, |nal| {
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(nal);
+        Ok(())
+    })
+}
+
+/// [`avcc_to_annex_b`], writing into a caller-provided slice (e.g. an arena
+/// slot sized with [`annex_b_len`]). Returns the bytes written.
+pub fn avcc_to_annex_b_into_slice(
+    data: &[u8],
+    length_size: u8,
+    out: &mut [u8],
+) -> crate::error::Result<usize> {
+    let mut pos = 0usize;
+    walk_avcc(data, length_size, |nal| {
+        let end = pos + 4 + nal.len();
+        let Some(dst) = out.get_mut(pos..end) else {
+            return Err(crate::error::Error::Config(
+                "Annex-B output slice too small".into(),
+            ));
+        };
+        dst[..4].copy_from_slice(&[0, 0, 0, 1]);
+        dst[4..].copy_from_slice(nal);
+        pos = end;
+        Ok(())
+    })?;
+    Ok(pos)
+}
+
+/// Walk the length-prefixed NALs of an AVCC sample, calling `emit` for each
+/// non-empty one. Shared validation for every conversion flavour above.
+fn walk_avcc(
+    data: &[u8],
+    length_size: u8,
+    mut emit: impl FnMut(&[u8]) -> crate::error::Result<()>,
+) -> crate::error::Result<()> {
     if !matches!(length_size, 1 | 2 | 4) {
         return Err(crate::error::Error::Config(format!(
             "invalid AVCC length_size {length_size} (must be 1, 2 or 4)"
@@ -176,7 +238,6 @@ pub fn avcc_to_annex_b(data: &[u8], length_size: u8) -> crate::error::Result<Vec
     }
     let length_size = length_size as usize;
 
-    let mut out = Vec::with_capacity(data.len() + 16);
     let mut i = 0usize;
     while i < data.len() {
         if i + length_size > data.len() {
@@ -197,13 +258,12 @@ pub fn avcc_to_annex_b(data: &[u8], length_size: u8) -> crate::error::Result<Vec
             )));
         }
         if len > 0 {
-            out.extend_from_slice(&[0, 0, 0, 1]);
-            out.extend_from_slice(&data[i..i + len]);
+            emit(&data[i..i + len])?;
         }
         i += len;
     }
 
-    Ok(out)
+    Ok(())
 }
 
 #[cfg(test)]

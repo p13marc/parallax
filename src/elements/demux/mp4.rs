@@ -217,10 +217,23 @@ impl Mp4AudioInfo {
     /// [`Mp4Demux::with_adts_aac`] to have the demuxer prepend this to every
     /// AAC sample instead.
     pub fn adts_header(&self, frame_len: usize) -> Option<[u8; 7]> {
-        let object_type = self.object_type?;
-        let freq_index = self.freq_index?;
-        let chan_conf = self.channel_config?;
+        Self::adts_header_from(
+            self.object_type?,
+            self.freq_index?,
+            self.channel_config?,
+            frame_len,
+        )
+    }
 
+    /// [`adts_header`](Self::adts_header) from the bare esds fields — lets
+    /// `read_sample` keep per-track Copy state instead of cloning the whole
+    /// track (config Vecs included) per sample (#144).
+    pub(crate) fn adts_header_from(
+        object_type: u8,
+        freq_index: u8,
+        chan_conf: u8,
+        frame_len: usize,
+    ) -> Option<[u8; 7]> {
         let full_len = frame_len.checked_add(7)?;
         if full_len > 0x1FFF || object_type == 0 {
             return None;
@@ -641,6 +654,7 @@ impl<R: Read + Seek> Mp4Demux<R> {
     /// Sync samples get every SPS/PPS from the avcC record prepended so a
     /// decoder can join at any keyframe (MP4 keeps parameter sets out-of-band;
     /// Annex-B consumers expect them in-band).
+    #[cfg(test)] // production converts straight into the slot (#144)
     fn avcc_sample_to_annex_b(
         cfg: &AvcDecoderConfig,
         data: &[u8],
@@ -843,16 +857,24 @@ impl<R: Read + Seek> Mp4Demux<R> {
     ///
     /// Returns an error if the track doesn't exist or sample reading fails.
     pub fn read_sample(&mut self, track_id: u32) -> Result<Option<Mp4Sample>> {
-        let track = self
-            .tracks
-            .iter()
-            .find(|t| t.id == track_id)
-            .ok_or_else(|| Error::Config(format!("Track {} not found", track_id)))?
-            .clone();
+        // Plain-Copy per-track state only — cloning the whole Mp4Track
+        // re-allocated its config Vecs on every sample (#144).
+        let (sample_count, timescale, codec, track_type, adts_fields) = {
+            let t = self
+                .tracks
+                .iter()
+                .find(|t| t.id == track_id)
+                .ok_or_else(|| Error::Config(format!("Track {} not found", track_id)))?;
+            let adts = t
+                .audio_info
+                .as_ref()
+                .and_then(|i| Some((i.object_type?, i.freq_index?, i.channel_config?)));
+            (t.sample_count, t.timescale, t.codec, t.track_type, adts)
+        };
 
         let sample_index = *self.sample_indices.get(&track_id).unwrap_or(&1);
 
-        if sample_index > track.sample_count {
+        if sample_index > sample_count {
             return Ok(None); // No more samples
         }
 
@@ -867,36 +889,62 @@ impl<R: Read + Seek> Mp4Demux<R> {
             None => return Ok(None),
         };
 
-        // H.264: convert the AVCC sample to a self-contained Annex-B access
-        // unit; anything else passes through in container form.
-        let mut payload: std::borrow::Cow<'_, [u8]> = match self.avc_configs.get(&track_id) {
-            Some(cfg) => std::borrow::Cow::Owned(Self::avcc_sample_to_annex_b(
-                cfg,
-                &sample.bytes,
-                sample.is_sync,
-            )?),
-            None => std::borrow::Cow::Borrowed(&sample.bytes),
+        // Build the outgoing payload directly in the arena slot (#144):
+        // H.264 converts to a self-contained Annex-B access unit (exact size
+        // via a length-prefix pre-pass), ADTS-wrapped AAC gets its 7-byte
+        // header prepended, everything else copies through once.
+        use crate::codec::annexb;
+        let handle = if let Some(cfg) = self.avc_configs.get(&track_id) {
+            let params_len: usize = if sample.is_sync {
+                cfg.sps
+                    .iter()
+                    .chain(cfg.pps.iter())
+                    .map(|n| 4 + n.len())
+                    .sum()
+            } else {
+                0
+            };
+            let total = params_len + annexb::annex_b_len(&sample.bytes, cfg.length_size)?;
+            let mut slot = self.output.acquire(total, "mp4demux")?;
+            {
+                let out = &mut slot.data_mut()[..total];
+                let mut pos = 0usize;
+                if sample.is_sync {
+                    for nal in cfg.sps.iter().chain(cfg.pps.iter()) {
+                        out[pos..pos + 4].copy_from_slice(&[0, 0, 0, 1]);
+                        out[pos + 4..pos + 4 + nal.len()].copy_from_slice(nal);
+                        pos += 4 + nal.len();
+                    }
+                }
+                annexb::avcc_to_annex_b_into_slice(
+                    &sample.bytes,
+                    cfg.length_size,
+                    &mut out[pos..],
+                )?;
+            }
+            MemoryHandle::with_len(slot, total)
+        } else {
+            let adts_header = if self.adts_aac && codec == Mp4Codec::Aac {
+                adts_fields.and_then(|(ot, fi, cc)| {
+                    Mp4AudioInfo::adts_header_from(ot, fi, cc, sample.bytes.len())
+                })
+            } else {
+                None
+            };
+            let header = adts_header.as_ref().map(|h| &h[..]).unwrap_or(&[]);
+            let total = header.len() + sample.bytes.len();
+            let mut slot = self.output.acquire(total, "mp4demux")?;
+            {
+                let out = &mut slot.data_mut()[..total];
+                out[..header.len()].copy_from_slice(header);
+                out[header.len()..].copy_from_slice(&sample.bytes);
+            }
+            MemoryHandle::with_len(slot, total)
         };
-
-        // AAC: optionally make each frame self-describing (see with_adts_aac).
-        if self.adts_aac
-            && track.codec == Mp4Codec::Aac
-            && let Some(header) = track
-                .audio_info
-                .as_ref()
-                .and_then(|info| info.adts_header(payload.len()))
-        {
-            let mut framed = Vec::with_capacity(payload.len() + header.len());
-            framed.extend_from_slice(&header);
-            framed.extend_from_slice(&payload);
-            payload = std::borrow::Cow::Owned(framed);
-        }
-
-        // Create buffer
-        let buffer = self.create_buffer(&payload, track_id, &sample, &track)?;
+        let buffer = self.finish_buffer(handle, track_id, &sample, timescale);
 
         // Calculate timestamps in nanoseconds
-        let timescale = track.timescale as u128;
+        let timescale = timescale as u128;
         let pts_ns = (sample.start_time as u128 * 1_000_000_000)
             .checked_div(timescale)
             .unwrap_or(0) as u64;
@@ -921,9 +969,9 @@ impl<R: Read + Seek> Mp4Demux<R> {
         self.stats.samples_read += 1;
         self.stats.bytes_read += sample.bytes.len() as u64;
 
-        if track.track_type == Mp4TrackType::Video {
+        if track_type == Mp4TrackType::Video {
             self.stats.video_samples += 1;
-        } else if track.track_type == Mp4TrackType::Audio {
+        } else if track_type == Mp4TrackType::Audio {
             self.stats.audio_samples += 1;
         }
 
@@ -945,24 +993,15 @@ impl<R: Read + Seek> Mp4Demux<R> {
         }))
     }
 
-    /// Create a buffer from sample data.
-    fn create_buffer(
+    /// Wrap an already-written arena handle with the sample's metadata.
+    fn finish_buffer(
         &mut self,
-        data: &[u8],
+        handle: MemoryHandle,
         track_id: u32,
         sample: &mp4::Mp4Sample,
-        track: &Mp4Track,
-    ) -> Result<Buffer> {
-        // `grow_to_fit`: a sample larger than the current slot rebuilds the
-        // arena rather than failing, because a demuxer's output size follows
-        // the file, not a ceiling it chose.
-        let mut slot = self.output.acquire(data.len(), "mp4demux")?;
-        slot.data_mut()[..data.len()].copy_from_slice(data);
-
-        let handle = MemoryHandle::with_len(slot, data.len());
-
-        // Build metadata
-        let timescale = track.timescale as u128;
+        timescale: u32,
+    ) -> Buffer {
+        let timescale = timescale as u128;
 
         let mut metadata = Metadata::new();
         metadata.stream_id = track_id;
@@ -984,7 +1023,7 @@ impl<R: Read + Seek> Mp4Demux<R> {
             metadata.flags |= BufferFlags::SYNC_POINT;
         }
 
-        Ok(Buffer::new(handle, metadata))
+        Buffer::new(handle, metadata)
     }
 
     /// Read all samples from a track into a vector.

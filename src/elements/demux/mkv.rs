@@ -330,7 +330,9 @@ pub struct MkvDemux<R: Read + Seek> {
 /// A converted frame awaiting arena space.
 struct PendingFrame {
     pad: crate::element::PadId,
-    payload: Vec<u8>,
+    /// The raw block payload — conversion is idempotent, so the retry
+    /// re-converts straight into the slot once one is free (#144).
+    raw: Vec<u8>,
     track: u64,
     timestamp_ticks: u64,
     duration_ticks: Option<u64>,
@@ -528,12 +530,23 @@ impl<R: Read + Seek> MkvDemux<R> {
             .map(|ticks| (ticks * self.timestamp_scale as f64) as u64)
     }
 
-    /// Convert one frame's payload to its pipeline form.
+    /// Convert one frame's payload directly into an arena slot and wrap it
+    /// with timing metadata — no intermediate `Vec` (#144).
     ///
-    /// H.264 becomes a self-contained Annex-B access unit (SPS/PPS in-band on
-    /// keyframes); header-stripped tracks get their prefix restored;
-    /// everything else passes through as stored.
-    fn convert_payload(&self, track: u64, data: &[u8], is_keyframe: bool) -> Result<Vec<u8>> {
+    /// H.264 becomes a self-contained Annex-B access unit (SPS/PPS in-band
+    /// on keyframes) sized exactly via a length-prefix pre-pass;
+    /// header-stripped tracks get their prefix restored; everything else
+    /// copies through once.
+    fn emit_frame(
+        &mut self,
+        track: u64,
+        data: &[u8],
+        timestamp_ticks: u64,
+        duration_ticks: Option<u64>,
+        is_keyframe: bool,
+    ) -> Result<Buffer> {
+        use crate::codec::annexb;
+
         let prefix = self
             .stripped_prefix
             .iter()
@@ -546,37 +559,98 @@ impl<R: Read + Seek> MkvDemux<R> {
                 .routed
                 .first()
                 .is_some_and(|(id, pad)| *id == track && pad.0 == 0);
-        if is_h264_video {
+
+        let handle = if is_h264_video && prefix.is_empty() {
             let cfg = self.avc_config.as_ref().expect("checked above");
-            let mut stripped;
-            let data = if prefix.is_empty() {
-                data
+            let params_len: usize = if is_keyframe {
+                cfg.sps
+                    .iter()
+                    .chain(cfg.pps.iter())
+                    .map(|n| 4 + n.len())
+                    .sum()
             } else {
-                stripped = Vec::with_capacity(prefix.len() + data.len());
-                stripped.extend_from_slice(prefix);
-                stripped.extend_from_slice(data);
-                &stripped[..]
+                0
             };
-            let mut out = Vec::with_capacity(data.len() + 64);
-            if is_keyframe {
-                for nal in cfg.sps.iter().chain(cfg.pps.iter()) {
-                    out.extend_from_slice(&[0, 0, 0, 1]);
-                    out.extend_from_slice(nal);
+            let total = params_len + annexb::annex_b_len(data, cfg.length_size)?;
+            let mut slot = self.output.acquire(total, "mkvdemux")?;
+            {
+                let out = &mut slot.data_mut()[..total];
+                let mut pos = 0usize;
+                if is_keyframe {
+                    for nal in cfg.sps.iter().chain(cfg.pps.iter()) {
+                        out[pos..pos + 4].copy_from_slice(&[0, 0, 0, 1]);
+                        out[pos + 4..pos + 4 + nal.len()].copy_from_slice(nal);
+                        pos += 4 + nal.len();
+                    }
                 }
+                pos += annexb::avcc_to_annex_b_into_slice(data, cfg.length_size, &mut out[pos..])?;
+                debug_assert_eq!(pos, total);
             }
-            out.extend_from_slice(&crate::codec::annexb::avcc_to_annex_b(
-                data,
-                cfg.length_size,
-            )?);
-            Ok(out)
-        } else if prefix.is_empty() {
-            Ok(data.to_vec())
+            MemoryHandle::with_len(slot, total)
+        } else if is_h264_video {
+            // Header-stripped H.264 (rare): the length prefixes span the
+            // prefix/data boundary, so materialize once, then convert.
+            let mut joined = Vec::with_capacity(prefix.len() + data.len());
+            joined.extend_from_slice(prefix);
+            joined.extend_from_slice(data);
+            let cfg = self.avc_config.as_ref().expect("checked above");
+            let params_len: usize = if is_keyframe {
+                cfg.sps
+                    .iter()
+                    .chain(cfg.pps.iter())
+                    .map(|n| 4 + n.len())
+                    .sum()
+            } else {
+                0
+            };
+            let total = params_len + annexb::annex_b_len(&joined, cfg.length_size)?;
+            let mut slot = self.output.acquire(total, "mkvdemux")?;
+            {
+                let out = &mut slot.data_mut()[..total];
+                let mut pos = 0usize;
+                if is_keyframe {
+                    for nal in cfg.sps.iter().chain(cfg.pps.iter()) {
+                        out[pos..pos + 4].copy_from_slice(&[0, 0, 0, 1]);
+                        out[pos + 4..pos + 4 + nal.len()].copy_from_slice(nal);
+                        pos += 4 + nal.len();
+                    }
+                }
+                annexb::avcc_to_annex_b_into_slice(&joined, cfg.length_size, &mut out[pos..])?;
+            }
+            MemoryHandle::with_len(slot, total)
         } else {
-            let mut out = Vec::with_capacity(prefix.len() + data.len());
-            out.extend_from_slice(prefix);
-            out.extend_from_slice(data);
-            Ok(out)
+            // Passthrough (optionally prefix-restored): one copy into the slot.
+            let total = prefix.len() + data.len();
+            let mut slot = self.output.acquire(total, "mkvdemux")?;
+            {
+                let out = &mut slot.data_mut()[..total];
+                out[..prefix.len()].copy_from_slice(prefix);
+                out[prefix.len()..].copy_from_slice(data);
+            }
+            MemoryHandle::with_len(slot, total)
+        };
+
+        let mut metadata = Metadata::new();
+        metadata.stream_id = track as u32;
+        let pts = timestamp_ticks.saturating_mul(self.timestamp_scale);
+        metadata.pts = ClockTime::from_nanos(pts);
+        // Matroska blocks carry presentation time only (see module docs).
+        metadata.dts = ClockTime::from_nanos(pts);
+        let duration_ns = duration_ticks
+            .map(|d| d.saturating_mul(self.timestamp_scale))
+            .or_else(|| {
+                self.default_duration_ns
+                    .iter()
+                    .find(|(id, _)| *id == track)
+                    .map(|(_, d)| *d)
+            });
+        if let Some(d) = duration_ns {
+            metadata.duration = ClockTime::from_nanos(d);
         }
+        if is_keyframe {
+            metadata.flags |= BufferFlags::SYNC_POINT;
+        }
+        Ok(Buffer::new(handle, metadata))
     }
 
     /// Best-effort keyframe determination for a video frame.
@@ -619,43 +693,6 @@ impl<R: Read + Seek> MkvDemux<R> {
             _ => true, // audio frames are all sync points
         }
     }
-
-    /// Copy a converted payload into the output arena with timing metadata.
-    fn create_buffer(
-        &mut self,
-        data: &[u8],
-        track: u64,
-        timestamp_ticks: u64,
-        duration_ticks: Option<u64>,
-        is_keyframe: bool,
-    ) -> Result<Buffer> {
-        // `grow_to_fit`: output size follows the file, not a chosen ceiling.
-        let mut slot = self.output.acquire(data.len(), "mkvdemux")?;
-        slot.data_mut()[..data.len()].copy_from_slice(data);
-        let handle = MemoryHandle::with_len(slot, data.len());
-
-        let mut metadata = Metadata::new();
-        metadata.stream_id = track as u32;
-        let pts = timestamp_ticks.saturating_mul(self.timestamp_scale);
-        metadata.pts = ClockTime::from_nanos(pts);
-        // Matroska blocks carry presentation time only (see module docs).
-        metadata.dts = ClockTime::from_nanos(pts);
-        let duration_ns = duration_ticks
-            .map(|d| d.saturating_mul(self.timestamp_scale))
-            .or_else(|| {
-                self.default_duration_ns
-                    .iter()
-                    .find(|(id, _)| *id == track)
-                    .map(|(_, d)| *d)
-            });
-        if let Some(d) = duration_ns {
-            metadata.duration = ClockTime::from_nanos(d);
-        }
-        if is_keyframe {
-            metadata.flags |= BufferFlags::SYNC_POINT;
-        }
-        Ok(Buffer::new(handle, metadata))
-    }
 }
 
 impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
@@ -672,9 +709,9 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
         // read — the executor treats PoolExhausted as flow control and calls
         // produce() again.
         if let Some(p) = self.pending.take() {
-            match self.create_buffer(
-                &p.payload,
+            match self.emit_frame(
                 p.track,
+                &p.raw,
                 p.timestamp_ticks,
                 p.duration_ticks,
                 p.is_keyframe,
@@ -743,29 +780,28 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
                 self.video_resync = false;
             }
 
+            // Convert straight into the slot (the take/restore dance frees
+            // the `&self.frame` borrow for the `&mut self` call). On arena
+            // exhaustion the raw payload is copied once into the pending
+            // stash — an allocation only on that rare path.
+            let ticks = self.frame.timestamp;
+            let duration = self.frame.duration;
             let data = std::mem::take(&mut self.frame.data);
-            let payload = self.convert_payload(track, &data, is_key)?;
-            self.frame.data = data; // hand the allocation back for reuse
-            let p = PendingFrame {
-                pad,
-                payload,
-                track,
-                timestamp_ticks: self.frame.timestamp,
-                duration_ticks: self.frame.duration,
-                is_keyframe: is_key,
-            };
-            match self.create_buffer(
-                &p.payload,
-                p.track,
-                p.timestamp_ticks,
-                p.duration_ticks,
-                p.is_keyframe,
-            ) {
+            let result = self.emit_frame(track, &data, ticks, duration, is_key);
+            self.frame.data = data;
+            match result {
                 Ok(buffer) => {
-                    return Ok(DemuxerProduce::Routed(RoutedOutput::single(p.pad, buffer)));
+                    return Ok(DemuxerProduce::Routed(RoutedOutput::single(pad, buffer)));
                 }
                 Err(e) => {
-                    self.pending = Some(p);
+                    self.pending = Some(PendingFrame {
+                        pad,
+                        raw: self.frame.data.clone(),
+                        track,
+                        timestamp_ticks: ticks,
+                        duration_ticks: duration,
+                        is_keyframe: is_key,
+                    });
                     return Err(e);
                 }
             }
