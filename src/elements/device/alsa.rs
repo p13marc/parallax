@@ -482,6 +482,11 @@ pub struct AlsaSink {
     written_frames: u64,
     /// Device playback position, shared with the clock.
     position: Arc<AlsaPosition>,
+    /// The PCM's poll fd, registered with the tokio reactor once and kept —
+    /// a fresh `AsyncFd` per buffer cost an allocation plus two epoll_ctl
+    /// syscalls per audio buffer (#142). Lazily built on first consume so
+    /// construction stays runtime-independent.
+    poll_fd: Option<AsyncFd<std::os::fd::RawFd>>,
 }
 
 /// Clock provider wrapper for AlsaSink.
@@ -562,6 +567,7 @@ impl AlsaSink {
             frame_size,
             clock_provider,
             written_frames: 0,
+            poll_fd: None,
             position,
         })
     }
@@ -839,13 +845,14 @@ impl AsyncSink for AlsaSink {
             return Ok(());
         }
 
-        // Wait for space using poll
-        let fds = self.poll_descriptors()?;
-        if !fds.is_empty() {
-            let fd = fds[0].fd;
-            if let Ok(async_fd) = AsyncFd::new(fd) {
-                let _ = async_fd.writable().await;
-            }
+        // Register the PCM's poll fd with the tokio reactor once and keep
+        // it — a fresh `AsyncFd` per buffer cost an allocation plus two
+        // epoll_ctl syscalls per audio buffer (#142).
+        if self.poll_fd.is_none()
+            && let Ok(fds) = self.poll_descriptors()
+            && let Some(first) = fds.first()
+        {
+            self.poll_fd = AsyncFd::new(first.fd).ok();
         }
 
         // Bytes, not `i16`. `io_bytes()` converts the byte count to frames
@@ -854,8 +861,6 @@ impl AsyncSink for AlsaSink {
         // whose alignment we do not control. `io_i16()` used to be hard-coded
         // here, which meant any other configured format simply errored on
         // every buffer (#70).
-        let io = self.pcm.io_bytes();
-
         // `writei` can write fewer frames than asked for. The remainder used to
         // be silently discarded, which drops audio and makes the frame
         // accounting the clock depends on wrong.
@@ -864,8 +869,29 @@ impl AsyncSink for AlsaSink {
         let mut underruns = 0u32;
 
         while written < wanted {
-            match io.writei(&data[written..wanted]) {
-                Ok(0) => break,
+            // Scoped: `io` borrows the !Sync PCM, so it must not live
+            // across the awaits below or the consume future stops being
+            // Send. `io_bytes()` is a pointer wrap, not a syscall.
+            let write_result = {
+                let io = self.pcm.io_bytes();
+                io.writei(&data[written..wanted])
+            };
+            match write_result {
+                Ok(0) => {
+                    // Device refused data: wait for the next writability
+                    // edge through the persistent registration. Readiness
+                    // is cleared only here — clearing on successful passes
+                    // would wait for a full-to-writable *edge* that a
+                    // never-full buffer never emits.
+                    match &self.poll_fd {
+                        Some(async_fd) => {
+                            if let Ok(mut guard) = async_fd.writable().await {
+                                guard.clear_ready();
+                            }
+                        }
+                        None => break,
+                    }
+                }
                 Ok(frames_written) => {
                     written += frames_written * self.frame_size;
                     self.written_frames += frames_written as u64;
@@ -889,6 +915,18 @@ impl AsyncSink for AlsaSink {
                     self.pcm
                         .prepare()
                         .map_err(|e| DeviceError::Alsa(e.to_string()))?;
+                }
+                Err(e) if e.errno() == libc::EAGAIN => {
+                    // Non-blocking device with a full buffer — same wait as
+                    // the Ok(0) case.
+                    match &self.poll_fd {
+                        Some(async_fd) => {
+                            if let Ok(mut guard) = async_fd.writable().await {
+                                guard.clear_ready();
+                            }
+                        }
+                        None => tokio::task::yield_now().await,
+                    }
                 }
                 Err(e) => return Err(DeviceError::Alsa(e.to_string()).into()),
             }

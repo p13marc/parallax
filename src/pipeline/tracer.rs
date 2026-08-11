@@ -77,6 +77,10 @@ pub trait Tracer: Send + Sync {
 #[derive(Clone, Default)]
 pub struct TracerRegistry {
     inner: Arc<Mutex<Vec<Box<dyn Tracer>>>>,
+    /// Registered-tracer count, for the lock-free empty fast path (#142):
+    /// with no tracers, every buffer used to pay two mutex round-trips and
+    /// two `Instant::now()` clock reads per element hop.
+    count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// A tracer's name, or a stand-in if asking for it also panics.
@@ -112,12 +116,15 @@ impl TracerRegistry {
 
     /// Add a tracer.
     pub fn add(&self, tracer: Box<dyn Tracer>) {
-        self.lock().push(tracer);
+        let mut tracers = self.lock();
+        tracers.push(tracer);
+        self.count
+            .store(tracers.len(), std::sync::atomic::Ordering::Release);
     }
 
-    /// Check if any tracers are registered.
+    /// Check if any tracers are registered (lock-free).
     pub fn is_empty(&self) -> bool {
-        self.lock().is_empty()
+        self.count.load(std::sync::atomic::Ordering::Acquire) == 0
     }
 
     /// Number of registered tracers.
@@ -152,19 +159,29 @@ impl TracerRegistry {
             }
         }
 
-        for i in failed.into_iter().rev() {
-            tracers.remove(i);
+        if !failed.is_empty() {
+            for i in failed.into_iter().rev() {
+                tracers.remove(i);
+            }
+            self.count
+                .store(tracers.len(), std::sync::atomic::Ordering::Release);
         }
     }
 
     /// Notify all tracers of a buffer.
     pub fn notify_buffer(&self, element_name: &str, buffer: &Buffer) {
+        if self.is_empty() {
+            return;
+        }
         let ts = Instant::now();
         self.notify_each("on_buffer", |t| t.on_buffer(element_name, buffer, ts));
     }
 
     /// Notify all tracers of a processed buffer.
     pub fn notify_buffer_processed(&self, element_name: &str) {
+        if self.is_empty() {
+            return;
+        }
         let ts = Instant::now();
         self.notify_each("on_buffer_processed", |t| {
             t.on_buffer_processed(element_name, ts)
@@ -173,6 +190,9 @@ impl TracerRegistry {
 
     /// Notify all tracers of a dropped buffer.
     pub fn notify_drop(&self, element_name: &str) {
+        if self.is_empty() {
+            return;
+        }
         let ts = Instant::now();
         self.notify_each("on_drop", |t| t.on_drop(element_name, ts));
     }

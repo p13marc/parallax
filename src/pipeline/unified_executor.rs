@@ -2564,10 +2564,22 @@ fn spawn_transform_task(
             output_bridges: &[Arc<AsyncRtBridge>],
             tracers: &TracerRegistry,
         ) {
+            // Move the buffer into the common single-consumer case instead
+            // of cloning for it and dropping the original (#142) — the
+            // clone was a metadata copy plus six refcount atomics per
+            // buffer per element for nothing.
+            if output_bridges.is_empty() {
+                broadcast(outputs, buffer, tracers).await;
+                return;
+            }
             broadcast(outputs, buffer.clone(), tracers).await;
-            for bridge in output_bridges {
+            let (last, rest) = output_bridges
+                .split_last()
+                .expect("output_bridges checked non-empty");
+            for bridge in rest {
                 let _ = bridge.push_async(buffer.clone()).await;
             }
+            let _ = last.push_async(buffer).await;
         }
 
         /// Helper to send EOS to all downstream channels and bridges.

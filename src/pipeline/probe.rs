@@ -218,6 +218,10 @@ impl std::fmt::Debug for ProbeEntry {
 #[derive(Clone, Default)]
 pub struct ProbeRegistry {
     inner: Arc<Mutex<ProbeRegistryInner>>,
+    /// Total registered probes, for the lock-free empty fast path (#142):
+    /// most pipelines never register a probe, yet every buffer used to pay
+    /// two mutex round-trips here.
+    count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[derive(Default)]
@@ -275,6 +279,20 @@ impl ProbeRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Recompute the probe count while holding the lock. Called after every
+    /// mutation, including invoke-time one-shot removals.
+    fn refresh_count(&self, inner: &ProbeRegistryInner) {
+        let total = inner.probes.values().map(Vec::len).sum();
+        self.count
+            .store(total, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Lock-free emptiness check.
+    #[inline]
+    fn is_empty_fast(&self) -> bool {
+        self.count.load(std::sync::atomic::Ordering::Acquire) == 0
+    }
+
     /// Add a probe to a pad.
     ///
     /// Returns the probe ID for later removal.
@@ -291,6 +309,7 @@ impl ProbeRegistry {
         };
         let mut inner = self.lock();
         inner.probes.entry(pad).or_default().push(entry);
+        self.refresh_count(&inner);
         id
     }
 
@@ -299,13 +318,18 @@ impl ProbeRegistry {
     /// Returns `true` if the probe was found and removed.
     pub fn remove(&self, id: ProbeId) -> bool {
         let mut inner = self.lock();
+        let mut removed = false;
         for probes in inner.probes.values_mut() {
             if let Some(pos) = probes.iter().position(|p| p.id == id) {
                 probes.remove(pos);
-                return true;
+                removed = true;
+                break;
             }
         }
-        false
+        if removed {
+            self.refresh_count(&inner);
+        }
+        removed
     }
 
     /// Check if any probes are registered for a pad.
@@ -321,6 +345,9 @@ impl ProbeRegistry {
     ///
     /// Returns the probe result that determines what happens to the buffer.
     pub fn invoke_buffer(&self, pad: &PadRef, buffer: &Buffer) -> ProbeReturn {
+        if self.is_empty_fast() {
+            return ProbeReturn::Ok;
+        }
         let mut inner = self.lock();
         let Some(probes) = inner.probes.get_mut(pad) else {
             return ProbeReturn::Ok;
@@ -346,8 +373,11 @@ impl ProbeRegistry {
         }
 
         // Remove one-shot probes (reverse order to preserve indices)
-        for i in to_remove.into_iter().rev() {
-            probes.remove(i);
+        if !to_remove.is_empty() {
+            for i in to_remove.into_iter().rev() {
+                probes.remove(i);
+            }
+            self.refresh_count(&inner);
         }
 
         result
@@ -357,6 +387,9 @@ impl ProbeRegistry {
     ///
     /// Returns the probe result that determines what happens to the event.
     pub fn invoke_event(&self, pad: &PadRef, event: &Event, downstream: bool) -> ProbeReturn {
+        if self.is_empty_fast() {
+            return ProbeReturn::Ok;
+        }
         let probe_type = if event.is_serialized() {
             if downstream {
                 ProbeType::EVENT_DOWN
@@ -391,8 +424,11 @@ impl ProbeRegistry {
             }
         }
 
-        for i in to_remove.into_iter().rev() {
-            probes.remove(i);
+        if !to_remove.is_empty() {
+            for i in to_remove.into_iter().rev() {
+                probes.remove(i);
+            }
+            self.refresh_count(&inner);
         }
 
         result
@@ -402,6 +438,9 @@ impl ProbeRegistry {
     ///
     /// When a pad has a BLOCK probe, data flow should be paused.
     pub fn is_blocked(&self, pad: &PadRef) -> bool {
+        if self.is_empty_fast() {
+            return false;
+        }
         let inner = self.lock();
         inner.probes.get(pad).is_some_and(|probes| {
             probes
@@ -412,6 +451,9 @@ impl ProbeRegistry {
 
     /// Invoke IDLE probes for a pad (called when no data is flowing).
     pub fn invoke_idle(&self, pad: &PadRef) {
+        if self.is_empty_fast() {
+            return;
+        }
         let mut inner = self.lock();
         let Some(probes) = inner.probes.get_mut(pad) else {
             return;
@@ -427,8 +469,11 @@ impl ProbeRegistry {
             }
         }
 
-        for i in to_remove.into_iter().rev() {
-            probes.remove(i);
+        if !to_remove.is_empty() {
+            for i in to_remove.into_iter().rev() {
+                probes.remove(i);
+            }
+            self.refresh_count(&inner);
         }
     }
 
