@@ -16,8 +16,10 @@ use parallax::elements::transform::VideoConvertElement;
 use parallax::elements::{AacDecoder, AutoVideoSink, H264Decoder, VideoKey, VideoWindowEvent};
 use parallax::pipeline::{EndReason, Executor, LinkPolicy, Pipeline};
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A video player built on the parallax pipeline engine.
 #[derive(Parser, Debug)]
@@ -211,6 +213,25 @@ fn command_for_terminal() -> Option<Command> {
     None
 }
 
+/// Counts dropped buffers across the whole pipeline, for the status line.
+struct DropCounter(Arc<AtomicU64>);
+
+impl parallax::pipeline::tracer::Tracer for DropCounter {
+    fn on_drop(&self, _element_name: &str, _ts: std::time::Instant) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn name(&self) -> &str {
+        "player-drops"
+    }
+}
+
+/// `mm:ss` for the status line.
+fn mmss(ns: u64) -> String {
+    let secs = ns / 1_000_000_000;
+    format!("{:02}:{:02}", secs / 60, secs % 60)
+}
+
 /// Keep raw mode strictly scoped to the playback loop, whatever exit path.
 struct RawMode(bool);
 
@@ -307,6 +328,10 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
     let window = sink.handle();
 
     let mut pipeline = Pipeline::new();
+    let dropped = Arc::new(AtomicU64::new(0));
+    pipeline
+        .tracer_registry()
+        .add(Box::new(DropCounter(dropped.clone())));
     let src = pipeline.add_demuxer("mp4demux", source);
     let dec = pipeline.add_filter("decode", H264Decoder::new()?);
     let cvt = pipeline.add_filter("convert", convert);
@@ -330,13 +355,15 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
     }
 
     let executor = Executor::new();
-    let handle = executor
+    let mut handle = executor
         .start(&mut pipeline)
         .context("failed to start the pipeline")?;
+    let mut bus = handle.take_bus();
     let mut ended = handle.ended();
 
     println!("controls: Space pause · ←/→ seek 10s · f fullscreen · q quit");
     let raw_mode = RawMode::enable();
+    let mut status_tick = tokio::time::interval(std::time::Duration::from_millis(250));
 
     // The window opens lazily on the first displayed frame, so is_open()
     // starts out false — only treat false as "closed" after it was seen open.
@@ -362,6 +389,42 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
                 println!("\ninterrupted");
                 handle.stop();
                 break Outcome::Stop;
+            }
+            _ = status_tick.tick() => {
+                // One line, redrawn in place ~4x/s: position / duration,
+                // pause marker, drop count, and any bus warnings/errors.
+                let position = handle.position().to_option().map(|p| p.nanos()).unwrap_or(0);
+                let state = if handle.is_paused() { " ⏸" } else { "" };
+                let drops = dropped.load(Ordering::Relaxed);
+                let drops = if drops > 0 {
+                    format!(" · {drops} dropped")
+                } else {
+                    String::new()
+                };
+                let mut notes = String::new();
+                if let Some(bus) = bus.as_mut() {
+                    use parallax::pipeline::bus::MessageKind;
+                    while let Some(msg) = bus.poll() {
+                        match msg.kind {
+                            MessageKind::Error { error, .. } => {
+                                notes = format!(" · ERROR: {error}");
+                            }
+                            MessageKind::Warning { warning, .. } => {
+                                notes = format!(" · warning: {warning}");
+                            }
+                            MessageKind::Buffering { percent, .. } => {
+                                notes = format!(" · buffering {percent}%");
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                print!(
+                    "\r\x1b[K{} / {}{state}{drops}{notes}",
+                    mmss(position),
+                    mmss(duration_ns)
+                );
+                let _ = std::io::stdout().flush();
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
                 let mut commands = Vec::new();
@@ -407,6 +470,7 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
     };
 
     drop(raw_mode);
+    println!();
     let _ = handle.wait().await;
     Ok(outcome)
 }
