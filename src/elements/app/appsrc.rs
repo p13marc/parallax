@@ -5,6 +5,7 @@
 use crate::buffer::Buffer;
 use crate::element::{ProduceContext, ProduceResult, Source};
 use crate::error::{Error, Result};
+use crate::event::{Event, EventResult};
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -157,7 +158,12 @@ impl Source for AppSrc {
         let mut state = self.inner.lock();
 
         if state.flushing {
-            return Err(Error::Element("appsrc is flushing".into()));
+            // Flushing is a *temporary* state — the app raises it around a
+            // seek and clears it again (`set_flushing(false)`). An `Err` here
+            // would kill the element task and end the pipeline, turning every
+            // seek into a teardown; WouldBlock parks the source until the app
+            // resumes pushing.
+            return Ok(ProduceResult::WouldBlock);
         }
 
         if let Some(buffer) = state.queue.pop_front() {
@@ -169,6 +175,36 @@ impl Source for AppSrc {
             Ok(ProduceResult::Eos)
         } else {
             Ok(ProduceResult::WouldBlock)
+        }
+    }
+
+    fn is_seekable(&self) -> bool {
+        // Seekable by proxy: the app repositions whatever feeds this AppSrc.
+        true
+    }
+
+    fn handle_upstream_event(&mut self, event: &Event) -> EventResult {
+        match event {
+            Event::Seek(_) => {
+                // The app owns the actual repositioning (it drives the reader
+                // behind this AppSrc, and learns of the seek through its own
+                // control plane). The element's share of the job is dropping
+                // the queued pre-seek buffers so they cannot surface after
+                // the flush sequence the executor is about to run.
+                let mut state = self.inner.lock();
+                let dropped = state.queue.len();
+                state.queue.clear();
+                // Same wakeup pair as produce(): the queue just freed space.
+                self.inner.data_available.notify_all();
+                self.inner.space_available_async.notify_waiters();
+                tracing::debug!(
+                    "appsrc '{}': dropped {} queued buffers on seek",
+                    self.name,
+                    dropped
+                );
+                EventResult::Handled
+            }
+            _ => EventResult::NotHandled,
         }
     }
 

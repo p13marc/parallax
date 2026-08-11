@@ -5,14 +5,21 @@
 //!
 //! # Seek Flow
 //!
+//! On a running pipeline, use [`PipelineHandle::seek`] — the graph-level
+//! `Pipeline::seek` only reaches elements before `Executor::start` moves them
+//! into their tasks. The runtime sequence, executed by the source task:
+//!
 //! ```text
-//! Application → pipeline.seek()
-//!   1. FlushStart sent downstream (clears queues)
-//!   2. SeekEvent sent upstream to sources
-//!   3. Source repositions, emits new Segment downstream
+//! Application → handle.seek()
+//!   1. SeekEvent delivered upstream to each source task
+//!   2. Source repositions (handle_upstream_event)
+//!   3. FlushStart sent downstream in-band (receivers discard stale buffers)
 //!   4. FlushStop sent downstream (resume processing)
-//!   5. SeekDone posted to bus
+//!   5. New Segment sent downstream (re-anchors the timeline)
+//!   6. SeekDone posted to bus
 //! ```
+//!
+//! [`PipelineHandle::seek`]: crate::pipeline::PipelineHandle::seek
 //!
 //! # Example
 //!

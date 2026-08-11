@@ -261,7 +261,17 @@ if seekable.seekable {
 }
 ```
 
-Under the hood, a `SeekEvent` travels upstream to a `SeekableSource` (e.g. `FileSrc`). After a seek, a `SegmentEvent` establishes the timestamp mapping:
+The graph-level `pipeline.seek_*` only reaches elements *before* `Executor::start` moves them into their tasks. To seek a **running** pipeline, use the handle — the seek is delivered to each source task, which repositions the source and runs the flush sequence in-band (FlushStart → FlushStop → Segment, then `MessageKind::SeekDone` on the bus; receivers drop buffered pre-seek data in between):
+
+```rust
+let handle = executor.start(&mut pipeline)?;
+handle.seek_time(ClockTime::from_secs(30)).await;     // or seek_bytes / seek(SeekEvent)
+// watch the bus for MessageKind::SeekDone
+```
+
+A source that cannot seek posts a bus `Warning` and keeps producing. Sources scheduled on RT threads have no control channel — runtime seek covers the async path only.
+
+Under the hood, a `SeekEvent` travels upstream to the source's `handle_upstream_event` (e.g. `FileSrc`). After a seek, a `SegmentEvent` establishes the timestamp mapping:
 
 ```rust
 use parallax::event::SegmentEvent;

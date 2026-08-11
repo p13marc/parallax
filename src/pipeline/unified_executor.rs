@@ -35,6 +35,7 @@ use crate::element::{
     ProcessingHint, SourceResult,
 };
 use crate::error::{Error, Result};
+use crate::event::{Event, EventResult, FlushStopEvent, SeekEvent, SeekType, SegmentEvent};
 use crate::memory::{OutputBudget, defaults};
 use crate::pipeline::bus::{Bus, BusHandle};
 use crate::pipeline::probe::{ProbeRegistry, ProbeReturn};
@@ -508,6 +509,17 @@ impl Stopper {
 // Handle
 // ============================================================================
 
+/// Control-channel sender for one running source task.
+///
+/// Upstream events cannot ride the data channels (those point downstream), so
+/// every async-spawned source gets a small out-of-band channel, drained at the
+/// top of its produce loop. Sources scheduled on RT threads have none — the RT
+/// path carries no events at all yet.
+struct SourceControl {
+    name: String,
+    tx: AsyncSender<Event>,
+}
+
 /// Handle to a running pipeline.
 pub struct PipelineHandle {
     /// Tokio task handles.
@@ -539,6 +551,9 @@ pub struct PipelineHandle {
     /// running. They loop until told to stop, so they cannot be counted like
     /// tasks — instead the seed holds EOS back until `wait`/`abort` joins them.
     seed: Option<TaskGuard>,
+    /// Control-channel senders into the running source tasks (see
+    /// [`send_event_upstream`](Self::send_event_upstream)).
+    controls: Vec<SourceControl>,
 }
 
 impl PipelineHandle {
@@ -735,6 +750,54 @@ impl PipelineHandle {
         self.events.send(PipelineEvent::Stopped);
     }
 
+    /// Send an upstream event to every running source task.
+    ///
+    /// This is the runtime counterpart of [`Pipeline::send_event_upstream`],
+    /// which only works before `start()` moves the elements into their tasks.
+    /// The event is handled asynchronously by each source's produce loop:
+    /// for a flushing [`Event::Seek`] the source repositions, broadcasts
+    /// FlushStart → FlushStop → Segment in-band to its downstream graph, and
+    /// posts [`MessageKind::SeekDone`](crate::pipeline::bus::MessageKind::SeekDone) on the bus when it is done.
+    ///
+    /// Returns `false` if no source accepted the event — the pipeline has no
+    /// async-spawned sources (RT-scheduled sources carry no control channel),
+    /// or every source task has already finished.
+    pub async fn send_event_upstream(&self, event: Event) -> bool {
+        let mut delivered = false;
+        for control in &self.controls {
+            if control.tx.send(event.clone()).await.is_ok() {
+                delivered = true;
+            } else {
+                tracing::debug!(
+                    "source '{}' is gone; upstream event '{}' not delivered",
+                    control.name,
+                    event.name()
+                );
+            }
+        }
+        delivered
+    }
+
+    /// Seek a running pipeline.
+    ///
+    /// Delivers the seek to every source; sources that are not seekable (live
+    /// capture, AppSrc without an app-side seek story) report it and continue.
+    /// Watch the bus for [`MessageKind::SeekDone`](crate::pipeline::bus::MessageKind::SeekDone) to learn when the flush
+    /// sequence has run.
+    pub async fn seek(&self, seek: SeekEvent) -> bool {
+        self.send_event_upstream(Event::Seek(seek)).await
+    }
+
+    /// Seek to a time position (flushing, keyframe-snapped). See [`Self::seek`].
+    pub async fn seek_time(&self, position: ClockTime) -> bool {
+        self.seek(SeekEvent::new_time(position)).await
+    }
+
+    /// Seek to a byte offset (flushing). See [`Self::seek`].
+    pub async fn seek_bytes(&self, position: u64) -> bool {
+        self.seek(SeekEvent::new_bytes(position)).await
+    }
+
     /// Subscribe to pipeline events.
     pub fn subscribe(&self) -> EventReceiver {
         self.events.subscribe()
@@ -896,11 +959,20 @@ impl Executor {
             None
         };
 
+        // Control-channel senders for the source tasks, collected as they spawn.
+        let mut controls = Vec::new();
+
         // Execute based on scheduling mode
         let (tasks, rt_handles, bridges, rt_driver_task) = match effective_scheduling {
             SchedulingMode::Async => {
-                let tasks =
-                    self.run_async(pipeline, clock_info.as_ref(), &events, &stop, &outcome)?;
+                let tasks = self.run_async(
+                    pipeline,
+                    clock_info.as_ref(),
+                    &events,
+                    &stop,
+                    &outcome,
+                    &mut controls,
+                )?;
                 (tasks, Vec::new(), Vec::new(), None)
             }
             SchedulingMode::Hybrid | SchedulingMode::RealTime => {
@@ -932,8 +1004,14 @@ impl Executor {
                              and low-latency — running fully async. Nodes: [{names}]."
                         );
                     }
-                    let tasks =
-                        self.run_async(pipeline, clock_info.as_ref(), &events, &stop, &outcome)?;
+                    let tasks = self.run_async(
+                        pipeline,
+                        clock_info.as_ref(),
+                        &events,
+                        &stop,
+                        &outcome,
+                        &mut controls,
+                    )?;
                     (tasks, Vec::new(), Vec::new(), None)
                 } else {
                     self.run_hybrid(
@@ -944,6 +1022,7 @@ impl Executor {
                         &events,
                         &stop,
                         &outcome,
+                        &mut controls,
                     )?
                 }
             }
@@ -999,6 +1078,7 @@ impl Executor {
             stop,
             outcome,
             seed,
+            controls,
         })
     }
 
@@ -1011,6 +1091,7 @@ impl Executor {
         events: &EventSender,
         stop: &Arc<AtomicBool>,
         outcome: &Arc<TerminalOutcome>,
+        controls: &mut Vec<SourceControl>,
     ) -> Result<Vec<JoinHandle<Result<()>>>> {
         let mut channels = ChannelNetwork::new();
 
@@ -1020,7 +1101,9 @@ impl Executor {
         }
 
         // Spawn tasks
-        self.spawn_tasks(pipeline, channels, clock_info, events, stop, outcome)
+        self.spawn_tasks(
+            pipeline, channels, clock_info, events, stop, outcome, controls,
+        )
     }
 
     /// Run with hybrid async + RT execution.
@@ -1034,6 +1117,7 @@ impl Executor {
         events: &EventSender,
         stop: &Arc<AtomicBool>,
         outcome: &Arc<TerminalOutcome>,
+        controls: &mut Vec<SourceControl>,
     ) -> Result<(
         Vec<JoinHandle<Result<()>>>,
         Vec<crate::pipeline::rt_scheduler::DataThreadHandle>,
@@ -1073,7 +1157,7 @@ impl Executor {
 
         // Spawn async tasks for the async portion of the graph
         let tasks = self.spawn_tasks_for_partition(
-            pipeline, partition, channels, scheduler, clock_info, events, stop, outcome,
+            pipeline, partition, channels, scheduler, clock_info, events, stop, outcome, controls,
         )?;
 
         // Collect bridges (keep alive)
@@ -1309,6 +1393,7 @@ impl Executor {
         events: &EventSender,
         stop: &Arc<AtomicBool>,
         outcome: &Arc<TerminalOutcome>,
+        controls: &mut Vec<SourceControl>,
     ) -> Result<Vec<JoinHandle<Result<()>>>> {
         let mut tasks = Vec::new();
 
@@ -1330,6 +1415,7 @@ impl Executor {
                 events,
                 stop,
                 outcome,
+                controls,
             )?;
             tasks.push(task);
         }
@@ -1349,6 +1435,7 @@ impl Executor {
         events: &EventSender,
         stop: &Arc<AtomicBool>,
         outcome: &Arc<TerminalOutcome>,
+        controls: &mut Vec<SourceControl>,
     ) -> Result<Vec<JoinHandle<Result<()>>>> {
         let mut tasks = Vec::new();
 
@@ -1377,6 +1464,7 @@ impl Executor {
                 events,
                 stop,
                 outcome,
+                controls,
             )?;
             tasks.push(task);
         }
@@ -1395,6 +1483,7 @@ impl Executor {
         events: &EventSender,
         stop: &Arc<AtomicBool>,
         outcome: &Arc<TerminalOutcome>,
+        controls: &mut Vec<SourceControl>,
     ) -> Result<JoinHandle<Result<()>>> {
         self.spawn_node_task_with_bridges(
             pipeline,
@@ -1406,6 +1495,7 @@ impl Executor {
             events,
             stop,
             outcome,
+            controls,
         )
     }
 
@@ -1422,6 +1512,7 @@ impl Executor {
         events: &EventSender,
         stop: &Arc<AtomicBool>,
         outcome: &Arc<TerminalOutcome>,
+        controls: &mut Vec<SourceControl>,
     ) -> Result<JoinHandle<Result<()>>> {
         // Before `get_node_mut` borrows the pipeline mutably: `children()` needs
         // it shared.
@@ -1473,18 +1564,30 @@ impl Executor {
         let share = TaskGuard::new(outcome, &node_name);
 
         let task = match element_type {
-            ElementType::Source => spawn_source_task(
-                node_name,
-                node_id,
-                element,
-                channels.take_outputs(node_id),
-                output_bridges,
-                events_clone,
-                probes,
-                tracers,
-                stop.clone(),
-                share,
-            ),
+            ElementType::Source => {
+                // Out-of-band control channel for upstream events (seek). Small
+                // and bounded: control events are rare and handled promptly.
+                let (control_tx, control_rx) = bounded_async::<Event>(8);
+                let bus = pipeline.bus_handle().for_element(&node_name);
+                controls.push(SourceControl {
+                    name: node_name.clone(),
+                    tx: control_tx,
+                });
+                spawn_source_task(
+                    node_name,
+                    node_id,
+                    element,
+                    channels.take_outputs(node_id),
+                    output_bridges,
+                    events_clone,
+                    probes,
+                    tracers,
+                    stop.clone(),
+                    control_rx,
+                    bus,
+                    share,
+                )
+            }
             ElementType::Sink => spawn_sink_task(
                 node_name,
                 node_id,
@@ -1670,6 +1773,13 @@ enum Message {
     /// — sending both invites the receiver to record whichever arrives second
     /// as the reason the stream ended.
     Error(StreamError),
+    /// A non-terminal in-band event (FlushStart/FlushStop/Segment/...).
+    ///
+    /// `Eos` and `Error` keep their own variants — they are terminal and every
+    /// receive loop exits on them, which an `Event` arm must never do. Events
+    /// occupy channel slots between buffers, so their ordering relative to
+    /// buffers on a link is FIFO-exact.
+    Event(Event),
 }
 
 type ChannelKey = (NodeId, String, NodeId, String);
@@ -1742,6 +1852,17 @@ async fn broadcast(branches: &[OutputBranch], buffer: Buffer, tracers: &TracerRe
 async fn broadcast_eos(branches: &[OutputBranch]) {
     for branch in branches {
         let _ = branch.tx.send(Message::Eos).await;
+    }
+}
+
+/// Send an in-band event to every branch, **always blocking**.
+///
+/// Events are control flow, not payload: a dropped FlushStop would leave the
+/// branch's subtree discarding buffers forever, so `LinkPolicy::Drop` does not
+/// apply — same reasoning as [`broadcast_eos`].
+async fn broadcast_event(branches: &[OutputBranch], event: &Event) {
+    for branch in branches {
+        let _ = branch.tx.send(Message::Event(event.clone())).await;
     }
 }
 
@@ -1890,6 +2011,79 @@ impl ChannelNetwork {
 // ============================================================================
 
 #[allow(clippy::too_many_arguments)]
+/// Handle one upstream event delivered to a source task's control channel.
+///
+/// For a handled flushing seek this runs the flush sequence in-band on every
+/// output branch — FlushStart → FlushStop → Segment, the order downstream
+/// elements rely on to discard stale data and re-anchor their timeline — and
+/// posts [`MessageKind::SeekDone`](crate::pipeline::bus::MessageKind::SeekDone) on the bus. The segment is synthesized here
+/// from the seek's target: asking the element for its actual landing position
+/// would need a new `AsyncElementDyn` method, which is an ABI bump.
+async fn handle_source_control_event(
+    name: &str,
+    element: &mut Box<DynAsyncElement<'static>>,
+    event: &Event,
+    outputs: &[OutputBranch],
+    src_pad: &crate::pipeline::probe::PadRef,
+    probe_registry: &ProbeRegistry,
+    bus: &BusHandle,
+) {
+    match probe_registry.invoke_event(src_pad, event, false) {
+        ProbeReturn::Drop | ProbeReturn::Handled => return,
+        _ => {}
+    }
+
+    let result = element.handle_upstream_event(event);
+    let Event::Seek(seek) = event else {
+        return;
+    };
+
+    match result {
+        EventResult::Handled => {
+            // Src-pad probes see each emitted event, mirroring how buffers are
+            // probed on the pad that emits them; Drop/Handled suppresses it.
+            let emit = |event: Event| match probe_registry.invoke_event(src_pad, &event, true) {
+                ProbeReturn::Drop | ProbeReturn::Handled => None,
+                _ => Some(event),
+            };
+            if seek.flags.contains(crate::event::SeekFlags::FLUSH) {
+                if let Some(ev) = emit(Event::FlushStart) {
+                    broadcast_event(outputs, &ev).await;
+                }
+                if let Some(ev) = emit(Event::FlushStop(FlushStopEvent::new(true))) {
+                    broadcast_event(outputs, &ev).await;
+                }
+            }
+
+            // Segment start = the requested target. `base` stays 0: nothing
+            // downstream consumes running time from segments yet (#71 will).
+            let target = match seek.start.seek_type {
+                SeekType::Set => seek.start.position.max(0),
+                _ => 0,
+            };
+            let segment = match seek.format {
+                crate::event::SegmentFormat::Bytes => SegmentEvent::new_bytes(target as u64, None),
+                _ => SegmentEvent::new_time(ClockTime::from_nanos(target as u64), None),
+            };
+            if let Some(ev) = emit(Event::Segment(segment)) {
+                broadcast_event(outputs, &ev).await;
+            }
+
+            bus.post(crate::pipeline::bus::MessageKind::SeekDone {
+                position: ClockTime::from_nanos(target as u64),
+            });
+            tracing::info!("source '{name}': seek handled, segment starts at {target}");
+        }
+        EventResult::NotHandled => {
+            bus.post_warning(format!("source '{name}' cannot seek; seek ignored"), None);
+        }
+        EventResult::Error => {
+            bus.post_warning(format!("source '{name}': seek failed"), None);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_source_task(
     name: String,
     node_id: NodeId,
@@ -1900,6 +2094,8 @@ fn spawn_source_task(
     probe_registry: ProbeRegistry,
     tracers: TracerRegistry,
     stop: Arc<AtomicBool>,
+    control_rx: AsyncReceiver<Event>,
+    bus: BusHandle,
     share: TaskGuard,
 ) -> JoinHandle<Result<()>> {
     tokio::spawn(reporting(share, async move {
@@ -1921,6 +2117,24 @@ fn spawn_source_task(
                     bridge.signal_eos();
                 }
                 break;
+            }
+
+            // Drain control events (seek) between produce calls. Polled rather
+            // than select!ed against `process_source`: cancelling a produce
+            // future mid-await could lose the buffer it was about to return.
+            // The cost is that a source blocked inside `process_source` sees
+            // the event only when that call returns — same caveat as `stop`.
+            while let Ok(Some(event)) = control_rx.try_recv() {
+                handle_source_control_event(
+                    &name,
+                    &mut element,
+                    &event,
+                    &outputs,
+                    &src_pad,
+                    &probe_registry,
+                    &bus,
+                )
+                .await;
             }
             tracing::trace!("source '{}': calling process_source", name);
             match guard(&name, element.process_source()).await {
@@ -2023,12 +2237,18 @@ fn spawn_sink_task(
         let n_inputs = inputs.len();
         tracing::debug!("sink '{}': {} inputs", name, n_inputs);
         if let Some(rx) = inputs.into_iter().next() {
+            // Between FlushStart and FlushStop arriving buffers are stale.
+            let mut flushing = false;
             // Standard path: read from kanal channel
             loop {
                 match rx.recv().await {
                     Ok(Message::Buffer(buffer)) => {
                         count += 1;
                         tracing::debug!("sink '{}': received buffer {}", name, count);
+                        if flushing {
+                            tracers.notify_drop(&name);
+                            continue;
+                        }
                         match probe_registry.invoke_buffer(&sink_pad, &buffer) {
                             ProbeReturn::Drop | ProbeReturn::Handled => continue,
                             _ => {}
@@ -2039,6 +2259,21 @@ fn spawn_sink_task(
                             return Err(e);
                         }
                         tracers.notify_buffer_processed(&name);
+                    }
+                    Ok(Message::Event(event)) => {
+                        match probe_registry.invoke_event(&sink_pad, &event, true) {
+                            ProbeReturn::Drop | ProbeReturn::Handled => continue,
+                            _ => {}
+                        }
+                        match &event {
+                            Event::FlushStart => flushing = true,
+                            Event::FlushStop(_) => flushing = false,
+                            _ => {}
+                        }
+                        // No `flush()` here: a sink's flush *commits* buffered
+                        // output (an Mp4FileSink finalizes the file) — the
+                        // element decides what a flush-seek means for it.
+                        let _ = element.handle_downstream_event(event);
                     }
                     Ok(Message::Eos) => {
                         tracing::debug!("sink '{}': EOS after {}", name, count);
@@ -2174,6 +2409,9 @@ fn spawn_transform_task(
         }
 
         if let Some(rx) = inputs.into_iter().next() {
+            // Between FlushStart and FlushStop every arriving buffer is stale
+            // by definition — drop it instead of processing.
+            let mut flushing = false;
             // Standard path: read from kanal channel
             loop {
                 tracing::trace!("transform '{}': waiting for input", name);
@@ -2186,6 +2424,11 @@ fn spawn_transform_task(
                             count,
                             buffer.len()
                         );
+
+                        if flushing {
+                            tracers.notify_drop(&name);
+                            continue;
+                        }
 
                         // Sink-pad probes see the input before the element does.
                         match probe_registry.invoke_buffer(&sink_pad, &buffer) {
@@ -2241,6 +2484,35 @@ fn spawn_transform_task(
                                 send_error(&outputs, &output_bridges, &err).await;
                                 return Err(e);
                             }
+                        }
+                    }
+                    Ok(Message::Event(event)) => {
+                        match probe_registry.invoke_event(&sink_pad, &event, true) {
+                            ProbeReturn::Drop | ProbeReturn::Handled => continue,
+                            _ => {}
+                        }
+                        match &event {
+                            Event::FlushStart => {
+                                flushing = true;
+                                // Drain the element's internal state and
+                                // *discard* it: pending reordered frames from
+                                // before the seek must not surface after it.
+                                if let Err(e) = guard(&name, element.flush()).await {
+                                    tracing::warn!("flush error in '{}': {}", name, e);
+                                }
+                                shed.reset();
+                            }
+                            Event::FlushStop(_) => flushing = false,
+                            _ => {}
+                        }
+                        // The element sees every event and decides what goes
+                        // on: `Some` forwards (the default), `None` consumes.
+                        if let Some(fwd) = element.handle_downstream_event(event) {
+                            match probe_registry.invoke_event(&src_pad, &fwd, true) {
+                                ProbeReturn::Drop | ProbeReturn::Handled => continue,
+                                _ => {}
+                            }
+                            broadcast_event(&outputs, &fwd).await;
                         }
                     }
                     Ok(Message::Error(err)) => {
@@ -2390,10 +2662,17 @@ fn spawn_demuxer_task(
         let mut count: u64 = 0;
 
         if let Some(rx) = inputs.into_iter().next() {
+            // Between FlushStart and FlushStop arriving buffers are stale.
+            let mut flushing = false;
             loop {
                 match rx.recv().await {
                     Ok(Message::Buffer(buffer)) => {
                         count += 1;
+
+                        if flushing {
+                            tracers.notify_drop(&name);
+                            continue;
+                        }
 
                         match probe_registry.invoke_buffer(&sink_pad, &buffer) {
                             ProbeReturn::Drop | ProbeReturn::Handled => continue,
@@ -2428,6 +2707,32 @@ fn spawn_demuxer_task(
                                     broadcast_error(branches, &err).await;
                                 }
                                 return Err(e);
+                            }
+                        }
+                    }
+                    Ok(Message::Event(event)) => {
+                        match probe_registry.invoke_event(&sink_pad, &event, true) {
+                            ProbeReturn::Drop | ProbeReturn::Handled => continue,
+                            _ => {}
+                        }
+                        match &event {
+                            Event::FlushStart => {
+                                flushing = true;
+                                if let Err(e) = guard(&name, element.flush()).await {
+                                    tracing::warn!("flush error in '{}': {}", name, e);
+                                }
+                            }
+                            Event::FlushStop(_) => flushing = false,
+                            _ => {}
+                        }
+                        // Events go to every output pad, like EOS does.
+                        if let Some(fwd) = element.handle_downstream_event(event) {
+                            match probe_registry.invoke_event(&src_pad, &fwd, true) {
+                                ProbeReturn::Drop | ProbeReturn::Handled => continue,
+                                _ => {}
+                            }
+                            for branches in outputs_by_pad.values() {
+                                broadcast_event(branches, &fwd).await;
                             }
                         }
                     }
@@ -2522,11 +2827,15 @@ fn spawn_muxer_task(
 
         let total = receivers.len();
         let mut eos_count = 0;
+        // Flushes are counted across inputs like EOS: FlushStart forwards on
+        // the first arrival, FlushStop once every started flush has stopped —
+        // forwarding each input's pair verbatim would flush the output twice.
+        let mut active_flushes: usize = 0;
 
         while let Some((pad, rx, msg)) = receivers.next().await {
             // Keep listening on this input unless it just ended; the EOS and
             // error arms deliberately let it drop.
-            if matches!(msg, Some(Message::Buffer(_))) {
+            if matches!(msg, Some(Message::Buffer(_) | Message::Event(_))) {
                 receivers.push(recv_one(pad, rx));
             }
             let msg = match msg {
@@ -2536,6 +2845,11 @@ fn spawn_muxer_task(
             match msg {
                 Ok(Message::Buffer(buffer)) => {
                     count += 1;
+
+                    if active_flushes > 0 {
+                        tracers.notify_drop(&name);
+                        continue;
+                    }
 
                     match probe_registry.invoke_buffer(&sink_pad, &buffer) {
                         ProbeReturn::Drop | ProbeReturn::Handled => continue,
@@ -2567,6 +2881,33 @@ fn spawn_muxer_task(
                             broadcast_error(&outputs, &err).await;
                             return Err(e);
                         }
+                    }
+                }
+                Ok(Message::Event(event)) => {
+                    match probe_registry.invoke_event(&sink_pad, &event, true) {
+                        ProbeReturn::Drop | ProbeReturn::Handled => continue,
+                        _ => {}
+                    }
+                    let forward = match &event {
+                        Event::FlushStart => {
+                            active_flushes += 1;
+                            active_flushes == 1
+                        }
+                        Event::FlushStop(_) => {
+                            active_flushes = active_flushes.saturating_sub(1);
+                            active_flushes == 0
+                        }
+                        _ => true,
+                    };
+                    match element.handle_downstream_event(event) {
+                        Some(fwd) if forward => {
+                            match probe_registry.invoke_event(&src_pad, &fwd, true) {
+                                ProbeReturn::Drop | ProbeReturn::Handled => continue,
+                                _ => {}
+                            }
+                            broadcast_event(&outputs, &fwd).await;
+                        }
+                        _ => {}
                     }
                 }
                 Ok(Message::Error(err)) => {

@@ -299,6 +299,17 @@ impl Sink for AppSink {
         match &event {
             crate::event::Event::Eos => self.send_eos(),
             crate::event::Event::Error(err) => self.send_error(err.clone()),
+            crate::event::Event::FlushStart => {
+                // Queued-but-unpulled buffers are stale the moment a flush
+                // starts; drop them so the application cannot pull pre-seek
+                // data after the flush sequence.
+                let mut state = self.inner.lock();
+                let dropped = state.queue.len();
+                state.total_dropped += dropped as u64;
+                state.queue.clear();
+                drop(state);
+                self.inner.space_available.notify_all();
+            }
             _ => {}
         }
         Some(event)
