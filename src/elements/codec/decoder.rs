@@ -162,15 +162,8 @@ impl Dav1dDecoder {
         slot.data_mut()[..frame.data.len()].copy_from_slice(&frame.data);
 
         // The pts attached at send time comes back on the picture, so match
-        // the originating input's metadata by it (FIFO fallback for
-        // untimestamped streams).
-        let claimed = self
-            .pending_meta
-            .iter()
-            .position(|m| m.pts.nanos() as i64 == frame.pts)
-            .and_then(|i| self.pending_meta.remove(i))
-            .or_else(|| self.pending_meta.pop_front());
-        let mut metadata = claimed.unwrap_or_default();
+        // the originating input's metadata by it.
+        let mut metadata = self.claim_meta_for(frame.pts);
         metadata.pts = ClockTime::from_nanos(frame.pts as u64);
         metadata.sequence = self.frames_out;
         self.frames_out += 1;
@@ -212,36 +205,143 @@ impl Dav1dDecoder {
             _ => (w.div_ceil(2), h.div_ceil(2)),
         };
 
-        let mut frame = VideoFrame::new(width, height, format);
-        frame.pts = picture.timestamp().unwrap_or(0);
-        frame.stride_y = w * bytes_per_sample;
-        frame.stride_u = cw * bytes_per_sample;
-        frame.stride_v = cw * bytes_per_sample;
+        let stride_y = w * bytes_per_sample;
+        let stride_c = cw * bytes_per_sample;
+        let y_size = stride_y * h;
+        let c_size = stride_c * ch;
 
-        let y_size = frame.stride_y * h;
-        let c_size = frame.stride_u * ch;
-        frame.data = vec![0u8; y_size + 2 * c_size];
+        // Single allocation, no zero-fill: rows are appended in output
+        // order, so the Vec is exactly full when the copy finishes.
+        let mut data = Vec::with_capacity(y_size + 2 * c_size);
+        Self::append_packed_planes(picture, &mut data, h, ch, stride_y, stride_c);
 
-        for (component, rows, row_bytes, offset) in [
-            (dav1d::PlanarImageComponent::Y, h, frame.stride_y, 0),
-            (dav1d::PlanarImageComponent::U, ch, frame.stride_u, y_size),
-            (
-                dav1d::PlanarImageComponent::V,
-                ch,
-                frame.stride_v,
-                y_size + c_size,
-            ),
+        Ok(VideoFrame {
+            width,
+            height,
+            format,
+            pts: picture.timestamp().unwrap_or(0),
+            data,
+            stride_y,
+            stride_u: stride_c,
+            stride_v: stride_c,
+        })
+    }
+
+    /// Append the picture's planes, de-strided, onto `out`.
+    fn append_packed_planes(
+        picture: &dav1d::Picture,
+        out: &mut Vec<u8>,
+        h: usize,
+        ch: usize,
+        stride_y: usize,
+        stride_c: usize,
+    ) {
+        for (component, rows, row_bytes) in [
+            (dav1d::PlanarImageComponent::Y, h, stride_y),
+            (dav1d::PlanarImageComponent::U, ch, stride_c),
+            (dav1d::PlanarImageComponent::V, ch, stride_c),
         ] {
             let plane = picture.plane(component);
             let src_stride = picture.stride(component) as usize;
             for row in 0..rows {
-                let src = &plane[row * src_stride..row * src_stride + row_bytes];
-                frame.data[offset + row * row_bytes..offset + (row + 1) * row_bytes]
-                    .copy_from_slice(src);
+                out.extend_from_slice(&plane[row * src_stride..row * src_stride + row_bytes]);
             }
         }
+    }
 
-        Ok(frame)
+    /// Geometry of a picture in packed-output terms:
+    /// `(format, h, ch, stride_y, stride_c, total_bytes)`.
+    fn packed_geometry(
+        picture: &dav1d::Picture,
+    ) -> Result<(PixelFormat, usize, usize, usize, usize, usize)> {
+        let bit_depth = picture.bit_depth();
+        let format = match (picture.pixel_layout(), bit_depth) {
+            (dav1d::PixelLayout::I420, 8) => PixelFormat::I420,
+            (dav1d::PixelLayout::I420, 10) => PixelFormat::I420p10,
+            (dav1d::PixelLayout::I422, 8) => PixelFormat::I422,
+            (dav1d::PixelLayout::I444, 8) => PixelFormat::I444,
+            _ => {
+                return Err(Error::InvalidSegment(format!(
+                    "Unsupported pixel format: {:?} {}bit",
+                    picture.pixel_layout(),
+                    bit_depth
+                )));
+            }
+        };
+        let bytes_per_sample = if bit_depth > 8 { 2 } else { 1 };
+        let (w, h) = (picture.width() as usize, picture.height() as usize);
+        let (cw, ch) = match format {
+            PixelFormat::I444 => (w, h),
+            PixelFormat::I422 => (w.div_ceil(2), h),
+            _ => (w.div_ceil(2), h.div_ceil(2)),
+        };
+        let stride_y = w * bytes_per_sample;
+        let stride_c = cw * bytes_per_sample;
+        Ok((
+            format,
+            h,
+            ch,
+            stride_y,
+            stride_c,
+            stride_y * h + 2 * stride_c * ch,
+        ))
+    }
+
+    /// Single-copy hot path: de-stride the picture's planes straight into
+    /// an arena slot (#139). Used when no earlier frame is queued, which is
+    /// the steady state — one picture out per temporal unit in.
+    fn picture_to_slot(&mut self, picture: &dav1d::Picture) -> Result<Buffer> {
+        let (format, h, ch, stride_y, stride_c, total) = Self::packed_geometry(picture)?;
+        let dims = (picture.width(), picture.height());
+        if self.last_dims.is_some_and(|last| last != dims) {
+            tracing::info!(
+                "dav1ddecoder: resolution changed to {}x{}, rebuilding the output arena",
+                dims.0,
+                dims.1
+            );
+            self.output.reset();
+        }
+        self.last_dims = Some(dims);
+
+        let mut slot = self.output.acquire(total, "dav1ddecoder")?;
+        {
+            let dst = &mut slot.data_mut()[..total];
+            let mut off = 0;
+            for (component, rows, row_bytes) in [
+                (dav1d::PlanarImageComponent::Y, h, stride_y),
+                (dav1d::PlanarImageComponent::U, ch, stride_c),
+                (dav1d::PlanarImageComponent::V, ch, stride_c),
+            ] {
+                let plane = picture.plane(component);
+                let src_stride = picture.stride(component) as usize;
+                for row in 0..rows {
+                    dst[off..off + row_bytes]
+                        .copy_from_slice(&plane[row * src_stride..row * src_stride + row_bytes]);
+                    off += row_bytes;
+                }
+            }
+        }
+        self.frame_count += 1;
+
+        let pts = picture.timestamp().unwrap_or(0);
+        let mut metadata = self.claim_meta_for(pts);
+        metadata.pts = ClockTime::from_nanos(pts as u64);
+        metadata.sequence = self.frames_out;
+        self.frames_out += 1;
+        metadata.set_video_dims(dims.0, dims.1, format.into());
+
+        Ok(Buffer::new(MemoryHandle::with_len(slot, total), metadata))
+    }
+
+    /// Claim the input metadata whose pts rode through dav1d as the packet
+    /// timestamp (FIFO fallback for untimestamped streams).
+    fn claim_meta_for(&mut self, pts: i64) -> crate::metadata::Metadata {
+        self.pending_meta
+            .iter()
+            .position(|m| m.pts.nanos() as i64 == pts)
+            .and_then(|i| self.pending_meta.remove(i))
+            .or_else(|| self.pending_meta.pop_front())
+            .unwrap_or_default()
     }
 }
 
@@ -261,6 +361,29 @@ impl Element for Dav1dDecoder {
 
         let pts = buffer.metadata().pts.nanos() as i64;
         self.send_frame(buffer.as_bytes(), pts)?;
+
+        // Steady state — nothing queued: the fresh picture de-strides
+        // straight into an arena slot, no intermediate frame (#139). Owned
+        // copies only happen when pictures burst faster than they're
+        // emitted (send_frame's Again drain, or >1 picture per send).
+        if self.ready.is_empty() {
+            match self.decoder.get_picture() {
+                Ok(picture) => {
+                    let out = self.picture_to_slot(&picture)?;
+                    self.drain_pictures()?; // surplus, if any → owned queue
+                    return Ok(Some(out));
+                }
+                Err(dav1d::Error::Again) => return Ok(None),
+                Err(e) => {
+                    return Err(Error::InvalidSegment(format!(
+                        "dav1d decode failed: {:?}",
+                        e
+                    )));
+                }
+            }
+        }
+        // Frames already queued: keep display order — append the fresh
+        // pictures, emit the oldest.
         self.drain_pictures()?;
         self.emit_ready()
     }
@@ -268,8 +391,17 @@ impl Element for Dav1dDecoder {
     /// Drain the pictures dav1d still holds (its frame-delay pipeline) at
     /// EOS, one per call until empty.
     fn flush(&mut self) -> Result<Option<Buffer>> {
-        self.drain_pictures()?;
-        self.emit_ready()
+        if let Some(buf) = self.emit_ready()? {
+            return Ok(Some(buf));
+        }
+        match self.decoder.get_picture() {
+            Ok(picture) => Ok(Some(self.picture_to_slot(&picture)?)),
+            Err(dav1d::Error::Again) => Ok(None),
+            Err(e) => Err(Error::InvalidSegment(format!(
+                "dav1d decode failed: {:?}",
+                e
+            ))),
+        }
     }
 
     fn execution_hints(&self) -> ExecutionHints {

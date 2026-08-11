@@ -1047,6 +1047,72 @@ impl H264Decoder {
     /// smallest PTS still in flight is the right one. `ClockTime::NONE` is
     /// `u64::MAX`, so un-timestamped entries sort last and are consumed FIFO
     /// among themselves.
+    /// Copy openh264's borrowed planes straight into an arena slot,
+    /// de-striding on the fly — the single-copy hot path (#139).
+    ///
+    /// A free function over the individual fields, not a method: the
+    /// `DecodedYUV` mutably borrows `self.decoder` for its whole lifetime,
+    /// so only disjoint field access can run while it is alive.
+    #[allow(clippy::too_many_arguments)]
+    fn yuv_to_slot(
+        output: &mut OutputArena,
+        last_dims: &mut Option<(u32, u32)>,
+        pending: &mut VecDeque<Metadata>,
+        frames_out: &mut u64,
+        yuv: &openh264::decoder::DecodedYUV<'_>,
+    ) -> Result<Buffer> {
+        use openh264::formats::YUVSource;
+
+        let (w, h) = yuv.dimensions();
+        let dims = (w as u32, h as u32);
+        if last_dims.is_some_and(|last| last != dims) {
+            tracing::info!(
+                "h264decoder: resolution changed to {}x{}, rebuilding the output arena",
+                dims.0,
+                dims.1
+            );
+            output.reset();
+        }
+        *last_dims = Some(dims);
+
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        let total = w * h + 2 * cw * ch;
+        let mut slot = output.acquire(total, "h264decoder")?;
+        {
+            let dst = &mut slot.data_mut()[..total];
+            let (sy, su, sv) = yuv.strides();
+            let mut off = 0;
+            for (plane, stride, rows, cols) in [
+                (yuv.y(), sy, h, w),
+                (yuv.u(), su, ch, cw),
+                (yuv.v(), sv, ch, cw),
+            ] {
+                for row in 0..rows {
+                    dst[off..off + cols].copy_from_slice(&plane[row * stride..row * stride + cols]);
+                    off += cols;
+                }
+            }
+        }
+        let handle = crate::buffer::MemoryHandle::with_len(slot, total);
+
+        let mut metadata = Self::claim_pending(pending).unwrap_or_default();
+        metadata.sequence = *frames_out;
+        *frames_out += 1;
+        metadata.set_video_dims(dims.0, dims.1, crate::format::PixelFormat::I420);
+        Ok(Buffer::new(handle, metadata))
+    }
+
+    /// Field-level version of [`take_pending_metadata`](Self::take_pending_metadata),
+    /// callable while the decoder is borrowed.
+    fn claim_pending(pending: &mut VecDeque<Metadata>) -> Option<Metadata> {
+        let oldest = pending
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, meta)| meta.pts)
+            .map(|(index, _)| index)?;
+        pending.remove(oldest)
+    }
+
     fn take_pending_metadata(&mut self) -> Option<Metadata> {
         let oldest = self
             .pending
@@ -1176,12 +1242,25 @@ impl Element for H264Decoder {
         }
         self.pending.push_back(buffer.metadata().clone());
 
-        let input_data = buffer.as_bytes();
+        self.bytes_decoded += buffer.as_bytes().len() as u64;
 
-        match self.decode(input_data)? {
-            Some(frame) => {
-                let source = self.take_pending_metadata();
-                Ok(Some(self.frame_to_buffer(&frame, source)?))
+        // Single-copy hot path: the DecodedYUV borrows `self.decoder`, so
+        // the slot copy runs over the *other* fields while it is alive —
+        // no intermediate DecodedFrame, no plane Vecs (#139).
+        let yuv = self
+            .decoder
+            .decode(buffer.as_bytes())
+            .map_err(|e| Error::Config(format!("H.264 decode failed: {:?}", e)))?;
+        match yuv {
+            Some(yuv) => {
+                self.frame_count += 1;
+                Ok(Some(Self::yuv_to_slot(
+                    &mut self.output,
+                    &mut self.last_dims,
+                    &mut self.pending,
+                    &mut self.frames_out,
+                    &yuv,
+                )?))
             }
             None => Ok(None),
         }
