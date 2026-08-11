@@ -264,6 +264,10 @@ pub use codec::{OpusApplication, OpusDecoder, OpusEncoder};
 #[cfg(feature = "aac-encode")]
 pub use codec::AacEncoder;
 
+// Audio codecs - streaming AAC decoder (symphonia)
+#[cfg(feature = "audio-aac")]
+pub use codec::AacDecoder;
+
 // Audio codec traits and wrappers (always available when any audio codec is enabled)
 #[cfg(any(
     feature = "audio-flac",

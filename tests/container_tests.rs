@@ -625,6 +625,115 @@ mod mp4_roundtrip_tests {
         assert!(video.is_keyframe);
     }
 
+    /// The #69 → #68 chain: the demuxer's synthesized ASC initializes the
+    /// streaming AAC decoder, and demuxed access units decode to PCM with the
+    /// right stream parameters. The fixture's zero-byte payloads parse as
+    /// valid silent AAC frames, so no binary fixture is needed.
+    #[cfg(feature = "audio-aac")]
+    #[test]
+    fn test_asc_from_demuxer_initializes_streaming_aac_decoder() {
+        use parallax::elements::AacDecoder;
+        use parallax::elements::codec::{AudioDecoder, AudioSampleFormat};
+
+        let mut mux = Mp4Mux::new(Cursor::new(Vec::new()), Mp4MuxConfig::default())
+            .expect("Should create muxer");
+        let audio_track = mux
+            .add_audio_track(Mp4AudioTrackConfig::aac(48000, 1))
+            .expect("Should add audio track");
+        // A hand-built silent AAC-LC frame for mono: an SCE whose fields are
+        // all zero, then the END element (0b111) padding the fourth byte.
+        for i in 0..5u64 {
+            // 1024 samples at 48 kHz ≈ 21 ms per frame.
+            mux.write_audio_sample(audio_track, &[0x00, 0x00, 0x00, 0x07], i * 21, 21)
+                .unwrap();
+        }
+        let mp4_data = mux.finish().expect("Should finalize").into_inner();
+
+        let mut demux = Mp4Demux::new(Cursor::new(mp4_data.clone()), mp4_data.len() as u64)
+            .expect("Should create demuxer");
+        let audio_id = demux.audio_track_id().unwrap();
+        let asc = demux
+            .track(audio_id)
+            .unwrap()
+            .audio_info
+            .as_ref()
+            .unwrap()
+            .audio_specific_config
+            .clone()
+            .expect("fixture has an esds configuration");
+
+        let mut decoder = AacDecoder::from_asc(&asc).expect("ASC initializes the decoder");
+        assert_eq!(decoder.output_sample_rate(), 48000);
+        assert_eq!(decoder.output_channels(), 1);
+
+        let mut frames = 0;
+        while let Some(sample) = demux.read_sample(audio_id).unwrap() {
+            let pcm = decoder.decode(sample.buffer.as_bytes()).unwrap();
+            assert_eq!(pcm.sample_rate, 48000);
+            assert_eq!(pcm.channels, 1);
+            assert_eq!(pcm.format, AudioSampleFormat::F32);
+            assert_eq!(pcm.samples_per_channel, 1024);
+            frames += 1;
+        }
+        assert_eq!(frames, 5);
+    }
+
+    /// Same chain as a running pipeline: AppSrc(raw AAC) →
+    /// AudioDecoderElement → AppSink, with rate/channels/format landing in
+    /// each output buffer's `Metadata.format`.
+    #[cfg(feature = "audio-aac")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_aac_decoder_element_populates_metadata_format() {
+        use parallax::buffer::{Buffer, MemoryHandle};
+        use parallax::elements::codec::AudioDecoderElement;
+        use parallax::elements::{AacDecoder, AppSink, AppSrc, Pulled};
+        use parallax::format::{MediaFormat, SampleFormat};
+        use parallax::memory::SharedArena;
+        use parallax::metadata::Metadata;
+        use parallax::pipeline::{Executor, Pipeline};
+
+        // AAC-LC, 48 kHz, mono.
+        let decoder = AacDecoder::from_asc(&[0x11, 0x88]).unwrap();
+
+        let mut pipeline = Pipeline::new();
+        let appsrc = AppSrc::with_max_buffers(8);
+        let src_handle = appsrc.handle();
+        let appsink = AppSink::with_max_buffers(8);
+        let sink_handle = appsink.handle();
+        let src = pipeline.add_source("src", appsrc);
+        let dec = pipeline.add_transform("aacdec", AudioDecoderElement::new(decoder));
+        let sink = pipeline.add_sink("sink", appsink);
+        pipeline.link(src, dec).unwrap();
+        pipeline.link(dec, sink).unwrap();
+
+        let executor = Executor::new();
+        let handle = executor.start(&mut pipeline).unwrap();
+
+        // Silent mono SCE frames (see the aac_decoder unit tests).
+        let arena = SharedArena::new(64, 8).unwrap();
+        for _ in 0..3 {
+            let mut slot = arena.acquire().unwrap();
+            slot.data_mut()[..4].copy_from_slice(&[0x00, 0x00, 0x00, 0x07]);
+            let buffer = Buffer::new(MemoryHandle::with_len(slot, 4), Metadata::new());
+            src_handle.push_buffer(buffer).await.unwrap();
+        }
+        src_handle.end_stream();
+
+        let mut seen = 0;
+        while let Pulled::Buffer(out) = sink_handle.pull_buffer().await {
+            let Some(MediaFormat::AudioRaw(format)) = out.metadata().format else {
+                panic!("decoded buffer carries no AudioRaw format");
+            };
+            assert_eq!(format.sample_rate, 48000);
+            assert_eq!(format.channels, 1);
+            assert_eq!(format.sample_format, SampleFormat::F32);
+            assert_eq!(out.len(), 1024 * 4, "one silent mono f32 frame");
+            seen += 1;
+        }
+        assert_eq!(seen, 3);
+        handle.wait().await.unwrap();
+    }
+
     #[test]
     fn test_seek_all_lands_av_together() {
         let mp4_data = seekable_av_fixture();

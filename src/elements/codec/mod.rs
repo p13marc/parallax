@@ -7,7 +7,7 @@
 //!
 //! | Codec | Feature | Decoder | Encoder | Pure Rust |
 //! |-------|---------|---------|---------|-----------|
-//! | H.264 | `h264` | [`H264Decoder`] | [`H264Encoder`] | No (OpenH264) |
+//! | H.264 | `h264` | `H264Decoder` | `H264Encoder` | No (OpenH264) |
 //! | H.264 (hardware) | `v4l2-m2m` | - | `V4l2M2mH264Encoder` | Yes (kernel driver) |
 //! | AV1 | `av1-decode` | `Dav1dDecoder` | - | No (C lib) |
 //! | AV1 | `av1-encode` | - | `Rav1eEncoder` | Yes |
@@ -20,15 +20,15 @@
 //! | AAC | `aac-encode` | - | `AacEncoder` | No (FDK-AAC) |
 //! | FLAC | `audio-flac` | `SymphoniaDecoder` | - | Yes |
 //! | MP3 | `audio-mp3` | `SymphoniaDecoder` | - | Yes |
-//! | AAC | `audio-aac` | `SymphoniaDecoder` | - | Yes |
+//! | AAC | `audio-aac` | `SymphoniaDecoder`, `AacDecoder` (streaming) | - | Yes |
 //! | Vorbis | `audio-vorbis` | `SymphoniaDecoder` | - | Yes |
 //!
 //! # Image Codecs
 //!
 //! | Format | Feature | Decoder | Encoder | Pure Rust |
 //! |--------|---------|---------|---------|-----------|
-//! | JPEG | `image-jpeg` | [`JpegDecoder`] | [`JpegEncoder`] | Yes |
-//! | PNG | `image-png` | [`PngDecoder`] | [`PngEncoder`] | Yes |
+//! | JPEG | `image-jpeg` | `JpegDecoder` | `JpegEncoder` | Yes |
+//! | PNG | `image-png` | `PngDecoder` | `PngEncoder` | Yes |
 //!
 //! # Feature Flags
 //!
@@ -210,6 +210,13 @@ pub use opus::{OpusApplication, OpusDecoder, OpusEncoder};
 mod aac;
 #[cfg(feature = "aac-encode")]
 pub use aac::AacEncoder;
+
+// Streaming AAC decoder (symphonia) — decodes raw access units, unlike
+// SymphoniaDecoder's container probing.
+#[cfg(feature = "audio-aac")]
+mod aac_decoder;
+#[cfg(feature = "audio-aac")]
+pub use aac_decoder::AacDecoder;
 
 // Image codecs
 #[cfg(any(feature = "image-jpeg", feature = "image-png"))]
