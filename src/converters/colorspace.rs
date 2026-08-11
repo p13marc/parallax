@@ -2088,6 +2088,10 @@ impl VideoConvert {
     // -------------------------------------------------------------------------
 
     /// Convert YUV to RGB using the configured color matrix.
+    ///
+    /// Only the scalar conversion paths call this; with `simd-colorspace`
+    /// those paths are compiled out and the yuv crate does the math.
+    #[cfg_attr(feature = "simd-colorspace", allow(dead_code))]
     #[inline]
     fn yuv_to_rgb(&self, y: u8, u: u8, v: u8) -> (u8, u8, u8) {
         let y = y as i32;
@@ -2126,6 +2130,7 @@ impl VideoConvert {
     }
 
     /// Convert RGB to YUV using the configured color matrix.
+    #[cfg_attr(feature = "simd-colorspace", allow(dead_code))]
     #[inline]
     fn rgb_to_yuv(&self, r: u8, g: u8, b: u8) -> (u8, u8, u8) {
         let r = r as i32;

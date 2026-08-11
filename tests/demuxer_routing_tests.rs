@@ -270,6 +270,65 @@ async fn mp4_demux_source_routes_av_branches() {
     }
 }
 
+/// with_loop: the stream rewinds at EOS instead of ending, until stopped.
+#[cfg(feature = "mp4-demux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn mp4_demux_source_loops_at_eos() {
+    use parallax::elements::Mp4DemuxSource;
+    use parallax::elements::demux::Mp4Demux;
+    use parallax::elements::mux::{Mp4Mux, Mp4MuxConfig, Mp4VideoTrackConfig};
+    use std::io::Cursor;
+
+    let mut mux = Mp4Mux::new(Cursor::new(Vec::new()), Mp4MuxConfig::default()).unwrap();
+    let sps = vec![0x67, 0x42, 0x00, 0x1f];
+    let pps = vec![0x68, 0xce, 0x3c, 0x80];
+    let video = mux
+        .add_video_track(Mp4VideoTrackConfig::h264(320, 240, &sps, &pps))
+        .unwrap();
+    for i in 0..4u64 {
+        mux.write_video_sample(
+            video,
+            &[0x00, 0x00, 0x00, 0x02, 0x65, 0xAA],
+            i * 100,
+            100,
+            true,
+        )
+        .unwrap();
+    }
+    let mp4_data = mux.finish().unwrap().into_inner();
+    let demux = Mp4Demux::new(Cursor::new(mp4_data.clone()), mp4_data.len() as u64).unwrap();
+
+    let mut pipeline = Pipeline::new();
+    let sink = AppSink::with_max_buffers(4);
+    let sink_handle = sink.handle();
+    let node = pipeline.add_demuxer(
+        "mp4demux",
+        Mp4DemuxSource::video_only(demux).with_loop(true),
+    );
+    let vs = pipeline.add_sink("video_sink", sink);
+    pipeline.link_pads(node, "video", vs, "sink").unwrap();
+
+    let executor = Executor::new();
+    let handle = executor.start(&mut pipeline).unwrap();
+
+    // Far more buffers than the file holds: only looping can supply them.
+    let mut pts = Vec::new();
+    for _ in 0..10 {
+        match sink_handle.pull_buffer().await {
+            Pulled::Buffer(b) => pts.push(b.metadata().pts.nanos() / 1_000_000),
+            other => panic!("stream ended early: {other:?}"),
+        }
+    }
+    assert!(
+        pts.windows(2).filter(|w| w[1] < w[0]).count() >= 2,
+        "PTS wrapped at least twice across 10 pulls of a 4-sample file: {pts:?}"
+    );
+
+    handle.stop();
+    while let Pulled::Buffer(_) = sink_handle.pull_buffer().await {}
+    handle.wait().await.unwrap();
+}
+
 /// Runtime seek reaches a source-style demuxer: PipelineHandle::seek lands
 /// Mp4DemuxSource on the target GOP's keyframe and playback continues from
 /// there to EOS.

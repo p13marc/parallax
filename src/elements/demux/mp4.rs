@@ -995,6 +995,8 @@ pub struct Mp4DemuxSource<R: Read + Seek + Send> {
     /// Read-ahead of one sample per track, for DTS-ordered interleaving.
     pending: Vec<Option<Mp4Sample>>,
     primed: bool,
+    /// Restart from the top at EOS instead of ending (see [`with_loop`](Self::with_loop)).
+    looping: bool,
 }
 
 impl<R: Read + Seek + Send> Mp4DemuxSource<R> {
@@ -1020,7 +1022,35 @@ impl<R: Read + Seek + Send> Mp4DemuxSource<R> {
             tracks,
             pending,
             primed: false,
+            looping: false,
         }
+    }
+
+    /// Wrap an opened [`Mp4Demux`], selecting only its first video track.
+    ///
+    /// The audio pad never exists, so nothing is routed to it — for players
+    /// running without an audio branch, this beats leaving the pad unlinked
+    /// (which drops each audio sample with a rate-limited warning).
+    pub fn video_only(demux: Mp4Demux<R>) -> Self {
+        let mut this = Self::new(demux);
+        this.tracks.retain(|(_, pad)| pad.0 == 0);
+        this.outputs.retain(|(pad, _)| pad.0 == 0);
+        this.pending.truncate(this.tracks.len());
+        this
+    }
+
+    /// Loop playback: at end of stream, seek back to the start and keep
+    /// producing instead of reporting EOS.
+    ///
+    /// This is the only way to loop a windowed player in-process — winit
+    /// allows one event loop per process ever, so tearing the pipeline down
+    /// and rebuilding it cannot reopen the window. The stream then never
+    /// ends on its own; stop it with [`PipelineHandle::stop`].
+    ///
+    /// [`PipelineHandle::stop`]: crate::pipeline::PipelineHandle::stop
+    pub fn with_loop(mut self, looping: bool) -> Self {
+        self.looping = looping;
+        self
     }
 
     /// The wrapped demuxer (e.g. for `seek_all_to_time`).
@@ -1064,6 +1094,13 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for Mp4DemuxSource<R> {
             .map(|(i, _)| i);
 
         let Some(i) = next else {
+            if self.looping {
+                // Rewind and keep going — one keyframe-snapped seek to zero,
+                // then re-prime the read-ahead on the next call.
+                self.demux.seek_all_to_time(0)?;
+                self.primed = false;
+                return self.produce();
+            }
             return Ok(DemuxerProduce::Eos);
         };
         let sample = self.pending[i].take().expect("selected a pending sample");

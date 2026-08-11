@@ -24,8 +24,8 @@ Tracked on the Forgejo issue tracker under the `player-app` label:
 
 | Issue | What | Status |
 |---|---|---|
-| #77 | Scaffold: CLI, probe the file, print track info | this crate |
-| #79 | Video-only playback (M0) | pending |
+| #77 | Scaffold: CLI, probe the file, print track info | done |
+| #79 | Video-only playback (M0) | done |
 | #80 | Audio branch, ALSA clock as sync master | pending |
 | #81 | Pause (Space) and ±10 s seek (arrows) | pending |
 | #82 | Position/duration status line | pending |
