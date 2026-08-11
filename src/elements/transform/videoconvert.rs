@@ -44,8 +44,6 @@ pub struct VideoConvertElement {
     /// was built for. A converter is only valid for one of these — caching it
     /// unconditionally is what made mid-stream format changes impossible.
     converter_key: Option<(PixelFormat, PixelFormat, u32, u32)>,
-    /// Output buffer for conversion
-    output_buffer: Vec<u8>,
     /// Element name
     name: String,
     /// Arena for output buffers
@@ -64,7 +62,6 @@ impl VideoConvertElement {
             height: 0,
             converter: None,
             converter_key: None,
-            output_buffer: Vec::new(),
             name: "videoconvert".to_string(),
             // `SharedArena::new` aligns every slot to a cache line, which is
             // stronger than the 32 bytes the AVX paths need — this used to ask
@@ -185,9 +182,6 @@ impl VideoConvertElement {
 
         let converter = VideoConvert::new(input_format, self.output_format, width, height)?;
 
-        let output_size = self.output_format.buffer_size(width, height);
-        self.output_buffer.resize(output_size, 0);
-
         tracing::info!(
             "VideoConvert: {:?} {}x{} -> {:?} {}x{}{}",
             input_format,
@@ -237,20 +231,26 @@ impl Element for VideoConvertElement {
         // follow it rather than keep converting at the first frame's geometry.
         let (input_format, width, height) =
             self.resolve_input(buffer.metadata(), input_data.len())?;
+
+        // No-op conversion: forward the input untouched (the VideoScale /
+        // AudioDownmix passthrough precedent) — zero copies, zero slots.
+        if input_format == self.output_format {
+            return Ok(Some(buffer));
+        }
+
         self.ensure_converter(input_format, width, height)?;
 
         let converter = self.converter.as_ref().unwrap();
 
-        // Convert
-        converter.convert(input_data, &mut self.output_buffer)?;
-
-        // Create output buffer with AVX-aligned arena for SIMD efficiency
-        let output_size = self.output_buffer.len();
-
+        // Convert straight into the arena slot — every converter arm writes
+        // into the caller's `&mut [u8]`, so a scratch staging buffer would
+        // only add a redundant full-frame memcpy (#140). Acquiring before
+        // converting is correct for a stateless transform: on PoolExhausted
+        // the executor sheds this input either way, so failing first just
+        // skips the wasted work.
+        let output_size = self.output_format.buffer_size(width, height);
         let mut slot = self.output.acquire(output_size, "videoconvert")?;
-
-        // Copy converted data
-        slot.data_mut()[..output_size].copy_from_slice(&self.output_buffer);
+        converter.convert(input_data, &mut slot.data_mut()[..output_size])?;
 
         // Size the handle by the converted data, not by the arena slot: the
         // slot is reused across geometry changes and is only ever >= the frame.

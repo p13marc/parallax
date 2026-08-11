@@ -245,8 +245,6 @@ pub struct VideoScale {
     /// The `(format, src_w, src_h, dst_w, dst_h)` the cached engine was built
     /// for. A change in *any* of them rebuilds it.
     engine_key: Option<(converters::PixelFormat, u32, u32, u32, u32)>,
-    /// Scratch output: the engine writes into a `&mut [u8]`.
-    scratch: Vec<u8>,
     /// Geometry of the last frame — observability only, never a fallback.
     last_source: Option<(u32, u32, PixelFormat)>,
     /// Target of the last frame — observability only.
@@ -281,7 +279,6 @@ impl VideoScale {
             mode: ScaleMode::default(),
             engine: None,
             engine_key: None,
-            scratch: Vec::new(),
             last_source: None,
             last_target: None,
             frames_processed: 0,
@@ -372,9 +369,6 @@ impl VideoScale {
         let engine =
             converters::ScaleEngine::new(src_w, src_h, dst_w, dst_h, format)?.with_mode(self.mode);
 
-        self.scratch.clear();
-        self.scratch.resize(format.buffer_size(dst_w, dst_h), 0);
-
         tracing::info!(
             "VideoScale: {:?} {}x{} -> {}x{}{}",
             format,
@@ -464,11 +458,15 @@ impl Element for VideoScale {
 
         self.ensure_engine(format, src_w, src_h, dst_w, dst_h)?;
         let engine = self.engine.as_ref().expect("ensure_engine just built one");
-        engine.scale(buffer.as_bytes(), &mut self.scratch)?;
 
-        let output_size = self.scratch.len();
+        // Scale straight into the arena slot — the engine writes into any
+        // caller slice, so a scratch staging buffer only added a redundant
+        // full-frame memcpy (#140). Acquire-first is correct for a stateless
+        // transform: on PoolExhausted the executor sheds this input either
+        // way, so failing before the work is strictly better.
+        let output_size = format.buffer_size(dst_w, dst_h);
         let mut slot = self.output.acquire(output_size, "videoscale")?;
-        slot.data_mut()[..output_size].copy_from_slice(&self.scratch);
+        engine.scale(buffer.as_bytes(), &mut slot.data_mut()[..output_size])?;
 
         let mut metadata = buffer.metadata().clone();
         // The INPUT format, not a hardcoded I420: scaling preserves the format.
