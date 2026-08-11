@@ -230,6 +230,12 @@ mod vorbis_decoder;
 #[cfg(feature = "audio-vorbis")]
 pub use vorbis_decoder::VorbisDecoder;
 
+// AC-3 / E-AC-3 decoder (oxideav-ac3, pure Rust).
+#[cfg(feature = "eac3")]
+mod eac3_decoder;
+#[cfg(feature = "eac3")]
+pub use eac3_decoder::Eac3Decoder;
+
 // Image codecs
 #[cfg(any(feature = "image-jpeg", feature = "image-png"))]
 mod image;

@@ -60,6 +60,7 @@ pub mod app;
     feature = "audio-aac",
     feature = "audio-vorbis",
     feature = "opus",
+    feature = "eac3",
     feature = "aac-encode",
     feature = "image-jpeg",
     feature = "image-png"
@@ -280,6 +281,10 @@ pub use codec::AacDecoder;
 // Audio codecs - streaming Vorbis decoder (symphonia)
 #[cfg(feature = "audio-vorbis")]
 pub use codec::VorbisDecoder;
+
+// Audio codecs - AC-3 / E-AC-3 decoder (oxideav-ac3)
+#[cfg(feature = "eac3")]
+pub use codec::Eac3Decoder;
 
 // Audio codec traits and wrappers (always available when any audio codec is enabled)
 #[cfg(any(

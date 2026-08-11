@@ -220,6 +220,7 @@ Codec traits: `VideoEncoder`/`VideoDecoder` and `AudioEncoder`/`AudioDecoder` (a
 | VP8/VP9 decode | `VpxDecoder::vp8()/vp9()` (impl `Element`) | `vpx` | libvpx system library (`libvpx-devel`; bindings generated via bindgen, needs libclang at build time); I420 output, display-order 1:1 timestamps, mid-stream resolution changes |
 | FLAC/MP3/AAC/Vorbis decode | `SymphoniaDecoder` (impl `Element`) | `audio-flac`/`-mp3`/`-aac`/`-vorbis` | Symphonia, pure Rust |
 | Vorbis streaming decode | `VorbisDecoder::from_codec_private` (impl `AudioDecoder`; wrap: `AudioDecoderElement`) | `audio-vorbis` | Symphonia packet-level; takes the Xiph-laced Matroska CodecPrivate directly |
+| AC-3 / E-AC-3 decode | `Eac3Decoder::stereo(rate)` / `::passthrough(rate, ch)` (impl `AudioDecoder`; wrap: `AudioDecoderElement`) | `eac3` | oxideav-ac3, pure Rust; self-describing bitstream, no extradata; `stereo` runs the spec LoRo fold-down in-decoder; S16 out |
 | Opus | `OpusEncoder::new(rate, ch, bitrate, OpusApplication)`, `OpusDecoder` (impl audio traits) | `opus` | libopus; 48 kHz frame sizes 120–2880 samples |
 | AAC encode | `AacEncoder` (impl `AudioEncoder`) | `aac-encode` | FDK-AAC — **license restrictions for commercial use** |
 | JPEG | `JpegEncoder` / `JpegDecoder` | `image-jpeg` | zune-jpeg + jpeg-encoder, pure Rust |

@@ -620,6 +620,8 @@ pub enum AudioCodec {
     Pcma,
     /// Vorbis.
     Vorbis,
+    /// E-AC-3 (Dolby Digital Plus); covers plain AC-3 as well.
+    Eac3,
 }
 
 // ============================================================================

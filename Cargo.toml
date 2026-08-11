@@ -133,6 +133,11 @@ env-libvpx-sys = { version = "5", optional = true, features = ["generate"] }
 # Opus audio codec (bindings to libopus)
 opus = { version = "0.3", optional = true }
 
+# AC-3 / E-AC-3 audio decoder (pure Rust; young crate — pin exact).
+# oxideav-core supplies the Packet/Decoder types its API speaks.
+oxideav-ac3 = { version = "=0.0.10", optional = true }
+oxideav-core = { version = "0.1", optional = true }
+
 # AAC audio encoder (bindings to FDK-AAC - note license restrictions)
 fdk-aac = { version = "0.6", optional = true }
 
@@ -195,6 +200,7 @@ audio-mp3 = ["dep:symphonia", "symphonia/mp3"]
 audio-aac = ["dep:symphonia", "symphonia/aac"]
 audio-vorbis = ["dep:symphonia", "symphonia/vorbis"]
 opus = ["dep:opus"]  # Opus audio encoder/decoder (requires libopus)
+eac3 = ["dep:oxideav-ac3", "dep:oxideav-core"]  # AC-3 / E-AC-3 audio decoder (pure Rust)
 aac-encode = ["dep:fdk-aac"]  # AAC audio encoder (note: FDK-AAC license restrictions)
 # Image codecs (all pure Rust)
 image-codecs = ["image-jpeg", "image-png"]
