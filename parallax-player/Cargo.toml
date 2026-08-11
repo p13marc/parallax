@@ -11,6 +11,9 @@ license = "MIT OR Apache-2.0"
 parallax = { package = "parallax-pipeline", path = "..", features = [
     "mp4-demux",
     "mkv-demux",
+    "vpx",
+    "av1-decode",
+    "opus",
     "h264",
     "display",
     "simd-colorspace",

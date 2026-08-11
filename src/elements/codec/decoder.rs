@@ -106,8 +106,8 @@ impl Dav1dDecoder {
 
     /// Convert dav1d Picture to our VideoFrame.
     fn picture_to_frame(&self, picture: &dav1d::Picture) -> Result<VideoFrame> {
-        let width = picture.width() as u32;
-        let height = picture.height() as u32;
+        let width = picture.width();
+        let height = picture.height();
         let bit_depth = picture.bit_depth();
 
         let format = match (picture.pixel_layout(), bit_depth) {

@@ -15,7 +15,10 @@ use parallax::elements::demux::{
 };
 use parallax::elements::device::{AlsaFormat, AlsaSampleFormat, AlsaSink};
 use parallax::elements::transform::VideoConvertElement;
-use parallax::elements::{AacDecoder, AutoVideoSink, H264Decoder, VideoKey, VideoWindowEvent};
+use parallax::elements::{
+    AacDecoder, AutoVideoSink, Dav1dDecoder, H264Decoder, OpusDecoder, VideoKey, VideoWindowEvent,
+    VpxDecoder,
+};
 use parallax::pipeline::typefind::{MediaType, TypeFindRegistry};
 use parallax::pipeline::{EndReason, Executor, LinkPolicy, Pipeline};
 use std::fs::File;
@@ -356,16 +359,8 @@ fn open_and_probe(args: &Args) -> anyhow::Result<Probed> {
     let Some(video) = &summary.video else {
         bail!("no video track — nothing to play");
     };
-    if video.codec != VideoCodecKind::H264 {
-        let hint = match video.codec {
-            VideoCodecKind::Vp8 | VideoCodecKind::Vp9 => " (VP8/VP9 decode is not wired up yet)",
-            VideoCodecKind::Av1 => " (AV1 decode is not wired up yet)",
-            _ => "",
-        };
-        bail!(
-            "video track is {} — only H.264 is supported for now{hint}",
-            video.codec
-        );
+    if let VideoCodecKind::Other(codec) = &video.codec {
+        bail!("video track is {codec} — no decoder for it yet");
     }
 
     Ok(Probed { source, summary })
@@ -461,12 +456,22 @@ impl Drop for RawMode {
     }
 }
 
+/// The audio decoder chosen for the stream — variants per codec, so each
+/// concrete `AudioDecoderElement<D>` can be added to the pipeline.
+enum AudioDec {
+    Aac(AudioDecoderElement<AacDecoder>),
+    Opus(AudioDecoderElement<OpusDecoder>),
+}
+
 /// Build the audio branch's fallible pieces, explaining a fallback to
 /// video-only instead of failing playback.
-fn audio_branch(
-    args: &Args,
-    audio: Option<&AudioStream>,
-) -> Option<(AudioDecoderElement<AacDecoder>, AlsaSink)> {
+///
+/// The decoder's output format decides the ALSA configuration: AAC emits
+/// interleaved f32, Opus interleaved s16 — hand ALSA exactly that so no
+/// conversion sits in between. The sink also provides the pipeline clock
+/// (priority 150), so once this branch exists the video paces off the
+/// audio hardware.
+fn audio_branch(args: &Args, audio: Option<&AudioStream>) -> Option<(AudioDec, AlsaSink)> {
     if args.no_audio {
         return None;
     }
@@ -474,36 +479,56 @@ fn audio_branch(
         println!("no audio track — video only");
         return None;
     };
-    if stream.codec != AudioCodecKind::Aac {
-        println!(
-            "audio track is {} — decode not wired up yet, video only",
-            stream.codec
-        );
-        return None;
-    }
-    let Some(asc) = &stream.extradata else {
-        println!("AAC track has no usable decoder config — video only");
-        return None;
-    };
-    let decoder = match AacDecoder::from_asc(asc) {
-        Ok(d) => d,
-        Err(e) => {
-            println!("audio decoder unavailable ({e}) — video only");
+
+    let (decoder, alsa_sample_format) = match &stream.codec {
+        AudioCodecKind::Aac => {
+            let Some(asc) = &stream.extradata else {
+                println!("AAC track has no usable decoder config — video only");
+                return None;
+            };
+            match AacDecoder::from_asc(asc) {
+                Ok(d) => (
+                    AudioDec::Aac(AudioDecoderElement::new(d)),
+                    AlsaSampleFormat::F32LE,
+                ),
+                Err(e) => {
+                    println!("audio decoder unavailable ({e}) — video only");
+                    return None;
+                }
+            }
+        }
+        AudioCodecKind::Opus => {
+            // Opus always decodes at 48 kHz; the track's declared rate is
+            // the original input rate, not the decode rate.
+            match OpusDecoder::new(48_000, stream.channels) {
+                Ok(d) => (
+                    AudioDec::Opus(AudioDecoderElement::new(d)),
+                    AlsaSampleFormat::S16LE,
+                ),
+                Err(e) => {
+                    println!("audio decoder unavailable ({e}) — video only");
+                    return None;
+                }
+            }
+        }
+        other => {
+            println!("audio track is {other} — decode not wired up yet, video only");
             return None;
         }
     };
-    // The decoder emits interleaved f32 at the stream's rate; hand ALSA
-    // exactly that so no conversion sits in between. The sink also provides
-    // the pipeline clock (priority 150), so once this branch exists the
-    // video paces off the audio hardware — that is M2's A/V sync.
+
+    let sample_rate = match decoder {
+        AudioDec::Aac(_) => stream.sample_rate,
+        AudioDec::Opus(_) => 48_000,
+    };
     let format = AlsaFormat {
-        sample_rate: stream.sample_rate,
+        sample_rate,
         channels: stream.channels,
-        format: AlsaSampleFormat::F32LE,
+        format: alsa_sample_format,
         ..AlsaFormat::default()
     };
     match AlsaSink::new("default", format) {
-        Ok(sink) => Some((AudioDecoderElement::new(decoder), sink)),
+        Ok(sink) => Some((decoder, sink)),
         Err(e) => {
             println!("audio device unavailable ({e}) — video only");
             None
@@ -567,7 +592,20 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
             pipeline.add_demuxer("demux", s)
         }
     };
-    let dec = pipeline.add_filter("decode", H264Decoder::new()?);
+    // The video decoder follows the probed codec; every decoder emits I420
+    // with in-band geometry, so the convert → display tail is codec-agnostic.
+    let video_codec = summary
+        .video
+        .as_ref()
+        .map(|v| v.codec.clone())
+        .expect("probe guarantees a video track");
+    let dec = match video_codec {
+        VideoCodecKind::H264 => pipeline.add_filter("decode", H264Decoder::new()?),
+        VideoCodecKind::Vp8 => pipeline.add_filter("decode", VpxDecoder::vp8()?),
+        VideoCodecKind::Vp9 => pipeline.add_filter("decode", VpxDecoder::vp9()?),
+        VideoCodecKind::Av1 => pipeline.add_filter("decode", Dav1dDecoder::new()?),
+        VideoCodecKind::Other(codec) => bail!("video track is {codec} — no decoder for it yet"),
+    };
     let cvt = pipeline.add_filter("convert", convert);
     let snk = pipeline.add_sink("display", sink);
     // Deep branch links decouple the two consumers: the demuxer emits in DTS
@@ -581,9 +619,12 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
     pipeline.link(cvt, snk)?;
 
     if let Some((audio_decoder, alsa_sink)) = audio {
-        let adec = pipeline.add_transform("aacdec", audio_decoder);
+        let adec = match audio_decoder {
+            AudioDec::Aac(d) => pipeline.add_transform("audiodec", d),
+            AudioDec::Opus(d) => pipeline.add_transform("audiodec", d),
+        };
         let aout = pipeline.add_async_sink("speaker", alsa_sink);
-        // ~2 s of AAC read-ahead at 21 ms per packet.
+        // ~2 s of audio read-ahead at ~20 ms per packet.
         pipeline.link_pads_full(src, "audio", adec, "sink", LinkPolicy::Block, Some(96))?;
         pipeline.link(adec, aout)?;
     }

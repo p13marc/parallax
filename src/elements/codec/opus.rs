@@ -267,7 +267,7 @@ impl AudioEncoder for OpusEncoder {
         let frame_samples = self.frame_size * self.channels as usize;
         let padding_needed = frame_samples - self.buffer.len();
         self.buffer
-            .extend(std::iter::repeat(0i16).take(padding_needed));
+            .extend(std::iter::repeat_n(0i16, padding_needed));
 
         let frame: Vec<i16> = self.buffer.drain(..).collect();
         Ok(vec![self.encode_frame(&frame)?])
