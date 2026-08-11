@@ -14,9 +14,10 @@ use parallax::elements::demux::{Mp4Codec, Mp4Demux, Mp4DemuxSource, Mp4TrackType
 use parallax::elements::device::{AlsaFormat, AlsaSampleFormat, AlsaSink};
 use parallax::elements::transform::VideoConvertElement;
 use parallax::elements::{AacDecoder, AutoVideoSink, H264Decoder, VideoKey, VideoWindowEvent};
+use parallax::pipeline::typefind::{MediaType, TypeFindRegistry};
 use parallax::pipeline::{EndReason, Executor, LinkPolicy, Pipeline};
 use std::fs::File;
-use std::io::{BufReader, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -79,9 +80,30 @@ struct Probed {
 
 /// Open the file and describe it; error out early on things we cannot play.
 fn open_and_probe(args: &Args) -> anyhow::Result<Probed> {
-    let file =
+    let mut file =
         File::open(&args.file).with_context(|| format!("cannot open {}", args.file.display()))?;
     let size = file.metadata()?.len();
+
+    // Name what the file actually is before the demuxer's parse error can:
+    // "Matroska detected" beats "not a readable MP4".
+    let mut head = [0u8; 8192];
+    let n = file.read(&mut head)?;
+    match TypeFindRegistry::with_builtins().detect(&head[..n]) {
+        Some(found) if found.media_type != MediaType::Mp4 => {
+            bail!(
+                "{}: {:?} detected — only MP4 is supported for now",
+                args.file.display(),
+                found.media_type
+            );
+        }
+        Some(_) => {}
+        None => bail!(
+            "{}: not a media file this player recognizes",
+            args.file.display()
+        ),
+    }
+    file.seek(SeekFrom::Start(0))?;
+
     let demux = Mp4Demux::new(BufReader::new(file), size)
         .with_context(|| format!("{} is not a readable MP4", args.file.display()))?;
 
@@ -130,8 +152,13 @@ fn open_and_probe(args: &Args) -> anyhow::Result<Probed> {
     };
     let codec = demux.track(video_id).map(|t| t.codec);
     if codec != Some(Mp4Codec::H264) {
+        let hint = match codec {
+            Some(Mp4Codec::H265) => " (H.265 decode is not wired up yet)",
+            Some(Mp4Codec::Vp9) => " (VP9 decode is not wired up yet)",
+            _ => "",
+        };
         bail!(
-            "video track is {} — only H.264 is supported for now",
+            "video track is {} — only H.264 is supported for now{hint}",
             codec.map(|c| c.to_string()).unwrap_or_default()
         );
     }

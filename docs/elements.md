@@ -303,6 +303,7 @@ Every controllable element implements `Controllable`, so the accessor is always 
 | `GainControl` | `Gain::control()` | `set_factor(f)` / `set_db(db)`, `factor()` / `db()` |
 | `FlowStateHandle` | `Queue::control()` | backpressure signalling to live sources |
 | `AppSinkHandle` / `AppSrcHandle` | `AppSink::handle()` / `AppSrc::handle()` | async-first `pull_buffer`/`push_buffer` (+`_timeout`; `*_blocking` twins for plain threads), `try_pull_buffer`/`try_push_buffer`, `stats()` |
+| `AutoVideoSinkHandle` | `AutoVideoSink::handle()` `[display]` | window events (`try_event`/`event_timeout` → `VideoWindowEvent`: keys as `VideoKey`, mouse, close, resize; bounded and sender-side lossy), `set_fullscreen(bool)`, `is_open()`. No handle taken ⇒ no events |
 
 ```rust,ignore
 use parallax::control::Controllable;
