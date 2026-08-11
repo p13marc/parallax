@@ -299,6 +299,20 @@ impl Drop for AutoVideoSink {
 }
 
 impl Sink for AutoVideoSink {
+    fn handle_downstream_event(
+        &mut self,
+        event: crate::event::Event,
+    ) -> Option<crate::event::Event> {
+        // A flushing seek moved the stream: drop the PTS anchor so the first
+        // post-seek frame re-anchors at its own arrival time. Without this a
+        // forward seek would schedule every new frame `seek distance` in the
+        // future (capped by MAX_WAIT, but still a stall).
+        if matches!(event, crate::event::Event::FlushStop(_)) {
+            self.pacer.anchor = None;
+        }
+        Some(event)
+    }
+
     fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
         let data = ctx.input();
 
@@ -324,16 +338,29 @@ impl Sink for AutoVideoSink {
             && let Some(pts) = meta.pts.to_option()
             && let Some(now) = ctx.running_time().to_option()
         {
-            match self.pacer.schedule(pts, now, self.max_lateness) {
-                Pace::Present => {}
-                // Blocking here is the point: it is what back-pressures the
-                // decoder and the source down to real time. Other sync sinks
-                // block on their I/O for the same reason.
-                Pace::Wait(delay) => thread::sleep(delay),
-                Pace::DropLate => {
-                    self.drop_frame("late");
-                    return Ok(());
+            let mut pace = self.pacer.schedule(pts, now, self.max_lateness);
+            // Blocking here is the point: it is what back-pressures the
+            // decoder and the source down to real time. Other sync sinks
+            // block on their I/O for the same reason.
+            //
+            // The wait polls the clock in short slices instead of sleeping the
+            // full delay: against a clock frozen by `PipelineHandle::pause`
+            // a one-shot sleep would keep presenting at wall-clock rate,
+            // while re-reading running time stalls right here — and resumes
+            // gap-free, because the clock does. `MAX_WAIT` still applies to
+            // each *computed* deficit (the PTS-jump escape hatch), not to the
+            // frozen-clock stall, where the deficit never shrinks but stays
+            // under the cap.
+            while let Pace::Wait(delay) = pace {
+                thread::sleep(delay.min(Duration::from_millis(10)));
+                match ctx.running_time().to_option() {
+                    Some(now) => pace = self.pacer.schedule(pts, now, self.max_lateness),
+                    None => break,
                 }
+            }
+            if pace == Pace::DropLate {
+                self.drop_frame("late");
+                return Ok(());
             }
         }
 
@@ -780,6 +807,29 @@ mod tests {
         assert_eq!(
             pacer.schedule(ns(FRAME_25FPS), ns(500_000_000), DEFAULT_MAX_LATENESS),
             Pace::Wait(Duration::from_nanos(FRAME_25FPS))
+        );
+    }
+
+    #[test]
+    fn a_frozen_clock_keeps_the_pacer_waiting() {
+        // PipelineHandle::pause freezes running time. Re-scheduling against
+        // the same `now` must keep answering Wait with a constant deficit —
+        // never Present — which is what makes the consume() poll loop stall
+        // for as long as the pause lasts.
+        let mut pacer = PtsPacer::default();
+        pacer.schedule(ns(0), ns(0), DEFAULT_MAX_LATENESS);
+
+        let frozen_now = ns(0);
+        for _ in 0..100 {
+            assert_eq!(
+                pacer.schedule(ns(FRAME_25FPS), frozen_now, DEFAULT_MAX_LATENESS),
+                Pace::Wait(Duration::from_nanos(FRAME_25FPS))
+            );
+        }
+        // Resume: time advances past the target and the frame presents.
+        assert_eq!(
+            pacer.schedule(ns(FRAME_25FPS), ns(FRAME_25FPS), DEFAULT_MAX_LATENESS),
+            Pace::Present
         );
     }
 }

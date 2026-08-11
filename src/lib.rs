@@ -76,7 +76,7 @@ pub mod typed;
 pub mod prelude {
     pub use crate::buffer::Buffer;
     pub use crate::clock::{
-        Clock, ClockFlags, ClockProvider, ClockTime, PipelineClock, SystemClock,
+        Clock, ClockFlags, ClockProvider, ClockTime, PausableClock, PipelineClock, SystemClock,
     };
     // Runtime control. `Controllable` is what makes `element.control()` resolve,
     // so it belongs in the prelude of a crate whose headline feature is changing

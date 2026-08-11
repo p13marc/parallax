@@ -271,6 +271,17 @@ handle.seek_time(ClockTime::from_secs(30)).await;     // or seek_bytes / seek(Se
 
 A source that cannot seek posts a bus `Warning` and keeps producing. Sources scheduled on RT threads have no control channel — runtime seek covers the async path only.
 
+The handle also pauses and resumes a running pipeline, and reports the stream position:
+
+```rust
+handle.pause();                    // freezes the pipeline clock + gates sources
+assert!(handle.is_paused());
+let pos = handle.position();       // last-presented PTS (monotonic across pause/resume)
+handle.resume();                   // gap-free: running time continues where it froze
+```
+
+Pause freezes the shared clock, so clock-paced sinks (e.g. `AutoVideoSink` with `sync`) stall mid-wait and resume without a burst of late frames; sources stop producing until resumed. Both post `MessageKind::StateChanged` (`Running ↔ Idle`). `position()` re-anchors on a runtime seek and falls back to running time before the first frame is presented.
+
 Under the hood, a `SeekEvent` travels upstream to the source's `handle_upstream_event` (e.g. `FileSrc`). After a seek, a `SegmentEvent` establishes the timestamp mapping:
 
 ```rust

@@ -491,6 +491,92 @@ impl Clock for SystemClock {
 // PipelineClock
 // ============================================================================
 
+/// A clock wrapper that can freeze and resume without a gap.
+///
+/// Wraps the pipeline's selected clock so `PipelineHandle::pause()` can stop
+/// time for **every** element at once. The wrapper is what makes runtime
+/// pause possible at all: `Executor::start` hands each element the raw
+/// `Arc<dyn Clock>` plus a *copied* base time, so rebasing `PipelineClock`
+/// after start is invisible to them — the freeze has to live inside the
+/// shared clock itself.
+///
+/// While paused, [`now`](Clock::now) returns the instant of the pause; on
+/// resume the paused span is folded into an offset, so observers see time
+/// continue exactly where it stopped — monotonic, gap-free. Sinks pacing
+/// presentation against running time therefore stall naturally while paused
+/// and pick up without a burst of late frames.
+pub struct PausableClock {
+    inner: Arc<dyn Clock>,
+    /// Inner-clock time at which the freeze began; `u64::MAX` while running.
+    paused_at: AtomicU64,
+    /// Total time spent paused so far, subtracted from the inner clock.
+    offset: AtomicU64,
+}
+
+impl PausableClock {
+    /// Wrap a clock. Starts running (not paused).
+    pub fn new(inner: Arc<dyn Clock>) -> Self {
+        Self {
+            inner,
+            paused_at: AtomicU64::new(u64::MAX),
+            offset: AtomicU64::new(0),
+        }
+    }
+
+    /// Freeze the clock at the current instant. Idempotent.
+    pub fn pause(&self) {
+        let now = self.inner.now().0;
+        // CAS from "running": a second pause() keeps the first freeze point.
+        let _ = self
+            .paused_at
+            .compare_exchange(u64::MAX, now, Ordering::AcqRel, Ordering::Acquire);
+    }
+
+    /// Resume a frozen clock, folding the paused span into the offset so
+    /// observed time continues gap-free. Idempotent.
+    pub fn resume(&self) {
+        let paused_at = self.paused_at.load(Ordering::Acquire);
+        if paused_at == u64::MAX {
+            return;
+        }
+        let paused_for = self.inner.now().0.saturating_sub(paused_at);
+        // Grow the offset *before* releasing the freeze: a reader between the
+        // two sees the frozen time with the new offset, which equals the
+        // resume instant — never a backwards jump.
+        self.offset.fetch_add(paused_for, Ordering::AcqRel);
+        self.paused_at.store(u64::MAX, Ordering::Release);
+    }
+
+    /// Whether the clock is currently frozen.
+    pub fn is_paused(&self) -> bool {
+        self.paused_at.load(Ordering::Acquire) != u64::MAX
+    }
+}
+
+impl Clock for PausableClock {
+    fn now(&self) -> ClockTime {
+        let paused_at = self.paused_at.load(Ordering::Acquire);
+        let raw = if paused_at == u64::MAX {
+            self.inner.now()
+        } else {
+            ClockTime(paused_at)
+        };
+        raw.saturating_sub(ClockTime(self.offset.load(Ordering::Acquire)))
+    }
+
+    fn flags(&self) -> ClockFlags {
+        self.inner.flags()
+    }
+
+    fn resolution(&self) -> u64 {
+        self.inner.resolution()
+    }
+
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+}
+
 /// Pipeline timing context.
 ///
 /// Manages pipeline time with a base time (when the pipeline started).
@@ -789,5 +875,79 @@ mod tests {
 
         let back = clock.to_running_time(clock_time);
         assert_eq!(back, running);
+    }
+
+    /// A clock the test can move by hand.
+    struct ManualClock(AtomicU64);
+
+    impl Clock for ManualClock {
+        fn now(&self) -> ClockTime {
+            ClockTime(self.0.load(Ordering::Acquire))
+        }
+    }
+
+    fn manual(start: u64) -> (Arc<ManualClock>, PausableClock) {
+        let inner = Arc::new(ManualClock(AtomicU64::new(start)));
+        let pausable = PausableClock::new(inner.clone());
+        (inner, pausable)
+    }
+
+    #[test]
+    fn pausable_clock_follows_inner_while_running() {
+        let (inner, clock) = manual(1_000);
+        assert_eq!(clock.now(), ClockTime(1_000));
+        inner.0.store(5_000, Ordering::Release);
+        assert_eq!(clock.now(), ClockTime(5_000));
+        assert!(!clock.is_paused());
+    }
+
+    #[test]
+    fn pausable_clock_freezes_and_resumes_gap_free() {
+        let (inner, clock) = manual(1_000);
+
+        clock.pause();
+        assert!(clock.is_paused());
+        inner.0.store(9_000, Ordering::Release);
+        assert_eq!(clock.now(), ClockTime(1_000), "frozen at the pause instant");
+
+        clock.resume();
+        assert!(!clock.is_paused());
+        // 8_000 ticks passed while paused; observed time continues from 1_000.
+        assert_eq!(clock.now(), ClockTime(1_000));
+        inner.0.store(12_000, Ordering::Release);
+        assert_eq!(clock.now(), ClockTime(4_000));
+    }
+
+    #[test]
+    fn pausable_clock_pause_and_resume_are_idempotent() {
+        let (inner, clock) = manual(1_000);
+
+        clock.pause();
+        inner.0.store(2_000, Ordering::Release);
+        clock.pause(); // must keep the first freeze point
+        assert_eq!(clock.now(), ClockTime(1_000));
+
+        clock.resume();
+        clock.resume(); // second resume must not grow the offset again
+        assert_eq!(clock.now(), ClockTime(1_000));
+        inner.0.store(3_000, Ordering::Release);
+        assert_eq!(clock.now(), ClockTime(2_000));
+    }
+
+    #[test]
+    fn pausable_clock_accumulates_pauses_monotonically() {
+        let (inner, clock) = manual(0);
+        let mut last = ClockTime::ZERO;
+        for round in 1..=3u64 {
+            inner.0.store(round * 1_000, Ordering::Release);
+            clock.pause();
+            inner.0.store(round * 1_000 + 500, Ordering::Release);
+            clock.resume();
+            let now = clock.now();
+            assert!(now >= last, "went backwards: {now} < {last}");
+            last = now;
+        }
+        // 3 pauses x 500 ticks paused; 3_500 raw - 1_500 offset.
+        assert_eq!(clock.now(), ClockTime(2_000));
     }
 }

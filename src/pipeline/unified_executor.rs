@@ -55,7 +55,7 @@ use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
 use tokio::sync::watch;
@@ -520,6 +520,15 @@ struct SourceControl {
     tx: AsyncSender<Event>,
 }
 
+/// Runtime-control state assembled while tasks spawn, then moved onto the
+/// [`PipelineHandle`]: the source control channels, the pause gate the source
+/// loops watch, and the last-presented-PTS cell the sink loops write.
+struct RuntimeControls {
+    controls: Vec<SourceControl>,
+    pause_rx: watch::Receiver<bool>,
+    position: Arc<AtomicU64>,
+}
+
 /// Handle to a running pipeline.
 pub struct PipelineHandle {
     /// Tokio task handles.
@@ -554,6 +563,16 @@ pub struct PipelineHandle {
     /// Control-channel senders into the running source tasks (see
     /// [`send_event_upstream`](Self::send_event_upstream)).
     controls: Vec<SourceControl>,
+    /// Pause gate watched by the source loops (see [`pause`](Self::pause)).
+    pause_tx: watch::Sender<bool>,
+    /// The shared clock wrapper, when the pipeline has a started clock.
+    pausable: Option<Arc<crate::clock::PausableClock>>,
+    /// Base time distributed to the elements, for the running-time fallback in
+    /// [`position`](Self::position). `NONE` when the pipeline has no clock.
+    base_time: ClockTime,
+    /// Last-presented PTS in nanoseconds, written by the sink tasks;
+    /// `u64::MAX` until a sink has presented (or after a flush reset it).
+    position: Arc<AtomicU64>,
 }
 
 impl PipelineHandle {
@@ -798,6 +817,79 @@ impl PipelineHandle {
         self.seek(SeekEvent::new_bytes(position)).await
     }
 
+    /// Pause the running pipeline. Idempotent.
+    ///
+    /// Freezes the shared [`PausableClock`](crate::clock::PausableClock) —
+    /// sinks pacing presentation against running time stall on the spot — and
+    /// gates every source's produce loop, so unclocked pipelines pause too.
+    /// In-flight buffers drain into the sinks' pacing waits rather than being
+    /// dropped. Posts `StateChanged{Running → Idle}` on the bus.
+    ///
+    /// Limits: an `AlsaSink` plays out what its device buffer already holds
+    /// (a crisp `snd_pcm_pause` control is a follow-up), and a source blocked
+    /// *inside* `process_source` observes the gate only when that call
+    /// returns — the same caveat as [`stop`](Self::stop).
+    pub fn pause(&self) {
+        if *self.pause_tx.borrow() {
+            return;
+        }
+        // Clock first, then the gate: from the freeze on, nothing is presented,
+        // so the few buffers a not-yet-gated source still produces just queue.
+        if let Some(clock) = &self.pausable {
+            clock.pause();
+        }
+        self.pause_tx.send_replace(true);
+        self.events
+            .send_state_changed(PipelineState::Running, PipelineState::Idle);
+        if let Some(bus) = &self.bus_handle {
+            bus.post_state_changed(PipelineState::Running, PipelineState::Idle);
+        }
+    }
+
+    /// Resume a paused pipeline. Idempotent.
+    ///
+    /// Un-gates the sources and resumes the clock gap-free: running time
+    /// continues from where it froze, so sinks pick up on the very next frame
+    /// with no burst of late frames. Posts `StateChanged{Idle → Running}`.
+    pub fn resume(&self) {
+        if !*self.pause_tx.borrow() {
+            return;
+        }
+        self.pause_tx.send_replace(false);
+        if let Some(clock) = &self.pausable {
+            clock.resume();
+        }
+        self.events
+            .send_state_changed(PipelineState::Idle, PipelineState::Running);
+        if let Some(bus) = &self.bus_handle {
+            bus.post_state_changed(PipelineState::Idle, PipelineState::Running);
+        }
+    }
+
+    /// Whether the pipeline is currently paused by [`pause`](Self::pause).
+    pub fn is_paused(&self) -> bool {
+        *self.pause_tx.borrow()
+    }
+
+    /// Current stream position.
+    ///
+    /// The PTS of the last buffer any sink presented — monotonic between
+    /// flushes, frozen while paused (nothing is presented), and re-anchored by
+    /// the `Segment` of a runtime seek. Before the first presentation it falls
+    /// back to running time (which matches the stream position only for
+    /// streams that start at zero), and is `ClockTime::NONE` for a clock-less
+    /// pipeline that has not presented anything.
+    pub fn position(&self) -> ClockTime {
+        let pts = self.position.load(Ordering::Acquire);
+        if pts != u64::MAX {
+            return ClockTime::from_nanos(pts);
+        }
+        match &self.pausable {
+            Some(clock) if self.base_time.is_some() => clock.now().saturating_sub(self.base_time),
+            _ => ClockTime::NONE,
+        }
+    }
+
     /// Subscribe to pipeline events.
     pub fn subscribe(&self) -> EventReceiver {
         self.events.subscribe()
@@ -949,18 +1041,39 @@ impl Executor {
             effective_scheduling
         );
 
-        // Auto-select the best clock from pipeline elements, then start it
+        // Auto-select the best clock from pipeline elements, then start it.
+        //
+        // The selected clock is wrapped in a `PausableClock` *before* it is
+        // distributed: elements receive the raw `Arc<dyn Clock>` plus a copied
+        // base time, so this shared wrapper is the only lever that still
+        // reaches them after start — it is what makes `PipelineHandle::pause`
+        // freeze presentation everywhere at once.
         pipeline.select_clock();
         pipeline.start_clock();
         let pipeline_clock = pipeline.clock();
-        let clock_info: Option<(Arc<dyn Clock>, ClockTime)> = if pipeline_clock.is_started() {
-            Some((pipeline_clock.clock(), pipeline_clock.base_time()))
+        let (clock_info, pausable): (
+            Option<(Arc<dyn Clock>, ClockTime)>,
+            Option<Arc<crate::clock::PausableClock>>,
+        ) = if pipeline_clock.is_started() {
+            let wrapped = Arc::new(crate::clock::PausableClock::new(pipeline_clock.clock()));
+            (
+                Some((
+                    wrapped.clone() as Arc<dyn Clock>,
+                    pipeline_clock.base_time(),
+                )),
+                Some(wrapped),
+            )
         } else {
-            None
+            (None, None)
         };
 
-        // Control-channel senders for the source tasks, collected as they spawn.
-        let mut controls = Vec::new();
+        // Runtime-control state, filled in as the tasks spawn.
+        let (pause_tx, pause_rx) = watch::channel(false);
+        let mut runtime = RuntimeControls {
+            controls: Vec::new(),
+            pause_rx,
+            position: Arc::new(AtomicU64::new(u64::MAX)),
+        };
 
         // Execute based on scheduling mode
         let (tasks, rt_handles, bridges, rt_driver_task) = match effective_scheduling {
@@ -971,7 +1084,7 @@ impl Executor {
                     &events,
                     &stop,
                     &outcome,
-                    &mut controls,
+                    &mut runtime,
                 )?;
                 (tasks, Vec::new(), Vec::new(), None)
             }
@@ -1010,7 +1123,7 @@ impl Executor {
                         &events,
                         &stop,
                         &outcome,
-                        &mut controls,
+                        &mut runtime,
                     )?;
                     (tasks, Vec::new(), Vec::new(), None)
                 } else {
@@ -1022,7 +1135,7 @@ impl Executor {
                         &events,
                         &stop,
                         &outcome,
-                        &mut controls,
+                        &mut runtime,
                     )?
                 }
             }
@@ -1078,7 +1191,11 @@ impl Executor {
             stop,
             outcome,
             seed,
-            controls,
+            controls: runtime.controls,
+            pause_tx,
+            pausable,
+            base_time: clock_info.map(|(_, b)| b).unwrap_or(ClockTime::NONE),
+            position: runtime.position,
         })
     }
 
@@ -1091,7 +1208,7 @@ impl Executor {
         events: &EventSender,
         stop: &Arc<AtomicBool>,
         outcome: &Arc<TerminalOutcome>,
-        controls: &mut Vec<SourceControl>,
+        runtime: &mut RuntimeControls,
     ) -> Result<Vec<JoinHandle<Result<()>>>> {
         let mut channels = ChannelNetwork::new();
 
@@ -1102,7 +1219,7 @@ impl Executor {
 
         // Spawn tasks
         self.spawn_tasks(
-            pipeline, channels, clock_info, events, stop, outcome, controls,
+            pipeline, channels, clock_info, events, stop, outcome, runtime,
         )
     }
 
@@ -1117,7 +1234,7 @@ impl Executor {
         events: &EventSender,
         stop: &Arc<AtomicBool>,
         outcome: &Arc<TerminalOutcome>,
-        controls: &mut Vec<SourceControl>,
+        runtime: &mut RuntimeControls,
     ) -> Result<(
         Vec<JoinHandle<Result<()>>>,
         Vec<crate::pipeline::rt_scheduler::DataThreadHandle>,
@@ -1157,7 +1274,7 @@ impl Executor {
 
         // Spawn async tasks for the async portion of the graph
         let tasks = self.spawn_tasks_for_partition(
-            pipeline, partition, channels, scheduler, clock_info, events, stop, outcome, controls,
+            pipeline, partition, channels, scheduler, clock_info, events, stop, outcome, runtime,
         )?;
 
         // Collect bridges (keep alive)
@@ -1393,7 +1510,7 @@ impl Executor {
         events: &EventSender,
         stop: &Arc<AtomicBool>,
         outcome: &Arc<TerminalOutcome>,
-        controls: &mut Vec<SourceControl>,
+        runtime: &mut RuntimeControls,
     ) -> Result<Vec<JoinHandle<Result<()>>>> {
         let mut tasks = Vec::new();
 
@@ -1415,7 +1532,7 @@ impl Executor {
                 events,
                 stop,
                 outcome,
-                controls,
+                runtime,
             )?;
             tasks.push(task);
         }
@@ -1435,7 +1552,7 @@ impl Executor {
         events: &EventSender,
         stop: &Arc<AtomicBool>,
         outcome: &Arc<TerminalOutcome>,
-        controls: &mut Vec<SourceControl>,
+        runtime: &mut RuntimeControls,
     ) -> Result<Vec<JoinHandle<Result<()>>>> {
         let mut tasks = Vec::new();
 
@@ -1464,7 +1581,7 @@ impl Executor {
                 events,
                 stop,
                 outcome,
-                controls,
+                runtime,
             )?;
             tasks.push(task);
         }
@@ -1483,7 +1600,7 @@ impl Executor {
         events: &EventSender,
         stop: &Arc<AtomicBool>,
         outcome: &Arc<TerminalOutcome>,
-        controls: &mut Vec<SourceControl>,
+        runtime: &mut RuntimeControls,
     ) -> Result<JoinHandle<Result<()>>> {
         self.spawn_node_task_with_bridges(
             pipeline,
@@ -1495,7 +1612,7 @@ impl Executor {
             events,
             stop,
             outcome,
-            controls,
+            runtime,
         )
     }
 
@@ -1512,7 +1629,7 @@ impl Executor {
         events: &EventSender,
         stop: &Arc<AtomicBool>,
         outcome: &Arc<TerminalOutcome>,
-        controls: &mut Vec<SourceControl>,
+        runtime: &mut RuntimeControls,
     ) -> Result<JoinHandle<Result<()>>> {
         // Before `get_node_mut` borrows the pipeline mutably: `children()` needs
         // it shared.
@@ -1569,7 +1686,7 @@ impl Executor {
                 // and bounded: control events are rare and handled promptly.
                 let (control_tx, control_rx) = bounded_async::<Event>(8);
                 let bus = pipeline.bus_handle().for_element(&node_name);
-                controls.push(SourceControl {
+                runtime.controls.push(SourceControl {
                     name: node_name.clone(),
                     tx: control_tx,
                 });
@@ -1584,6 +1701,7 @@ impl Executor {
                     tracers,
                     stop.clone(),
                     control_rx,
+                    runtime.pause_rx.clone(),
                     bus,
                     share,
                 )
@@ -1597,6 +1715,7 @@ impl Executor {
                 events_clone,
                 probes,
                 tracers,
+                runtime.position.clone(),
                 share,
             ),
             ElementType::Transform => spawn_transform_task(
@@ -2095,6 +2214,7 @@ fn spawn_source_task(
     tracers: TracerRegistry,
     stop: Arc<AtomicBool>,
     control_rx: AsyncReceiver<Event>,
+    pause_rx: watch::Receiver<bool>,
     bus: BusHandle,
     share: TaskGuard,
 ) -> JoinHandle<Result<()>> {
@@ -2135,6 +2255,25 @@ fn spawn_source_task(
                     &bus,
                 )
                 .await;
+            }
+
+            // Runtime pause (PipelineHandle::pause): stop producing until
+            // resumed. Control events still drain so a seek can land while
+            // paused, and stop still wins.
+            while *pause_rx.borrow() && !stop.load(Ordering::Acquire) {
+                while let Ok(Some(event)) = control_rx.try_recv() {
+                    handle_source_control_event(
+                        &name,
+                        &mut element,
+                        &event,
+                        &outputs,
+                        &src_pad,
+                        &probe_registry,
+                        &bus,
+                    )
+                    .await;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
             tracing::trace!("source '{}': calling process_source", name);
             match guard(&name, element.process_source()).await {
@@ -2225,8 +2364,19 @@ fn spawn_sink_task(
     events: EventSender,
     probe_registry: ProbeRegistry,
     tracers: TracerRegistry,
+    position: Arc<AtomicU64>,
     share: TaskGuard,
 ) -> JoinHandle<Result<()>> {
+    // Advance the shared last-presented-PTS cell. `max` keeps it monotonic
+    // against decoder reordering; the FlushStop reset is what lets a backwards
+    // seek move it backwards.
+    fn present(position: &AtomicU64, pts: ClockTime) {
+        let Some(pts) = pts.to_option() else { return };
+        let _ = position.fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+            (cur == u64::MAX || pts.nanos() > cur).then_some(pts.nanos())
+        });
+    }
+
     tokio::spawn(reporting(share, async move {
         tracing::debug!("sink '{}' started", name);
         events.send_node_started(&name);
@@ -2254,11 +2404,13 @@ fn spawn_sink_task(
                             _ => {}
                         }
                         tracers.notify_buffer(&name, &buffer);
+                        let pts = buffer.metadata().pts;
                         if let Err(e) = guard(&name, element.process(Some(buffer))).await {
                             events.send_error(e.to_string(), Some(name.clone()));
                             return Err(e);
                         }
                         tracers.notify_buffer_processed(&name);
+                        present(&position, pts);
                     }
                     Ok(Message::Event(event)) => {
                         match probe_registry.invoke_event(&sink_pad, &event, true) {
@@ -2267,7 +2419,18 @@ fn spawn_sink_task(
                         }
                         match &event {
                             Event::FlushStart => flushing = true,
-                            Event::FlushStop(_) => flushing = false,
+                            Event::FlushStop(_) => {
+                                flushing = false;
+                                // Forget the pre-seek position; the Segment
+                                // that follows re-anchors it, and `present`'s
+                                // max() starts fresh from there.
+                                position.store(u64::MAX, Ordering::Release);
+                            }
+                            Event::Segment(seg)
+                                if seg.format == crate::event::SegmentFormat::Time =>
+                            {
+                                position.store(seg.start.max(0) as u64, Ordering::Release);
+                            }
                             _ => {}
                         }
                         // No `flush()` here: a sink's flush *commits* buffered
@@ -2311,12 +2474,14 @@ fn spawn_sink_task(
                         _ => {}
                     }
                     tracers.notify_buffer(&name, &buffer);
+                    let pts = buffer.metadata().pts;
                     let result = guard(&name, element.process(Some(buffer))).await;
                     tracers.notify_buffer_processed(&name);
                     if let Err(e) = result {
                         events.send_error(e.to_string(), Some(name.clone()));
                         return Err(e);
                     }
+                    present(&position, pts);
                 }
                 // Check if we're done (EOS + empty)
                 if bridge.is_done() {
