@@ -8,10 +8,12 @@
 use anyhow::{Context, bail};
 use clap::Parser;
 use parallax::converters::PixelFormat;
+use parallax::elements::codec::AudioDecoderElement;
 use parallax::elements::demux::{Mp4Codec, Mp4Demux, Mp4DemuxSource, Mp4TrackType};
+use parallax::elements::device::{AlsaFormat, AlsaSampleFormat, AlsaSink};
 use parallax::elements::transform::VideoConvertElement;
-use parallax::elements::{AutoVideoSink, H264Decoder};
-use parallax::pipeline::{EndReason, Executor, Pipeline};
+use parallax::elements::{AacDecoder, AutoVideoSink, H264Decoder};
+use parallax::pipeline::{EndReason, Executor, LinkPolicy, Pipeline};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
@@ -55,8 +57,18 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What the audio branch needs from the container: the ASC plus the stream
+/// parameters, when the file has a playable AAC track.
+struct AudioParams {
+    asc: Vec<u8>,
+    sample_rate: u32,
+    channels: u32,
+}
+
 /// Open the file and describe it; error out early on things we cannot play.
-fn open_and_probe(args: &Args) -> anyhow::Result<(Mp4Demux<BufReader<File>>, u32, u32)> {
+fn open_and_probe(
+    args: &Args,
+) -> anyhow::Result<(Mp4Demux<BufReader<File>>, u32, u32, Option<AudioParams>)> {
     let file =
         File::open(&args.file).with_context(|| format!("cannot open {}", args.file.display()))?;
     let size = file.metadata()?.len();
@@ -114,16 +126,76 @@ fn open_and_probe(args: &Args) -> anyhow::Result<(Mp4Demux<BufReader<File>>, u32
         );
     }
     let (width, height) = geometry.filter(|(w, h)| *w > 0 && *h > 0).unwrap_or((0, 0));
-    Ok((demux, width, height))
+
+    // The audio branch needs an AAC track with a usable decoder config.
+    let audio = demux
+        .audio_track_id()
+        .and_then(|id| demux.track(id))
+        .filter(|t| t.codec == Mp4Codec::Aac)
+        .and_then(|t| t.audio_info.as_ref())
+        .and_then(|info| {
+            info.audio_specific_config.as_ref().map(|asc| AudioParams {
+                asc: asc.clone(),
+                sample_rate: info.sample_rate,
+                channels: info.channels as u32,
+            })
+        });
+
+    Ok((demux, width, height, audio))
+}
+
+/// Build the audio branch's fallible pieces, explaining a fallback to
+/// video-only instead of failing playback.
+fn audio_branch(
+    args: &Args,
+    audio: Option<AudioParams>,
+) -> Option<(AudioDecoderElement<AacDecoder>, AlsaSink)> {
+    if args.no_audio {
+        return None;
+    }
+    let Some(params) = audio else {
+        println!("no playable AAC track — video only");
+        return None;
+    };
+    let decoder = match AacDecoder::from_asc(&params.asc) {
+        Ok(d) => d,
+        Err(e) => {
+            println!("audio decoder unavailable ({e}) — video only");
+            return None;
+        }
+    };
+    // The decoder emits interleaved f32 at the stream's rate; hand ALSA
+    // exactly that so no conversion sits in between. The sink also provides
+    // the pipeline clock (priority 150), so once this branch exists the
+    // video paces off the audio hardware — that is M2's A/V sync.
+    let format = AlsaFormat {
+        sample_rate: params.sample_rate,
+        channels: params.channels,
+        format: AlsaSampleFormat::F32LE,
+        ..AlsaFormat::default()
+    };
+    match AlsaSink::new("default", format) {
+        Ok(sink) => Some((AudioDecoderElement::new(decoder), sink)),
+        Err(e) => {
+            println!("audio device unavailable ({e}) — video only");
+            None
+        }
+    }
 }
 
 /// One playback pass: build the pipeline, run it to EOS / close / Ctrl-C.
 async fn play(args: &Args) -> anyhow::Result<Outcome> {
-    let (demux, width, height) = open_and_probe(args)?;
+    let (demux, width, height, audio) = open_and_probe(args)?;
+    let audio = audio_branch(args, audio);
 
-    // Audio is #80; until then the video-only source keeps the audio pad
-    // from existing at all (no unlinked-pad drop warnings).
-    let source = Mp4DemuxSource::video_only(demux).with_loop(args.loop_playback);
+    // Without an audio branch the video-only source keeps the audio pad from
+    // existing at all (no unlinked-pad drop warnings).
+    let source = if audio.is_some() {
+        Mp4DemuxSource::new(demux)
+    } else {
+        Mp4DemuxSource::video_only(demux)
+    }
+    .with_loop(args.loop_playback);
 
     let mut convert = VideoConvertElement::new()
         .with_input_format(PixelFormat::I420)
@@ -147,9 +219,23 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
     let dec = pipeline.add_filter("decode", H264Decoder::new()?);
     let cvt = pipeline.add_filter("convert", convert);
     let snk = pipeline.add_sink("display", sink);
-    pipeline.link_pads(src, "video", dec, "sink")?;
+    // Deep branch links decouple the two consumers: the demuxer emits in DTS
+    // order, so if the video branch backpressures at its exact rate the audio
+    // branch starves, the device underruns, the audio-master clock freezes,
+    // and the paced video sink waits on that frozen clock — a crawl. The
+    // demuxer's output arena is sized from these capacities (#84/#91), so
+    // depth here is accounted memory, not a leak.
+    pipeline.link_pads_full(src, "video", dec, "sink", LinkPolicy::Block, Some(24))?;
     pipeline.link(dec, cvt)?;
     pipeline.link(cvt, snk)?;
+
+    if let Some((audio_decoder, alsa_sink)) = audio {
+        let adec = pipeline.add_transform("aacdec", audio_decoder);
+        let aout = pipeline.add_async_sink("speaker", alsa_sink);
+        // ~2 s of AAC read-ahead at 21 ms per packet.
+        pipeline.link_pads_full(src, "audio", adec, "sink", LinkPolicy::Block, Some(96))?;
+        pipeline.link(adec, aout)?;
+    }
 
     let executor = Executor::new();
     let handle = executor
@@ -157,6 +243,9 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
         .context("failed to start the pipeline")?;
     let mut ended = handle.ended();
 
+    // The window opens lazily on the first displayed frame, so is_open()
+    // starts out false — only treat false as "closed" after it was seen open.
+    let mut window_seen = false;
     let outcome = loop {
         tokio::select! {
             reason = &mut ended => {
@@ -180,7 +269,9 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
                 break Outcome::Stop;
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
-                if !window.is_open() {
+                if window.is_open() {
+                    window_seen = true;
+                } else if window_seen {
                     handle.stop();
                 }
             }

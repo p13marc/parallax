@@ -3067,6 +3067,12 @@ fn spawn_demuxer_task(
                     Ok(DemuxResult::WouldBlock) => {
                         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                     }
+                    // Arena exhaustion is flow control here exactly as it is
+                    // for transforms: downstream still holds every slot. A
+                    // source-style demuxer has nothing to shed but time.
+                    Err(Error::PoolExhausted) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
                     Ok(DemuxResult::Eos) => {
                         tracing::info!("demuxer '{}': EOS after {} buffers", name, count);
                         for branches in outputs_by_pad.values() {

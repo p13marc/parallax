@@ -663,6 +663,15 @@ pub struct AlsaPosition {
     epoch: std::time::Instant,
     /// Configured sample rate, for frames → time.
     sample_rate: u32,
+    /// Nanoseconds since `epoch` when the stream ended, plus one (0 = live).
+    ///
+    /// After release the clock continues at wall rate from where the device
+    /// left off. The stream *ending* is not a stall: paced sinks on other
+    /// branches still need time to advance to present their tail, and a
+    /// frozen master clock would park them forever.
+    released_at_nanos: AtomicU64,
+    /// The derived playback time captured at release.
+    released_base_nanos: AtomicU64,
 }
 
 impl AlsaPosition {
@@ -674,6 +683,28 @@ impl AlsaPosition {
             last_reported_nanos: AtomicU64::new(0),
             epoch: std::time::Instant::now(),
             sample_rate: sample_rate.max(1),
+            released_at_nanos: AtomicU64::new(0),
+            released_base_nanos: AtomicU64::new(0),
+        }
+    }
+
+    /// End-of-stream: freeze the device-derived time base and continue at
+    /// wall rate from it. Idempotent — the first release wins.
+    pub fn release(&self, at: std::time::Instant) {
+        // Capture the base *before* claiming the flag, so the winning value
+        // is computed from live-device time. The claim decides idempotency;
+        // a reader racing between claim and base-store sees base 0, and the
+        // monotonic fetch_max in `now_at` absorbs it — `now_at` here has
+        // already pushed `last_reported_nanos` to at least `base`.
+        let base = self.now_at(at).nanos();
+        let at_nanos =
+            (at.saturating_duration_since(self.epoch).as_nanos() as u64).saturating_add(1);
+        if self
+            .released_at_nanos
+            .compare_exchange(0, at_nanos, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.released_base_nanos.store(base, Ordering::Release);
         }
     }
 
@@ -694,6 +725,19 @@ impl AlsaPosition {
     /// reported position jump, and a clock that went backwards would send every
     /// PTS-paced sink into an unrecoverable drop loop.
     pub fn now_at(&self, at: std::time::Instant) -> ClockTime {
+        // A released clock runs at wall rate from the point playback ended.
+        if let Some(released_at) = self
+            .released_at_nanos
+            .load(Ordering::Acquire)
+            .checked_sub(1)
+        {
+            let base = self.released_base_nanos.load(Ordering::Acquire);
+            let now_nanos = at.saturating_duration_since(self.epoch).as_nanos() as u64;
+            let time = base.saturating_add(now_nanos.saturating_sub(released_at));
+            let previous = self.last_reported_nanos.fetch_max(time, Ordering::AcqRel);
+            return ClockTime::from_nanos(time.max(previous));
+        }
+
         let frames = self.frames_played.load(Ordering::Acquire);
         let Some(updated_at) = self.updated_at_nanos.load(Ordering::Acquire).checked_sub(1) else {
             // Nothing has played yet. Report zero rather than interpolating
@@ -861,6 +905,23 @@ impl AsyncSink for AlsaSink {
         ExecutionHints::io_bound()
     }
 
+    fn handle_downstream_event(
+        &mut self,
+        event: crate::event::Event,
+    ) -> Option<crate::event::Event> {
+        if matches!(
+            event,
+            crate::event::Event::Eos | crate::event::Event::Error(_)
+        ) {
+            // Play out what the device already holds, then release the clock:
+            // this stream ending is not a stall, and other paced branches
+            // (video presenting its buffered tail) still need time to move.
+            let _ = self.pcm.drain();
+            self.position().release(std::time::Instant::now());
+        }
+        Some(event)
+    }
+
     fn as_clock_provider(&self) -> Option<&dyn ClockProvider> {
         Some(&self.clock_provider)
     }
@@ -988,6 +1049,44 @@ mod tests {
             stalled,
             ClockTime::from_nanos(1_000_000_000 + MAX_INTERPOLATION.as_nanos() as u64)
         );
+    }
+
+    #[test]
+    fn a_released_clock_keeps_running_at_wall_rate() {
+        // End of stream is not a stall: the device played its last frame, and
+        // other paced branches (video presenting its buffered tail) still
+        // need time to advance — a frozen master clock parks them forever.
+        let position = AlsaPosition::new(48_000);
+        position.update(48_000, at(&position, 1_000));
+        position.release(at(&position, 1_000));
+
+        assert_eq!(
+            position.now_at(at(&position, 1_500)),
+            ClockTime::from_nanos(1_500_000_000),
+            "wall rate from the release point"
+        );
+        assert_eq!(
+            position.now_at(at(&position, 11_000)),
+            ClockTime::from_nanos(11_000_000_000),
+            "no interpolation cap after release"
+        );
+    }
+
+    #[test]
+    fn release_is_idempotent_and_monotonic() {
+        let position = AlsaPosition::new(48_000);
+        position.update(48_000, at(&position, 1_000));
+        let before = position.now_at(at(&position, 1_000));
+
+        position.release(at(&position, 1_000));
+        position.release(at(&position, 1_050)); // second release: no effect
+
+        // Still anchored at the first release: wall rate from t=1000, not a
+        // re-anchor at t=1050. (Queries only ever move forward — the
+        // monotonic guard makes an out-of-order query sticky by design.)
+        let after = position.now_at(at(&position, 1_100));
+        assert!(after >= before, "release rewound the clock");
+        assert_eq!(after, ClockTime::from_nanos(1_100_000_000));
     }
 
     #[test]

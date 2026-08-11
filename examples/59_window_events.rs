@@ -35,6 +35,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Space = pause/resume, f/Enter = fullscreen, Esc/q = quit");
 
+    // The window opens lazily on the first frame; only a false AFTER a true
+    // means the user closed it.
+    let mut window_seen = false;
     loop {
         tokio::select! {
             reason = &mut ended => {
@@ -78,7 +81,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         other => println!("{other:?}"),
                     }
                 }
-                if !window.is_open() {
+                if window.is_open() {
+                    window_seen = true;
+                } else if window_seen {
                     handle.stop();
                 }
             }
