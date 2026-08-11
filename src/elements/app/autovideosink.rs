@@ -24,6 +24,7 @@
 //! This design mirrors GStreamer's xvimagesink which also runs its own
 //! X11 event thread.
 
+use crate::buffer::Buffer;
 use crate::clock::ClockTime;
 use crate::element::{ConsumeContext, Sink};
 use crate::error::{Error, Result};
@@ -36,9 +37,15 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 /// Frame data sent to the display thread.
+///
+/// Carries the pipeline `Buffer` itself — a clone is three atomic
+/// increments and (since #138) an allocation-free metadata copy, so the
+/// display thread shares the arena slot instead of receiving a
+/// full-frame `Vec` copy (#141). The slot stays pinned until the frame
+/// is replaced, which is why the display channel is kept shallow.
 struct DisplayFrame {
-    /// RGBA pixel data
-    data: Vec<u8>,
+    /// RGBA pixel data, arena-backed.
+    data: Buffer,
     /// Frame width in pixels
     width: u32,
     /// Frame height in pixels
@@ -388,7 +395,10 @@ impl AutoVideoSink {
         self.height.store(initial_height, Ordering::SeqCst);
 
         // Bounded channel for backpressure (8 frames buffer)
-        let (sender, receiver) = mpsc::sync_channel::<DisplayFrame>(8);
+        // Shallow on purpose: each queued frame pins an upstream arena slot
+        // (see DisplayFrame). 3 in flight + 1 presented stays well inside the
+        // producer's IN_FLIGHT_MARGIN.
+        let (sender, receiver) = mpsc::sync_channel::<DisplayFrame>(3);
 
         let running = Arc::clone(&self.running);
         let title = self.title.clone();
@@ -527,7 +537,9 @@ impl Sink for AutoVideoSink {
         }
 
         let frame = DisplayFrame {
-            data: data.to_vec(),
+            // Refcount bump, not a copy: the display thread maps the same
+            // arena slot the converter wrote (#141).
+            data: ctx.buffer().clone(),
             width,
             height,
         };
@@ -620,6 +632,7 @@ fn run_display_loop(
         initial_width: u32,
         initial_height: u32,
         events_tx: Option<kanal::Sender<VideoWindowEvent>>,
+        blit_cache: BlitCache,
         /// Desired state, set by the handle; compared against `is_fullscreen`.
         fullscreen: Arc<AtomicBool>,
         is_fullscreen: bool,
@@ -802,7 +815,13 @@ fn run_display_loop(
 
             // Get buffer and blit frame
             if let Ok(mut buffer) = surface.buffer_mut() {
-                blit_frame(frame, &mut buffer, width as usize, height as usize);
+                blit_frame(
+                    frame,
+                    &mut buffer,
+                    width as usize,
+                    height as usize,
+                    &mut self.blit_cache,
+                );
                 let _ = buffer.present();
             }
         }
@@ -821,6 +840,7 @@ fn run_display_loop(
         receiver,
         running,
         current_frame: None,
+        blit_cache: BlitCache::default(),
         title: title.to_string(),
         initial_width,
         initial_height,
@@ -836,11 +856,33 @@ fn run_display_loop(
 }
 
 /// Blit an RGBA frame to the softbuffer surface with scaling.
-fn blit_frame(frame: &DisplayFrame, buffer: &mut [u32], dst_width: usize, dst_height: usize) {
+/// Horizontal nearest-neighbour map, cached across frames — rebuilding it
+/// costs one small allocation only when the source or window geometry
+/// changes.
+#[derive(Default)]
+struct BlitCache {
+    key: (usize, usize),
+    x_map: Vec<u32>,
+}
+
+fn blit_frame(
+    frame: &DisplayFrame,
+    buffer: &mut [u32],
+    dst_width: usize,
+    dst_height: usize,
+    cache: &mut BlitCache,
+) {
     let src_width = frame.width as usize;
     let src_height = frame.height as usize;
+    let src = frame.data.as_bytes();
 
-    if src_width == 0 || src_height == 0 || dst_width == 0 || dst_height == 0 {
+    if src_width == 0
+        || src_height == 0
+        || dst_width == 0
+        || dst_height == 0
+        || src.len() < src_width * src_height * 4
+        || buffer.len() < dst_width * dst_height
+    {
         return;
     }
 
@@ -857,26 +899,41 @@ fn blit_frame(frame: &DisplayFrame, buffer: &mut [u32], dst_width: usize, dst_he
     let x0 = (dst_width - out_width) / 2;
     let y0 = (dst_height - out_height) / 2;
 
-    for dst_y in 0..dst_height {
-        for dst_x in 0..dst_width {
-            let idx = dst_y * dst_width + dst_x;
-            let inside =
-                (x0..x0 + out_width).contains(&dst_x) && (y0..y0 + out_height).contains(&dst_y);
-            if !inside {
-                buffer[idx] = 0; // letterbox bar
-                continue;
-            }
+    if cache.key != (src_width, out_width) {
+        cache.key = (src_width, out_width);
+        cache.x_map.clear();
+        cache
+            .x_map
+            .extend((0..out_width).map(|x| ((x * src_width) / out_width) as u32));
+    }
 
-            // Nearest-neighbor within the letterboxed rectangle.
-            let src_x = ((dst_x - x0) * src_width) / out_width;
-            let src_y = ((dst_y - y0) * src_height) / out_height;
-            let src_idx = (src_y * src_width + src_x) * 4;
-            if src_idx + 3 < frame.data.len() {
-                let r = frame.data[src_idx] as u32;
-                let g = frame.data[src_idx + 1] as u32;
-                let b = frame.data[src_idx + 2] as u32;
-                // softbuffer expects 0xRRGGBB format (no alpha, RGB in low 24 bits)
-                buffer[idx] = (r << 16) | (g << 8) | b;
+    // Row-wise: bars fill by slice, the image row converts RGBA → 0RGB with
+    // all bounds established once per row (#141) — the previous per-pixel
+    // loop paid a bounds check, two `contains`, and a mul+div per pixel.
+    for dst_y in 0..dst_height {
+        let row = &mut buffer[dst_y * dst_width..(dst_y + 1) * dst_width];
+        if dst_y < y0 || dst_y >= y0 + out_height {
+            row.fill(0); // letterbox bar
+            continue;
+        }
+        row[..x0].fill(0);
+        row[x0 + out_width..].fill(0);
+
+        let src_y = ((dst_y - y0) * src_height) / out_height;
+        let src_row = &src[src_y * src_width * 4..(src_y + 1) * src_width * 4];
+        let out_row = &mut row[x0..x0 + out_width];
+        if out_width == src_width {
+            // 1:1 horizontal: straight zip, no index math.
+            for (dst, px) in out_row.iter_mut().zip(src_row.chunks_exact(4)) {
+                // softbuffer expects 0xRRGGBB (no alpha, RGB in the low 24 bits).
+                *dst = ((px[0] as u32) << 16) | ((px[1] as u32) << 8) | (px[2] as u32);
+            }
+        } else {
+            for (dst, &sx) in out_row.iter_mut().zip(&cache.x_map[..out_width]) {
+                let o = sx as usize * 4;
+                *dst = ((src_row[o] as u32) << 16)
+                    | ((src_row[o + 1] as u32) << 8)
+                    | (src_row[o + 2] as u32);
             }
         }
     }
@@ -886,17 +943,29 @@ fn blit_frame(frame: &DisplayFrame, buffer: &mut [u32], dst_width: usize, dst_he
 mod tests {
     use super::*;
 
+    /// An arena-backed white RGBA frame of `w`x`h` for blit tests.
+    fn white_frame(w: u32, h: u32) -> DisplayFrame {
+        let len = (w * h * 4) as usize;
+        let arena = crate::memory::SharedArena::new(len, 2).unwrap();
+        let mut slot = arena.acquire().unwrap();
+        slot.data_mut()[..len].fill(0xFF);
+        DisplayFrame {
+            data: Buffer::new(
+                crate::buffer::MemoryHandle::with_len(slot, len),
+                crate::metadata::Metadata::new(),
+            ),
+            width: w,
+            height: h,
+        }
+    }
+
     #[test]
     fn letterbox_centers_and_paints_bars_black() {
         // 2x2 white frame into a 4x2 window: 1:1 content in the middle two
         // columns, black pillars on columns 0 and 3.
-        let frame = DisplayFrame {
-            data: vec![0xFF; 2 * 2 * 4],
-            width: 2,
-            height: 2,
-        };
+        let frame = white_frame(2, 2);
         let mut buffer = vec![0x123456u32; 4 * 2];
-        blit_frame(&frame, &mut buffer, 4, 2);
+        blit_frame(&frame, &mut buffer, 4, 2, &mut BlitCache::default());
 
         for y in 0..2 {
             assert_eq!(buffer[y * 4], 0, "left pillar is black");
@@ -908,14 +977,24 @@ mod tests {
 
     #[test]
     fn matching_aspect_fills_the_window() {
-        let frame = DisplayFrame {
-            data: vec![0xFF; 2 * 2 * 4],
-            width: 2,
-            height: 2,
-        };
+        let frame = white_frame(2, 2);
         let mut buffer = vec![0u32; 8 * 8];
-        blit_frame(&frame, &mut buffer, 8, 8);
+        blit_frame(&frame, &mut buffer, 8, 8, &mut BlitCache::default());
         assert!(buffer.iter().all(|p| *p == 0xFFFFFF), "no bars");
+    }
+
+    /// The scaled path via the cached x-map produces the same result when
+    /// geometry changes between frames (cache rebuild).
+    #[test]
+    fn blit_cache_survives_geometry_changes() {
+        let mut cache = BlitCache::default();
+        let frame = white_frame(2, 2);
+        let mut a = vec![0u32; 8 * 8];
+        blit_frame(&frame, &mut a, 8, 8, &mut cache);
+        let mut b = vec![0u32; 6 * 6];
+        blit_frame(&frame, &mut b, 6, 6, &mut cache);
+        assert!(a.iter().all(|p| *p == 0xFFFFFF));
+        assert!(b.iter().all(|p| *p == 0xFFFFFF));
     }
 
     #[test]
