@@ -13,6 +13,9 @@ mod mpegts;
 #[cfg(feature = "mp4-demux")]
 mod mp4;
 
+#[cfg(feature = "mp4-demux")]
+mod mp4_extra;
+
 #[cfg(feature = "mkv-demux")]
 mod mkv;
 

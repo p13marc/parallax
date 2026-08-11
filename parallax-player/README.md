@@ -34,7 +34,7 @@ Phase 2 — format expansion (`video-player` label):
 |---|---|---|
 | #121/#122 | Matroska/WebM container support | done |
 | #123/#124 | VP8/VP9 decode (libvpx) + codec dispatch | done |
-| #125 | AV1/Opus in MP4 | pending |
+| #125 | AV1/Opus in MP4 | done |
 | #126 | Vorbis audio | pending |
 | #127/#128 | E-AC-3 audio + 5.1 downmix | pending |
 

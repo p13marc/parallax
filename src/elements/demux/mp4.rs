@@ -10,7 +10,9 @@
 //! | Video | H.264/AVC | Samples converted to Annex-B with in-band SPS/PPS on keyframes |
 //! | Video | H.265/HEVC | Passes through in container (length-prefixed) form |
 //! | Video | VP9 | WebM compatible |
+//! | Video | AV1 | `av01` recovered by the stsd side-scan; samples are plain OBUs |
 //! | Audio | AAC | Most common |
+//! | Audio | Opus | `Opus`/`dOps` recovered by the stsd side-scan; raw Opus packets |
 //!
 //! # Example
 //!
@@ -57,8 +59,13 @@ pub enum Mp4Codec {
     H265,
     /// VP9 video.
     Vp9,
+    /// AV1 video (`av01` sample entry, recovered by the stsd scan — the
+    /// mp4 crate itself does not model it).
+    Av1,
     /// AAC audio.
     Aac,
+    /// Opus audio (`Opus` sample entry, recovered by the stsd scan).
+    Opus,
     /// TTML/TTXT subtitles.
     Ttxt,
     /// Unknown codec.
@@ -68,12 +75,15 @@ pub enum Mp4Codec {
 impl Mp4Codec {
     /// Returns true if this is a video codec.
     pub fn is_video(&self) -> bool {
-        matches!(self, Mp4Codec::H264 | Mp4Codec::H265 | Mp4Codec::Vp9)
+        matches!(
+            self,
+            Mp4Codec::H264 | Mp4Codec::H265 | Mp4Codec::Vp9 | Mp4Codec::Av1
+        )
     }
 
     /// Returns true if this is an audio codec.
     pub fn is_audio(&self) -> bool {
-        matches!(self, Mp4Codec::Aac)
+        matches!(self, Mp4Codec::Aac | Mp4Codec::Opus)
     }
 
     /// Returns true if this is a subtitle codec.
@@ -88,7 +98,9 @@ impl std::fmt::Display for Mp4Codec {
             Mp4Codec::H264 => write!(f, "H.264/AVC"),
             Mp4Codec::H265 => write!(f, "H.265/HEVC"),
             Mp4Codec::Vp9 => write!(f, "VP9"),
+            Mp4Codec::Av1 => write!(f, "AV1"),
             Mp4Codec::Aac => write!(f, "AAC"),
+            Mp4Codec::Opus => write!(f, "Opus"),
             Mp4Codec::Ttxt => write!(f, "TTXT"),
             Mp4Codec::Unknown => write!(f, "Unknown"),
         }
@@ -192,6 +204,9 @@ pub struct Mp4AudioInfo {
     /// with extension payloads (HE-AAC's SBR block) cannot be reconstructed
     /// from the parsed fields, so those stay `None`.
     pub audio_specific_config: Option<Vec<u8>>,
+    /// Raw codec configuration for non-esds codecs — the `dOps` payload for
+    /// Opus tracks (mirrors `MkvAudioInfo::codec_private`).
+    pub codec_private: Option<Vec<u8>>,
 }
 
 impl Mp4AudioInfo {
@@ -448,6 +463,12 @@ impl<R: Read + Seek> Mp4Demux<R> {
     ///
     /// Returns an error if the MP4 header cannot be parsed.
     pub fn new(reader: R, size: u64) -> Result<Self> {
+        // Recover sample entries the mp4 crate drops (av01, Opus) before it
+        // consumes the reader; tolerant — an unscannable file just leaves
+        // the affected tracks Unknown, as before.
+        let mut reader = reader;
+        let stsd_extras = super::mp4_extra::scan(&mut reader).unwrap_or_default();
+
         let mp4_reader = Mp4Reader::read_header(reader, size)
             .map_err(|e| Error::Config(format!("Failed to read MP4 header: {}", e)))?;
 
@@ -461,10 +482,23 @@ impl<R: Read + Seek> Mp4Demux<R> {
                 .map(Mp4TrackType::from)
                 .unwrap_or(Mp4TrackType::Unknown);
 
-            let codec = track
+            let mut codec = track
                 .media_type()
                 .map(Mp4Codec::from)
                 .unwrap_or(Mp4Codec::Unknown);
+            let extra = stsd_extras
+                .iter()
+                .find(|(id, _)| *id == track.track_id())
+                .map(|(_, e)| e);
+            if codec == Mp4Codec::Unknown
+                && let Some(extra) = extra
+            {
+                codec = match &extra.fourcc {
+                    b"av01" => Mp4Codec::Av1,
+                    b"Opus" => Mp4Codec::Opus,
+                    _ => Mp4Codec::Unknown,
+                };
+            }
 
             // H.264 tracks: lift the avcC record so samples can be converted
             // to Annex-B with in-band parameter sets. A track without one
@@ -521,20 +555,30 @@ impl<R: Read + Seek> Mp4Demux<R> {
                     .as_ref()
                     .and_then(|mp4a| mp4a.esds.as_ref())
                     .map(|esds| &esds.es_desc.dec_config.dec_specific);
+                let dops = extra.and_then(|e| e.dops.as_ref());
                 Some(Mp4AudioInfo {
-                    sample_rate: track
-                        .sample_freq_index()
-                        .map(|i| Self::sample_rate_from_index(i))
-                        .unwrap_or(44100),
-                    channels: track
-                        .channel_config()
-                        .map(|c| Self::channel_count(c))
-                        .unwrap_or(2),
+                    // Opus always decodes at 48 kHz regardless of the
+                    // original input rate the dOps box records.
+                    sample_rate: if codec == Mp4Codec::Opus {
+                        48_000
+                    } else {
+                        track
+                            .sample_freq_index()
+                            .map(|i| Self::sample_rate_from_index(i))
+                            .unwrap_or(44100)
+                    },
+                    channels: dops.map(|d| d.channels as u16).unwrap_or_else(|| {
+                        track
+                            .channel_config()
+                            .map(|c| Self::channel_count(c))
+                            .unwrap_or(2)
+                    }),
                     object_type: dec_specific.map(|d| d.profile),
                     freq_index: dec_specific.map(|d| d.freq_index),
                     channel_config: dec_specific.map(|d| d.chan_conf),
                     audio_specific_config: dec_specific
                         .and_then(|d| synthesize_asc(d.profile, d.freq_index, d.chan_conf)),
+                    codec_private: dops.map(|d| d.raw.clone()),
                 })
             } else {
                 None
@@ -1374,6 +1418,7 @@ mod tests {
             freq_index: Some(3),
             channel_config: Some(2),
             audio_specific_config: synthesize_asc(2, 3, 2),
+            codec_private: None,
         };
         let header = info.adts_header(100).unwrap();
 
@@ -1397,6 +1442,7 @@ mod tests {
             freq_index: None,
             channel_config: None,
             audio_specific_config: None,
+            codec_private: None,
         };
         assert_eq!(no_esds.adts_header(100), None);
 
@@ -1407,6 +1453,7 @@ mod tests {
             freq_index: Some(3),
             channel_config: Some(2),
             audio_specific_config: None,
+            codec_private: None,
         };
         assert!(info.adts_header(0x1FFF - 6).is_none(), "overflows 13 bits");
         assert!(info.adts_header(0x1FFF - 7).is_some());

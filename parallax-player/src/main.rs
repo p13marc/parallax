@@ -115,6 +115,7 @@ impl From<Mp4Codec> for VideoCodecKind {
         match c {
             Mp4Codec::H264 => VideoCodecKind::H264,
             Mp4Codec::Vp9 => VideoCodecKind::Vp9,
+            Mp4Codec::Av1 => VideoCodecKind::Av1,
             other => VideoCodecKind::Other(other.to_string()),
         }
     }
@@ -238,6 +239,7 @@ fn probe_mp4(args: &Args, demux: &Mp4Demux<BufReader<File>>) -> StreamSummary {
             Some(AudioStream {
                 codec: match t.codec {
                     Mp4Codec::Aac => AudioCodecKind::Aac,
+                    Mp4Codec::Opus => AudioCodecKind::Opus,
                     other => AudioCodecKind::Other(other.to_string()),
                 },
                 sample_rate: info.sample_rate,
