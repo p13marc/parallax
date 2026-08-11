@@ -24,7 +24,7 @@
 
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::error::{Error, Result};
-use crate::memory::SharedArena;
+use crate::memory::{OutputArena, defaults};
 use crate::metadata::Metadata;
 
 use std::collections::BTreeMap;
@@ -314,10 +314,16 @@ pub fn decode_ber_length(data: &[u8]) -> Option<(usize, usize)> {
 // ============================================================================
 
 /// KLV encoder for creating STANAG 4609 / MISB metadata packets.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct KlvEncoder {
     /// Tags and their values (BTreeMap for deterministic ordering).
     tags: BTreeMap<u8, Vec<u8>>,
+    /// Per-instance arena for [`to_buffer`](Self::to_buffer) outputs.
+    ///
+    /// This used to be a process-wide `static OnceLock<SharedArena>` shared
+    /// by every encoder in the process, with an unchecked copy that panicked
+    /// on a packet over the slot size (#95). `grow_to_fit` rebuilds instead.
+    output: OutputArena,
 }
 
 impl KlvEncoder {
@@ -325,6 +331,9 @@ impl KlvEncoder {
     pub fn new() -> Self {
         Self {
             tags: BTreeMap::new(),
+            output: OutputArena::new(defaults::METADATA_SLOT_COUNT)
+                .with_min_slot_size(defaults::METADATA_SLOT_SIZE)
+                .grow_to_fit(),
         }
     }
 
@@ -506,13 +515,25 @@ impl KlvEncoder {
     }
 
     /// Create a Buffer containing the encoded KLV data.
-    pub fn to_buffer(&self, uls: Uls) -> Result<Buffer> {
+    ///
+    /// `&mut self` because the buffer comes from the encoder's own arena —
+    /// the process-wide arena this replaced could not be sized or reclaimed
+    /// per instance (#95).
+    pub fn to_buffer(&mut self, uls: Uls) -> Result<Buffer> {
         let data = self.encode_with_uls(uls);
-        create_klv_buffer(data)
+        if data.is_empty() {
+            return Err(Error::Element("Empty KLV data".into()));
+        }
+        let mut slot = self.output.acquire(data.len(), "klvencoder")?;
+        slot.data_mut()[..data.len()].copy_from_slice(&data);
+        Ok(Buffer::new(
+            MemoryHandle::with_len(slot, data.len()),
+            Metadata::new(),
+        ))
     }
 
     /// Create a MISB ST 0601 Buffer.
-    pub fn to_st0601_buffer(&self) -> Result<Buffer> {
+    pub fn to_st0601_buffer(&mut self) -> Result<Buffer> {
         self.to_buffer(Uls::MisbSt0601)
     }
 }
@@ -585,33 +606,10 @@ fn calculate_checksum(data: &[u8]) -> u16 {
 // Buffer Creation
 // ============================================================================
 
-/// Create a Buffer from KLV data.
-/// Get the global KLV arena (lazily initialized).
-fn klv_arena() -> &'static SharedArena {
-    use std::sync::OnceLock;
-    static ARENA: OnceLock<SharedArena> = OnceLock::new();
-    // 64KB slots should be sufficient for KLV metadata, 32 slots for concurrency
-    ARENA.get_or_init(|| SharedArena::new(65536, 32).expect("Failed to create KLV arena"))
-}
-
-fn create_klv_buffer(data: Vec<u8>) -> Result<Buffer> {
-    if data.is_empty() {
-        return Err(Error::Element("Empty KLV data".into()));
+impl Default for KlvEncoder {
+    fn default() -> Self {
+        Self::new()
     }
-
-    let arena = klv_arena();
-    arena.reclaim();
-
-    let mut slot = arena
-        .acquire()
-        .ok_or_else(|| Error::Element("Failed to acquire slot from arena".into()))?;
-
-    slot.data_mut()[..data.len()].copy_from_slice(&data);
-
-    let handle = MemoryHandle::with_len(slot, data.len());
-    let metadata = Metadata::new();
-
-    Ok(Buffer::new(handle, metadata))
 }
 
 // ============================================================================
@@ -721,7 +719,7 @@ impl StanagMetadataBuilder {
     }
 
     /// Build as a Buffer containing MISB ST 0601 data.
-    pub fn build_st0601_buffer(self) -> Result<Buffer> {
+    pub fn build_st0601_buffer(mut self) -> Result<Buffer> {
         self.encoder.to_st0601_buffer()
     }
 
@@ -885,9 +883,20 @@ mod tests {
 
     #[test]
     fn test_klv_buffer_creation() {
-        let encoder = KlvEncoder::new();
+        let mut encoder = KlvEncoder::new();
         let buffer = encoder.to_st0601_buffer().unwrap();
         assert!(buffer.len() > 16); // At least ULS + length + checksum
+    }
+
+    #[test]
+    fn oversized_klv_grows_the_arena_instead_of_panicking() {
+        // The old process-wide arena had fixed 64 KiB slots and an unchecked
+        // copy — a packet past the slot size panicked (#95). grow_to_fit
+        // rebuilds instead.
+        let mut encoder = KlvEncoder::new();
+        encoder.add_tag(KlvTag::Custom(90), vec![0xAB; 100_000]);
+        let buffer = encoder.to_st0601_buffer().unwrap();
+        assert!(buffer.len() > 100_000);
     }
 
     #[test]
