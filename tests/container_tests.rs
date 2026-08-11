@@ -486,4 +486,124 @@ mod mp4_roundtrip_tests {
             .expect("Should read audio");
         assert_eq!(audio_samples.len(), 3);
     }
+
+    /// A/V fixture with a real GOP structure: 20 video frames at 100 ms with
+    /// a keyframe every 5 (t = 0, 500, 1000, 1500 ms), plus audio frames of
+    /// 21 ms covering the same 2 s span.
+    fn seekable_av_fixture() -> Vec<u8> {
+        let mut mux = Mp4Mux::new(Cursor::new(Vec::new()), Mp4MuxConfig::default())
+            .expect("Should create muxer");
+
+        let sps = vec![0x67, 0x42, 0x00, 0x1f];
+        let pps = vec![0x68, 0xce, 0x3c, 0x80];
+        let video_track = mux
+            .add_video_track(Mp4VideoTrackConfig::h264(320, 240, &sps, &pps))
+            .expect("Should add video track");
+        let audio_track = mux
+            .add_audio_track(Mp4AudioTrackConfig::aac(48000, 2))
+            .expect("Should add audio track");
+
+        // AVCC samples: 4-byte length prefix, then the NAL.
+        let keyframe = vec![0x00, 0x00, 0x00, 0x02, 0x65, 0xAA];
+        let delta = vec![0x00, 0x00, 0x00, 0x02, 0x41, 0x9A];
+        for i in 0..20u64 {
+            let is_key = i % 5 == 0;
+            let data = if is_key { &keyframe } else { &delta };
+            mux.write_video_sample(video_track, data, i * 100, 100, is_key)
+                .unwrap();
+        }
+        let audio_data = vec![0xFFu8, 0xF1, 0x50, 0x80];
+        for i in 0..95u64 {
+            mux.write_audio_sample(audio_track, &audio_data, i * 21, 21)
+                .unwrap();
+        }
+
+        mux.finish().expect("Should finalize").into_inner()
+    }
+
+    #[test]
+    fn test_seek_to_time_lands_on_prior_keyframe() {
+        let mp4_data = seekable_av_fixture();
+        let mut demux = Mp4Demux::new(Cursor::new(mp4_data.clone()), mp4_data.len() as u64)
+            .expect("Should create demuxer");
+        let video_id = demux.video_track_id().unwrap();
+
+        // 1234 ms sits in the third GOP; its keyframe is at 1000 ms.
+        let point = demux.seek_to_time(video_id, 1_234_000_000).unwrap();
+        assert!(point.is_sync);
+        assert_eq!(point.time_ns, 1_000_000_000);
+        assert!(point.time_ns <= 1_234_000_000);
+
+        // The next read returns exactly that keyframe, self-contained
+        // (SPS/PPS re-emitted in-band so a decoder can restart here).
+        let sample = demux.read_sample(video_id).unwrap().unwrap();
+        assert!(sample.is_keyframe);
+        assert_eq!(sample.pts_ns, 1_000_000_000);
+        let nal_types: Vec<u8> = parallax::codec::annexb::nal_units(sample.buffer.as_bytes())
+            .map(|n| n.nal_type())
+            .collect();
+        assert_eq!(nal_types, vec![7, 8, 5]);
+
+        // ...and reading continues sequentially from there.
+        let next = demux.read_sample(video_id).unwrap().unwrap();
+        assert!(!next.is_keyframe);
+        assert_eq!(next.pts_ns, 1_100_000_000);
+    }
+
+    #[test]
+    fn test_seek_to_time_edges() {
+        let mp4_data = seekable_av_fixture();
+        let mut demux = Mp4Demux::new(Cursor::new(mp4_data.clone()), mp4_data.len() as u64)
+            .expect("Should create demuxer");
+        let video_id = demux.video_track_id().unwrap();
+
+        // Exactly on a keyframe.
+        let point = demux.seek_to_time(video_id, 500_000_000).unwrap();
+        assert_eq!(point.time_ns, 500_000_000);
+        assert!(point.is_sync);
+
+        // Zero lands on the first sample.
+        let point = demux.seek_to_time(video_id, 0).unwrap();
+        assert_eq!(point.time_ns, 0);
+        assert_eq!(point.sample_index, 1);
+
+        // Past the end clamps to the last keyframe.
+        let point = demux.seek_to_time(video_id, 99_000_000_000).unwrap();
+        assert_eq!(point.time_ns, 1_500_000_000);
+        assert!(point.is_sync);
+
+        // Unknown track errors.
+        assert!(demux.seek_to_time(42, 0).is_err());
+    }
+
+    #[test]
+    fn test_seek_all_lands_av_together() {
+        let mp4_data = seekable_av_fixture();
+        let mut demux = Mp4Demux::new(Cursor::new(mp4_data.clone()), mp4_data.len() as u64)
+            .expect("Should create demuxer");
+        let video_id = demux.video_track_id().unwrap();
+        let audio_id = demux.audio_track_id().unwrap();
+
+        let point = demux.seek_all_to_time(1_234_000_000).unwrap();
+        assert_eq!(point.track_id, video_id);
+        assert_eq!(
+            point.time_ns, 1_000_000_000,
+            "video snapped to its keyframe"
+        );
+
+        // Audio landed at or before the video keyframe, within one frame.
+        let audio = demux.read_sample(audio_id).unwrap().unwrap();
+        assert!(audio.pts_ns <= point.time_ns);
+        assert!(
+            point.time_ns - audio.pts_ns < audio.duration_ns,
+            "audio ({} ns) more than one frame ({} ns) behind video ({} ns)",
+            audio.pts_ns,
+            audio.duration_ns,
+            point.time_ns
+        );
+
+        let video = demux.read_sample(video_id).unwrap().unwrap();
+        assert!(video.is_keyframe);
+        assert_eq!(video.pts_ns, point.time_ns);
+    }
 }

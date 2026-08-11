@@ -21,6 +21,6 @@ pub use mpegts::{
 
 #[cfg(feature = "mp4-demux")]
 pub use mp4::{
-    Mp4AudioInfo, Mp4Codec, Mp4Demux, Mp4DemuxStats, Mp4Sample, Mp4Track, Mp4TrackType,
-    Mp4VideoInfo,
+    Mp4AudioInfo, Mp4Codec, Mp4Demux, Mp4DemuxStats, Mp4Sample, Mp4SeekPoint, Mp4Track,
+    Mp4TrackType, Mp4VideoInfo,
 };

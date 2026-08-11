@@ -176,6 +176,89 @@ pub struct Mp4AudioInfo {
 }
 
 // ============================================================================
+// Seeking
+// ============================================================================
+
+/// Where a time-based seek landed.
+///
+/// Returned by [`Mp4Demux::seek_to_time`] and [`Mp4Demux::seek_all_to_time`].
+/// The landing time is at or before the requested target (except when the
+/// target precedes the track's first sync sample, where the first sync sample
+/// is the earliest decodable position).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mp4SeekPoint {
+    /// Track the seek was resolved on.
+    pub track_id: u32,
+    /// 1-based sample index the next [`Mp4Demux::read_sample`] will return.
+    pub sample_index: u32,
+    /// Start time of that sample in nanoseconds.
+    pub time_ns: u64,
+    /// Whether the landing sample is a sync sample (keyframe).
+    pub is_sync: bool,
+}
+
+/// Locate the last sample whose start time is at or before `target_ticks`.
+///
+/// `entries` are stts runs as `(sample_count, sample_delta)`. Returns the
+/// 1-based sample index and its start time in ticks, clamped to the last
+/// sample; `None` for a track with no samples.
+fn stts_locate(
+    entries: impl IntoIterator<Item = (u32, u32)>,
+    target_ticks: u64,
+) -> Option<(u32, u64)> {
+    let mut index: u64 = 1;
+    let mut time: u64 = 0;
+    let mut last: Option<(u32, u64)> = None;
+    for (count, delta) in entries {
+        let (count, delta) = (count as u64, delta as u64);
+        if count == 0 {
+            continue;
+        }
+        let span = count * delta;
+        if delta > 0 && target_ticks < time + span {
+            let n = (target_ticks - time) / delta;
+            return Some(((index + n) as u32, time + n * delta));
+        }
+        // Target lies beyond this run: remember the run's last sample.
+        last = Some(((index + count - 1) as u32, time + span - delta));
+        index += count;
+        time += span;
+    }
+    last
+}
+
+/// Start time in ticks of a 1-based sample index, per the stts runs.
+fn stts_time_of(entries: impl IntoIterator<Item = (u32, u32)>, sample: u32) -> Option<u64> {
+    let mut index: u64 = 1;
+    let mut time: u64 = 0;
+    for (count, delta) in entries {
+        let (count, delta) = (count as u64, delta as u64);
+        if (sample as u64) < index + count {
+            return Some(time + (sample as u64 - index) * delta);
+        }
+        index += count;
+        time += count * delta;
+    }
+    None
+}
+
+/// Snap a 1-based sample index back to the nearest sync sample at or before
+/// it. `sync_samples` is the sorted stss entry list; `None` means every
+/// sample is a sync sample. A target before the first sync sample snaps
+/// *forward* to it — there is nothing decodable earlier.
+fn snap_to_sync(sync_samples: Option<&[u32]>, sample: u32) -> (u32, bool) {
+    match sync_samples {
+        None => (sample, true),
+        Some([]) => (sample, false),
+        Some(entries) => match entries.binary_search(&sample) {
+            Ok(_) => (sample, true),
+            Err(0) => (entries[0], true),
+            Err(i) => (entries[i - 1], true),
+        },
+    }
+}
+
+// ============================================================================
 // Sample
 // ============================================================================
 
@@ -507,6 +590,104 @@ impl<R: Read + Seek> Mp4Demux<R> {
         self.sample_indices.insert(track_id, 1);
     }
 
+    /// Seek one track to a target time, landing on a decodable sample.
+    ///
+    /// Resolves `target_ns` to a sample via the time-to-sample table (stts),
+    /// then snaps back to the nearest sync sample via the sync-sample table
+    /// (stss) — when a track has no stss box every sample is a sync sample,
+    /// which is the normal case for audio. The landing time is therefore at
+    /// or before the target, except when the target precedes the first sync
+    /// sample (nothing earlier is decodable, so the seek snaps forward to it).
+    ///
+    /// The next [`read_sample`](Self::read_sample) on this track returns the
+    /// landing sample. On a video track the demuxer re-emits SPS/PPS in-band
+    /// on keyframes, so a decoder can restart cleanly at the landing point.
+    ///
+    /// To seek several tracks consistently, use
+    /// [`seek_all_to_time`](Self::seek_all_to_time) — seeking each track to
+    /// the same target independently can land video and audio a whole GOP
+    /// apart, because only video snaps to keyframes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the track does not exist, has no samples, or has
+    /// a zero timescale.
+    pub fn seek_to_time(&mut self, track_id: u32, target_ns: u64) -> Result<Mp4SeekPoint> {
+        let track = self
+            .reader
+            .tracks()
+            .get(&track_id)
+            .ok_or_else(|| Error::Config(format!("Track {} not found", track_id)))?;
+
+        let timescale = track.timescale();
+        if timescale == 0 {
+            return Err(Error::Config(format!(
+                "Track {} has a zero timescale",
+                track_id
+            )));
+        }
+
+        let target_ticks = (target_ns as u128 * timescale as u128 / 1_000_000_000) as u64;
+
+        let stbl = &track.trak.mdia.minf.stbl;
+        let stts = || {
+            stbl.stts
+                .entries
+                .iter()
+                .map(|e| (e.sample_count, e.sample_delta))
+        };
+
+        let (sample, _) = stts_locate(stts(), target_ticks).ok_or_else(|| {
+            Error::Config(format!("Track {} has no samples to seek in", track_id))
+        })?;
+
+        let sync_entries = stbl.stss.as_ref().map(|s| s.entries.as_slice());
+        let (landing, is_sync) = snap_to_sync(sync_entries, sample);
+
+        // The snap changed the index, so recompute its start time.
+        let landing_ticks = stts_time_of(stts(), landing).unwrap_or(0);
+        let time_ns = (landing_ticks as u128 * 1_000_000_000 / timescale as u128) as u64;
+
+        self.sample_indices.insert(track_id, landing);
+
+        Ok(Mp4SeekPoint {
+            track_id,
+            sample_index: landing,
+            time_ns,
+            is_sync,
+        })
+    }
+
+    /// Seek every track to a consistent position at or before `target_ns`.
+    ///
+    /// The target is first resolved on the video track (keyframe snap via
+    /// [`seek_to_time`](Self::seek_to_time)); every other track is then
+    /// sought to the video's landing time, so audio starts where the video
+    /// keyframe does instead of up to a GOP later. Files without a video
+    /// track resolve the target on the first track instead.
+    ///
+    /// Returns the seek point of the reference track.
+    pub fn seek_all_to_time(&mut self, target_ns: u64) -> Result<Mp4SeekPoint> {
+        let reference = self
+            .video_track_id()
+            .or_else(|| self.tracks.first().map(|t| t.id))
+            .ok_or_else(|| Error::Config("MP4 has no tracks to seek".into()))?;
+
+        let point = self.seek_to_time(reference, target_ns)?;
+
+        let other_ids: Vec<u32> = self
+            .tracks
+            .iter()
+            .map(|t| t.id)
+            .filter(|id| *id != reference)
+            .collect();
+        for id in other_ids {
+            self.seek_to_time(id, point.time_ns)?;
+        }
+
+        Ok(point)
+    }
+
     /// Read the next sample from a track.
     ///
     /// Returns `None` when all samples have been read.
@@ -780,5 +961,75 @@ mod tests {
         // Length prefix claims 9 bytes; only 1 remains.
         let sample = [0u8, 0, 0, 9, 0x41];
         assert!(TestDemux::avcc_sample_to_annex_b(&test_avc_config(), &sample, false).is_err());
+    }
+
+    // 10 samples of 100 ticks, then 5 of 200 ticks: track spans 0..2000.
+    const STTS: [(u32, u32); 2] = [(10, 100), (5, 200)];
+
+    #[test]
+    fn stts_locate_finds_containing_sample() {
+        assert_eq!(stts_locate(STTS, 0), Some((1, 0)));
+        assert_eq!(
+            stts_locate(STTS, 99),
+            Some((1, 0)),
+            "mid-sample rounds down"
+        );
+        assert_eq!(stts_locate(STTS, 100), Some((2, 100)));
+        assert_eq!(stts_locate(STTS, 999), Some((10, 900)), "last of first run");
+        assert_eq!(
+            stts_locate(STTS, 1000),
+            Some((11, 1000)),
+            "first of second run"
+        );
+        assert_eq!(stts_locate(STTS, 1350), Some((12, 1200)));
+    }
+
+    #[test]
+    fn stts_locate_clamps_past_the_end() {
+        assert_eq!(
+            stts_locate(STTS, 5000),
+            Some((15, 1800)),
+            "clamps to last sample"
+        );
+        assert_eq!(stts_locate([], 0), None, "no samples");
+        assert_eq!(
+            stts_locate([(0, 100)], 50),
+            None,
+            "empty runs carry no samples"
+        );
+    }
+
+    #[test]
+    fn stts_time_of_inverts_locate() {
+        assert_eq!(stts_time_of(STTS, 1), Some(0));
+        assert_eq!(stts_time_of(STTS, 10), Some(900));
+        assert_eq!(stts_time_of(STTS, 11), Some(1000));
+        assert_eq!(stts_time_of(STTS, 15), Some(1800));
+        assert_eq!(stts_time_of(STTS, 16), None, "past the end");
+    }
+
+    #[test]
+    fn snap_to_sync_snaps_backwards() {
+        let stss = [1u32, 6, 11];
+        assert_eq!(
+            snap_to_sync(Some(&stss), 6),
+            (6, true),
+            "already a keyframe"
+        );
+        assert_eq!(snap_to_sync(Some(&stss), 9), (6, true), "snaps back");
+        assert_eq!(snap_to_sync(Some(&stss), 15), (11, true));
+        assert_eq!(
+            snap_to_sync(None, 7),
+            (7, true),
+            "no stss: everything is sync"
+        );
+    }
+
+    #[test]
+    fn snap_to_sync_before_first_keyframe_goes_forward() {
+        // Pathological file whose first sync sample is not sample 1: nothing
+        // before it is decodable, so the seek moves forward.
+        let stss = [4u32, 8];
+        assert_eq!(snap_to_sync(Some(&stss), 2), (4, true));
     }
 }
