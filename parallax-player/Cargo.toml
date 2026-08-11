@@ -1,0 +1,21 @@
+[package]
+name = "parallax-player"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+publish = false
+description = "Video player demo built on the parallax pipeline engine"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+parallax = { package = "parallax-pipeline", path = "..", features = [
+    "mp4-demux",
+    "h264",
+    "display",
+    "simd-colorspace",
+] }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"

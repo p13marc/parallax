@@ -1,5 +1,12 @@
 [workspace]
-members = [".", "parallax-macros", "examples/example-plugin"]
+members = [".", "parallax-macros", "parallax-player", "examples/example-plugin"]
+# The default build set stays exactly what a bare `cargo <cmd>` built before
+# the player existed: the root package alone. Anything wider changes what CI
+# compiles — adding the player would unify its features (h264/display/...)
+# into every workspace-wide invocation, and even adding example-plugin
+# surfaces clippy findings CI never gated on. Build the others explicitly:
+# `cargo run -p parallax-player -- file.mp4`, `cargo clippy -p example-plugin`.
+default-members = ["."]
 
 [package]
 # Package is `parallax-pipeline` on crates.io (the bare name is squatted);
