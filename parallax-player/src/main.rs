@@ -7,12 +7,13 @@
 
 use anyhow::{Context, bail};
 use clap::Parser;
+use parallax::clock::ClockTime;
 use parallax::converters::PixelFormat;
 use parallax::elements::codec::AudioDecoderElement;
 use parallax::elements::demux::{Mp4Codec, Mp4Demux, Mp4DemuxSource, Mp4TrackType};
 use parallax::elements::device::{AlsaFormat, AlsaSampleFormat, AlsaSink};
 use parallax::elements::transform::VideoConvertElement;
-use parallax::elements::{AacDecoder, AutoVideoSink, H264Decoder};
+use parallax::elements::{AacDecoder, AutoVideoSink, H264Decoder, VideoKey, VideoWindowEvent};
 use parallax::pipeline::{EndReason, Executor, LinkPolicy, Pipeline};
 use std::fs::File;
 use std::io::BufReader;
@@ -65,10 +66,17 @@ struct AudioParams {
     channels: u32,
 }
 
+/// Everything `play` needs from the container probe.
+struct Probed {
+    demux: Mp4Demux<BufReader<File>>,
+    width: u32,
+    height: u32,
+    audio: Option<AudioParams>,
+    duration_ns: u64,
+}
+
 /// Open the file and describe it; error out early on things we cannot play.
-fn open_and_probe(
-    args: &Args,
-) -> anyhow::Result<(Mp4Demux<BufReader<File>>, u32, u32, Option<AudioParams>)> {
+fn open_and_probe(args: &Args) -> anyhow::Result<Probed> {
     let file =
         File::open(&args.file).with_context(|| format!("cannot open {}", args.file.display()))?;
     let size = file.metadata()?.len();
@@ -141,7 +149,85 @@ fn open_and_probe(
             })
         });
 
-    Ok((demux, width, height, audio))
+    let duration_ns = demux.duration_ns();
+    Ok(Probed {
+        demux,
+        width,
+        height,
+        audio,
+        duration_ns,
+    })
+}
+
+/// The player's control commands, from window keys or the terminal.
+enum Command {
+    PauseToggle,
+    SeekBy(i64),
+    Fullscreen,
+    Quit,
+}
+
+fn command_for_key(key: &VideoKey) -> Option<Command> {
+    match key {
+        VideoKey::Space => Some(Command::PauseToggle),
+        VideoKey::ArrowLeft => Some(Command::SeekBy(-10)),
+        VideoKey::ArrowRight => Some(Command::SeekBy(10)),
+        VideoKey::Escape => Some(Command::Quit),
+        VideoKey::Enter => Some(Command::Fullscreen),
+        VideoKey::Character(c) => match c.as_str() {
+            "q" => Some(Command::Quit),
+            "f" => Some(Command::Fullscreen),
+            " " => Some(Command::PauseToggle),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Raw-mode terminal keys, mapped onto the same commands as the window's.
+///
+/// Raw mode swallows the terminal's own Ctrl-C handling, so it is mapped to
+/// Quit here explicitly. Only armed when stdin is a terminal.
+fn command_for_terminal() -> Option<Command> {
+    use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, poll, read};
+    while poll(std::time::Duration::ZERO).unwrap_or(false) {
+        if let Ok(Event::Key(key)) = read() {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                return Some(Command::Quit);
+            }
+            return match key.code {
+                KeyCode::Char(' ') => Some(Command::PauseToggle),
+                KeyCode::Left => Some(Command::SeekBy(-10)),
+                KeyCode::Right => Some(Command::SeekBy(10)),
+                KeyCode::Char('q') | KeyCode::Esc => Some(Command::Quit),
+                KeyCode::Char('f') => Some(Command::Fullscreen),
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
+/// Keep raw mode strictly scoped to the playback loop, whatever exit path.
+struct RawMode(bool);
+
+impl RawMode {
+    fn enable() -> Self {
+        use crossterm::tty::IsTty;
+        let armed = std::io::stdin().is_tty() && crossterm::terminal::enable_raw_mode().is_ok();
+        RawMode(armed)
+    }
+}
+
+impl Drop for RawMode {
+    fn drop(&mut self) {
+        if self.0 {
+            let _ = crossterm::terminal::disable_raw_mode();
+        }
+    }
 }
 
 /// Build the audio branch's fallible pieces, explaining a fallback to
@@ -185,7 +271,13 @@ fn audio_branch(
 
 /// One playback pass: build the pipeline, run it to EOS / close / Ctrl-C.
 async fn play(args: &Args) -> anyhow::Result<Outcome> {
-    let (demux, width, height, audio) = open_and_probe(args)?;
+    let Probed {
+        demux,
+        width,
+        height,
+        audio,
+        duration_ns,
+    } = open_and_probe(args)?;
     let audio = audio_branch(args, audio);
 
     // Without an audio branch the video-only source keeps the audio pad from
@@ -243,6 +335,9 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
         .context("failed to start the pipeline")?;
     let mut ended = handle.ended();
 
+    println!("controls: Space pause · ←/→ seek 10s · f fullscreen · q quit");
+    let raw_mode = RawMode::enable();
+
     // The window opens lazily on the first displayed frame, so is_open()
     // starts out false — only treat false as "closed" after it was seen open.
     let mut window_seen = false;
@@ -268,7 +363,40 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
                 handle.stop();
                 break Outcome::Stop;
             }
-            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
+                let mut commands = Vec::new();
+                while let Some(event) = window.try_event() {
+                    if let VideoWindowEvent::KeyPressed(key) = event
+                        && let Some(cmd) = command_for_key(&key)
+                    {
+                        commands.push(cmd);
+                    }
+                }
+                if let Some(cmd) = command_for_terminal() {
+                    commands.push(cmd);
+                }
+                for cmd in commands {
+                    match cmd {
+                        Command::PauseToggle => {
+                            if handle.is_paused() {
+                                handle.resume();
+                            } else {
+                                handle.pause();
+                            }
+                        }
+                        Command::SeekBy(secs) => {
+                            let position = handle.position().to_option()
+                                .map(|p| p.nanos() as i64)
+                                .unwrap_or(0);
+                            let target = (position + secs * 1_000_000_000)
+                                .clamp(0, duration_ns.saturating_sub(1) as i64);
+                            handle.seek_time(ClockTime::from_nanos(target as u64)).await;
+                        }
+                        Command::Fullscreen => window.set_fullscreen(!window.is_fullscreen()),
+                        Command::Quit => handle.stop(),
+                    }
+                }
+
                 if window.is_open() {
                     window_seen = true;
                 } else if window_seen {
@@ -278,6 +406,7 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
         }
     };
 
+    drop(raw_mode);
     let _ = handle.wait().await;
     Ok(outcome)
 }
