@@ -11,6 +11,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   SENSOR_FEATURES: zenoh,h264,v4l2,rtp,rtsp,image-jpeg,hotplug
+  # Pure-Rust media/container combo (no system libs needed)
+  MEDIA_FEATURES: mp4-demux,mkv-demux,audio-aac,audio-vorbis
   # shared compiler cache: sccache (mounted from the runner VM) -> garage S3
   # on vm-runner-01; S3 endpoint+credentials come from the runner's env_file
   RUSTC_WRAPPER: /srv/cache/bin/sccache
@@ -39,6 +41,7 @@ jobs:
           cache-targets: false
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo clippy --all-targets --features "$SENSOR_FEATURES,image-codecs,zenoh-unstable" -- -D warnings
+      - run: cargo clippy --all-targets --features "$MEDIA_FEATURES" -- -D warnings
 
   test:
     runs-on: ubuntu-24.04
@@ -56,6 +59,7 @@ jobs:
       - run: cargo test --doc
       - run: cargo check --all-targets --features "$SENSOR_FEATURES"
       - run: cargo nextest run --features "$SENSOR_FEATURES"
+      - run: cargo nextest run --features "$MEDIA_FEATURES"
 
   msrv:
     runs-on: ubuntu-24.04

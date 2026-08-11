@@ -202,6 +202,7 @@ let (w, h) = info.wait_for_dimensions(0).await.ok_or("session ended")?;
 | `TsDemux` `[mpeg-ts]` | MPEG-TS demuxer (programs, elementary streams) |
 | `Mp4Mux` / `Mp4MuxTransform` / `Mp4FileSink` `[mp4-demux]` | MP4 muxing as `Muxer`, transform, or all-in-one file sink; video+audio track configs |
 | `Mp4Demux` `[mp4-demux]` | MP4/MOV demuxer (tracks, samples, codec info) |
+| `MkvDemux` `[mkv-demux]` | Matroska/WebM demuxer (pure Rust via `matroska-demuxer`); source-style `Demuxer` with `video`/`audio` pads, cue-based seek with linear fallback, H.264 → Annex-B conversion; subtitle tracks listed but not routed |
 | `StreamIdDemux` | Route buffers by `stream_id` metadata |
 
 N-to-1 synchronization (PTS alignment across pads) is provided by `element::muxer::MuxerSyncState` — see [pipeline.md](pipeline.md#muxing-n-to-1).

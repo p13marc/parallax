@@ -3,6 +3,7 @@
 //! - [`StreamIdDemux`]: Demultiplex by stream ID
 //! - `TsDemux`: MPEG Transport Stream demultiplexer (requires `mpeg-ts` feature)
 //! - `Mp4Demux`: MP4/MOV container demultiplexer (requires `mp4-demux` feature)
+//! - `MkvDemux`: Matroska/WebM container demultiplexer (requires `mkv-demux` feature)
 
 mod streamid_demux;
 
@@ -11,6 +12,9 @@ mod mpegts;
 
 #[cfg(feature = "mp4-demux")]
 mod mp4;
+
+#[cfg(feature = "mkv-demux")]
+mod mkv;
 
 pub use streamid_demux::{StreamIdDemux, StreamIdDemuxStats, StreamOutput};
 
@@ -25,3 +29,6 @@ pub use mp4::{
     Mp4AudioInfo, Mp4Codec, Mp4Demux, Mp4DemuxSource, Mp4DemuxStats, Mp4Sample, Mp4SeekPoint,
     Mp4Track, Mp4TrackType, Mp4VideoInfo,
 };
+
+#[cfg(feature = "mkv-demux")]
+pub use mkv::{MkvAudioInfo, MkvCodec, MkvDemux, MkvTrack, MkvTrackType, MkvVideoInfo};

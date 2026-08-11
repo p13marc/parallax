@@ -123,6 +123,7 @@ yuv = { version = "0.8", optional = true }
 
 # Container formats (pure Rust)
 mp4 = { version = "0.14", optional = true }
+matroska-demuxer = { version = "0.8", optional = true }
 
 # Opus audio codec (bindings to libopus)
 opus = { version = "0.3", optional = true }
@@ -202,6 +203,7 @@ zenoh-unstable = ["zenoh", "zenoh/unstable"] # reliability control + matching li
 rtp = ["dep:rtp", "dep:rtcp", "dep:webrtc-util"]  # RTP/RTCP elements
 rtsp = ["rtp", "dep:retina", "dep:url"]  # RTSP client (includes RTP support)
 mpeg-ts = ["dep:mpeg2ts-reader"]  # MPEG-TS demuxer
+mkv-demux = ["dep:matroska-demuxer"]  # Matroska/WebM container demuxer
 mp4-demux = ["dep:mp4"]  # MP4/MOV container demuxer
 display = ["dep:winit", "dep:softbuffer"]  # Video display window (autovideosink)
 # Device capture (modern Linux stack)

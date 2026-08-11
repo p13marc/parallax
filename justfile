@@ -45,6 +45,15 @@ check-sensor:
     cargo nextest run --features {{sensor_features}}
     cargo clippy --all-targets --features {{sensor_features}},image-codecs,zenoh-unstable -- -D warnings
 
+# Pure-Rust media/container feature combo (mirrors CI's media checks)
+media_features := "mp4-demux,mkv-demux,audio-aac,audio-vorbis"
+
+# Check + test + lint the media/container combo (mirrors CI)
+check-media:
+    cargo check --all-targets --features {{media_features}}
+    cargo nextest run --features {{media_features}}
+    cargo clippy --all-targets --features {{media_features}} -- -D warnings
+
 # Check + test + lint the V4L2 M2M hardware encoder (mirrors CI's test-v4l2-m2m job).
 # Needs libclang + kernel headers (on immutable Fedora: run inside a toolbox).
 # Live queue test: modprobe vicodec, then PARALLAX_VICODEC_TEST_DEVICE=auto just check-m2m

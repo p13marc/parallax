@@ -208,6 +208,9 @@ pub use demux::{
     Mp4Track, Mp4TrackType, Mp4VideoInfo,
 };
 
+#[cfg(feature = "mkv-demux")]
+pub use demux::{MkvAudioInfo, MkvCodec, MkvDemux, MkvTrack, MkvTrackType, MkvVideoInfo};
+
 // Mux
 #[cfg(feature = "mp4-demux")]
 pub use mux::{
