@@ -522,6 +522,41 @@ fn split_url_credentials(url_str: &str) -> Result<(Url, Option<RtspCredentials>)
     Ok((url, credentials))
 }
 
+/// Parse `a=framesize:<pt> <width>-<height>` attributes from a raw SDP.
+///
+/// Entry `i` of the result corresponds to the i-th `m=` section, matching
+/// retina's stream order. This attribute is the *cheap* source of geometry —
+/// present in many camera SDPs whose `sprop-parameter-sets` are missing or
+/// unusable — and retina's SDP parser handles `a=framerate` but not this one
+/// (#90). Parsed here as a fallback: dimensions retina derives from real
+/// parameter sets stay authoritative.
+fn parse_sdp_framesizes(sdp: &[u8]) -> Vec<Option<(u32, u32)>> {
+    let text = String::from_utf8_lossy(sdp);
+    let mut sections: Vec<Option<(u32, u32)>> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with("m=") {
+            sections.push(None);
+        } else if let Some(rest) = line.strip_prefix("a=framesize:") {
+            // Attributes before the first m= line belong to the session
+            // section; a framesize there has no stream to attach to.
+            let Some(section) = sections.last_mut() else {
+                continue;
+            };
+            // "<pt> <width>-<height>"
+            if let Some(dims) = rest.split_whitespace().nth(1)
+                && let Some((w, h)) = dims.split_once('-')
+                && let (Ok(w), Ok(h)) = (w.parse::<u32>(), h.parse::<u32>())
+                && w > 0
+                && h > 0
+            {
+                *section = Some((w, h));
+            }
+        }
+    }
+    sections
+}
+
 // ============================================================================
 // RtspSession (Connected)
 // ============================================================================
@@ -581,6 +616,11 @@ impl RtspSession {
                 })?
                 .map_err(|e| Error::Element(format!("RTSP DESCRIBE failed: {}", e)))?;
 
+        // The SDP's own account of each stream's geometry (a=framesize) —
+        // known at connect() instead of after the first keyframe, for the
+        // cameras that send it (#90).
+        let framesizes = parse_sdp_framesizes(session.sdp());
+
         // Get stream information
         let mut streams = Vec::new();
         for (i, stream) in session.streams().iter().enumerate() {
@@ -595,8 +635,12 @@ impl RtspSession {
 
             // Parameters parsed by retina from the SDP (sprop-parameter-sets
             // etc.). Video parameters may be absent until the first frame for
-            // streams whose SDP omits them.
-            let mut dimensions = None;
+            // streams whose SDP omits them — a=framesize fills in until then,
+            // and real parameter sets override it below.
+            let mut dimensions = match media_type {
+                MediaType::Video => framesizes.get(i).copied().flatten(),
+                _ => None,
+            };
             let mut sample_rate = None;
             let mut codec_data = None;
             match stream.parameters() {
@@ -1012,6 +1056,60 @@ impl crate::element::AsyncSource for RtspSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn framesize_maps_to_its_media_section() {
+        let sdp = b"v=0\r\n\
+            o=- 0 0 IN IP4 10.0.0.1\r\n\
+            s=Camera\r\n\
+            m=video 0 RTP/AVP 96\r\n\
+            a=rtpmap:96 H264/90000\r\n\
+            a=framesize:96 1280-720\r\n\
+            m=audio 0 RTP/AVP 97\r\n\
+            a=rtpmap:97 mpeg4-generic/48000/2\r\n";
+        assert_eq!(
+            parse_sdp_framesizes(sdp),
+            vec![Some((1280, 720)), None],
+            "video section carries it, audio does not"
+        );
+    }
+
+    #[test]
+    fn framesize_outside_a_media_section_is_ignored() {
+        let sdp = b"v=0\r\na=framesize:96 640-480\r\nm=video 0 RTP/AVP 96\r\n";
+        assert_eq!(parse_sdp_framesizes(sdp), vec![None]);
+    }
+
+    #[test]
+    fn malformed_framesizes_are_ignored() {
+        for bad in [
+            "a=framesize:96",           // no dimensions
+            "a=framesize:96 1280x720",  // wrong separator
+            "a=framesize:96 0-720",     // zero width
+            "a=framesize:96 wide-tall", // not numbers
+            "a=framesize:96 1280-",     // half a pair
+        ] {
+            let sdp = format!("m=video 0 RTP/AVP 96\r\n{bad}\r\n");
+            assert_eq!(
+                parse_sdp_framesizes(sdp.as_bytes()),
+                vec![None],
+                "accepted {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn later_sections_do_not_inherit_earlier_framesizes() {
+        let sdp = b"m=video 0 RTP/AVP 96\r\n\
+            a=framesize:96 1920-1080\r\n\
+            m=video 0 RTP/AVP 98\r\n\
+            a=framesize:98 640-360\r\n\
+            m=application 0 RTP/AVP 99\r\n";
+        assert_eq!(
+            parse_sdp_framesizes(sdp),
+            vec![Some((1920, 1080)), Some((640, 360)), None]
+        );
+    }
 
     #[test]
     fn test_rtsp_src_builder() {
