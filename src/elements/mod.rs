@@ -182,7 +182,7 @@ pub use app::{
 };
 
 #[cfg(feature = "display")]
-pub use app::AutoVideoSink;
+pub use app::{AutoVideoSink, AutoVideoSinkHandle, VideoKey, VideoWindowEvent};
 
 // IPC
 pub use ipc::{IpcSink, IpcSrc, MemorySink, MemorySinkStats, MemorySrc, SharedMemorySink};

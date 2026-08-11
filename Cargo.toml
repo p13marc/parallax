@@ -338,6 +338,10 @@ required-features = ["rtsp"]
 name = "58_rtsp_display"
 required-features = ["rtsp", "h264", "display"]
 
+[[example]]
+name = "59_window_events"
+required-features = ["display"]
+
 # Streaming protocol examples (25-26): no special features required
 [[example]]
 name = "25_hls_output"

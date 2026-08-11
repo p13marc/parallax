@@ -48,7 +48,7 @@ Two coexisting generations:
 
 **Flush**: executor calls `flush()` repeatedly at EOS until it returns `None`/`Output::None` — implement it in encoders/muxers to drain buffered data.
 
-**Runtime control** (`src/control.rs`, always compiled): `Executor::start()` *moves* elements into their tasks, so `get_element_mut()` returns `None` on a running pipeline. The only way to mutate a live element is an `Arc<Atomic*>` **handle cloned before `start()`**. Every controllable element implements `Controllable`, so the accessor is always `control()`: `EncoderControl` (bitrate/GOP/QP/rate-control/skip-frames/keyframe), `EncoderStatsHandle` (read-only counters), `KeyframeHandle`, `ScaleControl`, `ThrottleControl`, `JpegQualityControl`, `ValveControl`, `GainControl` (volume, linear or dB), `FlowStateHandle`. See `docs/elements.md` § Runtime control.
+**Runtime control** (`src/control.rs`, always compiled): `Executor::start()` *moves* elements into their tasks, so `get_element_mut()` returns `None` on a running pipeline. The only way to mutate a live element is an `Arc<Atomic*>` **handle cloned before `start()`**. Every controllable element implements `Controllable`, so the accessor is always `control()`: `EncoderControl` (bitrate/GOP/QP/rate-control/skip-frames/keyframe), `EncoderStatsHandle` (read-only counters), `KeyframeHandle`, `ScaleControl`, `ThrottleControl`, `JpegQualityControl`, `ValveControl`, `GainControl` (volume, linear or dB), `FlowStateHandle`, `AutoVideoSinkHandle` (#74: window events — `VideoWindowEvent`/`VideoKey` over a bounded lossy channel, `try_event`/`event_timeout` — plus `set_fullscreen(bool)`; taken via `sink.handle()` *before* start, no handle = no events). See `docs/elements.md` § Runtime control.
 
 **Geometry-in-Metadata invariant**: geometry travels in-band. **No element takes dimensions at construction** — `H264EncoderConfig::new()`, `JpegEncoder::new()`, `PngEncoder::new()`, `VideoScale::new()`, `EncoderElement::new(enc)`, `HwEncoderElement::new(enc)`, `Rav1eConfig::default()` and `V4l2M2mEncoderConfig::new()` are all dimension-free. An element that cannot determine its geometry from `Metadata` **errors**; it never falls back to a stale constructor value. Lazily-built state (an output arena, a rav1e context, the V4L2 M2M driver queues) is created on the first frame and rebuilt on a resize.
 
@@ -66,7 +66,7 @@ Two coexisting generations:
 
 - Strictly **linear chains**: `elem prop=val ! elem ...`. NO caps filters, NO tee branching (`t. !`), NO bins. Fan-out requires the programmatic API.
 - Property values: quoted strings, bare words, ints, floats, bools (`true/false/yes/no`).
-- Registered factory names (only these work in `parse`): `nullsource`, `nullsink`, `passthrough`, `tee`, `filesrc`, `filesink`, `videoconvert`, `videotestsrc`, + `autovideosink` [display] (props `title`, `width`+`height`, `sync`, `max-lateness-ms`), `v4l2src` [v4l2]. Extendable via `ElementFactory::with_plugin_registry`. Do NOT write doc examples with unregistered names like `decoder`, `audiosrc`, `h264enc`.
+- Registered factory names (only these work in `parse`): `nullsource`, `nullsink`, `passthrough`, `tee`, `filesrc`, `filesink`, `videoconvert`, `videotestsrc`, + `autovideosink` [display] (props `title`, `width`+`height`, `sync`, `max-lateness-ms`; blit is aspect-preserving letterboxed since #74), `v4l2src` [v4l2]. Extendable via `ElementFactory::with_plugin_registry`. Do NOT write doc examples with unregistered names like `decoder`, `audiosrc`, `h264enc`.
 
 ### States (PipeWire-inspired)
 

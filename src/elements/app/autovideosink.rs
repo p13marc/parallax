@@ -166,6 +166,123 @@ pub struct AutoVideoSink {
     pacer: PtsPacer,
     /// Frames dropped for being late or for a full display channel.
     dropped: u64,
+    /// Window-event channel, created when [`handle`](Self::handle) is called.
+    /// `None` means no handle was taken and the event loop sends nothing —
+    /// exactly the historical behavior.
+    events: Option<(
+        kanal::Sender<VideoWindowEvent>,
+        kanal::Receiver<VideoWindowEvent>,
+    )>,
+    /// Desired fullscreen state, polled by the event loop.
+    fullscreen: Arc<AtomicBool>,
+}
+
+/// A key press from the video window, winit-agnostic.
+///
+/// The named variants cover what a player binds (transport control); anything
+/// else arrives as [`Character`](Self::Character) text or a named
+/// [`Other`](Self::Other).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VideoKey {
+    /// A printable character key, as text (e.g. `"q"`).
+    Character(String),
+    /// The space bar.
+    Space,
+    /// Escape.
+    Escape,
+    /// Enter/Return.
+    Enter,
+    /// Left arrow.
+    ArrowLeft,
+    /// Right arrow.
+    ArrowRight,
+    /// Up arrow.
+    ArrowUp,
+    /// Down arrow.
+    ArrowDown,
+    /// Any other key, by its winit debug name.
+    Other(String),
+}
+
+/// A user-interaction event from the video window.
+#[derive(Debug, Clone, PartialEq)]
+pub enum VideoWindowEvent {
+    /// A key was pressed (repeats are filtered out).
+    KeyPressed(VideoKey),
+    /// The left mouse button was pressed at this window position.
+    MousePressed {
+        /// X position in window coordinates.
+        x: f64,
+        /// Y position in window coordinates.
+        y: f64,
+    },
+    /// The user asked to close the window. The window *will* close and the
+    /// pipeline sees EOS via `is_open()`; this event lets the app react too.
+    CloseRequested,
+    /// The window was resized.
+    Resized {
+        /// New inner width in pixels.
+        width: u32,
+        /// New inner height in pixels.
+        height: u32,
+    },
+}
+
+/// Runtime handle to an [`AutoVideoSink`]'s window.
+///
+/// Follows the [`Controllable`](crate::control::Controllable) convention:
+/// take it (and clone it freely) **before** `Executor::start` moves the sink
+/// into its task. Events arrive on a bounded channel — a consumer that stops
+/// reading loses the oldest events, never blocks the window.
+///
+/// ```rust,ignore
+/// let mut sink = AutoVideoSink::new().with_sync(true);
+/// let window = sink.handle();                    // BEFORE start
+/// let handle = executor.start(&mut pipeline)?;
+/// while let Some(event) = window.try_event() {
+///     match event {
+///         VideoWindowEvent::KeyPressed(VideoKey::Space) => handle.pause(),
+///         VideoWindowEvent::KeyPressed(VideoKey::Escape) => handle.stop(),
+///         _ => {}
+///     }
+/// }
+/// ```
+#[derive(Clone)]
+pub struct AutoVideoSinkHandle {
+    events: kanal::Receiver<VideoWindowEvent>,
+    fullscreen: Arc<AtomicBool>,
+    running: Arc<AtomicBool>,
+}
+
+impl AutoVideoSinkHandle {
+    /// Next pending window event, if any. Non-blocking.
+    pub fn try_event(&self) -> Option<VideoWindowEvent> {
+        self.events.try_recv().ok().flatten()
+    }
+
+    /// Wait for the next window event, giving up after `timeout`.
+    pub fn event_timeout(&self, timeout: Duration) -> Option<VideoWindowEvent> {
+        self.events.recv_timeout(timeout).ok()
+    }
+
+    /// Ask the window to enter or leave borderless fullscreen.
+    ///
+    /// Applied by the event loop within one poll iteration; safe to call from
+    /// any thread, before or after the window exists.
+    pub fn set_fullscreen(&self, fullscreen: bool) {
+        self.fullscreen.store(fullscreen, Ordering::SeqCst);
+    }
+
+    /// Whether fullscreen is currently requested.
+    pub fn is_fullscreen(&self) -> bool {
+        self.fullscreen.load(Ordering::SeqCst)
+    }
+
+    /// Whether the display window is still open (mirrors
+    /// [`AutoVideoSink::is_open`]).
+    pub fn is_open(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
 }
 
 impl AutoVideoSink {
@@ -183,6 +300,26 @@ impl AutoVideoSink {
             max_lateness: DEFAULT_MAX_LATENESS,
             pacer: PtsPacer::default(),
             dropped: 0,
+            events: None,
+            fullscreen: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Runtime handle to the window: events + fullscreen control.
+    ///
+    /// Must be taken **before** `Executor::start` moves the sink into its
+    /// task (the [`Controllable`](crate::control::Controllable) convention).
+    /// A sink whose handle was never taken sends no events at all.
+    pub fn handle(&mut self) -> AutoVideoSinkHandle {
+        // Bounded and lossy on the sender side: the window must never block
+        // on a consumer that stopped reading.
+        let (_, rx) = self
+            .events
+            .get_or_insert_with(|| kanal::bounded::<VideoWindowEvent>(64));
+        AutoVideoSinkHandle {
+            events: rx.clone(),
+            fullscreen: self.fullscreen.clone(),
+            running: self.running.clone(),
         }
     }
 
@@ -255,13 +392,21 @@ impl AutoVideoSink {
 
         let running = Arc::clone(&self.running);
         let title = self.title.clone();
+        let events_tx = self.events.as_ref().map(|(tx, _)| tx.clone());
+        let fullscreen = self.fullscreen.clone();
 
         running.store(true, Ordering::SeqCst);
 
         let handle = thread::spawn(move || {
-            if let Err(e) =
-                run_display_loop(receiver, running, &title, initial_width, initial_height)
-            {
+            if let Err(e) = run_display_loop(
+                receiver,
+                running,
+                &title,
+                initial_width,
+                initial_height,
+                events_tx,
+                fullscreen,
+            ) {
                 eprintln!("Display error: {}", e);
             }
         });
@@ -446,19 +591,23 @@ fn detect_dimensions(size: usize) -> (u32, u32) {
 }
 
 /// Run the winit display loop in the display thread.
+#[allow(clippy::too_many_arguments)]
 fn run_display_loop(
     receiver: mpsc::Receiver<DisplayFrame>,
     running: Arc<AtomicBool>,
     title: &str,
     initial_width: u32,
     initial_height: u32,
+    events_tx: Option<kanal::Sender<VideoWindowEvent>>,
+    fullscreen: Arc<AtomicBool>,
 ) -> Result<()> {
     use winit::application::ApplicationHandler;
     use winit::dpi::LogicalSize;
-    use winit::event::WindowEvent;
+    use winit::event::{ElementState, MouseButton, WindowEvent};
     use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+    use winit::keyboard::{Key, NamedKey};
     use winit::platform::x11::EventLoopBuilderExtX11;
-    use winit::window::{Window, WindowAttributes, WindowId};
+    use winit::window::{Fullscreen, Window, WindowAttributes, WindowId};
 
     struct VideoApp {
         window: Option<std::rc::Rc<Window>>,
@@ -470,6 +619,23 @@ fn run_display_loop(
         title: String,
         initial_width: u32,
         initial_height: u32,
+        events_tx: Option<kanal::Sender<VideoWindowEvent>>,
+        /// Desired state, set by the handle; compared against `is_fullscreen`.
+        fullscreen: Arc<AtomicBool>,
+        is_fullscreen: bool,
+        /// Last cursor position, for MousePressed coordinates.
+        cursor: (f64, f64),
+    }
+
+    impl VideoApp {
+        /// Best-effort event delivery: a full channel drops the event (the
+        /// consumer stopped reading) and a missing sender means no handle was
+        /// ever taken.
+        fn emit(&self, event: VideoWindowEvent) {
+            if let Some(tx) = &self.events_tx {
+                let _ = tx.try_send(event);
+            }
+        }
     }
 
     impl ApplicationHandler for VideoApp {
@@ -523,17 +689,51 @@ fn run_display_loop(
         ) {
             match event {
                 WindowEvent::CloseRequested => {
+                    self.emit(VideoWindowEvent::CloseRequested);
                     self.running.store(false, Ordering::SeqCst);
                     event_loop.exit();
                 }
                 WindowEvent::RedrawRequested => {
                     self.render();
                 }
-                WindowEvent::Resized(_) => {
+                WindowEvent::Resized(size) => {
+                    self.emit(VideoWindowEvent::Resized {
+                        width: size.width,
+                        height: size.height,
+                    });
                     // Surface will be resized on next render
                     if let Some(window) = &self.window {
                         window.request_redraw();
                     }
+                }
+                WindowEvent::KeyboardInput { event, .. } => {
+                    if event.state == ElementState::Pressed && !event.repeat {
+                        let key = match &event.logical_key {
+                            Key::Named(NamedKey::Space) => VideoKey::Space,
+                            Key::Named(NamedKey::Escape) => VideoKey::Escape,
+                            Key::Named(NamedKey::Enter) => VideoKey::Enter,
+                            Key::Named(NamedKey::ArrowLeft) => VideoKey::ArrowLeft,
+                            Key::Named(NamedKey::ArrowRight) => VideoKey::ArrowRight,
+                            Key::Named(NamedKey::ArrowUp) => VideoKey::ArrowUp,
+                            Key::Named(NamedKey::ArrowDown) => VideoKey::ArrowDown,
+                            Key::Character(text) => VideoKey::Character(text.to_string()),
+                            other => VideoKey::Other(format!("{other:?}")),
+                        };
+                        self.emit(VideoWindowEvent::KeyPressed(key));
+                    }
+                }
+                WindowEvent::CursorMoved { position, .. } => {
+                    self.cursor = (position.x, position.y);
+                }
+                WindowEvent::MouseInput {
+                    state: ElementState::Pressed,
+                    button: MouseButton::Left,
+                    ..
+                } => {
+                    self.emit(VideoWindowEvent::MousePressed {
+                        x: self.cursor.0,
+                        y: self.cursor.1,
+                    });
                 }
                 _ => {}
             }
@@ -544,6 +744,19 @@ fn run_display_loop(
             if !self.running.load(Ordering::SeqCst) {
                 event_loop.exit();
                 return;
+            }
+
+            // Apply a fullscreen request from the handle.
+            let want_fullscreen = self.fullscreen.load(Ordering::SeqCst);
+            if want_fullscreen != self.is_fullscreen
+                && let Some(window) = &self.window
+            {
+                window.set_fullscreen(if want_fullscreen {
+                    Some(Fullscreen::Borderless(None))
+                } else {
+                    None
+                });
+                self.is_fullscreen = want_fullscreen;
             }
 
             // Check for ONE new frame (don't drain - render each frame)
@@ -611,6 +824,10 @@ fn run_display_loop(
         title: title.to_string(),
         initial_width,
         initial_height,
+        events_tx,
+        fullscreen,
+        is_fullscreen: false,
+        cursor: (0.0, 0.0),
     };
 
     event_loop
@@ -623,23 +840,43 @@ fn blit_frame(frame: &DisplayFrame, buffer: &mut [u32], dst_width: usize, dst_he
     let src_width = frame.width as usize;
     let src_height = frame.height as usize;
 
-    if src_width == 0 || src_height == 0 {
+    if src_width == 0 || src_height == 0 || dst_width == 0 || dst_height == 0 {
         return;
     }
 
-    // Simple nearest-neighbor scaling
-    for dst_y in 0..dst_height {
-        let src_y = (dst_y * src_height) / dst_height;
-        for dst_x in 0..dst_width {
-            let src_x = (dst_x * src_width) / dst_width;
+    // Aspect-preserving letterbox: scale to fit, center, black bars around.
+    // Stretching to the window distorted anything whose aspect ratio did not
+    // match — obvious the moment a 16:9 stream met a fullscreen 16:10 panel.
+    let (out_width, out_height) = if src_width * dst_height >= src_height * dst_width {
+        // Width-bound: pillar-free, bars top/bottom.
+        (dst_width, (src_height * dst_width / src_width).max(1))
+    } else {
+        // Height-bound: bars left/right.
+        ((src_width * dst_height / src_height).max(1), dst_height)
+    };
+    let x0 = (dst_width - out_width) / 2;
+    let y0 = (dst_height - out_height) / 2;
 
+    for dst_y in 0..dst_height {
+        for dst_x in 0..dst_width {
+            let idx = dst_y * dst_width + dst_x;
+            let inside =
+                (x0..x0 + out_width).contains(&dst_x) && (y0..y0 + out_height).contains(&dst_y);
+            if !inside {
+                buffer[idx] = 0; // letterbox bar
+                continue;
+            }
+
+            // Nearest-neighbor within the letterboxed rectangle.
+            let src_x = ((dst_x - x0) * src_width) / out_width;
+            let src_y = ((dst_y - y0) * src_height) / out_height;
             let src_idx = (src_y * src_width + src_x) * 4;
             if src_idx + 3 < frame.data.len() {
                 let r = frame.data[src_idx] as u32;
                 let g = frame.data[src_idx + 1] as u32;
                 let b = frame.data[src_idx + 2] as u32;
                 // softbuffer expects 0xRRGGBB format (no alpha, RGB in low 24 bits)
-                buffer[dst_y * dst_width + dst_x] = (r << 16) | (g << 8) | b;
+                buffer[idx] = (r << 16) | (g << 8) | b;
             }
         }
     }
@@ -648,6 +885,59 @@ fn blit_frame(frame: &DisplayFrame, buffer: &mut [u32], dst_width: usize, dst_he
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn letterbox_centers_and_paints_bars_black() {
+        // 2x2 white frame into a 4x2 window: 1:1 content in the middle two
+        // columns, black pillars on columns 0 and 3.
+        let frame = DisplayFrame {
+            data: vec![0xFF; 2 * 2 * 4],
+            width: 2,
+            height: 2,
+        };
+        let mut buffer = vec![0x123456u32; 4 * 2];
+        blit_frame(&frame, &mut buffer, 4, 2);
+
+        for y in 0..2 {
+            assert_eq!(buffer[y * 4], 0, "left pillar is black");
+            assert_eq!(buffer[y * 4 + 3], 0, "right pillar is black");
+            assert_eq!(buffer[y * 4 + 1], 0xFFFFFF, "content");
+            assert_eq!(buffer[y * 4 + 2], 0xFFFFFF, "content");
+        }
+    }
+
+    #[test]
+    fn matching_aspect_fills_the_window() {
+        let frame = DisplayFrame {
+            data: vec![0xFF; 2 * 2 * 4],
+            width: 2,
+            height: 2,
+        };
+        let mut buffer = vec![0u32; 8 * 8];
+        blit_frame(&frame, &mut buffer, 8, 8);
+        assert!(buffer.iter().all(|p| *p == 0xFFFFFF), "no bars");
+    }
+
+    #[test]
+    fn handle_events_flow_and_fullscreen_toggles() {
+        let mut sink = AutoVideoSink::new();
+        let handle = sink.handle();
+        let handle2 = handle.clone();
+
+        assert_eq!(handle.try_event(), None);
+        // The element side owns the sender; emit as the event loop would.
+        let (tx, _) = sink.events.as_ref().unwrap().clone();
+        tx.try_send(VideoWindowEvent::KeyPressed(VideoKey::Space))
+            .unwrap();
+        assert_eq!(
+            handle.try_event(),
+            Some(VideoWindowEvent::KeyPressed(VideoKey::Space))
+        );
+
+        assert!(!handle2.is_fullscreen());
+        handle2.set_fullscreen(true);
+        assert!(handle.is_fullscreen());
+    }
 
     #[test]
     fn test_detect_dimensions() {

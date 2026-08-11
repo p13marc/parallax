@@ -17,4 +17,4 @@ pub use appsink::{AppSink, AppSinkHandle, AppSinkStats, Pulled};
 pub use appsrc::{AppSrc, AppSrcHandle, AppSrcStats};
 
 #[cfg(feature = "display")]
-pub use autovideosink::AutoVideoSink;
+pub use autovideosink::{AutoVideoSink, AutoVideoSinkHandle, VideoKey, VideoWindowEvent};
