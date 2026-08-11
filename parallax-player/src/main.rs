@@ -17,7 +17,7 @@ use parallax::elements::device::{AlsaFormat, AlsaSampleFormat, AlsaSink};
 use parallax::elements::transform::VideoConvertElement;
 use parallax::elements::{
     AacDecoder, AutoVideoSink, Dav1dDecoder, H264Decoder, OpusDecoder, VideoKey, VideoWindowEvent,
-    VpxDecoder,
+    VorbisDecoder, VpxDecoder,
 };
 use parallax::pipeline::typefind::{MediaType, TypeFindRegistry};
 use parallax::pipeline::{EndReason, Executor, LinkPolicy, Pipeline};
@@ -463,6 +463,7 @@ impl Drop for RawMode {
 enum AudioDec {
     Aac(AudioDecoderElement<AacDecoder>),
     Opus(AudioDecoderElement<OpusDecoder>),
+    Vorbis(AudioDecoderElement<VorbisDecoder>),
 }
 
 /// Build the audio branch's fallible pieces, explaining a fallback to
@@ -513,6 +514,22 @@ fn audio_branch(args: &Args, audio: Option<&AudioStream>) -> Option<(AudioDec, A
                 }
             }
         }
+        AudioCodecKind::Vorbis => {
+            let Some(private) = &stream.extradata else {
+                println!("Vorbis track has no CodecPrivate headers — video only");
+                return None;
+            };
+            match VorbisDecoder::from_codec_private(private) {
+                Ok(d) => (
+                    AudioDec::Vorbis(AudioDecoderElement::new(d)),
+                    AlsaSampleFormat::F32LE,
+                ),
+                Err(e) => {
+                    println!("audio decoder unavailable ({e}) — video only");
+                    return None;
+                }
+            }
+        }
         other => {
             println!("audio track is {other} — decode not wired up yet, video only");
             return None;
@@ -520,7 +537,7 @@ fn audio_branch(args: &Args, audio: Option<&AudioStream>) -> Option<(AudioDec, A
     };
 
     let sample_rate = match decoder {
-        AudioDec::Aac(_) => stream.sample_rate,
+        AudioDec::Aac(_) | AudioDec::Vorbis(_) => stream.sample_rate,
         AudioDec::Opus(_) => 48_000,
     };
     let format = AlsaFormat {
@@ -624,6 +641,7 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
         let adec = match audio_decoder {
             AudioDec::Aac(d) => pipeline.add_transform("audiodec", d),
             AudioDec::Opus(d) => pipeline.add_transform("audiodec", d),
+            AudioDec::Vorbis(d) => pipeline.add_transform("audiodec", d),
         };
         let aout = pipeline.add_async_sink("speaker", alsa_sink);
         // ~2 s of audio read-ahead at ~20 ms per packet.

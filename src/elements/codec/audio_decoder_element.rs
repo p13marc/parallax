@@ -133,6 +133,13 @@ impl<D: AudioDecoder + 'static> Transform for AudioDecoderElement<D> {
         // Decode packet
         let mut samples = self.decoder.decode(packet)?;
 
+        // A packet can legitimately decode to nothing (Vorbis primes its
+        // MDCT window on the first packet after init/seek) — emitting an
+        // empty buffer downstream helps nobody.
+        if samples.samples_per_channel == 0 {
+            return Ok(Output::None);
+        }
+
         // Set timestamp
         samples.pts = if input_pts != 0 {
             input_pts

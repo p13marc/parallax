@@ -277,6 +277,10 @@ pub use codec::AacEncoder;
 #[cfg(feature = "audio-aac")]
 pub use codec::AacDecoder;
 
+// Audio codecs - streaming Vorbis decoder (symphonia)
+#[cfg(feature = "audio-vorbis")]
+pub use codec::VorbisDecoder;
+
 // Audio codec traits and wrappers (always available when any audio codec is enabled)
 #[cfg(any(
     feature = "audio-flac",

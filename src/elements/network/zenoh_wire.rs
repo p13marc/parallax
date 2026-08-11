@@ -166,6 +166,7 @@ pub fn audio_codec_to_code(codec: AudioCodec) -> u8 {
         AudioCodec::Mp3 => 2,
         AudioCodec::Pcmu => 3,
         AudioCodec::Pcma => 4,
+        AudioCodec::Vorbis => 5,
     }
 }
 
@@ -177,6 +178,7 @@ pub fn audio_codec_from_code(code: u8) -> Option<AudioCodec> {
         2 => AudioCodec::Mp3,
         3 => AudioCodec::Pcmu,
         4 => AudioCodec::Pcma,
+        5 => AudioCodec::Vorbis,
         _ => return None,
     })
 }
@@ -415,6 +417,7 @@ pub fn encoding_for_format(format: Option<&MediaFormat>) -> zenoh::bytes::Encodi
         Some(MediaFormat::Audio(AudioCodec::Mp3)) => Encoding::from("audio/mpeg"),
         Some(MediaFormat::Audio(AudioCodec::Pcmu)) => Encoding::from("audio/PCMU"),
         Some(MediaFormat::Audio(AudioCodec::Pcma)) => Encoding::from("audio/PCMA"),
+        Some(MediaFormat::Audio(AudioCodec::Vorbis)) => Encoding::from("audio/vorbis"),
         Some(MediaFormat::AudioRaw(af)) => Encoding::from("audio/raw").with_schema(format!(
             "{:?};{}ch;{}Hz",
             af.sample_format, af.channels, af.sample_rate
@@ -561,6 +564,7 @@ mod tests {
             AudioCodec::Mp3,
             AudioCodec::Pcmu,
             AudioCodec::Pcma,
+            AudioCodec::Vorbis,
         ] {
             assert_eq!(
                 audio_codec_from_code(audio_codec_to_code(codec)),

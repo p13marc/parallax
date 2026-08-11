@@ -711,3 +711,68 @@ mod geometry_in_metadata {
         assert!(err.contains("set_video_dims"), "unhelpful error: {err}");
     }
 }
+
+// ============================================================================
+// Streaming Vorbis decoder (#126)
+// ============================================================================
+
+#[cfg(all(feature = "audio-vorbis", feature = "mkv-demux"))]
+mod vorbis_streaming_tests {
+    use parallax::element::{Demuxer, DemuxerProduce};
+    use parallax::elements::VorbisDecoder;
+    use parallax::elements::codec::AudioDecoder;
+    use parallax::elements::demux::MkvDemux;
+    use std::io::Cursor;
+
+    const VP8_VORBIS_WEBM: &[u8] = include_bytes!("fixtures/tiny_vp8_vorbis.webm");
+
+    /// Decode the Vorbis track demuxed from the WebM fixture: headers from
+    /// CodecPrivate, packets straight from the container.
+    #[test]
+    fn decodes_demuxed_vorbis_track() {
+        let mut demux = MkvDemux::new(Cursor::new(VP8_VORBIS_WEBM.to_vec())).unwrap();
+        let track = demux.audio_track().unwrap();
+        let private = track
+            .audio_info
+            .as_ref()
+            .unwrap()
+            .codec_private
+            .clone()
+            .expect("Xiph-laced CodecPrivate");
+        let declared_rate = track.audio_info.as_ref().unwrap().sample_rate;
+
+        let mut dec = VorbisDecoder::from_codec_private(&private).unwrap();
+        assert_eq!(dec.output_sample_rate(), declared_rate);
+        assert_eq!(dec.output_channels(), 1, "mono sine fixture");
+
+        let mut samples_out = 0usize;
+        loop {
+            match demux.produce().unwrap() {
+                DemuxerProduce::Routed(routed) => {
+                    for (pad, buf) in routed {
+                        if pad.0 != 1 {
+                            continue; // audio pad only
+                        }
+                        let out = dec.decode(buf.as_bytes()).unwrap();
+                        samples_out += out.samples_per_channel;
+                        if out.samples_per_channel > 0 {
+                            assert_eq!(out.sample_rate, declared_rate);
+                            assert_eq!(
+                                out.data.len(),
+                                out.samples_per_channel * out.channels as usize * 4,
+                                "interleaved f32 bytes"
+                            );
+                        }
+                    }
+                }
+                DemuxerProduce::Eos => break,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        // ~1 s of audio at 44.1 kHz.
+        assert!(
+            samples_out > 30_000,
+            "decoded ~1s of PCM, got {samples_out} samples/ch"
+        );
+    }
+}

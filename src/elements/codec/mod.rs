@@ -224,6 +224,12 @@ mod aac_decoder;
 #[cfg(feature = "audio-aac")]
 pub use aac_decoder::AacDecoder;
 
+// Streaming Vorbis decoder (symphonia) — same shape for demuxed packets.
+#[cfg(feature = "audio-vorbis")]
+mod vorbis_decoder;
+#[cfg(feature = "audio-vorbis")]
+pub use vorbis_decoder::VorbisDecoder;
+
 // Image codecs
 #[cfg(any(feature = "image-jpeg", feature = "image-png"))]
 mod image;
