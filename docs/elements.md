@@ -161,6 +161,7 @@ let (w, h) = info.wait_for_dimensions(0).await.ok_or("session ended")?;
 | `BufferTrim` / `BufferSlice` / `BufferPad` | Trim to max / extract range / pad to min |
 | `BufferSplit` / `BufferJoin` / `BufferConcat` | Split/join at delimiters; concatenate |
 | `Gain` | RT-safe audio gain (PCM multiply) |
+| `AudioDownmix` | 5.1/7.1 → stereo fold-down (ITU-R BS.775, LFE dropped, clip-safe normalization); channel count and sample format read per buffer from `MediaFormat::AudioRaw` metadata, rewritten to 2 ch on output; mono/stereo pass through zero-copy |
 | `VideoScale` | Resize frames in **any** format the scaler engine supports (I420, NV12, RGB24, BGR24, RGBA, BGRA, Gray8, YUYV, UYVY) — it reads the pixel format from the buffer and errors if the buffer does not declare one. `ScaleMode` picks the filter; source geometry comes from the buffer, target is retargetable at runtime via `ScaleControl` (see [Runtime control](#runtime-control-bandwidth-knobs)). Target == source is a zero-copy passthrough |
 | `VideoConvertElement` | Pixel-format conversion (see [formats.md](formats.md)); format and dimensions from buffer metadata, then `with_input_format`/`with_size`, then buffer-size auto-detection — and re-negotiated when they change mid-stream |
 | `AudioConvertElement` | Sample-format conversion (S16 ↔ F32, …) |

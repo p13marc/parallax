@@ -15,7 +15,7 @@ use parallax::elements::demux::{
     MkvCodec, MkvDemux, MkvTrackType, Mp4Codec, Mp4Demux, Mp4DemuxSource, Mp4TrackType,
 };
 use parallax::elements::device::{AlsaFormat, AlsaSampleFormat, AlsaSink};
-use parallax::elements::transform::VideoConvertElement;
+use parallax::elements::transform::{AudioDownmix, VideoConvertElement};
 use parallax::elements::{
     AacDecoder, AutoVideoSink, Dav1dDecoder, H264Decoder, OpusDecoder, VideoKey, VideoWindowEvent,
     VorbisDecoder, VpxDecoder,
@@ -558,6 +558,9 @@ fn audio_branch(args: &Args, audio: Option<&AudioStream>) -> Option<(AudioDec, A
         // Stereo fold-down happens inside the decoder.
         AudioDec::Eac3(_) => (stream.sample_rate, 2),
     };
+    // The AudioDownmix behind the decoder folds anything above stereo, so
+    // ALSA never opens with more than 2 channels.
+    let channels = channels.min(2);
     let format = AlsaFormat {
         sample_rate,
         channels,
@@ -662,10 +665,15 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
             AudioDec::Vorbis(d) => pipeline.add_transform("audiodec", d),
             AudioDec::Eac3(d) => pipeline.add_transform("audiodec", d),
         };
+        // Fold any multichannel PCM to stereo; mono/stereo pass through
+        // untouched, so this is free for the common case and keeps a
+        // future multichannel decoder from mis-sizing the sink.
+        let adownmix = pipeline.add_filter("adownmix", AudioDownmix::new());
         let aout = pipeline.add_async_sink("speaker", alsa_sink);
         // ~2 s of audio read-ahead at ~20 ms per packet.
         pipeline.link_pads_full(src, "audio", adec, "sink", LinkPolicy::Block, Some(96))?;
-        pipeline.link(adec, aout)?;
+        pipeline.link(adec, adownmix)?;
+        pipeline.link(adownmix, aout)?;
     }
 
     let executor = Executor::new();
