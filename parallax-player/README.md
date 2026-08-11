@@ -11,7 +11,7 @@ cargo run -p parallax-player -- movie.mp4
 ## Scope
 
 MP4/MOV and MKV/WebM files; video H.264, VP8, VP9 or AV1; audio AAC-LC,
-Opus or Vorbis (E-AC-3 pending); subtitle tracks are listed but not rendered.
+Opus, Vorbis or E-AC-3 (5.1 folded to stereo); subtitle tracks are listed but not rendered.
 The pipeline is built programmatically on the in-pipeline demuxers, with
 the decoder chosen from the probed codec:
 
@@ -36,7 +36,8 @@ Phase 2 — format expansion (`video-player` label):
 | #123/#124 | VP8/VP9 decode (libvpx) + codec dispatch | done |
 | #125 | AV1/Opus in MP4 | done |
 | #126 | Vorbis audio | done |
-| #127/#128 | E-AC-3 audio + 5.1 downmix | pending |
+| #127 | E-AC-3 audio (in-decoder stereo fold-down) | done |
+| #128 | Generic 5.1 downmix element | pending |
 
 The core engine work the player rides on (in-pipeline MP4 demuxing with
 per-pad routing, runtime pause/seek/position, the streaming AAC decoder,

@@ -167,6 +167,7 @@ pub fn audio_codec_to_code(codec: AudioCodec) -> u8 {
         AudioCodec::Pcmu => 3,
         AudioCodec::Pcma => 4,
         AudioCodec::Vorbis => 5,
+        AudioCodec::Eac3 => 6,
     }
 }
 
@@ -179,6 +180,7 @@ pub fn audio_codec_from_code(code: u8) -> Option<AudioCodec> {
         3 => AudioCodec::Pcmu,
         4 => AudioCodec::Pcma,
         5 => AudioCodec::Vorbis,
+        6 => AudioCodec::Eac3,
         _ => return None,
     })
 }
@@ -418,6 +420,7 @@ pub fn encoding_for_format(format: Option<&MediaFormat>) -> zenoh::bytes::Encodi
         Some(MediaFormat::Audio(AudioCodec::Pcmu)) => Encoding::from("audio/PCMU"),
         Some(MediaFormat::Audio(AudioCodec::Pcma)) => Encoding::from("audio/PCMA"),
         Some(MediaFormat::Audio(AudioCodec::Vorbis)) => Encoding::from("audio/vorbis"),
+        Some(MediaFormat::Audio(AudioCodec::Eac3)) => Encoding::from("audio/eac3"),
         Some(MediaFormat::AudioRaw(af)) => Encoding::from("audio/raw").with_schema(format!(
             "{:?};{}ch;{}Hz",
             af.sample_format, af.channels, af.sample_rate
@@ -565,6 +568,7 @@ mod tests {
             AudioCodec::Pcmu,
             AudioCodec::Pcma,
             AudioCodec::Vorbis,
+            AudioCodec::Eac3,
         ] {
             assert_eq!(
                 audio_codec_from_code(audio_codec_to_code(codec)),

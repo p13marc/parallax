@@ -19,6 +19,7 @@ parallax = { package = "parallax-pipeline", path = "..", features = [
     "simd-colorspace",
     "audio-aac",
     "audio-vorbis",
+    "eac3",
     "alsa",
 ] }
 clap = { version = "4", features = ["derive"] }

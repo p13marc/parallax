@@ -9,6 +9,7 @@ use anyhow::{Context, bail};
 use clap::Parser;
 use parallax::clock::ClockTime;
 use parallax::converters::PixelFormat;
+use parallax::elements::Eac3Decoder;
 use parallax::elements::codec::AudioDecoderElement;
 use parallax::elements::demux::{
     MkvCodec, MkvDemux, MkvTrackType, Mp4Codec, Mp4Demux, Mp4DemuxSource, Mp4TrackType,
@@ -464,6 +465,7 @@ enum AudioDec {
     Aac(AudioDecoderElement<AacDecoder>),
     Opus(AudioDecoderElement<OpusDecoder>),
     Vorbis(AudioDecoderElement<VorbisDecoder>),
+    Eac3(AudioDecoderElement<Eac3Decoder>),
 }
 
 /// Build the audio branch's fallible pieces, explaining a fallback to
@@ -530,19 +532,35 @@ fn audio_branch(args: &Args, audio: Option<&AudioStream>) -> Option<(AudioDec, A
                 }
             }
         }
+        AudioCodecKind::Eac3 => {
+            // The decoder folds 5.1 programs down to stereo internally
+            // (spec LoRo matrix), so ALSA always gets 2 channels here.
+            match Eac3Decoder::stereo(stream.sample_rate) {
+                Ok(d) => (
+                    AudioDec::Eac3(AudioDecoderElement::new(d)),
+                    AlsaSampleFormat::S16LE,
+                ),
+                Err(e) => {
+                    println!("audio decoder unavailable ({e}) — video only");
+                    return None;
+                }
+            }
+        }
         other => {
             println!("audio track is {other} — decode not wired up yet, video only");
             return None;
         }
     };
 
-    let sample_rate = match decoder {
-        AudioDec::Aac(_) | AudioDec::Vorbis(_) => stream.sample_rate,
-        AudioDec::Opus(_) => 48_000,
+    let (sample_rate, channels) = match decoder {
+        AudioDec::Aac(_) | AudioDec::Vorbis(_) => (stream.sample_rate, stream.channels),
+        AudioDec::Opus(_) => (48_000, stream.channels),
+        // Stereo fold-down happens inside the decoder.
+        AudioDec::Eac3(_) => (stream.sample_rate, 2),
     };
     let format = AlsaFormat {
         sample_rate,
-        channels: stream.channels,
+        channels,
         format: alsa_sample_format,
         ..AlsaFormat::default()
     };
@@ -642,6 +660,7 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
             AudioDec::Aac(d) => pipeline.add_transform("audiodec", d),
             AudioDec::Opus(d) => pipeline.add_transform("audiodec", d),
             AudioDec::Vorbis(d) => pipeline.add_transform("audiodec", d),
+            AudioDec::Eac3(d) => pipeline.add_transform("audiodec", d),
         };
         let aout = pipeline.add_async_sink("speaker", alsa_sink);
         // ~2 s of audio read-ahead at ~20 ms per packet.
