@@ -44,9 +44,9 @@ fn tracked<R>(f: impl FnOnce() -> R) -> (R, u64) {
 // Metadata clone budget (always compiled)
 // ============================================================================
 
-/// `Metadata::clone` is paid per frame per hop. Budget today: the custom
-/// map costs heap (table + 2 boxed u64s from `set_video_dims`); #138
-/// ratchets this to 0.
+/// `Metadata::clone` is paid per frame per hop. Since #138 the custom map
+/// stores small scalars inline in a SmallVec, so cloning after
+/// `set_video_dims` must not touch the heap at all.
 #[test]
 fn metadata_clone_budget() {
     use parallax::metadata::Metadata;
@@ -67,8 +67,8 @@ fn metadata_clone_budget() {
     let per_clone = allocs as f64 / 8.0;
     println!("metadata_clone_budget: {per_clone:.1} allocs per clone");
     assert!(
-        per_clone <= 4.0,
-        "Metadata::clone after set_video_dims: {per_clone:.1} allocs (budget 4)"
+        per_clone <= 0.0,
+        "Metadata::clone after set_video_dims: {per_clone:.1} allocs (budget 0)"
     );
 }
 
@@ -149,9 +149,9 @@ mod decode_convert {
 
     /// Steady-state heap allocations per frame through decode + convert.
     ///
-    /// Budget today (measured baseline, generous): H264Decoder does 4
-    /// payload allocs + Metadata churn, VideoConvert adds metadata churn.
-    /// #139/#140/#138 ratchet this toward <= 2.
+    /// Baseline was 12.0; #138 (inline metadata) brought it to 4.0 — the
+    /// remaining allocs are H264Decoder's per-frame payload Vecs, which
+    /// #139/#140 ratchet toward <= 2.
     #[test]
     fn decode_convert_steady_state_budget() {
         let aus = encoded_aus(24);
@@ -200,8 +200,8 @@ mod decode_convert {
         let per_frame = allocs as f64 / n;
         println!("decode_convert_steady_state: {per_frame:.1} allocs per frame");
         assert!(
-            per_frame <= 24.0,
-            "decode+convert steady state: {per_frame:.1} allocs/frame (budget 24)"
+            per_frame <= 8.0,
+            "decode+convert steady state: {per_frame:.1} allocs/frame (budget 8)"
         );
     }
 }

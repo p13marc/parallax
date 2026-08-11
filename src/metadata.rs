@@ -12,7 +12,6 @@ use crate::clock::ClockTime;
 use crate::format::MediaFormat;
 use rkyv::{Archive, Deserialize, Serialize};
 use std::any::Any;
-use std::collections::HashMap;
 
 // ============================================================================
 // Buffer Flags
@@ -336,6 +335,84 @@ impl MetaBox {
     }
 }
 
+/// A custom-metadata value with the common scalar types stored inline.
+///
+/// `Metadata` is cloned per buffer per element, so the representation of the
+/// custom map is hot-path cost: the boxed `dyn Any` fallback allocates on
+/// every clone, while the inline variants (which cover `set_video_dims`'s
+/// `"width"`/`"height"` and most `app/*` counters) clone as plain copies.
+#[derive(Clone)]
+enum MetaValue {
+    U64(u64),
+    I64(i64),
+    F64(f64),
+    Bool(bool),
+    Boxed(MetaBox),
+}
+
+impl MetaValue {
+    fn new<T: Clone + Send + Sync + std::fmt::Debug + 'static>(value: T) -> Self {
+        // Runtime specialization: `T` is 'static, so the scalar fast paths
+        // can be detected through `Any` without nightly specialization.
+        let any = &value as &dyn Any;
+        if let Some(v) = any.downcast_ref::<u64>() {
+            MetaValue::U64(*v)
+        } else if let Some(v) = any.downcast_ref::<i64>() {
+            MetaValue::I64(*v)
+        } else if let Some(v) = any.downcast_ref::<f64>() {
+            MetaValue::F64(*v)
+        } else if let Some(v) = any.downcast_ref::<bool>() {
+            MetaValue::Bool(*v)
+        } else {
+            MetaValue::Boxed(MetaBox::new(value))
+        }
+    }
+
+    fn downcast_ref<T: 'static>(&self) -> Option<&T> {
+        match self {
+            MetaValue::U64(v) => (v as &dyn Any).downcast_ref(),
+            MetaValue::I64(v) => (v as &dyn Any).downcast_ref(),
+            MetaValue::F64(v) => (v as &dyn Any).downcast_ref(),
+            MetaValue::Bool(v) => (v as &dyn Any).downcast_ref(),
+            MetaValue::Boxed(b) => b.downcast_ref(),
+        }
+    }
+
+    fn downcast_mut<T: 'static>(&mut self) -> Option<&mut T> {
+        match self {
+            MetaValue::U64(v) => (v as &mut dyn Any).downcast_mut(),
+            MetaValue::I64(v) => (v as &mut dyn Any).downcast_mut(),
+            MetaValue::F64(v) => (v as &mut dyn Any).downcast_mut(),
+            MetaValue::Bool(v) => (v as &mut dyn Any).downcast_mut(),
+            MetaValue::Boxed(b) => b.downcast_mut(),
+        }
+    }
+
+    fn into_inner<T: 'static>(self) -> Option<T> {
+        match self {
+            // Cold path (`remove`): a transient box beats duplicating the
+            // downcast logic per scalar type.
+            MetaValue::U64(v) => (Box::new(v) as Box<dyn Any>).downcast().ok().map(|b| *b),
+            MetaValue::I64(v) => (Box::new(v) as Box<dyn Any>).downcast().ok().map(|b| *b),
+            MetaValue::F64(v) => (Box::new(v) as Box<dyn Any>).downcast().ok().map(|b| *b),
+            MetaValue::Bool(v) => (Box::new(v) as Box<dyn Any>).downcast().ok().map(|b| *b),
+            MetaValue::Boxed(b) => b.into_inner(),
+        }
+    }
+}
+
+impl std::fmt::Debug for MetaValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MetaValue::U64(v) => std::fmt::Debug::fmt(v, f),
+            MetaValue::I64(v) => std::fmt::Debug::fmt(v, f),
+            MetaValue::F64(v) => std::fmt::Debug::fmt(v, f),
+            MetaValue::Bool(v) => std::fmt::Debug::fmt(v, f),
+            MetaValue::Boxed(b) => std::fmt::Debug::fmt(b, f),
+        }
+    }
+}
+
 // ============================================================================
 // Metadata
 // ============================================================================
@@ -418,7 +495,12 @@ pub struct Metadata {
     ///
     /// Use `set()`, `get()`, and related methods to access.
     /// Keys should be namespaced: `"domain/type"` (e.g., `"stanag/klv"`).
-    custom: HashMap<&'static str, MetaBox>,
+    ///
+    /// Small association list, not a hash map: entry counts are tiny (the
+    /// common case is exactly `"width"`+`"height"`, which fit the inline
+    /// capacity), a linear scan beats hashing at that size, and cloning
+    /// inline entries touches no heap.
+    custom: smallvec::SmallVec<[(&'static str, MetaValue); 2]>,
 }
 
 impl Metadata {
@@ -589,7 +671,11 @@ impl Metadata {
         key: &'static str,
         value: T,
     ) {
-        self.custom.insert(key, MetaBox::new(value));
+        let value = MetaValue::new(value);
+        match self.custom.iter_mut().find(|(k, _)| *k == key) {
+            Some(entry) => entry.1 = value,
+            None => self.custom.push((key, value)),
+        }
     }
 
     /// Record raw video dimensions, in **both** representations elements read.
@@ -699,33 +785,41 @@ impl Metadata {
     /// assert_eq!(meta.get::<u32>("app/other"), None); // Key not found
     /// ```
     pub fn get<T: 'static>(&self, key: &'static str) -> Option<&T> {
-        self.custom.get(key)?.downcast_ref()
+        self.custom
+            .iter()
+            .find(|(k, _)| *k == key)?
+            .1
+            .downcast_ref()
     }
 
     /// Get mutable custom metadata by key.
     ///
     /// Returns `None` if the key doesn't exist or the type doesn't match.
     pub fn get_mut<T: 'static>(&mut self, key: &'static str) -> Option<&mut T> {
-        self.custom.get_mut(key)?.downcast_mut()
+        self.custom
+            .iter_mut()
+            .find(|(k, _)| *k == key)?
+            .1
+            .downcast_mut()
     }
 
     /// Check if custom metadata exists for a key.
     #[inline]
     pub fn has(&self, key: &'static str) -> bool {
-        self.custom.contains_key(key)
+        self.custom.iter().any(|(k, _)| *k == key)
     }
 
     /// Remove custom metadata by key.
     ///
     /// Returns the value if it existed and matched the type.
     pub fn remove<T: 'static>(&mut self, key: &'static str) -> Option<T> {
-        let meta_box = self.custom.remove(key)?;
-        meta_box.into_inner()
+        let index = self.custom.iter().position(|(k, _)| *k == key)?;
+        self.custom.remove(index).1.into_inner()
     }
 
     /// Get all custom metadata keys.
     pub fn custom_keys(&self) -> impl Iterator<Item = &'static str> + '_ {
-        self.custom.keys().copied()
+        self.custom.iter().map(|(k, _)| *k)
     }
 
     /// Get the number of custom metadata entries.
