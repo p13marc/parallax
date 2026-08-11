@@ -308,6 +308,10 @@ pub struct OpusDecoder {
     channels: u32,
     /// Packets decoded.
     packets_in: u64,
+    /// Reused i16 decode scratch (worst-case frame, sized once).
+    pcm_scratch: Vec<i16>,
+    /// Spent output Vec handed back by the element wrapper (#143).
+    recycled: Vec<u8>,
 }
 
 impl OpusDecoder {
@@ -335,6 +339,8 @@ impl OpusDecoder {
             sample_rate,
             channels,
             packets_in: 0,
+            pcm_scratch: Vec::new(),
+            recycled: Vec::new(),
         })
     }
 
@@ -346,23 +352,27 @@ impl OpusDecoder {
 
 impl AudioDecoder for OpusDecoder {
     fn decode(&mut self, packet: &[u8]) -> Result<AudioSamples> {
-        // Maximum frame size: 120ms at 48kHz = 5760 samples per channel
-        // With stereo: 5760 * 2 = 11520 samples
+        // Maximum frame size: 120ms at 48kHz = 5760 samples per channel.
+        // The scratch is sized once and reused — a fresh zero-filled Vec
+        // per packet cost an allocation plus a 23 KB memset (#143).
         let max_samples = 5760 * self.channels as usize;
-        let mut output = vec![0i16; max_samples];
+        self.pcm_scratch.resize(max_samples, 0);
 
         let decoded_samples = self
             .decoder
-            .decode(packet, &mut output, false)
+            .decode(packet, &mut self.pcm_scratch, false)
             .map_err(|e| Error::Element(format!("Opus decode error: {:?}", e)))?;
 
         self.packets_in += 1;
 
-        // Trim to actual decoded size
-        output.truncate(decoded_samples * self.channels as usize);
-
-        // Convert to bytes
-        let bytes: Vec<u8> = output.iter().flat_map(|s| s.to_le_bytes()).collect();
+        // Pack the decoded prefix into the recycled Vec, exact-size.
+        let used = decoded_samples * self.channels as usize;
+        let mut bytes = std::mem::take(&mut self.recycled);
+        bytes.clear();
+        bytes.reserve(used * 2);
+        for s in &self.pcm_scratch[..used] {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
 
         Ok(AudioSamples {
             data: bytes,
@@ -389,6 +399,11 @@ impl AudioDecoder for OpusDecoder {
 
     fn output_format(&self) -> AudioSampleFormat {
         AudioSampleFormat::S16
+    }
+
+    fn recycle(&mut self, mut data: Vec<u8>) {
+        data.clear();
+        self.recycled = data;
     }
 }
 

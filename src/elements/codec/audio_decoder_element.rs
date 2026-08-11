@@ -157,6 +157,9 @@ impl<D: AudioDecoder + 'static> Transform for AudioDecoderElement<D> {
             .output
             .acquire(samples.data.len(), "audiodecoderelement")?;
         slot.data_mut()[..samples.data.len()].copy_from_slice(&samples.data);
+        // Hand the spent Vec back so the decoder reuses it next packet (#143).
+        let data_len = samples.data.len();
+        self.decoder.recycle(std::mem::take(&mut samples.data));
 
         // Preserve input metadata and update PTS/duration
         let mut metadata = buffer.metadata().clone();
@@ -168,7 +171,7 @@ impl<D: AudioDecoder + 'static> Transform for AudioDecoderElement<D> {
         metadata.format = Some(pcm_media_format(&samples));
 
         Ok(Output::single(Buffer::new(
-            MemoryHandle::with_len(slot, samples.data.len()),
+            MemoryHandle::with_len(slot, data_len),
             metadata,
         )))
     }

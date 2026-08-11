@@ -261,6 +261,18 @@ pub trait AudioDecoder: Send {
 
     /// Get the output sample format.
     fn output_format(&self) -> AudioSampleFormat;
+
+    /// Hand a spent output buffer back for reuse.
+    ///
+    /// [`AudioDecoderElement`] calls this with the drained
+    /// [`AudioSamples::data`] Vec after copying it into the arena slot, so
+    /// a decoder that stores it and fills it again on the next
+    /// [`decode`](Self::decode) runs allocation-free in steady state
+    /// (#143). The default drops the buffer — correctness never depends on
+    /// recycling.
+    ///
+    /// [`AudioDecoderElement`]: crate::elements::codec::AudioDecoderElement
+    fn recycle(&mut self, _data: Vec<u8>) {}
 }
 
 #[cfg(test)]

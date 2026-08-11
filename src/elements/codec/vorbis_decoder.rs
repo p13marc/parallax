@@ -47,6 +47,8 @@ pub struct VorbisDecoder {
     channels: u32,
     /// Scratch for the interleaved f32 samples of one decoded frame.
     samples: Vec<f32>,
+    /// Spent output Vec handed back by the element wrapper (#143).
+    recycled: Vec<u8>,
     packets_in: u64,
 }
 
@@ -88,6 +90,7 @@ impl VorbisDecoder {
             sample_rate,
             channels,
             samples: Vec::new(),
+            recycled: Vec::new(),
             packets_in: 0,
         })
     }
@@ -112,7 +115,14 @@ impl AudioDecoder for VorbisDecoder {
         let frames = decoded.frames();
 
         decoded.copy_to_vec_interleaved(&mut self.samples);
-        let data: Vec<u8> = self.samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        // Pack into the recycled Vec with an exact reserve — the flat_map
+        // collect this replaces grew by repeated realloc (#143).
+        let mut data = std::mem::take(&mut self.recycled);
+        data.clear();
+        data.reserve(self.samples.len() * 4);
+        for s in &self.samples {
+            data.extend_from_slice(&s.to_le_bytes());
+        }
 
         self.packets_in += 1;
 
@@ -143,6 +153,11 @@ impl AudioDecoder for VorbisDecoder {
 
     fn output_format(&self) -> AudioSampleFormat {
         AudioSampleFormat::F32
+    }
+
+    fn recycle(&mut self, mut data: Vec<u8>) {
+        data.clear();
+        self.recycled = data;
     }
 }
 
