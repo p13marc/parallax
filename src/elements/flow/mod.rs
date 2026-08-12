@@ -30,7 +30,7 @@ mod valve;
 pub use concat::{Concat, ConcatStats, ConcatStream};
 pub use funnel::{Funnel, FunnelInput, FunnelStats};
 pub use inspect::Inspect;
-pub use queue2::{BufferingAction, BufferingConfig, DownloadedRanges, Queue2, Queue2Stats};
+pub use queue2::{BufferingConfig, DownloadedRanges, Queue2, Queue2Stats};
 pub use selector::{
     InputSelector, InputSelectorStats, OutputSelector, OutputSelectorStats, SelectorInput,
     SelectorOutput,

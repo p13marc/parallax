@@ -1,7 +1,6 @@
 //! Advanced buffering queue with network-oriented strategies.
 //!
-//! `Queue2` extends the basic [`Queue`](super::Queue) with buffering modes
-//! designed for network streaming:
+//! `Queue2` provides buffering modes designed for network streaming:
 //!
 //! - **Stream**: In-memory ring buffer with watermark-based pause/resume
 //! - **Download**: File-backed progressive download with random access
@@ -75,8 +74,11 @@ impl Default for BufferingConfig {
 // ============================================================================
 
 /// Action determined by the buffering state machine.
+///
+/// Element mode records it but always forwards (see [`Element::process`]);
+/// honoring Hold/Pause is blocked on the seek/flow wiring of #163/#164.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BufferingAction {
+pub(crate) enum BufferingAction {
     /// Forward buffer downstream normally.
     Forward,
     /// Hold buffer (don't forward yet, still buffering).
@@ -185,9 +187,9 @@ impl std::fmt::Display for Queue2Stats {
 
 /// Advanced buffering queue with stream, download, and timeshift modes.
 ///
-/// Unlike [`Queue`](super::Queue), Queue2 is designed for network streaming
-/// scenarios where buffering strategies are needed to handle variable
-/// network conditions.
+/// Designed for network streaming scenarios where buffering strategies are
+/// needed to handle variable network conditions. (Plain queueing needs no
+/// element — the link channel is the queue.)
 pub struct Queue2 {
     config: BufferingConfig,
     /// In-memory buffer (stream mode).
@@ -214,9 +216,6 @@ pub struct Queue2 {
     file: Option<File>,
     /// Current write position in file.
     file_write_pos: u64,
-    /// Current read position in file (for timeshift mode).
-    #[allow(dead_code)]
-    file_read_pos: u64,
     /// Downloaded ranges (for download mode).
     downloaded_ranges: DownloadedRanges,
 }
@@ -230,12 +229,26 @@ struct RateState {
 }
 
 impl Queue2 {
-    /// Drop everything buffered: the in-memory ring, the byte accounting,
-    /// and (download/timeshift) the notion of what has been written — a
-    /// flushing seek abandoned that data.
+    /// Drop the in-memory ring and its byte accounting — a flushing seek
+    /// abandoned that data. File-backed state (the download/timeshift file,
+    /// its write position, `DownloadedRanges`) deliberately survives: what
+    /// is on disk is still on disk after a seek, and #164's buffering-aware
+    /// seeking builds on exactly that.
     fn clear_buffered(&mut self) {
         self.ring.clear();
         self.current_bytes = 0;
+        if matches!(
+            self.config.mode,
+            BufferingMode::Stream | BufferingMode::Live
+        ) {
+            self.percent = self.calculate_stream_percent();
+            if !self.is_buffering {
+                // Empty after a flush: the honest state is "buffering again",
+                // and the bus should say so instead of a stale 100 %.
+                self.is_buffering = true;
+                self.post_buffering(self.percent);
+            }
+        }
     }
 
     /// Create a Queue2 in stream buffering mode.
@@ -289,7 +302,6 @@ impl Queue2 {
             bus: None,
             file: None,
             file_write_pos: 0,
-            file_read_pos: 0,
             downloaded_ranges: DownloadedRanges::default(),
         }
     }
@@ -557,27 +569,22 @@ impl Queue2 {
 
 impl Element for Queue2 {
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
-        // Push buffer based on mode
-        let action = match self.config.mode {
+        // Record-and-forward: the push updates stats/percent and posts
+        // Buffering bus messages, but element mode never withholds data —
+        // honoring the state machine's Hold/Pause needs the seek/flow
+        // wiring tracked by #163/#164 pt2.
+        match self.config.mode {
             BufferingMode::Stream | BufferingMode::Live => {
-                self.process_stream_push(buffer);
-                // In Element mode, always try to forward
-                BufferingAction::Forward
+                let _ = self.process_stream_push(buffer);
             }
             BufferingMode::Download => {
                 self.process_download_push(buffer)?;
-                BufferingAction::Forward
             }
             BufferingMode::Timeshift => {
                 self.process_timeshift_push(buffer)?;
-                BufferingAction::Forward
             }
-        };
-
-        match action {
-            BufferingAction::Forward | BufferingAction::Resume => Ok(self.stream_pop()),
-            BufferingAction::Hold | BufferingAction::Pause => Ok(None),
         }
+        Ok(self.stream_pop())
     }
 
     fn handle_downstream_event(
@@ -642,6 +649,45 @@ mod tests {
         assert!(matches!(fwd, Some(crate::event::Event::FlushStart)));
         assert!(q.ring.is_empty(), "FlushStart must clear the ring");
         assert_eq!(q.current_bytes, 0);
+    }
+
+    #[test]
+    fn flush_re_enters_buffering_with_honest_stats() {
+        use crate::element::Element;
+
+        let mut q = Queue2::stream(200).with_watermarks(10, 90);
+        // Fill past the high mark so buffering completes.
+        let _ = q.process_stream_push(make_buffer(100, 0));
+        let _ = q.process_stream_push(make_buffer(100, 1));
+        assert!(!q.is_buffering());
+        assert_eq!(q.buffering_percent(), 100);
+
+        // A flushing seek empties the ring: percent must not stay a stale
+        // 100 %, and the state machine re-enters buffering.
+        let _ = Element::handle_downstream_event(&mut q, crate::event::Event::FlushStart);
+        assert_eq!(q.buffering_percent(), 0);
+        assert!(q.is_buffering(), "empty after flush = buffering again");
+    }
+
+    #[test]
+    fn flush_leaves_download_file_state_intact() {
+        use crate::element::Element;
+
+        let dir = std::env::temp_dir().join(format!("parallax_q2_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dl.tmp");
+        let mut q = Queue2::download(&path, Some(1000));
+        q.process(make_buffer(100, 0)).unwrap();
+        assert_eq!(q.downloaded_ranges().total_bytes(), 100);
+        assert_eq!(q.file_write_pos, 100);
+
+        // The on-disk state survives a flushing seek — that is what #164's
+        // buffering-aware seeking will serve locally.
+        let _ = Element::handle_downstream_event(&mut q, crate::event::Event::FlushStart);
+        assert_eq!(q.downloaded_ranges().total_bytes(), 100);
+        assert_eq!(q.file_write_pos, 100);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
