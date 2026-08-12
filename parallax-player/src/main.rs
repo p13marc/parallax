@@ -602,9 +602,13 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
         .unwrap_or((0, 0));
     let audio = audio_branch(args, summary.audio.as_ref());
 
+    // BGRA, not RGBA: same SIMD conversion cost, but BGRA bytes read as
+    // little-endian u32 are already softbuffer's presentation layout, so
+    // AutoVideoSink's blit is a copy instead of a per-pixel channel shuffle
+    // (the shuffle measured ~37% of the player's total CPU).
     let mut convert = VideoConvertElement::new()
         .with_input_format(PixelFormat::I420)
-        .with_output_format(PixelFormat::Rgba);
+        .with_output_format(PixelFormat::Bgra);
     if width > 0 {
         convert = convert.with_size(width, height);
     }

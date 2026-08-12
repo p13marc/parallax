@@ -45,12 +45,21 @@ use winit::event_loop::EventLoopProxy;
 /// full-frame `Vec` copy (#141). The slot stays pinned until the frame
 /// is replaced, which is why the display channel is kept shallow.
 struct DisplayFrame {
-    /// RGBA pixel data, arena-backed.
+    /// Pixel data, arena-backed. BGRA or RGBA, per `bgra`.
     data: Buffer,
     /// Frame width in pixels
     width: u32,
     /// Frame height in pixels
     height: u32,
+    /// Whether the payload is BGRA rather than RGBA.
+    ///
+    /// BGRA bytes read as little-endian `u32` are exactly softbuffer's
+    /// `0RGB` presentation format, so the blit degenerates to a row copy
+    /// (1:1) or an index-copy (scaled) with no per-pixel channel shuffle —
+    /// the shuffle was ~37% of the whole player's CPU on a real file. A
+    /// player that feeds this sink should convert to BGRA; RGBA remains
+    /// accepted for everything else.
+    bgra: bool,
 }
 
 /// The winit user event: "state changed, wake up and look".
@@ -580,6 +589,7 @@ impl Sink for AutoVideoSink {
             data: ctx.buffer().clone(),
             width,
             height,
+            bgra: meta.video_pixel_format() == Some(PixelFormat::Bgra),
         };
 
         // A full channel means the display cannot keep up. Shed this frame and
@@ -609,6 +619,27 @@ impl Sink for AutoVideoSink {
     fn input_caps(&self) -> Caps {
         // AutoVideoSink expects RGBA data (any resolution)
         Caps::video_raw_any_resolution(PixelFormat::Rgba)
+    }
+
+    fn input_media_caps(&self) -> crate::format::ElementMediaCaps {
+        use crate::format::{
+            CapsValue, ElementMediaCaps, FormatCaps, FormatMemoryCap, MemoryCaps, MemoryLayout,
+            VideoFormatCaps,
+        };
+        // RGBA first: the converter matrix reaches Rgba from every source
+        // format, so auto-inserted converters keep working everywhere. BGRA
+        // is the fast path (blit without the per-pixel shuffle) for
+        // producers that can emit it — the player converts to it explicitly.
+        ElementMediaCaps::new([FormatMemoryCap::new(
+            FormatCaps::VideoRaw(VideoFormatCaps {
+                width: CapsValue::Any,
+                height: CapsValue::Any,
+                pixel_format: CapsValue::List(vec![PixelFormat::Rgba, PixelFormat::Bgra]),
+                framerate: CapsValue::Any,
+                layout: MemoryLayout::NONE,
+            }),
+            MemoryCaps::cpu_only(),
+        )])
     }
 }
 
@@ -662,7 +693,7 @@ fn run_display_loop(
     proxy_slot: SharedProxy,
 ) -> Result<()> {
     use winit::application::ApplicationHandler;
-    use winit::dpi::LogicalSize;
+    use winit::dpi::PhysicalSize;
     use winit::event::{ElementState, MouseButton, WindowEvent};
     use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
     use winit::keyboard::{Key, NamedKey};
@@ -718,9 +749,14 @@ fn run_display_loop(
                 return; // Already have a window
             }
 
+            // Physical size, deliberately: a logical size is multiplied by
+            // the display scale factor, so on a scaled desktop the surface
+            // never matches the video and every frame takes the scaling blit.
+            // At physical size the default window is pixel-perfect AND hits
+            // the 1:1 row-copy fast path (#161).
             let attrs = WindowAttributes::default()
                 .with_title(&self.title)
-                .with_inner_size(LogicalSize::new(self.initial_width, self.initial_height));
+                .with_inner_size(PhysicalSize::new(self.initial_width, self.initial_height));
 
             match event_loop.create_window(attrs) {
                 Ok(window) => {
@@ -991,18 +1027,39 @@ fn blit_frame(
         let src_y = ((dst_y - y0) * src_height) / out_height;
         let src_row = &src[src_y * src_width * 4..(src_y + 1) * src_width * 4];
         let out_row = &mut row[x0..x0 + out_width];
-        if out_width == src_width {
-            // 1:1 horizontal: straight zip, no index math.
-            for (dst, px) in out_row.iter_mut().zip(src_row.chunks_exact(4)) {
-                // softbuffer expects 0xRRGGBB (no alpha, RGB in the low 24 bits).
-                *dst = ((px[0] as u32) << 16) | ((px[1] as u32) << 8) | (px[2] as u32);
+        match (frame.bgra, out_width == src_width) {
+            // BGRA is softbuffer's 0RGB layout already (the alpha byte lands
+            // in the ignored top bits), so no per-pixel channel shuffle —
+            // which used to be ~37% of the player's entire CPU (#161). The
+            // `try_into` on a 4-byte subslice compiles to a single 32-bit
+            // load; spelling out the four bytes kept four byte-loads plus
+            // shifts (measured).
+            (true, true) => {
+                // 1:1: a straight row copy at memcpy speed.
+                for (dst, px) in out_row.iter_mut().zip(src_row.chunks_exact(4)) {
+                    *dst = u32::from_le_bytes(px.try_into().unwrap());
+                }
             }
-        } else {
-            for (dst, &sx) in out_row.iter_mut().zip(&cache.x_map[..out_width]) {
-                let o = sx as usize * 4;
-                *dst = ((src_row[o] as u32) << 16)
-                    | ((src_row[o + 1] as u32) << 8)
-                    | (src_row[o + 2] as u32);
+            (true, false) => {
+                for (dst, &sx) in out_row.iter_mut().zip(&cache.x_map[..out_width]) {
+                    let o = sx as usize * 4;
+                    *dst = u32::from_le_bytes(src_row[o..o + 4].try_into().unwrap());
+                }
+            }
+            // RGBA compat: shuffle each pixel into 0xRRGGBB.
+            (false, true) => {
+                // 1:1 horizontal: straight zip, no index math.
+                for (dst, px) in out_row.iter_mut().zip(src_row.chunks_exact(4)) {
+                    *dst = ((px[0] as u32) << 16) | ((px[1] as u32) << 8) | (px[2] as u32);
+                }
+            }
+            (false, false) => {
+                for (dst, &sx) in out_row.iter_mut().zip(&cache.x_map[..out_width]) {
+                    let o = sx as usize * 4;
+                    *dst = ((src_row[o] as u32) << 16)
+                        | ((src_row[o + 1] as u32) << 8)
+                        | (src_row[o + 2] as u32);
+                }
             }
         }
     }
@@ -1012,12 +1069,12 @@ fn blit_frame(
 mod tests {
     use super::*;
 
-    /// An arena-backed white RGBA frame of `w`x`h` for blit tests.
-    fn white_frame(w: u32, h: u32) -> DisplayFrame {
+    /// An arena-backed frame of `w`x`h` with every byte `fill`, for blits.
+    fn filled_frame(w: u32, h: u32, fill: u8, bgra: bool) -> DisplayFrame {
         let len = (w * h * 4) as usize;
         let arena = crate::memory::SharedArena::new(len, 2).unwrap();
         let mut slot = arena.acquire().unwrap();
-        slot.data_mut()[..len].fill(0xFF);
+        slot.data_mut()[..len].fill(fill);
         DisplayFrame {
             data: Buffer::new(
                 crate::buffer::MemoryHandle::with_len(slot, len),
@@ -1025,6 +1082,52 @@ mod tests {
             ),
             width: w,
             height: h,
+            bgra,
+        }
+    }
+
+    /// An arena-backed white RGBA frame of `w`x`h` for blit tests.
+    fn white_frame(w: u32, h: u32) -> DisplayFrame {
+        filled_frame(w, h, 0xFF, false)
+    }
+
+    /// A single-pixel frame with explicit channel bytes, for format tests.
+    fn pixel_frame(bytes: [u8; 4], bgra: bool) -> DisplayFrame {
+        let arena = crate::memory::SharedArena::new(64, 2).unwrap();
+        let mut slot = arena.acquire().unwrap();
+        slot.data_mut()[..4].copy_from_slice(&bytes);
+        DisplayFrame {
+            data: Buffer::new(
+                crate::buffer::MemoryHandle::with_len(slot, 4),
+                crate::metadata::Metadata::new(),
+            ),
+            width: 1,
+            height: 1,
+            bgra,
+        }
+    }
+
+    /// Both formats land the same color in the presentation buffer: an
+    /// RGBA pixel goes through the shuffle, a BGRA pixel is copied verbatim
+    /// (its little-endian u32 IS softbuffer's 0RGB layout).
+    #[test]
+    fn bgra_and_rgba_blit_the_same_color() {
+        // R=0x11 G=0x22 B=0x33 → presentation 0x112233 (+ alpha in the
+        // ignored top byte on the BGRA path).
+        let rgba = pixel_frame([0x11, 0x22, 0x33, 0xFF], false);
+        let bgra = pixel_frame([0x33, 0x22, 0x11, 0xFF], true);
+
+        for (frame, mask) in [(&rgba, 0xFF_FFFFu32), (&bgra, 0x00FF_FFFF)] {
+            // 1:1 path.
+            let mut one = vec![0u32; 1];
+            blit_frame(frame, &mut one, 1, 1, &mut BlitCache::default());
+            assert_eq!(one[0] & mask, 0x112233);
+            // Scaled path (1x1 → 2x2).
+            let mut four = vec![0u32; 4];
+            blit_frame(frame, &mut four, 2, 2, &mut BlitCache::default());
+            for px in four {
+                assert_eq!(px & mask, 0x112233);
+            }
         }
     }
 
