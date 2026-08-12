@@ -1,8 +1,11 @@
 //! Flow control and routing elements.
 //!
 //! ## Buffering
-//! - [`Queue`]: Async buffer queue with backpressure
-//! - [`Queue2`]: Advanced network buffering (stream/download/timeshift)
+//! - [`Queue2`]: Network buffering (stream/download/timeshift). There is no
+//!   plain `Queue` element: every element runs in its own task behind a
+//!   bounded channel, so the link itself is the queue — capacity via
+//!   `link_pads_full`, loss policy via `LinkPolicy`, occupancy-driven flow
+//!   signals via `Pipeline::monitor_link`.
 //!
 //! ## Inspection
 //! - [`Inspect`]: 1-in/1-out passthrough counter (formerly, and misleadingly,
@@ -20,7 +23,6 @@
 mod concat;
 mod funnel;
 mod inspect;
-mod queue;
 mod queue2;
 mod selector;
 mod valve;
@@ -28,7 +30,6 @@ mod valve;
 pub use concat::{Concat, ConcatStats, ConcatStream};
 pub use funnel::{Funnel, FunnelInput, FunnelStats};
 pub use inspect::Inspect;
-pub use queue::{LeakyMode, Queue, QueueStats};
 pub use queue2::{BufferingAction, BufferingConfig, DownloadedRanges, Queue2, Queue2Stats};
 pub use selector::{
     InputSelector, InputSelectorStats, OutputSelector, OutputSelectorStats, SelectorInput,

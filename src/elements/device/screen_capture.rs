@@ -52,7 +52,7 @@ use crate::format::{
 };
 use crate::memory::{OutputArena, OutputBudget, defaults};
 use crate::metadata::Metadata;
-use crate::pipeline::flow::{FlowPolicy, FlowSignal, FlowStateHandle};
+use crate::pipeline::flow::FlowStateHandle;
 
 use super::DeviceError;
 
@@ -98,9 +98,6 @@ pub struct ScreenCaptureConfig {
     /// Maximum number of frames to capture before EOS.
     /// None means unlimited (capture until manually stopped).
     pub max_frames: Option<u32>,
-    /// Flow policy for handling downstream backpressure.
-    /// Default: Drop frames when downstream is busy (prevents capture lag).
-    pub flow_policy: FlowPolicy,
 }
 
 impl Default for ScreenCaptureConfig {
@@ -110,10 +107,6 @@ impl Default for ScreenCaptureConfig {
             show_cursor: true,
             restore_token: None,
             max_frames: None,
-            // Screen capture should drop frames when downstream is busy
-            // to prevent building up lag. This is the standard behavior
-            // for live video sources.
-            flow_policy: FlowPolicy::drop_with_logging(),
         }
     }
 }
@@ -148,12 +141,6 @@ impl ScreenCaptureConfig {
     /// Set whether to show the cursor.
     pub fn with_cursor(mut self, show: bool) -> Self {
         self.show_cursor = show;
-        self
-    }
-
-    /// Set the flow policy for handling downstream backpressure.
-    pub fn with_flow_policy(mut self, policy: FlowPolicy) -> Self {
-        self.flow_policy = policy;
         self
     }
 }
@@ -881,18 +868,17 @@ impl ScreenCaptureSrc {
 
     /// Set the flow state handle for downstream backpressure monitoring.
     ///
-    /// When set, the source will check this handle before producing frames.
-    /// If downstream signals backpressure (Busy), frames will be dropped
-    /// according to the configured flow policy.
-    ///
-    /// # Example
+    /// When set, the source checks the handle before producing and drops
+    /// the captured frame while downstream is backed up. The handle comes
+    /// from monitoring the outgoing link:
     ///
     /// ```rust,ignore
-    /// let queue = Queue::new(100).with_flow_control();
-    /// let flow_state = queue.flow_state_handle();
-    ///
-    /// let mut capture = ScreenCaptureSrc::default_config();
-    /// capture.set_flow_state(flow_state);
+    /// let link = pipeline.link_with(cap, enc, LinkPolicy::Drop)?;
+    /// let flow = pipeline.monitor_link(link)?;
+    /// pipeline
+    ///     .get_element_mut::<ScreenCaptureSrc>("cap")
+    ///     .unwrap()
+    ///     .set_flow_state(flow);
     /// ```
     pub fn set_flow_state(&mut self, handle: FlowStateHandle) {
         self.flow_state = Some(handle);
@@ -948,25 +934,21 @@ impl Source for ScreenCaptureSrc {
             None => return Ok(ProduceResult::WouldBlock),
         };
 
-        // Check for downstream backpressure
-        if let Some(ref flow_state) = self.flow_state {
-            if !flow_state.should_produce() && self.config.flow_policy.allows_dropping() {
-                // Drop this frame due to backpressure
-                self.frames_dropped += 1;
-                flow_state.record_drop();
-
-                if self.config.flow_policy.should_log_drops() {
-                    if self.frames_dropped == 1 || self.frames_dropped % 30 == 0 {
-                        tracing::warn!(
-                            "Screen capture: dropping frame due to backpressure (total dropped: {})",
-                            self.frames_dropped
-                        );
-                    }
-                }
-
-                // Return WouldBlock to signal we didn't produce, but aren't at EOS
-                return Ok(ProduceResult::WouldBlock);
+        // Downstream backpressure: a gated live source drops the frame
+        // before the arena copy — that is the whole point of the gate.
+        if let Some(ref flow_state) = self.flow_state
+            && !flow_state.should_produce()
+        {
+            self.frames_dropped += 1;
+            flow_state.record_drop();
+            if self.frames_dropped == 1 || self.frames_dropped % 30 == 0 {
+                tracing::warn!(
+                    "Screen capture: dropping frame due to backpressure (total dropped: {})",
+                    self.frames_dropped
+                );
             }
+            // WouldBlock signals "didn't produce, not EOS".
+            return Ok(ProduceResult::WouldBlock);
         }
 
         // The actual frame size may differ from the portal-reported dimensions,
@@ -1024,17 +1006,6 @@ impl Source for ScreenCaptureSrc {
     fn execution_hints(&self) -> ExecutionHints {
         ExecutionHints::io_bound()
     }
-
-    fn handle_flow_signal(&mut self, signal: FlowSignal) {
-        // Update our internal state based on downstream signal
-        if let Some(ref flow_state) = self.flow_state {
-            flow_state.set_signal(signal);
-        }
-    }
-
-    fn flow_policy(&self) -> FlowPolicy {
-        self.config.flow_policy.clone()
-    }
 }
 
 impl Drop for ScreenCaptureSrc {
@@ -1089,14 +1060,12 @@ mod tests {
             .with_source_type(CaptureSourceType::Window)
             .with_cursor(false)
             .with_restore_token("test_token_123")
-            .with_max_frames(100)
-            .with_flow_policy(FlowPolicy::Block);
+            .with_max_frames(100);
 
         assert_eq!(config.source_type, CaptureSourceType::Window);
         assert!(!config.show_cursor);
         assert_eq!(config.restore_token, Some("test_token_123".to_string()));
         assert_eq!(config.max_frames, Some(100));
-        assert!(matches!(config.flow_policy, FlowPolicy::Block));
     }
 
     #[test]

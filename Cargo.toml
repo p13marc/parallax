@@ -270,7 +270,7 @@ name = "03_fanout"
 name = "04_funnel"
 
 [[example]]
-name = "05_queue"
+name = "05_backpressure"
 
 [[example]]
 name = "06_appsrc"

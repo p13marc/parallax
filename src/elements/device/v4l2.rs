@@ -56,7 +56,7 @@ use crate::format::{
 };
 use crate::memory::{DmaBufSegment, OutputArena, OutputBudget, defaults};
 use crate::metadata::Metadata;
-use crate::pipeline::flow::{FlowPolicy, FlowSignal, FlowStateHandle};
+use crate::pipeline::flow::FlowStateHandle;
 
 use super::DeviceError;
 
@@ -893,21 +893,6 @@ impl Source for V4l2Src {
             ElementMediaCaps::any_cpu()
         } else {
             ElementMediaCaps::new(caps)
-        }
-    }
-
-    fn handle_flow_signal(&mut self, signal: FlowSignal) {
-        // Update our internal state based on downstream signal
-        if let Some(ref flow_state) = self.flow_state {
-            flow_state.set_signal(signal);
-        }
-    }
-
-    fn flow_policy(&self) -> FlowPolicy {
-        // V4L2 is a live source - always use Drop policy to prevent lag
-        FlowPolicy::Drop {
-            log_drops: true,
-            max_consecutive: None,
         }
     }
 }

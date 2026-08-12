@@ -374,28 +374,14 @@ pipeline.get_element_mut::<V4l2Src>("cam").unwrap().set_flow_state(flow);
 
 The source checks `should_produce()` before doing capture work and skips the frame while the link is backed up — cheaper than `LinkPolicy::Drop` alone, which discards the frame only *after* it was captured and copied. RT/bridge boundary edges carry no channel and are not monitored.
 
-- **`FlowSignal`**: `Ready`, `Busy`, `Drop`, `EosAck`, `Pausing`, `Stopping`
-- **`FlowPolicy`** (how a source reacts): `Block` (default — for files), `Drop { log_drops, .. }` (live capture), `RingBuffer { capacity }`, `Adaptive { .. }`
-- **`WaterMarks`**: high/low queue thresholds (default 80%/20%)
+- **`FlowSignal`**: `Ready` | `Busy`, polled by the source via `FlowStateHandle::should_produce()`
+- **`WaterMarks`**: high/low occupancy thresholds (default 80%/20% of the link capacity)
 
-```rust
-use parallax::elements::flow::Queue;
-
-let queue = Queue::new(100).with_flow_control();
-let flow_state = queue.flow_state_handle();
-
-let mut capture = ScreenCaptureSrc::default_config();
-capture.set_flow_state(flow_state);
-// When the queue crosses its high watermark it signals Busy;
-// the source's produce() sees should_produce() == false and drops the frame
-// per its FlowPolicy; at the low watermark production resumes.
-```
-
-All device sources (`ScreenCaptureSrc`, `V4l2Src`, `LibCameraSrc`, `PipeWireSrc`, `AlsaSrc`) default to a `Drop` policy and accept `set_flow_state`. In custom sources, check `flow_state.should_produce()` in `produce()` and return `ProduceResult::WouldBlock` when dropping. See `examples/47_flow_control.rs`.
+All device sources (`ScreenCaptureSrc`, `V4l2Src`, `LibCameraSrc`, `PipeWireSrc`, `AlsaSrc`) accept `set_flow_state`. In custom sources, check `flow_state.should_produce()` in `produce()` and return `ProduceResult::WouldBlock` when skipping. See `examples/47_flow_control.rs`.
 
 ### Network buffering: Queue2
 
-`Queue2` extends `Queue` with GStreamer-queue2-style buffering strategies:
+`Queue2` provides GStreamer-queue2-style buffering strategies:
 
 | Mode | Backing | Use case |
 |------|---------|----------|

@@ -142,7 +142,6 @@ let (w, h) = info.wait_for_dimensions(0).await.ok_or("session ended")?;
 
 | Element | Description |
 |---------|-------------|
-| `Queue` | Bounded queue with backpressure, watermarks (`with_flow_control`, `with_water_marks`), leaky modes (`LeakyMode`) |
 | `Queue2` | Network buffering: `stream` (memory ring), `download` (progressive file), `timeshift` (circular file); posts `Buffering` messages |
 | `Inspect` | 1-in/1-out passthrough counter (buffers/bytes). **Not** a fan-out — it was called `Tee` and never was one. Fan-out needs no element: link one src-pad to several sinks (see [pipeline.md](pipeline.md#fan-out)). `tee` survives as a deprecated parse alias |
 | `Funnel` | N-to-1 merge (`FunnelInput` handles) |
@@ -306,7 +305,7 @@ Every controllable element implements `Controllable`, so the accessor is always 
 | `JpegQualityControl` | `JpegEncoder::control()` | `set_quality(1..=100)` |
 | `ValveControl` | `Valve::control()` | `open()` / `close()` |
 | `GainControl` | `Gain::control()` | `set_factor(f)` / `set_db(db)`, `factor()` / `db()` |
-| `FlowStateHandle` | `Queue::control()` | backpressure signalling to live sources |
+| `FlowStateHandle` | `Pipeline::monitor_link` | backpressure signalling to live sources |
 | `AppSinkHandle` / `AppSrcHandle` | `AppSink::handle()` / `AppSrc::handle()` | async-first `pull_buffer`/`push_buffer` (+`_timeout`; `*_blocking` twins for plain threads), `try_pull_buffer`/`try_push_buffer`, `stats()` |
 | `AutoVideoSinkHandle` | `AutoVideoSink::handle()` `[display]` | window events (`try_event`/`event_timeout` → `VideoWindowEvent`: keys as `VideoKey`, mouse, close, resize; bounded and sender-side lossy), `set_fullscreen(bool)`, `is_open()`. No handle taken ⇒ no events |
 

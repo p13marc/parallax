@@ -29,7 +29,7 @@
 //! | `JpegQualityControl` | `JpegEncoder` | JPEG quality 1..=100 |
 //! | [`ValveControl`] | `Valve` | open / close |
 //! | [`GainControl`] | `Gain` | audio volume (`set_factor`, `set_db`) |
-//! | [`FlowStateHandle`] | `Queue` | backpressure signalling to live sources |
+//! | [`FlowStateHandle`] | `Pipeline::monitor_link` | backpressure signalling to live sources |
 //!
 //! # Example
 //!

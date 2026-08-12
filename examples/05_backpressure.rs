@@ -1,19 +1,19 @@
-//! # Queue (Backpressure)
+//! # Backpressure (the link is the queue)
 //!
-//! A pipeline with a Queue element that buffers data between source and sink.
-//! The queue provides backpressure when full.
+//! Every element runs in its own task behind a bounded channel, so queueing
+//! is a property of the **link**, not an element: `link_pads_full` sets the
+//! channel capacity, and a full channel back-pressures the producer.
 //!
 //! ```text
-//! [FastSource] → [Queue] → [SlowSink]
+//! [FastSource] ──channel(2)──> [SlowSink]
 //! ```
 //!
-//! Run: `cargo run --example 05_queue`
+//! Run: `cargo run --example 05_backpressure`
 
 use parallax::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
-use parallax::elements::Queue;
 use parallax::error::Result;
 use parallax::memory::SharedArena;
-use parallax::pipeline::Pipeline;
+use parallax::pipeline::{LinkPolicy, Pipeline};
 use std::time::Duration;
 
 struct FastSource {
@@ -53,12 +53,12 @@ async fn main() -> Result<()> {
     let mut pipeline = Pipeline::new();
 
     let src = pipeline.add_source_with_arena("src", FastSource { count: 0, max: 5 }, arena);
-    // Queue with capacity of 2 buffers
-    let queue = pipeline.add_filter("queue", Queue::new(2));
     let sink = pipeline.add_sink("sink", SlowSink);
 
-    pipeline.link(src, queue)?;
-    pipeline.link(queue, sink)?;
+    // The channel between the two nodes holds at most 2 buffers; once it is
+    // full the source's send waits — that IS the backpressure. `Block` is the
+    // default policy (no data loss); `LinkPolicy::Drop` would shed instead.
+    pipeline.link_pads_full(src, "src", sink, "sink", LinkPolicy::Block, Some(2))?;
 
     pipeline.run().await
 }

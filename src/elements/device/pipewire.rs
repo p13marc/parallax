@@ -34,7 +34,7 @@ use pipewire as pw;
 
 use crate::element::{AsyncSink, AsyncSource, ExecutionHints, ProduceContext, ProduceResult};
 use crate::error::Result;
-use crate::pipeline::flow::{FlowPolicy, FlowSignal, FlowStateHandle};
+use crate::pipeline::flow::FlowStateHandle;
 
 use super::DeviceError;
 
@@ -466,21 +466,6 @@ impl AsyncSource for PipeWireSrc {
 
     fn execution_hints(&self) -> ExecutionHints {
         ExecutionHints::io_bound()
-    }
-
-    fn handle_flow_signal(&mut self, signal: FlowSignal) {
-        // Update our internal state based on downstream signal
-        if let Some(ref flow_state) = self.flow_state {
-            flow_state.set_signal(signal);
-        }
-    }
-
-    fn flow_policy(&self) -> FlowPolicy {
-        // PipeWire is a live source - always use Drop policy to prevent lag
-        FlowPolicy::Drop {
-            log_drops: true,
-            max_consecutive: None,
-        }
     }
 }
 

@@ -28,7 +28,7 @@ brings in: `Buffer`, `Metadata`/`BufferFlags`/`RtpMeta`, clock types (`Clock`, `
 | `tracer::{Tracer, TracerRegistry, LatencyTracer, FramerateTracer, DropTracer, PipelineStats}` | Runtime tracing; `PARALLAX_TRACERS` |
 | `seek::{PositionQuery, DurationQuery, SeekableQuery}` | Seeking |
 | `typefind::{TypeFindRegistry, MediaType, TypeFindResult, TypeFindProbability}` | Content detection |
-| `flow::{FlowSignal, FlowPolicy, FlowStateHandle, WaterMarks, FlowStats}` | Backpressure primitives |
+| `flow::{FlowSignal, FlowStateHandle, WaterMarks}` | Backpressure primitives (produced by `Pipeline::monitor_link`) |
 | `driver::{TimerDriver, ManualDriver, DriverConfig, DriverStats}` | RT cycle pacing |
 | `rt_bridge::{AsyncRtBridge, BridgeConfig, EventFd}` | Async↔RT boundary |
 | `events::{PipelineEvent, EventSender, EventReceiver, EventStream}` | Typed event channel (distinct from the bus) |

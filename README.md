@@ -269,7 +269,7 @@ Full catalog with feature flags in **[docs/elements.md](docs/elements.md)**. Sum
 | **App integration** | `AppSrc`/`AppSink` (+ handles), `AutoVideoSink` (display window) |
 | **Network** | TCP/UDP/Unix src+sink (sync & async), UDP multicast, `HttpSrc` (byte-seekable via HTTP `Range`)/`HttpSink`, `WebSocketSrc`/`WebSocketSink`, Zenoh pub/sub/query |
 | **RTP/RTSP** | `RtpSrc`/`RtpSink`, jitter buffer, `RtcpHandler`, payloaders/depayloaders for H.264/H.265/VP8/VP9 (+ Opus depay), `RtspSrc` client (Annex-B or length-prefixed framing, URL credentials, per-op timeouts). See `examples/57_rtsp_capture.rs` and `examples/58_rtsp_display.rs`; `just rtsp-server` serves a local test stream |
-| **Flow** | `Queue` (watermarks, leaky modes), `Queue2` (stream/download/timeshift buffering), `Inspect` (passthrough counter), `Funnel`, `InputSelector`/`OutputSelector`, `Concat`, `Valve` |
+| **Flow** | `Queue2` (stream/download/timeshift buffering), `Inspect` (passthrough counter), `Funnel`, `InputSelector`/`OutputSelector`, `Concat`, `Valve` — plain queueing is a *link* property: capacity + `LinkPolicy` + `Pipeline::monitor_link` |
 | **Transforms** | `Map`, `Filter`, `FilterMap`, `FlatMap`, `Chunk`, `Batch`/`Unbatch`, buffer trim/slice/pad/split/join/concat, dedup/range/regex filters, `Gain`, `VideoScale`, `VideoConvertElement`, `AudioConvertElement`, `AudioResampleElement` |
 | **Timing** | `Delay`, `Timeout`, `Debounce`, `Throttle`, `RateLimiter` |
 | **Metadata** | `SequenceNumber`, `Timestamper`, `MetadataInject`/`MetadataExtract`, `TimestampDebug`, `KlvEncoder` (STANAG 4609/MISB) |
@@ -285,7 +285,7 @@ Full catalog with feature flags in **[docs/elements.md](docs/elements.md)**. Sum
 - **Seeking** — `pipeline.seek_bytes(pos)` / `seek_time(t)`, `query_position()`, `query_duration()`, `query_seekable()`; segment events map PTS to running/stream time. See `examples/52_seeking.rs`.
 - **Pad probes** — intercept buffers/events at any pad (`ProbeType::BUFFER`, `ProbeReturn::{Ok, Drop, Remove, Handled}`). See `examples/53_pad_probes.rs`.
 - **Tracers** — `LatencyTracer`, `FramerateTracer`, `DropTracer`; activate with `PARALLAX_TRACERS="latency;framerate;drops"`; DOT graph dumps via `PARALLAX_DOT_DIR`. See `examples/54_tracers.rs`.
-- **Flow control** — `FlowSignal`/`FlowPolicy` backpressure for live sources (block, drop, ring-buffer, adaptive), queue watermarks. See `examples/47_flow_control.rs`.
+- **Flow control** — the link channel is the queue: capacity + `LinkPolicy` per link, plus `Pipeline::monitor_link` watermark signals so live sources skip capture work while downstream is backed up. See `examples/47_flow_control.rs`.
 - **Type detection** — `TypeFindRegistry` sniffs common container/codec formats (MP4, Matroska, MPEG-TS, Ogg, WAV, FLAC, MP3, H.264, PNG, JPEG, …) from leading bytes, with extension fallback. See `examples/56_typefind.rs`.
 - **Clocks** — `ClockTime` (ns, `NONE` sentinel), pluggable `Clock`/`ClockProvider`; the executor auto-selects the highest-priority provider (e.g. ALSA hardware clock) at start. See `examples/48_clock_provider.rs`.
 - **Caps negotiation** — multi-format `ElementMediaCaps` with memory-type coupling (CPU vs DMA-BUF); converter auto-insertion controlled by `ConverterPolicy::{Deny, Warn, Allow}` (default `Deny`: fail with a helpful error instead of silently inserting converters). See `examples/17_multi_format_caps.rs` and `examples/45_dmabuf_negotiation.rs`.
@@ -343,7 +343,7 @@ Default features are **empty** — everything below is opt-in.
 
 | Range | Topic |
 |-------|-------|
-| `01`–`08` | Basics: hello, transform, fan-out, funnel, queue, appsrc, file I/O, TCP |
+| `01`–`08` | Basics: hello, transform, fan-out, funnel, backpressure, appsrc, file I/O, TCP |
 | `09`–`11` | Typed pipelines, builder DSL, buffer pools |
 | `13`–`18`, `20` | Codecs: PNG (`image-codecs`), H.264 (`h264`), AV1 (`av1-encode`), MPEG-TS (`mpeg-ts`), caps negotiation, GPU decode (`vulkan-video`), Opus (`opus`) |
 | `22`–`26` | Devices & streaming: V4L2 (`v4l2`), display (`display`), HLS, DASH |
