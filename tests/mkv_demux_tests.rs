@@ -239,6 +239,192 @@ async fn mkv_video_only_loops_at_eos() {
     handle.wait().await.unwrap();
 }
 
+// ============================================================================
+// Cue-indexed seek (#158) — driving the Demuxer trait directly, so the
+// assertions are deterministic (no pipeline, no wall clock).
+// ============================================================================
+
+mod cue_seek {
+    use super::*;
+    use parallax::buffer::Buffer;
+    use parallax::clock::ClockTime;
+    use parallax::element::{Demuxer, DemuxerProduce};
+    use parallax::event::{Event, SeekEvent};
+    use parallax::metadata::BufferFlags;
+    use std::io::{Read, Seek, SeekFrom};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Counts every byte read, to prove a seek is indexed, not a rescan.
+    struct CountingReader {
+        inner: Cursor<Vec<u8>>,
+        read: Arc<AtomicU64>,
+    }
+
+    impl Read for CountingReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.read.fetch_add(n as u64, Ordering::Relaxed);
+            Ok(n)
+        }
+    }
+
+    impl Seek for CountingReader {
+        fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(from)
+        }
+    }
+
+    fn counting(data: &[u8]) -> (MkvDemux<CountingReader>, Arc<AtomicU64>) {
+        let read = Arc::new(AtomicU64::new(0));
+        let reader = CountingReader {
+            inner: Cursor::new(data.to_vec()),
+            read: read.clone(),
+        };
+        (MkvDemux::new(reader).expect("fixture parses"), read)
+    }
+
+    /// `(pad, pts_ms, sync)` facts; the buffer itself is dropped so the
+    /// demuxer's own arena never runs out of slots.
+    fn facts(buffer: &Buffer) -> (u64, bool) {
+        (
+            buffer.metadata().pts.nanos() / 1_000_000,
+            buffer.metadata().flags.contains(BufferFlags::SYNC_POINT),
+        )
+    }
+
+    /// Produce until the next routed buffer; count empty yields on the way.
+    fn next_buffer<R: Read + Seek + Send>(
+        demux: &mut MkvDemux<R>,
+        yields: &mut usize,
+    ) -> Option<(u32, u64, bool)> {
+        for _ in 0..10_000 {
+            match demux.produce().expect("produce") {
+                DemuxerProduce::Routed(routed) if routed.is_empty() => *yields += 1,
+                DemuxerProduce::Routed(routed) => {
+                    let (pad, buffer) = routed.into_iter().next().unwrap();
+                    let (pts, sync) = facts(&buffer);
+                    return Some((pad.0, pts, sync));
+                }
+                DemuxerProduce::Eos => return None,
+                DemuxerProduce::WouldBlock => panic!("MkvDemux never blocks"),
+            }
+        }
+        panic!("produce() made no progress");
+    }
+
+    fn seek_to(demux: &mut MkvDemux<impl Read + Seek + Send>, millis: u64) {
+        let event = Event::Seek(SeekEvent::new_time(ClockTime::from_millis(millis)));
+        assert!(
+            demux.handle_upstream_event(&event).is_handled(),
+            "seek handled"
+        );
+    }
+
+    /// (A) BlockGroup fixture: a cue-indexed seek lands on the keyframe at
+    /// or after the target and reads only the target cluster — not the file.
+    #[test]
+    fn mkv_cue_seek_lands_without_rescan() {
+        let (mut demux, read) = counting(H264_AAC_MKV);
+        let mut yields = 0;
+
+        // Play a couple of frames from the head first.
+        for _ in 0..2 {
+            next_buffer(&mut demux, &mut yields).expect("head frames");
+        }
+
+        let before = read.load(Ordering::Relaxed);
+        seek_to(&mut demux, 1200);
+
+        // First post-seek VIDEO buffer: the 1500 ms keyframe, sync-flagged;
+        // nothing on any pad below the 1200 ms target.
+        loop {
+            let (pad, pts, sync) = next_buffer(&mut demux, &mut yields).expect("post-seek data");
+            assert!(pts >= 1200, "pre-target frame leaked: pad {pad} pts {pts}");
+            if pad == 0 {
+                assert_eq!(pts, 1500, "landing keyframe");
+                assert!(sync, "landing frame is a keyframe");
+                break;
+            }
+        }
+
+        // Cluster 2 spans ~7.6 KB; the old rewind fallback re-read the whole
+        // file (≥ 15 KB) frame by frame.
+        let delta = read.load(Ordering::Relaxed) - before;
+        assert!(delta < 9_000, "seek re-read {delta} bytes — a rescan");
+    }
+
+    /// (B) SimpleBlock fixtures: same landing contract on both WebM codecs
+    /// (keyframes verified at 0 and 500 ms).
+    #[test]
+    fn webm_cue_seek_simpleblock() {
+        for (name, data) in [("vp9", VP9_OPUS_WEBM), ("vp8", VP8_VORBIS_WEBM)] {
+            let (mut demux, _) = counting(data);
+            let mut yields = 0;
+            next_buffer(&mut demux, &mut yields).expect("head frame");
+
+            seek_to(&mut demux, 300);
+            loop {
+                let (pad, pts, sync) = next_buffer(&mut demux, &mut yields)
+                    .unwrap_or_else(|| panic!("{name}: stream ended before the seek landed"));
+                assert!(pts >= 300, "{name}: pre-target frame leaked: {pts}");
+                if pad == 0 {
+                    assert_eq!(pts, 500, "{name}: landing keyframe");
+                    assert!(sync, "{name}: sync-flagged");
+                    break;
+                }
+            }
+        }
+    }
+
+    /// (C) Per-track skip + resync composition: a seek past the last
+    /// keyframe emits NO video at all (never a stale or mid-GOP frame),
+    /// while audio at/after the target still flows.
+    #[test]
+    fn seek_no_pre_target_video_leak() {
+        let (mut demux, _) = counting(H264_AAC_MKV);
+        let mut yields = 0;
+        next_buffer(&mut demux, &mut yields).expect("head frame");
+
+        seek_to(&mut demux, 1600);
+        let mut audio = 0u64;
+        while let Some((pad, pts, _)) = next_buffer(&mut demux, &mut yields) {
+            assert_ne!(
+                pad, 0,
+                "video emitted after a seek past the last keyframe (pts {pts})"
+            );
+            assert!(pts >= 1600, "pre-target audio leaked: {pts}");
+            audio += 1;
+        }
+        assert!(audio > 0, "audio at/after the target still flows");
+    }
+
+    /// (D) The scan yields within its budget, so a superseding seek gets a
+    /// produce() boundary to land on instead of queueing behind the scan.
+    #[test]
+    fn seek_scan_yields_within_budget() {
+        let read = Arc::new(AtomicU64::new(0));
+        let reader = CountingReader {
+            inner: Cursor::new(H264_AAC_MKV.to_vec()),
+            read,
+        };
+        let mut demux = MkvDemux::new(reader)
+            .expect("fixture parses")
+            .with_scan_budget(4);
+        let mut yields = 0;
+        next_buffer(&mut demux, &mut yields).expect("head frame");
+
+        seek_to(&mut demux, 1600);
+        // Draining to the first post-seek buffer discards more than 4 frames
+        // (skips + resync), so at least one empty yield must interleave.
+        while next_buffer(&mut demux, &mut yields).is_some() {}
+        assert!(
+            yields > 0,
+            "a bounded scan must yield between produce() calls"
+        );
+    }
+}
+
 /// Subtitle tracks are listed but never routed.
 #[test]
 fn subtitle_tracks_listed_not_routed() {

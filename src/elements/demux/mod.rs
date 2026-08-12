@@ -19,6 +19,9 @@ mod mp4_extra;
 #[cfg(feature = "mkv-demux")]
 mod mkv;
 
+#[cfg(feature = "mkv-demux")]
+mod mkv_cues;
+
 pub use streamid_demux::{StreamIdDemux, StreamIdDemuxStats, StreamOutput};
 
 #[cfg(feature = "mpeg-ts")]

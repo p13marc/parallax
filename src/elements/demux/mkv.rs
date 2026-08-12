@@ -297,7 +297,15 @@ fn vp9_is_keyframe(data: &[u8]) -> bool {
 ///
 /// [`Demuxer`]: crate::element::Demuxer
 pub struct MkvDemux<R: Read + Seek> {
-    file: MatroskaFile<R>,
+    file: MatroskaFile<super::mkv_cues::SharedReader<R>>,
+    /// Second handle to the reader inside `file`, for cue-indexed seeks:
+    /// the crate keeps its reader private, so repositioning goes through
+    /// this shared handle (state reset via `file.seek(0)` first).
+    raw: super::mkv_cues::SharedReader<R>,
+    /// Parallax-owned cue table, scanned before `MatroskaFile::open` — the
+    /// crate's own cue path mis-resolves ffmpeg's CueRelativePosition (see
+    /// `mkv_cues`). Empty for cue-less files.
+    cues: Vec<super::mkv_cues::CueEntry>,
     tracks: Vec<MkvTrack>,
     /// Nanoseconds per Matroska timestamp tick.
     timestamp_scale: u64,
@@ -322,10 +330,22 @@ pub struct MkvDemux<R: Read + Seek> {
     /// control (the executor retries produce()), so the frame taken from the
     /// parser must survive the retry instead of being lost.
     pending: Option<PendingFrame>,
-    /// Linear-seek fallback: drop every frame below this tick position
-    /// (see [`handle_upstream_event`](crate::element::Demuxer)).
-    skip_until_ticks: Option<u64>,
+    /// Post-seek skip, **per routed track**: `(track_number, target_ticks)`
+    /// entries, each cleared only by that track's own first frame at/after
+    /// the target. A single global skip used to be cleared by whichever
+    /// track crossed the target first — audio interleaves ahead, so stale
+    /// pre-target video leaked through (#158).
+    skip: Vec<(u64, u64)>,
+    /// Frames the produce() scan may discard (skip + resync) before
+    /// returning an empty `Routed` to yield — the executor drains a
+    /// superseding seek between produce() calls, so a long scan must not
+    /// hold the task.
+    scan_budget: usize,
 }
+
+/// Default [`MkvDemux::with_scan_budget`]: a whole cluster of discards per
+/// produce() call, cheap enough to stay responsive.
+const DEFAULT_SCAN_BUDGET: usize = 256;
 
 /// A converted frame awaiting arena space.
 struct PendingFrame {
@@ -352,7 +372,14 @@ impl<R: Read + Seek> MkvDemux<R> {
         use crate::element::PadId;
         use crate::format::Caps;
 
-        let file = MatroskaFile::open(reader)
+        // Own cue pre-scan on the raw reader BEFORE the crate consumes it
+        // (the mp4_extra precedent), then keep a second handle for seeks.
+        let mut reader = reader;
+        let cues = super::mkv_cues::scan_cues(&mut reader);
+        let shared = super::mkv_cues::SharedReader::new(reader);
+        let raw = shared.clone();
+
+        let file = MatroskaFile::open(shared)
             .map_err(|e| Error::Config(format!("failed to parse Matroska file: {e:?}")))?;
         let timestamp_scale = file.info().timestamp_scale().get();
 
@@ -387,6 +414,8 @@ impl<R: Read + Seek> MkvDemux<R> {
 
         let mut this = Self {
             file,
+            raw,
+            cues,
             tracks,
             timestamp_scale,
             outputs: Vec::new(),
@@ -401,7 +430,8 @@ impl<R: Read + Seek> MkvDemux<R> {
             looping: false,
             video_resync: false,
             pending: None,
-            skip_until_ticks: None,
+            skip: Vec::new(),
+            scan_budget: DEFAULT_SCAN_BUDGET,
         };
 
         let video = this
@@ -492,6 +522,16 @@ impl<R: Read + Seek> MkvDemux<R> {
     /// producing instead of reporting EOS.
     pub fn with_loop(mut self, looping: bool) -> Self {
         self.looping = looping;
+        self
+    }
+
+    /// Cap how many frames one `produce()` call may discard while scanning
+    /// toward a seek target before yielding an empty result (default 256).
+    ///
+    /// Yielding lets the executor drain a superseding seek between calls, so
+    /// a second arrow press does not queue behind a long scan.
+    pub fn with_scan_budget(mut self, budget: usize) -> Self {
+        self.scan_budget = budget.max(1);
         self
     }
 
@@ -726,7 +766,15 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
             }
         }
 
+        let mut discarded = 0usize;
         loop {
+            // Bound the scan work per call: past the budget, yield an empty
+            // result (a free cooperative yield — no sleep) so the executor
+            // can drain a superseding seek before the scan continues.
+            if discarded >= self.scan_budget {
+                return Ok(DemuxerProduce::Routed(RoutedOutput::new()));
+            }
+
             let more = self
                 .file
                 .next_frame(&mut self.frame)
@@ -737,6 +785,10 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
                         .seek(0)
                         .map_err(|e| Error::Config(format!("MKV rewind failed: {e:?}")))?;
                     self.video_resync = true;
+                    // A seek past the last frame leaves skip entries no frame
+                    // can ever satisfy; the loop rewind must drop them or it
+                    // would discard every frame forever.
+                    self.skip.clear();
                     continue;
                 }
                 return Ok(DemuxerProduce::Eos);
@@ -747,13 +799,16 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
                 continue; // subtitle or extra track
             };
 
-            // Linear-seek fallback: everything below the target is dropped
-            // without conversion.
-            if let Some(target) = self.skip_until_ticks {
-                if self.frame.timestamp < target {
+            // Post-seek skip, strictly per track: only this track's own
+            // first frame at/after the target clears its entry, so audio
+            // interleaved ahead of video can no longer let pre-target video
+            // through.
+            if let Some(i) = self.skip.iter().position(|(id, _)| *id == track) {
+                if self.frame.timestamp < self.skip[i].1 {
+                    discarded += 1;
                     continue;
                 }
-                self.skip_until_ticks = None;
+                self.skip.swap_remove(i);
             }
 
             let codec = self
@@ -773,8 +828,13 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
 
             // After a seek, hold video until a keyframe so a decoder never
             // joins mid-GOP. Audio passes through (every frame decodes).
+            // Evaluated only after the video track's own skip has cleared —
+            // a pre-target keyframe (the t=0 one, during a rewind scan) can
+            // no longer satisfy the resync while the skip is still
+            // discarding (#158).
             if self.video_resync && is_video {
                 if !is_key {
+                    discarded += 1;
                     continue;
                 }
                 self.video_resync = false;
@@ -826,34 +886,58 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
         }
         let target_ns = seek.start.position.max(0) as u64;
         let ticks = target_ns / self.timestamp_scale;
-        // Try the cue-indexed fast path first. matroska-demuxer 0.8 mis-seeks
-        // on cues that carry CueRelativePosition (ffmpeg-muxed MKVs): it
-        // resolves the offset against the *first* cluster and then fails to
-        // parse. Fall back to a rewind plus a skip-below-target scan, which
-        // is linear over block headers but always lands correctly.
-        let sought = match self.file.seek(ticks) {
-            Ok(()) => true,
-            Err(fast) => {
-                tracing::debug!(
-                    "mkvdemux: cue seek to tick {ticks} failed ({fast:?}); \
-                     falling back to linear scan from the start"
-                );
-                match self.file.seek(0) {
-                    Ok(()) => {
-                        self.skip_until_ticks = Some(ticks);
+
+        // Cue-indexed path first, on OUR cue table (`mkv_cues`): the crate's
+        // own cue seek mis-resolves ffmpeg's CueRelativePosition against the
+        // first cluster — sometimes erroring, sometimes silently landing
+        // wrong. `file.seek(0)` is a cheap, always-correct parser-state
+        // reset (clears the crate's queued frames); the shared raw handle
+        // then repositions the stream at the cue's Cluster element start,
+        // from which `next_frame` resynchronizes off the cluster's own
+        // Timestamp. Cue-less files take the crate's linear path, and a
+        // rewind-plus-skip remains the last resort.
+        let cue = self.cues.iter().rev().find(|c| c.time_ticks <= ticks);
+        let sought = match cue {
+            Some(cue) => match self.file.seek(0) {
+                Ok(()) => match self.raw.seek(std::io::SeekFrom::Start(cue.cluster_offset)) {
+                    Ok(_) => {
+                        tracing::debug!(
+                            "mkvdemux: cue seek to tick {ticks} lands at cluster offset {}",
+                            cue.cluster_offset
+                        );
                         true
                     }
                     Err(e) => {
-                        tracing::warn!("mkvdemux: seek failed: {e:?}");
+                        tracing::warn!("mkvdemux: cue reposition failed: {e}");
                         false
                     }
+                },
+                Err(e) => {
+                    tracing::warn!("mkvdemux: seek state reset failed: {e:?}");
+                    false
                 }
-            }
+            },
+            None => match self.file.seek(ticks) {
+                Ok(()) => true,
+                Err(fast) => {
+                    tracing::debug!(
+                        "mkvdemux: crate seek to tick {ticks} failed ({fast:?}); \
+                         falling back to linear scan from the start"
+                    );
+                    self.file.seek(0).is_ok()
+                }
+            },
         };
         if sought {
             tracing::info!("mkvdemux: seek to {target_ns} ns (tick {ticks})");
             self.pending = None;
             self.video_resync = true;
+            // Per-track skip on EVERY path: the cue lands at (or before) the
+            // target's cluster, the crate's narrow phase only guarantees the
+            // first block, and the rewind fallback starts at zero — in all
+            // three cases each routed track discards its own frames below
+            // the target.
+            self.skip = self.routed.iter().map(|&(id, _)| (id, ticks)).collect();
             EventResult::Handled
         } else {
             EventResult::Error
