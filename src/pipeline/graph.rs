@@ -411,6 +411,12 @@ pub struct Link {
     /// Channel capacity for this link; `None` uses
     /// [`ExecutorConfig::channel_capacity`](crate::pipeline::ExecutorConfig).
     pub capacity: Option<usize>,
+    /// Watermarks for flow monitoring; `None` derives 80/20 from the
+    /// resolved channel capacity when the link is monitored.
+    pub watermarks: Option<crate::pipeline::flow::WaterMarks>,
+    /// Shared flow state the executor drives from channel occupancy.
+    /// Created by [`Pipeline::monitor_link`]; `None` = unmonitored.
+    pub(crate) flow_state: Option<crate::pipeline::flow::FlowStateHandle>,
 }
 
 impl Default for Link {
@@ -420,6 +426,8 @@ impl Default for Link {
             sink_pad: "sink".to_string(),
             policy: LinkPolicy::default(),
             capacity: None,
+            watermarks: None,
+            flow_state: None,
         }
     }
 }
@@ -448,6 +456,13 @@ impl Link {
     /// Set this link's channel capacity, overriding the executor default.
     pub fn with_capacity(mut self, capacity: usize) -> Self {
         self.capacity = Some(capacity);
+        self
+    }
+
+    /// Set the watermarks used when this link is monitored
+    /// (see [`Pipeline::monitor_link`]).
+    pub fn with_watermarks(mut self, marks: crate::pipeline::flow::WaterMarks) -> Self {
+        self.watermarks = Some(marks);
         self
     }
 }
@@ -1342,7 +1357,7 @@ impl Pipeline {
     /// Link two nodes with default pad names.
     ///
     /// Creates an edge from `src` to `sink` using the default "src" and "sink" pads.
-    pub fn link(&mut self, src: NodeId, sink: NodeId) -> Result<()> {
+    pub fn link(&mut self, src: NodeId, sink: NodeId) -> Result<LinkId> {
         self.link_pads(src, "src", sink, "sink")
     }
 
@@ -1363,12 +1378,12 @@ impl Pipeline {
     /// ```
     ///
     /// EOS is still delivered blocking, whatever the policy.
-    pub fn link_lossy(&mut self, src: NodeId, sink: NodeId) -> Result<()> {
+    pub fn link_lossy(&mut self, src: NodeId, sink: NodeId) -> Result<LinkId> {
         self.link_with(src, sink, LinkPolicy::Drop)
     }
 
     /// Link two nodes with an explicit [`LinkPolicy`], using default pad names.
-    pub fn link_with(&mut self, src: NodeId, sink: NodeId, policy: LinkPolicy) -> Result<()> {
+    pub fn link_with(&mut self, src: NodeId, sink: NodeId, policy: LinkPolicy) -> Result<LinkId> {
         self.link_pads_full(src, "src", sink, "sink", policy, None)
     }
 
@@ -1379,7 +1394,7 @@ impl Pipeline {
         src_pad: &str,
         sink: NodeId,
         sink_pad: &str,
-    ) -> Result<()> {
+    ) -> Result<LinkId> {
         self.link_pads_full(src, src_pad, sink, sink_pad, LinkPolicy::default(), None)
     }
 
@@ -1391,7 +1406,7 @@ impl Pipeline {
         sink: NodeId,
         sink_pad: &str,
         policy: LinkPolicy,
-    ) -> Result<()> {
+    ) -> Result<LinkId> {
         self.link_pads_full(src, src_pad, sink, sink_pad, policy, None)
     }
 
@@ -1409,7 +1424,7 @@ impl Pipeline {
         sink_pad: &str,
         policy: LinkPolicy,
         capacity: Option<usize>,
-    ) -> Result<()> {
+    ) -> Result<LinkId> {
         // Validate source node and pad
         let src_node = self
             .graph
@@ -1441,14 +1456,15 @@ impl Pipeline {
         link.capacity = capacity;
 
         // Add edge (daggy ensures no cycles)
-        self.graph
+        let edge = self
+            .graph
             .add_edge(src.0, sink.0, link)
             .map_err(|_| Error::InvalidSegment("linking would create a cycle".into()))?;
 
         // Invalidate negotiation since the graph has changed
         self.negotiation = None;
 
-        Ok(())
+        Ok(LinkId(edge))
     }
 
     /// Get all source nodes (nodes with no incoming edges).
@@ -1862,6 +1878,52 @@ impl Pipeline {
             negotiated_format,
             negotiated_memory,
         })
+    }
+
+    /// Monitor a link's channel occupancy, deriving watermarks from its
+    /// resolved capacity (80 % high / 20 % low).
+    ///
+    /// The returned [`FlowStateHandle`](crate::pipeline::flow::FlowStateHandle)
+    /// is driven by the executor at runtime — `Busy` when the link's channel
+    /// fills past the high mark, back to `Ready` when it drains to the low
+    /// mark. Wire it into a live source's `set_flow_state` *before* start;
+    /// the source checks `should_produce()` and skips capture work while
+    /// the link is backed up:
+    ///
+    /// ```rust,ignore
+    /// let link = pipeline.link_with(cam, enc, LinkPolicy::Drop)?;
+    /// let flow = pipeline.monitor_link(link)?;
+    /// pipeline.get_element_mut::<V4l2Src>("cam").unwrap().set_flow_state(flow);
+    /// ```
+    ///
+    /// Links crossing an RT/bridge boundary are not monitored (the RT path
+    /// carries no channel to observe).
+    pub fn monitor_link(&mut self, id: LinkId) -> Result<crate::pipeline::flow::FlowStateHandle> {
+        let link = self
+            .graph
+            .edge_weight_mut(id.0)
+            .ok_or_else(|| Error::InvalidSegment("link not found".into()))?;
+        let state = link
+            .flow_state
+            .get_or_insert_with(crate::pipeline::flow::new_flow_state);
+        Ok(state.clone())
+    }
+
+    /// [`monitor_link`](Self::monitor_link) with explicit watermarks
+    /// instead of the capacity-derived 80/20 defaults.
+    pub fn monitor_link_with(
+        &mut self,
+        id: LinkId,
+        marks: crate::pipeline::flow::WaterMarks,
+    ) -> Result<crate::pipeline::flow::FlowStateHandle> {
+        {
+            let link = self
+                .graph
+                .edge_weight_mut(id.0)
+                .ok_or_else(|| Error::InvalidSegment("link not found".into()))?;
+            link.watermarks = Some(marks);
+        }
+        self.monitor_link(id)
     }
 
     /// Get the negotiated format for a specific link.

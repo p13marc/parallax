@@ -331,6 +331,40 @@ pub fn new_flow_state() -> FlowStateHandle {
     Arc::new(SharedFlowState::new())
 }
 
+/// Watermark-driven [`FlowSignal`] production for one monitored link.
+///
+/// The executor samples the link channel's occupancy on **both** sides —
+/// after every send and after every receive — and folds it through the
+/// hysteresis below into the shared [`FlowStateHandle`] that
+/// [`Pipeline::monitor_link`](crate::pipeline::Pipeline::monitor_link)
+/// returned. Sender-only sampling would deadlock the Ready transition: a
+/// gated source stops sending, so occupancy would never be re-sampled.
+#[derive(Debug)]
+pub(crate) struct LinkFlowMonitor {
+    marks: WaterMarks,
+    state: FlowStateHandle,
+}
+
+impl LinkFlowMonitor {
+    pub(crate) fn new(marks: WaterMarks, state: FlowStateHandle) -> Self {
+        Self { marks, state }
+    }
+
+    /// Fold one occupancy sample into the signal: Ready → Busy at the high
+    /// mark, Busy → Ready at the low mark, hysteresis in between.
+    pub(crate) fn update(&self, occupancy: usize) {
+        match self.state.signal() {
+            FlowSignal::Ready if self.marks.is_high(occupancy) => {
+                self.state.set_signal(FlowSignal::Busy);
+            }
+            FlowSignal::Busy if self.marks.is_low(occupancy) => {
+                self.state.set_signal(FlowSignal::Ready);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Water mark configuration for queue-based flow control.
 #[derive(Debug, Clone, Copy)]
 pub struct WaterMarks {
@@ -484,6 +518,27 @@ mod tests {
         let custom = WaterMarks::with_percentages(100, 90, 10);
         assert_eq!(custom.high, 90);
         assert_eq!(custom.low, 10);
+    }
+
+    #[test]
+    fn link_flow_monitor_hysteresis() {
+        let state = new_flow_state();
+        let monitor = LinkFlowMonitor::new(WaterMarks::new(8, 2), state.clone());
+
+        // Climbing through the band keeps Ready until the high mark.
+        monitor.update(5);
+        assert_eq!(state.signal(), FlowSignal::Ready);
+        monitor.update(8);
+        assert_eq!(state.signal(), FlowSignal::Busy);
+
+        // Draining through the band keeps Busy until the low mark.
+        monitor.update(5);
+        assert_eq!(state.signal(), FlowSignal::Busy);
+        monitor.update(2);
+        assert_eq!(state.signal(), FlowSignal::Ready);
+
+        // One backpressure event counted for the single Ready→Busy edge.
+        assert_eq!(state.backpressure_events(), 1);
     }
 
     #[test]

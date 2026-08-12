@@ -359,7 +359,20 @@ Also: `pipeline.to_dot()` / `to_dot_with_options(DotOptions::verbose())`, `to_js
 
 ## Flow control & backpressure
 
-Live sources (cameras, screen, audio) produce at a fixed rate regardless of downstream speed. The flow-control primitives (`src/pipeline/flow.rs`) let downstream congestion reach the source:
+Live sources (cameras, screen, audio) produce at a fixed rate regardless of downstream speed. The flow-control primitives (`src/pipeline/flow.rs`) let downstream congestion reach the source.
+
+### Link monitoring
+
+In a task-per-element engine the link channel *is* the queue, so that is where occupancy is observable. `Pipeline::monitor_link` attaches watermarks to a link and returns a `FlowStateHandle` the executor drives at runtime — `Busy` when the channel fills past the high mark, back to `Ready` when it drains to the low mark (sampled after every send *and* every receive, so the signal releases even while a gated source is idle):
+
+```rust
+let link = pipeline.link_with(cam, enc, LinkPolicy::Drop)?;
+let flow = pipeline.monitor_link(link)?;   // 80/20 of the link capacity
+// or: pipeline.monitor_link_with(link, WaterMarks::new(24, 4))?
+pipeline.get_element_mut::<V4l2Src>("cam").unwrap().set_flow_state(flow);
+```
+
+The source checks `should_produce()` before doing capture work and skips the frame while the link is backed up — cheaper than `LinkPolicy::Drop` alone, which discards the frame only *after* it was captured and copied. RT/bridge boundary edges carry no channel and are not monitored.
 
 - **`FlowSignal`**: `Ready`, `Busy`, `Drop`, `EosAck`, `Pausing`, `Stopping`
 - **`FlowPolicy`** (how a source reacts): `Block` (default — for files), `Drop { log_drops, .. }` (live capture), `RingBuffer { capacity }`, `Adaptive { .. }`

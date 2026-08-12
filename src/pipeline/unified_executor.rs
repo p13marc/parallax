@@ -38,6 +38,7 @@ use crate::error::{Error, Result};
 use crate::event::{Event, EventResult, FlushStopEvent, SeekEvent, SeekType, SegmentEvent};
 use crate::memory::{OutputBudget, defaults};
 use crate::pipeline::bus::{Bus, BusHandle};
+use crate::pipeline::flow::{LinkFlowMonitor, WaterMarks};
 use crate::pipeline::probe::{ProbeRegistry, ProbeReturn};
 use crate::pipeline::rt_bridge::AsyncRtBridge;
 use crate::pipeline::rt_scheduler::{
@@ -1525,6 +1526,12 @@ impl Executor {
             if !network.has_channel(node_id, &link.src_pad, child_id, &link.sink_pad) {
                 let capacity = link.capacity.unwrap_or(self.config.channel_capacity);
                 let (tx, rx) = bounded_async::<Message>(capacity);
+                let flow = link.flow_state.as_ref().map(|state| {
+                    let marks = link
+                        .watermarks
+                        .unwrap_or_else(|| WaterMarks::from_capacity(capacity));
+                    Arc::new(LinkFlowMonitor::new(marks, state.clone()))
+                });
                 network.add_channel(
                     node_id,
                     link.src_pad.clone(),
@@ -1534,6 +1541,7 @@ impl Executor {
                     rx,
                     link.policy,
                     node_name(pipeline, child_id),
+                    flow,
                 );
             }
             self.build_channels(pipeline, child_id, network);
@@ -1564,6 +1572,12 @@ impl Executor {
                 if !network.has_channel(node_id, &link.src_pad, child_id, &link.sink_pad) {
                     let capacity = link.capacity.unwrap_or(self.config.channel_capacity);
                     let (tx, rx) = bounded_async::<Message>(capacity);
+                    let flow = link.flow_state.as_ref().map(|state| {
+                        let marks = link
+                            .watermarks
+                            .unwrap_or_else(|| WaterMarks::from_capacity(capacity));
+                        Arc::new(LinkFlowMonitor::new(marks, state.clone()))
+                    });
                     network.add_channel(
                         node_id,
                         link.src_pad.clone(),
@@ -1573,6 +1587,7 @@ impl Executor {
                         rx,
                         link.policy,
                         node_name(pipeline, child_id),
+                        flow,
                     );
                 }
                 self.build_channels_for_async(
@@ -2037,6 +2052,11 @@ struct OutputBranch {
     policy: LinkPolicy,
     /// Name of the element on the far end, for drop reporting.
     sink_name: String,
+    /// Flow monitor for this link (`Pipeline::monitor_link`), fed the
+    /// channel occupancy after every send. The receive side samples too —
+    /// a gated source stops sending, so sender-only sampling would never
+    /// observe the drain that flips the signal back to Ready.
+    flow: Option<Arc<LinkFlowMonitor>>,
 }
 
 impl OutputBranch {
@@ -2051,7 +2071,7 @@ impl OutputBranch {
     /// died spun at 100% CPU producing into a closed channel until the handle
     /// was dropped. Callers use this to stop.
     async fn send_buffer(&self, buffer: Buffer, epoch: u64, tracers: &TracerRegistry) -> bool {
-        match self.policy {
+        let sent = match self.policy {
             LinkPolicy::Block => self.tx.send(Message::Buffer(buffer, epoch)).await.is_ok(),
             LinkPolicy::Drop => match self.tx.try_send(Message::Buffer(buffer, epoch)) {
                 Ok(true) => true,
@@ -2061,7 +2081,37 @@ impl OutputBranch {
                 }
                 Err(_) => false, // closed
             },
+        };
+        if let Some(flow) = &self.flow {
+            flow.update(self.tx.len());
         }
+        sent
+    }
+}
+
+/// One upstream branch of a sink-pad: the receiving end of a link's channel,
+/// plus that link's flow monitor. `recv`/`try_recv` sample occupancy after
+/// every receive, which is the half of the monitoring that observes drains.
+struct InputBranch {
+    rx: AsyncReceiver<Message>,
+    flow: Option<Arc<LinkFlowMonitor>>,
+}
+
+impl InputBranch {
+    async fn recv(&self) -> std::result::Result<Message, kanal::ReceiveError> {
+        let msg = self.rx.recv().await;
+        if let Some(flow) = &self.flow {
+            flow.update(self.rx.len());
+        }
+        msg
+    }
+
+    fn try_recv(&self) -> std::result::Result<Option<Message>, kanal::ReceiveError> {
+        let msg = self.rx.try_recv();
+        if let Some(flow) = &self.flow {
+            flow.update(self.rx.len());
+        }
+        msg
     }
 }
 
@@ -2171,7 +2221,7 @@ fn node_name(pipeline: &Pipeline, node_id: NodeId) -> String {
 struct ChannelNetwork {
     channels: HashMap<ChannelKey, (AsyncSender<Message>, AsyncReceiver<Message>)>,
     outputs: HashMap<(NodeId, String), Vec<OutputBranch>>,
-    inputs: HashMap<(NodeId, String), Vec<AsyncReceiver<Message>>>,
+    inputs: HashMap<(NodeId, String), Vec<InputBranch>>,
 }
 
 impl ChannelNetwork {
@@ -2199,6 +2249,7 @@ impl ChannelNetwork {
         rx: AsyncReceiver<Message>,
         policy: LinkPolicy,
         sink_name: String,
+        flow: Option<Arc<LinkFlowMonitor>>,
     ) {
         self.channels.insert(
             (src, src_pad.clone(), sink, sink_pad.clone()),
@@ -2211,8 +2262,12 @@ impl ChannelNetwork {
                 tx,
                 policy,
                 sink_name,
+                flow: flow.clone(),
             });
-        self.inputs.entry((sink, sink_pad)).or_default().push(rx);
+        self.inputs
+            .entry((sink, sink_pad))
+            .or_default()
+            .push(InputBranch { rx, flow });
     }
 
     fn take_outputs_by_pad(&mut self, node: NodeId) -> HashMap<String, Vec<OutputBranch>> {
@@ -2231,7 +2286,7 @@ impl ChannelNetwork {
         result
     }
 
-    fn take_inputs_by_pad(&mut self, node: NodeId) -> HashMap<String, Vec<AsyncReceiver<Message>>> {
+    fn take_inputs_by_pad(&mut self, node: NodeId) -> HashMap<String, Vec<InputBranch>> {
         let mut result = HashMap::new();
         let keys: Vec<_> = self
             .inputs
@@ -2254,7 +2309,7 @@ impl ChannelNetwork {
             .collect()
     }
 
-    fn take_inputs(&mut self, node: NodeId) -> Vec<AsyncReceiver<Message>> {
+    fn take_inputs(&mut self, node: NodeId) -> Vec<InputBranch> {
         self.take_inputs_by_pad(node)
             .into_values()
             .flatten()
@@ -2542,7 +2597,7 @@ fn spawn_sink_task(
     name: String,
     node_id: NodeId,
     mut element: Box<DynAsyncElement<'static>>,
-    inputs: Vec<AsyncReceiver<Message>>,
+    inputs: Vec<InputBranch>,
     input_bridges: Vec<Arc<AsyncRtBridge>>,
     events: EventSender,
     probe_registry: ProbeRegistry,
@@ -2787,7 +2842,7 @@ fn spawn_transform_task(
     name: String,
     node_id: NodeId,
     mut element: Box<DynAsyncElement<'static>>,
-    inputs: Vec<AsyncReceiver<Message>>,
+    inputs: Vec<InputBranch>,
     outputs: Vec<OutputBranch>,
     input_bridges: Vec<Arc<AsyncRtBridge>>,
     output_bridges: Vec<Arc<AsyncRtBridge>>,
@@ -3146,7 +3201,7 @@ fn spawn_demuxer_task(
     name: String,
     node_id: NodeId,
     mut element: Box<DynAsyncElement<'static>>,
-    inputs: Vec<AsyncReceiver<Message>>,
+    inputs: Vec<InputBranch>,
     outputs_by_pad: HashMap<String, Vec<OutputBranch>>,
     events: EventSender,
     probe_registry: ProbeRegistry,
@@ -3421,7 +3476,7 @@ fn spawn_muxer_task(
     name: String,
     node_id: NodeId,
     mut element: Box<DynAsyncElement<'static>>,
-    inputs_by_pad: HashMap<String, Vec<AsyncReceiver<Message>>>,
+    inputs_by_pad: HashMap<String, Vec<InputBranch>>,
     outputs: Vec<OutputBranch>,
     events: EventSender,
     probe_registry: ProbeRegistry,
@@ -3449,10 +3504,7 @@ fn spawn_muxer_task(
         // pushed another — delivered exactly *one* buffer per input pad and
         // then fell out of the loop. A two-input muxer muxed two buffers,
         // whatever the stream length.
-        async fn recv_one(
-            pad: String,
-            rx: AsyncReceiver<Message>,
-        ) -> (String, AsyncReceiver<Message>, Option<Message>) {
+        async fn recv_one(pad: String, rx: InputBranch) -> (String, InputBranch, Option<Message>) {
             let msg = rx.recv().await.ok();
             (pad, rx, msg)
         }
