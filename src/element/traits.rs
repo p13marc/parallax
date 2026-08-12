@@ -1452,7 +1452,7 @@ pub trait Demuxer: Send {
         format!("src_{}", pad.0)
     }
 
-    /// Handle an upstream event (seek, QoS).
+    /// Handle an upstream event (seek).
     ///
     /// A *source-style* demuxer receives runtime events exactly like a
     /// source does — `PipelineHandle::seek` lands here. Return `Handled`

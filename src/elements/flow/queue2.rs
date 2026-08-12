@@ -230,6 +230,14 @@ struct RateState {
 }
 
 impl Queue2 {
+    /// Drop everything buffered: the in-memory ring, the byte accounting,
+    /// and (download/timeshift) the notion of what has been written — a
+    /// flushing seek abandoned that data.
+    fn clear_buffered(&mut self) {
+        self.ring.clear();
+        self.current_bytes = 0;
+    }
+
     /// Create a Queue2 in stream buffering mode.
     pub fn stream(max_size_bytes: usize) -> Self {
         Self::with_config(BufferingConfig {
@@ -572,6 +580,18 @@ impl Element for Queue2 {
         }
     }
 
+    fn handle_downstream_event(
+        &mut self,
+        event: crate::event::Event,
+    ) -> Option<crate::event::Event> {
+        // Same rule as Queue: a flushing seek drains buffering queues by
+        // propagation (#162).
+        if matches!(event, crate::event::Event::FlushStart) {
+            self.clear_buffered();
+        }
+        Some(event)
+    }
+
     fn name(&self) -> &str {
         "queue2"
     }
@@ -603,6 +623,25 @@ mod tests {
         let slot = arena.acquire().unwrap();
         let handle = MemoryHandle::with_len(slot, size.min(256));
         Buffer::new(handle, Metadata::from_sequence(seq))
+    }
+
+    #[test]
+    fn flush_start_clears_the_buffered_contents() {
+        use crate::element::Element;
+
+        let mut q = Queue2::stream(1024);
+        // Fill the ring through the push half alone (Element::process is
+        // 1-in-1-out and would drain as it goes).
+        for seq in 0..3 {
+            let _ = q.process_stream_push(make_buffer(64, seq));
+        }
+        assert_eq!(q.ring.len(), 3);
+        assert!(q.current_bytes > 0);
+
+        let fwd = Element::handle_downstream_event(&mut q, crate::event::Event::FlushStart);
+        assert!(matches!(fwd, Some(crate::event::Event::FlushStart)));
+        assert!(q.ring.is_empty(), "FlushStart must clear the ring");
+        assert_eq!(q.current_bytes, 0);
     }
 
     #[test]

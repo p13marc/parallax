@@ -9,7 +9,7 @@
 //! Events are categorized by their flow direction:
 //!
 //! - **Downstream events**: Flow with data (EOS, segment, tags, stream-start)
-//! - **Upstream events**: Flow against data (seek, QoS)
+//! - **Upstream events**: Flow against data (seek)
 //! - **Bidirectional events**: Can flow either way (flush)
 //!
 //! # Serialization
@@ -86,12 +86,6 @@ pub enum Event {
     /// Seek request.
     Seek(SeekEvent),
 
-    /// Quality of Service feedback.
-    Qos(QosEvent),
-
-    /// Request for latency info.
-    LatencyQuery,
-
     // ========== Bidirectional Events ==========
     /// Flush start - immediately discard buffered data.
     FlushStart,
@@ -129,7 +123,7 @@ impl Event {
 
     /// Check if this is an upstream event (flows against data).
     pub fn is_upstream(&self) -> bool {
-        matches!(self, Event::Seek(_) | Event::Qos(_) | Event::LatencyQuery)
+        matches!(self, Event::Seek(_))
     }
 
     /// Check if this is a bidirectional event.
@@ -167,8 +161,6 @@ impl Event {
             Event::CapsChanged(_) => "caps-changed",
             Event::Gap(_) => "gap",
             Event::Seek(_) => "seek",
-            Event::Qos(_) => "qos",
-            Event::LatencyQuery => "latency-query",
             Event::FlushStart => "flush-start",
             Event::FlushStop(_) => "flush-stop",
             Event::Pause => "pause",
@@ -660,49 +652,6 @@ impl SeekFlags {
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
-}
-
-// ============================================================================
-// QoS Event
-// ============================================================================
-
-/// Quality of Service event - feedback about processing performance.
-///
-/// Sent upstream to indicate that elements are having trouble
-/// keeping up with the data rate.
-#[derive(Debug, Clone)]
-pub struct QosEvent {
-    /// Type of QoS issue.
-    pub qos_type: QosType,
-    /// Proportion of frames being dropped (0.0 - 1.0).
-    pub proportion: f64,
-    /// Difference between expected and actual processing time.
-    pub diff: ClockTime,
-    /// Timestamp of the problematic buffer.
-    pub timestamp: ClockTime,
-}
-
-impl QosEvent {
-    /// Create a new QoS event.
-    pub fn new(qos_type: QosType, proportion: f64, diff: ClockTime, timestamp: ClockTime) -> Self {
-        Self {
-            qos_type,
-            proportion,
-            diff,
-            timestamp,
-        }
-    }
-}
-
-/// Type of QoS issue.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum QosType {
-    /// Not enough data (underflow).
-    Underflow,
-    /// Too much data (overflow).
-    Overflow,
-    /// Data rate too high (throttling needed).
-    Throttle,
 }
 
 // ============================================================================

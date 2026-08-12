@@ -482,6 +482,20 @@ impl Element for Queue {
         self.pop()
     }
 
+    fn handle_downstream_event(
+        &mut self,
+        event: crate::event::Event,
+    ) -> Option<crate::event::Event> {
+        // A flushing seek drains queues by propagation, exactly as
+        // GStreamer's queue does (#162). NOT wired through the trait
+        // `Element::flush` — that hook has drain-and-emit-at-EOS
+        // semantics, the opposite of discarding.
+        if matches!(event, crate::event::Event::FlushStart) {
+            Queue::flush(self);
+        }
+        Some(event)
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -529,6 +543,23 @@ mod tests {
         let queue = Queue::new(10);
         assert!(queue.is_empty());
         assert_eq!(queue.len(), 0);
+    }
+
+    #[test]
+    fn flush_start_drops_the_queued_contents() {
+        use crate::element::Element;
+
+        let mut queue = Queue::new(10);
+        for seq in 0..3 {
+            queue.push(create_test_buffer(64, seq)).unwrap();
+        }
+        assert_eq!(queue.len(), 3);
+
+        // A flushing seek drains queues by event propagation (#162); the
+        // event itself is forwarded downstream unchanged.
+        let fwd = Element::handle_downstream_event(&mut queue, crate::event::Event::FlushStart);
+        assert!(matches!(fwd, Some(crate::event::Event::FlushStart)));
+        assert!(queue.is_empty(), "FlushStart must drop queued buffers");
     }
 
     #[test]

@@ -428,7 +428,7 @@ pub trait PipelineElement {
         Some(event)
     }
 
-    /// Handle an upstream event (flows against data: seek, QoS).
+    /// Handle an upstream event (flows against data: seek).
     ///
     /// Return `EventResult::Handled` if processed, `NotHandled` to pass upstream.
     fn handle_upstream_event(&mut self, _event: &Event) -> EventResult {
