@@ -25,10 +25,7 @@
 //! let decoder = SymphoniaDecoder::for_format(AudioFormat::Mp3)?;
 //! ```
 
-use crate::buffer::{Buffer, MemoryHandle};
-use crate::element::{Element, ExecutionHints};
 use crate::error::{Error, Result};
-use crate::memory::{OutputArena, OutputBudget, defaults};
 
 /// Supported audio formats.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,9 +108,15 @@ mod symphonia_decoder {
     use symphonia::core::io::MediaSourceStream;
     use symphonia::core::meta::MetadataOptions;
 
-    /// Audio decoder using Symphonia (pure Rust).
+    /// One-shot, container-probing audio decoder using Symphonia (pure Rust).
     ///
     /// Supports FLAC, MP3, AAC, and Vorbis depending on enabled features.
+    ///
+    /// **Not a pipeline element** (#160): it re-probes its accumulated input
+    /// as a whole container on every call, which makes it unusable for
+    /// demuxed streams — the streaming decoders (`AacDecoder`,
+    /// `VorbisDecoder`, ...) are the element-system route. This remains as a
+    /// convenience for decoding a complete in-memory file to PCM.
     pub struct SymphoniaDecoder {
         /// Hint for format detection.
         hint: Option<String>,
@@ -125,8 +128,6 @@ mod symphonia_decoder {
         last_sample_rate: Option<u32>,
         /// Channel count from last decoded frame.
         last_channels: Option<u16>,
-        /// Arena for output buffers.
-        output: OutputArena,
     }
 
     impl SymphoniaDecoder {
@@ -138,7 +139,6 @@ mod symphonia_decoder {
                 input_buffer: Vec::new(),
                 last_sample_rate: None,
                 last_channels: None,
-                output: OutputArena::new(defaults::AUDIO_SLOT_COUNT).with_min_slot_size(64 * 1024),
             })
         }
 
@@ -162,7 +162,6 @@ mod symphonia_decoder {
                 input_buffer: Vec::new(),
                 last_sample_rate: None,
                 last_channels: None,
-                output: OutputArena::new(defaults::AUDIO_SLOT_COUNT).with_min_slot_size(64 * 1024),
             })
         }
 
@@ -171,8 +170,13 @@ mod symphonia_decoder {
             self.frame_count
         }
 
-        /// Decode audio from input buffer.
-        fn decode_audio(&mut self, input: &[u8]) -> Result<Option<(Vec<f32>, AudioFrameInfo)>> {
+        /// Feed a chunk of an audio *file* and try to decode.
+        ///
+        /// Accumulates input across calls; once enough of the container has
+        /// arrived to probe, returns interleaved f32 samples plus their
+        /// description. Feeding the entire file in one call is the intended
+        /// use.
+        pub fn decode_chunk(&mut self, input: &[u8]) -> Result<Option<(Vec<f32>, AudioFrameInfo)>> {
             // Accumulate input data
             self.input_buffer.extend_from_slice(input);
 
@@ -273,43 +277,6 @@ mod symphonia_decoder {
     impl Default for SymphoniaDecoder {
         fn default() -> Self {
             Self::new().expect("Failed to create default decoder")
-        }
-    }
-
-    impl Element for SymphoniaDecoder {
-        fn set_output_budget(&mut self, budget: OutputBudget) {
-            self.output.set_budget(budget);
-        }
-
-        fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
-            let input = buffer.as_bytes();
-
-            match self.decode_audio(input)? {
-                Some((samples, _info)) => {
-                    // Convert f32 samples to bytes
-                    let byte_len = samples.len() * 4;
-
-                    let mut slot = self.output.acquire(byte_len, "symphoniadecoder")?;
-
-                    // Copy f32 samples as bytes
-                    let src_bytes = unsafe {
-                        std::slice::from_raw_parts(samples.as_ptr() as *const u8, byte_len)
-                    };
-                    slot.data_mut()[..byte_len].copy_from_slice(src_bytes);
-
-                    let metadata = buffer.metadata().clone();
-
-                    Ok(Some(Buffer::new(
-                        MemoryHandle::with_len(slot, byte_len),
-                        metadata,
-                    )))
-                }
-                None => Ok(None),
-            }
-        }
-
-        fn execution_hints(&self) -> ExecutionHints {
-            ExecutionHints::cpu_intensive()
         }
     }
 }

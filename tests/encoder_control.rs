@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use parallax::buffer::{Buffer, MemoryHandle};
 use parallax::control::Controllable;
+use parallax::element::Element;
 use parallax::elements::app::{AppSink, AppSrc, Pulled};
 use parallax::elements::codec::{H264Decoder, H264Encoder, H264EncoderConfig, RateControlMode};
 use parallax::elements::transform::VideoScale;
@@ -149,8 +150,11 @@ async fn bitrate_and_resolution_change_on_a_running_pipeline() {
     let mut decoder = H264Decoder::new().unwrap();
     let mut sizes = Vec::new();
     for buffer in &outputs {
-        if let Some(frame) = decoder.decode(buffer.as_bytes()).unwrap() {
-            sizes.push((frame.width(), frame.height()));
+        // The decoder is an Element (its owned-frame API went private in
+        // #160); geometry travels in the decoded buffer's metadata.
+        if let Some(frame) = decoder.process(buffer.clone()).unwrap() {
+            let (w, h) = frame.metadata().video_dims().expect("decoded dims");
+            sizes.push((w as usize, h as usize));
         }
     }
     assert!(
@@ -240,8 +244,9 @@ async fn resolution_can_be_lowered_and_restored_while_running() {
     let mut decoder = H264Decoder::new().unwrap();
     let mut sizes = Vec::new();
     for buffer in &outputs {
-        if let Some(frame) = decoder.decode(buffer.as_bytes()).unwrap() {
-            sizes.push((frame.width(), frame.height()));
+        if let Some(frame) = decoder.process(buffer.clone()).unwrap() {
+            let (w, h) = frame.metadata().video_dims().expect("decoded dims");
+            sizes.push((w as usize, h as usize));
         }
     }
 

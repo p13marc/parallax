@@ -148,44 +148,6 @@ fn unsupported(parameter: &str) -> Error {
     ))
 }
 
-/// Trait for video decoders.
-///
-/// Video decoders take encoded packets and produce raw video frames.
-/// Similar to encoders, there may not be a 1:1 correspondence due
-/// to frame reordering and buffering.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// let mut decoder = MyDecoder::new()?;
-///
-/// for packet in packets {
-///     for frame in decoder.decode(&packet)? {
-///         // Process decoded frame
-///     }
-/// }
-///
-/// // Flush at EOS
-/// for frame in decoder.flush()? {
-///     // Process remaining frames
-/// }
-/// ```
-pub trait VideoDecoder: Send {
-    /// Decode an encoded packet.
-    ///
-    /// Returns zero or more decoded frames. The decoder may buffer
-    /// packets internally for B-frame reordering.
-    fn decode(&mut self, packet: &[u8]) -> Result<Vec<VideoFrame>>;
-
-    /// Flush any buffered frames at end-of-stream.
-    fn flush(&mut self) -> Result<Vec<VideoFrame>>;
-
-    /// Check if decoder has buffered frames.
-    fn has_pending(&self) -> bool {
-        false
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

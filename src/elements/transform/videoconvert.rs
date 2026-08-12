@@ -443,7 +443,6 @@ mod tests {
             "output metadata must carry the OUTPUT format, not the input's"
         );
         assert_eq!(out.metadata().video_dims(), Some((640, 480)));
-        assert_eq!(out.metadata().get::<u64>("width"), Some(&640));
     }
 
     /// The exact element the zensight sensor builds for a YUYV camera

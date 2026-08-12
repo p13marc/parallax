@@ -412,8 +412,6 @@ mod tests {
             meta.format,
             Some(MediaFormat::VideoRaw(vf)) if vf.width == 32 && vf.height == 16
         ));
-        // Legacy convention too (AutoVideoSink reads it).
-        assert_eq!(meta.get::<u64>("width"), Some(&32));
         // Input metadata (stream_id) is inherited.
         assert_eq!(meta.stream_id, 7);
     }

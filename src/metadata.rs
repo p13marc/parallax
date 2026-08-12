@@ -339,8 +339,8 @@ impl MetaBox {
 ///
 /// `Metadata` is cloned per buffer per element, so the representation of the
 /// custom map is hot-path cost: the boxed `dyn Any` fallback allocates on
-/// every clone, while the inline variants (which cover `set_video_dims`'s
-/// `"width"`/`"height"` and most `app/*` counters) clone as plain copies.
+/// every clone, while the inline variants (which cover the typical scalar
+/// counters, `h264/*` flags and `app/*` values) clone as plain copies.
 #[derive(Clone)]
 enum MetaValue {
     U64(u64),
@@ -496,10 +496,9 @@ pub struct Metadata {
     /// Use `set()`, `get()`, and related methods to access.
     /// Keys should be namespaced: `"domain/type"` (e.g., `"stanag/klv"`).
     ///
-    /// Small association list, not a hash map: entry counts are tiny (the
-    /// common case is exactly `"width"`+`"height"`, which fit the inline
-    /// capacity), a linear scan beats hashing at that size, and cloning
-    /// inline entries touches no heap.
+    /// Small association list, not a hash map: entry counts are tiny (one
+    /// or two scalar entries fit the inline capacity), a linear scan beats
+    /// hashing at that size, and cloning inline entries touches no heap.
     custom: smallvec::SmallVec<[(&'static str, MetaValue); 2]>,
 }
 
@@ -678,18 +677,15 @@ impl Metadata {
         }
     }
 
-    /// Record raw video dimensions, in **both** representations elements read.
+    /// Record raw video dimensions in [`format`](Self::format)
+    /// (`MediaFormat::VideoRaw`) — the single representation (#160).
     ///
-    /// Two conventions exist in this crate and neither is going away:
-    /// [`format`](Self::format) (`MediaFormat::VideoRaw`), which encoders read,
-    /// and the `"width"` / `"height"` `u64` custom keys, which decoders set and
-    /// `AutoVideoSink` reads. An element that resizes a frame and updates only
-    /// one of them leaves the other stale, and the downstream that trusts the
-    /// stale one silently mis-sizes the frame.
-    ///
-    /// Elements that change or originate raw video dimensions should call this
-    /// instead of writing either representation directly, and read them back
-    /// with [`video_dims`](Self::video_dims).
+    /// The legacy `"width"` / `"height"` `u64` custom keys are no longer
+    /// written or read; `MediaFormat` is the one source of truth, and
+    /// [`video_dims`](Self::video_dims) the one accessor. Elements that
+    /// change or originate raw video dimensions call this rather than
+    /// touching `format` directly, so the framerate a source negotiated
+    /// survives a resize.
     ///
     /// # Example
     ///
@@ -701,7 +697,6 @@ impl Metadata {
     /// meta.set_video_dims(320, 240, PixelFormat::I420);
     ///
     /// assert_eq!(meta.video_dims(), Some((320, 240)));
-    /// assert_eq!(meta.get::<u64>("width"), Some(&320)); // legacy readers too
     /// ```
     pub fn set_video_dims(
         &mut self,
@@ -722,8 +717,6 @@ impl Metadata {
             pixel_format,
             framerate,
         )));
-        self.set("width", width as u64);
-        self.set("height", height as u64);
     }
 
     /// Declare the framerate of the raw video this buffer belongs to.
@@ -741,21 +734,16 @@ impl Metadata {
         }
     }
 
-    /// Raw video dimensions, if this buffer carries them.
+    /// Raw video dimensions, if this buffer carries a `VideoRaw` format.
     ///
-    /// Prefers [`format`](Self::format) and falls back to the legacy
-    /// `"width"` / `"height"` custom keys. See
-    /// [`set_video_dims`](Self::set_video_dims) for why there are two.
+    /// The counterpart of [`set_video_dims`](Self::set_video_dims); since
+    /// #160 `MediaFormat` is the only representation — the legacy
+    /// `"width"`/`"height"` custom-key fallback is gone.
     pub fn video_dims(&self) -> Option<(u32, u32)> {
-        if let Some(MediaFormat::VideoRaw(vf)) = self.format
-            && vf.width > 0
-            && vf.height > 0
-        {
-            return Some((vf.width, vf.height));
-        }
-
-        match (self.get::<u64>("width"), self.get::<u64>("height")) {
-            (Some(&w), Some(&h)) if w > 0 && h > 0 => Some((w as u32, h as u32)),
+        match self.format {
+            Some(MediaFormat::VideoRaw(vf)) if vf.width > 0 && vf.height > 0 => {
+                Some((vf.width, vf.height))
+            }
             _ => None,
         }
     }
@@ -950,11 +938,10 @@ mod tests {
     use crate::format::PixelFormat;
 
     #[test]
-    fn set_video_dims_writes_both_conventions() {
+    fn set_video_dims_writes_the_typed_format_only() {
         let mut meta = Metadata::new();
         meta.set_video_dims(640, 480, PixelFormat::I420);
 
-        // The typed representation encoders read...
         match meta.format {
             Some(MediaFormat::VideoRaw(vf)) => {
                 assert_eq!((vf.width, vf.height), (640, 480));
@@ -962,23 +949,18 @@ mod tests {
             }
             other => panic!("expected VideoRaw format, got {other:?}"),
         }
-        // ...and the legacy keys AutoVideoSink reads.
-        assert_eq!(meta.get::<u64>("width"), Some(&640));
-        assert_eq!(meta.get::<u64>("height"), Some(&480));
+        // The dual convention is gone (#160): no legacy custom keys.
+        assert_eq!(meta.get::<u64>("width"), None);
+        assert_eq!(meta.get::<u64>("height"), None);
     }
 
     #[test]
-    fn resizing_updates_both_conventions() {
-        // The bug this guards: an element that resizes and updates only one
-        // representation leaves the other stale, and whichever downstream
-        // trusts the stale one mis-sizes the frame.
+    fn resizing_updates_the_dims() {
         let mut meta = Metadata::new();
         meta.set_video_dims(640, 480, PixelFormat::I420);
         meta.set_video_dims(320, 240, PixelFormat::I420);
 
         assert_eq!(meta.video_dims(), Some((320, 240)));
-        assert_eq!(meta.get::<u64>("width"), Some(&320));
-        assert_eq!(meta.get::<u64>("height"), Some(&240));
     }
 
     #[test]
@@ -1004,13 +986,14 @@ mod tests {
     }
 
     #[test]
-    fn video_dims_falls_back_to_legacy_keys() {
-        // What H264Decoder produces today: custom keys, no typed format.
+    fn video_dims_ignores_the_retired_legacy_keys() {
+        // Custom "width"/"height" keys are ordinary app data now (#160):
+        // geometry only counts when it travels as MediaFormat::VideoRaw.
         let mut meta = Metadata::new();
         meta.set("width", 1280u64);
         meta.set("height", 720u64);
 
-        assert_eq!(meta.video_dims(), Some((1280, 720)));
+        assert_eq!(meta.video_dims(), None);
         assert_eq!(meta.video_pixel_format(), None);
     }
 

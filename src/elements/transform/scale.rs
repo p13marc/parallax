@@ -336,12 +336,14 @@ impl VideoScale {
             )
         })?;
 
+        // Defensive: video_dims() implies a VideoRaw format, which always
+        // names a pixel format — this arm is unreachable since #160 retired
+        // the format-free legacy keys, and stays as a guard.
         let format = metadata.video_pixel_format().ok_or_else(|| {
             Error::Element(format!(
                 "VideoScale: buffer is {width}x{height} but carries no pixel format — the \
-                 upstream element must call Metadata::set_video_dims() rather than writing \
-                 bare \"width\"/\"height\" keys. The byte count cannot disambiguate it \
-                 (I420 and NV12 are both w*h*3/2)."
+                 upstream element must call Metadata::set_video_dims(). The byte count \
+                 cannot disambiguate it (I420 and NV12 are both w*h*3/2)."
             ))
         })?;
 
@@ -609,20 +611,24 @@ mod tests {
     // Geometry travels in-band: refuse to guess
     // ------------------------------------------------------------------
 
-    /// A buffer with dimensions but no pixel format is not scalable: the byte
-    /// count cannot disambiguate I420 from NV12 (both w*h*3/2), and guessing
-    /// wrong scrambles chroma silently. Error instead.
+    /// The retired legacy `"width"`/`"height"` custom keys carry no geometry
+    /// any more (#160): a buffer wearing only them is a buffer without
+    /// dimensions, and the error says how to fix it. (Dims-without-format is
+    /// unrepresentable now — `MediaFormat::VideoRaw` always names one.)
     #[test]
-    fn a_buffer_without_a_pixel_format_errors() {
+    fn legacy_custom_keys_no_longer_count_as_dimensions() {
         let arena = SharedArena::new(4096, 4).unwrap();
         let slot = arena.acquire().unwrap();
         let mut metadata = Metadata::new();
-        metadata.set("width", 16u64); // the legacy convention, format-free
+        metadata.set("width", 16u64);
         metadata.set("height", 16u64);
         let buffer = Buffer::new(MemoryHandle::with_len(slot, 384), metadata);
 
         let err = VideoScale::new().process(buffer).unwrap_err().to_string();
-        assert!(err.contains("no pixel format"), "unhelpful error: {err}");
+        assert!(
+            err.contains("no video dimensions"),
+            "unhelpful error: {err}"
+        );
         assert!(err.contains("set_video_dims"), "unhelpful error: {err}");
     }
 
@@ -885,21 +891,19 @@ mod tests {
     }
 
     #[test]
-    fn scaled_output_is_stamped_for_both_metadata_conventions() {
+    fn scaled_output_is_stamped_with_the_new_geometry() {
         let mut scaler = VideoScale::new();
         scaler.control().set_target(160, 120);
 
         let out = scale_once(&mut scaler, frame(PixelFormat::I420, 320, 240));
         let meta = out.metadata();
 
-        // The modern convention...
+        // MediaFormat::VideoRaw is the single geometry representation (#160).
         assert!(matches!(
             meta.format,
             Some(MediaFormat::VideoRaw(vf)) if vf.width == 160 && vf.height == 120
         ));
-        // ...and the legacy one, which AutoVideoSink still reads.
-        assert_eq!(meta.get::<u64>("width"), Some(&160));
-        assert_eq!(meta.get::<u64>("height"), Some(&120));
+        assert_eq!(meta.video_dims(), Some((160, 120)));
     }
 
     #[test]

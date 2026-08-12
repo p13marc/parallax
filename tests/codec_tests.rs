@@ -307,8 +307,6 @@ mod jpeg_tests {
     feature = "audio-vorbis"
 ))]
 mod audio_tests {
-    use super::*;
-    use parallax::element::Element;
     use parallax::elements::codec::SymphoniaDecoder;
 
     #[test]
@@ -321,12 +319,10 @@ mod audio_tests {
     #[test]
     fn test_symphonia_decoder_invalid_data() {
         let mut decoder = SymphoniaDecoder::new().expect("Should create decoder");
-        let input = create_test_buffer(b"not audio data - this is garbage");
 
-        // The decoder buffers data and returns Ok(None) for small/unrecognized inputs
-        // This is expected behavior - it waits for more data
-        let result = decoder.process(input);
-        // Should succeed but return None (not enough data to decode)
+        // The decoder buffers data and returns Ok(None) for small/unrecognized
+        // inputs — it waits for more data rather than erroring.
+        let result = decoder.decode_chunk(b"not audio data - this is garbage");
         assert!(result.is_ok(), "Should not error on small invalid data");
         assert!(
             result.unwrap().is_none(),
@@ -335,33 +331,28 @@ mod audio_tests {
     }
 
     /// Real decode: a 0.3s 440 Hz mono MP3 generated with ffmpeg. Exercises
-    /// the full probe -> track select -> decode -> interleave path.
+    /// the full probe -> track select -> decode -> interleave path of the
+    /// one-shot convenience API (SymphoniaDecoder left the element system
+    /// in #160 — streaming decoders are the pipeline route).
     #[cfg(feature = "audio-mp3")]
     #[test]
     fn test_symphonia_decoder_real_mp3() {
         let mut decoder = SymphoniaDecoder::for_format(parallax::elements::codec::AudioFormat::Mp3)
             .expect("Should create decoder");
         let data = include_bytes!("fixtures/sine.mp3");
-        let input = create_test_buffer(data);
 
-        let output = decoder.process(input).expect("decode should not error");
-        let output = output.expect("a full MP3 file must yield decoded samples");
-        assert!(
-            !output.as_bytes().is_empty(),
-            "decoded PCM must be non-empty"
-        );
-        // f32 samples: length must be a whole number of samples
-        assert_eq!(output.as_bytes().len() % 4, 0);
+        let output = decoder.decode_chunk(data).expect("decode should not error");
+        let (samples, info) = output.expect("a full MP3 file must yield decoded samples");
+        assert!(!samples.is_empty(), "decoded PCM must be non-empty");
+        assert_eq!(info.channels, 1, "sine fixture is mono");
     }
 
     #[test]
     fn test_symphonia_decoder_small_data() {
         let mut decoder = SymphoniaDecoder::new().expect("Should create decoder");
-        // Create a small buffer (less than 1024 bytes threshold)
-        let input = create_test_buffer(&[0u8; 100]);
 
-        // The decoder buffers data and waits for more
-        let result = decoder.process(input);
+        // Below the 1024-byte probe threshold: buffered, not decoded.
+        let result = decoder.decode_chunk(&[0u8; 100]);
         assert!(result.is_ok(), "Should handle small input gracefully");
         assert!(
             result.unwrap().is_none(),

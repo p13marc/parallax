@@ -512,10 +512,9 @@ impl Sink for AutoVideoSink {
 
         tracing::debug!("AutoVideoSink: received buffer with {} bytes", data.len());
 
-        // Dimensions: prefer per-buffer metadata, fall back to guessing from
-        // the RGBA buffer size. `video_dims` reads both conventions — the
-        // `MediaFormat::VideoRaw` one and the legacy "width"/"height" keys — so
-        // an upstream element that set only one of them still works.
+        // Dimensions: prefer per-buffer metadata (`MediaFormat::VideoRaw`,
+        // the single geometry representation since #160), fall back to
+        // guessing from the RGBA buffer size.
         let meta = ctx.metadata();
         let (width, height) = match meta.video_dims() {
             Some((w, h)) if w > 0 && h > 0 && (w as usize * h as usize * 4) == data.len() => (w, h),

@@ -1169,11 +1169,13 @@ impl H264Decoder {
         Ok(Buffer::new(handle, metadata))
     }
 
-    /// Decode H.264 NAL units.
+    /// Decode H.264 NAL units into an owned frame.
     ///
-    /// Returns the decoded YUV frame if a complete frame is available,
-    /// or `None` if more data is needed.
-    pub fn decode(&mut self, nal_data: &[u8]) -> Result<Option<DecodedFrame>> {
+    /// Internal since #160: the hot path writes planes straight into arena
+    /// slots (#149) and external callers go through `Element::process`, so
+    /// the owned-`DecodedFrame` surface survives only for in-module tests.
+    #[cfg(test)]
+    fn decode(&mut self, nal_data: &[u8]) -> Result<Option<DecodedFrame>> {
         self.bytes_decoded += nal_data.len() as u64;
 
         let result = self
@@ -1190,8 +1192,11 @@ impl H264Decoder {
         }
     }
 
-    /// Flush the decoder and retrieve any remaining frames.
-    pub fn flush(&mut self) -> Result<Vec<DecodedFrame>> {
+    /// Drain openh264's remaining pictures into owned frames.
+    ///
+    /// The private EOS-drain half of the old public `flush()` (#160):
+    /// `Element::flush` is the outside surface.
+    fn drain_remaining(&mut self) -> Result<Vec<DecodedFrame>> {
         let frames = self
             .decoder
             .flush_remaining()
@@ -1272,7 +1277,7 @@ impl Element for H264Decoder {
     /// buffered for reordering — was silently discarded at EOS.
     fn flush(&mut self) -> Result<Option<Buffer>> {
         if self.flushed.is_none() {
-            let frames = H264Decoder::flush(self)?;
+            let frames = self.drain_remaining()?;
             self.flushed = Some(frames.into());
         }
 
@@ -1292,7 +1297,7 @@ impl Element for H264Decoder {
 
 /// A decoded YUV frame from the H.264 decoder.
 #[derive(Debug)]
-pub struct DecodedFrame {
+pub(crate) struct DecodedFrame {
     /// Y plane data.
     y_data: Vec<u8>,
     /// U plane data.
@@ -1339,26 +1344,6 @@ impl DecodedFrame {
     /// Get the frame height.
     pub fn height(&self) -> usize {
         self.height
-    }
-
-    /// Get the Y plane data.
-    pub fn y_plane(&self) -> &[u8] {
-        &self.y_data
-    }
-
-    /// Get the U plane data.
-    pub fn u_plane(&self) -> &[u8] {
-        &self.u_data
-    }
-
-    /// Get the V plane data.
-    pub fn v_plane(&self) -> &[u8] {
-        &self.v_data
-    }
-
-    /// Get the strides for each plane (Y, U, V).
-    pub fn strides(&self) -> (usize, usize, usize) {
-        (self.y_stride, self.u_stride, self.v_stride)
     }
 
     /// Convert to contiguous YUV420 planar format.

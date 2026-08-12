@@ -210,7 +210,7 @@ N-to-1 synchronization (PTS alignment across pads) is provided by `element::muxe
 
 ## Codecs — `elements::codec`
 
-Codec traits: `VideoEncoder`/`VideoDecoder` and `AudioEncoder`/`AudioDecoder` (all with `flush()` for EOS draining), wrapped into pipeline elements by `EncoderElement`/`DecoderElement`/`AudioEncoderElement`/`AudioDecoderElement`. Some codecs implement `Element` directly instead (noted below).
+Codec surface rule (#160): video decoders implement `Element` directly; audio codecs implement `AudioDecoder`/`AudioEncoder` wrapped by `AudioDecoderElement`/`AudioEncoderElement`; video encoders implement `VideoEncoder` wrapped by `EncoderElement`. All codec traits have `flush()` for EOS draining.
 
 | Codec | Types | Feature | Notes |
 |-------|-------|---------|-------|
@@ -219,7 +219,7 @@ Codec traits: `VideoEncoder`/`VideoDecoder` and `AudioEncoder`/`AudioDecoder` (a
 | AV1 encode | `Rav1eEncoder` (impl `VideoEncoder`; wrap: `EncoderElement::new(enc)`) | `av1-encode` | rav1e, pure Rust; install nasm for SIMD |
 | AV1 decode | `Dav1dDecoder` (impl `Element`) | `av1-decode` | libdav1d system library |
 | VP8/VP9 decode | `VpxDecoder::vp8()/vp9()` (impl `Element`) | `vpx` | libvpx system library (`libvpx-devel`; bindings generated via bindgen, needs libclang at build time); I420 output, display-order 1:1 timestamps, mid-stream resolution changes |
-| FLAC/MP3/AAC/Vorbis decode | `SymphoniaDecoder` (impl `Element`) | `audio-flac`/`-mp3`/`-aac`/`-vorbis` | Symphonia, pure Rust |
+| FLAC/MP3/AAC/Vorbis one-shot file decode | `SymphoniaDecoder::decode_chunk` (convenience, not an element) | `audio-flac`/`-mp3`/`-aac`/`-vorbis` | Symphonia, pure Rust |
 | Vorbis streaming decode | `VorbisDecoder::from_codec_private` (impl `AudioDecoder`; wrap: `AudioDecoderElement`) | `audio-vorbis` | Symphonia packet-level; takes the Xiph-laced Matroska CodecPrivate directly |
 | AC-3 / E-AC-3 decode | `Eac3Decoder::stereo(rate)` / `::passthrough(rate, ch)` (impl `AudioDecoder`; wrap: `AudioDecoderElement`) | `eac3` | oxideav-ac3, pure Rust; self-describing bitstream, no extradata; `stereo` runs the spec LoRo fold-down in-decoder; S16 out |
 | Opus | `OpusEncoder::new(rate, ch, bitrate, OpusApplication)`, `OpusDecoder` (impl audio traits) | `opus` | libopus; 48 kHz frame sizes 120–2880 samples |

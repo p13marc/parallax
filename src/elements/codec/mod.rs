@@ -124,16 +124,19 @@ pub use crate::control::{
 
 // Video codec traits
 mod traits;
-pub use traits::{FrameType, VideoDecoder, VideoEncoder};
+pub use traits::{FrameType, VideoEncoder};
 
 // Audio codec traits
 mod audio_traits;
 pub use audio_traits::{AudioDecoder, AudioEncoder, AudioSampleFormat, AudioSamples};
 
-// Video element wrappers
-mod decoder_element;
+// Video element wrappers.
+//
+// Video decoders implement `Element` directly (h264/dav1d/vpx) — a wrapper
+// trait cannot carry input metadata/PTS through, which is why every real
+// decoder bypassed the old `DecoderElement` (deleted, #160). Encoders keep
+// the `VideoEncoder` + `EncoderElement` split.
 mod encoder_element;
-pub use decoder_element::DecoderElement;
 pub use encoder_element::EncoderElement;
 
 // Hardware codec element wrappers (Vulkan Video)
@@ -159,8 +162,7 @@ mod h264;
 pub use crate::control::RateControlMode;
 #[cfg(feature = "h264")]
 pub use h264::{
-    Complexity, DecodedFrame, H264Decoder, H264Encoder, H264EncoderConfig, Profile, SpsPpsStrategy,
-    UsageType,
+    Complexity, H264Decoder, H264Encoder, H264EncoderConfig, Profile, SpsPpsStrategy, UsageType,
 };
 
 // V4L2 M2M stateful hardware encoder
