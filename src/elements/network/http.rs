@@ -1,12 +1,17 @@
 //! HTTP source and sink elements.
 //!
-//! Provides HTTP-based data transfer using blocking I/O.
+//! Provides HTTP-based data transfer using blocking I/O (`ureq`).
 //!
-//! - [`HttpSrc`]: Fetches data from an HTTP endpoint (GET)
+//! - [`HttpSrc`]: Fetches data from an HTTP endpoint (GET), byte-seekable
+//!   via `Range` requests when the server supports them
 //! - [`HttpSink`]: Posts data to an HTTP endpoint (POST/PUT)
 //!
-//! Note: These elements use `ureq` for simple blocking HTTP.
-//! For async HTTP, consider using `reqwest` with AsyncHttpSrc/AsyncHttpSink.
+//! `HttpSrc` probes the server at pipeline start: the executor's seekability
+//! snapshot triggers the first GET (the same request `produce` would issue),
+//! whose response headers answer `Accept-Ranges`/`Content-Length`. That
+//! connection attempt blocks `Executor::start` for up to
+//! [`HttpSrc::with_timeout`] against an unreachable server — size the
+//! timeout accordingly.
 //!
 //! Requires the `http` feature flag.
 
@@ -15,9 +20,12 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
 use crate::error::{Error, Result};
+use crate::event::{Event, EventResult, SeekEvent, SeekType, SegmentFormat};
 use crate::memory::{OutputArena, OutputBudget, defaults};
 use crate::metadata::Metadata;
+use crate::pipeline::seek::{DurationQuery, PositionQuery};
 use std::io::Read;
+use std::sync::Mutex;
 use std::time::Duration;
 
 /// HTTP method for sink operations.
@@ -62,12 +70,32 @@ pub struct HttpSrc {
     chunk_size: usize,
     timeout: Option<Duration>,
     headers: Vec<(String, String)>,
-    response: Option<Box<dyn Read + Send>>,
-    connected: bool,
+    /// Interior mutability so the executor's start-time seekability snapshot
+    /// (`is_seekable(&self)` / `query_duration(&self)`) can perform the
+    /// probe connection. The hot path (`produce`) uses `get_mut` — no lock.
+    conn: Mutex<HttpConnection>,
     bytes_read: u64,
     sequence: u64,
-    status_code: Option<u16>,
     output: OutputArena,
+}
+
+/// Connection state behind the probe lock.
+#[derive(Default)]
+struct HttpConnection {
+    reader: Option<Box<dyn Read + Send>>,
+    /// A connection attempt happened and its header answers are recorded
+    /// (also set on failure, so the pre-start probe never retries — the
+    /// real error resurfaces from `produce`).
+    probed: bool,
+    status_code: Option<u16>,
+    /// The server honors `Range` requests: it answered 206, or advertised
+    /// `Accept-Ranges: bytes`.
+    seekable: bool,
+    /// Total resource length from `Content-Range` (206) or
+    /// `Content-Length` (200); `None` for chunked/unknown.
+    total_len: Option<u64>,
+    /// Byte offset the next connection resumes from (set by a seek).
+    next_offset: u64,
 }
 
 impl HttpSrc {
@@ -80,11 +108,9 @@ impl HttpSrc {
             chunk_size: 64 * 1024,
             timeout: Some(Duration::from_secs(30)),
             headers: Vec::new(),
-            response: None,
-            connected: false,
+            conn: Mutex::new(HttpConnection::default()),
             bytes_read: 0,
             sequence: 0,
-            status_code: None,
             output: OutputArena::new(defaults::SOURCE_SLOT_COUNT),
         })
     }
@@ -96,6 +122,9 @@ impl HttpSrc {
     }
 
     /// Set the request timeout.
+    ///
+    /// Also bounds the pre-start probe: the executor's seekability snapshot
+    /// establishes the first connection inside `Executor::start`.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
@@ -120,7 +149,7 @@ impl HttpSrc {
 
     /// Get the HTTP status code (after connection).
     pub fn status_code(&self) -> Option<u16> {
-        self.status_code
+        self.lock_conn().status_code
     }
 
     /// Get the number of bytes read.
@@ -133,31 +162,136 @@ impl HttpSrc {
         &self.name
     }
 
-    fn ensure_connected(&mut self) -> Result<()> {
-        if self.connected {
-            return Ok(());
-        }
+    fn lock_conn(&self) -> std::sync::MutexGuard<'_, HttpConnection> {
+        self.conn.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
-        let mut request = ureq::get(&self.url);
+    /// GET `url` from `conn.next_offset` with `Range: bytes=N-`, install the
+    /// body reader, and record status / total length / range capability.
+    ///
+    /// An offset-0 Range doubles as the capability probe: servers that
+    /// ignore it answer a harmless 200. After a real seek (`next_offset >
+    /// 0`) a 200 means the server ignored the Range — that errors loudly
+    /// instead of silently re-downloading from the start.
+    fn connect(
+        url: &str,
+        timeout: Option<Duration>,
+        headers: &[(String, String)],
+        conn: &mut HttpConnection,
+    ) -> Result<()> {
+        conn.probed = true;
 
-        if let Some(timeout) = self.timeout {
+        let mut request = ureq::get(url);
+        if let Some(timeout) = timeout {
             request = request.config().timeout_global(Some(timeout)).build();
         }
-
-        for (name, value) in &self.headers {
+        for (name, value) in headers {
             request = request.header(name.as_str(), value.as_str());
         }
+        request = request.header("Range", &format!("bytes={}-", conn.next_offset));
 
+        // ureq's default `http_status_as_error` maps 4xx/5xx to Err here.
         let response = request
             .call()
             .map_err(|e| Error::Element(format!("HTTP error: {}", e)))?;
 
-        self.status_code = Some(response.status().as_u16());
-        self.response = Some(Box::new(response.into_body().into_reader()));
-        self.connected = true;
+        let status = response.status().as_u16();
+        conn.status_code = Some(status);
+        if conn.next_offset > 0 && status != 206 {
+            return Err(Error::Element(format!(
+                "HTTP server ignored Range request (status {status}) — cannot resume at byte {}",
+                conn.next_offset
+            )));
+        }
+
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        let accept_ranges = header("accept-ranges").is_some_and(|v| v.contains("bytes"));
+        conn.seekable = status == 206 || accept_ranges;
+        conn.total_len = if status == 206 {
+            header("content-range")
+                .as_deref()
+                .and_then(parse_content_range_total)
+        } else {
+            response.body().content_length()
+        };
+        conn.reader = Some(Box::new(response.into_body().into_reader()));
 
         Ok(())
     }
+
+    /// Handle a byte seek: record the new offset and drop the connection.
+    ///
+    /// The reconnect is lazy — the next `produce` issues the Range request —
+    /// so a scrub storm of seeks coalesces into one connection, and the
+    /// reported landing is exact either way (byte seeks don't snap). A
+    /// server that then ignores the Range surfaces as a produce error:
+    /// fatal, and rightly so — the pipeline was told this source can seek.
+    fn handle_seek(&mut self, seek: &SeekEvent) -> EventResult {
+        if seek.format != SegmentFormat::Bytes {
+            return EventResult::NotHandled;
+        }
+
+        let conn = self.conn.get_mut().unwrap_or_else(|e| e.into_inner());
+        if !conn.probed {
+            // A graph-level seek can arrive before anything connected.
+            let (url, timeout, headers) = (&self.url, self.timeout, &self.headers);
+            if let Err(e) = Self::connect(url, timeout, headers, conn) {
+                tracing::warn!("httpsrc: probe for seek failed: {e}");
+                return EventResult::Error;
+            }
+        }
+        if !conn.seekable {
+            tracing::warn!("httpsrc: server does not accept byte ranges; seek refused");
+            return EventResult::Error;
+        }
+
+        let target = match seek.start.seek_type {
+            SeekType::Set => {
+                if seek.start.position < 0 {
+                    return EventResult::Error;
+                }
+                seek.start.position as u64
+            }
+            SeekType::Current => match self.bytes_read.checked_add_signed(seek.start.position) {
+                Some(t) => t,
+                None => return EventResult::Error,
+            },
+            SeekType::End => {
+                // Only meaningful against a known total (chunked responses
+                // have none).
+                let Some(total) = conn.total_len else {
+                    return EventResult::Error;
+                };
+                match total.checked_add_signed(seek.start.position) {
+                    Some(t) => t,
+                    None => return EventResult::Error,
+                }
+            }
+            SeekType::None => return EventResult::handled(),
+        };
+        // Past-the-end clamps to the end; the next produce sees
+        // `next_offset >= total_len` and returns a clean EOS.
+        let target = match conn.total_len {
+            Some(total) => target.min(total),
+            None => target,
+        };
+
+        conn.reader = None;
+        conn.next_offset = target;
+        self.bytes_read = target;
+        EventResult::handled_at(target as i64)
+    }
+}
+
+/// `"bytes 100-199/1000"` → `Some(1000)`; `"bytes 0-99/*"` → `None`.
+fn parse_content_range_total(value: &str) -> Option<u64> {
+    value.rsplit_once('/')?.1.trim().parse().ok()
 }
 
 impl Source for HttpSrc {
@@ -166,12 +300,20 @@ impl Source for HttpSrc {
     }
 
     fn produce(&mut self, _ctx: &mut ProduceContext) -> Result<ProduceResult> {
-        self.ensure_connected()?;
-
-        let reader = self
-            .response
-            .as_mut()
-            .ok_or_else(|| Error::Element("not connected".into()))?;
+        let conn = self.conn.get_mut().unwrap_or_else(|e| e.into_inner());
+        if conn.reader.is_none() {
+            // A seek to (or past) the end needs no connection: 416 territory.
+            if let Some(total) = conn.total_len
+                && conn.next_offset >= total
+            {
+                return Ok(ProduceResult::Eos);
+            }
+            // First call, post-seek reconnect, or retry after a failed
+            // pre-start probe — this surfaces the real connection error.
+            let (url, timeout, headers) = (&self.url, self.timeout, &self.headers);
+            Self::connect(url, timeout, headers, conn)?;
+        }
+        let reader = conn.reader.as_mut().expect("connected above");
 
         let Some(mut slot) = self.output.try_acquire(self.chunk_size, "httpsrc")? else {
             return Ok(ProduceResult::WouldBlock);
@@ -192,6 +334,46 @@ impl Source for HttpSrc {
             }
             Err(e) => Err(Error::Io(e)),
         }
+    }
+
+    fn is_seekable(&self) -> bool {
+        let mut conn = self.lock_conn();
+        if !conn.probed {
+            // The executor snapshots seekability at start; the probe is the
+            // same GET produce() would issue, so the connection is reused.
+            if let Err(e) = Self::connect(&self.url, self.timeout, &self.headers, &mut conn) {
+                tracing::warn!("httpsrc: probe failed, reporting unseekable: {e}");
+                return false;
+            }
+        }
+        conn.seekable
+    }
+
+    fn handle_upstream_event(&mut self, event: &Event) -> EventResult {
+        match event {
+            Event::Seek(seek) => self.handle_seek(seek),
+            _ => EventResult::NotHandled,
+        }
+    }
+
+    fn query_position(&self) -> Option<PositionQuery> {
+        Some(PositionQuery {
+            format: SegmentFormat::Bytes,
+            position: Some(self.bytes_read),
+        })
+    }
+
+    fn query_duration(&self) -> Option<DurationQuery> {
+        let mut conn = self.lock_conn();
+        if !conn.probed
+            && let Err(e) = Self::connect(&self.url, self.timeout, &self.headers, &mut conn)
+        {
+            tracing::warn!("httpsrc: probe failed, duration unknown: {e}");
+        }
+        Some(DurationQuery {
+            format: SegmentFormat::Bytes,
+            duration: conn.total_len,
+        })
     }
 }
 
@@ -346,6 +528,423 @@ pub struct HttpSinkStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::net::{SocketAddr, TcpListener};
+    use std::thread;
+
+    // ------------------------------------------------------------------
+    // Minimal blocking HTTP/1.1 test server (no dev-dependency; the same
+    // TcpListener-thread pattern as the tcp.rs tests). One request per
+    // connection, `Connection: close`.
+    // ------------------------------------------------------------------
+
+    struct ServerOpts {
+        /// Honor `Range: bytes=N-` with a 206 + Content-Range.
+        support_range: bool,
+        /// Advertise `Accept-Ranges: bytes` on 200 responses.
+        advertise_accept_ranges: bool,
+        /// Force this status on every response (with a tiny error body).
+        status: u16,
+        /// Include Content-Length (200) / Content-Range total (206).
+        send_length: bool,
+    }
+
+    impl Default for ServerOpts {
+        fn default() -> Self {
+            Self {
+                support_range: true,
+                advertise_accept_ranges: true,
+                status: 200,
+                send_length: true,
+            }
+        }
+    }
+
+    fn range_server(body: Vec<u8>, opts: ServerOpts) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                // Read the request head.
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte) {
+                        Ok(1) => head.push(byte[0]),
+                        _ => break,
+                    }
+                }
+                let head = String::from_utf8_lossy(&head);
+                let range_start: Option<u64> = head.lines().find_map(|l| {
+                    let (name, value) = l.split_once(':')?;
+                    if !name.eq_ignore_ascii_case("range") {
+                        return None;
+                    }
+                    let spec = value.trim().strip_prefix("bytes=")?;
+                    spec.split_once('-')?.0.parse().ok()
+                });
+
+                let mut response = Vec::new();
+                if opts.status != 200 {
+                    let msg = b"error";
+                    write!(
+                        response,
+                        "HTTP/1.1 {} Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        opts.status,
+                        msg.len()
+                    )
+                    .unwrap();
+                    response.extend_from_slice(msg);
+                } else if let (Some(start), true) = (range_start, opts.support_range) {
+                    // 206 with the requested suffix. An out-of-range start
+                    // yields an empty body (tests seek-to-end).
+                    let start = start.min(body.len() as u64) as usize;
+                    let part = &body[start..];
+                    let total = if opts.send_length {
+                        body.len().to_string()
+                    } else {
+                        "*".to_string()
+                    };
+                    write!(
+                        response,
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {}-{}/{}\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n",
+                        start,
+                        (start + part.len()).saturating_sub(1),
+                        total,
+                        part.len()
+                    )
+                    .unwrap();
+                    response.extend_from_slice(part);
+                } else {
+                    // Plain 200 from the start (Range absent or unsupported).
+                    write!(response, "HTTP/1.1 200 OK\r\n").unwrap();
+                    if opts.advertise_accept_ranges {
+                        write!(response, "Accept-Ranges: bytes\r\n").unwrap();
+                    }
+                    if opts.send_length {
+                        write!(response, "Content-Length: {}\r\n", body.len()).unwrap();
+                    }
+                    write!(response, "Connection: close\r\n\r\n").unwrap();
+                    response.extend_from_slice(&body);
+                }
+                let _ = stream.write_all(&response);
+            }
+        });
+        addr
+    }
+
+    fn body_of(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    fn src_for(addr: SocketAddr) -> HttpSrc {
+        HttpSrc::new(format!("http://{addr}/data"))
+            .unwrap()
+            .with_chunk_size(64)
+            .with_timeout(Duration::from_secs(5))
+    }
+
+    /// Drain produce() to EOS, appending payloads.
+    fn drain(src: &mut HttpSrc, out: &mut Vec<u8>) {
+        loop {
+            let mut ctx = crate::element::ProduceContext::without_buffer();
+            match src.produce(&mut ctx).unwrap() {
+                ProduceResult::OwnBuffer(buffer) => out.extend_from_slice(buffer.as_bytes()),
+                ProduceResult::Eos => break,
+                ProduceResult::WouldBlock => std::thread::yield_now(),
+                other => panic!("unexpected produce result: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn http_src_streams_body_to_eos() {
+        let body = body_of(1000);
+        let addr = range_server(body.clone(), ServerOpts::default());
+        let mut src = src_for(addr);
+
+        let mut out = Vec::new();
+        drain(&mut src, &mut out);
+        assert_eq!(out, body);
+        assert_eq!(src.bytes_read(), 1000);
+        assert_eq!(src.status_code(), Some(206), "offset-0 Range honored");
+    }
+
+    #[test]
+    fn http_src_is_seekable_with_range_support() {
+        let addr = range_server(body_of(100), ServerOpts::default());
+        let src = src_for(addr);
+        assert!(src.is_seekable());
+
+        // Accept-Ranges alone (200) also qualifies.
+        let addr = range_server(
+            body_of(100),
+            ServerOpts {
+                support_range: false,
+                advertise_accept_ranges: true,
+                ..Default::default()
+            },
+        );
+        let src = src_for(addr);
+        assert!(src.is_seekable());
+    }
+
+    #[test]
+    fn http_src_not_seekable_when_ranges_ignored() {
+        let addr = range_server(
+            body_of(100),
+            ServerOpts {
+                support_range: false,
+                advertise_accept_ranges: false,
+                ..Default::default()
+            },
+        );
+        let src = src_for(addr);
+        assert!(!src.is_seekable());
+
+        // ...and a seek against it is refused.
+        let mut src = src_for(addr);
+        let result = src.handle_upstream_event(&Event::Seek(SeekEvent::new_bytes(10)));
+        assert_eq!(result, EventResult::Error);
+    }
+
+    #[test]
+    fn http_src_query_duration_reports_length() {
+        let addr = range_server(body_of(1234), ServerOpts::default());
+        let src = src_for(addr);
+        let q = src.query_duration().unwrap();
+        assert_eq!(q.format, SegmentFormat::Bytes);
+        assert_eq!(q.duration, Some(1234));
+
+        // Unknown when the server sends no length.
+        let addr = range_server(
+            body_of(100),
+            ServerOpts {
+                support_range: false,
+                advertise_accept_ranges: true,
+                send_length: false,
+                ..Default::default()
+            },
+        );
+        let src = src_for(addr);
+        assert_eq!(src.query_duration().unwrap().duration, None);
+    }
+
+    #[test]
+    fn http_src_seek_set_resumes_at_offset() {
+        let body = body_of(1000);
+        let addr = range_server(body.clone(), ServerOpts::default());
+        let mut src = src_for(addr);
+
+        // Read one chunk from the head first.
+        let mut ctx = crate::element::ProduceContext::without_buffer();
+        let ProduceResult::OwnBuffer(first) = src.produce(&mut ctx).unwrap() else {
+            panic!("expected data");
+        };
+        assert_eq!(first.as_bytes(), &body[..64]);
+
+        let result = src.handle_upstream_event(&Event::Seek(SeekEvent::new_bytes(700)));
+        assert_eq!(
+            result,
+            EventResult::Handled {
+                position: Some(700)
+            }
+        );
+        assert_eq!(src.query_position().unwrap().position, Some(700));
+
+        let mut out = Vec::new();
+        drain(&mut src, &mut out);
+        assert_eq!(out, &body[700..], "stream resumed at the seek offset");
+        assert_eq!(src.bytes_read(), 1000);
+    }
+
+    #[test]
+    fn http_src_seek_current_and_end() {
+        let body = body_of(500);
+        let addr = range_server(body.clone(), ServerOpts::default());
+        let mut src = src_for(addr);
+
+        // Current-relative from a known position.
+        let mut ctx = crate::element::ProduceContext::without_buffer();
+        assert!(matches!(
+            src.produce(&mut ctx).unwrap(),
+            ProduceResult::OwnBuffer(_)
+        ));
+        let seek = SeekEvent::new(
+            SegmentFormat::Bytes,
+            crate::event::SeekPosition::current(100),
+        );
+        assert_eq!(
+            src.handle_upstream_event(&Event::Seek(seek)),
+            EventResult::Handled {
+                position: Some(164)
+            },
+            "64 read + 100 forward"
+        );
+
+        // End-relative needs the total.
+        let seek = SeekEvent::new(SegmentFormat::Bytes, crate::event::SeekPosition::end(-100));
+        assert_eq!(
+            src.handle_upstream_event(&Event::Seek(seek)),
+            EventResult::Handled {
+                position: Some(400)
+            }
+        );
+        let mut out = Vec::new();
+        drain(&mut src, &mut out);
+        assert_eq!(out, &body[400..]);
+
+        // Past-the-end clamps and the next produce is a clean EOS.
+        let seek = SeekEvent::new_bytes(9_999);
+        assert_eq!(
+            src.handle_upstream_event(&Event::Seek(seek)),
+            EventResult::Handled {
+                position: Some(500)
+            }
+        );
+        let mut out = Vec::new();
+        drain(&mut src, &mut out);
+        assert!(out.is_empty());
+
+        // End-relative against an unknown total errors.
+        let addr = range_server(
+            body_of(100),
+            ServerOpts {
+                support_range: false,
+                advertise_accept_ranges: true,
+                send_length: false,
+                ..Default::default()
+            },
+        );
+        let mut src = src_for(addr);
+        let seek = SeekEvent::new(SegmentFormat::Bytes, crate::event::SeekPosition::end(-10));
+        assert_eq!(
+            src.handle_upstream_event(&Event::Seek(seek)),
+            EventResult::Error
+        );
+    }
+
+    #[test]
+    fn http_src_errors_when_server_ignores_range_after_seek() {
+        // Server advertises Accept-Ranges (so the seek is accepted) but
+        // answers every request with 200 — the post-seek produce must fail
+        // loudly instead of silently restarting from byte 0.
+        let addr = range_server(
+            body_of(300),
+            ServerOpts {
+                support_range: false,
+                advertise_accept_ranges: true,
+                ..Default::default()
+            },
+        );
+        let mut src = src_for(addr);
+        assert!(src.is_seekable(), "server lies about ranges");
+
+        assert_eq!(
+            src.handle_upstream_event(&Event::Seek(SeekEvent::new_bytes(100))),
+            EventResult::Handled {
+                position: Some(100)
+            }
+        );
+        let mut ctx = crate::element::ProduceContext::without_buffer();
+        let err = src.produce(&mut ctx).unwrap_err();
+        assert!(
+            err.to_string().contains("ignored Range"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn http_src_non_2xx_is_an_error() {
+        // Pins ureq's default `http_status_as_error`: a 404 body must never
+        // stream as data.
+        let addr = range_server(
+            body_of(100),
+            ServerOpts {
+                status: 404,
+                ..Default::default()
+            },
+        );
+        let src = src_for(addr);
+        assert!(!src.is_seekable(), "probe failure reports unseekable");
+
+        let mut src = src_for(addr);
+        let mut ctx = crate::element::ProduceContext::without_buffer();
+        assert!(matches!(src.produce(&mut ctx), Err(Error::Element(_))));
+    }
+
+    #[test]
+    fn parse_content_range_total_cases() {
+        assert_eq!(parse_content_range_total("bytes 100-199/1000"), Some(1000));
+        assert_eq!(parse_content_range_total("bytes 0-0/1"), Some(1));
+        assert_eq!(parse_content_range_total("bytes 0-99/*"), None);
+        assert_eq!(parse_content_range_total("garbage"), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_src_seeks_at_runtime() {
+        use crate::elements::{AppSink, Pulled};
+        use crate::pipeline::bus::MessageKind;
+        use crate::pipeline::{Executor, LinkPolicy, Pipeline};
+
+        let body = body_of(4096);
+        let addr = range_server(body.clone(), ServerOpts::default());
+        let src = src_for(addr).with_chunk_size(256);
+
+        let mut pipeline = Pipeline::new();
+        let sink = AppSink::with_max_buffers(2);
+        let sink_handle = sink.handle();
+        let s = pipeline.add_source("httpsrc", src);
+        let k = pipeline.add_sink("appsink", sink);
+        // Tight link capacity: backpressure parks the source mid-stream, so
+        // the seek deterministically lands before EOS.
+        pipeline
+            .link_pads_full(s, "src", k, "sink", LinkPolicy::Block, Some(2))
+            .unwrap();
+
+        let executor = Executor::new();
+        let mut handle = executor.start(&mut pipeline).unwrap();
+        let mut bus = handle.take_bus().unwrap();
+
+        // The start-time snapshot probed the server.
+        assert!(handle.seekable());
+        assert_eq!(handle.query_duration().unwrap().duration, Some(4096));
+
+        // Pull a couple of chunks, then seek.
+        for _ in 0..2 {
+            assert!(matches!(sink_handle.pull_buffer().await, Pulled::Buffer(_)));
+        }
+        assert!(handle.seek_bytes(3000).await);
+
+        // Everything after the seek point: the tail of the collected stream
+        // must be exactly body[3000..].
+        let mut collected = Vec::new();
+        while let Pulled::Buffer(b) = sink_handle.pull_buffer().await {
+            collected.extend_from_slice(b.as_bytes());
+        }
+        handle.wait().await.unwrap();
+        assert!(
+            collected.ends_with(&body[3000..]),
+            "stream did not resume at the seek offset"
+        );
+
+        let mut seek_done = None;
+        while let Some(msg) = bus.poll() {
+            if let MessageKind::SeekDone {
+                format, position, ..
+            } = msg.kind
+            {
+                seek_done = Some((format, position));
+            }
+        }
+        assert_eq!(
+            seek_done,
+            Some((SegmentFormat::Bytes, Some(3000))),
+            "SeekDone carries the byte landing"
+        );
+    }
 
     #[test]
     fn test_http_src_creation() {

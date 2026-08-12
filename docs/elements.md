@@ -88,7 +88,7 @@ anything, so `Aborted` comes from the handle alone.
 | `UdpSrc` / `UdpSink` / `AsyncUdpSrc` / `AsyncUdpSink` | UDP datagrams |
 | `UnixSrc` / `UnixSink` / `AsyncUnixSrc` / `AsyncUnixSink` | Unix domain sockets (`UnixMode`) |
 | `UdpMulticastSrc` / `UdpMulticastSink` | Multicast group receive/send |
-| `HttpSrc` `[http]` | HTTP GET source |
+| `HttpSrc` `[http]` | HTTP GET source; byte-seekable via `Range` when the server supports it (probed at pipeline start) |
 | `HttpSink` `[http]` | HTTP POST/PUT sink |
 | `WebSocketSrc` / `WebSocketSink` `[websocket]` | WebSocket message I/O |
 | `ZenohSrc` / `ZenohSink` `[zenoh]` | Zenoh subscribe/publish on key expressions |

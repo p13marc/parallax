@@ -11,8 +11,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   SENSOR_FEATURES: zenoh,h264,v4l2,rtp,rtsp,image-jpeg,hotplug
-  # Pure-Rust media/container combo (no system libs needed)
-  MEDIA_FEATURES: mp4-demux,mkv-demux,audio-aac,audio-vorbis
+  # Pure-Rust media/container combo (no system libs needed; http = ureq/rustls)
+  MEDIA_FEATURES: mp4-demux,mkv-demux,audio-aac,audio-vorbis,http
   # shared compiler cache: sccache (mounted from the runner VM) -> garage S3
   # on vm-runner-01; S3 endpoint+credentials come from the runner's env_file
   RUSTC_WRAPPER: /srv/cache/bin/sccache
