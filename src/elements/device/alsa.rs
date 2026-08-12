@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
-use alsa::pcm::{Access, Format, HwParams, PCM};
+use alsa::pcm::{Access, Format, HwParams, PCM, State};
 use alsa::{Direction, PollDescriptors, ValueOr};
 use tokio::io::unix::AsyncFd;
 
@@ -480,6 +480,10 @@ pub struct AlsaSink {
     clock_provider: AlsaSinkClockProvider,
     /// Frames handed to the device so far.
     written_frames: u64,
+    /// Whether the hardware supports `snd_pcm_pause` (queried at setup).
+    can_pause: bool,
+    /// Whether the device is currently paused via `snd_pcm_pause`.
+    dev_paused: bool,
     /// Device playback position, shared with the clock.
     position: Arc<AlsaPosition>,
     /// The PCM's poll fd, registered with the tokio reactor once and kept —
@@ -525,6 +529,7 @@ impl AlsaSink {
         })?;
 
         // Configure hardware parameters
+        let can_pause;
         {
             let hwp = HwParams::any(&pcm).map_err(|e| DeviceError::Alsa(e.to_string()))?;
 
@@ -548,6 +553,8 @@ impl AlsaSink {
 
             pcm.hw_params(&hwp)
                 .map_err(|e| DeviceError::Alsa(e.to_string()))?;
+
+            can_pause = hwp.can_pause();
         }
 
         // Prepare for playback
@@ -567,6 +574,8 @@ impl AlsaSink {
             frame_size,
             clock_provider,
             written_frames: 0,
+            can_pause,
+            dev_paused: false,
             poll_fd: None,
             position,
         })
@@ -614,6 +623,8 @@ impl AlsaSink {
         let queued = self.pcm.delay().map(|d| d.max(0) as u64).unwrap_or(0);
         let _ = self.pcm.drop();
         let _ = self.pcm.prepare();
+        // snd_pcm_drop leaves any pause state behind with the stream.
+        self.dev_paused = false;
         self.written_frames = rebase_written(self.written_frames, queued, count_as_played);
         self.position
             .update(self.written_frames, std::time::Instant::now());
@@ -715,6 +726,13 @@ pub struct AlsaPosition {
     released_at_nanos: AtomicU64,
     /// The derived playback time captured at release.
     released_base_nanos: AtomicU64,
+    /// The playback time captured at pause, plus one (0 = live).
+    ///
+    /// While frozen the clock reports exactly this value: a paused device
+    /// consumes nothing, so its clock must hold still — that is what makes
+    /// `PausableClock`'s pause-span fold match reality instead of absorbing
+    /// seconds of queued audio the card kept playing (#156).
+    frozen_nanos: AtomicU64,
 }
 
 impl AlsaPosition {
@@ -728,7 +746,32 @@ impl AlsaPosition {
             sample_rate: sample_rate.max(1),
             released_at_nanos: AtomicU64::new(0),
             released_base_nanos: AtomicU64::new(0),
+            frozen_nanos: AtomicU64::new(0),
         }
+    }
+
+    /// Pause: pin the clock to the playback time as of `at`.
+    ///
+    /// Idempotent — the first freeze wins, so repeated Pause events cannot
+    /// creep the pinned value forward by interpolation.
+    pub fn freeze(&self, at: std::time::Instant) {
+        let now = self.now_at(at).nanos();
+        let _ = self.frozen_nanos.compare_exchange(
+            0,
+            now.saturating_add(1),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    /// Resume: let the clock run again from where it was pinned.
+    ///
+    /// Re-publishes the current frame count at `at`, so interpolation
+    /// restarts from the resume instant instead of counting the paused wall
+    /// span as elapsed playback.
+    pub fn unfreeze(&self, at: std::time::Instant) {
+        self.update(self.frames_played(), at);
+        self.frozen_nanos.store(0, Ordering::Release);
     }
 
     /// End-of-stream: freeze the device-derived time base and continue at
@@ -768,6 +811,13 @@ impl AlsaPosition {
     /// reported position jump, and a clock that went backwards would send every
     /// PTS-paced sink into an unrecoverable drop loop.
     pub fn now_at(&self, at: std::time::Instant) -> ClockTime {
+        // A frozen (paused) clock holds still: the device is consuming
+        // nothing, and time that passes here must not count as playback.
+        if let Some(frozen) = self.frozen_nanos.load(Ordering::Acquire).checked_sub(1) {
+            let previous = self.last_reported_nanos.fetch_max(frozen, Ordering::AcqRel);
+            return ClockTime::from_nanos(frozen.max(previous));
+        }
+
         // A released clock runs at wall rate from the point playback ended.
         if let Some(released_at) = self
             .released_at_nanos
@@ -1000,8 +1050,38 @@ impl AsyncSink for AlsaSink {
                 // buffer of pre-seek audio would otherwise play out) and
                 // cancel the discarded frames so the master clock continues
                 // from what was actually heard. No `release()` — the stream
-                // goes on from the new position.
+                // goes on from the new position. Works while paused too:
+                // drop supersedes the pause, and the position stays frozen
+                // until Resume.
                 self.discard_queued(false);
+            }
+            crate::event::Event::Pause => {
+                // Freeze the master clock at what has actually been heard —
+                // this is what keeps A/V aligned across a pause: a clock
+                // that kept counting the queued frames would fold seconds of
+                // "phantom" playback into PausableClock's resume offset.
+                self.publish_position();
+                self.position.freeze(std::time::Instant::now());
+                if self.can_pause && self.pcm.state() == State::Running {
+                    if self.pcm.pause(true).is_ok() {
+                        self.dev_paused = true;
+                    } else {
+                        self.discard_queued(true);
+                    }
+                } else {
+                    // Hardware without pause support: the honest fallback is
+                    // to *skip* the device buffer (≤ one buffer, ~85 ms) —
+                    // counted as played, so stream time steps over it and
+                    // alignment survives.
+                    self.discard_queued(true);
+                }
+            }
+            crate::event::Event::Resume => {
+                if self.dev_paused {
+                    let _ = self.pcm.pause(false);
+                    self.dev_paused = false;
+                }
+                self.position.unfreeze(std::time::Instant::now());
             }
             _ => {}
         }
@@ -1190,6 +1270,37 @@ mod tests {
         let after = position.now_at(at(&position, 1_100));
         assert!(after >= before, "release rewound the clock");
         assert_eq!(after, ClockTime::from_nanos(1_100_000_000));
+    }
+
+    #[test]
+    fn a_frozen_clock_holds_still_and_resumes_without_the_paused_span() {
+        let position = AlsaPosition::new(48_000);
+
+        // 480 frames at 48 kHz = 10 ms of playback, reported at t=10ms.
+        position.update(480, at(&position, 10));
+        assert_eq!(position.now_at(at(&position, 10)).nanos(), 10_000_000);
+
+        // Pause at t=20ms: the clock pins at 10ms played + 10ms interpolation.
+        position.freeze(at(&position, 20));
+        let frozen = position.now_at(at(&position, 20)).nanos();
+        assert_eq!(frozen, 20_000_000);
+
+        // Five seconds of wall time later it still reads exactly the same —
+        // this is what keeps PausableClock's fold honest (#156).
+        assert_eq!(position.now_at(at(&position, 5_020)).nanos(), frozen);
+
+        // A second freeze while frozen must not creep the value forward.
+        position.freeze(at(&position, 5_020));
+        assert_eq!(position.now_at(at(&position, 5_020)).nanos(), frozen);
+
+        // Resume at t=5_020ms: interpolation restarts from the resume
+        // instant, so 5 ms later the clock has advanced 5 ms, not 5 s.
+        position.unfreeze(at(&position, 5_020));
+        let after = position.now_at(at(&position, 5_025)).nanos();
+        assert!(
+            (frozen..=frozen + 5_000_000).contains(&after),
+            "paused wall span leaked into the clock: {after}"
+        );
     }
 
     #[test]

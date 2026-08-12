@@ -99,6 +99,15 @@ pub enum Event {
     /// Flush stop - resume normal operation.
     FlushStop(FlushStopEvent),
 
+    /// Runtime pause (`PipelineHandle::pause`). Executor-delivered straight to
+    /// sink elements — never enters the data channels — so a device sink can
+    /// silence its hardware buffer instead of letting it play out (AlsaSink:
+    /// `snd_pcm_pause`, or drop where the hardware cannot pause).
+    Pause,
+
+    /// Runtime resume, the counterpart of [`Pause`](Self::Pause).
+    Resume,
+
     /// Custom application event.
     Custom(CustomEvent),
 }
@@ -127,7 +136,11 @@ impl Event {
     pub fn is_bidirectional(&self) -> bool {
         matches!(
             self,
-            Event::FlushStart | Event::FlushStop(_) | Event::Custom(_)
+            Event::FlushStart
+                | Event::FlushStop(_)
+                | Event::Pause
+                | Event::Resume
+                | Event::Custom(_)
         )
     }
 
@@ -158,6 +171,8 @@ impl Event {
             Event::LatencyQuery => "latency-query",
             Event::FlushStart => "flush-start",
             Event::FlushStop(_) => "flush-stop",
+            Event::Pause => "pause",
+            Event::Resume => "resume",
             Event::Custom(c) => &c.name,
         }
     }

@@ -824,14 +824,18 @@ impl PipelineHandle {
     ///
     /// Freezes the shared [`PausableClock`](crate::clock::PausableClock) —
     /// sinks pacing presentation against running time stall on the spot — and
-    /// gates every source's produce loop, so unclocked pipelines pause too.
-    /// In-flight buffers drain into the sinks' pacing waits rather than being
-    /// dropped. Posts `StateChanged{Running → Idle}` on the bus.
+    /// gates the producer loops (sources and source-style demuxers) *and* the
+    /// sink loops. A gated sink delivers [`Event::Pause`] to its element
+    /// (`AlsaSink` pauses or silences its device buffer, so audio stops
+    /// within a period instead of draining seconds of queued stream) and
+    /// holds its first fresh buffer for resume — pause is not flush, nothing
+    /// is dropped. Transforms are deliberately not gated: they park on
+    /// backpressure, and staying live is what lets a flushing seek propagate
+    /// while paused. Posts `StateChanged{Running → Idle}` on the bus.
     ///
-    /// Limits: an `AlsaSink` plays out what its device buffer already holds
-    /// (a crisp `snd_pcm_pause` control is a follow-up), and a source blocked
-    /// *inside* `process_source` observes the gate only when that call
-    /// returns — the same caveat as [`stop`](Self::stop).
+    /// Limits: an element blocked *inside* `process`/`process_source`
+    /// observes the gate only when that call returns — the same caveat as
+    /// [`stop`](Self::stop) — and RT-scheduled nodes see no gate at all.
     pub fn pause(&self) {
         if *self.pause_tx.borrow() {
             return;
@@ -851,9 +855,11 @@ impl PipelineHandle {
 
     /// Resume a paused pipeline. Idempotent.
     ///
-    /// Un-gates the sources and resumes the clock gap-free: running time
-    /// continues from where it froze, so sinks pick up on the very next frame
-    /// with no burst of late frames. Posts `StateChanged{Idle → Running}`.
+    /// Un-gates the producers and sinks and resumes the clock gap-free:
+    /// running time continues from where it froze, so sinks pick up on the
+    /// very next frame with no burst of late frames. Each sink delivers
+    /// [`Event::Resume`] to its element and replays the buffer it held
+    /// during the pause. Posts `StateChanged{Idle → Running}`.
     pub fn resume(&self) {
         if !*self.pause_tx.borrow() {
             return;
@@ -1722,6 +1728,7 @@ impl Executor {
                 tracers,
                 runtime.position.clone(),
                 runtime.flush_epoch.clone(),
+                runtime.pause_rx.clone(),
                 share,
             ),
             ElementType::Transform => spawn_transform_task(
@@ -1770,6 +1777,7 @@ impl Executor {
                     stop.clone(),
                     control_rx,
                     runtime.flush_epoch.clone(),
+                    runtime.pause_rx.clone(),
                     bus,
                     share,
                 )
@@ -2431,6 +2439,7 @@ fn spawn_sink_task(
     tracers: TracerRegistry,
     position: Arc<AtomicU64>,
     flush_epoch: Arc<AtomicU64>,
+    pause_rx: watch::Receiver<bool>,
     share: TaskGuard,
 ) -> JoinHandle<Result<()>> {
     // Advance the shared last-presented-PTS cell. `max` keeps it monotonic
@@ -2441,6 +2450,39 @@ fn spawn_sink_task(
         let _ = position.fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
             (cur == u64::MAX || pts.nanos() > cur).then_some(pts.nanos())
         });
+    }
+
+    /// Deliver one in-band event to the sink element, with the probe and
+    /// position bookkeeping the event arms rely on. Shared by the running
+    /// loop and the paused drain, so a flushing seek acts identically in
+    /// both states.
+    ///
+    /// No `flush()` call here: a sink's flush *commits* buffered output (an
+    /// Mp4FileSink finalizes the file) — the element decides what a
+    /// flush-seek means for it.
+    fn deliver_sink_event(
+        element: &mut Box<DynAsyncElement<'static>>,
+        event: Event,
+        probe_registry: &ProbeRegistry,
+        sink_pad: &crate::pipeline::probe::PadRef,
+        position: &AtomicU64,
+    ) {
+        match probe_registry.invoke_event(sink_pad, &event, true) {
+            ProbeReturn::Drop | ProbeReturn::Handled => return,
+            _ => {}
+        }
+        match &event {
+            Event::FlushStop(_) => {
+                // Forget the pre-seek position; the Segment that follows
+                // re-anchors it, and `present`'s max() starts fresh there.
+                position.store(u64::MAX, Ordering::Release);
+            }
+            Event::Segment(seg) if seg.format == crate::event::SegmentFormat::Time => {
+                position.store(seg.start.max(0) as u64, Ordering::Release);
+            }
+            _ => {}
+        }
+        let _ = element.handle_downstream_event(event);
     }
 
     tokio::spawn(reporting(share, async move {
@@ -2455,7 +2497,71 @@ fn spawn_sink_task(
         if let Some(rx) = inputs.into_iter().next() {
             // Standard path: read from kanal channel
             loop {
-                match rx.recv().await {
+                // Runtime pause (#156). Gating only the producers leaves the
+                // queued stream ahead of this sink playing out (~2.6 s of
+                // audio on a real pipeline), so the sink holds too: tell the
+                // element once (AlsaSink silences its device), then drain
+                // non-blockingly until resume — stale-epoch buffers drop (a
+                // seek can land while paused), events act immediately (its
+                // FlushStart must silence the device now, not at resume), and
+                // the first fresh buffer is *stashed*, because pause is not
+                // flush: it replays right after resume. Eos/Error end the
+                // hold — a run that has ended stays ended, paused or not.
+                //
+                // A sink parked in `recv()` on an idle channel sees the gate
+                // only with the next message; during playback the channel is
+                // never idle, and an idle sink has nothing to silence.
+                let msg = if *pause_rx.borrow() {
+                    let _ = element.handle_downstream_event(Event::Pause);
+                    let mut stashed: Option<Message> = None;
+                    while *pause_rx.borrow() {
+                        // A run that has ended stays ended, paused or not.
+                        if matches!(stashed, Some(Message::Eos | Message::Error(_))) {
+                            break;
+                        }
+                        // Holding a fresh buffer: stop draining (its
+                        // successors keep FIFO order in the channel) and
+                        // just wait for resume.
+                        if stashed.is_some() {
+                            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                            continue;
+                        }
+                        match rx.try_recv() {
+                            Ok(Some(Message::Buffer(buffer, epoch))) => {
+                                if is_stale(epoch, &flush_epoch) {
+                                    count += 1;
+                                    tracers.notify_drop(&name);
+                                } else {
+                                    stashed = Some(Message::Buffer(buffer, epoch));
+                                }
+                            }
+                            Ok(Some(Message::Event(event))) => {
+                                deliver_sink_event(
+                                    &mut element,
+                                    event,
+                                    &probe_registry,
+                                    &sink_pad,
+                                    &position,
+                                );
+                            }
+                            Ok(Some(terminal)) => stashed = Some(terminal),
+                            Ok(None) => {
+                                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                            }
+                            // Closed: the recv below reports it to the
+                            // normal teardown arm.
+                            Err(_) => break,
+                        }
+                    }
+                    let _ = element.handle_downstream_event(Event::Resume);
+                    match stashed {
+                        Some(m) => Ok(m),
+                        None => rx.recv().await,
+                    }
+                } else {
+                    rx.recv().await
+                };
+                match msg {
                     Ok(Message::Buffer(buffer, epoch)) => {
                         count += 1;
                         tracing::debug!("sink '{}': received buffer {}", name, count);
@@ -2479,28 +2585,13 @@ fn spawn_sink_task(
                         present(&position, pts);
                     }
                     Ok(Message::Event(event)) => {
-                        match probe_registry.invoke_event(&sink_pad, &event, true) {
-                            ProbeReturn::Drop | ProbeReturn::Handled => continue,
-                            _ => {}
-                        }
-                        match &event {
-                            Event::FlushStop(_) => {
-                                // Forget the pre-seek position; the Segment
-                                // that follows re-anchors it, and `present`'s
-                                // max() starts fresh from there.
-                                position.store(u64::MAX, Ordering::Release);
-                            }
-                            Event::Segment(seg)
-                                if seg.format == crate::event::SegmentFormat::Time =>
-                            {
-                                position.store(seg.start.max(0) as u64, Ordering::Release);
-                            }
-                            _ => {}
-                        }
-                        // No `flush()` here: a sink's flush *commits* buffered
-                        // output (an Mp4FileSink finalizes the file) — the
-                        // element decides what a flush-seek means for it.
-                        let _ = element.handle_downstream_event(event);
+                        deliver_sink_event(
+                            &mut element,
+                            event,
+                            &probe_registry,
+                            &sink_pad,
+                            &position,
+                        );
                     }
                     Ok(Message::Eos) => {
                         tracing::debug!("sink '{}': EOS after {}", name, count);
@@ -2953,6 +3044,7 @@ fn spawn_demuxer_task(
     stop: Arc<AtomicBool>,
     control_rx: Option<AsyncReceiver<Event>>,
     flush_epoch: Arc<AtomicU64>,
+    pause_rx: watch::Receiver<bool>,
     bus: BusHandle,
     share: TaskGuard,
 ) -> JoinHandle<Result<()>> {
@@ -3126,6 +3218,33 @@ fn spawn_demuxer_task(
                         )
                         .await;
                     }
+                }
+
+                // Runtime pause: a source-style demuxer is the pipeline's
+                // producer, so it takes the same gate as spawn_source_task —
+                // #156's root cause was that it didn't, leaving pause with
+                // nothing to gate in demuxer-rooted pipelines. Control events
+                // still drain so a seek can land while paused. (The fed
+                // branch above is deliberately ungated, like transforms: it
+                // must keep moving for a flush to propagate, and backpressure
+                // parks it once the producer stops.)
+                while *pause_rx.borrow() && !stop.load(Ordering::Acquire) {
+                    if let Some(control_rx) = &control_rx {
+                        while let Ok(Some(event)) = control_rx.try_recv() {
+                            handle_source_control_event(
+                                &name,
+                                &mut element,
+                                &event,
+                                &all_branches,
+                                &src_pad,
+                                &probe_registry,
+                                &flush_epoch,
+                                &bus,
+                            )
+                            .await;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 }
 
                 match guard(&name, element.process_demux(None)).await {

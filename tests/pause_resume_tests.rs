@@ -18,6 +18,9 @@ fn arena() -> &'static SharedArena {
 }
 
 fn buffer_with_pts(pts_ns: u64) -> Buffer {
+    // Endless producers (CountingDemux) cycle far more buffers than the
+    // arena has slots; reclaim returns the released ones first.
+    arena().reclaim();
     let slot = arena().acquire().expect("test arena exhausted");
     let mut metadata = Metadata::new();
     metadata.pts = ClockTime::from_nanos(pts_ns);
@@ -122,6 +125,246 @@ async fn pause_and_resume_post_state_changes() {
         1,
         "exactly one resume transition after the pause: {transitions:?}"
     );
+}
+
+/// Pause gates a *source-style demuxer* — the topology where it used to gate
+/// nothing at all (#156): the player's only producer is `add_demuxer`, and
+/// `spawn_demuxer_task` had no pause_rx.
+#[tokio::test(flavor = "multi_thread")]
+async fn pause_gates_a_source_style_demuxer() {
+    use parallax::element::{Demuxer, DemuxerProduce, PadAddedCallback, PadId, RoutedOutput};
+    use parallax::format::Caps;
+
+    /// Endless one-pad demuxer that owns its "reader" (a counter).
+    struct CountingDemux {
+        seq: u64,
+        outputs: Vec<(PadId, Caps)>,
+    }
+
+    impl Demuxer for CountingDemux {
+        fn demux(&mut self, _buffer: Buffer) -> parallax::error::Result<RoutedOutput> {
+            unreachable!("source-style: driven through produce()")
+        }
+
+        fn produce(&mut self) -> parallax::error::Result<DemuxerProduce> {
+            let buffer = buffer_with_pts(self.seq * 1_000);
+            self.seq += 1;
+            Ok(DemuxerProduce::Routed(RoutedOutput::single(
+                PadId(0),
+                buffer,
+            )))
+        }
+
+        fn pad_name(&self, _pad: PadId) -> String {
+            "data".into()
+        }
+
+        fn outputs(&self) -> &[(PadId, Caps)] {
+            &self.outputs
+        }
+
+        fn on_pad_added(&mut self, _callback: PadAddedCallback) {}
+    }
+
+    let mut pipeline = Pipeline::new();
+    let node = pipeline.add_demuxer(
+        "demux",
+        CountingDemux {
+            seq: 0,
+            outputs: vec![(PadId(0), Caps::any())],
+        },
+    );
+    let sink = pipeline.add_sink("sink", NullSink::new());
+    pipeline.link_pads(node, "data", sink, "sink").unwrap();
+
+    let delivered = Arc::new(AtomicU64::new(0));
+    let delivered_probe = delivered.clone();
+    let _ = pipeline.add_probe(PadRef::sink(sink), ProbeType::BUFFER, move |_| {
+        delivered_probe.fetch_add(1, Ordering::Relaxed);
+        ProbeReturn::Ok
+    });
+
+    let executor = Executor::new();
+    let handle = executor.start(&mut pipeline).unwrap();
+
+    wait_until(|| delivered.load(Ordering::Relaxed) > 0, "first delivery").await;
+
+    handle.pause();
+    // Drain the in-flight tail, then the count must hold still — before the
+    // fix the demuxer kept producing and this grew by thousands.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let frozen = delivered.load(Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        delivered.load(Ordering::Relaxed),
+        frozen,
+        "a paused source-style demuxer kept delivering"
+    );
+
+    handle.resume();
+    wait_until(
+        || delivered.load(Ordering::Relaxed) > frozen,
+        "delivery after resume",
+    )
+    .await;
+
+    handle.stop();
+    handle.wait().await.unwrap();
+}
+
+/// A paused sink delivers Pause/Resume to its element exactly once per
+/// transition, holds (not drops) the buffer it stashed while paused, and
+/// replays everything in order on resume.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_paused_sink_delivers_pause_resume_and_replays_the_stash() {
+    use parallax::element::{ConsumeContext, Sink};
+    use parallax::event::Event;
+    use std::sync::Mutex;
+
+    /// Records every consume and every downstream event, in arrival order.
+    struct LoggingSink {
+        log: Arc<Mutex<Vec<String>>>,
+        first: bool,
+    }
+
+    impl Sink for LoggingSink {
+        fn consume(&mut self, ctx: &ConsumeContext) -> parallax::error::Result<()> {
+            let pts = ctx.metadata().pts.nanos();
+            self.log.lock().unwrap().push(format!("buf:{pts}"));
+            // The first consume is long enough that the test's pause() —
+            // issued a few ms after "buf:1000" appears — deterministically
+            // lands while this buffer is in flight and the rest of the burst
+            // is still queued. If the sink went idle first, Pause delivery
+            // would defer to the next message (the documented caveat) and
+            // the test would race.
+            if self.first {
+                self.first = false;
+                std::thread::sleep(Duration::from_millis(150));
+            } else {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(())
+        }
+
+        fn handle_downstream_event(&mut self, event: Event) -> Option<Event> {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("ev:{}", event.name()));
+            Some(event)
+        }
+    }
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut pipeline = Pipeline::new();
+    let appsrc = AppSrc::with_max_buffers(32);
+    let src_handle = appsrc.handle();
+    let src = pipeline.add_source("src", appsrc);
+    let sink = pipeline.add_sink(
+        "sink",
+        LoggingSink {
+            log: log.clone(),
+            first: true,
+        },
+    );
+    pipeline.link(src, sink).unwrap();
+
+    let executor = Executor::new();
+    let handle = executor.start(&mut pipeline).unwrap();
+
+    // A burst of five; the sink is chewing on the first when pause() lands.
+    for pts in [1_000u64, 2_000, 3_000, 4_000, 5_000] {
+        src_handle.push_buffer(buffer_with_pts(pts)).await.unwrap();
+    }
+    // Poll with yield_now, not a timer: the sink's deliberately *blocking*
+    // consume can stall the tokio time driver, and a timer-based wait would
+    // wake only after the whole burst has drained — pause() must land inside
+    // the first consume's window.
+    let t0 = std::time::Instant::now();
+    while !log.lock().unwrap().iter().any(|e| e == "buf:1000") {
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "first consume never came"
+        );
+        tokio::task::yield_now().await;
+    }
+    handle.pause();
+    handle.pause(); // idempotent: must not deliver a second Pause event
+
+    // While paused nothing more is consumed (the stash is held, not played).
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let frozen = log.lock().unwrap().len();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        log.lock().unwrap().len(),
+        frozen,
+        "the sink kept working while paused: {:?}",
+        log.lock().unwrap()
+    );
+
+    handle.resume();
+    wait_until(
+        || log.lock().unwrap().iter().any(|e| e == "buf:5000"),
+        "the full burst after resume",
+    )
+    .await;
+
+    src_handle.end_stream();
+    handle.wait().await.unwrap();
+
+    let log = log.lock().unwrap();
+    let buffers: Vec<&String> = log.iter().filter(|e| e.starts_with("buf:")).collect();
+    assert_eq!(
+        buffers,
+        ["buf:1000", "buf:2000", "buf:3000", "buf:4000", "buf:5000"],
+        "pause lost or reordered buffers: {log:?}"
+    );
+    assert_eq!(
+        log.iter().filter(|e| *e == "ev:pause").count(),
+        1,
+        "exactly one Pause event: {log:?}"
+    );
+    assert_eq!(
+        log.iter().filter(|e| *e == "ev:resume").count(),
+        1,
+        "exactly one Resume event: {log:?}"
+    );
+    let pause_at = log.iter().position(|e| e == "ev:pause").unwrap();
+    let resume_at = log.iter().position(|e| e == "ev:resume").unwrap();
+    assert!(pause_at < resume_at, "Pause precedes Resume: {log:?}");
+    assert!(
+        !log[pause_at..resume_at]
+            .iter()
+            .any(|e| e.starts_with("buf:")),
+        "a buffer was consumed between Pause and Resume: {log:?}"
+    );
+}
+
+/// Pausing a pipeline whose Block links are completely full must not
+/// deadlock: resume un-parks every blocked send and the run reaches EOS.
+#[tokio::test(flavor = "multi_thread")]
+async fn pause_with_full_block_links_resumes_to_eos() {
+    use parallax::pipeline::LinkPolicy;
+
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_source("src", NullSource::new(50));
+    let sink = pipeline.add_sink("sink", NullSink::new());
+    pipeline
+        .link_pads_full(src, "src", sink, "sink", LinkPolicy::Block, Some(2))
+        .unwrap();
+
+    let executor = Executor::new();
+    let handle = executor.start(&mut pipeline).unwrap();
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    handle.pause();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    handle.resume();
+
+    tokio::time::timeout(Duration::from_secs(10), handle.wait())
+        .await
+        .expect("paused-then-resumed pipeline reached EOS")
+        .unwrap();
 }
 
 /// position() follows the last-presented PTS monotonically, holds across a
