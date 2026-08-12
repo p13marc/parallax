@@ -244,7 +244,7 @@ Distinct from bus messages, `Event`s travel *through* the pipeline with the data
 - **Upstream**: `Seek`, `Qos`, `LatencyQuery`
 - **Bidirectional**: `FlushStart`, `FlushStop`, `Custom`
 
-Serialized events share channels with buffers via `PipelineItem::{Buffer, Event}` so ordering is preserved; flush events bypass queues (out-of-band `ControlSignal`). Elements handle them in `handle_downstream_event` / `handle_upstream_event` returning `EventResult::{Handled, NotHandled, Error}`.
+Serialized events share channels with buffers via `PipelineItem::{Buffer, Event}` so ordering is preserved; flush events also travel in-band; their immediacy comes from the flush epoch (a seek stamps all pre-seek buffers stale, and consumers shed them at receive speed). Elements handle them in `handle_downstream_event` / `handle_upstream_event` returning `EventResult::{Handled, NotHandled, Error}`.
 
 ## Seeking & position
 
@@ -261,7 +261,7 @@ if seekable.seekable {
 }
 ```
 
-The graph-level `pipeline.seek_*` only reaches elements *before* `Executor::start` moves them into their tasks. To seek a **running** pipeline, use the handle — the seek is delivered to each source task, which repositions the source and runs the flush sequence in-band (FlushStart → FlushStop → Segment, then `MessageKind::SeekDone` on the bus; receivers drop buffered pre-seek data in between):
+The graph-level `pipeline.seek_*` only reaches elements *before* `Executor::start` moves them into their tasks. To seek a **running** pipeline, use the handle — the seek is delivered to each source task, which repositions the source, bumps the pipeline-wide flush epoch (buffers are stamped with the epoch they were produced under, so consumers shed the queued pre-seek backlog at receive speed) and runs the flush sequence in-band (FlushStart → FlushStop → Segment, then `MessageKind::SeekDone` on the bus):
 
 ```rust
 let handle = executor.start(&mut pipeline)?;

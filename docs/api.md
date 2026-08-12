@@ -72,7 +72,7 @@ brings in: `Buffer`, `Metadata`/`BufferFlags`/`RtpMeta`, clock types (`Clock`, `
 
 ### `parallax::event` / `parallax::clock`
 
-`Event` (StreamStart/Segment/Tags/Eos/CapsChanged/Gap | Seek/Qos/LatencyQuery | FlushStart/FlushStop/Custom), `SegmentEvent` (`to_running_time`/`to_stream_time`), `SeekEvent`/`SeekFlags`, `PipelineItem`, `ControlSignal`, `TagList`/`TagValue`/`TagMergeMode`; `ClockTime`, `Clock`, `ClockFlags`, `ClockProvider`, `SystemClock`, `PipelineClock`.
+`Event` (StreamStart/Segment/Tags/Eos/CapsChanged/Gap | Seek/Qos/LatencyQuery | FlushStart/FlushStop/Custom), `SegmentEvent` (`to_running_time`/`to_stream_time`), `SeekEvent`/`SeekFlags`, `PipelineItem`, `TagList`/`TagValue`/`TagMergeMode`; `ClockTime`, `Clock`, `ClockFlags`, `ClockProvider`, `SystemClock`, `PipelineClock`.
 
 ### `parallax::elements`
 

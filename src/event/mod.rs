@@ -134,7 +134,11 @@ impl Event {
     /// Check if this event should be serialized with buffers.
     ///
     /// Serialized events respect buffer ordering and go through queues.
-    /// Non-serialized events (flush) bypass queues for immediate effect.
+    /// Non-serialized events (flush) still travel in-band and FIFO with
+    /// buffers — their *immediacy* comes from the flush epoch instead: the
+    /// seek handler stamps every pre-seek buffer stale, consumers shed the
+    /// stale backlog at receive speed, and the flush pair right behind it
+    /// reaches the elements with nothing queued in front.
     pub fn is_serialized(&self) -> bool {
         !matches!(self, Event::FlushStart | Event::FlushStop(_))
     }
@@ -842,31 +846,6 @@ impl From<Event> for PipelineItem {
     fn from(event: Event) -> Self {
         PipelineItem::Event(event)
     }
-}
-
-// ============================================================================
-// Control Signal (for non-serialized events)
-// ============================================================================
-
-/// Control signals that bypass the data channel.
-///
-/// These are used for non-serialized events like flush that need
-/// to take effect immediately without waiting in queues.
-#[derive(Debug, Clone)]
-pub enum ControlSignal {
-    /// Flush start - immediately discard buffered data.
-    FlushStart,
-    /// Flush stop - resume normal operation.
-    FlushStop {
-        /// Whether to reset running time.
-        reset_time: bool,
-    },
-    /// Pause processing.
-    Pause,
-    /// Resume processing.
-    Resume,
-    /// Shutdown the element.
-    Shutdown,
 }
 
 // ============================================================================

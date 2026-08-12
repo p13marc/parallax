@@ -596,6 +596,29 @@ impl AlsaSink {
         );
     }
 
+    /// Discard whatever the device still holds and reconcile the frame
+    /// accounting the master clock is built on.
+    ///
+    /// One primitive for every discontinuity, so the clock arithmetic lives
+    /// in exactly one place (see [`rebase_written`]):
+    /// - flush-seek (`count_as_played = false`): the queued frames belong to
+    ///   the abandoned stream position — *cancel* them, so the published
+    ///   position stays where playback actually got to, with no jump;
+    /// - underrun recovery (`count_as_played = true`): the queued frames are
+    ///   lost but stream time must move past them — *skip* them, publishing
+    ///   the advance in one deliberate step instead of letting the
+    ///   interpolation clamp absorb a mystery jump.
+    fn discard_queued(&mut self, count_as_played: bool) {
+        // In an XRUN the delay query fails; treat that as nothing queued —
+        // the device already discarded its buffer on its own.
+        let queued = self.pcm.delay().map(|d| d.max(0) as u64).unwrap_or(0);
+        let _ = self.pcm.drop();
+        let _ = self.pcm.prepare();
+        self.written_frames = rebase_written(self.written_frames, queued, count_as_played);
+        self.position
+            .update(self.written_frames, std::time::Instant::now());
+    }
+
     /// Get the audio format.
     pub fn format(&self) -> &AlsaFormat {
         &self.format
@@ -631,6 +654,20 @@ impl AlsaSink {
     /// callers that want to read it directly.
     pub fn create_clock(&self) -> AlsaClock {
         AlsaClock::from_position(Arc::clone(&self.position))
+    }
+}
+
+/// What `written_frames` becomes after discarding `queued` device frames.
+///
+/// Cancelled content (flush) is subtracted so the played count — and with it
+/// the master clock — continues from what was actually heard; skipped content
+/// (underrun, unpausable-hardware pause) stands, so stream time steps over
+/// the gap. Free function so the arithmetic unit-tests without a sound card.
+fn rebase_written(written: u64, queued: u64, count_as_played: bool) -> u64 {
+    if count_as_played {
+        written
+    } else {
+        written.saturating_sub(queued)
     }
 }
 
@@ -912,9 +949,10 @@ impl AsyncSink for AlsaSink {
                         .into());
                     }
                     tracing::debug!("alsasink: underrun, re-preparing the device");
-                    self.pcm
-                        .prepare()
-                        .map_err(|e| DeviceError::Alsa(e.to_string()))?;
+                    // Skip the lost frames deliberately: rebase + republish in
+                    // one step, so the master clock advances over the gap
+                    // instead of the interpolation clamp absorbing a jump.
+                    self.discard_queued(true);
                 }
                 Err(e) if e.errno() == libc::EAGAIN => {
                     // Non-blocking device with a full buffer — same wait as
@@ -947,15 +985,25 @@ impl AsyncSink for AlsaSink {
         &mut self,
         event: crate::event::Event,
     ) -> Option<crate::event::Event> {
-        if matches!(
-            event,
-            crate::event::Event::Eos | crate::event::Event::Error(_)
-        ) {
-            // Play out what the device already holds, then release the clock:
-            // this stream ending is not a stall, and other paced branches
-            // (video presenting its buffered tail) still need time to move.
-            let _ = self.pcm.drain();
-            self.position().release(std::time::Instant::now());
+        match &event {
+            crate::event::Event::Eos | crate::event::Event::Error(_) => {
+                // Play out what the device already holds, then release the
+                // clock: this stream ending is not a stall, and other paced
+                // branches (video presenting its buffered tail) still need
+                // time to move.
+                let _ = self.pcm.drain();
+                self.position().release(std::time::Instant::now());
+            }
+            crate::event::Event::FlushStart => {
+                // A flushing seek abandoned the stream position this buffer
+                // belongs to: silence the device now (up to a full device
+                // buffer of pre-seek audio would otherwise play out) and
+                // cancel the discarded frames so the master clock continues
+                // from what was actually heard. No `release()` — the stream
+                // goes on from the new position.
+                self.discard_queued(false);
+            }
+            _ => {}
         }
         Some(event)
     }
@@ -994,6 +1042,23 @@ mod tests {
             assert_eq!(alsa.to_caps_format(), expected, "{alsa:?}");
             assert_eq!(alsa.bytes_per_sample(), bytes, "{alsa:?}");
         }
+    }
+
+    #[test]
+    fn cancelling_queued_frames_rewinds_the_written_count() {
+        // Flush: 10_000 written, 4_096 still queued → the count falls back to
+        // what was actually heard, and the published position cannot jump.
+        assert_eq!(rebase_written(10_000, 4_096, false), 5_904);
+        // Never underflows, even if the delay query over-reports.
+        assert_eq!(rebase_written(100, 4_096, false), 0);
+    }
+
+    #[test]
+    fn skipping_queued_frames_keeps_the_written_count() {
+        // Underrun / unpausable-hardware discard: the frames are gone but
+        // stream time must step over them — written stands.
+        assert_eq!(rebase_written(10_000, 4_096, true), 10_000);
+        assert_eq!(rebase_written(0, 0, true), 0);
     }
 
     #[test]

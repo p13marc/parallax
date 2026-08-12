@@ -527,6 +527,9 @@ struct RuntimeControls {
     controls: Vec<SourceControl>,
     pause_rx: watch::Receiver<bool>,
     position: Arc<AtomicU64>,
+    /// Pipeline-wide flush epoch; see [`Message::Buffer`]. Bumped by the seek
+    /// handler inside producer tasks, read by every consuming task.
+    flush_epoch: Arc<AtomicU64>,
 }
 
 /// Handle to a running pipeline.
@@ -1073,6 +1076,7 @@ impl Executor {
             controls: Vec::new(),
             pause_rx,
             position: Arc::new(AtomicU64::new(u64::MAX)),
+            flush_epoch: Arc::new(AtomicU64::new(0)),
         };
 
         // Execute based on scheduling mode
@@ -1702,6 +1706,7 @@ impl Executor {
                     stop.clone(),
                     control_rx,
                     runtime.pause_rx.clone(),
+                    runtime.flush_epoch.clone(),
                     bus,
                     share,
                 )
@@ -1716,6 +1721,7 @@ impl Executor {
                 probes,
                 tracers,
                 runtime.position.clone(),
+                runtime.flush_epoch.clone(),
                 share,
             ),
             ElementType::Transform => spawn_transform_task(
@@ -1730,6 +1736,7 @@ impl Executor {
                 probes,
                 tracers,
                 ShedTracker::new(self.config.shed_fatal_after),
+                runtime.flush_epoch.clone(),
                 share,
             ),
             ElementType::Demuxer => {
@@ -1762,6 +1769,7 @@ impl Executor {
                     tracers,
                     stop.clone(),
                     control_rx,
+                    runtime.flush_epoch.clone(),
                     bus,
                     share,
                 )
@@ -1779,6 +1787,7 @@ impl Executor {
                     events_clone,
                     probes,
                     tracers,
+                    runtime.flush_epoch.clone(),
                     share,
                 )
             }
@@ -1903,7 +1912,17 @@ fn is_power_of_ten(mut n: u64) -> bool {
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)] // Intentional: avoid heap allocation on hot path
 enum Message {
-    Buffer(Buffer),
+    /// A buffer, stamped with the pipeline's flush epoch at production time.
+    ///
+    /// The epoch is what makes a flushing seek actually flush (#157): the
+    /// seek handler bumps the pipeline-wide counter after the element has
+    /// repositioned, so every buffer produced before the seek carries an
+    /// older stamp. Consumers drop stale-stamped buffers at receive speed —
+    /// the queued backlog that used to play out as ~2.5 s of pre-seek audio
+    /// drains in microseconds, and the in-band FlushStart/FlushStop/Segment
+    /// trio right behind it reaches the elements promptly. FIFO ordering
+    /// between buffers and events is untouched.
+    Buffer(Buffer, u64),
     Eos,
     /// An upstream element failed. Terminal, and never accompanied by an `Eos`
     /// — sending both invites the receiver to record whichever arrives second
@@ -1944,10 +1963,10 @@ impl OutputBranch {
     /// *immediately* rather than blocking — so a source feeding a sink that had
     /// died spun at 100% CPU producing into a closed channel until the handle
     /// was dropped. Callers use this to stop.
-    async fn send_buffer(&self, buffer: Buffer, tracers: &TracerRegistry) -> bool {
+    async fn send_buffer(&self, buffer: Buffer, epoch: u64, tracers: &TracerRegistry) -> bool {
         match self.policy {
-            LinkPolicy::Block => self.tx.send(Message::Buffer(buffer)).await.is_ok(),
-            LinkPolicy::Drop => match self.tx.try_send(Message::Buffer(buffer)) {
+            LinkPolicy::Block => self.tx.send(Message::Buffer(buffer, epoch)).await.is_ok(),
+            LinkPolicy::Drop => match self.tx.try_send(Message::Buffer(buffer, epoch)) {
                 Ok(true) => true,
                 Ok(false) => {
                     tracers.notify_drop(&self.sink_name);
@@ -1967,18 +1986,31 @@ impl OutputBranch {
 /// overwhelmingly common one — takes a direct await and allocates nothing.
 /// Returns `false` when every branch's receiver has gone away, so the producer
 /// can stop rather than spin. A pad with no branches at all counts as live.
-async fn broadcast(branches: &[OutputBranch], buffer: Buffer, tracers: &TracerRegistry) -> bool {
+async fn broadcast(
+    branches: &[OutputBranch],
+    buffer: Buffer,
+    epoch: u64,
+    tracers: &TracerRegistry,
+) -> bool {
     match branches {
         [] => true,
-        [only] => only.send_buffer(buffer, tracers).await,
+        [only] => only.send_buffer(buffer, epoch, tracers).await,
         many => futures::future::join_all(
             many.iter()
-                .map(|branch| branch.send_buffer(buffer.clone(), tracers)),
+                .map(|branch| branch.send_buffer(buffer.clone(), epoch, tracers)),
         )
         .await
         .into_iter()
         .any(|connected| connected),
     }
+}
+
+/// Whether a buffer stamped `epoch` predates the current flush epoch.
+///
+/// `Acquire` pairs with the seek handler's `fetch_add(AcqRel)`: once a task
+/// sees the bumped counter, every pre-bump buffer tests stale.
+fn is_stale(epoch: u64, current: &AtomicU64) -> bool {
+    epoch < current.load(Ordering::Acquire)
 }
 
 /// Send EOS to every branch, **always blocking**.
@@ -2162,6 +2194,7 @@ async fn handle_source_control_event(
     outputs: &[OutputBranch],
     src_pad: &crate::pipeline::probe::PadRef,
     probe_registry: &ProbeRegistry,
+    flush_epoch: &AtomicU64,
     bus: &BusHandle,
 ) {
     match probe_registry.invoke_event(src_pad, event, false) {
@@ -2183,6 +2216,14 @@ async fn handle_source_control_event(
                 _ => Some(event),
             };
             if seek.flags.contains(crate::event::SeekFlags::FLUSH) {
+                // The element repositioned in `handle_upstream_event` above and
+                // this runs inside the producer's own task, between produce
+                // calls — so every buffer already stamped is pre-seek and every
+                // buffer stamped after this line is post-seek, with no cross-
+                // task handshake. Bumping *before* FlushStart means consumers
+                // drain the stale backlog at receive speed and the flush trio
+                // arrives promptly instead of queueing behind seconds of data.
+                flush_epoch.fetch_add(1, Ordering::AcqRel);
                 if let Some(ev) = emit(Event::FlushStart) {
                     broadcast_event(outputs, &ev).await;
                 }
@@ -2232,6 +2273,7 @@ fn spawn_source_task(
     stop: Arc<AtomicBool>,
     control_rx: AsyncReceiver<Event>,
     pause_rx: watch::Receiver<bool>,
+    flush_epoch: Arc<AtomicU64>,
     bus: BusHandle,
     share: TaskGuard,
 ) -> JoinHandle<Result<()>> {
@@ -2269,6 +2311,7 @@ fn spawn_source_task(
                     &outputs,
                     &src_pad,
                     &probe_registry,
+                    &flush_epoch,
                     &bus,
                 )
                 .await;
@@ -2286,6 +2329,7 @@ fn spawn_source_task(
                         &outputs,
                         &src_pad,
                         &probe_registry,
+                        &flush_epoch,
                         &bus,
                     )
                     .await;
@@ -2314,7 +2358,11 @@ fn spawn_source_task(
                         count,
                         buffer.len()
                     );
-                    let connected = broadcast(&outputs, buffer.clone(), &tracers).await;
+                    // Stamped at send time: a seek handled in this iteration's
+                    // control drain already bumped the epoch, so this buffer —
+                    // produced after the reposition — carries the new one.
+                    let epoch = flush_epoch.load(Ordering::Acquire);
+                    let connected = broadcast(&outputs, buffer.clone(), epoch, &tracers).await;
                     for bridge in &output_bridges {
                         let _ = bridge.push_async(buffer.clone()).await;
                     }
@@ -2382,6 +2430,7 @@ fn spawn_sink_task(
     probe_registry: ProbeRegistry,
     tracers: TracerRegistry,
     position: Arc<AtomicU64>,
+    flush_epoch: Arc<AtomicU64>,
     share: TaskGuard,
 ) -> JoinHandle<Result<()>> {
     // Advance the shared last-presented-PTS cell. `max` keeps it monotonic
@@ -2404,15 +2453,15 @@ fn spawn_sink_task(
         let n_inputs = inputs.len();
         tracing::debug!("sink '{}': {} inputs", name, n_inputs);
         if let Some(rx) = inputs.into_iter().next() {
-            // Between FlushStart and FlushStop arriving buffers are stale.
-            let mut flushing = false;
             // Standard path: read from kanal channel
             loop {
                 match rx.recv().await {
-                    Ok(Message::Buffer(buffer)) => {
+                    Ok(Message::Buffer(buffer, epoch)) => {
                         count += 1;
                         tracing::debug!("sink '{}': received buffer {}", name, count);
-                        if flushing {
+                        // Pre-seek data: queued ahead of the flush trio, shed
+                        // at receive speed instead of presented (#157).
+                        if is_stale(epoch, &flush_epoch) {
                             tracers.notify_drop(&name);
                             continue;
                         }
@@ -2435,9 +2484,7 @@ fn spawn_sink_task(
                             _ => {}
                         }
                         match &event {
-                            Event::FlushStart => flushing = true,
                             Event::FlushStop(_) => {
-                                flushing = false;
                                 // Forget the pre-seek position; the Segment
                                 // that follows re-anchors it, and `present`'s
                                 // max() starts fresh from there.
@@ -2547,6 +2594,7 @@ fn spawn_transform_task(
     probe_registry: ProbeRegistry,
     tracers: TracerRegistry,
     mut shed: ShedTracker,
+    flush_epoch: Arc<AtomicU64>,
     share: TaskGuard,
 ) -> JoinHandle<Result<()>> {
     tokio::spawn(reporting(share, async move {
@@ -2560,6 +2608,7 @@ fn spawn_transform_task(
         /// Helper to send output buffer to all downstream channels and bridges.
         async fn send_output(
             buffer: Buffer,
+            epoch: u64,
             outputs: &[OutputBranch],
             output_bridges: &[Arc<AsyncRtBridge>],
             tracers: &TracerRegistry,
@@ -2569,10 +2618,10 @@ fn spawn_transform_task(
             // clone was a metadata copy plus six refcount atomics per
             // buffer per element for nothing.
             if output_bridges.is_empty() {
-                broadcast(outputs, buffer, tracers).await;
+                broadcast(outputs, buffer, epoch, tracers).await;
                 return;
             }
-            broadcast(outputs, buffer.clone(), tracers).await;
+            broadcast(outputs, buffer.clone(), epoch, tracers).await;
             let (last, rest) = output_bridges
                 .split_last()
                 .expect("output_bridges checked non-empty");
@@ -2603,14 +2652,17 @@ fn spawn_transform_task(
         }
 
         if let Some(rx) = inputs.into_iter().next() {
-            // Between FlushStart and FlushStop every arriving buffer is stale
-            // by definition — drop it instead of processing.
-            let mut flushing = false;
+            // Epoch of the last accepted input. Outputs are stamped with this,
+            // NOT with the global counter at send time: if a flush lands while
+            // `process()` is running, its output came from pre-seek input and
+            // must test stale downstream — a send-time global stamp would
+            // launder it fresh.
+            let mut in_epoch: u64 = 0;
             // Standard path: read from kanal channel
             loop {
                 tracing::trace!("transform '{}': waiting for input", name);
                 match rx.recv().await {
-                    Ok(Message::Buffer(buffer)) => {
+                    Ok(Message::Buffer(buffer, epoch)) => {
                         count += 1;
                         tracing::debug!(
                             "transform '{}': received buffer {} ({} bytes)",
@@ -2619,10 +2671,12 @@ fn spawn_transform_task(
                             buffer.len()
                         );
 
-                        if flushing {
+                        // Pre-seek data — shed at receive speed (#157).
+                        if is_stale(epoch, &flush_epoch) {
                             tracers.notify_drop(&name);
                             continue;
                         }
+                        in_epoch = epoch;
 
                         // Sink-pad probes see the input before the element does.
                         match probe_registry.invoke_buffer(&sink_pad, &buffer) {
@@ -2651,7 +2705,8 @@ fn spawn_transform_task(
                                     _ => {}
                                 }
                                 shed.reset();
-                                send_output(out, &outputs, &output_bridges, &tracers).await;
+                                send_output(out, in_epoch, &outputs, &output_bridges, &tracers)
+                                    .await;
                             }
                             Ok(None) => {
                                 tracing::debug!(
@@ -2685,19 +2740,16 @@ fn spawn_transform_task(
                             ProbeReturn::Drop | ProbeReturn::Handled => continue,
                             _ => {}
                         }
-                        match &event {
-                            Event::FlushStart => {
-                                flushing = true;
-                                // Drain the element's internal state and
-                                // *discard* it: pending reordered frames from
-                                // before the seek must not surface after it.
-                                if let Err(e) = guard(&name, element.flush()).await {
-                                    tracing::warn!("flush error in '{}': {}", name, e);
-                                }
-                                shed.reset();
+                        if let Event::FlushStart = &event {
+                            // Drain the element's internal state and *discard*
+                            // it: pending reordered frames from before the
+                            // seek must not surface after it. The stale
+                            // backlog ahead of this event was epoch-dropped,
+                            // so this runs before any fresh data arrives.
+                            if let Err(e) = guard(&name, element.flush()).await {
+                                tracing::warn!("flush error in '{}': {}", name, e);
                             }
-                            Event::FlushStop(_) => flushing = false,
-                            _ => {}
+                            shed.reset();
                         }
                         // The element sees every event and decides what goes
                         // on: `Some` forwards (the default), `None` consumes.
@@ -2736,7 +2788,14 @@ fn spawn_transform_task(
                                     buffers.len()
                                 );
                                 for buffer in buffers {
-                                    send_output(buffer, &outputs, &output_bridges, &tracers).await;
+                                    send_output(
+                                        buffer,
+                                        in_epoch,
+                                        &outputs,
+                                        &output_bridges,
+                                        &tracers,
+                                    )
+                                    .await;
                                 }
                             }
                             Err(e) => {
@@ -2760,6 +2819,11 @@ fn spawn_transform_task(
             // be absent entirely, so putting an element on an RT thread — the
             // elements most worth measuring — made it invisible to probes and
             // to LatencyTracer.
+            //
+            // Flush/pause do not cross bridges: the RT path carries no events,
+            // so bridge buffers have no epoch of their own. Outputs are
+            // stamped with the current global — RT-fed subtrees cannot seek,
+            // so nothing they emit is ever pre-seek.
             loop {
                 while let Some(buffer) = bridge.try_pop() {
                     count += 1;
@@ -2780,7 +2844,8 @@ fn spawn_transform_task(
                                 _ => {}
                             }
                             shed.reset();
-                            send_output(out, &outputs, &output_bridges, &tracers).await;
+                            let epoch = flush_epoch.load(Ordering::Acquire);
+                            send_output(out, epoch, &outputs, &output_bridges, &tracers).await;
                         }
                         Ok(None) => shed.reset(),
                         // Shed rather than die — see the channel path above.
@@ -2807,7 +2872,9 @@ fn spawn_transform_task(
                                 Output::Multiple(v) => v,
                             };
                             for buffer in buffers {
-                                send_output(buffer, &outputs, &output_bridges, &tracers).await;
+                                let epoch = flush_epoch.load(Ordering::Acquire);
+                                send_output(buffer, epoch, &outputs, &output_bridges, &tracers)
+                                    .await;
                             }
                         }
                         Err(e) => {
@@ -2846,17 +2913,18 @@ async fn route_demux_buffer(
     name: &str,
     pad: &str,
     buffer: Buffer,
+    epoch: u64,
     outputs_by_pad: &HashMap<String, Vec<OutputBranch>>,
     tracers: &TracerRegistry,
     unrouted: &mut u64,
 ) {
     match outputs_by_pad.get(pad) {
         Some(branches) => {
-            broadcast(branches, buffer, tracers).await;
+            broadcast(branches, buffer, epoch, tracers).await;
         }
         None if pad.is_empty() => {
             for branches in outputs_by_pad.values() {
-                broadcast(branches, buffer.clone(), tracers).await;
+                broadcast(branches, buffer.clone(), epoch, tracers).await;
             }
         }
         None => {
@@ -2884,6 +2952,7 @@ fn spawn_demuxer_task(
     tracers: TracerRegistry,
     stop: Arc<AtomicBool>,
     control_rx: Option<AsyncReceiver<Event>>,
+    flush_epoch: Arc<AtomicU64>,
     bus: BusHandle,
     share: TaskGuard,
 ) -> JoinHandle<Result<()>> {
@@ -2899,17 +2968,20 @@ fn spawn_demuxer_task(
         let all_branches: Vec<OutputBranch> = outputs_by_pad.values().flatten().cloned().collect();
 
         if let Some(rx) = inputs.into_iter().next() {
-            // Between FlushStart and FlushStop arriving buffers are stale.
-            let mut flushing = false;
+            // Same input-epoch rule as spawn_transform_task: outputs carry the
+            // epoch of the input they came from.
+            let mut in_epoch: u64 = 0;
             loop {
                 match rx.recv().await {
-                    Ok(Message::Buffer(buffer)) => {
+                    Ok(Message::Buffer(buffer, epoch)) => {
                         count += 1;
 
-                        if flushing {
+                        // Pre-seek data — shed at receive speed (#157).
+                        if is_stale(epoch, &flush_epoch) {
                             tracers.notify_drop(&name);
                             continue;
                         }
+                        in_epoch = epoch;
 
                         match probe_registry.invoke_buffer(&sink_pad, &buffer) {
                             ProbeReturn::Drop | ProbeReturn::Handled => continue,
@@ -2935,6 +3007,7 @@ fn spawn_demuxer_task(
                                         &name,
                                         &pad,
                                         out,
+                                        in_epoch,
                                         &outputs_by_pad,
                                         &tracers,
                                         &mut unrouted,
@@ -2963,15 +3036,12 @@ fn spawn_demuxer_task(
                             ProbeReturn::Drop | ProbeReturn::Handled => continue,
                             _ => {}
                         }
-                        match &event {
-                            Event::FlushStart => {
-                                flushing = true;
-                                if let Err(e) = guard(&name, element.flush()).await {
-                                    tracing::warn!("flush error in '{}': {}", name, e);
-                                }
+                        if let Event::FlushStart = &event {
+                            // Discard buffered state; stale inputs ahead of
+                            // this event were already epoch-dropped.
+                            if let Err(e) = guard(&name, element.flush()).await {
+                                tracing::warn!("flush error in '{}': {}", name, e);
                             }
-                            Event::FlushStop(_) => flushing = false,
-                            _ => {}
                         }
                         // Events go to every output pad, like EOS does.
                         if let Some(fwd) = element.handle_downstream_event(event) {
@@ -3004,6 +3074,7 @@ fn spawn_demuxer_task(
                                             &name,
                                             &pad,
                                             out,
+                                            in_epoch,
                                             &outputs_by_pad,
                                             &tracers,
                                             &mut unrouted,
@@ -3050,6 +3121,7 @@ fn spawn_demuxer_task(
                             &all_branches,
                             &src_pad,
                             &probe_registry,
+                            &flush_epoch,
                             &bus,
                         )
                         .await;
@@ -3058,6 +3130,10 @@ fn spawn_demuxer_task(
 
                 match guard(&name, element.process_demux(None)).await {
                     Ok(DemuxResult::Routed(routed)) => {
+                        // Same stamp-at-send rule as spawn_source_task: a seek
+                        // handled in this iteration's control drain already
+                        // bumped the epoch.
+                        let epoch = flush_epoch.load(Ordering::Acquire);
                         for (pad, out) in routed {
                             count += 1;
                             match probe_registry.invoke_buffer(&src_pad, &out) {
@@ -3069,6 +3145,7 @@ fn spawn_demuxer_task(
                                 &name,
                                 &pad,
                                 out,
+                                epoch,
                                 &outputs_by_pad,
                                 &tracers,
                                 &mut unrouted,
@@ -3120,6 +3197,7 @@ fn spawn_muxer_task(
     events: EventSender,
     probe_registry: ProbeRegistry,
     tracers: TracerRegistry,
+    flush_epoch: Arc<AtomicU64>,
     share: TaskGuard,
 ) -> JoinHandle<Result<()>> {
     use futures::stream::{FuturesUnordered, StreamExt};
@@ -3165,11 +3243,14 @@ fn spawn_muxer_task(
         // the first arrival, FlushStop once every started flush has stopped —
         // forwarding each input's pair verbatim would flush the output twice.
         let mut active_flushes: usize = 0;
+        // Outputs carry the newest epoch seen across inputs — a muxer's output
+        // interleaves all of them.
+        let mut in_epoch: u64 = 0;
 
         while let Some((pad, rx, msg)) = receivers.next().await {
             // Keep listening on this input unless it just ended; the EOS and
             // error arms deliberately let it drop.
-            if matches!(msg, Some(Message::Buffer(_) | Message::Event(_))) {
+            if matches!(msg, Some(Message::Buffer(..) | Message::Event(_))) {
                 receivers.push(recv_one(pad, rx));
             }
             let msg = match msg {
@@ -3177,13 +3258,15 @@ fn spawn_muxer_task(
                 None => Err(()),
             };
             match msg {
-                Ok(Message::Buffer(buffer)) => {
+                Ok(Message::Buffer(buffer, epoch)) => {
                     count += 1;
 
-                    if active_flushes > 0 {
+                    // Pre-seek data — shed at receive speed (#157).
+                    if is_stale(epoch, &flush_epoch) {
                         tracers.notify_drop(&name);
                         continue;
                     }
+                    in_epoch = in_epoch.max(epoch);
 
                     match probe_registry.invoke_buffer(&sink_pad, &buffer) {
                         ProbeReturn::Drop | ProbeReturn::Handled => continue,
@@ -3204,7 +3287,7 @@ fn spawn_muxer_task(
                                 ProbeReturn::Drop | ProbeReturn::Handled => continue,
                                 _ => {}
                             }
-                            broadcast(&outputs, out, &tracers).await;
+                            broadcast(&outputs, out, in_epoch, &tracers).await;
                         }
                         Ok(None) => {}
                         Err(e) => {
@@ -3257,7 +3340,7 @@ fn spawn_muxer_task(
                     if eos_count >= total {
                         // Flush any remaining data from final processing
                         if let Ok(Some(out)) = guard(&name, element.process(None)).await {
-                            broadcast(&outputs, out, &tracers).await;
+                            broadcast(&outputs, out, in_epoch, &tracers).await;
                         }
                         // Flush any buffered data before propagating EOS
                         match guard(&name, element.flush()).await {
@@ -3268,7 +3351,7 @@ fn spawn_muxer_task(
                                     Output::Multiple(v) => v,
                                 };
                                 for buffer in buffers {
-                                    broadcast(&outputs, buffer, &tracers).await;
+                                    broadcast(&outputs, buffer, in_epoch, &tracers).await;
                                 }
                             }
                             Err(e) => {

@@ -412,7 +412,12 @@ fn command_for_terminal() -> Option<Command> {
                 KeyCode::Char(' ') => Some(Command::PauseToggle),
                 KeyCode::Left => Some(Command::SeekBy(-10)),
                 KeyCode::Right => Some(Command::SeekBy(10)),
-                KeyCode::Char('q') | KeyCode::Esc => Some(Command::Quit),
+                // No Esc here, deliberately: with `poll(ZERO)` crossterm can
+                // catch the lone ESC byte of a not-yet-complete arrow
+                // sequence and report Esc — quitting on an arrow key. `q`
+                // and Ctrl-C quit the terminal path; the window path keeps
+                // Escape (winit delivers whole key events, no CSI ambiguity).
+                KeyCode::Char('q') => Some(Command::Quit),
                 KeyCode::Char('f') => Some(Command::Fullscreen),
                 _ => None,
             };
@@ -773,8 +778,14 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
                             let position = handle.position().to_option()
                                 .map(|p| p.nanos() as i64)
                                 .unwrap_or(0);
-                            let target = (position + secs * 1_000_000_000)
-                                .clamp(0, duration_ns.saturating_sub(1) as i64);
+                            // duration 0 means *unknown* (MKV/WebM with no
+                            // Segment Duration), not an empty file — clamping
+                            // against it sent every seek to t=0. Leave the
+                            // upper end open and let the demuxer land it.
+                            let mut target = (position + secs * 1_000_000_000).max(0);
+                            if duration_ns > 0 {
+                                target = target.min(duration_ns.saturating_sub(1) as i64);
+                            }
                             handle.seek_time(ClockTime::from_nanos(target as u64)).await;
                         }
                         Command::Fullscreen => window.set_fullscreen(!window.is_fullscreen()),

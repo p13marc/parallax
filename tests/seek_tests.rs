@@ -234,6 +234,139 @@ fn test_pipeline_query_seekable_with_null_source() {
     assert!(!seekable.seekable);
 }
 
+// ============================================================================
+// Runtime Flush-Seek Tests (#157)
+// ============================================================================
+
+/// A flushing runtime seek sheds the queued backlog instead of playing it.
+///
+/// Before the flush epoch, FlushStart/FlushStop rode the same FIFO channels as
+/// the buffers, back-to-back — every buffer already queued sat *ahead* of them
+/// and played out normally (~2.5 s of stale audio on a real file). Now the
+/// seek bumps a pipeline-wide epoch and consumers drop older-stamped buffers
+/// at receive speed, so only the handful already inside elements can surface.
+#[tokio::test(flavor = "multi_thread")]
+async fn runtime_flush_seek_sheds_the_queued_backlog() {
+    use parallax::buffer::{Buffer, MemoryHandle};
+    use parallax::element::{ProduceContext, ProduceResult, Source};
+    use parallax::elements::util::PassThrough;
+    use parallax::elements::{AppSink, Pulled};
+    use parallax::event::{Event, EventResult};
+    use parallax::memory::SharedArena;
+    use parallax::metadata::Metadata;
+    use parallax::pipeline::{Executor, LinkPolicy, Pipeline};
+    use std::sync::Arc;
+
+    /// Endless counter; PTS = sequence in milliseconds. A time seek jumps the
+    /// counter to the target millisecond.
+    struct SeekableCounter {
+        seq: u64,
+        arena: Arc<SharedArena>,
+    }
+
+    impl Source for SeekableCounter {
+        fn produce(&mut self, _ctx: &mut ProduceContext) -> parallax::error::Result<ProduceResult> {
+            self.arena.reclaim();
+            let Some(slot) = self.arena.acquire() else {
+                return Ok(ProduceResult::WouldBlock);
+            };
+            let mut metadata = Metadata::from_sequence(self.seq);
+            metadata.pts = ClockTime::from_millis(self.seq);
+            let buffer = Buffer::new(MemoryHandle::new(slot), metadata);
+            self.seq += 1;
+            Ok(ProduceResult::OwnBuffer(buffer))
+        }
+
+        fn is_seekable(&self) -> bool {
+            true
+        }
+
+        fn handle_upstream_event(&mut self, event: &Event) -> EventResult {
+            match event {
+                Event::Seek(seek) => {
+                    self.seq = (seek.start.position.max(0) as u64) / 1_000_000;
+                    EventResult::Handled
+                }
+                _ => EventResult::NotHandled,
+            }
+        }
+    }
+
+    let source = SeekableCounter {
+        seq: 0,
+        arena: Arc::new(SharedArena::new(64, 64).unwrap()),
+    };
+
+    let mut pipeline = Pipeline::new();
+    let sink = AppSink::with_max_buffers(2);
+    let sink_handle = sink.handle();
+    let src = pipeline.add_source("src", source);
+    let mid = pipeline.add_filter("mid", PassThrough::new());
+    let snk = pipeline.add_sink("snk", sink);
+    // The wide queue sits *upstream* of the transform: its 16 stale buffers
+    // can only reach the sink after the transform re-checks them, and by then
+    // the seek's epoch bump has landed. The narrow sink-side queue bounds the
+    // worst-case leak (4 + AppSink's 2 + in-flight) below the assertion even
+    // if the bump loses every scheduling race.
+    pipeline
+        .link_pads_full(src, "src", mid, "sink", LinkPolicy::Block, Some(16))
+        .unwrap();
+    pipeline
+        .link_pads_full(mid, "src", snk, "sink", LinkPolicy::Block, Some(4))
+        .unwrap();
+
+    let executor = Executor::new();
+    let mut handle = executor.start(&mut pipeline).unwrap();
+    let mut bus = handle.take_bus().unwrap();
+
+    // Prove flow, then let every queue fill (~34 buffers park the source).
+    assert!(matches!(sink_handle.pull_buffer().await, Pulled::Buffer(_)));
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    assert!(handle.seek_time(ClockTime::from_secs(60)).await);
+
+    // Drain until the seek lands, pacing the stale phase like a presenting
+    // sink would — a zero-delay drain can empty the sink-side queue before
+    // the parked source even gets scheduled to handle the seek.
+    let mut stale_after_seek = 0u64;
+    loop {
+        match sink_handle.pull_buffer().await {
+            Pulled::Buffer(b) => {
+                if b.metadata().pts.nanos() >= 60_000_000_000 {
+                    break;
+                }
+                stale_after_seek += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            other => panic!("stream ended before the seek landed: {other:?}"),
+        }
+    }
+
+    // ~22 buffers were queued at seek time; without the epoch every one of
+    // them plays out before the seek is visible. With it, at most the
+    // sink-side queue (4) plus AppSink's own 2 and a couple in flight can
+    // surface — the 16 upstream of the transform are always epoch-dropped.
+    assert!(
+        stale_after_seek <= 10,
+        "queued backlog leaked past the flush: {stale_after_seek} stale buffers"
+    );
+
+    handle.stop();
+    while let Pulled::Buffer(_) = sink_handle.pull_buffer().await {}
+    handle.wait().await.unwrap();
+
+    let mut seek_done = false;
+    while let Some(msg) = bus.poll() {
+        if matches!(
+            msg.kind,
+            parallax::pipeline::bus::MessageKind::SeekDone { .. }
+        ) {
+            seek_done = true;
+        }
+    }
+    assert!(seek_done, "SeekDone posted");
+}
+
 #[test]
 fn test_pipeline_seek_bytes() {
     let content = b"ABCDEFGHIJKLMNOP";
