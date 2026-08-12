@@ -799,6 +799,14 @@ pub trait Sink: Send {
         Some(event)
     }
 
+    /// Handle an upstream event arriving from the application (#163):
+    /// upstream events enter the graph at the sinks and travel hop-by-hop
+    /// toward the sources. Return `NotHandled` (the default) to pass the
+    /// event on upstream, `Handled` to consume it here.
+    fn handle_upstream_event(&mut self, _event: &Event) -> EventResult {
+        EventResult::NotHandled
+    }
+
     /// Get a clock provider if this sink can provide a clock.
     ///
     /// Audio sinks typically provide a hardware clock that can be used
@@ -868,6 +876,12 @@ pub trait AsyncSink: Send {
     /// Default implementation forwards all events.
     fn handle_downstream_event(&mut self, event: Event) -> Option<Event> {
         Some(event)
+    }
+
+    /// Handle an upstream event arriving from downstream (#163); see
+    /// [`Sink::handle_upstream_event`].
+    fn handle_upstream_event(&mut self, _event: &Event) -> EventResult {
+        EventResult::NotHandled
     }
 
     /// Get a clock provider if this sink can provide a clock.
@@ -1545,6 +1559,13 @@ pub trait Muxer: Send {
     /// override it: this muxer owns the arena its output buffers come from.
     fn set_output_budget(&mut self, _budget: crate::memory::OutputBudget) {
         // Default: ignore
+    }
+
+    /// Handle an upstream event arriving from downstream (#163); see
+    /// [`Sink::handle_upstream_event`]. A muxer that returns `NotHandled`
+    /// passes the event on to every input branch.
+    fn handle_upstream_event(&mut self, _event: &Event) -> EventResult {
+        EventResult::NotHandled
     }
 }
 
@@ -2320,6 +2341,12 @@ impl<S: Sink + Send + 'static> SendAsyncElementDyn for SinkAdapter<S> {
         ElementType::Sink
     }
 
+    // #163: upstream events route hop-by-hop; the adapter forwards them to
+    // the author trait so mid-graph elements can handle or translate them.
+    fn handle_upstream_event(&mut self, event: &Event) -> EventResult {
+        self.inner.handle_upstream_event(event)
+    }
+
     async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
         if let Some(ref buffer) = input {
             let mut ctx = ConsumeContext::new(buffer);
@@ -2389,6 +2416,12 @@ impl<E: Element + Send + 'static> SendAsyncElementDyn for ElementAdapter<E> {
 
     fn element_type(&self) -> ElementType {
         ElementType::Transform
+    }
+
+    // #163: upstream events route hop-by-hop; the adapter forwards them to
+    // the author trait so mid-graph elements can handle or translate them.
+    fn handle_upstream_event(&mut self, event: &Event) -> EventResult {
+        self.inner.handle_upstream_event(event)
     }
 
     fn set_bus(&mut self, bus: crate::pipeline::bus::BusHandle) {
@@ -2477,6 +2510,12 @@ impl SendAsyncElementDyn for BoxedElementAdapter {
         ElementType::Transform
     }
 
+    // #163: upstream events route hop-by-hop; the adapter forwards them to
+    // the author trait so mid-graph elements can handle or translate them.
+    fn handle_upstream_event(&mut self, event: &Event) -> EventResult {
+        self.inner.handle_upstream_event(event)
+    }
+
     fn set_bus(&mut self, bus: crate::pipeline::bus::BusHandle) {
         self.inner.set_bus(bus);
     }
@@ -2550,6 +2589,12 @@ impl<T: Transform + Send + 'static> SendAsyncElementDyn for TransformAdapter<T> 
 
     fn element_type(&self) -> ElementType {
         ElementType::Transform
+    }
+
+    // #163: upstream events route hop-by-hop; the adapter forwards them to
+    // the author trait so mid-graph elements can handle or translate them.
+    fn handle_upstream_event(&mut self, event: &Event) -> EventResult {
+        self.inner.handle_upstream_event(event)
     }
 
     fn set_output_budget(&mut self, budget: crate::memory::OutputBudget) {
@@ -2913,6 +2958,12 @@ impl<S: AsyncSink + Send + 'static> SendAsyncElementDyn for AsyncSinkAdapter<S> 
         ElementType::Sink
     }
 
+    // #163: upstream events route hop-by-hop; the adapter forwards them to
+    // the author trait so mid-graph elements can handle or translate them.
+    fn handle_upstream_event(&mut self, event: &Event) -> EventResult {
+        self.inner.handle_upstream_event(event)
+    }
+
     async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
         if let Some(ref buffer) = input {
             let mut ctx = ConsumeContext::new(buffer);
@@ -2989,6 +3040,12 @@ impl<T: AsyncTransform + Send + 'static> SendAsyncElementDyn for AsyncTransformA
 
     fn element_type(&self) -> ElementType {
         ElementType::Transform
+    }
+
+    // #163: upstream events route hop-by-hop; the adapter forwards them to
+    // the author trait so mid-graph elements can handle or translate them.
+    fn handle_upstream_event(&mut self, event: &Event) -> EventResult {
+        self.inner.handle_upstream_event(event)
     }
 
     fn set_output_budget(&mut self, budget: crate::memory::OutputBudget) {
@@ -3281,6 +3338,12 @@ impl<M: Muxer> MuxerAdapter<M> {
 impl<M: Muxer + Send + 'static> SendAsyncElementDyn for MuxerAdapter<M> {
     fn set_output_budget(&mut self, budget: crate::memory::OutputBudget) {
         self.inner.set_output_budget(budget);
+    }
+
+    // #163: upstream events route hop-by-hop; the adapter forwards them to
+    // the author trait so mid-graph elements can handle or translate them.
+    fn handle_upstream_event(&mut self, event: &Event) -> EventResult {
+        self.inner.handle_upstream_event(event)
     }
 
     fn name(&self) -> &str {

@@ -17,16 +17,22 @@
 //!
 //! ```text
 //! Application → handle.seek_time(t)
-//!   0. Gate: dispatched only to sources that declared is_seekable();
-//!      none declared → returns false, nothing happens (GStreamer parity)
-//!   1. SeekEvent delivered to each seekable source task
-//!   2. Source repositions (handle_upstream_event)
+//!   0. Gate: no source declared is_seekable() → returns false, nothing
+//!      happens (GStreamer parity)
+//!   1. The SeekEvent enters the graph at the SINKS and travels upstream
+//!      hop-by-hop (#163): each hop's element may handle it or pass it on
+//!      (EventResult::NotHandled forwards to every parent; seqnum dedup
+//!      collapses multi-path delivery in fan-out diamonds). Hybrid
+//!      pipelines fall back to direct fan-out to seekable sources — RT
+//!      segments carry no events.
+//!   2. The handling element repositions (handle_upstream_event); its own
+//!      task then runs the flush sequence — mid-graph handlers included
 //!   3. FlushStart sent downstream in-band; the flush epoch sheds the
 //!      queued pre-seek backlog at receive speed
 //!   4. FlushStop sent downstream (resume processing)
 //!   5. New Segment sent downstream (re-anchors the timeline, carrying
 //!      the seek's rate and stop and the element-reported landing)
-//!   6. SeekDone posted to the bus
+//!   6. SeekDone posted to the bus, naming the handling element
 //! ```
 //!
 //! # Segment discipline (#165)

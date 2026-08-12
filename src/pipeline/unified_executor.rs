@@ -520,7 +520,7 @@ impl Stopper {
 /// path carries no events at all yet.
 struct SourceControl {
     name: String,
-    tx: AsyncSender<Event>,
+    tx: tokio::sync::mpsc::UnboundedSender<Event>,
     /// Whether the element declared seek support, snapshotted in
     /// `spawn_element_task` before the element moved into its task. Gates
     /// `PipelineHandle::seek*`: seeks are only dispatched to elements that
@@ -535,6 +535,10 @@ struct SourceControl {
 /// loops watch, and the last-presented-PTS cell the sink loops write.
 struct RuntimeControls {
     controls: Vec<SourceControl>,
+    /// Sink-node inboxes (#163): where `PipelineHandle::seek` and
+    /// `send_event_upstream` enter the graph in fully-async pipelines.
+    /// Empty in hybrid mode — dispatch falls back to the source controls.
+    upstream_entries: Vec<(String, tokio::sync::mpsc::UnboundedSender<Event>)>,
     pause_rx: watch::Receiver<bool>,
     position: Arc<AtomicU64>,
     /// Pipeline-wide flush epoch; see [`Message::Buffer`]. Bumped by the seek
@@ -576,6 +580,9 @@ pub struct PipelineHandle {
     /// Control-channel senders into the running source tasks (see
     /// [`send_event_upstream`](Self::send_event_upstream)).
     controls: Vec<SourceControl>,
+    /// Sink-node inboxes (#163): the upstream-event entry points in a
+    /// fully-async pipeline. Empty in hybrid mode (legacy source fan-out).
+    upstream_entries: Vec<(String, tokio::sync::mpsc::UnboundedSender<Event>)>,
     /// Pause gate watched by the source loops (see [`pause`](Self::pause)).
     pause_tx: watch::Sender<bool>,
     /// The shared clock wrapper, when the pipeline has a started clock.
@@ -798,9 +805,26 @@ impl PipelineHandle {
     /// async-spawned sources (RT-scheduled sources carry no control channel),
     /// or every source task has already finished.
     pub async fn send_event_upstream(&self, event: Event) -> bool {
+        // #163: enter at the sinks and travel hop-by-hop toward the sources
+        // (mid-graph elements get their chance to handle or translate);
+        // hybrid pipelines keep the legacy direct source fan-out.
+        if !self.upstream_entries.is_empty() {
+            let mut delivered = false;
+            for (name, tx) in &self.upstream_entries {
+                if tx.send(event.clone()).is_ok() {
+                    delivered = true;
+                } else {
+                    tracing::debug!(
+                        "sink '{name}' is gone; upstream event '{}' not delivered",
+                        event.name()
+                    );
+                }
+            }
+            return delivered;
+        }
         let mut delivered = false;
         for control in &self.controls {
-            if control.tx.send(event.clone()).await.is_ok() {
+            if control.tx.send(event.clone()).is_ok() {
                 delivered = true;
             } else {
                 tracing::debug!(
@@ -824,9 +848,26 @@ impl PipelineHandle {
     /// Watch the bus for [`MessageKind::SeekDone`](crate::pipeline::bus::MessageKind::SeekDone) to learn when the flush
     /// sequence has run.
     pub async fn seek(&self, seek: SeekEvent) -> bool {
+        // The gate is unchanged: no source declared seekability → nothing
+        // is dispatched at all.
+        if !self.controls.iter().any(|c| c.seekable) {
+            return false;
+        }
+        // #163: dispatch via the sinks so the seek travels hop-by-hop and
+        // mid-graph elements can handle it; hybrid pipelines (no sink
+        // inboxes) keep the legacy direct fan-out to seekable sources.
+        if !self.upstream_entries.is_empty() {
+            let mut delivered = false;
+            for (_, tx) in &self.upstream_entries {
+                if tx.send(Event::Seek(seek.clone())).is_ok() {
+                    delivered = true;
+                }
+            }
+            return delivered;
+        }
         let mut delivered = false;
         for control in self.controls.iter().filter(|c| c.seekable) {
-            if control.tx.send(Event::Seek(seek.clone())).await.is_ok() {
+            if control.tx.send(Event::Seek(seek.clone())).is_ok() {
                 delivered = true;
             }
         }
@@ -1155,6 +1196,7 @@ impl Executor {
         let (pause_tx, pause_rx) = watch::channel(false);
         let mut runtime = RuntimeControls {
             controls: Vec::new(),
+            upstream_entries: Vec::new(),
             pause_rx,
             position: Arc::new(AtomicU64::new(u64::MAX)),
             flush_epoch: Arc::new(AtomicU64::new(0)),
@@ -1277,6 +1319,7 @@ impl Executor {
             outcome,
             seed,
             controls: runtime.controls,
+            upstream_entries: runtime.upstream_entries,
             pause_tx,
             pausable,
             base_time: clock_info.map(|(_, b)| b).unwrap_or(ClockTime::NONE),
@@ -1622,11 +1665,40 @@ impl Executor {
         let mut seen = std::collections::HashSet::new();
         let node_ids: Vec<NodeId> = node_ids.into_iter().filter(|id| seen.insert(*id)).collect();
 
+        // #163: one unbounded upstream inbox per node, created up front so
+        // each task can be handed its parents' senders at spawn.
+        let mut inbox_tx: HashMap<NodeId, tokio::sync::mpsc::UnboundedSender<Event>> =
+            HashMap::new();
+        let mut inbox_rx: HashMap<NodeId, tokio::sync::mpsc::UnboundedReceiver<Event>> =
+            HashMap::new();
+        for &node_id in &node_ids {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+            inbox_tx.insert(node_id, tx);
+            inbox_rx.insert(node_id, rx);
+        }
+
         for node_id in node_ids {
+            let parents: Vec<(String, tokio::sync::mpsc::UnboundedSender<Event>)> = pipeline
+                .parents(node_id)
+                .into_iter()
+                .filter_map(|(pid, _)| {
+                    inbox_tx
+                        .get(&pid)
+                        .map(|tx| (node_name(pipeline, pid), tx.clone()))
+                })
+                .collect();
+            let upstream = Some((
+                inbox_tx[&node_id].clone(),
+                UpstreamHop {
+                    rx: inbox_rx.remove(&node_id).expect("inbox created above"),
+                    parents,
+                },
+            ));
             let task = self.spawn_node_task(
                 pipeline,
                 node_id,
                 &mut channels,
+                upstream,
                 clock_info,
                 events,
                 stop,
@@ -1670,9 +1742,12 @@ impl Executor {
                 .filter_map(|e| scheduler.get_bridge(e.source, e.sink))
                 .collect();
 
+            // Hybrid mode keeps the legacy direct-to-source dispatch: RT
+            // segments carry no events, so hop routing cannot traverse them.
             let task = self.spawn_node_task_with_bridges(
                 pipeline,
                 node_id,
+                None,
                 &mut channels,
                 output_bridges,
                 input_bridges,
@@ -1695,6 +1770,7 @@ impl Executor {
         pipeline: &mut Pipeline,
         node_id: NodeId,
         channels: &mut ChannelNetwork,
+        upstream: Option<(tokio::sync::mpsc::UnboundedSender<Event>, UpstreamHop)>,
         clock_info: Option<&(Arc<dyn Clock>, ClockTime)>,
         events: &EventSender,
         stop: &Arc<AtomicBool>,
@@ -1704,6 +1780,7 @@ impl Executor {
         self.spawn_node_task_with_bridges(
             pipeline,
             node_id,
+            upstream,
             channels,
             Vec::new(),
             Vec::new(),
@@ -1721,6 +1798,7 @@ impl Executor {
         &self,
         pipeline: &mut Pipeline,
         node_id: NodeId,
+        upstream: Option<(tokio::sync::mpsc::UnboundedSender<Event>, UpstreamHop)>,
         channels: &mut ChannelNetwork,
         output_bridges: Vec<Arc<AsyncRtBridge>>,
         input_bridges: Vec<Arc<AsyncRtBridge>>,
@@ -1781,16 +1859,30 @@ impl Executor {
 
         let task = match element_type {
             ElementType::Source => {
-                // Out-of-band control channel for upstream events (seek). Small
-                // and bounded: control events are rare and handled promptly.
-                let (control_tx, control_rx) = bounded_async::<Event>(8);
+                // The source's upstream inbox doubles as its control
+                // channel; hybrid mode (no hop) falls back to a private
+                // bounded channel with no parents — identical semantics.
+                let (own_tx, hop) = match upstream {
+                    Some((tx, hop)) => (tx, hop),
+                    None => {
+                        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+                        (
+                            tx,
+                            UpstreamHop {
+                                rx,
+                                parents: Vec::new(),
+                            },
+                        )
+                    }
+                };
                 let bus = pipeline.bus_handle().for_element(&node_name);
+                // Snapshotted here, while the element is still in hand —
+                // after spawn it has moved into its task.
+                let seekable = element.is_seekable();
                 runtime.controls.push(SourceControl {
                     name: node_name.clone(),
-                    tx: control_tx,
-                    // Snapshotted here, while the element is still in hand —
-                    // after spawn it has moved into its task.
-                    seekable: element.is_seekable(),
+                    tx: own_tx,
+                    seekable,
                     duration: element.source_query_duration(),
                 });
                 spawn_source_task(
@@ -1803,61 +1895,94 @@ impl Executor {
                     probes,
                     tracers,
                     stop.clone(),
-                    control_rx,
+                    hop,
                     runtime.pause_rx.clone(),
                     runtime.flush_epoch.clone(),
+                    bus,
+                    seekable,
+                    share,
+                )
+            }
+            ElementType::Sink => {
+                // #163: sinks are the upstream-event entry points — register
+                // this sink's inbox with the handle.
+                let hop = upstream.map(|(own_tx, hop)| {
+                    runtime.upstream_entries.push((node_name.clone(), own_tx));
+                    hop
+                });
+                let bus = pipeline.bus_handle().for_element(&node_name);
+                spawn_sink_task(
+                    node_name,
+                    node_id,
+                    element,
+                    channels.take_inputs(node_id),
+                    input_bridges,
+                    events_clone,
+                    probes,
+                    tracers,
+                    runtime.position.clone(),
+                    runtime.flush_epoch.clone(),
+                    runtime.pause_rx.clone(),
+                    hop,
                     bus,
                     share,
                 )
             }
-            ElementType::Sink => spawn_sink_task(
-                node_name,
-                node_id,
-                element,
-                channels.take_inputs(node_id),
-                input_bridges,
-                events_clone,
-                probes,
-                tracers,
-                runtime.position.clone(),
-                runtime.flush_epoch.clone(),
-                runtime.pause_rx.clone(),
-                share,
-            ),
-            ElementType::Transform => spawn_transform_task(
-                node_name,
-                node_id,
-                element,
-                channels.take_inputs(node_id),
-                channels.take_outputs(node_id),
-                input_bridges,
-                output_bridges,
-                events_clone,
-                probes,
-                tracers,
-                ShedTracker::new(self.config.shed_fatal_after),
-                runtime.flush_epoch.clone(),
-                share,
-            ),
+            ElementType::Transform => {
+                let bus = pipeline.bus_handle().for_element(&node_name);
+                spawn_transform_task(
+                    node_name,
+                    node_id,
+                    element,
+                    channels.take_inputs(node_id),
+                    channels.take_outputs(node_id),
+                    input_bridges,
+                    output_bridges,
+                    events_clone,
+                    probes,
+                    tracers,
+                    ShedTracker::new(self.config.shed_fatal_after),
+                    runtime.flush_epoch.clone(),
+                    upstream.map(|(_, hop)| hop),
+                    bus,
+                    share,
+                )
+            }
             ElementType::Demuxer => {
                 // Inputs flattened (one sink pad), outputs kept per pad — that
                 // is the whole point of a demuxer.
                 let inputs = channels.take_inputs(node_id);
                 let outputs_by_pad = channels.take_outputs_by_pad(node_id);
                 // A source-style demuxer (no input links) is a source in every
-                // sense, including runtime control: it gets a control channel
-                // so PipelineHandle::seek reaches Demuxer::handle_upstream_event.
-                let control_rx = if inputs.is_empty() {
-                    let (control_tx, control_rx) = bounded_async::<Event>(8);
+                // sense, including runtime control: its inbox is registered as
+                // a SourceControl so PipelineHandle::seek reaches
+                // Demuxer::handle_upstream_event. A fed demuxer keeps its
+                // inbox as a mid-graph hop (#163).
+                let source_style = inputs.is_empty();
+                let seekable = element.is_seekable();
+                let hop = if source_style {
+                    let (own_tx, hop) = match upstream {
+                        Some((tx, hop)) => (tx, hop),
+                        None => {
+                            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+                            (
+                                tx,
+                                UpstreamHop {
+                                    rx,
+                                    parents: Vec::new(),
+                                },
+                            )
+                        }
+                    };
                     runtime.controls.push(SourceControl {
                         name: node_name.clone(),
-                        tx: control_tx,
-                        seekable: element.is_seekable(),
+                        tx: own_tx,
+                        seekable,
                         duration: element.source_query_duration(),
                     });
-                    Some(control_rx)
+                    Some(hop)
                 } else {
-                    None
+                    upstream.map(|(_, hop)| hop)
                 };
                 let bus = pipeline.bus_handle().for_element(&node_name);
                 spawn_demuxer_task(
@@ -1870,10 +1995,11 @@ impl Executor {
                     probes,
                     tracers,
                     stop.clone(),
-                    control_rx,
+                    hop,
                     runtime.flush_epoch.clone(),
                     runtime.pause_rx.clone(),
                     bus,
+                    source_style && seekable,
                     share,
                 )
             }
@@ -1881,6 +2007,7 @@ impl Executor {
                 // Mirror image: inputs per pad, outputs flattened.
                 let inputs_by_pad = channels.take_inputs_by_pad(node_id);
                 let outputs = channels.take_outputs(node_id);
+                let bus = pipeline.bus_handle().for_element(&node_name);
                 spawn_muxer_task(
                     node_name,
                     node_id,
@@ -1891,6 +2018,8 @@ impl Executor {
                     probes,
                     tracers,
                     runtime.flush_epoch.clone(),
+                    upstream.map(|(_, hop)| hop),
+                    bus,
                     share,
                 )
             }
@@ -2108,12 +2237,18 @@ impl InputBranch {
         msg
     }
 
-    fn try_recv(&self) -> std::result::Result<Option<Message>, kanal::ReceiveError> {
-        let msg = self.rx.try_recv();
-        if let Some(flow) = &self.flow {
-            flow.update(self.rx.len());
-        }
-        msg
+    /// A receive future that owns its channel handles (see [`PendingRecv`]):
+    /// safe to stash across loop iterations after losing a `select`.
+    fn recv_owned(&self) -> PendingRecv {
+        let rx = self.rx.clone();
+        let flow = self.flow.clone();
+        Box::pin(async move {
+            let msg = rx.recv().await;
+            if let Some(flow) = &flow {
+                flow.update(rx.len());
+            }
+            msg
+        })
     }
 }
 
@@ -2348,6 +2483,54 @@ impl ChannelNetwork {
 // Task Spawning
 // ============================================================================
 
+/// One node's upstream-event connectivity (#163): the receiving end of its
+/// unbounded inbox plus its parents' inbox senders. Upstream events enter
+/// the graph at the sinks and travel hop-by-hop toward the sources; a node
+/// that does not handle an event forwards it to every parent.
+///
+/// The inboxes are **unbounded** as a correctness choice, not convenience:
+/// an upstream send from task A to its parent B can coincide with B being
+/// parked in `send().await` into A's full data channel. A bounded upstream
+/// inbox would close that cycle into a deadlock; unbounded sends never
+/// await, so the cycle cannot form. Control events are rare and small.
+/// Inboxes are tokio mpsc, NOT kanal: their recv futures are dropped by
+/// `select` losers every iteration, and tokio's `recv` is documented
+/// cancel-safe. kanal's is not — a dropped mid-poll kanal future can eat
+/// the channel's waker registration, which freezes the winner-less side
+/// forever (observed as a sink that stops receiving data after the first
+/// upstream event arrives on an empty channel).
+struct UpstreamHop {
+    rx: tokio::sync::mpsc::UnboundedReceiver<Event>,
+    /// `(parent name, parent inbox)` — the async-spawned upstream peers.
+    parents: Vec<(String, tokio::sync::mpsc::UnboundedSender<Event>)>,
+}
+
+/// Forward an event to every parent inbox (unbounded: never blocks).
+fn forward_to_parents(
+    parents: &[(String, tokio::sync::mpsc::UnboundedSender<Event>)],
+    event: &Event,
+) {
+    for (parent, tx) in parents {
+        if tx.send(event.clone()).is_err() {
+            tracing::debug!(
+                "parent '{parent}' is gone; upstream {} dropped",
+                event.name()
+            );
+        }
+    }
+}
+
+/// A data-channel receive that survives losing a `select`: the future OWNS
+/// clones of the receiver and flow monitor, so it can be stashed and
+/// re-polled instead of dropped — a kanal recv future dropped after its
+/// first poll can lose the channel's waker registration (see
+/// [`UpstreamHop`]). Every receive on a channel with a stashed future MUST
+/// go through it, or messages handed directly to the pending future's slot
+/// would be skipped over.
+type PendingRecv = std::pin::Pin<
+    Box<dyn Future<Output = std::result::Result<Message, kanal::ReceiveError>> + Send>,
+>;
+
 #[allow(clippy::too_many_arguments)]
 /// Handle one upstream event delivered to a source task's control channel.
 ///
@@ -2360,7 +2543,16 @@ impl ChannelNetwork {
 /// Returns `true` when a Segment was emitted, so the caller can suppress its
 /// lazy initial segment (#165) — a seek that lands before the first buffer
 /// already established the mapping.
-async fn handle_source_control_event(
+///
+/// This is one hop of the upstream route (#163): the same function runs in
+/// a source's control drain (empty `parents` — the route ends here) and in
+/// mid-graph tasks (transform/demuxer/muxer), where `NotHandled` forwards
+/// the event to every parent inbox. A handling task runs the flush trio
+/// from its own loop, between its process calls, so the epoch discipline
+/// holds wherever the seek terminates. `last_seek_seqnum` dedups multi-path
+/// delivery (a diamond delivers the same seek along every branch); a seek
+/// with a seqnum at or below the last seen one is dropped — newer wins.
+async fn handle_upstream_hop(
     name: &str,
     element: &mut Box<DynAsyncElement<'static>>,
     event: &Event,
@@ -2369,7 +2561,21 @@ async fn handle_source_control_event(
     probe_registry: &ProbeRegistry,
     flush_epoch: &AtomicU64,
     bus: &BusHandle,
+    parents: &[(String, tokio::sync::mpsc::UnboundedSender<Event>)],
+    last_seek_seqnum: &mut u64,
+    warn_unhandled_seek: bool,
 ) -> bool {
+    if let Event::Seek(seek) = event {
+        if seek.seqnum() <= *last_seek_seqnum {
+            tracing::debug!(
+                "'{name}': seek {} already seen (multi-path delivery), dropped",
+                seek.seqnum()
+            );
+            return false;
+        }
+        *last_seek_seqnum = seek.seqnum();
+    }
+
     match probe_registry.invoke_event(src_pad, event, false) {
         ProbeReturn::Drop | ProbeReturn::Handled => return false,
         _ => {}
@@ -2377,6 +2583,9 @@ async fn handle_source_control_event(
 
     let result = element.handle_upstream_event(event);
     let Event::Seek(seek) = event else {
+        if result == EventResult::NotHandled {
+            forward_to_parents(parents, event);
+        }
         return false;
     };
 
@@ -2469,8 +2678,20 @@ async fn handle_source_control_event(
             );
             segment_emitted
         }
+        EventResult::NotHandled if !parents.is_empty() => {
+            // Not ours — keep it travelling toward the sources.
+            forward_to_parents(parents, event);
+            false
+        }
         EventResult::NotHandled => {
-            bus.post_warning(format!("source '{name}' cannot seek; seek ignored"), None);
+            // End of the route. Only warn when this element claimed
+            // seekability at start — an unseekable source in a mixed graph
+            // legitimately declines.
+            if warn_unhandled_seek {
+                bus.post_warning(format!("source '{name}' cannot seek; seek ignored"), None);
+            } else {
+                tracing::debug!("'{name}': seek {} reached an unseekable end", seek.seqnum());
+            }
             false
         }
         EventResult::Error => {
@@ -2491,10 +2712,13 @@ fn spawn_source_task(
     probe_registry: ProbeRegistry,
     tracers: TracerRegistry,
     stop: Arc<AtomicBool>,
-    control_rx: AsyncReceiver<Event>,
+    mut upstream: UpstreamHop,
     pause_rx: watch::Receiver<bool>,
     flush_epoch: Arc<AtomicU64>,
     bus: BusHandle,
+    // Whether this source claimed seekability at start — an unhandled seek
+    // only warns then.
+    warn_unhandled_seek: bool,
     share: TaskGuard,
 ) -> JoinHandle<Result<()>> {
     tokio::spawn(reporting(share, async move {
@@ -2522,6 +2746,7 @@ fn spawn_source_task(
             Some(q) if q.format == crate::event::SegmentFormat::Bytes
         );
         let mut segment_sent = false;
+        let mut last_seek_seqnum: u64 = 0;
         let mut count: u64 = 0;
         let mut would_block_count: u64 = 0;
 
@@ -2543,8 +2768,8 @@ fn spawn_source_task(
             // future mid-await could lose the buffer it was about to return.
             // The cost is that a source blocked inside `process_source` sees
             // the event only when that call returns — same caveat as `stop`.
-            while let Ok(Some(event)) = control_rx.try_recv() {
-                segment_sent |= handle_source_control_event(
+            while let Ok(event) = upstream.rx.try_recv() {
+                segment_sent |= handle_upstream_hop(
                     &name,
                     &mut element,
                     &event,
@@ -2553,6 +2778,9 @@ fn spawn_source_task(
                     &probe_registry,
                     &flush_epoch,
                     &bus,
+                    &upstream.parents,
+                    &mut last_seek_seqnum,
+                    warn_unhandled_seek,
                 )
                 .await;
             }
@@ -2561,8 +2789,8 @@ fn spawn_source_task(
             // resumed. Control events still drain so a seek can land while
             // paused, and stop still wins.
             while *pause_rx.borrow() && !stop.load(Ordering::Acquire) {
-                while let Ok(Some(event)) = control_rx.try_recv() {
-                    segment_sent |= handle_source_control_event(
+                while let Ok(event) = upstream.rx.try_recv() {
+                    segment_sent |= handle_upstream_hop(
                         &name,
                         &mut element,
                         &event,
@@ -2571,6 +2799,9 @@ fn spawn_source_task(
                         &probe_registry,
                         &flush_epoch,
                         &bus,
+                        &upstream.parents,
+                        &mut last_seek_seqnum,
+                        warn_unhandled_seek,
                     )
                     .await;
                 }
@@ -2686,6 +2917,8 @@ fn spawn_sink_task(
     position: Arc<AtomicU64>,
     flush_epoch: Arc<AtomicU64>,
     pause_rx: watch::Receiver<bool>,
+    upstream: Option<UpstreamHop>,
+    bus: BusHandle,
     share: TaskGuard,
 ) -> JoinHandle<Result<()>> {
     // Advance the shared last-presented-PTS cell. `max` keeps it monotonic
@@ -2741,6 +2974,16 @@ fn spawn_sink_task(
         let n_inputs = inputs.len();
         tracing::debug!("sink '{}': {} inputs", name, n_inputs);
         if let Some(rx) = inputs.into_iter().next() {
+            // Split the hop: tokio recv needs `&mut rx` while the parents
+            // list stays shared with the handler calls.
+            let (mut up_rx, up_parents) = match upstream {
+                Some(hop) => (Some(hop.rx), hop.parents),
+                None => (None, Vec::new()),
+            };
+            let mut last_seek_seqnum: u64 = 0;
+            // In-flight data receive, stashed when an upstream event wins the
+            // select (see `PendingRecv`). Every receive goes through it.
+            let mut pending: Option<PendingRecv> = None;
             // Standard path: read from kanal channel
             loop {
                 // Runtime pause (#156). Gating only the producers leaves the
@@ -2761,6 +3004,27 @@ fn spawn_sink_task(
                     let _ = element.handle_downstream_event(Event::Pause);
                     let mut stashed: Option<Message> = None;
                     while *pause_rx.borrow() {
+                        // Upstream events must keep moving while paused — a
+                        // seek lands during pause by design (#71), and since
+                        // #163 its path runs through this sink.
+                        if let Some(rx_up) = up_rx.as_mut() {
+                            while let Ok(event) = rx_up.try_recv() {
+                                let _ = handle_upstream_hop(
+                                    &name,
+                                    &mut element,
+                                    &event,
+                                    &[],
+                                    &sink_pad,
+                                    &probe_registry,
+                                    &flush_epoch,
+                                    &bus,
+                                    &up_parents,
+                                    &mut last_seek_seqnum,
+                                    false,
+                                )
+                                .await;
+                            }
+                        }
                         // A run that has ended stays ended, paused or not.
                         if matches!(stashed, Some(Message::Eos | Message::Error(_))) {
                             break;
@@ -2772,7 +3036,15 @@ fn spawn_sink_task(
                             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                             continue;
                         }
-                        match rx.try_recv() {
+                        let mut fut = pending.take().unwrap_or_else(|| rx.recv_owned());
+                        let polled = match futures::poll!(fut.as_mut()) {
+                            std::task::Poll::Ready(res) => res.map(Some),
+                            std::task::Poll::Pending => {
+                                pending = Some(fut);
+                                Ok(None)
+                            }
+                        };
+                        match polled {
                             Ok(Some(Message::Buffer(buffer, epoch))) => {
                                 if is_stale(epoch, &flush_epoch) {
                                     count += 1;
@@ -2802,10 +3074,58 @@ fn spawn_sink_task(
                     let _ = element.handle_downstream_event(Event::Resume);
                     match stashed {
                         Some(m) => Ok(m),
-                        None => rx.recv().await,
+                        None => {
+                            let fut = pending.take().unwrap_or_else(|| rx.recv_owned());
+                            fut.await
+                        }
+                    }
+                } else if up_rx.is_some() {
+                    // Upstream events enter the graph here (#163): the sink
+                    // is the dispatch point, offering each event to its
+                    // element and forwarding unhandled ones toward the
+                    // sources. The select polls the inbox first (control
+                    // outruns queued data); the losing data future is
+                    // STASHED, not dropped (see `PendingRecv`). Two-phase so
+                    // the `&mut` inbox borrow ends before the arms run.
+                    let data_fut = pending.take().unwrap_or_else(|| rx.recv_owned());
+                    let sel = {
+                        let rx_up = up_rx.as_mut().expect("checked above");
+                        match futures::future::select(std::pin::pin!(rx_up.recv()), data_fut).await
+                        {
+                            futures::future::Either::Left((ev, data_fut)) => Ok((ev, data_fut)),
+                            futures::future::Either::Right((res, _)) => Err(res),
+                        }
+                    };
+                    match sel {
+                        Ok((Some(event), data_fut)) => {
+                            pending = Some(data_fut);
+                            let _ = handle_upstream_hop(
+                                &name,
+                                &mut element,
+                                &event,
+                                &[],
+                                &sink_pad,
+                                &probe_registry,
+                                &flush_epoch,
+                                &bus,
+                                &up_parents,
+                                &mut last_seek_seqnum,
+                                false,
+                            )
+                            .await;
+                            continue;
+                        }
+                        Ok((None, data_fut)) => {
+                            // Inbox closed (handle dropped): stop selecting.
+                            pending = Some(data_fut);
+                            up_rx = None;
+                            continue;
+                        }
+                        Err(res) => res,
                     }
                 } else {
-                    rx.recv().await
+                    let fut = pending.take().unwrap_or_else(|| rx.recv_owned());
+                    fut.await
                 };
                 match msg {
                     Ok(Message::Buffer(buffer, epoch)) => {
@@ -2932,6 +3252,8 @@ fn spawn_transform_task(
     tracers: TracerRegistry,
     mut shed: ShedTracker,
     flush_epoch: Arc<AtomicU64>,
+    upstream: Option<UpstreamHop>,
+    bus: BusHandle,
     share: TaskGuard,
 ) -> JoinHandle<Result<()>> {
     tokio::spawn(reporting(share, async move {
@@ -2995,10 +3317,68 @@ fn spawn_transform_task(
             // must test stale downstream — a send-time global stamp would
             // launder it fresh.
             let mut in_epoch: u64 = 0;
+            // Split the hop: tokio recv needs `&mut rx` while the parents
+            // list stays shared with the handler calls.
+            let (mut up_rx, up_parents) = match upstream {
+                Some(hop) => (Some(hop.rx), hop.parents),
+                None => (None, Vec::new()),
+            };
+            let mut last_seek_seqnum: u64 = 0;
+            // In-flight data receive, stashed when an upstream event wins the
+            // select (see `PendingRecv`). Every receive goes through it.
+            let mut pending: Option<PendingRecv> = None;
             // Standard path: read from kanal channel
             loop {
                 tracing::trace!("transform '{}': waiting for input", name);
-                match rx.recv().await {
+                // Upstream events (seek and friends, #163) take priority:
+                // this element may handle them (running the flush trio from
+                // its own loop, preserving the epoch discipline) or forward
+                // them toward the sources. The losing data future is
+                // stashed, not dropped (see `PendingRecv`).
+                let data = if up_rx.is_some() {
+                    let data_fut = pending.take().unwrap_or_else(|| rx.recv_owned());
+                    // Two-phase so the `&mut` inbox borrow ends before the
+                    // arms run.
+                    let sel = {
+                        let rx_up = up_rx.as_mut().expect("checked above");
+                        match futures::future::select(std::pin::pin!(rx_up.recv()), data_fut).await
+                        {
+                            futures::future::Either::Left((ev, data_fut)) => Ok((ev, data_fut)),
+                            futures::future::Either::Right((res, _)) => Err(res),
+                        }
+                    };
+                    match sel {
+                        Ok((Some(event), data_fut)) => {
+                            pending = Some(data_fut);
+                            let _ = handle_upstream_hop(
+                                &name,
+                                &mut element,
+                                &event,
+                                &outputs,
+                                &src_pad,
+                                &probe_registry,
+                                &flush_epoch,
+                                &bus,
+                                &up_parents,
+                                &mut last_seek_seqnum,
+                                false,
+                            )
+                            .await;
+                            continue;
+                        }
+                        Ok((None, data_fut)) => {
+                            // Inbox closed (handle dropped): stop selecting.
+                            pending = Some(data_fut);
+                            up_rx = None;
+                            continue;
+                        }
+                        Err(res) => res,
+                    }
+                } else {
+                    let fut = pending.take().unwrap_or_else(|| rx.recv_owned());
+                    fut.await
+                };
+                match data {
                     Ok(Message::Buffer(buffer, epoch)) => {
                         count += 1;
                         tracing::debug!(
@@ -3315,10 +3695,11 @@ fn spawn_demuxer_task(
     probe_registry: ProbeRegistry,
     tracers: TracerRegistry,
     stop: Arc<AtomicBool>,
-    control_rx: Option<AsyncReceiver<Event>>,
+    mut upstream: Option<UpstreamHop>,
     flush_epoch: Arc<AtomicU64>,
     pause_rx: watch::Receiver<bool>,
     bus: BusHandle,
+    warn_unhandled_seek: bool,
     share: TaskGuard,
 ) -> JoinHandle<Result<()>> {
     tokio::spawn(reporting(share, async move {
@@ -3346,13 +3727,65 @@ fn spawn_demuxer_task(
             .await;
         }
         let mut segment_pads: HashSet<String> = HashSet::new();
+        let mut last_seek_seqnum: u64 = 0;
 
         if let Some(rx) = inputs.into_iter().next() {
             // Same input-epoch rule as spawn_transform_task: outputs carry the
             // epoch of the input they came from.
             let mut in_epoch: u64 = 0;
+            let (mut up_rx, up_parents) = match upstream {
+                Some(hop) => (Some(hop.rx), hop.parents),
+                None => (None, Vec::new()),
+            };
+            let mut pending: Option<PendingRecv> = None;
             loop {
-                match rx.recv().await {
+                // Upstream events from downstream take priority (#163):
+                // handle or forward them between data messages. The losing
+                // data future is stashed, not dropped (see `PendingRecv`).
+                let data = if up_rx.is_some() {
+                    let data_fut = pending.take().unwrap_or_else(|| rx.recv_owned());
+                    // Two-phase so the `&mut` inbox borrow ends before the
+                    // arms run.
+                    let sel = {
+                        let rx_up = up_rx.as_mut().expect("checked above");
+                        match futures::future::select(std::pin::pin!(rx_up.recv()), data_fut).await
+                        {
+                            futures::future::Either::Left((ev, data_fut)) => Ok((ev, data_fut)),
+                            futures::future::Either::Right((res, _)) => Err(res),
+                        }
+                    };
+                    match sel {
+                        Ok((Some(event), data_fut)) => {
+                            pending = Some(data_fut);
+                            let _ = handle_upstream_hop(
+                                &name,
+                                &mut element,
+                                &event,
+                                &all_branches,
+                                &src_pad,
+                                &probe_registry,
+                                &flush_epoch,
+                                &bus,
+                                &up_parents,
+                                &mut last_seek_seqnum,
+                                warn_unhandled_seek,
+                            )
+                            .await;
+                            continue;
+                        }
+                        Ok((None, data_fut)) => {
+                            // Inbox closed (handle dropped): stop selecting.
+                            pending = Some(data_fut);
+                            up_rx = None;
+                            continue;
+                        }
+                        Err(res) => res,
+                    }
+                } else {
+                    let fut = pending.take().unwrap_or_else(|| rx.recv_owned());
+                    fut.await
+                };
+                match data {
                     Ok(Message::Buffer(buffer, epoch)) => {
                         count += 1;
 
@@ -3521,9 +3954,9 @@ fn spawn_demuxer_task(
 
                 // Runtime control (seek), drained between produce calls —
                 // same polling contract as spawn_source_task.
-                if let Some(control_rx) = &control_rx {
-                    while let Ok(Some(event)) = control_rx.try_recv() {
-                        if handle_source_control_event(
+                if let Some(hop) = upstream.as_mut() {
+                    while let Ok(event) = hop.rx.try_recv() {
+                        if handle_upstream_hop(
                             &name,
                             &mut element,
                             &event,
@@ -3532,6 +3965,9 @@ fn spawn_demuxer_task(
                             &probe_registry,
                             &flush_epoch,
                             &bus,
+                            &hop.parents,
+                            &mut last_seek_seqnum,
+                            warn_unhandled_seek,
                         )
                         .await
                         {
@@ -3550,9 +3986,9 @@ fn spawn_demuxer_task(
                 // must keep moving for a flush to propagate, and backpressure
                 // parks it once the producer stops.)
                 while *pause_rx.borrow() && !stop.load(Ordering::Acquire) {
-                    if let Some(control_rx) = &control_rx {
-                        while let Ok(Some(event)) = control_rx.try_recv() {
-                            if handle_source_control_event(
+                    if let Some(hop) = upstream.as_mut() {
+                        while let Ok(event) = hop.rx.try_recv() {
+                            if handle_upstream_hop(
                                 &name,
                                 &mut element,
                                 &event,
@@ -3561,6 +3997,9 @@ fn spawn_demuxer_task(
                                 &probe_registry,
                                 &flush_epoch,
                                 &bus,
+                                &hop.parents,
+                                &mut last_seek_seqnum,
+                                warn_unhandled_seek,
                             )
                             .await
                             {
@@ -3644,6 +4083,8 @@ fn spawn_muxer_task(
     probe_registry: ProbeRegistry,
     tracers: TracerRegistry,
     flush_epoch: Arc<AtomicU64>,
+    upstream: Option<UpstreamHop>,
+    bus: BusHandle,
     share: TaskGuard,
 ) -> JoinHandle<Result<()>> {
     use futures::stream::{FuturesUnordered, StreamExt};
@@ -3702,7 +4143,56 @@ fn spawn_muxer_task(
         // interleaves all of them.
         let mut in_epoch: u64 = 0;
 
-        while let Some((pad, rx, msg)) = receivers.next().await {
+        let (mut up_rx, up_parents) = match upstream {
+            Some(hop) => (Some(hop.rx), hop.parents),
+            None => (None, Vec::new()),
+        };
+        let mut last_seek_seqnum: u64 = 0;
+        loop {
+            // Upstream events (#163) take priority over data; a muxer that
+            // does not handle one forwards it to every input branch's
+            // parent. The inbox is tokio mpsc (cancel-safe), and
+            // `FuturesUnordered::next` is a Stream poll whose inner recv
+            // futures are never dropped mid-flight — both branches are safe
+            // to lose.
+            let item = match up_rx.as_mut() {
+                Some(rx_up) => {
+                    tokio::select! {
+                        biased;
+                        ev = rx_up.recv() => Err(ev),
+                        item = receivers.next() => Ok(item),
+                    }
+                }
+                None => Ok(receivers.next().await),
+            };
+            let item = match item {
+                Err(Some(event)) => {
+                    let _ = handle_upstream_hop(
+                        &name,
+                        &mut element,
+                        &event,
+                        &outputs,
+                        &src_pad,
+                        &probe_registry,
+                        &flush_epoch,
+                        &bus,
+                        &up_parents,
+                        &mut last_seek_seqnum,
+                        false,
+                    )
+                    .await;
+                    continue;
+                }
+                Err(None) => {
+                    // Inbox closed (handle dropped): stop selecting on it.
+                    up_rx = None;
+                    continue;
+                }
+                Ok(i) => i,
+            };
+            let Some((pad, rx, msg)) = item else {
+                break;
+            };
             // Keep listening on this input unless it just ended; the EOS and
             // error arms deliberately let it drop.
             if matches!(msg, Some(Message::Buffer(..) | Message::Event(_))) {

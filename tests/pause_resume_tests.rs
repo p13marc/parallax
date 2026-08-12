@@ -419,3 +419,55 @@ async fn position_tracks_presented_pts_and_seeks() {
     src_handle.end_stream();
     handle.wait().await.unwrap();
 }
+
+/// A seek lands WHILE paused (#71): since #163 the seek's path runs through
+/// the (gated) sink, which must keep draining its upstream inbox during the
+/// hold — otherwise the seek would wedge until resume.
+#[tokio::test(flavor = "multi_thread")]
+async fn seek_lands_while_paused() {
+    use parallax::pipeline::bus::MessageKind;
+
+    let mut pipeline = Pipeline::new();
+    let appsrc = AppSrc::with_max_buffers(32);
+    let src_handle = appsrc.handle();
+    let src = pipeline.add_source("src", appsrc);
+    let sink = pipeline.add_sink("sink", NullSink::new());
+    pipeline.link(src, sink).unwrap();
+
+    let executor = Executor::new();
+    let mut handle = executor.start(&mut pipeline).unwrap();
+    let mut bus = handle.take_bus().unwrap();
+
+    src_handle
+        .push_buffer(buffer_with_pts(10_000))
+        .await
+        .unwrap();
+    wait_until(
+        || handle.position() == ClockTime::from_nanos(10_000),
+        "first buffer presented",
+    )
+    .await;
+
+    handle.pause();
+    assert!(handle.seek_time(ClockTime::from_nanos(500)).await);
+
+    // The seek completes during the pause: SeekDone posts without a resume.
+    let mut seek_done = false;
+    for _ in 0..400 {
+        while let Some(msg) = bus.poll() {
+            if matches!(msg.kind, MessageKind::SeekDone { .. }) {
+                seek_done = true;
+            }
+        }
+        if seek_done {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(seek_done, "seek must land while paused");
+    assert!(handle.is_paused());
+
+    handle.resume();
+    src_handle.end_stream();
+    handle.wait().await.unwrap();
+}
