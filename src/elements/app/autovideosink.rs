@@ -30,11 +30,12 @@ use crate::element::{ConsumeContext, Sink};
 use crate::error::{Error, Result};
 use crate::format::{Caps, PixelFormat};
 use std::num::NonZeroU32;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, SyncSender};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+use winit::event_loop::EventLoopProxy;
 
 /// Frame data sent to the display thread.
 ///
@@ -50,6 +51,31 @@ struct DisplayFrame {
     width: u32,
     /// Frame height in pixels
     height: u32,
+}
+
+/// The winit user event: "state changed, wake up and look".
+///
+/// The frame channel stays the data path; this is only the doorbell that lets
+/// the event loop idle in [`ControlFlow::Wait`] instead of the historical
+/// `ControlFlow::Poll` spin, which burned a full core on `try_recv` (#155).
+#[derive(Debug)]
+struct WakeUp;
+
+/// The display loop's doorbell, parked where every waker can reach it.
+///
+/// Filled by the display thread right after it builds the event loop, cleared
+/// when the loop exits. `None` simply means there is nothing to wake yet — the
+/// loop drains pending state on startup, so a wake missed in that window is
+/// harmless.
+type SharedProxy = Arc<Mutex<Option<EventLoopProxy<WakeUp>>>>;
+
+/// Ring the display loop's doorbell, if the loop exists.
+fn wake_display(proxy: &SharedProxy) {
+    let guard = proxy.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(p) = guard.as_ref() {
+        // EventLoopClosed means the loop is already gone — nothing to wake.
+        let _ = p.send_event(WakeUp);
+    }
 }
 
 /// Default lateness past which a frame is dropped rather than shown.
@@ -180,8 +206,10 @@ pub struct AutoVideoSink {
         kanal::Sender<VideoWindowEvent>,
         kanal::Receiver<VideoWindowEvent>,
     )>,
-    /// Desired fullscreen state, polled by the event loop.
+    /// Desired fullscreen state, applied by the event loop when woken.
     fullscreen: Arc<AtomicBool>,
+    /// Doorbell into the display loop; see [`SharedProxy`].
+    proxy: SharedProxy,
 }
 
 /// A key press from the video window, winit-agnostic.
@@ -259,6 +287,7 @@ pub struct AutoVideoSinkHandle {
     events: kanal::Receiver<VideoWindowEvent>,
     fullscreen: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
+    proxy: SharedProxy,
 }
 
 impl AutoVideoSinkHandle {
@@ -274,10 +303,11 @@ impl AutoVideoSinkHandle {
 
     /// Ask the window to enter or leave borderless fullscreen.
     ///
-    /// Applied by the event loop within one poll iteration; safe to call from
-    /// any thread, before or after the window exists.
+    /// Wakes the event loop to apply it; safe to call from any thread, before
+    /// or after the window exists.
     pub fn set_fullscreen(&self, fullscreen: bool) {
         self.fullscreen.store(fullscreen, Ordering::SeqCst);
+        wake_display(&self.proxy);
     }
 
     /// Whether fullscreen is currently requested.
@@ -309,6 +339,7 @@ impl AutoVideoSink {
             dropped: 0,
             events: None,
             fullscreen: Arc::new(AtomicBool::new(false)),
+            proxy: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -327,6 +358,7 @@ impl AutoVideoSink {
             events: rx.clone(),
             fullscreen: self.fullscreen.clone(),
             running: self.running.clone(),
+            proxy: self.proxy.clone(),
         }
     }
 
@@ -404,6 +436,7 @@ impl AutoVideoSink {
         let title = self.title.clone();
         let events_tx = self.events.as_ref().map(|(tx, _)| tx.clone());
         let fullscreen = self.fullscreen.clone();
+        let proxy = self.proxy.clone();
 
         running.store(true, Ordering::SeqCst);
 
@@ -416,9 +449,12 @@ impl AutoVideoSink {
                 initial_height,
                 events_tx,
                 fullscreen,
+                proxy.clone(),
             ) {
                 eprintln!("Display error: {}", e);
             }
+            // The loop is gone; wakes from here on have nowhere to go.
+            *proxy.lock().unwrap_or_else(|e| e.into_inner()) = None;
         });
 
         self.sender = Some(sender);
@@ -430,6 +466,9 @@ impl AutoVideoSink {
     /// Stop the display thread.
     fn stop_display(&mut self) {
         self.running.store(false, Ordering::SeqCst);
+        // The loop idles in `Wait`; without a wake it would only notice the
+        // flag on the next window event.
+        wake_display(&self.proxy);
 
         // Drop sender to unblock receiver
         self.sender.take();
@@ -548,7 +587,12 @@ impl Sink for AutoVideoSink {
         // count it — the previous code logged "drain one old frame", drained
         // nothing, and retried the same send with the result discarded.
         match sender.try_send(frame) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // Doorbell only — the sync_channel above is the data path. A
+                // full channel needs no wake: its frames already sent one each.
+                wake_display(&self.proxy);
+                Ok(())
+            }
             Err(mpsc::TrySendError::Full(_)) => {
                 self.drop_frame("display too slow");
                 Ok(())
@@ -603,6 +647,10 @@ fn detect_dimensions(size: usize) -> (u32, u32) {
 }
 
 /// Run the winit display loop in the display thread.
+///
+/// The loop is event-driven: it idles in `ControlFlow::Wait` and is woken by
+/// window events or by a [`WakeUp`] rung through `proxy_slot` (new frame,
+/// fullscreen request, shutdown). It never polls.
 #[allow(clippy::too_many_arguments)]
 fn run_display_loop(
     receiver: mpsc::Receiver<DisplayFrame>,
@@ -612,6 +660,7 @@ fn run_display_loop(
     initial_height: u32,
     events_tx: Option<kanal::Sender<VideoWindowEvent>>,
     fullscreen: Arc<AtomicBool>,
+    proxy_slot: SharedProxy,
 ) -> Result<()> {
     use winit::application::ApplicationHandler;
     use winit::dpi::LogicalSize;
@@ -649,9 +698,22 @@ fn run_display_loop(
                 let _ = tx.try_send(event);
             }
         }
+
+        /// Present every frame queued since the last wake.
+        ///
+        /// Rendering here instead of via `RedrawRequested` bypasses compositor
+        /// vsync throttling — same rationale as the old poll loop, minus the
+        /// polling. Runs on every wake, so a doorbell missed while the loop
+        /// was still being built is made up on the next event.
+        fn drain_frames(&mut self) {
+            while let Ok(frame) = self.receiver.try_recv() {
+                self.current_frame = Some(frame);
+                self.render();
+            }
+        }
     }
 
-    impl ApplicationHandler for VideoApp {
+    impl ApplicationHandler<WakeUp> for VideoApp {
         fn resumed(&mut self, event_loop: &ActiveEventLoop) {
             if self.window.is_some() {
                 return; // Already have a window
@@ -752,6 +814,13 @@ fn run_display_loop(
             }
         }
 
+        fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: WakeUp) {
+            // The doorbell: a frame was queued, fullscreen changed, or the
+            // sink is shutting down. State checks happen in `about_to_wait`,
+            // which winit runs right after this.
+            self.drain_frames();
+        }
+
         fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
             // Check if we should exit
             if !self.running.load(Ordering::SeqCst) {
@@ -772,17 +841,14 @@ fn run_display_loop(
                 self.is_fullscreen = want_fullscreen;
             }
 
-            // Check for ONE new frame (don't drain - render each frame)
-            if let Ok(frame) = self.receiver.try_recv() {
-                self.current_frame = Some(frame);
-                // Render immediately instead of waiting for RedrawRequested
-                // This bypasses compositor vsync throttling
-                self.render();
-            }
+            // Catch frames whose doorbell rang before the loop was built (the
+            // first frames of a stream race `start_display`).
+            self.drain_frames();
 
-            // Poll continuously - don't add artificial delay
-            // The frame rate is controlled by the source, not the sink
-            event_loop.set_control_flow(ControlFlow::Poll);
+            // Sleep until the next window event or WakeUp — the frame rate is
+            // set by the producer ringing the doorbell, not by polling (#155:
+            // ControlFlow::Poll here spun a full core on try_recv).
+            event_loop.set_control_flow(ControlFlow::Wait);
         }
     }
 
@@ -828,10 +894,14 @@ fn run_display_loop(
     }
 
     // Create event loop with any_thread enabled (Linux only)
-    let event_loop = EventLoop::builder()
+    let event_loop = EventLoop::<WakeUp>::with_user_event()
         .with_any_thread(true)
         .build()
         .map_err(|e| Error::Element(format!("Failed to create event loop: {}", e)))?;
+
+    // Publish the doorbell. Wakes rung before this point are covered by the
+    // drain in the first `about_to_wait`.
+    *proxy_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(event_loop.create_proxy());
 
     let mut app = VideoApp {
         window: None,
