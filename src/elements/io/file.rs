@@ -227,13 +227,16 @@ impl FileSrc {
             }
             SeekType::Current => std::io::SeekFrom::Current(seek.start.position),
             SeekType::End => std::io::SeekFrom::End(seek.start.position),
-            SeekType::None => return EventResult::Handled, // No position change
+            SeekType::None => return EventResult::handled(), // No position change
         };
 
         match file.seek(seek_pos) {
             Ok(new_pos) => {
                 self.bytes_read = new_pos;
-                EventResult::Handled
+                // The absolute resulting offset — for Current/End seeks this
+                // is the only party that knows it, and it feeds the honest
+                // Segment/SeekDone (#162).
+                EventResult::handled_at(new_pos as i64)
             }
             Err(_) => EventResult::Error,
         }

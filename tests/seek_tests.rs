@@ -285,7 +285,7 @@ async fn runtime_flush_seek_sheds_the_queued_backlog() {
             match event {
                 Event::Seek(seek) => {
                     self.seq = (seek.start.position.max(0) as u64) / 1_000_000;
-                    EventResult::Handled
+                    EventResult::handled()
                 }
                 _ => EventResult::NotHandled,
             }
@@ -365,6 +365,120 @@ async fn runtime_flush_seek_sheds_the_queued_backlog() {
         }
     }
     assert!(seek_done, "SeekDone posted");
+}
+
+/// A seek fanned out to several seekable sources performs exactly ONE
+/// epoch transition (the epoch becomes the seek's seqnum via fetch_max) —
+/// under the old per-source fetch_add, whichever source handled the seek
+/// second stale-stamped the first source's post-seek output, and one
+/// branch went silent after every multi-source seek (#162).
+#[tokio::test(flavor = "multi_thread")]
+async fn multi_source_seek_bumps_epoch_once() {
+    use parallax::buffer::{Buffer, MemoryHandle};
+    use parallax::element::{ProduceContext, ProduceResult, Source};
+    use parallax::elements::{AppSink, Pulled};
+    use parallax::event::{Event, EventResult};
+    use parallax::memory::SharedArena;
+    use parallax::metadata::Metadata;
+    use parallax::pipeline::Executor;
+    use parallax::pipeline::bus::MessageKind;
+    use std::sync::Arc;
+
+    struct SeekableCounter {
+        seq: u64,
+        arena: Arc<SharedArena>,
+    }
+
+    impl Source for SeekableCounter {
+        fn produce(&mut self, _ctx: &mut ProduceContext) -> parallax::error::Result<ProduceResult> {
+            self.arena.reclaim();
+            let Some(slot) = self.arena.acquire() else {
+                return Ok(ProduceResult::WouldBlock);
+            };
+            let mut metadata = Metadata::from_sequence(self.seq);
+            metadata.pts = ClockTime::from_millis(self.seq);
+            let buffer = Buffer::new(MemoryHandle::new(slot), metadata);
+            self.seq += 1;
+            Ok(ProduceResult::OwnBuffer(buffer))
+        }
+
+        fn is_seekable(&self) -> bool {
+            true
+        }
+
+        fn handle_upstream_event(&mut self, event: &Event) -> EventResult {
+            match event {
+                Event::Seek(seek) => {
+                    self.seq = (seek.start.position.max(0) as u64) / 1_000_000;
+                    EventResult::handled()
+                }
+                _ => EventResult::NotHandled,
+            }
+        }
+    }
+
+    let mut pipeline = Pipeline::new();
+    let mut handles = Vec::new();
+    for name in ["a", "b"] {
+        let src = pipeline.add_source(
+            format!("src_{name}"),
+            SeekableCounter {
+                seq: 0,
+                arena: Arc::new(SharedArena::new(64, 64).unwrap()),
+            },
+        );
+        let sink = AppSink::with_max_buffers(2);
+        handles.push(sink.handle());
+        let snk = pipeline.add_sink(format!("sink_{name}"), sink);
+        pipeline.link(src, snk).unwrap();
+    }
+
+    let executor = Executor::new();
+    let mut handle = executor.start(&mut pipeline).unwrap();
+    let mut bus = handle.take_bus().unwrap();
+
+    for h in &handles {
+        assert!(matches!(h.pull_buffer().await, Pulled::Buffer(_)));
+    }
+
+    assert!(handle.seek_time(ClockTime::from_secs(60)).await);
+
+    // BOTH branches must reach post-seek data: neither source's fresh
+    // output may be stale-dropped by the sibling handling the same seek.
+    for (i, h) in handles.iter().enumerate() {
+        loop {
+            match h.pull_buffer().await {
+                Pulled::Buffer(b) => {
+                    if b.metadata().pts.nanos() >= 60_000_000_000 {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                other => panic!("branch {i} ended before the seek landed: {other:?}"),
+            }
+        }
+    }
+
+    handle.stop();
+    for h in &handles {
+        while let Pulled::Buffer(_) = h.pull_buffer().await {}
+    }
+    handle.wait().await.unwrap();
+
+    // One SeekDone per handling source, all correlated by the same seqnum.
+    let mut dones: Vec<(u64, String)> = Vec::new();
+    while let Some(msg) = bus.poll() {
+        if let MessageKind::SeekDone { seqnum, source, .. } = msg.kind {
+            dones.push((seqnum, source));
+        }
+    }
+    assert_eq!(
+        dones.len(),
+        2,
+        "one SeekDone per handling source: {dones:?}"
+    );
+    assert_eq!(dones[0].0, dones[1].0, "same seek, same seqnum");
+    assert_ne!(dones[0].1, dones[1].1, "distinct handling sources");
 }
 
 /// The running handle answers seekability and duration from the snapshot

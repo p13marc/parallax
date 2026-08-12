@@ -167,8 +167,20 @@ pub enum MessageKind {
     // --- Seeking ---
     /// Seek completed (all elements flushed and repositioned).
     SeekDone {
-        /// New stream position after seek.
-        position: ClockTime,
+        /// Seqnum of the [`SeekEvent`](crate::event::SeekEvent) this
+        /// completes — correlate rapid seeks with their completions
+        /// (GStreamer's seqnum discipline). A multi-source pipeline posts
+        /// one SeekDone per handling source, all sharing the seek's seqnum.
+        seqnum: u64,
+        /// The element that handled the seek.
+        source: String,
+        /// Interpretation of `position` (Time = nanoseconds, Bytes = offset).
+        format: crate::event::SegmentFormat,
+        /// Where the stream actually landed — the element's reported landing
+        /// position when it knows one (keyframe-snapping demuxers land off
+        /// target), else the requested position; `None` for a relative seek
+        /// whose handler reported nothing.
+        position: Option<u64>,
     },
 
     // --- Application/Element-specific ---
@@ -230,7 +242,15 @@ impl fmt::Display for MessageKind {
             }
             MessageKind::ClockLost => write!(f, "ClockLost"),
             MessageKind::NewClock { clock_name } => write!(f, "NewClock: {clock_name}"),
-            MessageKind::SeekDone { position } => write!(f, "SeekDone: {position}"),
+            MessageKind::SeekDone {
+                seqnum,
+                source,
+                format,
+                position,
+            } => match position {
+                Some(p) => write!(f, "SeekDone #{seqnum} ({source}): {p} ({format:?})"),
+                None => write!(f, "SeekDone #{seqnum} ({source})"),
+            },
             MessageKind::Element {
                 structure_name,
                 fields,

@@ -1229,7 +1229,9 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for Mp4DemuxSource<R> {
                     *slot = None;
                 }
                 self.primed = false;
-                EventResult::Handled
+                // The keyframe actually landed on (may be before the
+                // request) — Segment/SeekDone report it (#162).
+                EventResult::handled_at(point.time_ns as i64)
             }
             Err(e) => {
                 tracing::warn!("mp4demux: seek failed: {e}");

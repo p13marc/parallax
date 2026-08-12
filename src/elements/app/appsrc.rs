@@ -202,7 +202,7 @@ impl Source for AppSrc {
                     self.name,
                     dropped
                 );
-                EventResult::Handled
+                EventResult::handled()
             }
             _ => EventResult::NotHandled,
         }

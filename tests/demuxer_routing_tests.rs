@@ -408,13 +408,22 @@ async fn mp4_demux_source_seeks_at_runtime() {
         "playback continued from the landing keyframe to EOS: {pts:?}"
     );
 
-    let mut seek_done = false;
+    // SeekDone reports where the demuxer ACTUALLY landed — the 1000 ms
+    // keyframe, not the 1200 ms request (#162: honest completion).
+    let mut seek_done = None;
     while let Some(msg) = bus.poll() {
-        if matches!(msg.kind, MessageKind::SeekDone { .. }) {
-            seek_done = true;
+        if let MessageKind::SeekDone {
+            format, position, ..
+        } = msg.kind
+        {
+            seek_done = Some((format, position));
         }
     }
-    assert!(seek_done, "SeekDone posted");
+    assert_eq!(
+        seek_done,
+        Some((parallax::event::SegmentFormat::Time, Some(1_000_000_000))),
+        "SeekDone carries the snapped keyframe position"
+    );
 }
 
 /// TsDemuxElement in a pipeline: TS bytes in, video frames only on the

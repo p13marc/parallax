@@ -203,14 +203,101 @@ async fn flush_seek_traverses_chain_in_order() {
     // flush() ran once for the FlushStart and once at EOS.
     assert_eq!(flushes.load(Ordering::SeqCst), 2);
 
-    // The bus reported the seek, at the requested position.
+    // The bus reported the seek: AppSrc reports no landing position, so
+    // the requested target is echoed, tagged with the seek's format.
     let mut seek_done = None;
     while let Some(msg) = bus.poll() {
-        if let MessageKind::SeekDone { position } = msg.kind {
-            seek_done = Some(position);
+        if let MessageKind::SeekDone {
+            format, position, ..
+        } = msg.kind
+        {
+            seek_done = Some((format, position));
         }
     }
-    assert_eq!(seek_done, Some(ClockTime::from_nanos(1_000)));
+    assert_eq!(
+        seek_done,
+        Some((parallax::event::SegmentFormat::Time, Some(1_000)))
+    );
+}
+
+/// A NON-flushing seek is a queued seek (#162, GStreamer's queue-behind-data
+/// semantics): the source repositions, but nothing is discarded — the new
+/// Segment travels FIFO behind the already-queued buffers, so downstream
+/// sees old data → segment → new data, with no flush events anywhere.
+#[tokio::test(flavor = "multi_thread")]
+async fn non_flushing_seek_queues_behind_data() {
+    use parallax::event::{SeekEvent, SeekFlags, SeekPosition, SegmentFormat};
+
+    let mut pipeline = Pipeline::new();
+    let appsrc = AppSrc::with_max_buffers(32);
+    let src_handle = appsrc.handle();
+    let src = pipeline.add_source("src", appsrc);
+    let appsink = AppSink::with_max_buffers(32);
+    let sink_handle = appsink.handle();
+    let snk = pipeline.add_sink("sink", appsink);
+    pipeline.link(src, snk).unwrap();
+
+    let sink_log = log_probe(&mut pipeline, PadRef::sink(snk));
+
+    let executor = Executor::new();
+    let mut handle = executor.start(&mut pipeline).unwrap();
+    let mut bus = handle.take_bus().unwrap();
+
+    for pts in [1_000u64, 2_000, 3_000] {
+        src_handle.push_buffer(buffer_with_pts(pts)).await.unwrap();
+    }
+    // Let the pre-seek buffers reach the sink pad before the seek, so their
+    // ordering relative to the Segment is unambiguous in the log.
+    wait_until(
+        || sink_log.lock().unwrap().len() >= 3,
+        "pre-seek buffers at the sink",
+    )
+    .await;
+
+    let seek = SeekEvent::new(SegmentFormat::Time, SeekPosition::set(1_000_000))
+        .with_flags(SeekFlags::empty());
+    assert!(handle.seek(seek).await);
+
+    wait_until(
+        || sink_log.lock().unwrap().iter().any(|e| e == "segment"),
+        "the queued segment",
+    )
+    .await;
+    src_handle
+        .push_buffer(buffer_with_pts(1_000_000))
+        .await
+        .unwrap();
+
+    src_handle.end_stream();
+    while let Pulled::Buffer(_) = sink_handle.pull_buffer().await {}
+    handle.wait().await.unwrap();
+
+    let log = sink_log.lock().unwrap().clone();
+    assert!(
+        !log.iter().any(|e| e.starts_with("flush")),
+        "a non-flushing seek must not flush: {log:?}"
+    );
+    let segment_at = log.iter().position(|e| e == "segment").unwrap();
+    let pre = &log[..segment_at];
+    assert_eq!(
+        pre.iter().filter(|e| e.starts_with("buffer:")).count(),
+        3,
+        "all pre-seek buffers arrive before the segment, none dropped: {log:?}"
+    );
+    assert!(
+        log[segment_at..].contains(&"buffer:1000000".to_string()),
+        "post-seek data follows the segment: {log:?}"
+    );
+
+    // SeekDone still posts — it means "source repositioned", not "the
+    // segment reached the sinks".
+    let mut seek_done = false;
+    while let Some(msg) = bus.poll() {
+        if matches!(msg.kind, MessageKind::SeekDone { .. }) {
+            seek_done = true;
+        }
+    }
+    assert!(seek_done, "SeekDone posted for a non-flushing seek");
 }
 
 /// A source that cannot seek reports a warning on the bus and keeps running.

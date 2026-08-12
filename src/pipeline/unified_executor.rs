@@ -2000,10 +2000,11 @@ fn is_power_of_ten(mut n: u64) -> bool {
 enum Message {
     /// A buffer, stamped with the pipeline's flush epoch at production time.
     ///
-    /// The epoch is what makes a flushing seek actually flush (#157): the
-    /// seek handler bumps the pipeline-wide counter after the element has
-    /// repositioned, so every buffer produced before the seek carries an
-    /// older stamp. Consumers drop stale-stamped buffers at receive speed —
+    /// The epoch is what makes a flushing seek actually flush (#157): after
+    /// the element repositions, the seek handler raises the pipeline-wide
+    /// counter to the seek's seqnum (`fetch_max` — idempotent across the
+    /// sources handling one seek, #162), so every buffer produced before
+    /// the seek carries an older stamp. Consumers drop stale-stamped buffers at receive speed —
     /// the queued backlog that used to play out as ~2.5 s of pre-seek audio
     /// drains in microseconds, and the in-band FlushStart/FlushStop/Segment
     /// trio right behind it reaches the elements promptly. FIFO ordering
@@ -2093,8 +2094,9 @@ async fn broadcast(
 
 /// Whether a buffer stamped `epoch` predates the current flush epoch.
 ///
-/// `Acquire` pairs with the seek handler's `fetch_add(AcqRel)`: once a task
-/// sees the bumped counter, every pre-bump buffer tests stale.
+/// `Acquire` pairs with the seek handler's `fetch_max(AcqRel)`: once a task
+/// sees the raised counter, every buffer stamped before the transition
+/// tests stale.
 fn is_stale(epoch: u64, current: &AtomicU64) -> bool {
     epoch < current.load(Ordering::Acquire)
 }
@@ -2294,7 +2296,7 @@ async fn handle_source_control_event(
     };
 
     match result {
-        EventResult::Handled => {
+        EventResult::Handled { position: landing } => {
             // Src-pad probes see each emitted event, mirroring how buffers are
             // probed on the pad that emits them; Drop/Handled suppresses it.
             let emit = |event: Event| match probe_registry.invoke_event(src_pad, &event, true) {
@@ -2306,10 +2308,20 @@ async fn handle_source_control_event(
                 // this runs inside the producer's own task, between produce
                 // calls — so every buffer already stamped is pre-seek and every
                 // buffer stamped after this line is post-seek, with no cross-
-                // task handshake. Bumping *before* FlushStart means consumers
-                // drain the stale backlog at receive speed and the flush trio
-                // arrives promptly instead of queueing behind seconds of data.
-                flush_epoch.fetch_add(1, Ordering::AcqRel);
+                // task handshake. Transitioning *before* FlushStart means
+                // consumers drain the stale backlog at receive speed and the
+                // flush trio arrives promptly instead of queueing behind
+                // seconds of data.
+                //
+                // The epoch BECOMES the seek's seqnum (seqnums are globally
+                // strictly increasing, so monotonicity holds). fetch_max is
+                // what makes a multi-source seek transition exactly once:
+                // every handling source calls it with the SAME seqnum (Clone
+                // shares it), the second call is a no-op, and each caller's
+                // own AcqRel RMW guarantees its later loads see ≥ seqnum —
+                // so no source's post-seek buffers can be stamped stale by a
+                // sibling handling the same seek.
+                flush_epoch.fetch_max(seek.seqnum(), Ordering::AcqRel);
                 if let Some(ev) = emit(Event::FlushStart) {
                     broadcast_event(outputs, &ev).await;
                 }
@@ -2318,24 +2330,44 @@ async fn handle_source_control_event(
                 }
             }
 
-            // Segment start = the requested target. `base` stays 0: nothing
-            // downstream consumes running time from segments yet (#71 will).
-            let target = match seek.start.seek_type {
-                SeekType::Set => seek.start.position.max(0),
-                _ => 0,
+            // Segment start: the element's actual landing position when it
+            // reported one (a keyframe-snapping demuxer lands off-target),
+            // else the requested position. Current/End-relative requests
+            // have no absolute target — only the element knows where they
+            // ended up (FileSrc reports it). `base` stays 0: nothing
+            // downstream consumes running time from segments yet (#165).
+            let requested = match seek.start.seek_type {
+                SeekType::Set => Some(seek.start.position.max(0)),
+                _ => None,
             };
+            let start = landing.map(|p| p.max(0)).or(requested);
+            let segment_start = start.unwrap_or_else(|| {
+                tracing::warn!(
+                    "source '{name}': relative seek with no reported landing; \
+                     segment restarts at 0"
+                );
+                0
+            });
             let segment = match seek.format {
-                crate::event::SegmentFormat::Bytes => SegmentEvent::new_bytes(target as u64, None),
-                _ => SegmentEvent::new_time(ClockTime::from_nanos(target as u64), None),
+                crate::event::SegmentFormat::Bytes => {
+                    SegmentEvent::new_bytes(segment_start as u64, None)
+                }
+                _ => SegmentEvent::new_time(ClockTime::from_nanos(segment_start as u64), None),
             };
             if let Some(ev) = emit(Event::Segment(segment)) {
                 broadcast_event(outputs, &ev).await;
             }
 
             bus.post(crate::pipeline::bus::MessageKind::SeekDone {
-                position: ClockTime::from_nanos(target as u64),
+                seqnum: seek.seqnum(),
+                source: name.to_string(),
+                format: seek.format,
+                position: start.map(|p| p as u64),
             });
-            tracing::info!("source '{name}': seek handled, segment starts at {target}");
+            tracing::info!(
+                "source '{name}': seek {} handled, segment starts at {segment_start}",
+                seek.seqnum()
+            );
         }
         EventResult::NotHandled => {
             bus.post_warning(format!("source '{name}' cannot seek; seek ignored"), None);

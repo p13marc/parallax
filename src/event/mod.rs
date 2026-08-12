@@ -480,6 +480,17 @@ impl TagsEvent {
 /// Sent upstream to request that sources seek to a new position.
 #[derive(Debug, Clone)]
 pub struct SeekEvent {
+    /// Sequence number tying everything a seek causes back to it.
+    ///
+    /// Private on purpose: only the constructors assign it, from one global
+    /// strictly-increasing counter — the flush-epoch mechanism *becomes*
+    /// this value on a flushing seek (`fetch_max`), so monotonicity is a
+    /// correctness requirement, not a convention. `Clone` keeps it: the
+    /// executor's per-source fan-out of one seek shares the seqnum, which
+    /// is what makes the epoch transition idempotent across sources, and
+    /// `MessageKind::SeekDone` carries it so applications can tell which
+    /// seek completed (GStreamer's seqnum discipline).
+    seqnum: u64,
     /// Seek rate (1.0 = normal, 2.0 = 2x speed, -1.0 = reverse).
     pub rate: f64,
     /// Format of start/stop positions.
@@ -492,39 +503,48 @@ pub struct SeekEvent {
     pub stop: SeekPosition,
 }
 
+/// Global seek seqnum source; starts at 1 so 0 stays "no seek yet" (the
+/// flush epoch's initial value).
+static SEEK_SEQNUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 impl SeekEvent {
+    /// A flushing seek with the given format and start position.
+    ///
+    /// The general constructor — `Current`/`End` relative positions come
+    /// through here (`SeekEvent::new(format, SeekPosition::end(-1024))`).
+    /// Flags default to [`SeekFlags::FLUSH`]; adjust with
+    /// [`with_flags`](Self::with_flags).
+    pub fn new(format: SegmentFormat, start: SeekPosition) -> Self {
+        Self {
+            seqnum: SEEK_SEQNUM.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            rate: 1.0,
+            format,
+            flags: SeekFlags::FLUSH,
+            start,
+            stop: SeekPosition::none(),
+        }
+    }
+
     /// Create a simple time-based seek to a position.
     pub fn new_time(position: ClockTime) -> Self {
-        Self {
-            rate: 1.0,
-            format: SegmentFormat::Time,
-            flags: SeekFlags::FLUSH.union(SeekFlags::KEY_UNIT),
-            start: SeekPosition {
-                seek_type: SeekType::Set,
-                position: position.nanos() as i64,
-            },
-            stop: SeekPosition {
-                seek_type: SeekType::None,
-                position: -1,
-            },
-        }
+        Self::new(
+            SegmentFormat::Time,
+            SeekPosition::set(position.nanos() as i64),
+        )
+        // KEY_UNIT describes what the container demuxers actually do: they
+        // always snap to a keyframe (MP4 backward, MKV forward). ACCURATE
+        // and SNAP_* are accepted but not yet honored (#166).
+        .with_flags(SeekFlags::FLUSH.union(SeekFlags::KEY_UNIT))
     }
 
     /// Create a byte-based seek.
     pub fn new_bytes(position: u64) -> Self {
-        Self {
-            rate: 1.0,
-            format: SegmentFormat::Bytes,
-            flags: SeekFlags::FLUSH,
-            start: SeekPosition {
-                seek_type: SeekType::Set,
-                position: position as i64,
-            },
-            stop: SeekPosition {
-                seek_type: SeekType::None,
-                position: -1,
-            },
-        }
+        Self::new(SegmentFormat::Bytes, SeekPosition::set(position as i64))
+    }
+
+    /// The sequence number identifying this seek and everything it caused.
+    pub fn seqnum(&self) -> u64 {
+        self.seqnum
     }
 
     /// Set the seek rate.
@@ -871,7 +891,15 @@ impl From<Event> for PipelineItem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventResult {
     /// Event was handled, don't propagate.
-    Handled,
+    Handled {
+        /// Where the element actually landed, in the event's format (ns for
+        /// Time, offset for Bytes), when it knows. A keyframe-snapping
+        /// demuxer reports the snapped position; the executor's synthesized
+        /// `Segment` and `SeekDone` then tell the truth instead of echoing
+        /// the requested target. `None` when the element cannot know (an
+        /// MKV landing depends on the next keyframe found during produce).
+        position: Option<i64>,
+    },
     /// Event was not handled, propagate to next element.
     NotHandled,
     /// Event handling failed.
@@ -879,9 +907,21 @@ pub enum EventResult {
 }
 
 impl EventResult {
+    /// Handled, landing position unknown.
+    pub fn handled() -> Self {
+        EventResult::Handled { position: None }
+    }
+
+    /// Handled, landed exactly here (in the event's format).
+    pub fn handled_at(position: i64) -> Self {
+        EventResult::Handled {
+            position: Some(position),
+        }
+    }
+
     /// Check if the event was handled.
     pub fn is_handled(&self) -> bool {
-        matches!(self, EventResult::Handled)
+        matches!(self, EventResult::Handled { .. })
     }
 }
 
@@ -947,6 +987,21 @@ mod tests {
         assert!(seek.flags.contains(SeekFlags::FLUSH));
         assert!(seek.flags.contains(SeekFlags::KEY_UNIT));
         assert_eq!(seek.start.position, 30_000_000_000);
+    }
+
+    #[test]
+    fn seek_seqnums_strictly_increase_and_clones_share_them() {
+        // Monotonicity is a correctness requirement: the flush epoch
+        // *becomes* the seqnum on a flushing seek (fetch_max).
+        let a = SeekEvent::new_time(ClockTime::from_secs(1));
+        let b = SeekEvent::new_bytes(0);
+        let c = SeekEvent::new(SegmentFormat::Time, SeekPosition::end(-1));
+        assert!(a.seqnum() < b.seqnum());
+        assert!(b.seqnum() < c.seqnum());
+        assert!(a.seqnum() > 0, "0 is reserved for 'no seek yet'");
+        // The executor's per-source fan-out clones one seek; sharing the
+        // seqnum is what makes the epoch transition idempotent.
+        assert_eq!(c.clone().seqnum(), c.seqnum());
     }
 
     #[test]

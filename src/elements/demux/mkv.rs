@@ -938,7 +938,10 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
             // three cases each routed track discards its own frames below
             // the target.
             self.skip = self.routed.iter().map(|&(id, _)| (id, ticks)).collect();
-            EventResult::Handled
+            // Landing unknown until produce() finds the first keyframe at or
+            // after the target — report None and let the executor fall back
+            // to the requested position for the Segment (#162).
+            EventResult::handled()
         } else {
             EventResult::Error
         }
