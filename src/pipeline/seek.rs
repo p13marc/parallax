@@ -24,9 +24,23 @@
 //!   3. FlushStart sent downstream in-band; the flush epoch sheds the
 //!      queued pre-seek backlog at receive speed
 //!   4. FlushStop sent downstream (resume processing)
-//!   5. New Segment sent downstream (re-anchors the timeline)
+//!   5. New Segment sent downstream (re-anchors the timeline, carrying
+//!      the seek's rate and stop and the element-reported landing)
 //!   6. SeekDone posted to the bus
 //! ```
+//!
+//! # Segment discipline (#165)
+//!
+//! Every buffer on the wire is preceded by a Segment: each producing task
+//! emits StreamStart at startup and a lazy initial Segment anchored at its
+//! first buffer's PTS (Bytes-from-0 for byte-oriented sources like FileSrc/
+//! HttpSrc, whose duration queries answer in Bytes). Demuxers and muxers
+//! OWN their pads' stream identity — per-pad StreamStart/Segment on the way
+//! out, upstream StreamStart/Segment swallowed (offered to the element
+//! first), and pads re-anchor after an upstream FlushStop. `AutoVideoSink`
+//! paces in segment running time via [`SegmentEvent::to_running_time`].
+//!
+//! [`SegmentEvent::to_running_time`]: crate::event::SegmentEvent::to_running_time
 //!
 //! [`Source`]: crate::element::Source
 //! [`Demuxer`]: crate::element::Demuxer

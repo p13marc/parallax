@@ -110,15 +110,16 @@ enum Pace {
     DropLate,
 }
 
-/// Maps buffer PTS onto pipeline running time.
+/// Paces presentation in segment running time.
 ///
-/// There are no `SegmentEvent`s anywhere in the tree yet (the executor's
-/// inter-element `Message` carries only buffers, EOS and errors), so the
-/// segment mapping in [`SegmentEvent::to_running_time`] has nothing to feed it.
-/// Instead the first frame anchors the stream: its PTS is pinned to the running
-/// time at which it arrived, and every later frame is scheduled at that anchor
-/// plus its PTS offset. A stream that does not start at zero therefore plays
-/// from wherever it starts, without a leading stall.
+/// The input is already segment-mapped (#165): `consume` runs each PTS
+/// through [`SegmentEvent::to_running_time`], so segment start/rate/base
+/// take effect upstream of this struct. The first frame still anchors the
+/// stream — its mapped time is pinned to the running time at which it
+/// arrived — because parallax has no LATENCY query: pacing purely against
+/// the clock would mark the first frames late by the pipeline's startup
+/// latency and drop them. The anchor absorbs that latency; a new segment
+/// (seek or start) clears it so the next frame re-anchors.
 ///
 /// [`SegmentEvent::to_running_time`]: crate::event::SegmentEvent::to_running_time
 #[derive(Debug, Default)]
@@ -206,6 +207,11 @@ pub struct AutoVideoSink {
     max_lateness: Duration,
     /// PTS → running-time mapping, built from the first frame.
     pacer: PtsPacer,
+    /// Current segment (#165): PTS map through
+    /// [`SegmentEvent::to_running_time`] before pacing, so a segment's
+    /// start/rate/base take effect. `None` until the initial segment
+    /// arrives (raw-PTS behavior).
+    segment: Option<crate::event::SegmentEvent>,
     /// Frames dropped for being late or for a full display channel.
     dropped: u64,
     /// Window-event channel, created when [`handle`](Self::handle) is called.
@@ -345,6 +351,7 @@ impl AutoVideoSink {
             sync: false,
             max_lateness: DEFAULT_MAX_LATENESS,
             pacer: PtsPacer::default(),
+            segment: None,
             dropped: 0,
             events: None,
             fullscreen: Arc::new(AtomicBool::new(false)),
@@ -506,12 +513,25 @@ impl Sink for AutoVideoSink {
         &mut self,
         event: crate::event::Event,
     ) -> Option<crate::event::Event> {
-        // A flushing seek moved the stream: drop the PTS anchor so the first
-        // post-seek frame re-anchors at its own arrival time. Without this a
-        // forward seek would schedule every new frame `seek distance` in the
-        // future (capped by MAX_WAIT, but still a stall).
-        if matches!(event, crate::event::Event::FlushStop(_)) {
-            self.pacer.anchor = None;
+        match &event {
+            // A flushing seek moved the stream: drop the PTS anchor so the
+            // first post-seek frame re-anchors at its own arrival time.
+            // Without this a forward seek would schedule every new frame
+            // `seek distance` in the future (capped by MAX_WAIT, but still
+            // a stall).
+            crate::event::Event::FlushStop(_) => {
+                self.pacer.anchor = None;
+            }
+            // A new segment re-defines the mapping (#165) — and re-anchors,
+            // which also covers the forward NON-flushing seek (the queued
+            // Segment arrives with no FlushStop to clear the anchor).
+            crate::event::Event::Segment(seg)
+                if seg.format == crate::event::SegmentFormat::Time =>
+            {
+                self.segment = Some(seg.clone());
+                self.pacer.anchor = None;
+            }
+            _ => {}
         }
         Some(event)
     }
@@ -539,6 +559,15 @@ impl Sink for AutoVideoSink {
             && ctx.clock().is_some()
             && let Some(pts) = meta.pts.to_option()
             && let Some(now) = ctx.running_time().to_option()
+            // Map through the current segment (#165): (pts − start)/|rate| +
+            // base. A PTS before the segment start has no valid mapping
+            // (out-of-segment frame) — present it immediately rather than
+            // pace it; segment-clipping is a later slice.
+            && let Some(pts) = self
+                .segment
+                .as_ref()
+                .map_or(meta.pts, |seg| seg.to_running_time(pts))
+                .to_option()
         {
             let mut pace = self.pacer.schedule(pts, now, self.max_lateness);
             // Blocking here is the point: it is what back-pressures the
@@ -1233,6 +1262,51 @@ mod tests {
         let sink = AutoVideoSink::new();
         assert!(!sink.sync);
         assert_eq!(sink.max_lateness, DEFAULT_MAX_LATENESS);
+    }
+
+    #[test]
+    fn a_time_segment_is_stored_and_re_anchors() {
+        use crate::element::Sink;
+        use crate::event::{Event, SegmentEvent};
+
+        let mut sink = AutoVideoSink::new();
+        sink.pacer.anchor = Some((ns(0), ns(0)));
+
+        // A Time segment installs the mapping and clears the anchor, so the
+        // next frame re-anchors in the new segment's running-time domain —
+        // this is also what un-stalls a forward NON-flushing seek (#165).
+        let seg = SegmentEvent::new_time(ClockTime::from_secs(10), None).with_rate(2.0);
+        let fwd = sink.handle_downstream_event(Event::Segment(seg));
+        assert!(matches!(fwd, Some(Event::Segment(_))), "segment forwarded");
+        assert!(sink.pacer.anchor.is_none(), "new segment re-anchors");
+        let stored = sink.segment.as_ref().expect("segment stored");
+        assert_eq!(stored.start, 10_000_000_000);
+        assert_eq!(stored.rate, 2.0);
+
+        // The mapping halves inter-frame spacing at rate 2.0.
+        let mapped_a = stored.to_running_time(ClockTime::from_secs(10));
+        let mapped_b = stored.to_running_time(ns(10_000_000_000 + 2 * FRAME_25FPS));
+        assert_eq!(mapped_a, ns(0));
+        assert_eq!(mapped_b, ns(FRAME_25FPS), "rate 2.0 halves the spacing");
+
+        // Out-of-segment PTS has no mapping — consume presents it directly.
+        assert_eq!(
+            stored.to_running_time(ClockTime::from_secs(5)),
+            ClockTime::NONE
+        );
+
+        // A Bytes segment is not a video timeline; ignored.
+        sink.pacer.anchor = Some((ns(0), ns(0)));
+        let bytes_seg = SegmentEvent::new_bytes(0, None);
+        let _ = sink.handle_downstream_event(Event::Segment(bytes_seg));
+        assert!(
+            sink.pacer.anchor.is_some(),
+            "bytes segment leaves pacing alone"
+        );
+        assert_eq!(
+            sink.segment.as_ref().unwrap().format,
+            crate::event::SegmentFormat::Time
+        );
     }
 
     #[test]

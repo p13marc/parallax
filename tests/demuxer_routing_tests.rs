@@ -627,3 +627,192 @@ async fn unlinked_pads_drop_instead_of_broadcasting() {
         "odd buffers were dropped, not rerouted"
     );
 }
+
+/// #165: a demuxer owns its pads' stream identity — each pad gets its own
+/// StreamStart and a lazy Time segment anchored at that pad's first PTS.
+/// Upstream StreamStart/Segment (the fed input's domain) is swallowed.
+#[tokio::test(flavor = "multi_thread")]
+async fn demuxer_pads_each_get_stream_start_and_segment() {
+    use parallax::clock::ClockTime;
+    use parallax::event::{Event, SegmentFormat};
+    use parallax::pipeline::probe::{PadRef, ProbeData, ProbeReturn, ProbeType};
+    use std::sync::{Arc, Mutex};
+
+    let mut pipeline = Pipeline::new();
+    let appsrc = AppSrc::with_max_buffers(16);
+    let src_handle = appsrc.handle();
+    let src = pipeline.add_source("src", appsrc);
+    let demux = pipeline.add_demuxer("parity", ParityDemuxer::new());
+    let even_sink = AppSink::with_max_buffers(16);
+    let even_handle = even_sink.handle();
+    let odd_sink = AppSink::with_max_buffers(16);
+    let odd_handle = odd_sink.handle();
+    let ev = pipeline.add_sink("even_sink", even_sink);
+    let od = pipeline.add_sink("odd_sink", odd_sink);
+    pipeline.link(src, demux).unwrap();
+    pipeline.link_pads(demux, "even", ev, "sink").unwrap();
+    pipeline.link_pads(demux, "odd", od, "sink").unwrap();
+
+    // Capture events on the demuxer's src side (one PadRef per node).
+    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    let _ = pipeline.add_probe(PadRef::src(demux), ProbeType::EVENT_DOWN, move |data| {
+        if let ProbeData::Event(e) = data {
+            let entry = match e {
+                Event::Segment(seg) => format!("segment:{:?}:{}", seg.format, seg.start),
+                other => other.name().to_string(),
+            };
+            events_clone.lock().unwrap().push(entry);
+        }
+        ProbeReturn::Ok
+    });
+
+    let executor = Executor::new();
+    let handle = executor.start(&mut pipeline).unwrap();
+
+    // seq 0 (pts 100 ms) → even, seq 1 (pts 250 ms) → odd.
+    for (seq, pts_ms) in [(0u64, 100u64), (1, 250), (2, 300), (3, 450)] {
+        let slot = arena().acquire().unwrap();
+        let mut meta = Metadata::from_sequence(seq);
+        meta.pts = ClockTime::from_millis(pts_ms);
+        src_handle
+            .push_buffer(Buffer::new(MemoryHandle::with_len(slot, 8), meta))
+            .await
+            .unwrap();
+    }
+    src_handle.end_stream();
+    while let Pulled::Buffer(_) = even_handle.pull_buffer().await {}
+    while let Pulled::Buffer(_) = odd_handle.pull_buffer().await {}
+    handle.wait().await.unwrap();
+
+    let events = events.lock().unwrap();
+    let stream_starts = events.iter().filter(|e| *e == "stream-start").count();
+    assert_eq!(stream_starts, 2, "one StreamStart per pad: {events:?}");
+    let segments: Vec<&String> = events
+        .iter()
+        .filter(|e| e.starts_with("segment:"))
+        .collect();
+    assert_eq!(
+        segments,
+        vec![
+            &format!("segment:{:?}:100000000", SegmentFormat::Time),
+            &format!("segment:{:?}:250000000", SegmentFormat::Time),
+        ],
+        "each pad anchors at its own first PTS; the upstream segment is \
+         swallowed: {events:?}"
+    );
+}
+
+/// #165: after an upstream flushing seek passes through a FED demuxer, each
+/// pad re-anchors with a fresh Time segment at its first post-seek buffer —
+/// the source's own (input-domain) seek segment is swallowed.
+#[tokio::test(flavor = "multi_thread")]
+async fn fed_demuxer_reanchors_segments_after_upstream_seek() {
+    use parallax::clock::ClockTime;
+    use parallax::event::Event;
+    use parallax::pipeline::probe::{PadRef, ProbeData, ProbeReturn, ProbeType};
+    use std::sync::{Arc, Mutex};
+
+    let mut pipeline = Pipeline::new();
+    let appsrc = AppSrc::with_max_buffers(16);
+    let src_handle = appsrc.handle();
+    let src = pipeline.add_source("src", appsrc);
+    let demux = pipeline.add_demuxer("parity", ParityDemuxer::new());
+    let even_sink = AppSink::with_max_buffers(16);
+    let even_handle = even_sink.handle();
+    let odd_sink = AppSink::with_max_buffers(16);
+    let odd_handle = odd_sink.handle();
+    let ev = pipeline.add_sink("even_sink", even_sink);
+    let od = pipeline.add_sink("odd_sink", odd_sink);
+    pipeline.link(src, demux).unwrap();
+    pipeline.link_pads(demux, "even", ev, "sink").unwrap();
+    pipeline.link_pads(demux, "odd", od, "sink").unwrap();
+
+    let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_clone = log.clone();
+    let _ = pipeline.add_probe(
+        PadRef::src(demux),
+        ProbeType::EVENT_DOWN | ProbeType::EVENT_FLUSH,
+        move |data| {
+            if let ProbeData::Event(e) = data {
+                let entry = match e {
+                    Event::Segment(seg) => format!("segment:{}", seg.start),
+                    other => other.name().to_string(),
+                };
+                log_clone.lock().unwrap().push(entry);
+            }
+            ProbeReturn::Ok
+        },
+    );
+
+    let executor = Executor::new();
+    let handle = executor.start(&mut pipeline).unwrap();
+
+    for (seq, pts_ms) in [(0u64, 100u64), (1, 250)] {
+        let slot = arena().acquire().unwrap();
+        let mut meta = Metadata::from_sequence(seq);
+        meta.pts = ClockTime::from_millis(pts_ms);
+        src_handle
+            .push_buffer(Buffer::new(MemoryHandle::with_len(slot, 8), meta))
+            .await
+            .unwrap();
+    }
+    // Both pads have anchored.
+    for _ in 0..200 {
+        if log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.starts_with("segment:"))
+            .count()
+            >= 2
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // AppSrc is seekable by proxy; the flush trio travels through the fed
+    // demuxer to every pad.
+    assert!(handle.seek_time(ClockTime::from_secs(10)).await);
+    for _ in 0..200 {
+        if log.lock().unwrap().iter().any(|e| e == "flush-stop") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // Post-seek data re-anchors each pad.
+    for (seq, pts_ms) in [(2u64, 10_000u64), (3, 10_250)] {
+        let slot = arena().acquire().unwrap();
+        let mut meta = Metadata::from_sequence(seq);
+        meta.pts = ClockTime::from_millis(pts_ms);
+        src_handle
+            .push_buffer(Buffer::new(MemoryHandle::with_len(slot, 8), meta))
+            .await
+            .unwrap();
+    }
+    src_handle.end_stream();
+    while let Pulled::Buffer(_) = even_handle.pull_buffer().await {}
+    while let Pulled::Buffer(_) = odd_handle.pull_buffer().await {}
+    handle.wait().await.unwrap();
+
+    let log = log.lock().unwrap();
+    let flush_stop = log
+        .iter()
+        .position(|e| e == "flush-stop")
+        .unwrap_or_else(|| panic!("no flush-stop: {log:?}"));
+    let post: Vec<&String> = log[flush_stop..]
+        .iter()
+        .filter(|e| e.starts_with("segment:"))
+        .collect();
+    assert_eq!(
+        post,
+        vec![
+            &"segment:10000000000".to_string(),
+            &"segment:10250000000".to_string()
+        ],
+        "each pad re-anchors at its first post-seek PTS; the source's seek \
+         segment is swallowed: {log:?}"
+    );
+}

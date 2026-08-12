@@ -149,9 +149,19 @@ async fn flush_seek_traverses_chain_in_order() {
     assert!(handle.seek_time(ClockTime::from_nanos(1_000)).await);
 
     // The whole sequence must arrive at the sink before we resume pushing.
+    // The FIRST segment on the wire is the initial one (#165); the seek's
+    // segment is the second.
     wait_until(
-        || sink_log.lock().unwrap().iter().any(|e| e == "segment"),
-        "segment at the sink",
+        || {
+            sink_log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| *e == "segment")
+                .count()
+                >= 2
+        },
+        "the seek's segment at the sink",
     )
     .await;
 
@@ -167,11 +177,29 @@ async fn flush_seek_traverses_chain_in_order() {
                 .position(|e| e == needle)
                 .unwrap_or_else(|| panic!("{name}: no '{needle}' in {log:?}"))
         };
+        // #165: every pad's wire begins stream-start, then the initial
+        // segment, before any buffer.
+        assert_eq!(log[0], "stream-start", "{name}: {log:?}");
+        let initial_segment = pos("segment");
+        let first_buffer = log
+            .iter()
+            .position(|e| e.starts_with("buffer:"))
+            .unwrap_or_else(|| panic!("{name}: no buffers in {log:?}"));
+        assert!(
+            initial_segment < first_buffer,
+            "{name}: initial segment must precede the first buffer: {log:?}"
+        );
         let flush_start = pos("flush-start");
         let flush_stop = pos("flush-stop");
-        let segment = pos("segment");
+        // The seek's segment is the first one AFTER flush-stop.
+        let seek_segment = flush_stop
+            + 1
+            + log[flush_stop + 1..]
+                .iter()
+                .position(|e| e == "segment")
+                .unwrap_or_else(|| panic!("{name}: no post-flush segment in {log:?}"));
         assert!(
-            flush_start < flush_stop && flush_stop < segment,
+            flush_start < flush_stop && flush_stop < seek_segment,
             "{name}: events out of order: {log:?}"
         );
         for (i, entry) in log.iter().enumerate() {
@@ -184,7 +212,7 @@ async fn flush_seek_traverses_chain_in_order() {
                     );
                 } else {
                     assert!(
-                        i > segment,
+                        i > seek_segment,
                         "{name}: post-seek buffer {pts} surfaced before Segment: {log:?}"
                     );
                 }
@@ -249,7 +277,15 @@ async fn non_flushing_seek_queues_behind_data() {
     // Let the pre-seek buffers reach the sink pad before the seek, so their
     // ordering relative to the Segment is unambiguous in the log.
     wait_until(
-        || sink_log.lock().unwrap().len() >= 3,
+        || {
+            sink_log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.starts_with("buffer:"))
+                .count()
+                >= 3
+        },
         "pre-seek buffers at the sink",
     )
     .await;
@@ -259,8 +295,16 @@ async fn non_flushing_seek_queues_behind_data() {
     assert!(handle.seek(seek).await);
 
     wait_until(
-        || sink_log.lock().unwrap().iter().any(|e| e == "segment"),
-        "the queued segment",
+        || {
+            sink_log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| *e == "segment")
+                .count()
+                >= 2
+        },
+        "the queued segment (the initial one is first, #165)",
     )
     .await;
     src_handle
@@ -277,7 +321,7 @@ async fn non_flushing_seek_queues_behind_data() {
         !log.iter().any(|e| e.starts_with("flush")),
         "a non-flushing seek must not flush: {log:?}"
     );
-    let segment_at = log.iter().position(|e| e == "segment").unwrap();
+    let segment_at = log.iter().rposition(|e| e == "segment").unwrap();
     let pre = &log[..segment_at];
     assert_eq!(
         pre.iter().filter(|e| e.starts_with("buffer:")).count(),
@@ -395,5 +439,185 @@ async fn filesrc_seek_bytes_repositions() {
     }
     assert!(seek_done, "no SeekDone on the bus");
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ============================================================================
+// #165 slice 1: initial StreamStart/Segment
+// ============================================================================
+
+/// Captured segments: `(format, start, rate, stop)`.
+type SegmentLog = Arc<Mutex<Vec<(parallax::event::SegmentFormat, i64, f64, i64)>>>;
+
+fn segment_probe(pipeline: &mut Pipeline, pad: PadRef) -> SegmentLog {
+    let log: SegmentLog = Arc::new(Mutex::new(Vec::new()));
+    let log_clone = log.clone();
+    let _ = pipeline.add_probe(pad, ProbeType::EVENT_DOWN, move |data| {
+        if let ProbeData::Event(parallax::event::Event::Segment(seg)) = data {
+            log_clone
+                .lock()
+                .unwrap()
+                .push((seg.format, seg.start, seg.rate, seg.stop));
+        }
+        ProbeReturn::Ok
+    });
+    log
+}
+
+/// Every pad's wire begins stream-start → segment → buffers, and the initial
+/// segment anchors at the FIRST buffer's PTS — not zero — so `position()` is
+/// honest for streams that start late.
+#[tokio::test(flavor = "multi_thread")]
+async fn pipeline_start_emits_stream_start_then_segment() {
+    use parallax::event::SegmentFormat;
+
+    let mut pipeline = Pipeline::new();
+    let appsrc = AppSrc::with_max_buffers(8);
+    let src_handle = appsrc.handle();
+    let src = pipeline.add_source("src", appsrc);
+    let snk = pipeline.add_sink("sink", NullSink::new());
+    pipeline.link(src, snk).unwrap();
+
+    let src_log = log_probe(&mut pipeline, PadRef::src(src));
+    let sink_log = log_probe(&mut pipeline, PadRef::sink(snk));
+    let segments = segment_probe(&mut pipeline, PadRef::sink(snk));
+
+    let executor = Executor::new();
+    let handle = executor.start(&mut pipeline).unwrap();
+
+    // First PTS is 10 s, not zero.
+    src_handle
+        .push_buffer(buffer_with_pts(10_000_000_000))
+        .await
+        .unwrap();
+    src_handle
+        .push_buffer(buffer_with_pts(10_100_000_000))
+        .await
+        .unwrap();
+    src_handle.end_stream();
+    handle.wait().await.unwrap();
+
+    for (name, log) in [("src", src_log), ("sink", sink_log)] {
+        let log = log.lock().unwrap();
+        assert_eq!(
+            &log[..3],
+            &[
+                "stream-start".to_string(),
+                "segment".to_string(),
+                "buffer:10000000000".to_string()
+            ],
+            "{name}: wire must start stream-start → segment → first buffer: {log:?}"
+        );
+    }
+    let segments = segments.lock().unwrap();
+    assert_eq!(
+        segments.as_slice(),
+        &[(SegmentFormat::Time, 10_000_000_000, 1.0, -1)],
+        "initial segment anchors at the first PTS at rate 1.0, no stop"
+    );
+}
+
+/// The initial segment re-anchors `position()` immediately: a stream starting
+/// at 10 s reports ~10 s from its first buffer, not the running-time fallback.
+#[tokio::test(flavor = "multi_thread")]
+async fn initial_segment_anchors_position_for_nonzero_streams() {
+    let mut pipeline = Pipeline::new();
+    let appsrc = AppSrc::with_max_buffers(8);
+    let src_handle = appsrc.handle();
+    let src = pipeline.add_source("src", appsrc);
+    let appsink = AppSink::with_max_buffers(4);
+    let sink_handle = appsink.handle();
+    let snk = pipeline.add_sink("sink", appsink);
+    pipeline.link(src, snk).unwrap();
+
+    let executor = Executor::new();
+    let handle = executor.start(&mut pipeline).unwrap();
+
+    src_handle
+        .push_buffer(buffer_with_pts(10_000_000_000))
+        .await
+        .unwrap();
+    wait_until(
+        || handle.position().to_option() == Some(ClockTime::from_secs(10)),
+        "position anchored at the stream's real start",
+    )
+    .await;
+
+    src_handle.end_stream();
+    while let Pulled::Buffer(_) = sink_handle.pull_buffer().await {}
+    handle.wait().await.unwrap();
+}
+
+/// An untimestamped stream (FileSrc) gets a Bytes segment from zero — the
+/// sink's Time-only position store ignores it.
+#[tokio::test(flavor = "multi_thread")]
+async fn untimestamped_source_emits_bytes_segment() {
+    use parallax::event::SegmentFormat;
+
+    let dir = std::env::temp_dir().join(format!("parallax-165-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("data.bin");
+    std::fs::write(&path, vec![7u8; 4096]).unwrap();
+
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_source("src", FileSrc::new(&path).with_chunk_size(1024));
+    let snk = pipeline.add_sink("sink", NullSink::new());
+    pipeline.link(src, snk).unwrap();
+    let segments = segment_probe(&mut pipeline, PadRef::sink(snk));
+
+    let executor = Executor::new();
+    let handle = executor.start(&mut pipeline).unwrap();
+    handle.wait().await.unwrap();
+
+    let segments = segments.lock().unwrap();
+    assert_eq!(
+        segments.as_slice(),
+        &[(SegmentFormat::Bytes, 0, 1.0, -1)],
+        "untimestamped stream anchors a Bytes segment at zero"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The post-seek segment now carries the seek's rate and stop (#165), so the
+/// segment's shape is trick-play-ready even though playback rate is not yet
+/// consumed anywhere else.
+#[tokio::test(flavor = "multi_thread")]
+async fn post_seek_segment_carries_rate_and_stop() {
+    use parallax::event::{SeekEvent, SeekPosition, SegmentFormat};
+
+    let dir = std::env::temp_dir().join(format!("parallax-165b-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("data.bin");
+    std::fs::write(&path, vec![7u8; 64 * 1024]).unwrap();
+
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_source("src", FileSrc::new(&path).with_chunk_size(1024));
+    let appsink = AppSink::with_max_buffers(2);
+    let sink_handle = appsink.handle();
+    let snk = pipeline.add_sink("sink", appsink);
+    pipeline.link(src, snk).unwrap();
+    let segments = segment_probe(&mut pipeline, PadRef::sink(snk));
+
+    let executor = Executor::new();
+    let handle = executor.start(&mut pipeline).unwrap();
+
+    for _ in 0..2 {
+        assert!(matches!(sink_handle.pull_buffer().await, Pulled::Buffer(_)));
+    }
+    let seek = SeekEvent::new_bytes(32 * 1024)
+        .with_rate(2.0)
+        .with_stop(SeekPosition::set(48 * 1024));
+    assert!(handle.seek(seek).await);
+
+    while let Pulled::Buffer(_) = sink_handle.pull_buffer().await {}
+    handle.wait().await.unwrap();
+
+    let segments = segments.lock().unwrap();
+    let last = segments.last().expect("seek segment captured");
+    assert_eq!(
+        *last,
+        (SegmentFormat::Bytes, 32 * 1024, 2.0, 48 * 1024),
+        "seek segment carries landing, rate and stop: {segments:?}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

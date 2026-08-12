@@ -35,7 +35,9 @@ use crate::element::{
     Output, ProcessingHint, SourceResult,
 };
 use crate::error::{Error, Result};
-use crate::event::{Event, EventResult, FlushStopEvent, SeekEvent, SeekType, SegmentEvent};
+use crate::event::{
+    Event, EventResult, FlushStopEvent, SeekEvent, SeekType, SegmentEvent, StreamStartEvent,
+};
 use crate::memory::{OutputBudget, defaults};
 use crate::pipeline::bus::{Bus, BusHandle};
 use crate::pipeline::flow::{LinkFlowMonitor, WaterMarks};
@@ -2172,6 +2174,31 @@ async fn broadcast_event(branches: &[OutputBranch], event: &Event) {
     }
 }
 
+/// Initial segment for a producing pad (#165): Time anchored at the first
+/// buffer's PTS — so `position()` is honest for streams that start at t > 0
+/// and the mapping matches the post-seek segment convention — or Bytes from
+/// zero when the stream is untimestamped.
+fn initial_segment_for(buffer: &Buffer) -> SegmentEvent {
+    match buffer.metadata().pts.to_option() {
+        Some(pts) => SegmentEvent::new_time(pts, None),
+        None => SegmentEvent::new_bytes(0, None),
+    }
+}
+
+/// Probe-then-broadcast for an event emitted on a src pad: src-pad probes see
+/// each emitted event, and Drop/Handled suppresses the emission.
+async fn emit_event(
+    outputs: &[OutputBranch],
+    src_pad: &crate::pipeline::probe::PadRef,
+    probes: &ProbeRegistry,
+    event: Event,
+) {
+    match probes.invoke_event(src_pad, &event, true) {
+        ProbeReturn::Drop | ProbeReturn::Handled => {}
+        _ => broadcast_event(outputs, &event).await,
+    }
+}
+
 /// Run an element call, converting a panic into an ordinary element error.
 ///
 /// A panicking task used to be invisible: it never reached its own error arm,
@@ -2328,8 +2355,11 @@ impl ChannelNetwork {
 /// output branch — FlushStart → FlushStop → Segment, the order downstream
 /// elements rely on to discard stale data and re-anchor their timeline — and
 /// posts [`MessageKind::SeekDone`](crate::pipeline::bus::MessageKind::SeekDone) on the bus. The segment is synthesized here
-/// from the seek's target: asking the element for its actual landing position
-/// would need a new `AsyncElementDyn` method, which is an ABI bump.
+/// from the seek's target and reported landing.
+///
+/// Returns `true` when a Segment was emitted, so the caller can suppress its
+/// lazy initial segment (#165) — a seek that lands before the first buffer
+/// already established the mapping.
 async fn handle_source_control_event(
     name: &str,
     element: &mut Box<DynAsyncElement<'static>>,
@@ -2339,15 +2369,15 @@ async fn handle_source_control_event(
     probe_registry: &ProbeRegistry,
     flush_epoch: &AtomicU64,
     bus: &BusHandle,
-) {
+) -> bool {
     match probe_registry.invoke_event(src_pad, event, false) {
-        ProbeReturn::Drop | ProbeReturn::Handled => return,
+        ProbeReturn::Drop | ProbeReturn::Handled => return false,
         _ => {}
     }
 
     let result = element.handle_upstream_event(event);
     let Event::Seek(seek) = event else {
-        return;
+        return false;
     };
 
     match result {
@@ -2389,8 +2419,10 @@ async fn handle_source_control_event(
             // reported one (a keyframe-snapping demuxer lands off-target),
             // else the requested position. Current/End-relative requests
             // have no absolute target — only the element knows where they
-            // ended up (FileSrc reports it). `base` stays 0: nothing
-            // downstream consumes running time from segments yet (#165).
+            // ended up (FileSrc reports it). The seek's rate and stop are
+            // carried so the segment's shape is right for trick play;
+            // `base` stays 0 and `applied_rate` 1.0 until rate ≠ 1.0
+            // playback actually lands (#165).
             let requested = match seek.start.seek_type {
                 SeekType::Set => Some(seek.start.position.max(0)),
                 _ => None,
@@ -2403,15 +2435,27 @@ async fn handle_source_control_event(
                 );
                 0
             });
+            let stop = match seek.stop.seek_type {
+                SeekType::Set => Some(seek.stop.position.max(0) as u64),
+                _ => None,
+            };
             let segment = match seek.format {
                 crate::event::SegmentFormat::Bytes => {
-                    SegmentEvent::new_bytes(segment_start as u64, None)
+                    SegmentEvent::new_bytes(segment_start as u64, stop)
                 }
-                _ => SegmentEvent::new_time(ClockTime::from_nanos(segment_start as u64), None),
-            };
-            if let Some(ev) = emit(Event::Segment(segment)) {
-                broadcast_event(outputs, &ev).await;
+                _ => SegmentEvent::new_time(
+                    ClockTime::from_nanos(segment_start as u64),
+                    stop.map(ClockTime::from_nanos),
+                ),
             }
+            .with_rate(seek.rate);
+            let segment_emitted = match emit(Event::Segment(segment)) {
+                Some(ev) => {
+                    broadcast_event(outputs, &ev).await;
+                    true
+                }
+                None => false,
+            };
 
             bus.post(crate::pipeline::bus::MessageKind::SeekDone {
                 seqnum: seek.seqnum(),
@@ -2423,12 +2467,15 @@ async fn handle_source_control_event(
                 "source '{name}': seek {} handled, segment starts at {segment_start}",
                 seek.seqnum()
             );
+            segment_emitted
         }
         EventResult::NotHandled => {
             bus.post_warning(format!("source '{name}' cannot seek; seek ignored"), None);
+            false
         }
         EventResult::Error => {
             bus.post_warning(format!("source '{name}': seek failed"), None);
+            false
         }
     }
 }
@@ -2455,6 +2502,26 @@ fn spawn_source_task(
         events.send_node_started(&name);
 
         let src_pad = crate::pipeline::probe::PadRef::src(node_id);
+        // StreamStart precedes everything on the wire — including a seek's
+        // flush trio, when one lands before the first buffer (#165).
+        emit_event(
+            &outputs,
+            &src_pad,
+            &probe_registry,
+            Event::StreamStart(StreamStartEvent::new(&name)),
+        )
+        .await;
+        // The initial Segment is lazy: it anchors at the FIRST buffer's PTS,
+        // which is only known once produced. A pre-first-buffer seek emits
+        // the segment instead and suppresses this one. Byte-oriented sources
+        // (FileSrc, HttpSrc — they answer duration queries in Bytes) get a
+        // Bytes segment instead: their buffers carry a meaningless PTS of
+        // zero, not a timeline (`Metadata::default()` is ZERO, not NONE).
+        let bytes_native = matches!(
+            element.source_query_duration(),
+            Some(q) if q.format == crate::event::SegmentFormat::Bytes
+        );
+        let mut segment_sent = false;
         let mut count: u64 = 0;
         let mut would_block_count: u64 = 0;
 
@@ -2477,7 +2544,7 @@ fn spawn_source_task(
             // The cost is that a source blocked inside `process_source` sees
             // the event only when that call returns — same caveat as `stop`.
             while let Ok(Some(event)) = control_rx.try_recv() {
-                handle_source_control_event(
+                segment_sent |= handle_source_control_event(
                     &name,
                     &mut element,
                     &event,
@@ -2495,7 +2562,7 @@ fn spawn_source_task(
             // paused, and stop still wins.
             while *pause_rx.borrow() && !stop.load(Ordering::Acquire) {
                 while let Ok(Some(event)) = control_rx.try_recv() {
-                    handle_source_control_event(
+                    segment_sent |= handle_source_control_event(
                         &name,
                         &mut element,
                         &event,
@@ -2515,6 +2582,20 @@ fn spawn_source_task(
                     let buffer = *buffer;
                     count += 1;
                     would_block_count = 0; // Reset
+
+                    // Lazy initial segment, anchored at this first buffer's
+                    // PTS (#165) — emitted before the buffer's own probes so
+                    // pad logs see segment-then-buffer, matching the wire.
+                    if !segment_sent {
+                        segment_sent = true;
+                        let segment = if bytes_native {
+                            SegmentEvent::new_bytes(0, None)
+                        } else {
+                            initial_segment_for(&buffer)
+                        };
+                        emit_event(&outputs, &src_pad, &probe_registry, Event::Segment(segment))
+                            .await;
+                    }
 
                     // Invoke buffer probes
                     match probe_registry.invoke_buffer(&src_pad, &buffer) {
@@ -3173,12 +3254,39 @@ async fn route_demux_buffer(
     outputs_by_pad: &HashMap<String, Vec<OutputBranch>>,
     tracers: &TracerRegistry,
     unrouted: &mut u64,
+    segment_pads: &mut HashSet<String>,
+    src_pad: &crate::pipeline::probe::PadRef,
+    probes: &ProbeRegistry,
 ) {
     match outputs_by_pad.get(pad) {
         Some(branches) => {
+            // Per-pad lazy initial segment, anchored at this pad's first
+            // buffer (#165): each elementary stream carries its own PTS
+            // domain, so pads anchor independently.
+            if segment_pads.insert(pad.to_string()) {
+                emit_event(
+                    branches,
+                    src_pad,
+                    probes,
+                    Event::Segment(initial_segment_for(&buffer)),
+                )
+                .await;
+            }
             broadcast(branches, buffer, epoch, tracers).await;
         }
         None if pad.is_empty() => {
+            // Legacy broadcast pad: one shared segment for every branch.
+            if segment_pads.insert(String::new()) {
+                for branches in outputs_by_pad.values() {
+                    emit_event(
+                        branches,
+                        src_pad,
+                        probes,
+                        Event::Segment(initial_segment_for(&buffer)),
+                    )
+                    .await;
+                }
+            }
             for branches in outputs_by_pad.values() {
                 broadcast(branches, buffer.clone(), epoch, tracers).await;
             }
@@ -3224,6 +3332,21 @@ fn spawn_demuxer_task(
         // Control events (seek) broadcast their flush sequence to every pad.
         let all_branches: Vec<OutputBranch> = outputs_by_pad.values().flatten().cloned().collect();
 
+        // #165: this node OWNS its pads' StreamStart/Segment — eager
+        // per-pad StreamStart now, lazy per-pad Segment at each pad's first
+        // buffer. Upstream StreamStart/Segment (a fed demuxer's byte-domain
+        // input) is offered to the element and swallowed below.
+        for (pad, branches) in &outputs_by_pad {
+            emit_event(
+                branches,
+                &src_pad,
+                &probe_registry,
+                Event::StreamStart(StreamStartEvent::new(format!("{name}/{pad}"))),
+            )
+            .await;
+        }
+        let mut segment_pads: HashSet<String> = HashSet::new();
+
         if let Some(rx) = inputs.into_iter().next() {
             // Same input-epoch rule as spawn_transform_task: outputs carry the
             // epoch of the input they came from.
@@ -3268,6 +3391,9 @@ fn spawn_demuxer_task(
                                         &outputs_by_pad,
                                         &tracers,
                                         &mut unrouted,
+                                        &mut segment_pads,
+                                        &src_pad,
+                                        &probe_registry,
                                     )
                                     .await;
                                 }
@@ -3302,6 +3428,29 @@ fn spawn_demuxer_task(
                         }
                         // Events go to every output pad, like EOS does.
                         if let Some(fwd) = element.handle_downstream_event(event) {
+                            match &fwd {
+                                // This node owns its pads' stream identity:
+                                // the input-side StreamStart/Segment describe
+                                // the upstream (byte) domain, and forwarding
+                                // them would mislabel the elementary streams.
+                                // The element saw them above — that is the
+                                // hook a TIME→BYTES-translating demuxer will
+                                // use (#163 phase B). Swallowed before the
+                                // src-pad probes: they never reach the wire.
+                                Event::StreamStart(_) | Event::Segment(_) => {
+                                    tracing::debug!(
+                                        "demuxer '{name}': swallowing upstream {}",
+                                        fwd.name()
+                                    );
+                                    continue;
+                                }
+                                // After an upstream flush (e.g. a byte seek on
+                                // the source below a fed demuxer), each pad
+                                // re-anchors with a fresh Time segment at its
+                                // first post-seek buffer.
+                                Event::FlushStop(_) => segment_pads.clear(),
+                                _ => {}
+                            }
                             match probe_registry.invoke_event(&src_pad, &fwd, true) {
                                 ProbeReturn::Drop | ProbeReturn::Handled => continue,
                                 _ => {}
@@ -3335,6 +3484,9 @@ fn spawn_demuxer_task(
                                             &outputs_by_pad,
                                             &tracers,
                                             &mut unrouted,
+                                            &mut segment_pads,
+                                            &src_pad,
+                                            &probe_registry,
                                         )
                                         .await;
                                     }
@@ -3371,7 +3523,7 @@ fn spawn_demuxer_task(
                 // same polling contract as spawn_source_task.
                 if let Some(control_rx) = &control_rx {
                     while let Ok(Some(event)) = control_rx.try_recv() {
-                        handle_source_control_event(
+                        if handle_source_control_event(
                             &name,
                             &mut element,
                             &event,
@@ -3381,7 +3533,11 @@ fn spawn_demuxer_task(
                             &flush_epoch,
                             &bus,
                         )
-                        .await;
+                        .await
+                        {
+                            // The seek's segment went to every pad.
+                            segment_pads.extend(outputs_by_pad.keys().cloned());
+                        }
                     }
                 }
 
@@ -3396,7 +3552,7 @@ fn spawn_demuxer_task(
                 while *pause_rx.borrow() && !stop.load(Ordering::Acquire) {
                     if let Some(control_rx) = &control_rx {
                         while let Ok(Some(event)) = control_rx.try_recv() {
-                            handle_source_control_event(
+                            if handle_source_control_event(
                                 &name,
                                 &mut element,
                                 &event,
@@ -3406,7 +3562,10 @@ fn spawn_demuxer_task(
                                 &flush_epoch,
                                 &bus,
                             )
-                            .await;
+                            .await
+                            {
+                                segment_pads.extend(outputs_by_pad.keys().cloned());
+                            }
                         }
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -3433,6 +3592,9 @@ fn spawn_demuxer_task(
                                 &outputs_by_pad,
                                 &tracers,
                                 &mut unrouted,
+                                &mut segment_pads,
+                                &src_pad,
+                                &probe_registry,
                             )
                             .await;
                         }
@@ -3496,6 +3658,18 @@ fn spawn_muxer_task(
         let sink_pad = crate::pipeline::probe::PadRef::sink(node_id);
         let src_pad = crate::pipeline::probe::PadRef::src(node_id);
         let mut count: u64 = 0;
+
+        // #165: the muxed output is a new stream — this node owns its
+        // StreamStart/Segment, and the per-input ones are swallowed below
+        // (forwarding N inputs' segments would mislabel the one output).
+        emit_event(
+            &outputs,
+            &src_pad,
+            &probe_registry,
+            Event::StreamStart(StreamStartEvent::new(&name)),
+        )
+        .await;
+        let mut segment_sent = false;
 
         // One pending receive per input, re-armed after each message.
         //
@@ -3568,6 +3742,16 @@ fn spawn_muxer_task(
                                 ProbeReturn::Drop | ProbeReturn::Handled => continue,
                                 _ => {}
                             }
+                            if !segment_sent {
+                                segment_sent = true;
+                                emit_event(
+                                    &outputs,
+                                    &src_pad,
+                                    &probe_registry,
+                                    Event::Segment(initial_segment_for(&out)),
+                                )
+                                .await;
+                            }
                             broadcast(&outputs, out, in_epoch, &tracers).await;
                         }
                         Ok(None) => {}
@@ -3599,6 +3783,17 @@ fn spawn_muxer_task(
                     };
                     match element.handle_downstream_event(event) {
                         Some(fwd) if forward => {
+                            match &fwd {
+                                // The muxed output has its own stream
+                                // identity; per-input StreamStart/Segment
+                                // describe the input tracks (#165), swallowed
+                                // before the src-pad probes.
+                                Event::StreamStart(_) | Event::Segment(_) => continue,
+                                // Post-flush, the output re-anchors at its
+                                // first fresh buffer.
+                                Event::FlushStop(_) => segment_sent = false,
+                                _ => {}
+                            }
                             match probe_registry.invoke_event(&src_pad, &fwd, true) {
                                 ProbeReturn::Drop | ProbeReturn::Handled => continue,
                                 _ => {}
@@ -3621,6 +3816,16 @@ fn spawn_muxer_task(
                     if eos_count >= total {
                         // Flush any remaining data from final processing
                         if let Ok(Some(out)) = guard(&name, element.process(None)).await {
+                            if !segment_sent {
+                                segment_sent = true;
+                                emit_event(
+                                    &outputs,
+                                    &src_pad,
+                                    &probe_registry,
+                                    Event::Segment(initial_segment_for(&out)),
+                                )
+                                .await;
+                            }
                             broadcast(&outputs, out, in_epoch, &tracers).await;
                         }
                         // Flush any buffered data before propagating EOS
@@ -3632,6 +3837,16 @@ fn spawn_muxer_task(
                                     Output::Multiple(v) => v,
                                 };
                                 for buffer in buffers {
+                                    if !segment_sent {
+                                        segment_sent = true;
+                                        emit_event(
+                                            &outputs,
+                                            &src_pad,
+                                            &probe_registry,
+                                            Event::Segment(initial_segment_for(&buffer)),
+                                        )
+                                        .await;
+                                    }
                                     broadcast(&outputs, buffer, in_epoch, &tracers).await;
                                 }
                             }
