@@ -132,6 +132,51 @@ impl Element for AsyncCounter {
     }
 }
 
+/// F32-silence source stamping `MediaFormat::AudioRaw` per buffer — the
+/// metadata `Gain` requires since it became format-aware (#159).
+struct AudioNullSource {
+    count: u64,
+    max: u64,
+    arena: Arc<parallax::memory::SharedArena>,
+}
+
+impl AudioNullSource {
+    fn new(max: u64) -> Self {
+        Self {
+            count: 0,
+            max,
+            arena: Arc::new(parallax::memory::SharedArena::new(64, 64).unwrap()),
+        }
+    }
+}
+
+impl parallax::element::Source for AudioNullSource {
+    fn produce(
+        &mut self,
+        _ctx: &mut parallax::element::ProduceContext,
+    ) -> Result<parallax::element::ProduceResult> {
+        use parallax::buffer::MemoryHandle;
+        use parallax::format::{AudioFormat, MediaFormat, SampleFormat};
+        use parallax::metadata::Metadata;
+        if self.count >= self.max {
+            return Ok(parallax::element::ProduceResult::Eos);
+        }
+        self.arena.reclaim();
+        let Some(slot) = self.arena.acquire() else {
+            return Ok(parallax::element::ProduceResult::WouldBlock);
+        };
+        let mut metadata = Metadata::from_sequence(self.count);
+        metadata.format = Some(MediaFormat::AudioRaw(AudioFormat::new(
+            48_000,
+            2,
+            SampleFormat::F32,
+        )));
+        let buffer = Buffer::new(MemoryHandle::with_len(slot, 64), metadata);
+        self.count += 1;
+        Ok(parallax::element::ProduceResult::OwnBuffer(buffer))
+    }
+}
+
 /// Counting sink that records the total number of buffers received.
 struct CountingSink {
     count: Arc<AtomicU64>,
@@ -464,7 +509,7 @@ async fn test_gain_hybrid_pipeline() {
     let num_buffers = 10u64;
 
     let mut pipeline = Pipeline::new();
-    let src = pipeline.add_source("src", NullSource::new(num_buffers));
+    let src = pipeline.add_source("src", AudioNullSource::new(num_buffers));
     let gain = pipeline.add_filter("gain", Gain::new(2.0));
     let sink = pipeline.add_sink("sink", CountingSink::new(sink_count.clone()));
 
@@ -1050,6 +1095,21 @@ fn test_rt_processing_allocation_free() {
 
     // --- Test Gain ---
     {
+        use parallax::format::{AudioFormat, MediaFormat, SampleFormat};
+
+        // Gain requires per-buffer AudioRaw metadata (#159); the stamp is a
+        // Copy struct inside the enum, so it must not cost an allocation —
+        // that is part of what this test now guards.
+        let audio_meta = |seq: u64| {
+            let mut m = Metadata::from_sequence(seq);
+            m.format = Some(MediaFormat::AudioRaw(AudioFormat::new(
+                48_000,
+                2,
+                SampleFormat::F32,
+            )));
+            m
+        };
+
         let gain = Gain::new(2.0);
         let mut adapter = DynAsyncElement::new_box(ElementAdapter::new(gain));
         let sync_elem = adapter
@@ -1059,7 +1119,7 @@ fn test_rt_processing_allocation_free() {
         // Warm up
         let slot = arena.acquire().unwrap();
         let handle = MemoryHandle::with_len(slot, 64);
-        let warmup = Buffer::new(handle, Metadata::from_sequence(0));
+        let warmup = Buffer::new(handle, audio_meta(0));
         let _ = sync_elem.process_sync(warmup);
 
         // Measure
@@ -1067,7 +1127,7 @@ fn test_rt_processing_allocation_free() {
         for i in 1..=50u64 {
             let slot = arena.acquire().unwrap();
             let handle = MemoryHandle::with_len(slot, 64);
-            let buffer = Buffer::new(handle, Metadata::from_sequence(i));
+            let buffer = Buffer::new(handle, audio_meta(i));
             let result = sync_elem.process_sync(buffer);
             assert!(result.is_ok());
             drop(result);

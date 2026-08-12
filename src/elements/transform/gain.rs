@@ -1,11 +1,15 @@
 //! Gain element for RT-safe audio amplitude adjustment.
 //!
-//! Multiplies audio samples by a constant factor in-place.
+//! Multiplies audio samples by a constant factor in-place, branching on the
+//! buffer's [`MediaFormat::AudioRaw`] metadata (S16/S32/F32/U8). A buffer
+//! without that metadata is an error — the old behavior silently assumed
+//! f32LE, which corrupted S16 streams into noise (#159).
 //! No allocations, no blocking — safe for real-time threads.
 
 use crate::buffer::Buffer;
 use crate::element::{Element, ExecutionHints, LatencyHint, ProcessingHint};
-use crate::error::Result;
+use crate::error::{Error, Result};
+use crate::format::{MediaFormat, SampleFormat};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -58,8 +62,13 @@ impl GainControl {
 
 /// RT-safe gain element that multiplies audio samples by a constant factor.
 ///
-/// Operates on f32 (little-endian) samples in-place. No allocation occurs
-/// during processing, making it suitable for RT data threads.
+/// Format-aware and in-place: each buffer's [`MediaFormat::AudioRaw`]
+/// metadata (which every audio decoder stamps per buffer) selects the
+/// sample interpretation — S16, S32, F32 or U8, little-endian. A buffer
+/// carrying no `AudioRaw` metadata is a hard error, at any factor: the
+/// alternative was assuming f32 and turning S16 audio into noise the
+/// moment the volume moved off unity. No allocation occurs during
+/// processing, making it suitable for RT data threads.
 ///
 /// The factor can be changed on a running pipeline through
 /// [`control`](Self::control).
@@ -154,6 +163,18 @@ impl crate::control::Controllable for Gain {
 
 impl Element for Gain {
     fn process(&mut self, mut buffer: Buffer) -> Result<Option<Buffer>> {
+        // Metadata first, before any fast path: erroring only once the
+        // factor moves off unity would let a mis-wired pipeline play fine
+        // until the user touches the volume — fail on the first buffer
+        // instead. (The AudioRaw clone is a Copy struct; no allocation.)
+        let Some(MediaFormat::AudioRaw(fmt)) = buffer.metadata().format.clone() else {
+            return Err(Error::Config(format!(
+                "{}: buffer carries no AudioRaw format metadata \
+                 (decoders set it per buffer; see MediaFormat::AudioRaw)",
+                self.name
+            )));
+        };
+
         let factor = self.factor();
 
         // Fast path: unity gain — no work needed
@@ -161,18 +182,50 @@ impl Element for Gain {
             return Ok(Some(buffer));
         }
 
-        // Fast path: mute — zero the buffer
+        // Fast path: mute. Digital silence is 0 for the signed and float
+        // formats but the midpoint for unsigned 8-bit.
         if factor == 0.0 {
-            buffer.as_bytes_mut().fill(0);
+            let silence = match fmt.sample_format {
+                SampleFormat::U8 => 0x80,
+                _ => 0,
+            };
+            buffer.as_bytes_mut().fill(silence);
             return Ok(Some(buffer));
         }
 
-        // Apply gain to f32 samples in-place
+        // Scale in-place, branched on the stream's actual sample format.
         let data = buffer.as_bytes_mut();
-        for sample in data.chunks_exact_mut(4) {
-            let val = f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]);
-            let out = val * factor;
-            sample.copy_from_slice(&out.to_le_bytes());
+        match fmt.sample_format {
+            SampleFormat::F32 => {
+                for sample in data.chunks_exact_mut(4) {
+                    let val = f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]);
+                    sample.copy_from_slice(&(val * factor).to_le_bytes());
+                }
+            }
+            SampleFormat::S16 => {
+                for sample in data.chunks_exact_mut(2) {
+                    let val = i16::from_le_bytes([sample[0], sample[1]]);
+                    let out = (f32::from(val) * factor).clamp(-32768.0, 32767.0) as i16;
+                    sample.copy_from_slice(&out.to_le_bytes());
+                }
+            }
+            SampleFormat::S32 => {
+                // f64: f32's 24-bit mantissa cannot represent i32 exactly.
+                for sample in data.chunks_exact_mut(4) {
+                    let val = i32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]);
+                    let out = (f64::from(val) * f64::from(factor))
+                        .clamp(f64::from(i32::MIN), f64::from(i32::MAX))
+                        as i32;
+                    sample.copy_from_slice(&out.to_le_bytes());
+                }
+            }
+            SampleFormat::U8 => {
+                // Scale around the unsigned midpoint, not around zero.
+                for sample in data.iter_mut() {
+                    let centered = f32::from(*sample) - 128.0;
+                    *sample = (centered * factor + 128.0).clamp(0.0, 255.0) as u8;
+                }
+            }
         }
 
         Ok(Some(buffer))
@@ -205,17 +258,45 @@ mod tests {
         ARENA.get_or_init(|| SharedArena::new(256, 64).unwrap())
     }
 
+    fn audio_metadata(seq: u64, format: SampleFormat) -> Metadata {
+        use crate::format::AudioFormat;
+        let mut metadata = Metadata::from_sequence(seq);
+        metadata.format = Some(MediaFormat::AudioRaw(AudioFormat::new(48_000, 2, format)));
+        metadata
+    }
+
     fn create_f32_buffer(samples: &[f32], seq: u64) -> Buffer {
         let arena = test_arena();
         let slot = arena.acquire().unwrap();
         let byte_len = samples.len() * 4;
         let handle = MemoryHandle::with_len(slot, byte_len);
-        let mut buffer = Buffer::new(handle, Metadata::from_sequence(seq));
+        let mut buffer = Buffer::new(handle, audio_metadata(seq, SampleFormat::F32));
         let data = buffer.as_bytes_mut();
         for (i, &sample) in samples.iter().enumerate() {
             data[i * 4..(i + 1) * 4].copy_from_slice(&sample.to_le_bytes());
         }
         buffer
+    }
+
+    fn create_s16_buffer(samples: &[i16], seq: u64) -> Buffer {
+        let arena = test_arena();
+        let slot = arena.acquire().unwrap();
+        let byte_len = samples.len() * 2;
+        let handle = MemoryHandle::with_len(slot, byte_len);
+        let mut buffer = Buffer::new(handle, audio_metadata(seq, SampleFormat::S16));
+        let data = buffer.as_bytes_mut();
+        for (i, &sample) in samples.iter().enumerate() {
+            data[i * 2..(i + 1) * 2].copy_from_slice(&sample.to_le_bytes());
+        }
+        buffer
+    }
+
+    fn read_s16_samples(buffer: &Buffer) -> Vec<i16> {
+        buffer
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect()
     }
 
     fn read_f32_samples(buffer: &Buffer) -> Vec<f32> {
@@ -251,6 +332,59 @@ mod tests {
         let result = gain.process(buffer).unwrap().unwrap();
         let samples = read_f32_samples(&result);
         assert_eq!(samples, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn s16_streams_scale_as_integers_not_reinterpreted_f32() {
+        // The old code read S16 pairs as f32 — noise. Half amplitude must
+        // be exact integer halving.
+        let mut gain = Gain::new(0.5);
+        let buffer = create_s16_buffer(&[10_000, -10_000, 0, 32_000], 0);
+        let result = gain.process(buffer).unwrap().unwrap();
+        assert_eq!(read_s16_samples(&result), vec![5_000, -5_000, 0, 16_000]);
+    }
+
+    #[test]
+    fn s16_gain_clamps_instead_of_wrapping() {
+        let mut gain = Gain::new(4.0);
+        let buffer = create_s16_buffer(&[20_000, -20_000], 0);
+        let result = gain.process(buffer).unwrap().unwrap();
+        assert_eq!(read_s16_samples(&result), vec![32_767, -32_768]);
+    }
+
+    #[test]
+    fn u8_mute_is_the_midpoint_not_zero() {
+        use crate::format::AudioFormat;
+        let arena = test_arena();
+        let slot = arena.acquire().unwrap();
+        let handle = MemoryHandle::with_len(slot, 4);
+        let mut metadata = Metadata::from_sequence(0);
+        metadata.format = Some(MediaFormat::AudioRaw(AudioFormat::new(
+            8_000,
+            1,
+            SampleFormat::U8,
+        )));
+        let mut buffer = Buffer::new(handle, metadata);
+        buffer.as_bytes_mut().copy_from_slice(&[0, 64, 192, 255]);
+
+        let mut gain = Gain::new(0.0);
+        let result = gain.process(buffer).unwrap().unwrap();
+        // 0x80 is U8 digital silence; a fill(0) would be a full-scale DC
+        // offset, i.e. a loud pop.
+        assert_eq!(result.as_bytes(), &[0x80; 4]);
+    }
+
+    #[test]
+    fn a_buffer_without_audio_metadata_is_an_error_even_at_unity() {
+        let arena = test_arena();
+        let slot = arena.acquire().unwrap();
+        let handle = MemoryHandle::with_len(slot, 8);
+        let buffer = Buffer::new(handle, Metadata::from_sequence(0));
+
+        // Unity too: erroring only once the volume moves would let a
+        // mis-wired pipeline play fine until the first keypress.
+        let mut gain = Gain::new(1.0);
+        assert!(gain.process(buffer).is_err());
     }
 
     #[test]

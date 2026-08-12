@@ -17,8 +17,8 @@ use parallax::elements::demux::{
 use parallax::elements::device::{AlsaFormat, AlsaSampleFormat, AlsaSink};
 use parallax::elements::transform::{AudioDownmix, VideoConvertElement};
 use parallax::elements::{
-    AacDecoder, AutoVideoSink, Dav1dDecoder, H264Decoder, OpusDecoder, VideoKey, VideoWindowEvent,
-    VorbisDecoder, VpxDecoder,
+    AacDecoder, AutoVideoSink, Dav1dDecoder, Gain, H264Decoder, OpusDecoder, VideoKey,
+    VideoWindowEvent, VorbisDecoder, VpxDecoder,
 };
 use parallax::pipeline::typefind::{MediaType, TypeFindRegistry};
 use parallax::pipeline::{EndReason, Executor, LinkPolicy, Pipeline};
@@ -373,6 +373,9 @@ fn open_and_probe(args: &Args) -> anyhow::Result<Probed> {
 enum Command {
     PauseToggle,
     SeekBy(i64),
+    /// Volume step in dB (±2 per keypress, clamped in the handler).
+    VolumeBy(f32),
+    MuteToggle,
     Fullscreen,
     Quit,
 }
@@ -382,11 +385,14 @@ fn command_for_key(key: &VideoKey) -> Option<Command> {
         VideoKey::Space => Some(Command::PauseToggle),
         VideoKey::ArrowLeft => Some(Command::SeekBy(-10)),
         VideoKey::ArrowRight => Some(Command::SeekBy(10)),
+        VideoKey::ArrowUp => Some(Command::VolumeBy(2.0)),
+        VideoKey::ArrowDown => Some(Command::VolumeBy(-2.0)),
         VideoKey::Escape => Some(Command::Quit),
         VideoKey::Enter => Some(Command::Fullscreen),
         VideoKey::Character(c) => match c.as_str() {
             "q" => Some(Command::Quit),
             "f" => Some(Command::Fullscreen),
+            "m" => Some(Command::MuteToggle),
             " " => Some(Command::PauseToggle),
             _ => None,
         },
@@ -412,6 +418,9 @@ fn command_for_terminal() -> Option<Command> {
                 KeyCode::Char(' ') => Some(Command::PauseToggle),
                 KeyCode::Left => Some(Command::SeekBy(-10)),
                 KeyCode::Right => Some(Command::SeekBy(10)),
+                KeyCode::Up => Some(Command::VolumeBy(2.0)),
+                KeyCode::Down => Some(Command::VolumeBy(-2.0)),
+                KeyCode::Char('m') => Some(Command::MuteToggle),
                 // No Esc here, deliberately: with `poll(ZERO)` crossterm can
                 // catch the lone ESC byte of a not-yet-complete arrow
                 // sequence and report Esc — quitting on an arrow key. `q`
@@ -663,6 +672,8 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
     pipeline.link(dec, cvt)?;
     pipeline.link(cvt, snk)?;
 
+    // Volume handle, taken before start(); None on a video-only run.
+    let mut volume: Option<parallax::elements::GainControl> = None;
     if let Some((audio_decoder, alsa_sink)) = audio {
         let adec = match audio_decoder {
             AudioDec::Aac(d) => pipeline.add_transform("audiodec", d),
@@ -674,11 +685,18 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
         // untouched, so this is free for the common case and keeps a
         // future multichannel decoder from mis-sizing the sink.
         let adownmix = pipeline.add_filter("adownmix", AudioDownmix::new());
+        // Software volume — format-aware (reads each buffer's AudioRaw
+        // metadata), so it sits safely on the S16 and F32 branches alike.
+        // The control handle must be taken BEFORE start moves the element.
+        let gain = Gain::new(1.0).with_name("volume");
+        volume = Some(gain.control());
+        let avolume = pipeline.add_filter("volume", gain);
         let aout = pipeline.add_async_sink("speaker", alsa_sink);
         // ~2 s of audio read-ahead at ~20 ms per packet.
         pipeline.link_pads_full(src, "audio", adec, "sink", LinkPolicy::Block, Some(96))?;
         pipeline.link(adec, adownmix)?;
-        pipeline.link(adownmix, aout)?;
+        pipeline.link(adownmix, avolume)?;
+        pipeline.link(avolume, aout)?;
     }
 
     let executor = Executor::new();
@@ -688,9 +706,15 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
     let mut bus = handle.take_bus();
     let mut ended = handle.ended();
 
-    println!("controls: Space pause · ←/→ seek 10s · f fullscreen · q quit");
+    println!("controls: Space pause · ←/→ seek 10s · ↑/↓ volume · m mute · f fullscreen · q quit");
     let raw_mode = RawMode::enable();
     let mut status_tick = tokio::time::interval(std::time::Duration::from_millis(250));
+
+    // Volume state lives player-side: the Gain handle only knows a linear
+    // factor, while the UI thinks in dB steps and a mute that remembers the
+    // level it will restore.
+    let mut vol_db: f32 = 0.0;
+    let mut muted = false;
 
     // The window opens lazily on the first displayed frame, so is_open()
     // starts out false — only treat false as "closed" after it was seen open.
@@ -746,8 +770,17 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
                         }
                     }
                 }
+                let vol = if volume.is_none() {
+                    String::new()
+                } else if muted {
+                    " · muted".to_string()
+                } else if vol_db != 0.0 {
+                    format!(" · vol {vol_db:+.0} dB")
+                } else {
+                    String::new()
+                };
                 print!(
-                    "\r\x1b[K{} / {}{state}{drops}{notes}",
+                    "\r\x1b[K{} / {}{state}{vol}{drops}{notes}",
                     mmss(position),
                     mmss(duration_ns)
                 );
@@ -787,6 +820,25 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
                                 target = target.min(duration_ns.saturating_sub(1) as i64);
                             }
                             handle.seek_time(ClockTime::from_nanos(target as u64)).await;
+                        }
+                        Command::VolumeBy(delta) => {
+                            if let Some(volume) = &volume {
+                                vol_db = (vol_db + delta).clamp(-40.0, 6.0);
+                                // Changing the volume always unmutes — the
+                                // user reaching for ↑ wants to hear it.
+                                muted = false;
+                                volume.set_db(vol_db);
+                            }
+                        }
+                        Command::MuteToggle => {
+                            if let Some(volume) = &volume {
+                                muted = !muted;
+                                if muted {
+                                    volume.set_factor(0.0);
+                                } else {
+                                    volume.set_db(vol_db);
+                                }
+                            }
                         }
                         Command::Fullscreen => window.set_fullscreen(!window.is_fullscreen()),
                         Command::Quit => handle.stop(),
