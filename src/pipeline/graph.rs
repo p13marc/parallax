@@ -1583,23 +1583,16 @@ impl Pipeline {
 
     /// Query whether any source in the pipeline supports seeking.
     pub fn query_seekable(&self) -> crate::pipeline::seek::SeekableQuery {
-        for src_id in self.sources() {
-            if let Some(node) = self.get_node(src_id)
-                && let Some(ref element) = node.element
-                && element.is_seekable()
-            {
-                let duration = element
-                    .source_query_duration()
-                    .and_then(|d| d.duration)
-                    .unwrap_or(0);
-                return crate::pipeline::seek::SeekableQuery {
-                    seekable: true,
-                    start: 0,
-                    stop: duration,
-                };
-            }
-        }
-        crate::pipeline::seek::SeekableQuery::not_seekable()
+        // Same fold as PipelineHandle::query_seekable — shared helper so
+        // the pre-start and runtime answers cannot drift.
+        let answers: Vec<_> = self
+            .sources()
+            .into_iter()
+            .filter_map(|src_id| self.get_node(src_id))
+            .filter_map(|node| node.element.as_ref())
+            .map(|element| (element.is_seekable(), element.source_query_duration()))
+            .collect();
+        crate::pipeline::seek::aggregate_seekable(answers.iter().map(|(s, d)| (*s, d.as_ref())))
     }
 
     /// Query the current position from source elements.

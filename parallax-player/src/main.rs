@@ -169,7 +169,6 @@ struct AudioStream {
 struct StreamSummary {
     video: Option<VideoStream>,
     audio: Option<AudioStream>,
-    duration_ns: u64,
 }
 
 /// The opened demuxer, by container.
@@ -248,11 +247,7 @@ fn probe_mp4(args: &Args, demux: &Mp4Demux<BufReader<File>>) -> StreamSummary {
                 extradata: info.audio_specific_config.clone(),
             })
         });
-    StreamSummary {
-        video,
-        audio,
-        duration_ns: demux.duration_ns(),
-    }
+    StreamSummary { video, audio }
 }
 
 /// Probe an opened MKV/WebM: print the track table and summarize.
@@ -313,11 +308,7 @@ fn probe_mkv(args: &Args, demux: &MkvDemux<BufReader<File>>) -> StreamSummary {
             extradata: info.codec_private.clone(),
         })
     });
-    StreamSummary {
-        video,
-        audio,
-        duration_ns,
-    }
+    StreamSummary { video, audio }
 }
 
 /// Open the file and describe it; error out early on things we cannot play.
@@ -593,7 +584,6 @@ fn audio_branch(args: &Args, audio: Option<&AudioStream>) -> Option<(AudioDec, A
 /// One playback pass: build the pipeline, run it to EOS / close / Ctrl-C.
 async fn play(args: &Args) -> anyhow::Result<Outcome> {
     let Probed { source, summary } = open_and_probe(args)?;
-    let duration_ns = summary.duration_ns;
     let (width, height) = summary
         .video
         .as_ref()
@@ -709,6 +699,16 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
         .context("failed to start the pipeline")?;
     let mut bus = handle.take_bus();
     let mut ended = handle.ended();
+
+    // Duration comes from the framework now — the demuxer reported it at
+    // start and the handle serves it (#162). NONE means unknown (streamed
+    // WebM without a Segment Duration): keep 0 so the seek clamp below
+    // stays open-ended.
+    let duration_ns = handle
+        .duration()
+        .to_option()
+        .map(|d| d.nanos())
+        .unwrap_or(0);
 
     println!("controls: Space pause · ←/→ seek 10s · ↑/↓ volume · m mute · f fullscreen · q quit");
     let raw_mode = RawMode::enable();

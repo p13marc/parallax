@@ -215,7 +215,7 @@ async fn flush_seek_traverses_chain_in_order() {
 
 /// A source that cannot seek reports a warning on the bus and keeps running.
 #[tokio::test(flavor = "multi_thread")]
-async fn unseekable_source_warns_and_continues() {
+async fn unseekable_pipeline_rejects_seek() {
     let mut pipeline = Pipeline::new();
     let src = pipeline.add_source("src", NullSource::new(u64::MAX));
     let sink = pipeline.add_sink("sink", NullSink::new());
@@ -225,21 +225,27 @@ async fn unseekable_source_warns_and_continues() {
     let mut handle = executor.start(&mut pipeline).unwrap();
     let mut bus = handle.take_bus().unwrap();
 
-    assert!(handle.seek_time(ClockTime::from_nanos(0)).await);
+    // GStreamer discipline (#162): no element declared seek support, so the
+    // seek is rejected up front — nothing dispatched, nothing flushed,
+    // nothing on the bus. The old behavior fired it at every source and
+    // warned after the fact.
+    assert!(!handle.seekable());
+    assert!(!handle.query_seekable().seekable);
+    assert!(!handle.seek_time(ClockTime::from_nanos(0)).await);
 
-    let mut warned = false;
-    for _ in 0..2000 {
-        while let Some(msg) = bus.poll() {
-            if matches!(msg.kind, MessageKind::Warning { .. }) {
-                warned = true;
-            }
-        }
-        if warned {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
+    // Give the pipeline a moment, then prove the seek left no trace and the
+    // stream is still running.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    while let Some(msg) = bus.poll() {
+        assert!(
+            !matches!(
+                msg.kind,
+                MessageKind::Warning { .. } | MessageKind::SeekDone { .. }
+            ),
+            "a rejected seek must leave no bus trace, got {:?}",
+            msg.kind
+        );
     }
-    assert!(warned, "no warning for the ignored seek");
 
     handle.stop();
     handle.wait().await.unwrap();

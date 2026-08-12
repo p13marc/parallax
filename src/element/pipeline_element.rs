@@ -435,6 +435,23 @@ pub trait PipelineElement {
         EventResult::NotHandled
     }
 
+    /// Whether this element (when acting as a source) supports seeking.
+    ///
+    /// Gates `PipelineHandle::seek*` via the start-time snapshot.
+    fn is_seekable(&self) -> bool {
+        false
+    }
+
+    /// Current source position, if tracked.
+    fn query_position(&self) -> Option<crate::pipeline::seek::PositionQuery> {
+        None
+    }
+
+    /// Stream duration, if known.
+    fn query_duration(&self) -> Option<crate::pipeline::seek::DurationQuery> {
+        None
+    }
+
     /// How many buffers the downstream graph can hold in flight.
     ///
     /// See [`Element::set_output_budget`](crate::element::Element::set_output_budget)
@@ -494,6 +511,25 @@ pub trait SimpleSource: Send {
     /// Handle upstream events (e.g., seek).
     fn handle_upstream_event(&mut self, _event: &Event) -> EventResult {
         EventResult::NotHandled
+    }
+
+    /// Whether this source supports seeking.
+    ///
+    /// Must return `true` for `handle_upstream_event` to ever see a seek:
+    /// the executor gates `PipelineHandle::seek*` on the seekability
+    /// snapshot taken at start.
+    fn is_seekable(&self) -> bool {
+        false
+    }
+
+    /// Current position, if this source tracks one.
+    fn query_position(&self) -> Option<crate::pipeline::seek::PositionQuery> {
+        None
+    }
+
+    /// Stream duration, if known (served by `PipelineHandle::duration()`).
+    fn query_duration(&self) -> Option<crate::pipeline::seek::DurationQuery> {
+        None
     }
 
     /// How many buffers the downstream graph can hold in flight.
@@ -666,6 +702,18 @@ impl<T: SimpleSource + 'static> SendPipelineElement for Src<T> {
 
     fn handle_upstream_event(&mut self, event: &Event) -> EventResult {
         self.0.handle_upstream_event(event)
+    }
+
+    fn is_seekable(&self) -> bool {
+        self.0.is_seekable()
+    }
+
+    fn query_position(&self) -> Option<crate::pipeline::seek::PositionQuery> {
+        self.0.query_position()
+    }
+
+    fn query_duration(&self) -> Option<crate::pipeline::seek::DurationQuery> {
+        self.0.query_duration()
     }
 }
 
@@ -878,6 +926,18 @@ impl<T: SendPipelineElement + 'static> super::traits::SendAsyncElementDyn
 
     fn handle_upstream_event(&mut self, event: &Event) -> EventResult {
         self.inner.handle_upstream_event(event)
+    }
+
+    fn is_seekable(&self) -> bool {
+        self.inner.is_seekable()
+    }
+
+    fn source_query_position(&self) -> Option<crate::pipeline::seek::PositionQuery> {
+        self.inner.query_position()
+    }
+
+    fn source_query_duration(&self) -> Option<crate::pipeline::seek::DurationQuery> {
+        self.inner.query_duration()
     }
 
     fn as_any(&self) -> &dyn Any {

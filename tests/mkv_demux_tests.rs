@@ -425,6 +425,40 @@ mod cue_seek {
     }
 }
 
+/// A demuxer-rooted pipeline reports seekable + duration through the
+/// running handle — it used to report `seekable() == false` while seeking
+/// perfectly well, because `DemuxerAdapter` never forwarded the queries
+/// (#162).
+#[tokio::test(flavor = "multi_thread")]
+async fn demuxer_rooted_pipeline_reports_seekable() {
+    let demux = open(H264_AAC_MKV).video_only();
+
+    let mut pipeline = Pipeline::new();
+    let sink = AppSink::with_max_buffers(4);
+    let sink_handle = sink.handle();
+    let node = pipeline.add_demuxer("mkvdemux", demux);
+    let vs = pipeline.add_sink("video_sink", sink);
+    pipeline.link_pads(node, "video", vs, "sink").unwrap();
+
+    let executor = Executor::new();
+    let handle = executor.start(&mut pipeline).unwrap();
+
+    assert!(handle.seekable(), "MkvDemux declares seek support");
+    let q = handle.query_seekable();
+    assert!(q.seekable);
+    assert!(
+        (1_800_000_000..=2_300_000_000).contains(&q.stop),
+        "range bounded by the ~2 s duration, got {}",
+        q.stop
+    );
+    let duration = handle.duration().to_option().expect("Time duration known");
+    assert!((1_800_000_000..=2_300_000_000).contains(&duration.nanos()));
+
+    handle.stop();
+    while let Pulled::Buffer(_) = sink_handle.pull_buffer().await {}
+    handle.wait().await.unwrap();
+}
+
 /// Subtitle tracks are listed but never routed.
 #[test]
 fn subtitle_tracks_listed_not_routed() {

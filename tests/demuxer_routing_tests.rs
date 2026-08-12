@@ -371,6 +371,15 @@ async fn mp4_demux_source_seeks_at_runtime() {
     let mut handle = executor.start(&mut pipeline).unwrap();
     let mut bus = handle.take_bus().unwrap();
 
+    // The demuxer-rooted pipeline advertises its seekability at runtime
+    // (#162): the snapshot came from Mp4DemuxSource's Demuxer impl.
+    assert!(handle.seekable());
+    assert!(handle.query_seekable().seekable);
+    assert!(
+        handle.duration().to_option().is_some(),
+        "muxed fixture declares a duration"
+    );
+
     // Consume the first couple of frames, then seek into the third GOP.
     for _ in 0..2 {
         assert!(matches!(

@@ -367,6 +367,49 @@ async fn runtime_flush_seek_sheds_the_queued_backlog() {
     assert!(seek_done, "SeekDone posted");
 }
 
+/// The running handle answers seekability and duration from the snapshot
+/// taken at start — the runtime counterpart of `Pipeline::query_*` (#162).
+#[tokio::test(flavor = "multi_thread")]
+async fn handle_reports_seekability_and_duration() {
+    use parallax::elements::NullSink;
+
+    // FileSrc pipeline: seekable, byte-format range = file length.
+    let content = vec![0u8; 4096];
+    let temp = create_test_file(&content);
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_source("src", FileSrc::open(temp.path()).unwrap());
+    let sink = pipeline.add_sink("sink", NullSink::new());
+    pipeline.link(src, sink).unwrap();
+
+    let executor = parallax::pipeline::Executor::new();
+    let handle = executor.start(&mut pipeline).unwrap();
+    assert!(handle.seekable());
+    let q = handle.query_seekable();
+    assert!(q.seekable);
+    assert_eq!(q.stop, 4096, "byte range bounded by the file length");
+    // FileSrc's duration is Bytes-format, so the Time-format duration is NONE.
+    assert_eq!(handle.duration(), ClockTime::NONE);
+    assert_eq!(
+        handle.query_duration().map(|d| (d.format, d.duration)),
+        Some((SegmentFormat::Bytes, Some(4096)))
+    );
+    handle.stop();
+    handle.wait().await.unwrap();
+
+    // NullSource pipeline: nothing seekable, no duration.
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_source("src", parallax::elements::NullSource::new(4));
+    let sink = pipeline.add_sink("sink", NullSink::new());
+    pipeline.link(src, sink).unwrap();
+    let executor = parallax::pipeline::Executor::new();
+    let handle = executor.start(&mut pipeline).unwrap();
+    assert!(!handle.seekable());
+    assert!(!handle.query_seekable().seekable);
+    assert_eq!(handle.duration(), ClockTime::NONE);
+    assert_eq!(handle.query_duration(), None);
+    handle.wait().await.unwrap();
+}
+
 #[test]
 fn test_pipeline_seek_bytes() {
     let content = b"ABCDEFGHIJKLMNOP";

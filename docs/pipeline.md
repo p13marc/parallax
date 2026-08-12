@@ -292,7 +292,7 @@ let running = seg.to_running_time(ClockTime::from_secs(12)); // → 7 s
 let stream  = seg.to_stream_time(ClockTime::from_secs(12));  // → 12 s
 ```
 
-`SeekRequest` provides a fluent builder (`SeekRequest::to_time(t).with_flush().with_key_unit()`). See `examples/52_seeking.rs`.
+Build a custom `SeekEvent` (`SeekEvent::new_time`/`new_bytes`) and pass it to `PipelineHandle::seek` for non-default flags. See `examples/52_seeking.rs`.
 
 ## Pad probes
 

@@ -80,7 +80,7 @@ pub use rt_scheduler::{
     ActivationRecord, BoundaryDirection, BoundaryEdge, DataThreadHandle, GraphPartition,
     NodeStatus, RtConfig, RtScheduler, SchedulingMode, spawn_data_thread,
 };
-pub use seek::{DurationQuery, PositionQuery, SeekRequest, SeekableQuery, SeekableSource};
+pub use seek::{DurationQuery, PositionQuery, SeekableQuery};
 pub use tags::{TagList, TagMergeMode, TagValue};
 pub use tracer::{
     DropTracer, ElementStats, FramerateTracer, LatencyTracer, PipelineStats, Tracer, TracerRegistry,

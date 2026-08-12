@@ -1238,6 +1238,19 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for Mp4DemuxSource<R> {
         }
     }
 
+    fn is_seekable(&self) -> bool {
+        true
+    }
+
+    fn query_duration(&self) -> Option<crate::pipeline::seek::DurationQuery> {
+        let d = self.demux.duration_ns();
+        Some(crate::pipeline::seek::DurationQuery {
+            format: crate::event::SegmentFormat::Time,
+            // 0 from the mvhd means "unknown", not "empty file".
+            duration: (d > 0).then_some(d),
+        })
+    }
+
     fn outputs(&self) -> &[(crate::element::PadId, crate::format::Caps)] {
         &self.outputs
     }

@@ -8,7 +8,7 @@ For the element *trait system* (how to write your own), see [getting-started.md]
 
 | Element | Description |
 |---------|-------------|
-| `FileSrc` | Reads a file in chunks; seekable (`SeekableSource`), reports position/duration |
+| `FileSrc` | Reads a file in chunks; seekable (bytes), reports position/duration |
 | `FileSink` | Writes buffers to a file |
 | `FdSrc` / `FdSink` | Read/write a raw file descriptor |
 | `ConsoleSink` | Debug-prints buffers (`ConsoleFormat`: text/hex/…) |

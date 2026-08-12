@@ -518,6 +518,13 @@ impl Stopper {
 struct SourceControl {
     name: String,
     tx: AsyncSender<Event>,
+    /// Whether the element declared seek support, snapshotted in
+    /// `spawn_element_task` before the element moved into its task. Gates
+    /// `PipelineHandle::seek*`: seeks are only dispatched to elements that
+    /// declared support (GStreamer's `GST_QUERY_SEEKING` discipline).
+    seekable: bool,
+    /// The element's duration answer at start (`None` = unknown/live).
+    duration: Option<crate::pipeline::seek::DurationQuery>,
 }
 
 /// Runtime-control state assembled while tasks spawn, then moved onto the
@@ -772,14 +779,17 @@ impl PipelineHandle {
         self.events.send(PipelineEvent::Stopped);
     }
 
-    /// Send an upstream event to every running source task.
+    /// Send an upstream event to every running source task, **ungated**.
     ///
     /// This is the runtime counterpart of [`Pipeline::send_event_upstream`],
     /// which only works before `start()` moves the elements into their tasks.
-    /// The event is handled asynchronously by each source's produce loop:
-    /// for a flushing [`Event::Seek`] the source repositions, broadcasts
-    /// FlushStart → FlushStop → Segment in-band to its downstream graph, and
-    /// posts [`MessageKind::SeekDone`](crate::pipeline::bus::MessageKind::SeekDone) on the bus when it is done.
+    /// The event is handled asynchronously by each source's produce loop.
+    ///
+    /// Unlike [`seek`](Self::seek) this fans out to *every* source,
+    /// seekable or not — the escape hatch for custom upstream events a
+    /// source may handle regardless of seekability. A `Seek` sent this way
+    /// bypasses the seekability gate and falls back to the per-source
+    /// "cannot seek" bus warning.
     ///
     /// Returns `false` if no source accepted the event — the pipeline has no
     /// async-spawned sources (RT-scheduled sources carry no control channel),
@@ -802,12 +812,74 @@ impl PipelineHandle {
 
     /// Seek a running pipeline.
     ///
-    /// Delivers the seek to every source; sources that are not seekable (live
-    /// capture, AppSrc without an app-side seek story) report it and continue.
+    /// **Gated on seekability** (GStreamer's discipline: an unhandled seek
+    /// does nothing): the seek is dispatched only to sources that declared
+    /// `is_seekable()` at start, and if none did this returns `false`
+    /// immediately — nothing is dispatched, nothing is flushed, nothing is
+    /// posted on the bus. Check [`seekable`](Self::seekable) /
+    /// [`query_seekable`](Self::query_seekable) first to know in advance.
     /// Watch the bus for [`MessageKind::SeekDone`](crate::pipeline::bus::MessageKind::SeekDone) to learn when the flush
     /// sequence has run.
     pub async fn seek(&self, seek: SeekEvent) -> bool {
-        self.send_event_upstream(Event::Seek(seek)).await
+        let mut delivered = false;
+        for control in self.controls.iter().filter(|c| c.seekable) {
+            if control.tx.send(Event::Seek(seek.clone())).await.is_ok() {
+                delivered = true;
+            }
+        }
+        delivered
+    }
+
+    /// Whether any source in the running pipeline declared seek support.
+    ///
+    /// Snapshotted at start from `is_seekable()` on every async-spawned
+    /// source and source-style demuxer (RT-scheduled sources carry no
+    /// control channel and count as unseekable).
+    pub fn seekable(&self) -> bool {
+        self.controls.iter().any(|c| c.seekable)
+    }
+
+    /// The seekable range of the running pipeline.
+    ///
+    /// First seekable source wins, matching `Pipeline::query_seekable`.
+    pub fn query_seekable(&self) -> crate::pipeline::seek::SeekableQuery {
+        crate::pipeline::seek::aggregate_seekable(
+            self.controls
+                .iter()
+                .map(|c| (c.seekable, c.duration.as_ref())),
+        )
+    }
+
+    /// Total stream duration, as the sources reported it at start.
+    ///
+    /// The best `SegmentFormat::Time` answer across sources;
+    /// [`ClockTime::NONE`] when no source knows (live capture, streamed
+    /// WebM without a Segment Duration). This is the runtime counterpart of
+    /// the pre-start `Pipeline::query_duration` — applications no longer
+    /// need to reach around the framework to a demuxer object.
+    pub fn duration(&self) -> ClockTime {
+        self.controls
+            .iter()
+            .filter_map(|c| c.duration.as_ref())
+            .filter(|d| d.format == crate::event::SegmentFormat::Time)
+            .filter_map(|d| d.duration)
+            .max()
+            .map(ClockTime::from_nanos)
+            .unwrap_or(ClockTime::NONE)
+    }
+
+    /// The first duration answer any source gave at start, `Time` preferred.
+    pub fn query_duration(&self) -> Option<crate::pipeline::seek::DurationQuery> {
+        let durations: Vec<_> = self
+            .controls
+            .iter()
+            .filter_map(|c| c.duration.clone())
+            .collect();
+        durations
+            .iter()
+            .find(|d| d.format == crate::event::SegmentFormat::Time)
+            .cloned()
+            .or_else(|| durations.into_iter().next())
     }
 
     /// Seek to a time position (flushing, keyframe-snapped). See [`Self::seek`].
@@ -1699,6 +1771,10 @@ impl Executor {
                 runtime.controls.push(SourceControl {
                     name: node_name.clone(),
                     tx: control_tx,
+                    // Snapshotted here, while the element is still in hand —
+                    // after spawn it has moved into its task.
+                    seekable: element.is_seekable(),
+                    duration: element.source_query_duration(),
                 });
                 spawn_source_task(
                     node_name,
@@ -1759,6 +1835,8 @@ impl Executor {
                     runtime.controls.push(SourceControl {
                         name: node_name.clone(),
                         tx: control_tx,
+                        seekable: element.is_seekable(),
+                        duration: element.source_query_duration(),
                     });
                     Some(control_rx)
                 } else {

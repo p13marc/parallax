@@ -944,6 +944,23 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
         }
     }
 
+    fn is_seekable(&self) -> bool {
+        // Cue-indexed when the file carries Cues; cue-less files still
+        // seek via the crate's linear path and the rewind fallback.
+        true
+    }
+
+    fn query_duration(&self) -> Option<crate::pipeline::seek::DurationQuery> {
+        // None when the Segment declares no Duration (streamed/remuxed
+        // WebM) — the handle then reports ClockTime::NONE, and players
+        // keep their upper seek clamp open.
+        self.duration_ns()
+            .map(|d| crate::pipeline::seek::DurationQuery {
+                format: crate::event::SegmentFormat::Time,
+                duration: Some(d),
+            })
+    }
+
     fn outputs(&self) -> &[(crate::element::PadId, crate::format::Caps)] {
         &self.outputs
     }

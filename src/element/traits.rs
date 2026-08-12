@@ -1462,6 +1462,31 @@ pub trait Demuxer: Send {
         EventResult::NotHandled
     }
 
+    /// Whether this demuxer supports seeking.
+    ///
+    /// A source-style demuxer that implements `handle_upstream_event` for
+    /// [`Event::Seek`] must return `true` — the executor snapshots this at
+    /// start and *gates* `PipelineHandle::seek*` on it: seeks are only ever
+    /// dispatched to elements that declared support, exactly like
+    /// GStreamer's `GST_QUERY_SEEKING`.
+    fn is_seekable(&self) -> bool {
+        false
+    }
+
+    /// Current position, if this demuxer tracks one.
+    fn query_position(&self) -> Option<crate::pipeline::seek::PositionQuery> {
+        None
+    }
+
+    /// Stream duration, if known.
+    ///
+    /// Snapshotted at start and served by `PipelineHandle::duration()`, so
+    /// applications no longer need to reach around the framework to the
+    /// demuxer object.
+    fn query_duration(&self) -> Option<crate::pipeline::seek::DurationQuery> {
+        None
+    }
+
     /// Get the name of this demuxer (for debugging/logging).
     fn name(&self) -> &str {
         std::any::type_name::<Self>()
@@ -3216,6 +3241,21 @@ impl<D: Demuxer + Send + 'static> SendAsyncElementDyn for DemuxerAdapter<D> {
 
     fn handle_upstream_event(&mut self, event: &Event) -> EventResult {
         self.inner.handle_upstream_event(event)
+    }
+
+    // Forwarded like SourceAdapter does: a source-style demuxer IS the
+    // pipeline's source, and without these a demuxer-rooted pipeline
+    // reported `seekable() == false` while seeking perfectly well.
+    fn is_seekable(&self) -> bool {
+        self.inner.is_seekable()
+    }
+
+    fn source_query_position(&self) -> Option<crate::pipeline::seek::PositionQuery> {
+        self.inner.query_position()
+    }
+
+    fn source_query_duration(&self) -> Option<crate::pipeline::seek::DurationQuery> {
+        self.inner.query_duration()
     }
 
     async fn process_demux(&mut self, input: Option<Buffer>) -> Result<DemuxResult> {

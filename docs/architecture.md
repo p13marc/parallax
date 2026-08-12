@@ -54,7 +54,7 @@ An element is a `Source`, `Sink`, `Element`/`Transform`, `Demuxer`, or `Muxer` i
 
 - Sources produce into pool-provided buffers via `ProduceContext` (`ProduceResult::Produced(n)`) or hand over their own buffers (`OwnBuffer`, `OwnDmaBuf`).
 - Elements declare **`ExecutionHints`** — `rt_safe`, `processing` (CPU/IO/memory-bound), `latency`, `memory` — which the executor uses to pick a strategy.
-- Elements may also expose caps (`output_media_caps`/`input_media_caps`), seeking (`SeekableSource`), flow policies for live sources, and clocks (`as_clock_provider`).
+- Elements may also expose caps (`output_media_caps`/`input_media_caps`), seeking (`is_seekable`/`query_duration` on the source traits), flow policies for live sources, and clocks (`as_clock_provider`).
 - A newer "simple" API (`SimpleSource`/`SimpleSink`/`SimpleTransform` + `Src`/`Snk`/`Xfm` wrappers) removes adapter boilerplate for straightforward elements.
 
 The built-in library (~100 elements across io/network/rtp/flow/transform/timing/mux/demux/codec/device/streaming categories) is cataloged in [elements.md](elements.md).

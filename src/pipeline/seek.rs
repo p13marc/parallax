@@ -1,47 +1,38 @@
-//! Seeking, position queries, and playback rate control.
+//! Seeking and position/duration query types.
 //!
-//! This module provides the pipeline-level API for seeking in media streams,
-//! querying position/duration, and controlling playback rate.
+//! # The two surfaces
 //!
-//! # Seek Flow
+//! **Element authors** declare seek support on the trait they implement —
+//! [`Source`], [`Demuxer`] and [`SimpleSource`] each carry optional
+//! `is_seekable()` / `query_position()` / `query_duration()` methods plus
+//! `handle_upstream_event` for the actual reposition. Declaring
+//! `is_seekable() == true` is what makes seeks reach the element at all.
 //!
-//! On a running pipeline, use [`PipelineHandle::seek`] — the graph-level
-//! `Pipeline::seek` only reaches elements before `Executor::start` moves them
-//! into their tasks. The runtime sequence, executed by the source task:
+//! **Applications** seek and query through [`PipelineHandle`] on a running
+//! pipeline (`seekable()`, `query_seekable()`, `duration()`, `seek_time()`,
+//! …) — the graph-level `Pipeline::seek_*`/`query_*` methods only work
+//! *before* `Executor::start` moves the elements into their tasks.
+//!
+//! # Seek flow (running pipeline)
 //!
 //! ```text
-//! Application → handle.seek()
-//!   1. SeekEvent delivered upstream to each source task
+//! Application → handle.seek_time(t)
+//!   0. Gate: dispatched only to sources that declared is_seekable();
+//!      none declared → returns false, nothing happens (GStreamer parity)
+//!   1. SeekEvent delivered to each seekable source task
 //!   2. Source repositions (handle_upstream_event)
-//!   3. FlushStart sent downstream in-band (receivers discard stale buffers)
+//!   3. FlushStart sent downstream in-band; the flush epoch sheds the
+//!      queued pre-seek backlog at receive speed
 //!   4. FlushStop sent downstream (resume processing)
 //!   5. New Segment sent downstream (re-anchors the timeline)
-//!   6. SeekDone posted to bus
+//!   6. SeekDone posted to the bus
 //! ```
 //!
-//! [`PipelineHandle::seek`]: crate::pipeline::PipelineHandle::seek
-//!
-//! # Example
-//!
-//! ```rust,ignore
-//! use parallax::pipeline::seek::SeekableQuery;
-//! use parallax::event::{SeekEvent, SegmentFormat};
-//! use parallax::clock::ClockTime;
-//!
-//! // Check if seeking is supported
-//! let seekable = pipeline.query_seekable();
-//! if seekable.seekable {
-//!     // Seek to 30 seconds
-//!     pipeline.seek_simple(ClockTime::from_secs(30)).await?;
-//!
-//!     // Query current position
-//!     if let Some(pos) = pipeline.query_position() {
-//!         println!("Position: {pos}");
-//!     }
-//! }
-//! ```
+//! [`Source`]: crate::element::Source
+//! [`Demuxer`]: crate::element::Demuxer
+//! [`SimpleSource`]: crate::element::SimpleSource
+//! [`PipelineHandle`]: crate::pipeline::PipelineHandle
 
-use crate::clock::ClockTime;
 use crate::event::SegmentFormat;
 
 // ============================================================================
@@ -88,161 +79,31 @@ impl SeekableQuery {
     }
 }
 
-// ============================================================================
-// Seekable Source Trait
-// ============================================================================
-
-/// Trait for sources that support seeking and position/duration queries.
+/// Fold per-source `(is_seekable, duration)` answers into one
+/// [`SeekableQuery`]: the first seekable source wins, its duration (when
+/// known) bounds the range.
 ///
-/// Implement this trait on your [`Source`](crate::element::Source) to enable
-/// seeking in pipelines. The pipeline will call these methods when the
-/// application requests seek operations or queries.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use parallax::pipeline::seek::{SeekableSource, PositionQuery, DurationQuery, SeekableQuery};
-/// use parallax::event::{SeekEvent, SegmentFormat};
-///
-/// impl SeekableSource for MyFileSource {
-///     fn is_seekable(&self) -> bool { true }
-///
-///     fn query_position(&self) -> Option<PositionQuery> {
-///         Some(PositionQuery {
-///             format: SegmentFormat::Bytes,
-///             position: Some(self.offset),
-///         })
-///     }
-///
-///     fn query_duration(&self) -> Option<DurationQuery> {
-///         Some(DurationQuery {
-///             format: SegmentFormat::Bytes,
-///             duration: Some(self.file_size),
-///         })
-///     }
-/// }
-/// ```
-pub trait SeekableSource {
-    /// Whether this source supports seeking.
-    fn is_seekable(&self) -> bool {
-        false
-    }
-
-    /// Query the current position.
-    fn query_position(&self) -> Option<PositionQuery> {
-        None
-    }
-
-    /// Query the total duration.
-    fn query_duration(&self) -> Option<DurationQuery> {
-        None
-    }
-
-    /// Query the seekable range.
-    fn query_seekable(&self) -> SeekableQuery {
-        if self.is_seekable()
-            && let Some(dur) = self.query_duration()
-        {
+/// Shared by the pre-start `Pipeline::query_seekable` and the runtime
+/// `PipelineHandle::query_seekable`, so the two surfaces cannot drift.
+pub(crate) fn aggregate_seekable<'a>(
+    sources: impl IntoIterator<Item = (bool, Option<&'a DurationQuery>)>,
+) -> SeekableQuery {
+    for (seekable, duration) in sources {
+        if seekable {
             return SeekableQuery {
                 seekable: true,
                 start: 0,
-                stop: dur.duration.unwrap_or(0),
+                stop: duration.and_then(|d| d.duration).unwrap_or(0),
             };
         }
-        SeekableQuery::not_seekable()
     }
-}
-
-// ============================================================================
-// Pipeline Seek Request
-// ============================================================================
-
-/// A simplified seek request for pipeline-level API.
-///
-/// This is a convenience wrapper around [`SeekEvent`](crate::event::SeekEvent)
-/// for common seek operations.
-#[derive(Debug, Clone)]
-pub struct SeekRequest {
-    /// Target position in nanoseconds.
-    pub position: ClockTime,
-    /// Playback rate (1.0 = normal).
-    pub rate: f64,
-    /// Whether to flush (responsive seek).
-    pub flush: bool,
-    /// Whether to seek to nearest keyframe.
-    pub key_unit: bool,
-}
-
-impl SeekRequest {
-    /// Create a simple seek to a time position with flush.
-    pub fn to_time(position: ClockTime) -> Self {
-        Self {
-            position,
-            rate: 1.0,
-            flush: true,
-            key_unit: true,
-        }
-    }
-
-    /// Create a rate change without seeking.
-    pub fn rate_change(rate: f64) -> Self {
-        Self {
-            position: ClockTime::NONE,
-            rate,
-            flush: true,
-            key_unit: false,
-        }
-    }
-
-    /// Set the playback rate.
-    pub fn with_rate(mut self, rate: f64) -> Self {
-        self.rate = rate;
-        self
-    }
-
-    /// Set whether to flush.
-    pub fn with_flush(mut self, flush: bool) -> Self {
-        self.flush = flush;
-        self
-    }
-
-    /// Set whether to seek to keyframe.
-    pub fn with_key_unit(mut self, key_unit: bool) -> Self {
-        self.key_unit = key_unit;
-        self
-    }
-
-    /// Convert to a [`SeekEvent`](crate::event::SeekEvent).
-    pub fn to_seek_event(&self) -> crate::event::SeekEvent {
-        use crate::event::{SeekEvent, SeekFlags, SeekPosition};
-
-        let mut flags = SeekFlags::empty();
-        if self.flush {
-            flags = flags.union(SeekFlags::FLUSH);
-        }
-        if self.key_unit {
-            flags = flags.union(SeekFlags::KEY_UNIT);
-        }
-
-        let start = if self.position == ClockTime::NONE {
-            SeekPosition::none()
-        } else {
-            SeekPosition::set(self.position.nanos() as i64)
-        };
-
-        SeekEvent {
-            rate: self.rate,
-            format: SegmentFormat::Time,
-            flags,
-            start,
-            stop: SeekPosition::none(),
-        }
-    }
+    SeekableQuery::not_seekable()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::ClockTime;
     use crate::event::SegmentEvent;
 
     #[test]
@@ -331,18 +192,31 @@ mod tests {
     }
 
     #[test]
-    fn test_seek_request_to_event() {
-        let req = SeekRequest::to_time(ClockTime::from_secs(30));
-        let event = req.to_seek_event();
-        assert_eq!(event.rate, 1.0);
-        assert!(event.flags.contains(crate::event::SeekFlags::FLUSH));
-        assert!(event.flags.contains(crate::event::SeekFlags::KEY_UNIT));
-        assert_eq!(event.start.position, 30_000_000_000);
-    }
-
-    #[test]
     fn test_seekable_query_not_seekable() {
         let q = SeekableQuery::not_seekable();
         assert!(!q.seekable);
+    }
+
+    #[test]
+    fn aggregate_prefers_the_first_seekable_source() {
+        let time = DurationQuery {
+            format: SegmentFormat::Time,
+            duration: Some(2_000_000_000),
+        };
+        let q = aggregate_seekable([(false, None), (true, Some(&time)), (true, None)]);
+        assert_eq!(
+            q,
+            SeekableQuery {
+                seekable: true,
+                start: 0,
+                stop: 2_000_000_000
+            }
+        );
+
+        assert!(!aggregate_seekable([(false, Some(&time))]).seekable);
+        // Seekable with unknown duration: open-ended range, stop = 0.
+        let q = aggregate_seekable([(true, None)]);
+        assert!(q.seekable);
+        assert_eq!(q.stop, 0);
     }
 }

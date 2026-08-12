@@ -26,7 +26,7 @@ brings in: `Buffer`, `Metadata`/`BufferFlags`/`RtpMeta`, clock types (`Clock`, `
 | `factory::{ElementFactory, PluginRegistry integration}` | Registered element names for `parse` |
 | `probe::{ProbeType, ProbeReturn, ProbeData, PadRef, ProbeRegistry, ProbeId}` | Pad probes |
 | `tracer::{Tracer, TracerRegistry, LatencyTracer, FramerateTracer, DropTracer, PipelineStats}` | Runtime tracing; `PARALLAX_TRACERS` |
-| `seek::{SeekRequest, PositionQuery, DurationQuery, SeekableQuery, SeekableSource}` | Seeking |
+| `seek::{PositionQuery, DurationQuery, SeekableQuery}` | Seeking |
 | `typefind::{TypeFindRegistry, MediaType, TypeFindResult, TypeFindProbability}` | Content detection |
 | `flow::{FlowSignal, FlowPolicy, FlowStateHandle, WaterMarks, FlowStats}` | Backpressure primitives |
 | `driver::{TimerDriver, ManualDriver, DriverConfig, DriverStats}` | RT cycle pacing |
