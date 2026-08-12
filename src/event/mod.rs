@@ -524,9 +524,11 @@ impl SeekEvent {
             SeekPosition::set(position.nanos() as i64),
         )
         // KEY_UNIT describes what the container demuxers actually do: they
-        // always snap to a keyframe (MP4 backward, MKV forward). ACCURATE
-        // and SNAP_* are accepted but not yet honored (#166).
-        .with_flags(SeekFlags::FLUSH.union(SeekFlags::KEY_UNIT))
+        // always snap to a keyframe, by default MP4 backward and MKV forward.
+        // Add SNAP_BEFORE/SNAP_AFTER (both = nearest) to pick the direction
+        // explicitly. ACCURATE is accepted but not yet honored (needs
+        // decoder clipping).
+        .with_flags(SeekFlags::FLUSH | SeekFlags::KEY_UNIT)
     }
 
     /// Create a byte-based seek.
@@ -652,6 +654,54 @@ impl SeekFlags {
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
+
+    /// The snap direction requested by [`SNAP_BEFORE`](Self::SNAP_BEFORE) /
+    /// [`SNAP_AFTER`](Self::SNAP_AFTER). `None` means neither bit is set and
+    /// the handling element applies its own default (MP4 snaps before, MKV
+    /// after); both bits request the nearest keyframe.
+    pub const fn snap(self) -> Option<SeekSnap> {
+        match (
+            self.contains(Self::SNAP_BEFORE),
+            self.contains(Self::SNAP_AFTER),
+        ) {
+            (true, true) => Some(SeekSnap::Nearest),
+            (true, false) => Some(SeekSnap::Before),
+            (false, true) => Some(SeekSnap::After),
+            (false, false) => None,
+        }
+    }
+}
+
+impl std::ops::BitOr for SeekFlags {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        self.union(rhs)
+    }
+}
+
+impl std::ops::BitOrAssign for SeekFlags {
+    fn bitor_assign(&mut self, rhs: Self) {
+        *self = self.union(rhs);
+    }
+}
+
+impl std::ops::BitAnd for SeekFlags {
+    type Output = Self;
+    fn bitand(self, rhs: Self) -> Self {
+        Self(self.0 & rhs.0)
+    }
+}
+
+/// Direction a keyframe-snapping ([`KEY_UNIT`](SeekFlags::KEY_UNIT)) seek may
+/// move the landing point, resolved from [`SeekFlags::snap`] (#166).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SeekSnap {
+    /// Land on the last keyframe at or before the target.
+    Before,
+    /// Land on the first keyframe at or after the target.
+    After,
+    /// Land on whichever keyframe is closest to the target.
+    Nearest,
 }
 
 // ============================================================================
@@ -900,6 +950,39 @@ mod tests {
         assert!(Event::Eos.is_downstream());
         assert!(Event::Seek(SeekEvent::new_time(ClockTime::ZERO)).is_upstream());
         assert!(Event::FlushStart.is_bidirectional());
+    }
+
+    #[test]
+    fn seek_flags_resolve_the_snap_direction() {
+        assert_eq!(SeekFlags::NONE.snap(), None, "unset = container default");
+        assert_eq!(
+            (SeekFlags::FLUSH | SeekFlags::KEY_UNIT).snap(),
+            None,
+            "unrelated bits don't imply a direction"
+        );
+        assert_eq!(SeekFlags::SNAP_BEFORE.snap(), Some(SeekSnap::Before));
+        assert_eq!(SeekFlags::SNAP_AFTER.snap(), Some(SeekSnap::After));
+        assert_eq!(
+            (SeekFlags::SNAP_BEFORE | SeekFlags::SNAP_AFTER).snap(),
+            Some(SeekSnap::Nearest),
+            "both bits = nearest"
+        );
+    }
+
+    #[test]
+    fn seek_flags_operators_match_union() {
+        let combined = SeekFlags::FLUSH | SeekFlags::KEY_UNIT | SeekFlags::SNAP_AFTER;
+        assert!(combined.contains(SeekFlags::FLUSH));
+        assert!(combined.contains(SeekFlags::KEY_UNIT));
+        assert!(combined.contains(SeekFlags::SNAP_AFTER));
+        assert!(!combined.contains(SeekFlags::SNAP_BEFORE));
+
+        let mut flags = SeekFlags::FLUSH;
+        flags |= SeekFlags::SNAP_BEFORE;
+        assert_eq!(flags, SeekFlags::FLUSH | SeekFlags::SNAP_BEFORE);
+
+        assert_eq!(combined & SeekFlags::FLUSH, SeekFlags::FLUSH);
+        assert!((combined & SeekFlags::SNAP_BEFORE).is_empty());
     }
 
     #[test]

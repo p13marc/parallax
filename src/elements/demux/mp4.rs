@@ -40,6 +40,7 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::clock::ClockTime;
 use crate::error::{Error, Result};
+use crate::event::SeekSnap;
 use crate::memory::{OutputArena, OutputBudget, defaults};
 use crate::metadata::{BufferFlags, Metadata};
 
@@ -277,9 +278,12 @@ fn synthesize_asc(object_type: u8, freq_index: u8, chan_conf: u8) -> Option<Vec<
 /// Where a time-based seek landed.
 ///
 /// Returned by [`Mp4Demux::seek_to_time`] and [`Mp4Demux::seek_all_to_time`].
-/// The landing time is at or before the requested target (except when the
-/// target precedes the track's first sync sample, where the first sync sample
-/// is the earliest decodable position).
+/// The landing time is on a sync sample in the direction the caller's
+/// [`SeekSnap`] chose: `Before` lands at or before the target (except when
+/// the target precedes the track's first sync sample, where the first sync
+/// sample is the earliest decodable position), `After` at or after it
+/// (clamped back to the last sync sample past the end of the track), and
+/// `Nearest` on whichever is closer in time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Mp4SeekPoint {
     /// Track the seek was resolved on.
@@ -349,6 +353,21 @@ fn snap_to_sync(sync_samples: Option<&[u32]>, sample: u32) -> (u32, bool) {
             Ok(_) => (sample, true),
             Err(0) => (entries[0], true),
             Err(i) => (entries[i - 1], true),
+        },
+    }
+}
+
+/// Snap a 1-based sample index forward to the nearest sync sample at or
+/// after it. A target past the last sync sample clamps *back* to it — there
+/// is nothing decodable later.
+fn snap_to_sync_after(sync_samples: Option<&[u32]>, sample: u32) -> (u32, bool) {
+    match sync_samples {
+        None => (sample, true),
+        Some([]) => (sample, false),
+        Some(entries) => match entries.binary_search(&sample) {
+            Ok(_) => (sample, true),
+            Err(i) if i < entries.len() => (entries[i], true),
+            Err(_) => (*entries.last().expect("non-empty stss"), true),
         },
     }
 }
@@ -750,11 +769,14 @@ impl<R: Read + Seek> Mp4Demux<R> {
     /// Seek one track to a target time, landing on a decodable sample.
     ///
     /// Resolves `target_ns` to a sample via the time-to-sample table (stts),
-    /// then snaps back to the nearest sync sample via the sync-sample table
-    /// (stss) — when a track has no stss box every sample is a sync sample,
-    /// which is the normal case for audio. The landing time is therefore at
-    /// or before the target, except when the target precedes the first sync
-    /// sample (nothing earlier is decodable, so the seek snaps forward to it).
+    /// then snaps to a sync sample via the sync-sample table (stss) in the
+    /// direction `snap` chose — when a track has no stss box every sample is
+    /// a sync sample, which is the normal case for audio, and the snap is a
+    /// no-op. `SeekSnap::Before` lands at or before the target (a target
+    /// before the first sync sample snaps forward to it — nothing earlier is
+    /// decodable), `After` at or after it (a target past the last sync
+    /// sample clamps back to it), `Nearest` on whichever is closer in time,
+    /// ties breaking toward `Before`.
     ///
     /// The next [`read_sample`](Self::read_sample) on this track returns the
     /// landing sample. On a video track the demuxer re-emits SPS/PPS in-band
@@ -769,7 +791,12 @@ impl<R: Read + Seek> Mp4Demux<R> {
     ///
     /// Returns an error if the track does not exist, has no samples, or has
     /// a zero timescale.
-    pub fn seek_to_time(&mut self, track_id: u32, target_ns: u64) -> Result<Mp4SeekPoint> {
+    pub fn seek_to_time(
+        &mut self,
+        track_id: u32,
+        target_ns: u64,
+        snap: SeekSnap,
+    ) -> Result<Mp4SeekPoint> {
         let track = self
             .reader
             .tracks()
@@ -799,7 +826,30 @@ impl<R: Read + Seek> Mp4Demux<R> {
         })?;
 
         let sync_entries = stbl.stss.as_ref().map(|s| s.entries.as_slice());
-        let (landing, is_sync) = snap_to_sync(sync_entries, sample);
+        let (landing, is_sync) = match snap {
+            SeekSnap::Before => snap_to_sync(sync_entries, sample),
+            SeekSnap::After => snap_to_sync_after(sync_entries, sample),
+            SeekSnap::Nearest => {
+                let before = snap_to_sync(sync_entries, sample);
+                let after = snap_to_sync_after(sync_entries, sample);
+                if before.0 == after.0 {
+                    before
+                } else {
+                    // Compare distances in time, not sample indices — GOP
+                    // lengths vary. Ties break toward Before.
+                    let dist = |s: u32| {
+                        stts_time_of(stts(), s)
+                            .map(|t| t.abs_diff(target_ticks))
+                            .unwrap_or(u64::MAX)
+                    };
+                    if dist(after.0) < dist(before.0) {
+                        after
+                    } else {
+                        before
+                    }
+                }
+            }
+        };
 
         // The snap changed the index, so recompute its start time.
         let landing_ticks = stts_time_of(stts(), landing).unwrap_or(0);
@@ -815,22 +865,25 @@ impl<R: Read + Seek> Mp4Demux<R> {
         })
     }
 
-    /// Seek every track to a consistent position at or before `target_ns`.
+    /// Seek every track to a consistent position around `target_ns`.
     ///
-    /// The target is first resolved on the video track (keyframe snap via
+    /// The target is first resolved on the video track with the caller's
+    /// `snap` direction (keyframe snap via
     /// [`seek_to_time`](Self::seek_to_time)); every other track is then
-    /// sought to the video's landing time, so audio starts where the video
-    /// keyframe does instead of up to a GOP later. Files without a video
-    /// track resolve the target on the first track instead.
+    /// sought to the video's landing time with `SeekSnap::Before` — audio
+    /// must start at or just before the video keyframe or playback opens
+    /// with an audio gap, so the snap direction only steers the *reference*
+    /// track. Files without a video track resolve the target on the first
+    /// track instead.
     ///
     /// Returns the seek point of the reference track.
-    pub fn seek_all_to_time(&mut self, target_ns: u64) -> Result<Mp4SeekPoint> {
+    pub fn seek_all_to_time(&mut self, target_ns: u64, snap: SeekSnap) -> Result<Mp4SeekPoint> {
         let reference = self
             .video_track_id()
             .or_else(|| self.tracks.first().map(|t| t.id))
             .ok_or_else(|| Error::Config("MP4 has no tracks to seek".into()))?;
 
-        let point = self.seek_to_time(reference, target_ns)?;
+        let point = self.seek_to_time(reference, target_ns, snap)?;
 
         let other_ids: Vec<u32> = self
             .tracks
@@ -839,7 +892,7 @@ impl<R: Read + Seek> Mp4Demux<R> {
             .filter(|id| *id != reference)
             .collect();
         for id in other_ids {
-            self.seek_to_time(id, point.time_ns)?;
+            self.seek_to_time(id, point.time_ns, SeekSnap::Before)?;
         }
 
         Ok(point)
@@ -1180,7 +1233,7 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for Mp4DemuxSource<R> {
             if self.looping {
                 // Rewind and keep going — one keyframe-snapped seek to zero,
                 // then re-prime the read-ahead on the next call.
-                self.demux.seek_all_to_time(0)?;
+                self.demux.seek_all_to_time(0, SeekSnap::Before)?;
                 self.primed = false;
                 return self.produce();
             }
@@ -1215,13 +1268,14 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for Mp4DemuxSource<R> {
         if seek.format != SegmentFormat::Time || seek.start.seek_type != SeekType::Set {
             return EventResult::NotHandled;
         }
+        let snap = seek.flags.snap().unwrap_or(SeekSnap::Before);
         match self
             .demux
-            .seek_all_to_time(seek.start.position.max(0) as u64)
+            .seek_all_to_time(seek.start.position.max(0) as u64, snap)
         {
             Ok(point) => {
                 tracing::info!(
-                    "mp4demux: seek to {} ns landed at {} ns (keyframe)",
+                    "mp4demux: seek to {} ns landed at {} ns (keyframe, {snap:?})",
                     seek.start.position,
                     point.time_ns
                 );
@@ -1519,5 +1573,40 @@ mod tests {
         // before it is decodable, so the seek moves forward.
         let stss = [4u32, 8];
         assert_eq!(snap_to_sync(Some(&stss), 2), (4, true));
+    }
+
+    #[test]
+    fn snap_to_sync_after_snaps_forward() {
+        let stss = [1u32, 6, 11];
+        assert_eq!(
+            snap_to_sync_after(Some(&stss), 6),
+            (6, true),
+            "already a keyframe"
+        );
+        assert_eq!(
+            snap_to_sync_after(Some(&stss), 9),
+            (11, true),
+            "snaps forward"
+        );
+        assert_eq!(
+            snap_to_sync_after(Some(&stss), 15),
+            (11, true),
+            "past the last keyframe clamps back"
+        );
+        assert_eq!(
+            snap_to_sync_after(Some(&stss), 2),
+            (6, true),
+            "between the first two"
+        );
+        assert_eq!(
+            snap_to_sync_after(None, 7),
+            (7, true),
+            "no stss: everything is sync"
+        );
+        assert_eq!(
+            snap_to_sync_after(Some(&[]), 7),
+            (7, false),
+            "empty stss: nothing to snap to"
+        );
     }
 }

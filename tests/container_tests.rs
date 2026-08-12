@@ -291,6 +291,7 @@ mod mp4_roundtrip_tests {
 
     use parallax::elements::demux::{Mp4Codec, Mp4Demux, Mp4TrackType};
     use parallax::elements::mux::{Mp4AudioTrackConfig, Mp4Mux, Mp4MuxConfig, Mp4VideoTrackConfig};
+    use parallax::event::SeekSnap;
 
     #[test]
     fn test_mp4_roundtrip_video_only() {
@@ -529,7 +530,9 @@ mod mp4_roundtrip_tests {
         let video_id = demux.video_track_id().unwrap();
 
         // 1234 ms sits in the third GOP; its keyframe is at 1000 ms.
-        let point = demux.seek_to_time(video_id, 1_234_000_000).unwrap();
+        let point = demux
+            .seek_to_time(video_id, 1_234_000_000, SeekSnap::Before)
+            .unwrap();
         assert!(point.is_sync);
         assert_eq!(point.time_ns, 1_000_000_000);
         assert!(point.time_ns <= 1_234_000_000);
@@ -558,22 +561,112 @@ mod mp4_roundtrip_tests {
         let video_id = demux.video_track_id().unwrap();
 
         // Exactly on a keyframe.
-        let point = demux.seek_to_time(video_id, 500_000_000).unwrap();
+        let point = demux
+            .seek_to_time(video_id, 500_000_000, SeekSnap::Before)
+            .unwrap();
         assert_eq!(point.time_ns, 500_000_000);
         assert!(point.is_sync);
 
         // Zero lands on the first sample.
-        let point = demux.seek_to_time(video_id, 0).unwrap();
+        let point = demux.seek_to_time(video_id, 0, SeekSnap::Before).unwrap();
         assert_eq!(point.time_ns, 0);
         assert_eq!(point.sample_index, 1);
 
         // Past the end clamps to the last keyframe.
-        let point = demux.seek_to_time(video_id, 99_000_000_000).unwrap();
+        let point = demux
+            .seek_to_time(video_id, 99_000_000_000, SeekSnap::Before)
+            .unwrap();
         assert_eq!(point.time_ns, 1_500_000_000);
         assert!(point.is_sync);
 
         // Unknown track errors.
-        assert!(demux.seek_to_time(42, 0).is_err());
+        assert!(demux.seek_to_time(42, 0, SeekSnap::Before).is_err());
+    }
+
+    #[test]
+    fn test_seek_to_time_snap_after() {
+        let mp4_data = seekable_av_fixture();
+        let mut demux = Mp4Demux::new(Cursor::new(mp4_data.clone()), mp4_data.len() as u64)
+            .expect("Should create demuxer");
+        let video_id = demux.video_track_id().unwrap();
+
+        // 1234 ms sits in the third GOP; the next keyframe is at 1500 ms.
+        let point = demux
+            .seek_to_time(video_id, 1_234_000_000, SeekSnap::After)
+            .unwrap();
+        assert!(point.is_sync);
+        assert_eq!(point.time_ns, 1_500_000_000);
+        let sample = demux.read_sample(video_id).unwrap().unwrap();
+        assert!(sample.is_keyframe);
+        assert_eq!(sample.pts_ns, 1_500_000_000);
+
+        // Exactly on a keyframe stays put.
+        let point = demux
+            .seek_to_time(video_id, 500_000_000, SeekSnap::After)
+            .unwrap();
+        assert_eq!(point.time_ns, 500_000_000);
+
+        // Past the last keyframe clamps back to it.
+        let point = demux
+            .seek_to_time(video_id, 99_000_000_000, SeekSnap::After)
+            .unwrap();
+        assert_eq!(point.time_ns, 1_500_000_000);
+        assert!(point.is_sync);
+
+        // Zero lands on the first sample.
+        let point = demux.seek_to_time(video_id, 0, SeekSnap::After).unwrap();
+        assert_eq!(point.time_ns, 0);
+        assert_eq!(point.sample_index, 1);
+    }
+
+    #[test]
+    fn test_seek_to_time_snap_nearest() {
+        let mp4_data = seekable_av_fixture();
+        let mut demux = Mp4Demux::new(Cursor::new(mp4_data.clone()), mp4_data.len() as u64)
+            .expect("Should create demuxer");
+        let video_id = demux.video_track_id().unwrap();
+
+        // 1234 ms: 234 ms back to 1000, 266 ms forward to 1500 — backward wins.
+        let point = demux
+            .seek_to_time(video_id, 1_234_000_000, SeekSnap::Nearest)
+            .unwrap();
+        assert_eq!(point.time_ns, 1_000_000_000);
+
+        // 1300 ms: 300 back vs 200 forward — forward wins.
+        let point = demux
+            .seek_to_time(video_id, 1_300_000_000, SeekSnap::Nearest)
+            .unwrap();
+        assert_eq!(point.time_ns, 1_500_000_000);
+
+        // Exactly on a keyframe stays put.
+        let point = demux
+            .seek_to_time(video_id, 1_000_000_000, SeekSnap::Nearest)
+            .unwrap();
+        assert_eq!(point.time_ns, 1_000_000_000);
+    }
+
+    #[test]
+    fn test_seek_all_snap_after_keeps_audio_at_or_before_video() {
+        let mp4_data = seekable_av_fixture();
+        let mut demux = Mp4Demux::new(Cursor::new(mp4_data.clone()), mp4_data.len() as u64)
+            .expect("Should create demuxer");
+        let audio_id = demux.audio_track_id().unwrap();
+
+        // Forward snap steers only the reference (video) track...
+        let point = demux
+            .seek_all_to_time(1_234_000_000, SeekSnap::After)
+            .unwrap();
+        assert_eq!(point.time_ns, 1_500_000_000);
+
+        // ...audio still lands at or just before the video keyframe.
+        let audio = demux.read_sample(audio_id).unwrap().unwrap();
+        assert!(audio.pts_ns <= point.time_ns);
+        assert!(
+            point.time_ns - audio.pts_ns < audio.duration_ns,
+            "audio ({} ns) more than one frame behind video ({} ns)",
+            audio.pts_ns,
+            point.time_ns
+        );
     }
 
     #[test]
@@ -742,7 +835,9 @@ mod mp4_roundtrip_tests {
         let video_id = demux.video_track_id().unwrap();
         let audio_id = demux.audio_track_id().unwrap();
 
-        let point = demux.seek_all_to_time(1_234_000_000).unwrap();
+        let point = demux
+            .seek_all_to_time(1_234_000_000, SeekSnap::Before)
+            .unwrap();
         assert_eq!(point.track_id, video_id);
         assert_eq!(
             point.time_ns, 1_000_000_000,

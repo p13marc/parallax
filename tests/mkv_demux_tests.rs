@@ -206,6 +206,67 @@ async fn mkv_seeks_at_runtime() {
     assert!(seek_done, "SeekDone posted");
 }
 
+/// Runtime SNAP_BEFORE: the seek lands on the prior cue keyframe (1000 ms)
+/// and, because the backward snap reports its landing, SeekDone carries the
+/// honest position instead of the requested one (#166).
+#[tokio::test(flavor = "multi_thread")]
+async fn mkv_snap_before_seeks_at_runtime() {
+    use parallax::clock::ClockTime;
+    use parallax::event::{SeekEvent, SeekFlags};
+    use parallax::pipeline::bus::MessageKind;
+
+    let demux = open(H264_AAC_MKV).video_only();
+
+    let mut pipeline = Pipeline::new();
+    let video_sink = AppSink::with_max_buffers(2);
+    let video_handle = video_sink.handle();
+    let node = pipeline.add_demuxer("mkvdemux", demux);
+    let vs = pipeline.add_sink("video_sink", video_sink);
+    pipeline.link_pads(node, "video", vs, "sink").unwrap();
+
+    let executor = Executor::new();
+    let mut handle = executor.start(&mut pipeline).unwrap();
+    let mut bus = handle.take_bus().unwrap();
+
+    for _ in 0..2 {
+        assert!(matches!(
+            video_handle.pull_buffer().await,
+            Pulled::Buffer(_)
+        ));
+    }
+    let seek = SeekEvent::new_time(ClockTime::from_millis(1200))
+        .with_flags(SeekFlags::FLUSH | SeekFlags::KEY_UNIT | SeekFlags::SNAP_BEFORE);
+    assert!(handle.seek(seek).await);
+
+    let mut pts = Vec::new();
+    while let Pulled::Buffer(b) = video_handle.pull_buffer().await {
+        pts.push(b.metadata().pts.nanos() / 1_000_000);
+    }
+    handle.wait().await.unwrap();
+
+    let landing = pts
+        .iter()
+        .rposition(|p| *p == 1000)
+        .expect("landing keyframe was presented");
+    assert_eq!(
+        &pts[landing..],
+        &[1000, 1100, 1200, 1300, 1400, 1500, 1600, 1700, 1800, 1900],
+        "playback continued from the prior cue keyframe to EOS: {pts:?}"
+    );
+
+    let mut seek_done_pos = None;
+    while let Some(msg) = bus.poll() {
+        if let MessageKind::SeekDone { position, .. } = msg.kind {
+            seek_done_pos = Some(position);
+        }
+    }
+    assert_eq!(
+        seek_done_pos,
+        Some(Some(1_000_000_000)),
+        "SeekDone reports the cue landing, not the request"
+    );
+}
+
 /// with_loop: the stream rewinds at EOS instead of ending, until stopped.
 #[tokio::test(flavor = "multi_thread")]
 async fn mkv_video_only_loops_at_eos() {
@@ -249,7 +310,7 @@ mod cue_seek {
     use parallax::buffer::Buffer;
     use parallax::clock::ClockTime;
     use parallax::element::{Demuxer, DemuxerProduce};
-    use parallax::event::{Event, SeekEvent};
+    use parallax::event::{Event, EventResult, SeekEvent, SeekFlags};
     use parallax::metadata::BufferFlags;
     use std::io::{Read, Seek, SeekFrom};
     use std::sync::Arc;
@@ -313,12 +374,19 @@ mod cue_seek {
         panic!("produce() made no progress");
     }
 
+    fn seek_with(
+        demux: &mut MkvDemux<impl Read + Seek + Send>,
+        millis: u64,
+        flags: SeekFlags,
+    ) -> EventResult {
+        let event =
+            Event::Seek(SeekEvent::new_time(ClockTime::from_millis(millis)).with_flags(flags));
+        demux.handle_upstream_event(&event)
+    }
+
     fn seek_to(demux: &mut MkvDemux<impl Read + Seek + Send>, millis: u64) {
-        let event = Event::Seek(SeekEvent::new_time(ClockTime::from_millis(millis)));
-        assert!(
-            demux.handle_upstream_event(&event).is_handled(),
-            "seek handled"
-        );
+        let result = seek_with(demux, millis, SeekFlags::FLUSH | SeekFlags::KEY_UNIT);
+        assert!(result.is_handled(), "seek handled");
     }
 
     /// (A) BlockGroup fixture: a cue-indexed seek lands on the keyframe at
@@ -422,6 +490,79 @@ mod cue_seek {
             yields > 0,
             "a bounded scan must yield between produce() calls"
         );
+    }
+
+    /// (E) SNAP_BEFORE lands on the prior cue and — unlike the forward
+    /// default — reports the landing up front, so the executor's Segment
+    /// and SeekDone carry the honest position (#166). Cues in the fixture
+    /// sit at 0/500/1000/1500 ms.
+    #[test]
+    fn cue_seek_snap_before_lands_on_prior_cue() {
+        let (mut demux, _) = counting(H264_AAC_MKV);
+        let mut yields = 0;
+        next_buffer(&mut demux, &mut yields).expect("head frame");
+
+        let result = seek_with(
+            &mut demux,
+            1200,
+            SeekFlags::FLUSH | SeekFlags::KEY_UNIT | SeekFlags::SNAP_BEFORE,
+        );
+        assert_eq!(
+            result,
+            EventResult::Handled {
+                position: Some(1_000_000_000)
+            },
+            "backward snap knows its landing up front"
+        );
+
+        // First post-seek video buffer is the 1000 ms cue keyframe; nothing
+        // below the cue leaks on any pad.
+        loop {
+            let (pad, pts, sync) = next_buffer(&mut demux, &mut yields).expect("post-seek data");
+            assert!(pts >= 1000, "pre-cue frame leaked: pad {pad} pts {pts}");
+            if pad == 0 {
+                assert_eq!(pts, 1000, "landing keyframe");
+                assert!(sync, "landing frame is a keyframe");
+                break;
+            }
+        }
+    }
+
+    /// (F) Both SNAP bits = nearest, resolved at cue granularity: 1200 ms is
+    /// closer to the 1000 ms cue, 1300 ms to the 1500 ms one.
+    #[test]
+    fn cue_seek_snap_nearest() {
+        let nearest =
+            SeekFlags::FLUSH | SeekFlags::KEY_UNIT | SeekFlags::SNAP_BEFORE | SeekFlags::SNAP_AFTER;
+
+        let (mut demux, _) = counting(H264_AAC_MKV);
+        let mut yields = 0;
+        next_buffer(&mut demux, &mut yields).expect("head frame");
+        assert_eq!(
+            seek_with(&mut demux, 1200, nearest),
+            EventResult::Handled {
+                position: Some(1_000_000_000)
+            },
+            "1200 ms resolves backward (200 ms) over forward (300 ms)"
+        );
+
+        let (mut demux, _) = counting(H264_AAC_MKV);
+        let mut yields = 0;
+        next_buffer(&mut demux, &mut yields).expect("head frame");
+        assert_eq!(
+            seek_with(&mut demux, 1300, nearest),
+            EventResult::Handled { position: None },
+            "1300 ms resolves forward, whose landing is scan-determined"
+        );
+        loop {
+            let (pad, pts, sync) = next_buffer(&mut demux, &mut yields).expect("post-seek data");
+            assert!(pts >= 1300, "pre-target frame leaked: pad {pad} pts {pts}");
+            if pad == 0 {
+                assert_eq!(pts, 1500, "forward landing keyframe");
+                assert!(sync);
+                break;
+            }
+        }
     }
 }
 

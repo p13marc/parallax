@@ -426,6 +426,87 @@ async fn mp4_demux_source_seeks_at_runtime() {
     );
 }
 
+/// SNAP_AFTER steers the runtime seek forward: the same 1200 ms request
+/// lands on the NEXT keyframe (1500 ms) and SeekDone reports it (#166).
+#[cfg(feature = "mp4-demux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn mp4_demux_source_snap_after_seeks_at_runtime() {
+    use parallax::clock::ClockTime;
+    use parallax::elements::Mp4DemuxSource;
+    use parallax::elements::demux::Mp4Demux;
+    use parallax::elements::mux::{Mp4Mux, Mp4MuxConfig, Mp4VideoTrackConfig};
+    use parallax::event::{SeekEvent, SeekFlags};
+    use parallax::pipeline::bus::MessageKind;
+    use std::io::Cursor;
+
+    // Same fixture as above: keyframes at 0/500/1000/1500 ms.
+    let mut mux = Mp4Mux::new(Cursor::new(Vec::new()), Mp4MuxConfig::default()).unwrap();
+    let sps = vec![0x67, 0x42, 0x00, 0x1f];
+    let pps = vec![0x68, 0xce, 0x3c, 0x80];
+    let video = mux
+        .add_video_track(Mp4VideoTrackConfig::h264(320, 240, &sps, &pps))
+        .unwrap();
+    let keyframe = [0x00, 0x00, 0x00, 0x02, 0x65, 0xAA];
+    let delta = [0x00, 0x00, 0x00, 0x02, 0x41, 0x9A];
+    for i in 0..20u64 {
+        let is_key = i % 5 == 0;
+        let data: &[u8] = if is_key { &keyframe } else { &delta };
+        mux.write_video_sample(video, data, i * 100, 100, is_key)
+            .unwrap();
+    }
+    let mp4_data = mux.finish().unwrap().into_inner();
+    let demux = Mp4Demux::new(Cursor::new(mp4_data.clone()), mp4_data.len() as u64).unwrap();
+
+    let mut pipeline = Pipeline::new();
+    let video_sink = AppSink::with_max_buffers(2);
+    let video_handle = video_sink.handle();
+    let node = pipeline.add_demuxer("mp4demux", Mp4DemuxSource::new(demux));
+    let vs = pipeline.add_sink("video_sink", video_sink);
+    pipeline.link_pads(node, "video", vs, "sink").unwrap();
+
+    let executor = Executor::new();
+    let mut handle = executor.start(&mut pipeline).unwrap();
+    let mut bus = handle.take_bus().unwrap();
+
+    for _ in 0..2 {
+        assert!(matches!(
+            video_handle.pull_buffer().await,
+            Pulled::Buffer(_)
+        ));
+    }
+    let seek = SeekEvent::new_time(ClockTime::from_millis(1200))
+        .with_flags(SeekFlags::FLUSH | SeekFlags::KEY_UNIT | SeekFlags::SNAP_AFTER);
+    assert!(handle.seek(seek).await);
+
+    let mut pts = Vec::new();
+    while let Pulled::Buffer(b) = video_handle.pull_buffer().await {
+        pts.push(b.metadata().pts.nanos() / 1_000_000);
+    }
+    handle.wait().await.unwrap();
+
+    let landing = pts
+        .iter()
+        .rposition(|p| *p == 1500)
+        .expect("landing keyframe was presented");
+    assert_eq!(
+        &pts[landing..],
+        &[1500, 1600, 1700, 1800, 1900],
+        "playback continued from the forward keyframe to EOS: {pts:?}"
+    );
+
+    let mut seek_done = None;
+    while let Some(msg) = bus.poll() {
+        if let MessageKind::SeekDone { position, .. } = msg.kind {
+            seek_done = Some(position);
+        }
+    }
+    assert_eq!(
+        seek_done,
+        Some(Some(1_500_000_000)),
+        "SeekDone carries the forward-snapped keyframe position"
+    );
+}
+
 /// TsDemuxElement in a pipeline: TS bytes in, video frames only on the
 /// video branch, audio only on audio.
 #[cfg(feature = "mpeg-ts")]

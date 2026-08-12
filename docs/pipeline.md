@@ -294,6 +294,20 @@ let stream  = seg.to_stream_time(ClockTime::from_secs(12));  // → 12 s
 
 Build a custom `SeekEvent` (`SeekEvent::new_time`/`new_bytes`) and pass it to `PipelineHandle::seek` for non-default flags. See `examples/52_seeking.rs`.
 
+### Snap direction
+
+Container demuxers snap a time seek to a keyframe (`KEY_UNIT`). By default MP4 snaps *backward* to the GOP's keyframe and MKV *forward* to the next cue; `SNAP_BEFORE`/`SNAP_AFTER` pick the direction explicitly, and both bits together mean "nearest":
+
+```rust
+use parallax::event::{SeekEvent, SeekFlags};
+
+let seek = SeekEvent::new_time(ClockTime::from_secs(30))
+    .with_flags(SeekFlags::FLUSH | SeekFlags::KEY_UNIT | SeekFlags::SNAP_AFTER);
+handle.seek(seek).await;
+```
+
+The synthesized `Segment` and `SeekDone` report the keyframe actually landed on. MKV resolves the direction at cue granularity and degrades to forward snapping on cue-less files; `ACCURATE` is accepted but not yet implemented (it needs decoder clipping).
+
 ## Pad probes
 
 Intercept buffers and events at any pad for inspection, filtering, or dropping:

@@ -887,6 +887,60 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
         let target_ns = seek.start.position.max(0) as u64;
         let ticks = target_ns / self.timestamp_scale;
 
+        // Snap direction (#166). Default is forward — MKV's scan-based skip
+        // naturally lands on the first keyframe at or after the target.
+        // Resolution happens at cue granularity: `prev`/`next` bracket the
+        // target in the cue table, and a non-cued keyframe between cues can
+        // make the true forward landing closer than `next` suggests — best
+        // effort, same as GStreamer's demuxers. Cue-less files can only
+        // scan forward, so Before/Nearest degrade.
+        let requested = seek.flags.snap().unwrap_or(crate::event::SeekSnap::After);
+        let prev = self
+            .cues
+            .iter()
+            .rev()
+            .find(|c| c.time_ticks <= ticks)
+            .map(|c| (c.time_ticks, c.cluster_offset));
+        let next_ticks = self
+            .cues
+            .iter()
+            .find(|c| c.time_ticks > ticks)
+            .map(|c| c.time_ticks);
+        use crate::event::SeekSnap;
+        let snap = if self.cues.is_empty() {
+            if requested != SeekSnap::After {
+                tracing::debug!(
+                    "mkvdemux: {requested:?} requested but the file has no cues; forward snap"
+                );
+            }
+            SeekSnap::After
+        } else {
+            match requested {
+                SeekSnap::Nearest => match (prev, next_ticks) {
+                    (Some((p, _)), Some(n)) if n - ticks < ticks - p => SeekSnap::After,
+                    (Some(_), _) => SeekSnap::Before,
+                    (None, _) => SeekSnap::After,
+                },
+                s => s,
+            }
+        };
+        // Backward snap lands exactly on a cue (skip to the cue's own time,
+        // landing knowable up front); forward keeps the requested tick as
+        // the skip floor and scans ahead to the next keyframe.
+        let (cue_target, skip_ticks, landing_ticks) = match snap {
+            SeekSnap::Before => {
+                // `prev`, or the first cue when the target precedes it —
+                // nothing decodable earlier (mirrors MP4's rule for a target
+                // before the first keyframe).
+                let (cue_ticks, offset) = prev.unwrap_or_else(|| {
+                    let c = &self.cues[0];
+                    (c.time_ticks, c.cluster_offset)
+                });
+                (Some(offset), cue_ticks, Some(cue_ticks))
+            }
+            _ => (prev.map(|(_, offset)| offset), ticks, None),
+        };
+
         // Cue-indexed path first, on OUR cue table (`mkv_cues`): the crate's
         // own cue seek mis-resolves ffmpeg's CueRelativePosition against the
         // first cluster — sometimes erroring, sometimes silently landing
@@ -896,14 +950,13 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
         // from which `next_frame` resynchronizes off the cluster's own
         // Timestamp. Cue-less files take the crate's linear path, and a
         // rewind-plus-skip remains the last resort.
-        let cue = self.cues.iter().rev().find(|c| c.time_ticks <= ticks);
-        let sought = match cue {
-            Some(cue) => match self.file.seek(0) {
-                Ok(()) => match self.raw.seek(std::io::SeekFrom::Start(cue.cluster_offset)) {
+        let sought = match cue_target {
+            Some(cluster_offset) => match self.file.seek(0) {
+                Ok(()) => match self.raw.seek(std::io::SeekFrom::Start(cluster_offset)) {
                     Ok(_) => {
                         tracing::debug!(
-                            "mkvdemux: cue seek to tick {ticks} lands at cluster offset {}",
-                            cue.cluster_offset
+                            "mkvdemux: cue seek to tick {ticks} lands at cluster offset \
+                             {cluster_offset}"
                         );
                         true
                     }
@@ -929,19 +982,32 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
             },
         };
         if sought {
-            tracing::info!("mkvdemux: seek to {target_ns} ns (tick {ticks})");
+            tracing::info!("mkvdemux: seek to {target_ns} ns (tick {ticks}, {snap:?})");
             self.pending = None;
             self.video_resync = true;
             // Per-track skip on EVERY path: the cue lands at (or before) the
-            // target's cluster, the crate's narrow phase only guarantees the
-            // first block, and the rewind fallback starts at zero — in all
-            // three cases each routed track discards its own frames below
-            // the target.
-            self.skip = self.routed.iter().map(|&(id, _)| (id, ticks)).collect();
-            // Landing unknown until produce() finds the first keyframe at or
-            // after the target — report None and let the executor fall back
-            // to the requested position for the Segment (#162).
-            EventResult::handled()
+            // skip target's cluster, the crate's narrow phase only guarantees
+            // the first block, and the rewind fallback starts at zero — in
+            // all three cases each routed track discards its own frames
+            // below the target.
+            self.skip = self
+                .routed
+                .iter()
+                .map(|&(id, _)| (id, skip_ticks))
+                .collect();
+            match landing_ticks {
+                // Backward snap: the cue IS the landing, report it so the
+                // Segment and SeekDone carry the honest position. Slightly
+                // optimistic if the keyframe heuristic rejects the cue's
+                // block and the resync scans past it — rare, self-correcting
+                // (video simply starts at the next keyframe).
+                Some(t) => EventResult::handled_at((t * self.timestamp_scale) as i64),
+                // Forward snap: landing unknown until produce() finds the
+                // first keyframe at or after the target — report None and
+                // let the executor fall back to the requested position for
+                // the Segment (#162).
+                None => EventResult::handled(),
+            }
         } else {
             EventResult::Error
         }
