@@ -205,3 +205,90 @@ mod decode_convert {
         );
     }
 }
+
+// ============================================================================
+// Executor per-buffer budget (always compiled)
+// ============================================================================
+
+/// What one extra element hop costs per buffer, on the executor's own path.
+///
+/// This exists because the alloc ratchet above only ever watched *element*
+/// code, so a regression inside the executor was invisible: #163 phase A
+/// added a `Box::pin`ned receive future per buffer (the `PendingRecv`
+/// workaround for kanal's cancel-unsafe recv) and nothing failed. Removing
+/// kanal took that box away again; this test is what keeps it away.
+///
+/// Measured `per_hop`: **2.0 → 1.0** across that removal.
+///
+/// The number is not supposed to be zero. What remains per hop is dynosaur's
+/// `dyn(box)` future, allocated once per `element.process()` call — see
+/// `DynAsyncElement` in `src/element/traits.rs`. Driving that to zero is a
+/// separate piece of work.
+mod executor_steady_state {
+    use super::tracked;
+    use parallax::elements::{NullSink, NullSource, PassThrough};
+    use parallax::pipeline::{Executor, Pipeline};
+
+    /// Total allocations for one linear pipeline run to EOS.
+    ///
+    /// Current-thread runtime on purpose: the tracking allocator counts in a
+    /// thread-local, so a multi-thread runtime would attribute the element
+    /// tasks' allocations to worker threads and measure almost nothing.
+    fn run(hops: usize, buffers: u64) -> u64 {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let (_, allocs) = tracked(|| {
+            rt.block_on(async {
+                let mut p = Pipeline::new();
+                let src = p.add_source("src", NullSource::new(buffers));
+                let mut prev = src;
+                for i in 0..hops {
+                    let f = p.add_filter(format!("f{i}"), PassThrough::new());
+                    p.link(prev, f).expect("link");
+                    prev = f;
+                }
+                let snk = p.add_sink("sink", NullSink::new());
+                p.link(prev, snk).expect("link");
+                Executor::new().run(&mut p).await.expect("run");
+            })
+        });
+        allocs
+    }
+
+    const LO: u64 = 100;
+    const HI: u64 = 1_100;
+
+    /// Allocations per buffer at `hops` transforms, as a two-point slope so
+    /// that everything paid once per run — graph construction, task spawn,
+    /// arena setup, teardown — cancels out instead of hiding a per-buffer
+    /// regression inside startup noise.
+    fn slope(hops: usize) -> f64 {
+        let lo = run(hops, LO);
+        let hi = run(hops, HI);
+        assert!(hi >= lo, "allocation counter went backwards: {hi} < {lo}");
+        (hi - lo) as f64 / (HI - LO) as f64
+    }
+
+    /// Budget for one hop's per-buffer allocations. Measured at 1.0; the
+    /// headroom is deliberately under one allocation, or the ratchet could
+    /// not catch a single reintroduced box.
+    const BUDGET: f64 = 1.5;
+
+    #[test]
+    fn executor_per_hop_alloc_budget() {
+        let _ = run(1, 32); // warm lazy globals
+        let one = slope(1);
+        let three = slope(3);
+        let per_hop = (three - one) / 2.0;
+        println!(
+            "executor: {one:.2} allocs/buffer at 1 hop, {three:.2} at 3 hops \
+             => {per_hop:.2} per buffer per hop"
+        );
+        assert!(
+            per_hop <= BUDGET,
+            "executor per-hop steady state: {per_hop:.2} allocs/buffer/hop (budget {BUDGET})"
+        );
+    }
+}
