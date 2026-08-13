@@ -383,12 +383,15 @@ pub struct RegexFilterStats {
 /// ```rust,ignore
 /// use parallax::elements::MetadataExtract;
 ///
-/// let (extractor, receiver) = MetadataExtract::new();
-/// // Use extractor in pipeline, receive metadata from receiver
+/// let (extractor, mut receiver) = MetadataExtract::new();
+/// // Use extractor in the pipeline; read the sideband from the receiver:
+/// while let Some(extracted) = receiver.recv().await {
+///     println!("{} bytes", extracted.size);
+/// }
 /// ```
 pub struct MetadataExtract {
     name: String,
-    sender: kanal::Sender<ExtractedMetadata>,
+    sender: tokio::sync::mpsc::UnboundedSender<ExtractedMetadata>,
     count: AtomicU64,
 }
 
@@ -403,8 +406,15 @@ pub struct ExtractedMetadata {
 
 impl MetadataExtract {
     /// Create a new metadata extractor and its receiver.
-    pub fn new() -> (Self, kanal::Receiver<ExtractedMetadata>) {
-        let (tx, rx) = kanal::unbounded();
+    ///
+    /// The channel is unbounded, so the send on the element's hot path
+    /// below never blocks and needs no runtime context — a sideband
+    /// consumer that stalls costs memory, never the pipeline.
+    pub fn new() -> (
+        Self,
+        tokio::sync::mpsc::UnboundedReceiver<ExtractedMetadata>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         (
             Self {
                 name: "metadata-extract".to_string(),
