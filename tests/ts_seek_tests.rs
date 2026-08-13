@@ -1,0 +1,225 @@
+//! #163 phase B, end to end: `filesrc ! tsdemux ! appsink` seeks in TIME.
+//!
+//! Nothing in this pipeline can seek in time. `FileSrc` seeks in bytes and
+//! `TsDemuxElement` does not own the reader — the seek only works because the
+//! demuxer *translates* it, which is the whole point of the phase.
+//!
+//! The fixture is muxed here rather than checked in so its shape is visible:
+//! **`psi_interval` must be non-zero**. The default (0) writes PAT/PMT once at
+//! the head, and a seek resets the parser — after which a head-only stream
+//! never delivers another frame, because the tables that describe it are
+//! thousands of packets behind the read cursor.
+
+#![cfg(feature = "mpeg-ts")]
+
+use std::time::Duration;
+
+use parallax::clock::ClockTime;
+use parallax::elements::{
+    AppSink, FileSrc, Pulled, TsDemuxElement, TsMux, TsMuxConfig, TsMuxStreamType, TsMuxTrack,
+};
+use parallax::event::SegmentFormat;
+use parallax::pipeline::bus::MessageKind;
+use parallax::pipeline::{Executor, Pipeline};
+use tempfile::NamedTempFile;
+
+const VIDEO_PID: u16 = 0x100;
+const FPS: u64 = 25;
+const FRAMES: u64 = 500; // 20 seconds
+
+/// Mux a 10-second single-track TS whose PSI repeats often enough to survive
+/// a mid-stream parser reset.
+fn fixture() -> NamedTempFile {
+    let config = TsMuxConfig::new()
+        .add_track(TsMuxTrack::new(VIDEO_PID, TsMuxStreamType::H264).video())
+        // Every 50 packets: frequent enough that a post-seek parser sees a
+        // PAT/PMT within a few reads.
+        .psi_interval(50)
+        // Denser than the 100 ms conformance floor, so 10 seconds of stream
+        // gives the byte index plenty of anchors.
+        .pcr_interval_ms(40);
+    let mut mux = TsMux::new(config);
+
+    // The payload is inert: this test is about where the demuxer lands, not
+    // about decoding. Each frame is distinctly sized so nothing accidentally
+    // aliases.
+    let mut out = Vec::new();
+    for frame in 0..FRAMES {
+        let pts = ClockTime::from_nanos(frame * 1_000_000_000 / FPS);
+        // 4 KB per frame, so the whole fixture (~2 MB) cannot fit in the
+        // pipeline's channel buffers. With a smaller one the source reads the
+        // file to EOS and exits before the seek ever reaches it — the seek
+        // then has nothing to act on, and the test passes or fails on I/O
+        // timing rather than on seeking.
+        let payload = vec![(frame % 251) as u8; 4096];
+        out.extend(
+            mux.write_pes(VIDEO_PID, &payload, Some(pts), Some(pts))
+                .unwrap(),
+        );
+    }
+
+    let mut file = NamedTempFile::new().unwrap();
+    std::io::Write::write_all(file.as_file_mut(), &out).unwrap();
+    std::io::Write::flush(file.as_file_mut()).unwrap();
+    file
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fed_ts_demuxer_seeks_in_time() {
+    let file = fixture();
+    let size = file.as_file().metadata().unwrap().len();
+    assert!(
+        size > 1_500_000,
+        "fixture is {size} bytes, too small to seek in"
+    );
+
+    let mut pipeline = Pipeline::new();
+    // Small reads: 100 packets each, so the demuxer is pushed often and the
+    // seek lands within a read or two of the estimate.
+    let src = pipeline.add_source("src", FileSrc::new(file.path()).with_chunk_size(100 * 188));
+    let demux = pipeline.add_demuxer("tsdemux", TsDemuxElement::new());
+    let sink = AppSink::with_max_buffers(4);
+    let sink_handle = sink.handle();
+    let snk = pipeline.add_async_sink("sink", sink);
+    pipeline.link(src, demux).unwrap();
+    pipeline.link_pads(demux, "video", snk, "sink").unwrap();
+
+    // Before start, with only FileSrc's answer to go on, the graph already
+    // reports TIME — the demuxer's declared translation replaced BYTES.
+    let pre = pipeline.query_seekable();
+    assert!(pre.seekable);
+    assert_eq!(pre.format, SegmentFormat::Time);
+
+    let executor = Executor::new();
+    let mut handle = executor.start(&mut pipeline).unwrap();
+    let mut bus = handle.take_bus().unwrap();
+
+    // Pull in the background: the sink must keep draining or the graph
+    // back-pressures and the seek never reaches the demuxer.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let puller = tokio::spawn(async move {
+        loop {
+            match sink_handle.pull_buffer().await {
+                Pulled::Buffer(b) => {
+                    if tx.send(b.metadata().pts).is_err() {
+                        break;
+                    }
+                    // Paced on purpose. Unthrottled, the whole 10-second
+                    // fixture is read and demuxed in about ten milliseconds,
+                    // and the seek races end-of-stream instead of landing
+                    // mid-play. A bounded AppSink with Block policy turns
+                    // this delay into back-pressure on the source.
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                Pulled::Ended(_) => break,
+                Pulled::Empty | Pulled::Flushing => tokio::task::yield_now().await,
+            }
+        }
+    });
+
+    // Let a couple of seconds of stream go past so the index has anchors.
+    let mut seen = 0;
+    while seen < 20 {
+        match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+            Ok(Some(_)) => seen += 1,
+            Ok(None) => panic!("stream ended before the seek could be issued"),
+            Err(_) => panic!("no frames within 5s; got {seen}"),
+        }
+    }
+
+    let target = ClockTime::from_secs(7);
+    assert!(handle.seek_time(target).await, "the seek was dispatched");
+
+    // Drain until a frame lands at or after the target. Pre-seek frames
+    // already in flight are stamped with the old epoch and dropped by the
+    // executor, but the ones already pulled are still in `rx`.
+    let mut landed = None;
+    let mut after_seek = 0u32;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+            Ok(Some(pts)) if pts >= ClockTime::from_secs(6) => {
+                landed = Some(pts);
+                break;
+            }
+            Ok(Some(_)) => after_seek += 1,
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    let landed = landed.expect("no frame at or after the seek target arrived");
+    assert!(
+        landed >= ClockTime::from_secs(6) && landed <= ClockTime::from_secs(9),
+        "landed at {landed}, which is not near the 7s target"
+    );
+    // Playing through from 0.8s to 6s would have delivered ~130 frames. The
+    // pre-seek buffers still in flight are epoch-dropped, so only a handful
+    // of already-pulled ones can precede the landing.
+    assert!(
+        after_seek < 30,
+        "{after_seek} frames before the landing: this played through rather than seeking"
+    );
+
+    handle.stop();
+    let _ = puller.await;
+    handle.wait().await.unwrap();
+
+    // The completion is reported in TIME — the format the application asked
+    // in — carrying the position actually reached, not the byte estimate.
+    let mut time_done = None;
+    while let Some(msg) = bus.poll() {
+        if let MessageKind::SeekDone {
+            format, position, ..
+        } = msg.kind
+            && format == SegmentFormat::Time
+        {
+            time_done = Some(position);
+        }
+    }
+    let position = time_done.expect("a TIME SeekDone was posted");
+    let position = position.expect("the demuxer reported where it landed");
+    assert!(
+        (6_000_000_000..=9_000_000_000).contains(&position),
+        "SeekDone reported {position} ns, which is not near the 7s target"
+    );
+}
+
+/// A seek issued before the index has anything in it must not be answered
+/// with a made-up offset. The demuxer refuses, the seek travels on to
+/// `FileSrc`, which cannot service a TIME seek either — and the pipeline says
+/// so instead of silently landing somewhere wrong.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_seek_before_any_pcr_is_refused_rather_than_guessed() {
+    let file = fixture();
+
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_source("src", FileSrc::new(file.path()));
+    let demux = pipeline.add_demuxer("tsdemux", TsDemuxElement::new());
+    let sink = AppSink::with_max_buffers(4).drop_on_full(true);
+    let sink_handle = sink.handle();
+    let snk = pipeline.add_async_sink("sink", sink);
+    pipeline.link(src, demux).unwrap();
+    pipeline.link_pads(demux, "video", snk, "sink").unwrap();
+
+    let executor = Executor::new();
+    let mut handle = executor.start(&mut pipeline).unwrap();
+    let mut bus = handle.take_bus().unwrap();
+
+    // Immediately, before a single buffer has been demuxed.
+    handle.seek_time(ClockTime::from_secs(5)).await;
+
+    handle.stop();
+    let _ = sink_handle;
+    handle.wait().await.unwrap();
+
+    // No TIME completion was posted: nothing claimed to have landed anywhere.
+    while let Some(msg) = bus.poll() {
+        if let MessageKind::SeekDone { format, .. } = msg.kind {
+            assert_ne!(
+                format,
+                SegmentFormat::Time,
+                "an unindexed seek must not report a TIME landing"
+            );
+        }
+    }
+}

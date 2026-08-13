@@ -308,6 +308,29 @@ handle.seek(seek).await;
 
 The synthesized `Segment` and `SeekDone` report the keyframe actually landed on. MKV resolves the direction at cue granularity and degrades to forward snapping on cue-less files; `ACCURATE` is accepted but not yet implemented (it needs decoder clipping).
 
+### Seeking a fed demuxer (`filesrc ! tsdemux`)
+
+Nothing in `filesrc ! tsdemux ! …` can seek in time: `FileSrc` seeks in bytes, and the demuxer does not own the reader. It works anyway, because the demuxer **translates** the seek:
+
+```rust
+let q = pipeline.query_seekable();
+assert_eq!(q.format, SegmentFormat::Time);   // not Bytes — see below
+handle.seek_time(ClockTime::from_secs(30)).await;
+```
+
+An element answers an upstream event with `EventResult::Forward(event)` to send a *different* event on in its place, built with `SeekEvent::derive(format, position)` so the seqnum survives — that identity is what keeps the flush epoch idempotent and lets `SeekDone` correlate. The executor forwards the replacement without bumping the epoch; the source that ultimately handles the derived seek does that, exactly as for an untranslated one.
+
+Because the demuxer declares the conversion through `seek_translations()`, `query_seekable()` reports **`Time`, replacing the source's `Bytes`** — GStreamer's discipline, where a demuxer refuses byte seekability downstream. The range does not survive the swap (a byte count is not a duration), so `stop` reopens to 0 unless the demuxer itself knows a duration. `seek_bytes()` still works: it reaches `FileSrc` honestly.
+
+Two completions reach the bus for one user seek, sharing a seqnum: the source's, in `Bytes`, at the offset it reached; and the demuxer's, in `Time`, carrying the PTS of the first buffer that actually arrived. The second is the one an application wants — it is measured, not estimated.
+
+`TsDemux` places the seek with a `TsByteIndex`: sparse `(time, offset)` anchors harvested from the PCR clock as data flows past, interpolated linearly. Exact for CBR, approximate for VBR or ad-spliced streams. Known limits:
+
+- an index with fewer than two anchors (under ~200 ms of stream seen, or no usable PCR) **refuses** the seek rather than guessing;
+- a TS with head-only PSI is unseekable — a seek resets the parser, and a stream that never repeats its PAT/PMT never recovers;
+- `duration()` stays `NONE` for a fed TS: the last PCR seen is a floor, not a total;
+- a source that has already read to EOS is gone, and a seek arriving afterwards has nothing to act on. With a file small enough to fit entirely in the pipeline's channel buffers, that happens almost immediately.
+
 ## Pad probes
 
 Intercept buffers and events at any pad for inspection, filtering, or dropping:
