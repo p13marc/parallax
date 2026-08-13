@@ -25,6 +25,7 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::clock::ClockTime;
 use crate::error::{Error, Result};
+use crate::event::{Event, EventResult, SeekPosition, SeekType, SegmentFormat};
 use crate::memory::{OutputArena, OutputBudget, defaults};
 use crate::metadata::Metadata;
 
@@ -41,6 +42,214 @@ use std::sync::{Arc, Mutex};
 
 /// Size of a single MPEG-TS packet.
 pub const TS_PACKET_SIZE: usize = 188;
+
+// ============================================================================
+// Byte index (time → offset, for seeking a fed demuxer)
+// ============================================================================
+
+/// Sparse time-to-byte index built from the PCR clock while demuxing (#163).
+///
+/// A *fed* demuxer cannot seek: it does not own the reader. What it can do is
+/// tell the source **where** to seek, which needs a mapping from stream time
+/// to byte offset. Bisection — the obvious way to build one — is
+/// architecturally unavailable here: each probe would be a full flush round
+/// trip through the executor. So the index is built passively from data that
+/// already flows past, and answers with a single-shot estimate.
+///
+/// The anchors come from the PCR, not from PES PTS: PCR is denser (a
+/// conformant stream repeats it at least every 100 ms), appears in the
+/// adaptation field of packets we can parse without any PSI, and is present
+/// from the first packet of the program rather than the first complete access
+/// unit.
+///
+/// # Accuracy
+///
+/// A linear interpolation between anchors is exact for CBR (the overwhelmingly
+/// common case for TS, which pads to a constant rate) and approximate for VBR
+/// or ad-spliced streams. **The honesty does not come from the estimate**: it
+/// comes from reporting the first PTS that actually arrives after the seek, so
+/// an application learns where it really landed even when the guess was off.
+#[derive(Debug, Default, Clone)]
+pub struct TsByteIndex {
+    /// `(nanoseconds since the first PCR, absolute byte offset)`, sorted.
+    anchors: Vec<(u64, u64)>,
+    /// 90 kHz base of the first PCR ever seen — the stream's time origin.
+    /// Deliberately *not* cleared by a flush: it is what makes post-seek
+    /// anchors comparable with pre-seek ones.
+    first_pcr: Option<u64>,
+    /// The PID the first PCR came from. A multi-program stream carries one
+    /// PCR per program; mixing two clocks into one index would corrupt it.
+    pcr_pid: Option<u16>,
+    /// Stream size in bytes, learned from the source's byte segment.
+    total: Option<u64>,
+}
+
+impl TsByteIndex {
+    /// Anchors closer together than this are redundant for a linear estimate.
+    const MIN_SPACING_NS: u64 = 100_000_000;
+    /// Above this the index is decimated (every other anchor dropped), which
+    /// halves the resolution and doubles the span it can cover.
+    const MAX_ANCHORS: usize = 8192;
+
+    /// Number of anchors currently held.
+    pub fn len(&self) -> usize {
+        self.anchors.len()
+    }
+
+    /// Whether the index holds no anchors at all.
+    pub fn is_empty(&self) -> bool {
+        self.anchors.is_empty()
+    }
+
+    /// Record the stream's total size, learned from a byte-format segment.
+    pub fn set_total(&mut self, total: Option<u64>) {
+        if let Some(t) = total.filter(|t| *t > 0) {
+            self.total = Some(t);
+        }
+    }
+
+    /// Scan one 188-byte packet at absolute `offset` and record its PCR.
+    fn observe(&mut self, packet: &[u8], offset: u64) {
+        let Some((pid, pcr)) = packet_pcr(packet) else {
+            return;
+        };
+        match self.pcr_pid {
+            Some(locked) if locked != pid => return,
+            Some(_) => {}
+            None => self.pcr_pid = Some(pid),
+        }
+        let origin = *self.first_pcr.get_or_insert(pcr);
+        // A PCR below the origin is either a 33-bit wrap (~26.5 h) or a
+        // discontinuity. Either way it cannot be placed on this timeline.
+        let Some(delta) = pcr.checked_sub(origin) else {
+            return;
+        };
+        // 90 kHz ticks → ns, exactly: 1e9 / 90_000 = 100_000 / 9.
+        let time_ns = delta.saturating_mul(100_000) / 9;
+        self.insert(time_ns, offset);
+    }
+
+    fn insert(&mut self, time_ns: u64, offset: u64) {
+        let pos = self.anchors.partition_point(|(t, _)| *t < time_ns);
+        // Redundant against either neighbour: a linear estimate gains nothing.
+        let crowded = |(t, _): &(u64, u64)| t.abs_diff(time_ns) < Self::MIN_SPACING_NS;
+        if pos > 0 && crowded(&self.anchors[pos - 1]) {
+            return;
+        }
+        if pos < self.anchors.len() && crowded(&self.anchors[pos]) {
+            return;
+        }
+        self.anchors.insert(pos, (time_ns, offset));
+        if self.anchors.len() > Self::MAX_ANCHORS {
+            let mut keep = false;
+            self.anchors.retain(|_| {
+                keep = !keep;
+                keep
+            });
+        }
+    }
+
+    /// Estimate the byte offset holding `target_ns` of stream time.
+    ///
+    /// `None` when the index is too thin to interpolate — fewer than two
+    /// anchors, i.e. under ~200 ms of stream seen. The caller must not invent
+    /// an offset in that case; refusing the seek is the honest answer.
+    ///
+    /// The result is clamped to the stream size (when known) and snapped down
+    /// to a 188-byte packet boundary, so the source resumes at a sync byte.
+    pub fn estimate_byte_offset(&self, target_ns: u64) -> Option<u64> {
+        if self.anchors.len() < 2 {
+            return None;
+        }
+        let (first_t, first_o) = self.anchors[0];
+        let n = self.anchors.len();
+        let raw = if target_ns <= first_t {
+            first_o
+        } else {
+            // Interpolate within the bracketing pair, or extrapolate along the
+            // last one when the target is past everything seen so far — which
+            // is the normal case for a forward seek into unread data.
+            let i = self.anchors.partition_point(|(t, _)| *t <= target_ns);
+            let (lo, hi) = if i >= n { (n - 2, n - 1) } else { (i - 1, i) };
+            interpolate(self.anchors[lo], self.anchors[hi], target_ns)
+        };
+        let clamped = match self.total {
+            Some(total) => raw.min(total.saturating_sub(TS_PACKET_SIZE as u64)),
+            None => raw,
+        };
+        Some(clamped / TS_PACKET_SIZE as u64 * TS_PACKET_SIZE as u64)
+    }
+}
+
+/// Linear interpolation (or extrapolation) of an offset at `target`.
+fn interpolate((t0, o0): (u64, u64), (t1, o1): (u64, u64), target: u64) -> u64 {
+    if t1 <= t0 {
+        return o1;
+    }
+    let span_t = (t1 - t0) as u128;
+    let span_o = o1.saturating_sub(o0) as u128;
+    let into = (target.saturating_sub(t0)) as u128;
+    let offset = o0 as u128 + span_o * into / span_t;
+    offset.min(u64::MAX as u128) as u64
+}
+
+/// Extract `(PID, PCR base)` from a TS packet's adaptation field.
+///
+/// The PCR base is the 33-bit 90 kHz counter; the 9-bit 27 MHz extension is
+/// deliberately discarded — it buys 11 ns of precision on an estimate whose
+/// error is measured in packets.
+fn packet_pcr(packet: &[u8]) -> Option<(u16, u64)> {
+    if packet.len() < TS_PACKET_SIZE || packet[0] != 0x47 {
+        return None;
+    }
+    // adaptation_field_control: 0b10 = AF only, 0b11 = AF + payload.
+    let afc = (packet[3] >> 4) & 0b11;
+    if afc != 0b10 && afc != 0b11 {
+        return None;
+    }
+    let af_len = packet[4] as usize;
+    // Need the flags byte plus 6 PCR bytes, all inside the packet.
+    if af_len < 7 || 5 + af_len > TS_PACKET_SIZE {
+        return None;
+    }
+    if packet[5] & 0x10 == 0 {
+        return None; // PCR_flag clear
+    }
+    let pid = (((packet[1] & 0x1F) as u16) << 8) | packet[2] as u16;
+    let b = &packet[6..12];
+    let base = ((b[0] as u64) << 25)
+        | ((b[1] as u64) << 17)
+        | ((b[2] as u64) << 9)
+        | ((b[3] as u64) << 1)
+        | ((b[4] as u64) >> 7);
+    Some((pid, base))
+}
+
+/// Find a packet boundary in `data`, confirmed by the sync bytes that should
+/// follow it.
+///
+/// A lone 0x47 is worth nothing — it is a perfectly ordinary payload byte, and
+/// locking onto one mid-packet desynchronises the parser for the rest of the
+/// stream. This checks up to three packets ahead, using as many as the data
+/// actually contains (a 200-byte read can only confirm one).
+fn find_sync(data: &[u8]) -> Option<usize> {
+    const CONFIRM: usize = 3;
+    for start in 0..data.len() {
+        if data[start] != 0x47 {
+            continue;
+        }
+        let confirmed = (1..CONFIRM).all(|k| {
+            let at = start + k * TS_PACKET_SIZE;
+            // Beyond the data is "not contradicted", not "confirmed" — with
+            // short reads there is nothing else to go on.
+            at >= data.len() || data[at] == 0x47
+        });
+        if confirmed {
+            return Some(start);
+        }
+    }
+    None
+}
 
 // ============================================================================
 // Stream Types
@@ -495,6 +704,13 @@ pub struct TsDemux {
     arena: SharedOutput,
     /// Partial packet buffer for handling non-aligned input.
     partial_packet: Vec<u8>,
+    /// Absolute byte offset of the next byte to be consumed, in the *source's*
+    /// address space. Advanced by `push`, re-anchored by
+    /// [`set_stream_position`](Self::set_stream_position) after a seek — which
+    /// is the only reason it is not just `stats.bytes_processed`.
+    stream_pos: u64,
+    /// Time-to-byte index built from the PCR clock; see [`TsByteIndex`].
+    index: TsByteIndex,
 }
 
 impl TsDemux {
@@ -517,6 +733,8 @@ impl TsDemux {
             stats,
             arena,
             partial_packet: Vec::new(),
+            stream_pos: 0,
+            index: TsByteIndex::default(),
         }
     }
 
@@ -540,6 +758,8 @@ impl TsDemux {
             stats,
             arena,
             partial_packet: Vec::new(),
+            stream_pos: 0,
+            index: TsByteIndex::default(),
         }
     }
 
@@ -589,26 +809,50 @@ impl TsDemux {
             combined
         };
 
-        // Find first sync byte
-        let start = to_process
-            .iter()
-            .position(|&b| b == 0x47)
-            .unwrap_or(to_process.len());
+        // Find a *confirmed* packet boundary: a lone 0x47 is an ordinary
+        // payload byte, and locking onto one desynchronises the rest of the
+        // stream. With nothing confirmable, keep the data as partial and wait
+        // for more rather than guessing.
+        let start = match find_sync(&to_process) {
+            Some(start) => start,
+            None => {
+                if !to_process.is_empty() {
+                    self.stats.lock().unwrap().sync_errors += 1;
+                }
+                // Anything before the last possible boundary is unusable.
+                let keep = to_process.len().saturating_sub(TS_PACKET_SIZE * 3);
+                self.stream_pos += keep as u64;
+                self.partial_packet = to_process[keep..].to_vec();
+                return Ok(self.output.lock().unwrap().drain(..).collect());
+            }
+        };
         if start > 0 {
             self.stats.lock().unwrap().sync_errors += 1;
         }
 
         let aligned = &to_process[start..];
+        self.stream_pos += start as u64;
 
         // Calculate how many complete packets we have
         let complete_packets = aligned.len() / TS_PACKET_SIZE;
         let complete_bytes = complete_packets * TS_PACKET_SIZE;
 
         if complete_bytes > 0 {
+            // Index before demuxing: the PCR sits in the adaptation field and
+            // needs no PSI, so this works from the very first packet — before
+            // the parser has even seen a PAT.
+            for i in 0..complete_packets {
+                let at = i * TS_PACKET_SIZE;
+                self.index.observe(
+                    &aligned[at..at + TS_PACKET_SIZE],
+                    self.stream_pos + at as u64,
+                );
+            }
             // Process complete packets
             self.demux.push(&mut self.ctx, &aligned[..complete_bytes]);
             self.stats.lock().unwrap().packets_processed += complete_packets as u64;
             self.stats.lock().unwrap().bytes_processed += complete_bytes as u64;
+            self.stream_pos += complete_bytes as u64;
         }
 
         // Save remaining partial packet
@@ -629,10 +873,58 @@ impl TsDemux {
         self.output.lock().unwrap().drain(..).collect()
     }
 
+    /// The time-to-byte index built so far; see [`TsByteIndex`].
+    pub fn index(&self) -> &TsByteIndex {
+        &self.index
+    }
+
+    /// Estimate the byte offset holding `target` of stream time.
+    ///
+    /// Shorthand for [`TsByteIndex::estimate_byte_offset`]; `None` when the
+    /// index is too thin to answer.
+    pub fn estimate_byte_offset(&self, target: ClockTime) -> Option<u64> {
+        self.index.estimate_byte_offset(target.nanos())
+    }
+
+    /// Tell the demuxer where in the source the next pushed byte comes from.
+    ///
+    /// Called after a seek, from the source's byte-format segment. Without it
+    /// every anchor recorded after the seek would be placed at the wrong
+    /// offset and the index would degrade with every seek instead of
+    /// improving.
+    pub fn set_stream_position(&mut self, offset: u64) {
+        self.stream_pos = offset;
+    }
+
+    /// The absolute offset of the next byte this demuxer expects.
+    pub fn stream_position(&self) -> u64 {
+        self.stream_pos
+    }
+
+    /// Record the stream's total size (from a byte segment), so byte
+    /// estimates can be clamped to it.
+    pub fn set_stream_total(&mut self, total: Option<u64>) {
+        self.index.set_total(total);
+    }
+
+    /// Rebuild the parser without touching statistics or the byte index.
+    ///
+    /// What a flush needs: half-assembled access units and PSI state are
+    /// invalid after a seek, but the index built from the bytes already read
+    /// is exactly what makes the *next* seek possible, and counters are not
+    /// timeline state.
+    pub fn reset_parser(&mut self) {
+        self.partial_packet.clear();
+        self.output.lock().unwrap().clear();
+        self.rebuild();
+    }
+
     /// Reset the demuxer state.
     ///
     /// Rebuilds the parser (PAT/PMT included), so the caller must expect
-    /// nothing to come out until the next PSI in the stream.
+    /// nothing to come out until the next PSI in the stream. Also clears the
+    /// statistics and the byte index — use [`reset_parser`](Self::reset_parser)
+    /// for a flush, which must keep both.
     ///
     /// The stream filter is carried across: recreating the context
     /// unconditionally with `TsDemuxContext::new` silently turned a
@@ -641,9 +933,14 @@ impl TsDemux {
         self.partial_packet.clear();
         self.output.lock().unwrap().clear();
         *self.stats.lock().unwrap() = TsDemuxStats::default();
+        self.index = TsByteIndex::default();
+        self.stream_pos = 0;
+        self.rebuild();
+    }
 
-        // Recreate the demuxer, preserving the filter this demuxer was built
-        // with.
+    /// Recreate the parser context, preserving the filter this demuxer was
+    /// built with.
+    fn rebuild(&mut self) {
         self.ctx = match self.ctx.stream_filter.clone() {
             Some(filter) => TsDemuxContext::with_filter(
                 self.output.clone(),
@@ -786,6 +1083,74 @@ impl crate::element::Demuxer for TsDemuxElement {
     fn set_output_budget(&mut self, budget: OutputBudget) {
         self.demux.set_output_budget(budget);
     }
+
+    /// TIME in, BYTES out — the whole reason this element participates in
+    /// seeking at all. Declared so `filesrc ! tsdemux` reports itself
+    /// TIME-seekable before anyone tries.
+    fn seek_translations(&self) -> Vec<crate::pipeline::seek::SeekTranslation> {
+        vec![crate::pipeline::seek::SeekTranslation {
+            from: crate::event::SegmentFormat::Time,
+            to: crate::event::SegmentFormat::Bytes,
+            // A fed TS demuxer never learns the duration: it sees a byte
+            // stream from wherever the source happens to be, and the last PCR
+            // it has seen is a floor, not a total.
+            duration: None,
+        }]
+    }
+
+    /// Translate a TIME seek into a BYTES seek on the source.
+    ///
+    /// Refuses (leaves the event to travel further upstream) when the index
+    /// cannot answer — under ~200 ms of stream seen, or a stream with no
+    /// usable PCR. Inventing an offset would land the source in the middle of
+    /// a packet and desynchronise the parse.
+    fn handle_upstream_event(&mut self, event: &Event) -> EventResult {
+        let Event::Seek(seek) = event else {
+            return EventResult::NotHandled;
+        };
+        if seek.format != SegmentFormat::Time {
+            return EventResult::NotHandled;
+        }
+        // Only absolute targets: Current/End-relative would need a position
+        // and a duration this element does not have.
+        if seek.start.seek_type != SeekType::Set {
+            return EventResult::NotHandled;
+        }
+        let target = ClockTime::from_nanos(seek.start.position.max(0) as u64);
+        let Some(offset) = self.demux.estimate_byte_offset(target) else {
+            tracing::debug!(
+                "tsdemux: byte index too thin ({} anchors) to place {target}",
+                self.demux.index().len()
+            );
+            return EventResult::NotHandled;
+        };
+        tracing::debug!("tsdemux: TIME {target} estimated at byte {offset}");
+        EventResult::forward(Event::Seek(
+            seek.derive(SegmentFormat::Bytes, SeekPosition::set(offset as i64)),
+        ))
+    }
+
+    /// Learn where the source landed, and how big the stream is.
+    fn handle_downstream_event(&mut self, event: Event) -> Option<Event> {
+        if let Event::Segment(seg) = &event
+            && seg.format == SegmentFormat::Bytes
+        {
+            self.demux.set_stream_position(seg.start.max(0) as u64);
+            self.demux
+                .set_stream_total(u64::try_from(seg.stop).ok().filter(|_| seg.stop >= 0));
+        }
+        Some(event)
+    }
+
+    /// Drop the half-assembled access unit and the PSI state, keeping the
+    /// byte index — that index is what makes the *next* seek possible.
+    fn flush(&mut self) -> Result<crate::element::RoutedOutput> {
+        let routed = Self::route(self.demux.flush());
+        self.demux.reset_parser();
+        // A post-seek EOS must drain again.
+        self.drained = false;
+        Ok(routed)
+    }
 }
 
 #[cfg(test)]
@@ -890,6 +1255,238 @@ mod tests {
         let mut all = TsDemux::new();
         all.reset();
         assert!(all.ctx.stream_filter.is_none());
+    }
+
+    // ========================================================================
+    // Byte index / sync (#163 phase B)
+    // ========================================================================
+
+    /// Build a 188-byte packet on `pid` carrying `pcr` (90 kHz ticks) in its
+    /// adaptation field. Payload is 0xFF so a stray 0x47 can never appear.
+    fn pcr_packet(pid: u16, pcr: u64) -> Vec<u8> {
+        let mut p = vec![0xFFu8; TS_PACKET_SIZE];
+        p[0] = 0x47;
+        p[1] = ((pid >> 8) as u8) & 0x1F;
+        p[2] = (pid & 0xFF) as u8;
+        p[3] = 0x20; // adaptation field only
+        p[4] = (TS_PACKET_SIZE - 5) as u8;
+        p[5] = 0x10; // PCR_flag
+        p[6] = (pcr >> 25) as u8;
+        p[7] = (pcr >> 17) as u8;
+        p[8] = (pcr >> 9) as u8;
+        p[9] = (pcr >> 1) as u8;
+        p[10] = ((pcr & 1) as u8) << 7;
+        p[11] = 0;
+        p
+    }
+
+    /// A packet with no adaptation field, so no PCR.
+    fn plain_packet(pid: u16) -> Vec<u8> {
+        let mut p = vec![0xFFu8; TS_PACKET_SIZE];
+        p[0] = 0x47;
+        p[1] = ((pid >> 8) as u8) & 0x1F;
+        p[2] = (pid & 0xFF) as u8;
+        p[3] = 0x10; // payload only
+        p
+    }
+
+    #[test]
+    fn pcr_is_parsed_from_the_adaptation_field() {
+        // 1 second at 90 kHz.
+        let pkt = pcr_packet(0x100, 90_000);
+        assert_eq!(packet_pcr(&pkt), Some((0x100, 90_000)));
+        assert_eq!(packet_pcr(&plain_packet(0x100)), None);
+        // A 33-bit PCR near the wrap point survives the bit shuffling.
+        let big = (1u64 << 33) - 1;
+        assert_eq!(packet_pcr(&pcr_packet(0x1FFF, big)), Some((0x1FFF, big)));
+    }
+
+    #[test]
+    fn sync_needs_confirmation_from_the_packets_that_follow() {
+        // A lone 0x47 in the middle of payload is not a packet boundary.
+        let mut data = vec![0x00u8; 4];
+        data.push(0x47); // decoy at 4, contradicted 188 bytes later
+        data.extend(vec![0x00u8; TS_PACKET_SIZE * 3]);
+        // The real stream starts after it.
+        let real = data.len();
+        for _ in 0..3 {
+            data.extend(plain_packet(0x100));
+        }
+        assert_eq!(find_sync(&data), Some(real));
+
+        // With too little data to contradict anything, the first 0x47 wins —
+        // there is nothing else to go on.
+        assert_eq!(find_sync(&[0x00, 0x47, 0x00]), Some(1));
+        assert_eq!(find_sync(&[0x00, 0x01, 0x02]), None);
+    }
+
+    #[test]
+    fn a_decoy_sync_byte_no_longer_desynchronises_the_parse() {
+        let mut demux = TsDemux::new();
+        // A 0x47 inside 100 bytes of leading junk, deliberately *off* the real
+        // packet grid. The old "first 0x47 wins" rule locked onto it and every
+        // packet after it was parsed 97 bytes out of phase.
+        let mut data = vec![0x00u8; 100];
+        data[3] = 0x47;
+        for second in 0..3u64 {
+            data.extend(pcr_packet(0x100, second * 90_000));
+        }
+        demux.push(&data).unwrap();
+
+        assert_eq!(demux.stats().sync_errors, 1, "the junk prefix is reported");
+        assert_eq!(demux.stats().packets_processed, 3);
+        assert_eq!(
+            demux.stream_position(),
+            100 + 3 * TS_PACKET_SIZE as u64,
+            "consumed the junk and exactly three packets"
+        );
+        // The clincher: a misaligned parse finds no PCR at all, because the
+        // adaptation-field bits land on payload.
+        assert_eq!(demux.index().len(), 3, "PCRs were found, so alignment held");
+    }
+
+    #[test]
+    fn the_index_maps_time_to_bytes_from_pcr() {
+        let mut demux = TsDemux::new();
+        // 10 seconds of CBR: one PCR packet per second, 1000 packets apart.
+        for second in 0..10u64 {
+            let mut chunk = pcr_packet(0x100, second * 90_000);
+            for _ in 0..999 {
+                chunk.extend(plain_packet(0x100));
+            }
+            demux.push(&chunk).unwrap();
+        }
+        assert_eq!(demux.index().len(), 10, "one anchor per second");
+
+        // Second 5 sits 5000 packets in, exactly.
+        let at5 = demux
+            .estimate_byte_offset(ClockTime::from_secs(5))
+            .expect("index has 10 anchors");
+        assert_eq!(at5, 5000 * TS_PACKET_SIZE as u64);
+
+        // Between anchors, linearly.
+        let at_2s5 = demux
+            .estimate_byte_offset(ClockTime::from_millis(2500))
+            .unwrap();
+        assert_eq!(at_2s5, 2500 * TS_PACKET_SIZE as u64);
+
+        // Before the start clamps to the first anchor; every answer is on the
+        // packet grid.
+        assert_eq!(demux.estimate_byte_offset(ClockTime::ZERO), Some(0));
+        for target in [0, 1, 1234, 9_999_999_999u64] {
+            let off = demux
+                .estimate_byte_offset(ClockTime::from_nanos(target))
+                .unwrap();
+            assert_eq!(off % TS_PACKET_SIZE as u64, 0, "target {target}");
+        }
+    }
+
+    #[test]
+    fn a_thin_index_refuses_to_guess() {
+        let mut demux = TsDemux::new();
+        assert_eq!(demux.estimate_byte_offset(ClockTime::from_secs(1)), None);
+        demux.push(&pcr_packet(0x100, 0)).unwrap();
+        assert_eq!(
+            demux.estimate_byte_offset(ClockTime::from_secs(1)),
+            None,
+            "one anchor gives a point, not a slope"
+        );
+    }
+
+    #[test]
+    fn estimates_are_clamped_to_the_stream_size() {
+        let mut demux = TsDemux::new();
+        for second in 0..3u64 {
+            let mut chunk = pcr_packet(0x100, second * 90_000);
+            for _ in 0..99 {
+                chunk.extend(plain_packet(0x100));
+            }
+            demux.push(&chunk).unwrap();
+        }
+        let total = 300 * TS_PACKET_SIZE as u64;
+        demux.set_stream_total(Some(total));
+        // An hour into a 3-second file: the last packet, not past the end.
+        let off = demux
+            .estimate_byte_offset(ClockTime::from_secs(3600))
+            .unwrap();
+        assert!(off < total, "{off} must be inside a {total}-byte stream");
+        assert_eq!(off, total - TS_PACKET_SIZE as u64);
+    }
+
+    #[test]
+    fn a_second_pcr_pid_does_not_corrupt_the_index() {
+        let mut demux = TsDemux::new();
+        // Program A ticks forward; program B carries a wildly different clock
+        // on another PID and must be ignored entirely.
+        for second in 0..4u64 {
+            let mut chunk = pcr_packet(0x100, second * 90_000);
+            chunk.extend(pcr_packet(0x200, 9_000_000 + second * 90_000));
+            for _ in 0..98 {
+                chunk.extend(plain_packet(0x100));
+            }
+            demux.push(&chunk).unwrap();
+        }
+        assert_eq!(demux.index().len(), 4);
+        assert_eq!(
+            demux.estimate_byte_offset(ClockTime::from_secs(1)),
+            Some(100 * TS_PACKET_SIZE as u64)
+        );
+    }
+
+    #[test]
+    fn a_flush_keeps_the_index_and_a_reset_drops_it() {
+        let mut demux = TsDemux::new();
+        for second in 0..3u64 {
+            let mut chunk = pcr_packet(0x100, second * 90_000);
+            for _ in 0..99 {
+                chunk.extend(plain_packet(0x100));
+            }
+            demux.push(&chunk).unwrap();
+        }
+        assert_eq!(demux.index().len(), 3);
+
+        demux.reset_parser();
+        assert_eq!(
+            demux.index().len(),
+            3,
+            "the index survives a flush — it is what makes the next seek work"
+        );
+        assert!(
+            demux.stats().packets_processed > 0,
+            "counters are not timeline state"
+        );
+
+        demux.reset();
+        assert!(demux.index().is_empty(), "a full reset starts over");
+    }
+
+    #[test]
+    fn post_seek_anchors_land_at_their_real_offsets() {
+        let mut demux = TsDemux::new();
+        // Read the first 2 seconds...
+        for second in 0..2u64 {
+            let mut chunk = pcr_packet(0x100, second * 90_000);
+            for _ in 0..99 {
+                chunk.extend(plain_packet(0x100));
+            }
+            demux.push(&chunk).unwrap();
+        }
+        // ...then the source seeks to second 8 and says where it landed.
+        demux.reset_parser();
+        demux.set_stream_position(800 * TS_PACKET_SIZE as u64);
+        let mut chunk = pcr_packet(0x100, 8 * 90_000);
+        for _ in 0..99 {
+            chunk.extend(plain_packet(0x100));
+        }
+        demux.push(&chunk).unwrap();
+
+        assert_eq!(demux.index().len(), 3);
+        // The new anchor is placed at 800 packets, so the estimate for second
+        // 4 interpolates across the gap instead of being nonsense.
+        assert_eq!(
+            demux.estimate_byte_offset(ClockTime::from_secs(4)),
+            Some(400 * TS_PACKET_SIZE as u64)
+        );
     }
 
     #[test]
