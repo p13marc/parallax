@@ -3,9 +3,11 @@
 //! Error propagation used to exist in two of six task exits. A sink, demuxer or
 //! muxer that failed returned straight out of its task, so everything below it
 //! waited forever — and a source whose only sink had died did something worse
-//! than hang: `OutputBranch::send_buffer` discarded its result, and kanal
-//! reports a closed channel *immediately* rather than blocking, so the source
-//! spun at 100% CPU producing into nothing.
+//! than hang: `OutputBranch::send_buffer` discarded its result, and a send
+//! into a closed channel fails *immediately* rather than blocking, so the
+//! source spun at 100% CPU producing into nothing. That is why the send
+//! result is still load-bearing today — it is how a producer learns its
+//! consumer is gone.
 //!
 //! Every test here is wrapped in a timeout, so a regression fails the suite
 //! instead of hanging CI until it is killed.
