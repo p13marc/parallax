@@ -52,7 +52,6 @@ use crate::pipeline::{
     PipelineEvent, PipelineState, StreamError, TimerDriver,
 };
 use futures::FutureExt;
-use kanal::{AsyncReceiver, AsyncSender, bounded_async};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
@@ -60,6 +59,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
+use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
+use tokio::sync::mpsc::{Receiver as MsgReceiver, Sender as MsgSender, channel as message_channel};
 
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -1569,8 +1570,13 @@ impl Executor {
     fn build_channels(&self, pipeline: &Pipeline, node_id: NodeId, network: &mut ChannelNetwork) {
         for (child_id, link) in pipeline.children(node_id) {
             if !network.has_channel(node_id, &link.src_pad, child_id, &link.sink_pad) {
-                let capacity = link.capacity.unwrap_or(self.config.channel_capacity);
-                let (tx, rx) = bounded_async::<Message>(capacity);
+                // `.max(1)`: tokio panics on a zero-capacity channel where
+                // kanal made a rendezvous channel, and both
+                // `link_pads_full(.., Some(0))`
+                // and `with_channel_capacity(0)` are public. Clamping here also
+                // keeps `WaterMarks::from_capacity` off a degenerate 0/0 band.
+                let capacity = link.capacity.unwrap_or(self.config.channel_capacity).max(1);
+                let (tx, rx) = message_channel::<Message>(capacity);
                 let flow = link.flow_state.as_ref().map(|state| {
                     let marks = link
                         .watermarks
@@ -1615,8 +1621,9 @@ impl Executor {
 
             if async_set.contains(&child_id) {
                 if !network.has_channel(node_id, &link.src_pad, child_id, &link.sink_pad) {
-                    let capacity = link.capacity.unwrap_or(self.config.channel_capacity);
-                    let (tx, rx) = bounded_async::<Message>(capacity);
+                    // See the sibling in `build_channels`: tokio panics on 0.
+                    let capacity = link.capacity.unwrap_or(self.config.channel_capacity).max(1);
+                    let (tx, rx) = message_channel::<Message>(capacity);
                     let flow = link.flow_state.as_ref().map(|state| {
                         let marks = link
                             .watermarks
@@ -2179,7 +2186,7 @@ type ChannelKey = (NodeId, String, NodeId, String);
 /// slow branch differently from a fast one.
 #[derive(Clone)]
 struct OutputBranch {
-    tx: AsyncSender<Message>,
+    tx: MsgSender<Message>,
     policy: LinkPolicy,
     /// Name of the element on the far end, for drop reporting.
     sink_name: String,
@@ -2191,30 +2198,42 @@ struct OutputBranch {
 }
 
 impl OutputBranch {
+    /// Queued messages on this link.
+    ///
+    /// tokio's `Sender` has no `len()`; `max_capacity - capacity` is exact
+    /// here because nothing in this file calls `reserve()`, and it can never
+    /// exceed the capacity.
+    #[inline]
+    fn occupancy(&self) -> usize {
+        self.tx.max_capacity() - self.tx.capacity()
+    }
+
     /// Send a buffer, honouring the link policy.
     ///
-    /// kanal's `try_send` returns `Ok(false)` when the channel is **full** (not
-    /// an error) and `Err` only when it is closed — easy to get backwards.
-    /// Returns `false` once the branch's receiver is gone.
+    /// Returns `false` once the branch's receiver is gone, which is what lets
+    /// a producer stop instead of spinning: a source feeding a sink that had
+    /// died used to run at 100% CPU into a closed channel (#85,
+    /// `tests/no_hang_on_error.rs`). A **full** channel is not that — under
+    /// `Drop` the buffer is shed and the branch stays live.
     ///
-    /// The result used to be discarded, and kanal reports a closed channel
-    /// *immediately* rather than blocking — so a source feeding a sink that had
-    /// died spun at 100% CPU producing into a closed channel until the handle
-    /// was dropped. Callers use this to stop.
+    /// NOTE: `send().await` must never appear as a `select!` branch. tokio
+    /// guarantees the message was not *sent* if the future is cancelled, but
+    /// the message is *dropped*. Nothing here sends inside a select; keep it
+    /// that way.
     async fn send_buffer(&self, buffer: Buffer, epoch: u64, tracers: &TracerRegistry) -> bool {
         let sent = match self.policy {
             LinkPolicy::Block => self.tx.send(Message::Buffer(buffer, epoch)).await.is_ok(),
             LinkPolicy::Drop => match self.tx.try_send(Message::Buffer(buffer, epoch)) {
-                Ok(true) => true,
-                Ok(false) => {
+                Ok(()) => true,
+                Err(TrySendError::Full(_)) => {
                     tracers.notify_drop(&self.sink_name);
                     true
                 }
-                Err(_) => false, // closed
+                Err(TrySendError::Closed(_)) => false,
             },
         };
         if let Some(flow) = &self.flow {
-            flow.update(self.tx.len());
+            flow.update(self.occupancy());
         }
         sent
     }
@@ -2224,12 +2243,19 @@ impl OutputBranch {
 /// plus that link's flow monitor. `recv`/`try_recv` sample occupancy after
 /// every receive, which is the half of the monitoring that observes drains.
 struct InputBranch {
-    rx: AsyncReceiver<Message>,
+    rx: MsgReceiver<Message>,
     flow: Option<Arc<LinkFlowMonitor>>,
 }
 
 impl InputBranch {
-    async fn recv(&self) -> std::result::Result<Message, kanal::ReceiveError> {
+    /// Receive one message; `None` once every sender is gone.
+    ///
+    /// **Cancel-safe, and it must stay that way.** tokio guarantees that a
+    /// dropped `recv` future consumed no message, which is what lets the
+    /// consuming loops below race this against their upstream inbox in a
+    /// plain `select!`. Anything added before that await — a permit, a
+    /// stashed value — would be lost when a select loser is dropped.
+    async fn recv(&mut self) -> Option<Message> {
         let msg = self.rx.recv().await;
         if let Some(flow) = &self.flow {
             flow.update(self.rx.len());
@@ -2237,18 +2263,13 @@ impl InputBranch {
         msg
     }
 
-    /// A receive future that owns its channel handles (see [`PendingRecv`]):
-    /// safe to stash across loop iterations after losing a `select`.
-    fn recv_owned(&self) -> PendingRecv {
-        let rx = self.rx.clone();
-        let flow = self.flow.clone();
-        Box::pin(async move {
-            let msg = rx.recv().await;
-            if let Some(flow) = &flow {
-                flow.update(rx.len());
-            }
-            msg
-        })
+    /// Non-blocking receive, for the sink's paused drain.
+    fn try_recv(&mut self) -> std::result::Result<Message, TryRecvError> {
+        let msg = self.rx.try_recv();
+        if let Some(flow) = &self.flow {
+            flow.update(self.rx.len());
+        }
+        msg
     }
 }
 
@@ -2381,7 +2402,13 @@ fn node_name(pipeline: &Pipeline, node_id: NodeId) -> String {
 }
 
 struct ChannelNetwork {
-    channels: HashMap<ChannelKey, (AsyncSender<Message>, AsyncReceiver<Message>)>,
+    /// Dedup key set for `has_channel` — one channel per graph edge.
+    ///
+    /// This used to hold a clone of both halves. tokio's receiver is not
+    /// `Clone`, and keeping either half here would defer closed-detection
+    /// until `spawn_tasks` returned; the key alone is all `has_channel`
+    /// ever read.
+    channels: HashSet<ChannelKey>,
     outputs: HashMap<(NodeId, String), Vec<OutputBranch>>,
     inputs: HashMap<(NodeId, String), Vec<InputBranch>>,
 }
@@ -2389,7 +2416,7 @@ struct ChannelNetwork {
 impl ChannelNetwork {
     fn new() -> Self {
         Self {
-            channels: HashMap::new(),
+            channels: HashSet::new(),
             outputs: HashMap::new(),
             inputs: HashMap::new(),
         }
@@ -2397,7 +2424,7 @@ impl ChannelNetwork {
 
     fn has_channel(&self, src: NodeId, src_pad: &str, sink: NodeId, sink_pad: &str) -> bool {
         self.channels
-            .contains_key(&(src, src_pad.to_string(), sink, sink_pad.to_string()))
+            .contains(&(src, src_pad.to_string(), sink, sink_pad.to_string()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2407,16 +2434,14 @@ impl ChannelNetwork {
         src_pad: String,
         sink: NodeId,
         sink_pad: String,
-        tx: AsyncSender<Message>,
-        rx: AsyncReceiver<Message>,
+        tx: MsgSender<Message>,
+        rx: MsgReceiver<Message>,
         policy: LinkPolicy,
         sink_name: String,
         flow: Option<Arc<LinkFlowMonitor>>,
     ) {
-        self.channels.insert(
-            (src, src_pad.clone(), sink, sink_pad.clone()),
-            (tx.clone(), rx.clone()),
-        );
+        self.channels
+            .insert((src, src_pad.clone(), sink, sink_pad.clone()));
         self.outputs
             .entry((src, src_pad))
             .or_default()
@@ -2493,16 +2518,27 @@ impl ChannelNetwork {
 /// parked in `send().await` into A's full data channel. A bounded upstream
 /// inbox would close that cycle into a deadlock; unbounded sends never
 /// await, so the cycle cannot form. Control events are rare and small.
-/// Inboxes are tokio mpsc, NOT kanal: their recv futures are dropped by
-/// `select` losers every iteration, and tokio's `recv` is documented
-/// cancel-safe. kanal's is not — a dropped mid-poll kanal future can eat
-/// the channel's waker registration, which freezes the winner-less side
-/// forever (observed as a sink that stops receiving data after the first
-/// upstream event arrives on an empty channel).
 struct UpstreamHop {
     rx: tokio::sync::mpsc::UnboundedReceiver<Event>,
     /// `(parent name, parent inbox)` — the async-spawned upstream peers.
     parents: Vec<(String, tokio::sync::mpsc::UnboundedSender<Event>)>,
+}
+
+/// Which side of a consuming task's data-vs-upstream select fired.
+///
+/// Returning the winner instead of acting inside the `select!` arm is what
+/// keeps the `&mut up_rx` borrow scoped to the select itself, so the
+/// inbox-closed arm can reassign it and the handler arms can borrow
+/// `up_parents` freely.
+// Not boxed on purpose: this is a per-iteration stack value that exists only
+// to carry the select's winner out to the arms. `Message` is already moved by
+// value through the channel itself, so the enum costs nothing extra — whereas
+// boxing would put an allocation back on the per-buffer path, which is the
+// thing this migration removes.
+#[allow(clippy::large_enum_variant)]
+enum Incoming {
+    Upstream(Option<Event>),
+    Data(Option<Message>),
 }
 
 /// Forward an event to every parent inbox (unbounded: never blocks).
@@ -2519,17 +2555,6 @@ fn forward_to_parents(
         }
     }
 }
-
-/// A data-channel receive that survives losing a `select`: the future OWNS
-/// clones of the receiver and flow monitor, so it can be stashed and
-/// re-polled instead of dropped — a kanal recv future dropped after its
-/// first poll can lose the channel's waker registration (see
-/// [`UpstreamHop`]). Every receive on a channel with a stashed future MUST
-/// go through it, or messages handed directly to the pending future's slot
-/// would be skipped over.
-type PendingRecv = std::pin::Pin<
-    Box<dyn Future<Output = std::result::Result<Message, kanal::ReceiveError>> + Send>,
->;
 
 #[allow(clippy::too_many_arguments)]
 /// Handle one upstream event delivered to a source task's control channel.
@@ -2973,7 +2998,7 @@ fn spawn_sink_task(
 
         let n_inputs = inputs.len();
         tracing::debug!("sink '{}': {} inputs", name, n_inputs);
-        if let Some(rx) = inputs.into_iter().next() {
+        if let Some(mut rx) = inputs.into_iter().next() {
             // Split the hop: tokio recv needs `&mut rx` while the parents
             // list stays shared with the handler calls.
             let (mut up_rx, up_parents) = match upstream {
@@ -2981,10 +3006,7 @@ fn spawn_sink_task(
                 None => (None, Vec::new()),
             };
             let mut last_seek_seqnum: u64 = 0;
-            // In-flight data receive, stashed when an upstream event wins the
-            // select (see `PendingRecv`). Every receive goes through it.
-            let mut pending: Option<PendingRecv> = None;
-            // Standard path: read from kanal channel
+            // Standard path: read from the link channel
             loop {
                 // Runtime pause (#156). Gating only the producers leaves the
                 // queued stream ahead of this sink playing out (~2.6 s of
@@ -3036,16 +3058,8 @@ fn spawn_sink_task(
                             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                             continue;
                         }
-                        let mut fut = pending.take().unwrap_or_else(|| rx.recv_owned());
-                        let polled = match futures::poll!(fut.as_mut()) {
-                            std::task::Poll::Ready(res) => res.map(Some),
-                            std::task::Poll::Pending => {
-                                pending = Some(fut);
-                                Ok(None)
-                            }
-                        };
-                        match polled {
-                            Ok(Some(Message::Buffer(buffer, epoch))) => {
+                        match rx.try_recv() {
+                            Ok(Message::Buffer(buffer, epoch)) => {
                                 if is_stale(epoch, &flush_epoch) {
                                     count += 1;
                                     tracers.notify_drop(&name);
@@ -3053,7 +3067,7 @@ fn spawn_sink_task(
                                     stashed = Some(Message::Buffer(buffer, epoch));
                                 }
                             }
-                            Ok(Some(Message::Event(event))) => {
+                            Ok(Message::Event(event)) => {
                                 deliver_sink_event(
                                     &mut element,
                                     event,
@@ -3062,43 +3076,39 @@ fn spawn_sink_task(
                                     &position,
                                 );
                             }
-                            Ok(Some(terminal)) => stashed = Some(terminal),
-                            Ok(None) => {
+                            Ok(terminal) => stashed = Some(terminal),
+                            Err(TryRecvError::Empty) => {
                                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                             }
-                            // Closed: the recv below reports it to the
-                            // normal teardown arm.
-                            Err(_) => break,
+                            // Disconnected only fires once the queue is empty
+                            // AND every sender is gone, so buffered messages
+                            // still drain first. The recv below reports the
+                            // close to the normal teardown arm.
+                            Err(TryRecvError::Disconnected) => break,
                         }
                     }
                     let _ = element.handle_downstream_event(Event::Resume);
                     match stashed {
-                        Some(m) => Ok(m),
-                        None => {
-                            let fut = pending.take().unwrap_or_else(|| rx.recv_owned());
-                            fut.await
-                        }
+                        Some(m) => Some(m),
+                        None => rx.recv().await,
                     }
                 } else if up_rx.is_some() {
                     // Upstream events enter the graph here (#163): the sink
                     // is the dispatch point, offering each event to its
                     // element and forwarding unhandled ones toward the
-                    // sources. The select polls the inbox first (control
-                    // outruns queued data); the losing data future is
-                    // STASHED, not dropped (see `PendingRecv`). Two-phase so
-                    // the `&mut` inbox borrow ends before the arms run.
-                    let data_fut = pending.take().unwrap_or_else(|| rx.recv_owned());
-                    let sel = {
+                    // sources. `biased` polls the inbox first so control
+                    // outruns queued data; both receives are cancel-safe, so
+                    // the losing branch simply resumes next iteration.
+                    let incoming = {
                         let rx_up = up_rx.as_mut().expect("checked above");
-                        match futures::future::select(std::pin::pin!(rx_up.recv()), data_fut).await
-                        {
-                            futures::future::Either::Left((ev, data_fut)) => Ok((ev, data_fut)),
-                            futures::future::Either::Right((res, _)) => Err(res),
+                        tokio::select! {
+                            biased;
+                            ev = rx_up.recv() => Incoming::Upstream(ev),
+                            msg = rx.recv() => Incoming::Data(msg),
                         }
                     };
-                    match sel {
-                        Ok((Some(event), data_fut)) => {
-                            pending = Some(data_fut);
+                    match incoming {
+                        Incoming::Upstream(Some(event)) => {
                             let _ = handle_upstream_hop(
                                 &name,
                                 &mut element,
@@ -3115,20 +3125,18 @@ fn spawn_sink_task(
                             .await;
                             continue;
                         }
-                        Ok((None, data_fut)) => {
+                        Incoming::Upstream(None) => {
                             // Inbox closed (handle dropped): stop selecting.
-                            pending = Some(data_fut);
                             up_rx = None;
                             continue;
                         }
-                        Err(res) => res,
+                        Incoming::Data(msg) => msg,
                     }
                 } else {
-                    let fut = pending.take().unwrap_or_else(|| rx.recv_owned());
-                    fut.await
+                    rx.recv().await
                 };
                 match msg {
-                    Ok(Message::Buffer(buffer, epoch)) => {
+                    Some(Message::Buffer(buffer, epoch)) => {
                         count += 1;
                         tracing::debug!("sink '{}': received buffer {}", name, count);
                         // Pre-seek data: queued ahead of the flush trio, shed
@@ -3150,7 +3158,7 @@ fn spawn_sink_task(
                         tracers.notify_buffer_processed(&name);
                         present(&position, pts);
                     }
-                    Ok(Message::Event(event)) => {
+                    Some(Message::Event(event)) => {
                         deliver_sink_event(
                             &mut element,
                             event,
@@ -3159,25 +3167,25 @@ fn spawn_sink_task(
                             &position,
                         );
                     }
-                    Ok(Message::Eos) => {
+                    Some(Message::Eos) => {
                         tracing::debug!("sink '{}': EOS after {}", name, count);
                         // Deliver EOS to the element so sinks with external
                         // consumers (AppSink) can unblock them.
                         let _ = element.handle_downstream_event(crate::event::Event::Eos);
                         break;
                     }
-                    Ok(Message::Error(err)) => {
+                    Some(Message::Error(err)) => {
                         // The whole point of #85: the consumer learns the
                         // pipeline *failed*, not that the stream ended.
                         tracing::error!("sink '{}': upstream failed: {}", name, err);
                         let _ = element.handle_downstream_event(crate::event::Event::Error(err));
                         break;
                     }
-                    Err(e) => {
+                    None => {
                         // Upstream now sends a terminal message before dropping
                         // its sender, so a bare close means the pipeline was
                         // aborted rather than that it ended.
-                        tracing::debug!("sink '{}': channel closed after {}: {}", name, count, e);
+                        tracing::debug!("sink '{}': channel closed after {}", name, count);
                         let _ = element.handle_downstream_event(crate::event::Event::Eos);
                         break;
                     }
@@ -3310,7 +3318,7 @@ fn spawn_transform_task(
             }
         }
 
-        if let Some(rx) = inputs.into_iter().next() {
+        if let Some(mut rx) = inputs.into_iter().next() {
             // Epoch of the last accepted input. Outputs are stamped with this,
             // NOT with the global counter at send time: if a flush lands while
             // `process()` is running, its output came from pre-seek input and
@@ -3324,32 +3332,27 @@ fn spawn_transform_task(
                 None => (None, Vec::new()),
             };
             let mut last_seek_seqnum: u64 = 0;
-            // In-flight data receive, stashed when an upstream event wins the
-            // select (see `PendingRecv`). Every receive goes through it.
-            let mut pending: Option<PendingRecv> = None;
-            // Standard path: read from kanal channel
+            // Standard path: read from the link channel
             loop {
                 tracing::trace!("transform '{}': waiting for input", name);
                 // Upstream events (seek and friends, #163) take priority:
                 // this element may handle them (running the flush trio from
                 // its own loop, preserving the epoch discipline) or forward
-                // them toward the sources. The losing data future is
-                // stashed, not dropped (see `PendingRecv`).
+                // them toward the sources.
                 let data = if up_rx.is_some() {
-                    let data_fut = pending.take().unwrap_or_else(|| rx.recv_owned());
-                    // Two-phase so the `&mut` inbox borrow ends before the
-                    // arms run.
-                    let sel = {
+                    // `biased` polls the inbox first so control outruns queued
+                    // data; both receives are cancel-safe, so the losing
+                    // branch simply resumes next iteration.
+                    let incoming = {
                         let rx_up = up_rx.as_mut().expect("checked above");
-                        match futures::future::select(std::pin::pin!(rx_up.recv()), data_fut).await
-                        {
-                            futures::future::Either::Left((ev, data_fut)) => Ok((ev, data_fut)),
-                            futures::future::Either::Right((res, _)) => Err(res),
+                        tokio::select! {
+                            biased;
+                            ev = rx_up.recv() => Incoming::Upstream(ev),
+                            msg = rx.recv() => Incoming::Data(msg),
                         }
                     };
-                    match sel {
-                        Ok((Some(event), data_fut)) => {
-                            pending = Some(data_fut);
+                    match incoming {
+                        Incoming::Upstream(Some(event)) => {
                             let _ = handle_upstream_hop(
                                 &name,
                                 &mut element,
@@ -3366,20 +3369,18 @@ fn spawn_transform_task(
                             .await;
                             continue;
                         }
-                        Ok((None, data_fut)) => {
+                        Incoming::Upstream(None) => {
                             // Inbox closed (handle dropped): stop selecting.
-                            pending = Some(data_fut);
                             up_rx = None;
                             continue;
                         }
-                        Err(res) => res,
+                        Incoming::Data(msg) => msg,
                     }
                 } else {
-                    let fut = pending.take().unwrap_or_else(|| rx.recv_owned());
-                    fut.await
+                    rx.recv().await
                 };
                 match data {
-                    Ok(Message::Buffer(buffer, epoch)) => {
+                    Some(Message::Buffer(buffer, epoch)) => {
                         count += 1;
                         tracing::debug!(
                             "transform '{}': received buffer {} ({} bytes)",
@@ -3452,7 +3453,7 @@ fn spawn_transform_task(
                             }
                         }
                     }
-                    Ok(Message::Event(event)) => {
+                    Some(Message::Event(event)) => {
                         match probe_registry.invoke_event(&sink_pad, &event, true) {
                             ProbeReturn::Drop | ProbeReturn::Handled => continue,
                             _ => {}
@@ -3478,14 +3479,14 @@ fn spawn_transform_task(
                             broadcast_event(&outputs, &fwd).await;
                         }
                     }
-                    Ok(Message::Error(err)) => {
+                    Some(Message::Error(err)) => {
                         // Terminal: pass the reason on rather than flushing and
                         // reporting a clean end.
                         tracing::error!("transform '{}': upstream failed: {}", name, err);
                         send_error(&outputs, &output_bridges, &err).await;
                         break;
                     }
-                    Ok(Message::Eos) => {
+                    Some(Message::Eos) => {
                         tracing::info!(
                             "transform '{}': received EOS after {} buffers, flushing",
                             name,
@@ -3522,7 +3523,7 @@ fn spawn_transform_task(
                         send_eos(&outputs, &output_bridges).await;
                         break;
                     }
-                    Err(_) => {
+                    None => {
                         send_eos(&outputs, &output_bridges).await;
                         break;
                     }
@@ -3729,7 +3730,7 @@ fn spawn_demuxer_task(
         let mut segment_pads: HashSet<String> = HashSet::new();
         let mut last_seek_seqnum: u64 = 0;
 
-        if let Some(rx) = inputs.into_iter().next() {
+        if let Some(mut rx) = inputs.into_iter().next() {
             // Same input-epoch rule as spawn_transform_task: outputs carry the
             // epoch of the input they came from.
             let mut in_epoch: u64 = 0;
@@ -3737,26 +3738,23 @@ fn spawn_demuxer_task(
                 Some(hop) => (Some(hop.rx), hop.parents),
                 None => (None, Vec::new()),
             };
-            let mut pending: Option<PendingRecv> = None;
             loop {
                 // Upstream events from downstream take priority (#163):
-                // handle or forward them between data messages. The losing
-                // data future is stashed, not dropped (see `PendingRecv`).
+                // handle or forward them between data messages.
                 let data = if up_rx.is_some() {
-                    let data_fut = pending.take().unwrap_or_else(|| rx.recv_owned());
-                    // Two-phase so the `&mut` inbox borrow ends before the
-                    // arms run.
-                    let sel = {
+                    // `biased` polls the inbox first so control outruns queued
+                    // data; both receives are cancel-safe, so the losing
+                    // branch simply resumes next iteration.
+                    let incoming = {
                         let rx_up = up_rx.as_mut().expect("checked above");
-                        match futures::future::select(std::pin::pin!(rx_up.recv()), data_fut).await
-                        {
-                            futures::future::Either::Left((ev, data_fut)) => Ok((ev, data_fut)),
-                            futures::future::Either::Right((res, _)) => Err(res),
+                        tokio::select! {
+                            biased;
+                            ev = rx_up.recv() => Incoming::Upstream(ev),
+                            msg = rx.recv() => Incoming::Data(msg),
                         }
                     };
-                    match sel {
-                        Ok((Some(event), data_fut)) => {
-                            pending = Some(data_fut);
+                    match incoming {
+                        Incoming::Upstream(Some(event)) => {
                             let _ = handle_upstream_hop(
                                 &name,
                                 &mut element,
@@ -3773,20 +3771,18 @@ fn spawn_demuxer_task(
                             .await;
                             continue;
                         }
-                        Ok((None, data_fut)) => {
+                        Incoming::Upstream(None) => {
                             // Inbox closed (handle dropped): stop selecting.
-                            pending = Some(data_fut);
                             up_rx = None;
                             continue;
                         }
-                        Err(res) => res,
+                        Incoming::Data(msg) => msg,
                     }
                 } else {
-                    let fut = pending.take().unwrap_or_else(|| rx.recv_owned());
-                    fut.await
+                    rx.recv().await
                 };
                 match data {
-                    Ok(Message::Buffer(buffer, epoch)) => {
+                    Some(Message::Buffer(buffer, epoch)) => {
                         count += 1;
 
                         // Pre-seek data — shed at receive speed (#157).
@@ -3847,7 +3843,7 @@ fn spawn_demuxer_task(
                             }
                         }
                     }
-                    Ok(Message::Event(event)) => {
+                    Some(Message::Event(event)) => {
                         match probe_registry.invoke_event(&sink_pad, &event, true) {
                             ProbeReturn::Drop | ProbeReturn::Handled => continue,
                             _ => {}
@@ -3893,14 +3889,14 @@ fn spawn_demuxer_task(
                             }
                         }
                     }
-                    Ok(Message::Error(err)) => {
+                    Some(Message::Error(err)) => {
                         tracing::error!("demuxer '{}': upstream failed: {}", name, err);
                         for branches in outputs_by_pad.values() {
                             broadcast_error(branches, &err).await;
                         }
                         break;
                     }
-                    Ok(Message::Eos) | Err(_) => {
+                    Some(Message::Eos) | None => {
                         // Drain the demuxer through the routed path
                         // (process_demux(None) → Demuxer::produce), so a
                         // trailing partial frame keeps its pad — the old
@@ -4119,8 +4115,11 @@ fn spawn_muxer_task(
         // pushed another — delivered exactly *one* buffer per input pad and
         // then fell out of the loop. A two-input muxer muxed two buffers,
         // whatever the stream length.
-        async fn recv_one(pad: String, rx: InputBranch) -> (String, InputBranch, Option<Message>) {
-            let msg = rx.recv().await.ok();
+        async fn recv_one(
+            pad: String,
+            mut rx: InputBranch,
+        ) -> (String, InputBranch, Option<Message>) {
+            let msg = rx.recv().await;
             (pad, rx, msg)
         }
 
@@ -4198,12 +4197,8 @@ fn spawn_muxer_task(
             if matches!(msg, Some(Message::Buffer(..) | Message::Event(_))) {
                 receivers.push(recv_one(pad, rx));
             }
-            let msg = match msg {
-                Some(m) => Ok(m),
-                None => Err(()),
-            };
             match msg {
-                Ok(Message::Buffer(buffer, epoch)) => {
+                Some(Message::Buffer(buffer, epoch)) => {
                     count += 1;
 
                     // Pre-seek data — shed at receive speed (#157).
@@ -4255,7 +4250,7 @@ fn spawn_muxer_task(
                         }
                     }
                 }
-                Ok(Message::Event(event)) => {
+                Some(Message::Event(event)) => {
                     match probe_registry.invoke_event(&sink_pad, &event, true) {
                         ProbeReturn::Drop | ProbeReturn::Handled => continue,
                         _ => {}
@@ -4293,7 +4288,7 @@ fn spawn_muxer_task(
                         _ => {}
                     }
                 }
-                Ok(Message::Error(err)) => {
+                Some(Message::Error(err)) => {
                     // One failed input dooms the muxed stream: the output would
                     // be missing a track from here on. Pass the reason on
                     // immediately rather than waiting for the other inputs.
@@ -4301,7 +4296,7 @@ fn spawn_muxer_task(
                     broadcast_error(&outputs, &err).await;
                     break;
                 }
-                Ok(Message::Eos) | Err(_) => {
+                Some(Message::Eos) | None => {
                     eos_count += 1;
                     if eos_count >= total {
                         // Flush any remaining data from final processing
