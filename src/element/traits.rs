@@ -1408,6 +1408,28 @@ pub trait Demuxer: Send {
         EventResult::NotHandled
     }
 
+    /// Handle a downstream event (flows with the data: segment, EOS, flush).
+    ///
+    /// A *fed* demuxer needs this where a source-style one does not: the
+    /// seek it answered was translated into a byte seek upstream, so the
+    /// `Segment` that comes back down carries the source's post-seek byte
+    /// position. That is the demuxer's cue to align its parser with the
+    /// new read offset. Return `Some(event)` to forward (the default),
+    /// `None` to consume it.
+    fn handle_downstream_event(&mut self, event: Event) -> Option<Event> {
+        Some(event)
+    }
+
+    /// Drop parser state that a flush invalidates.
+    ///
+    /// Called on `FlushStart` (output discarded) and again at EOS (output
+    /// routed). A container parser that carries partially-assembled access
+    /// units across `demux` calls must clear them here, or the first
+    /// post-seek buffer arrives welded to bytes from before the seek.
+    fn flush(&mut self) -> Result<RoutedOutput> {
+        Ok(RoutedOutput::new())
+    }
+
     /// Whether this demuxer supports seeking.
     ///
     /// A source-style demuxer that implements `handle_upstream_event` for
@@ -1729,6 +1751,23 @@ pub trait AsyncElementDyn {
         _input: Option<Buffer>,
     ) -> impl std::future::Future<Output = Result<DemuxResult>> + Send {
         async { Ok(DemuxResult::Eos) }
+    }
+
+    /// Flush a demuxer, keeping the pad routing.
+    ///
+    /// The flat [`flush`](Self::flush) cannot serve a demuxer: it returns
+    /// bare buffers, and the executor would have to broadcast a trailing
+    /// video access unit down the audio branch too. Called on `FlushStart`
+    /// (output discarded, the point is the state reset) and at EOS (output
+    /// routed), so a *fed* demuxer — whose `produce` is never called — can
+    /// still emit what its parser was holding.
+    ///
+    /// Default implementation returns nothing; [`DemuxerAdapter`] overrides
+    /// it.
+    fn flush_demux(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<Vec<(String, Buffer)>>> + Send {
+        async { Ok(Vec::new()) }
     }
 
     /// Set the pipeline clock for this element.
@@ -3230,6 +3269,32 @@ impl<D: Demuxer + Send + 'static> SendAsyncElementDyn for DemuxerAdapter<D> {
 
     fn handle_upstream_event(&mut self, event: &Event) -> EventResult {
         self.inner.handle_upstream_event(event)
+    }
+
+    fn handle_downstream_event(&mut self, event: Event) -> Option<Event> {
+        self.inner.handle_downstream_event(event)
+    }
+
+    async fn flush_demux(&mut self) -> Result<Vec<(String, Buffer)>> {
+        // Routed-but-undelivered buffers are pre-flush data by definition;
+        // keeping them would leak across a seek.
+        self.pending.clear();
+        Ok(self
+            .inner
+            .flush()?
+            .into_iter()
+            .map(|(pad, buffer)| (self.inner.pad_name(pad), buffer))
+            .collect())
+    }
+
+    async fn flush(&mut self) -> Result<Output> {
+        // The executor drives demuxers through `flush_demux`; this exists
+        // so a demuxer reached through the flat path still resets.
+        self.pending.clear();
+        let routed = self.inner.flush()?;
+        Ok(Output::from(
+            routed.into_iter().map(|(_, b)| b).collect::<Vec<_>>(),
+        ))
     }
 
     // Forwarded like SourceAdapter does: a source-style demuxer IS the

@@ -440,3 +440,218 @@ async fn transform_translates_seek_to_the_source() {
         "the source's byte completion is still reported: {dones:?}"
     );
 }
+
+/// #163 phase B: the demuxer half of the same round trip.
+///
+/// A *fed* demuxer that translated a TIME seek into a BYTES seek needs three
+/// things back from the executor, and none of them existed before this test:
+///
+/// 1. the source's post-seek `Segment`, delivered to
+///    `Demuxer::handle_downstream_event` — the demuxer's cue that the byte
+///    cursor moved, carrying the file total so a byte estimate can be clamped;
+/// 2. `Demuxer::flush()` on `FlushStart`, so a half-assembled access unit
+///    from before the seek is dropped rather than welded onto the first
+///    post-seek bytes (the output of *that* call is discarded);
+/// 3. the same `flush()` at EOS, with the output **routed** — a fed demuxer's
+///    `produce()` is never called, so this is its only chance to emit the
+///    tail, and it must land on its own pad rather than every branch.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fed_demuxer_is_flushed_and_sees_the_translated_segment() {
+    use parallax::element::{Demuxer, PadAddedCallback, PadId, RoutedOutput};
+    use parallax::event::{SeekEvent, SeekPosition};
+    use parallax::format::Caps;
+    use parallax::pipeline::seek::DurationQuery;
+
+    const TOTAL: u64 = 4096;
+
+    /// A byte-addressed source that knows its own size.
+    struct SizedSource {
+        produced: u64,
+    }
+
+    impl Source for SizedSource {
+        fn produce(&mut self, _ctx: &mut ProduceContext) -> Result<ProduceResult> {
+            arena().reclaim();
+            let Some(slot) = arena().acquire() else {
+                return Ok(ProduceResult::WouldBlock);
+            };
+            self.produced += 1;
+            Ok(ProduceResult::OwnBuffer(Buffer::new(
+                MemoryHandle::with_len(slot, 8),
+                Metadata::from_sequence(self.produced),
+            )))
+        }
+
+        fn is_seekable(&self) -> bool {
+            true
+        }
+
+        fn query_duration(&self) -> Option<DurationQuery> {
+            Some(DurationQuery {
+                format: SegmentFormat::Bytes,
+                duration: Some(TOTAL),
+            })
+        }
+
+        fn handle_upstream_event(&mut self, event: &Event) -> EventResult {
+            match event {
+                Event::Seek(seek) if seek.format == SegmentFormat::Bytes => {
+                    EventResult::handled_at(seek.start.position)
+                }
+                _ => EventResult::NotHandled,
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct Record {
+        segments: Vec<(SegmentFormat, i64, i64)>,
+        flushes: usize,
+    }
+
+    struct TranslatingDemuxer {
+        outputs: Vec<(PadId, Caps)>,
+        record: Arc<Mutex<Record>>,
+    }
+
+    impl Demuxer for TranslatingDemuxer {
+        fn demux(&mut self, buffer: Buffer) -> Result<RoutedOutput> {
+            Ok(RoutedOutput::single(PadId(0), buffer))
+        }
+
+        fn pad_name(&self, _pad: PadId) -> String {
+            "video".into()
+        }
+
+        fn handle_upstream_event(&mut self, event: &Event) -> EventResult {
+            if let Event::Seek(seek) = event
+                && seek.format == SegmentFormat::Time
+            {
+                return EventResult::forward(Event::Seek(
+                    seek.derive(SegmentFormat::Bytes, SeekPosition::set(1024)),
+                ));
+            }
+            EventResult::NotHandled
+        }
+
+        fn handle_downstream_event(&mut self, event: Event) -> Option<Event> {
+            if let Event::Segment(seg) = &event {
+                self.record
+                    .lock()
+                    .unwrap()
+                    .segments
+                    .push((seg.format, seg.start, seg.stop));
+            }
+            Some(event)
+        }
+
+        fn flush(&mut self) -> Result<RoutedOutput> {
+            self.record.lock().unwrap().flushes += 1;
+            arena().reclaim();
+            match arena().acquire() {
+                // Sequence 0 marks the tail: no produced buffer ever uses it.
+                Some(slot) => Ok(RoutedOutput::single(
+                    PadId(0),
+                    Buffer::new(MemoryHandle::with_len(slot, 8), Metadata::from_sequence(0)),
+                )),
+                None => Ok(RoutedOutput::new()),
+            }
+        }
+
+        fn outputs(&self) -> &[(PadId, Caps)] {
+            &self.outputs
+        }
+
+        fn on_pad_added(&mut self, _callback: PadAddedCallback) {}
+
+        fn name(&self) -> &str {
+            "translatingdemux"
+        }
+    }
+
+    let record = Arc::new(Mutex::new(Record::default()));
+
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_source("src", SizedSource { produced: 0 });
+    let demux = pipeline.add_demuxer(
+        "demux",
+        TranslatingDemuxer {
+            outputs: vec![(PadId(0), Caps::any())],
+            record: record.clone(),
+        },
+    );
+    let appsink = AppSink::with_max_buffers(2);
+    let sink_handle = appsink.handle();
+    let snk = pipeline.add_async_sink("sink", appsink);
+    pipeline.link(src, demux).unwrap();
+    pipeline.link_pads(demux, "video", snk, "sink").unwrap();
+
+    let executor = Executor::new();
+    let handle = executor.start(&mut pipeline).unwrap();
+
+    let tails = Arc::new(AtomicU64::new(0));
+    let counted = tails.clone();
+    let drain = tokio::spawn(async move {
+        loop {
+            match sink_handle.pull_buffer().await {
+                Pulled::Buffer(b) => {
+                    if b.metadata().sequence == 0 {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                Pulled::Ended(_) => break,
+                Pulled::Empty | Pulled::Flushing => tokio::task::yield_now().await,
+            }
+        }
+    });
+
+    assert!(
+        handle
+            .seek(SeekEvent::new_time(ClockTime::from_secs(5)))
+            .await
+    );
+
+    wait_until(
+        || record.lock().unwrap().flushes > 0,
+        "the demuxer to be flushed by FlushStart",
+    )
+    .await;
+    wait_until(
+        || !record.lock().unwrap().segments.is_empty(),
+        "the source's post-seek segment to reach the demuxer",
+    )
+    .await;
+
+    handle.stop();
+    drain.await.unwrap();
+    handle.wait().await.unwrap();
+
+    let record = record.lock().unwrap();
+    // The lazy initial segment (start 0) precedes the seek's; both carry the
+    // total, which is what makes a byte estimate clampable at any point.
+    assert!(
+        record
+            .segments
+            .contains(&(SegmentFormat::Bytes, 1024, TOTAL as i64)),
+        "the demuxer sees where the source landed and how big the stream is: {:?}",
+        record.segments
+    );
+    assert!(
+        record
+            .segments
+            .iter()
+            .all(|(_, _, stop)| *stop == TOTAL as i64),
+        "every byte segment carries the total: {:?}",
+        record.segments
+    );
+    assert!(
+        record.flushes >= 2,
+        "flushed once on FlushStart and once at EOS, got {}",
+        record.flushes
+    );
+    assert_eq!(
+        tails.load(Ordering::SeqCst),
+        1,
+        "the FlushStart flush is discarded; only the EOS one is routed"
+    );
+}

@@ -2684,7 +2684,14 @@ async fn handle_upstream_hop(
             });
             let stop = match seek.stop.seek_type {
                 SeekType::Set => Some(seek.stop.position.max(0) as u64),
-                _ => None,
+                // No explicit stop: fall back to the element's total in the
+                // seek's own format. A fed demuxer translating TIME→BYTES
+                // has no other way to learn the file size, and without it
+                // its byte estimate cannot be clamped to the last byte.
+                _ => element
+                    .source_query_duration()
+                    .filter(|d| d.format == seek.format)
+                    .and_then(|d| d.duration),
             };
             let segment = match seek.format {
                 crate::event::SegmentFormat::Bytes => {
@@ -2821,10 +2828,15 @@ fn spawn_source_task(
         // (FileSrc, HttpSrc — they answer duration queries in Bytes) get a
         // Bytes segment instead: their buffers carry a meaningless PTS of
         // zero, not a timeline (`Metadata::default()` is ZERO, not NONE).
-        let bytes_native = matches!(
-            element.source_query_duration(),
-            Some(q) if q.format == crate::event::SegmentFormat::Bytes
-        );
+        // The total rides along as the segment's `stop`: a fed demuxer
+        // translating a TIME seek into a BYTES one has no other way to learn
+        // the stream size, and without it no byte estimate can be clamped.
+        let byte_total = element
+            .source_query_duration()
+            .filter(|q| q.format == crate::event::SegmentFormat::Bytes)
+            .map(|q| q.duration);
+        let bytes_native = byte_total.is_some();
+        let byte_total = byte_total.flatten();
         let mut segment_sent = false;
         let mut last_seek_seqnum: u64 = 0;
         // #163 phase B: set when this element converts a seek into another
@@ -2906,7 +2918,7 @@ fn spawn_source_task(
                     if !segment_sent {
                         segment_sent = true;
                         let segment = if bytes_native {
-                            SegmentEvent::new_bytes(0, None)
+                            SegmentEvent::new_bytes(0, byte_total)
                         } else {
                             initial_segment_for(&buffer)
                         };
@@ -3948,7 +3960,7 @@ fn spawn_demuxer_task(
                         if let Event::FlushStart = &event {
                             // Discard buffered state; stale inputs ahead of
                             // this event were already epoch-dropped.
-                            if let Err(e) = guard(&name, element.flush()).await {
+                            if let Err(e) = guard(&name, element.flush_demux()).await {
                                 tracing::warn!("flush error in '{}': {}", name, e);
                             }
                         }
@@ -4023,6 +4035,29 @@ fn spawn_demuxer_task(
                                     break;
                                 }
                             }
+                        }
+                        // A *fed* demuxer's `produce` is never called, so the
+                        // loop above drained nothing; whatever its parser was
+                        // still assembling comes out here, on its own pad.
+                        match guard(&name, element.flush_demux()).await {
+                            Ok(routed) => {
+                                for (pad, out) in routed {
+                                    route_demux_buffer(
+                                        &name,
+                                        &pad,
+                                        out,
+                                        in_epoch,
+                                        &outputs_by_pad,
+                                        &tracers,
+                                        &mut unrouted,
+                                        &mut segment_pads,
+                                        &src_pad,
+                                        &probe_registry,
+                                    )
+                                    .await;
+                                }
+                            }
+                            Err(e) => tracing::warn!("EOS flush error in '{}': {}", name, e),
                         }
                         for branches in outputs_by_pad.values() {
                             broadcast_eos(branches).await;
