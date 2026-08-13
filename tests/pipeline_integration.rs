@@ -899,7 +899,7 @@ fn test_plugin_abi_version() {
 
     // 2: AsyncElementDyn::set_output_budget (executor-sized output arenas)
     // 3: AsyncElementDyn::process_demux (per-pad demuxer routing, #76)
-    assert_eq!(PARALLAX_ABI_VERSION, 4);
+    assert_eq!(PARALLAX_ABI_VERSION, 5);
 }
 
 /// Test plugin descriptor struct sizes are non-zero.

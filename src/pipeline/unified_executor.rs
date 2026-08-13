@@ -36,7 +36,8 @@ use crate::element::{
 };
 use crate::error::{Error, Result};
 use crate::event::{
-    Event, EventResult, FlushStopEvent, SeekEvent, SeekType, SegmentEvent, StreamStartEvent,
+    Event, EventResult, FlushStopEvent, SeekEvent, SeekType, SegmentEvent, SegmentFormat,
+    StreamStartEvent,
 };
 use crate::memory::{OutputBudget, defaults};
 use crate::pipeline::bus::{Bus, BusHandle};
@@ -2524,6 +2525,15 @@ struct UpstreamHop {
     parents: Vec<(String, tokio::sync::mpsc::UnboundedSender<Event>)>,
 }
 
+/// A seek this task converted into another format and forwarded upstream
+/// (#163 phase B), held until the upstream flush comes back down so the
+/// completion can be reported in the format the application asked in.
+struct PendingTranslation {
+    seqnum: u64,
+    /// The format the application seeked in (the outward one).
+    format: SegmentFormat,
+}
+
 /// Which side of a consuming task's data-vs-upstream select fired.
 ///
 /// Returning the winner instead of acting inside the `select!` arm is what
@@ -2589,6 +2599,7 @@ async fn handle_upstream_hop(
     parents: &[(String, tokio::sync::mpsc::UnboundedSender<Event>)],
     last_seek_seqnum: &mut u64,
     warn_unhandled_seek: bool,
+    pending_translation: &mut Option<PendingTranslation>,
 ) -> bool {
     if let Event::Seek(seek) = event {
         if seek.seqnum() <= *last_seek_seqnum {
@@ -2608,8 +2619,10 @@ async fn handle_upstream_hop(
 
     let result = element.handle_upstream_event(event);
     let Event::Seek(seek) = event else {
-        if result == EventResult::NotHandled {
-            forward_to_parents(parents, event);
+        match &result {
+            EventResult::NotHandled => forward_to_parents(parents, event),
+            EventResult::Forward(translated) => forward_to_parents(parents, translated),
+            _ => {}
         }
         return false;
     };
@@ -2703,6 +2716,48 @@ async fn handle_upstream_hop(
             );
             segment_emitted
         }
+        EventResult::Forward(translated) => {
+            if parents.is_empty() {
+                bus.post_warning(
+                    format!("'{name}' translated a seek but has no upstream peer"),
+                    None,
+                );
+                return false;
+            }
+            // The invariant `SeekEvent::derive` exists to preserve. A
+            // replacement that renamed the seek would break flush-epoch
+            // idempotence and SeekDone correlation, so it is a bug in the
+            // element rather than a policy to honour.
+            match &*translated {
+                Event::Seek(t) if t.seqnum() == seek.seqnum() => {}
+                other => {
+                    bus.post_warning(
+                        format!(
+                            "'{name}' replaced seek {} with an unrelated {} — dropped",
+                            seek.seqnum(),
+                            other.name()
+                        ),
+                        None,
+                    );
+                    return false;
+                }
+            }
+            *pending_translation = Some(PendingTranslation {
+                seqnum: seek.seqnum(),
+                format: seek.format,
+            });
+            tracing::debug!(
+                "'{name}': translated seek {} to {:?}, forwarding upstream",
+                seek.seqnum(),
+                translated.name()
+            );
+            // No epoch bump, no flush trio, no SeekDone here: the upstream
+            // source runs all of that when it handles the derived seek, and
+            // because `derive` kept the seqnum, `fetch_max` reaches exactly
+            // the same value it otherwise would.
+            forward_to_parents(parents, &translated);
+            false
+        }
         EventResult::NotHandled if !parents.is_empty() => {
             // Not ours — keep it travelling toward the sources.
             forward_to_parents(parents, event);
@@ -2772,6 +2827,10 @@ fn spawn_source_task(
         );
         let mut segment_sent = false;
         let mut last_seek_seqnum: u64 = 0;
+        // #163 phase B: set when this element converts a seek into another
+        // format and forwards it upstream; cleared when the completion is
+        // reported in the format the application asked in.
+        let mut pending_translation: Option<PendingTranslation> = None;
         let mut count: u64 = 0;
         let mut would_block_count: u64 = 0;
 
@@ -2806,6 +2865,7 @@ fn spawn_source_task(
                     &upstream.parents,
                     &mut last_seek_seqnum,
                     warn_unhandled_seek,
+                    &mut pending_translation,
                 )
                 .await;
             }
@@ -2827,6 +2887,7 @@ fn spawn_source_task(
                         &upstream.parents,
                         &mut last_seek_seqnum,
                         warn_unhandled_seek,
+                        &mut pending_translation,
                     )
                     .await;
                 }
@@ -3006,6 +3067,10 @@ fn spawn_sink_task(
                 None => (None, Vec::new()),
             };
             let mut last_seek_seqnum: u64 = 0;
+            // #163 phase B: set when this element converts a seek into another
+            // format and forwards it upstream; cleared when the completion is
+            // reported in the format the application asked in.
+            let mut pending_translation: Option<PendingTranslation> = None;
             // Standard path: read from the link channel
             loop {
                 // Runtime pause (#156). Gating only the producers leaves the
@@ -3043,6 +3108,7 @@ fn spawn_sink_task(
                                     &up_parents,
                                     &mut last_seek_seqnum,
                                     false,
+                                    &mut pending_translation,
                                 )
                                 .await;
                             }
@@ -3121,6 +3187,7 @@ fn spawn_sink_task(
                                 &up_parents,
                                 &mut last_seek_seqnum,
                                 false,
+                                &mut pending_translation,
                             )
                             .await;
                             continue;
@@ -3332,6 +3399,10 @@ fn spawn_transform_task(
                 None => (None, Vec::new()),
             };
             let mut last_seek_seqnum: u64 = 0;
+            // #163 phase B: set when this element converts a seek into another
+            // format and forwards it upstream; cleared when the completion is
+            // reported in the format the application asked in.
+            let mut pending_translation: Option<PendingTranslation> = None;
             // Standard path: read from the link channel
             loop {
                 tracing::trace!("transform '{}': waiting for input", name);
@@ -3365,6 +3436,7 @@ fn spawn_transform_task(
                                 &up_parents,
                                 &mut last_seek_seqnum,
                                 false,
+                                &mut pending_translation,
                             )
                             .await;
                             continue;
@@ -3638,13 +3710,15 @@ async fn route_demux_buffer(
     segment_pads: &mut HashSet<String>,
     src_pad: &crate::pipeline::probe::PadRef,
     probes: &ProbeRegistry,
-) {
+) -> bool {
+    let mut anchored = false;
     match outputs_by_pad.get(pad) {
         Some(branches) => {
             // Per-pad lazy initial segment, anchored at this pad's first
             // buffer (#165): each elementary stream carries its own PTS
             // domain, so pads anchor independently.
             if segment_pads.insert(pad.to_string()) {
+                anchored = true;
                 emit_event(
                     branches,
                     src_pad,
@@ -3658,6 +3732,7 @@ async fn route_demux_buffer(
         None if pad.is_empty() => {
             // Legacy broadcast pad: one shared segment for every branch.
             if segment_pads.insert(String::new()) {
+                anchored = true;
                 for branches in outputs_by_pad.values() {
                     emit_event(
                         branches,
@@ -3683,6 +3758,7 @@ async fn route_demux_buffer(
             }
         }
     }
+    anchored
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3729,6 +3805,10 @@ fn spawn_demuxer_task(
         }
         let mut segment_pads: HashSet<String> = HashSet::new();
         let mut last_seek_seqnum: u64 = 0;
+        // #163 phase B: set when this element converts a seek into another
+        // format and forwards it upstream; cleared when the completion is
+        // reported in the format the application asked in.
+        let mut pending_translation: Option<PendingTranslation> = None;
 
         if let Some(mut rx) = inputs.into_iter().next() {
             // Same input-epoch rule as spawn_transform_task: outputs carry the
@@ -3767,6 +3847,7 @@ fn spawn_demuxer_task(
                                 &up_parents,
                                 &mut last_seek_seqnum,
                                 warn_unhandled_seek,
+                                &mut pending_translation,
                             )
                             .await;
                             continue;
@@ -3812,7 +3893,8 @@ fn spawn_demuxer_task(
                                         ProbeReturn::Drop | ProbeReturn::Handled => continue,
                                         _ => {}
                                     }
-                                    route_demux_buffer(
+                                    let pts = out.metadata().pts;
+                                    let anchored = route_demux_buffer(
                                         &name,
                                         &pad,
                                         out,
@@ -3825,6 +3907,21 @@ fn spawn_demuxer_task(
                                         &probe_registry,
                                     )
                                     .await;
+                                    // #163 phase B: a seek this demuxer
+                                    // translated completes here, not at the
+                                    // source. The source answered in BYTES,
+                                    // which is not the question the
+                                    // application asked; the first post-flush
+                                    // buffer's PTS is the honest landing in
+                                    // the format it did ask in.
+                                    if anchored && let Some(pt) = pending_translation.take() {
+                                        bus.post(crate::pipeline::bus::MessageKind::SeekDone {
+                                            seqnum: pt.seqnum,
+                                            source: name.clone(),
+                                            format: pt.format,
+                                            position: pts.to_option().map(|p| p.nanos()),
+                                        });
+                                    }
                                 }
                             }
                             // Input-driven demuxers do not signal these; treat
@@ -3964,6 +4061,7 @@ fn spawn_demuxer_task(
                             &hop.parents,
                             &mut last_seek_seqnum,
                             warn_unhandled_seek,
+                            &mut pending_translation,
                         )
                         .await
                         {
@@ -3996,6 +4094,7 @@ fn spawn_demuxer_task(
                                 &hop.parents,
                                 &mut last_seek_seqnum,
                                 warn_unhandled_seek,
+                                &mut pending_translation,
                             )
                             .await
                             {
@@ -4147,6 +4246,10 @@ fn spawn_muxer_task(
             None => (None, Vec::new()),
         };
         let mut last_seek_seqnum: u64 = 0;
+        // #163 phase B: set when this element converts a seek into another
+        // format and forwards it upstream; cleared when the completion is
+        // reported in the format the application asked in.
+        let mut pending_translation: Option<PendingTranslation> = None;
         loop {
             // Upstream events (#163) take priority over data; a muxer that
             // does not handle one forwards it to every input branch's
@@ -4178,6 +4281,7 @@ fn spawn_muxer_task(
                         &up_parents,
                         &mut last_seek_seqnum,
                         false,
+                        &mut pending_translation,
                     )
                     .await;
                     continue;

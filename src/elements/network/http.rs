@@ -707,7 +707,7 @@ mod tests {
         // ...and a seek against it is refused.
         let mut src = src_for(addr);
         let result = src.handle_upstream_event(&Event::Seek(SeekEvent::new_bytes(10)));
-        assert_eq!(result, EventResult::Error);
+        assert!(matches!(result, EventResult::Error));
     }
 
     #[test]
@@ -746,12 +746,12 @@ mod tests {
         assert_eq!(first.as_bytes(), &body[..64]);
 
         let result = src.handle_upstream_event(&Event::Seek(SeekEvent::new_bytes(700)));
-        assert_eq!(
+        assert!(matches!(
             result,
             EventResult::Handled {
                 position: Some(700)
             }
-        );
+        ));
         assert_eq!(src.query_position().unwrap().position, Some(700));
 
         let mut out = Vec::new();
@@ -776,34 +776,36 @@ mod tests {
             SegmentFormat::Bytes,
             crate::event::SeekPosition::current(100),
         );
-        assert_eq!(
-            src.handle_upstream_event(&Event::Seek(seek)),
-            EventResult::Handled {
-                position: Some(164)
-            },
+        assert!(
+            matches!(
+                src.handle_upstream_event(&Event::Seek(seek)),
+                EventResult::Handled {
+                    position: Some(164)
+                }
+            ),
             "64 read + 100 forward"
         );
 
         // End-relative needs the total.
         let seek = SeekEvent::new(SegmentFormat::Bytes, crate::event::SeekPosition::end(-100));
-        assert_eq!(
+        assert!(matches!(
             src.handle_upstream_event(&Event::Seek(seek)),
             EventResult::Handled {
                 position: Some(400)
             }
-        );
+        ));
         let mut out = Vec::new();
         drain(&mut src, &mut out);
         assert_eq!(out, &body[400..]);
 
         // Past-the-end clamps and the next produce is a clean EOS.
         let seek = SeekEvent::new_bytes(9_999);
-        assert_eq!(
+        assert!(matches!(
             src.handle_upstream_event(&Event::Seek(seek)),
             EventResult::Handled {
                 position: Some(500)
             }
-        );
+        ));
         let mut out = Vec::new();
         drain(&mut src, &mut out);
         assert!(out.is_empty());
@@ -820,10 +822,10 @@ mod tests {
         );
         let mut src = src_for(addr);
         let seek = SeekEvent::new(SegmentFormat::Bytes, crate::event::SeekPosition::end(-10));
-        assert_eq!(
+        assert!(matches!(
             src.handle_upstream_event(&Event::Seek(seek)),
             EventResult::Error
-        );
+        ));
     }
 
     #[test]
@@ -842,12 +844,12 @@ mod tests {
         let mut src = src_for(addr);
         assert!(src.is_seekable(), "server lies about ranges");
 
-        assert_eq!(
+        assert!(matches!(
             src.handle_upstream_event(&Event::Seek(SeekEvent::new_bytes(100))),
             EventResult::Handled {
                 position: Some(100)
             }
-        );
+        ));
         let mut ctx = crate::element::ProduceContext::without_buffer();
         let err = src.produce(&mut ctx).unwrap_err();
         assert!(

@@ -507,12 +507,14 @@ mod cue_seek {
             1200,
             SeekFlags::FLUSH | SeekFlags::KEY_UNIT | SeekFlags::SNAP_BEFORE,
         );
-        assert_eq!(
-            result,
-            EventResult::Handled {
-                position: Some(1_000_000_000)
-            },
-            "backward snap knows its landing up front"
+        assert!(
+            matches!(
+                result,
+                EventResult::Handled {
+                    position: Some(1_000_000_000)
+                }
+            ),
+            "backward snap knows its landing up front, got {result:?}"
         );
 
         // First post-seek video buffer is the 1000 ms cue keyframe; nothing
@@ -538,20 +540,24 @@ mod cue_seek {
         let (mut demux, _) = counting(H264_AAC_MKV);
         let mut yields = 0;
         next_buffer(&mut demux, &mut yields).expect("head frame");
-        assert_eq!(
-            seek_with(&mut demux, 1200, nearest),
-            EventResult::Handled {
-                position: Some(1_000_000_000)
-            },
+        assert!(
+            matches!(
+                seek_with(&mut demux, 1200, nearest),
+                EventResult::Handled {
+                    position: Some(1_000_000_000)
+                }
+            ),
             "1200 ms resolves backward (200 ms) over forward (300 ms)"
         );
 
         let (mut demux, _) = counting(H264_AAC_MKV);
         let mut yields = 0;
         next_buffer(&mut demux, &mut yields).expect("head frame");
-        assert_eq!(
-            seek_with(&mut demux, 1300, nearest),
-            EventResult::Handled { position: None },
+        assert!(
+            matches!(
+                seek_with(&mut demux, 1300, nearest),
+                EventResult::Handled { position: None }
+            ),
             "1300 ms resolves forward, whose landing is scan-determined"
         );
         loop {

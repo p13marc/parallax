@@ -558,6 +558,33 @@ impl SeekEvent {
         self.stop = stop;
         self
     }
+
+    /// Retarget this seek into another format, keeping seqnum, rate and flags.
+    ///
+    /// The conversion primitive for push-mode demuxers, paired with
+    /// [`EventResult::Forward`]: a TS demuxer turns a TIME seek into a BYTES
+    /// seek on its upstream source. **Sharing the seqnum is the point** — it
+    /// is what makes the flush epoch's `fetch_max` idempotent across the
+    /// conversion and lets `SeekDone` correlate the two completions.
+    ///
+    /// `stop` resets to [`SeekPosition::none`]: converting a stop position
+    /// needs a second estimate, so an element that can make one should chain
+    /// [`with_stop`](Self::with_stop) explicitly.
+    ///
+    /// The private seqnum stops callers *minting* one, not propagating one —
+    /// `SeekEvent` is `Clone` and its other fields are public, so this is
+    /// sugar over something already possible, and it can only ever copy a
+    /// seqnum that exists.
+    pub fn derive(&self, format: SegmentFormat, start: SeekPosition) -> Self {
+        Self {
+            seqnum: self.seqnum,
+            rate: self.rate,
+            flags: self.flags,
+            format,
+            start,
+            stop: SeekPosition::none(),
+        }
+    }
 }
 
 /// Position in a seek event.
@@ -887,7 +914,10 @@ impl From<Event> for PipelineItem {
 // ============================================================================
 
 /// Result of handling an event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// No longer `Copy`/`Eq`: [`Forward`](Self::Forward) carries a boxed
+/// replacement event.
+#[derive(Debug, Clone)]
 pub enum EventResult {
     /// Event was handled, don't propagate.
     Handled {
@@ -899,6 +929,18 @@ pub enum EventResult {
         /// MKV landing depends on the next keyframe found during produce).
         position: Option<i64>,
     },
+    /// Consumed this event; send **this** one upstream instead (#163).
+    ///
+    /// The push-mode translation primitive: a fed demuxer converts a TIME
+    /// seek into a BYTES seek on its upstream source, and the byte segment
+    /// that comes back down is rewritten into its pads' Time domain.
+    ///
+    /// For a seek the replacement **must carry the original's seqnum** —
+    /// build it with [`SeekEvent::derive`], never a fresh constructor. The
+    /// seqnum is what keeps the flush epoch idempotent and lets `SeekDone`
+    /// correlate across the conversion; the executor drops a replacement
+    /// that renamed the seek, with a warning on the bus.
+    Forward(Box<Event>),
     /// Event was not handled, propagate to next element.
     NotHandled,
     /// Event handling failed.
@@ -916,6 +958,11 @@ impl EventResult {
         EventResult::Handled {
             position: Some(position),
         }
+    }
+
+    /// Consumed, with `event` to be sent upstream in its place.
+    pub fn forward(event: Event) -> Self {
+        EventResult::Forward(Box::new(event))
     }
 
     /// Check if the event was handled.
@@ -967,6 +1014,26 @@ mod tests {
             Some(SeekSnap::Nearest),
             "both bits = nearest"
         );
+    }
+
+    #[test]
+    fn derive_preserves_seqnum_rate_and_flags() {
+        let original = SeekEvent::new_time(ClockTime::from_secs(5))
+            .with_rate(2.0)
+            .with_stop(SeekPosition::set(9_000));
+        let derived = original.derive(SegmentFormat::Bytes, SeekPosition::set(4096));
+
+        // The whole point: one logical seek, so one seqnum. It is what keeps
+        // the flush epoch idempotent and correlates the two SeekDones.
+        assert_eq!(derived.seqnum(), original.seqnum());
+        assert_eq!(derived.rate, original.rate);
+        assert_eq!(derived.flags, original.flags);
+
+        assert_eq!(derived.format, SegmentFormat::Bytes);
+        assert_eq!(derived.start.position, 4096);
+        // stop does not survive a format change: converting it needs its own
+        // estimate, so the caller must chain with_stop deliberately.
+        assert_eq!(derived.stop.seek_type, SeekType::None);
     }
 
     #[test]

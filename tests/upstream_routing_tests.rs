@@ -314,3 +314,129 @@ async fn diamond_delivers_seek_once() {
     }
     assert_eq!(seek_dones, 1, "one SeekDone for one logical seek");
 }
+
+/// #163 phase B: a mid-graph element can *translate* a seek — consume the one
+/// it was given and send a different one upstream. This is how a push-mode
+/// demuxer turns a TIME seek into a BYTES seek on its source.
+///
+/// No container involved on purpose: this is the executor-level contract, and
+/// it runs under default features in every CI job.
+#[tokio::test(flavor = "multi_thread")]
+async fn transform_translates_seek_to_the_source() {
+    use parallax::event::{SeekEvent, SeekPosition, SegmentFormat};
+
+    let source_seeks = Arc::new(Mutex::new(Vec::<(u64, SegmentFormat, i64)>::new()));
+    let seen = source_seeks.clone();
+
+    /// Records every seek that reaches it, in whatever format.
+    struct RecordingSource {
+        produced: u64,
+        seen: Arc<Mutex<Vec<(u64, SegmentFormat, i64)>>>,
+    }
+
+    impl Source for RecordingSource {
+        fn produce(&mut self, _ctx: &mut ProduceContext) -> Result<ProduceResult> {
+            arena().reclaim();
+            let Some(slot) = arena().acquire() else {
+                return Ok(ProduceResult::WouldBlock);
+            };
+            self.produced += 1;
+            Ok(ProduceResult::OwnBuffer(Buffer::new(
+                MemoryHandle::with_len(slot, 8),
+                Metadata::from_sequence(self.produced),
+            )))
+        }
+
+        fn is_seekable(&self) -> bool {
+            true
+        }
+
+        fn handle_upstream_event(&mut self, event: &Event) -> EventResult {
+            if let Event::Seek(seek) = event {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push((seek.seqnum(), seek.format, seek.start.position));
+                return EventResult::handled_at(seek.start.position);
+            }
+            EventResult::NotHandled
+        }
+    }
+
+    /// Stands in for a fed demuxer: converts TIME to BYTES on the way up.
+    struct TranslatingTransform;
+
+    impl Transform for TranslatingTransform {
+        fn transform(&mut self, buffer: Buffer) -> Result<Output> {
+            Ok(Output::Single(buffer))
+        }
+
+        fn handle_upstream_event(&mut self, event: &Event) -> EventResult {
+            if let Event::Seek(seek) = event
+                && seek.format == SegmentFormat::Time
+            {
+                // `derive`, not a fresh constructor: the seqnum must survive.
+                return EventResult::forward(Event::Seek(
+                    seek.derive(SegmentFormat::Bytes, SeekPosition::set(4096)),
+                ));
+            }
+            EventResult::NotHandled
+        }
+
+        fn name(&self) -> &str {
+            "translator"
+        }
+    }
+
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_source("src", RecordingSource { produced: 0, seen });
+    let xfm = pipeline.add_transform("translator", TranslatingTransform);
+    let appsink = AppSink::with_max_buffers(2);
+    let sink_handle = appsink.handle();
+    let snk = pipeline.add_async_sink("sink", appsink);
+    pipeline.link(src, xfm).unwrap();
+    pipeline.link(xfm, snk).unwrap();
+
+    let executor = Executor::new();
+    let mut handle = executor.start(&mut pipeline).unwrap();
+    let mut bus = handle.take_bus().unwrap();
+
+    let drain = tokio::spawn(drain_all(sink_handle));
+
+    let seek = SeekEvent::new_time(ClockTime::from_secs(5));
+    let seqnum = seek.seqnum();
+    assert!(handle.seek(seek).await);
+
+    wait_until(
+        || !source_seeks.lock().unwrap().is_empty(),
+        "the translated seek to reach the source",
+    )
+    .await;
+    handle.stop();
+    drain.await.unwrap();
+    handle.wait().await.unwrap();
+
+    let seen = source_seeks.lock().unwrap();
+    assert_eq!(seen.len(), 1, "exactly one seek reached the source");
+    assert_eq!(
+        seen[0],
+        (seqnum, SegmentFormat::Bytes, 4096),
+        "the source saw a BYTES seek carrying the original seqnum"
+    );
+
+    // The source reports its own Bytes completion; the translator reports the
+    // Time one the application actually asked for. Both share the seqnum.
+    let mut dones = Vec::new();
+    while let Some(msg) = bus.poll() {
+        if let MessageKind::SeekDone {
+            seqnum: sq, format, ..
+        } = msg.kind
+        {
+            dones.push((sq, format));
+        }
+    }
+    assert!(
+        dones.contains(&(seqnum, SegmentFormat::Bytes)),
+        "the source's byte completion is still reported: {dones:?}"
+    );
+}
