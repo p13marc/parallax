@@ -200,8 +200,8 @@ pub use demux::{StreamIdDemux, StreamIdDemuxStats, StreamOutput};
 
 #[cfg(feature = "mpeg-ts")]
 pub use demux::{
-    TS_PACKET_SIZE, TsDemux, TsDemuxElement, TsDemuxStats, TsElementaryStream, TsFrame, TsProgram,
-    TsStreamType,
+    TS_PACKET_SIZE, TsByteIndex, TsDemux, TsDemuxElement, TsDemuxStats, TsElementaryStream,
+    TsFrame, TsProgram, TsStreamType,
 };
 
 #[cfg(feature = "mp4-demux")]
