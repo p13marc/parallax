@@ -38,7 +38,7 @@ use std::thread;
 use ashpd::desktop::PersistMode;
 use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
 use ashpd::enumflags2::BitFlags;
-use kanal::{Receiver, Sender, bounded};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded};
 use pipewire as pw;
 use pw::spa;
 use spa::sys as spa_sys;
@@ -804,12 +804,11 @@ impl ScreenCaptureSrc {
                     tracing::debug!("Screen capture shutdown requested (received signal)");
                     break;
                 }
-                Err(kanal::ReceiveErrorTimeout::Closed)
-                | Err(kanal::ReceiveErrorTimeout::SendClosed) => {
+                Err(RecvTimeoutError::Disconnected) => {
                     tracing::debug!("Screen capture shutdown (channel closed)");
                     break;
                 }
-                Err(kanal::ReceiveErrorTimeout::Timeout) => {
+                Err(RecvTimeoutError::Timeout) => {
                     // No shutdown yet, continue
                     let count = frame_count.load(Ordering::Relaxed);
                     if count > 0 && count % 30 == 0 {
@@ -888,7 +887,7 @@ impl ScreenCaptureSrc {
     pub fn try_recv_frame(&mut self) -> Option<CapturedFrame> {
         self.frame_receiver
             .as_ref()
-            .and_then(|rx| rx.try_recv().ok().flatten())
+            .and_then(|rx| rx.try_recv().ok())
     }
 
     /// Receive a frame, blocking until one is available.

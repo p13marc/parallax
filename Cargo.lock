@@ -3659,6 +3659,7 @@ dependencies = [
  "ashpd",
  "bytes",
  "criterion",
+ "crossbeam-channel",
  "daggy",
  "dav1d",
  "dynosaur",

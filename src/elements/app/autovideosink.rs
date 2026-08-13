@@ -218,8 +218,8 @@ pub struct AutoVideoSink {
     /// `None` means no handle was taken and the event loop sends nothing —
     /// exactly the historical behavior.
     events: Option<(
-        kanal::Sender<VideoWindowEvent>,
-        kanal::Receiver<VideoWindowEvent>,
+        crossbeam_channel::Sender<VideoWindowEvent>,
+        crossbeam_channel::Receiver<VideoWindowEvent>,
     )>,
     /// Desired fullscreen state, applied by the event loop when woken.
     fullscreen: Arc<AtomicBool>,
@@ -299,7 +299,7 @@ pub enum VideoWindowEvent {
 /// ```
 #[derive(Clone)]
 pub struct AutoVideoSinkHandle {
-    events: kanal::Receiver<VideoWindowEvent>,
+    events: crossbeam_channel::Receiver<VideoWindowEvent>,
     fullscreen: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
     proxy: SharedProxy,
@@ -308,7 +308,7 @@ pub struct AutoVideoSinkHandle {
 impl AutoVideoSinkHandle {
     /// Next pending window event, if any. Non-blocking.
     pub fn try_event(&self) -> Option<VideoWindowEvent> {
-        self.events.try_recv().ok().flatten()
+        self.events.try_recv().ok()
     }
 
     /// Wait for the next window event, giving up after `timeout`.
@@ -369,7 +369,7 @@ impl AutoVideoSink {
         // on a consumer that stopped reading.
         let (_, rx) = self
             .events
-            .get_or_insert_with(|| kanal::bounded::<VideoWindowEvent>(64));
+            .get_or_insert_with(|| crossbeam_channel::bounded::<VideoWindowEvent>(64));
         AutoVideoSinkHandle {
             events: rx.clone(),
             fullscreen: self.fullscreen.clone(),
@@ -717,7 +717,7 @@ fn run_display_loop(
     title: &str,
     initial_width: u32,
     initial_height: u32,
-    events_tx: Option<kanal::Sender<VideoWindowEvent>>,
+    events_tx: Option<crossbeam_channel::Sender<VideoWindowEvent>>,
     fullscreen: Arc<AtomicBool>,
     proxy_slot: SharedProxy,
 ) -> Result<()> {
@@ -739,7 +739,7 @@ fn run_display_loop(
         title: String,
         initial_width: u32,
         initial_height: u32,
-        events_tx: Option<kanal::Sender<VideoWindowEvent>>,
+        events_tx: Option<crossbeam_channel::Sender<VideoWindowEvent>>,
         blit_cache: BlitCache,
         /// Desired state, set by the handle; compared against `is_fullscreen`.
         fullscreen: Arc<AtomicBool>,
