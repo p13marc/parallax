@@ -6,6 +6,11 @@
 *.ts
 log.txt
 
+# ...but tests/fixtures/ holds checked-in inputs, not output. Without this,
+# `*.mp4` and `*.ts` silently swallow new fixtures: the tests pass locally
+# off an untracked file and CI fails to compile them (include_bytes!).
+!tests/fixtures/**
+
 # Editor files
 *.swp
 *~
