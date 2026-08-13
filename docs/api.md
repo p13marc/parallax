@@ -84,7 +84,7 @@ The built-in element library — full catalog in [elements.md](elements.md).
 
 ### `parallax::link`
 
-`LocalLink` (kanal channels, `bounded`/`unbounded` → sender/receiver pairs), `IpcPublisher`/`IpcSubscriber` (shared-memory IPC), `NetworkSender`/`NetworkReceiver` (TCP + rkyv, framed with magic/version/CRC32).
+`IpcPublisher`/`IpcSubscriber` (shared-memory IPC), `NetworkSender`/`NetworkReceiver` (TCP + rkyv, framed with magic/version/CRC32). In-process links need no type: the executor gives every graph edge its own `tokio::sync::mpsc` channel (capacity via `link_pads_full`, loss via `LinkPolicy`).
 
 ### `parallax::plugin`
 

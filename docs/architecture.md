@@ -100,7 +100,7 @@ Details: [scheduling.md](scheduling.md).
 
 | Link | Transport | Copy semantics |
 |------|-----------|----------------|
-| `LocalLink` | kanal channel (in-process) | move — refcount only |
+| pipeline link | `tokio::sync::mpsc` channel, one per graph edge (in-process) | move — refcount only |
 | `IpcPublisher`/`IpcSubscriber` | Unix socket + shared arena | zero-copy — only a small ref crosses the socket; the arena fd is passed once via SCM_RIGHTS |
 | `NetworkSender`/`NetworkReceiver` | TCP | serialized with rkyv (framed: `PRLX` magic, version, CRC32) |
 

@@ -102,7 +102,7 @@ Pipeline::parse("zenoh_sub key=factory/camera/1 ! display-element")?;
 
 | Boundary | Bridge | Copy cost |
 |----------|--------|-----------|
-| In-process | `LocalLink` (kanal) | zero (move) |
+| In-process | the executor's per-edge `tokio::sync::mpsc` channel | zero (move) |
 | Cross-process | `IpcSrc`/`IpcSink` | zero (shared pages; ~bytes of metadata per buffer) |
 | Cross-machine | `ZenohSrc`/`ZenohSink`, TCP links | serialize (rkyv) |
 
