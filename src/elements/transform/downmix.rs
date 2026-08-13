@@ -20,7 +20,10 @@ use crate::memory::{OutputArena, OutputBudget, defaults};
 /// ITU-R BS.775 fold-down gain for center and surround channels.
 const SURROUND_GAIN: f32 = std::f32::consts::FRAC_1_SQRT_2; // −3 dB
 
-/// Multichannel → stereo downmix (see the [module docs](self)).
+/// Multichannel → stereo downmix, ITU-R BS.775 fold-down.
+///
+/// The module this lives in is private, so its docs are not published —
+/// everything a caller needs is here and on the methods below.
 ///
 /// ```rust,ignore
 /// let node = pipeline.add_filter("downmix", AudioDownmix::new());
