@@ -630,13 +630,31 @@ impl TsDemux {
     }
 
     /// Reset the demuxer state.
+    ///
+    /// Rebuilds the parser (PAT/PMT included), so the caller must expect
+    /// nothing to come out until the next PSI in the stream.
+    ///
+    /// The stream filter is carried across: recreating the context
+    /// unconditionally with `TsDemuxContext::new` silently turned a
+    /// `video_only()` demuxer into one that accepted everything.
     pub fn reset(&mut self) {
         self.partial_packet.clear();
         self.output.lock().unwrap().clear();
         *self.stats.lock().unwrap() = TsDemuxStats::default();
 
-        // Recreate the demuxer
-        self.ctx = TsDemuxContext::new(self.output.clone(), self.stats.clone(), self.arena.clone());
+        // Recreate the demuxer, preserving the filter this demuxer was built
+        // with.
+        self.ctx = match self.ctx.stream_filter.clone() {
+            Some(filter) => TsDemuxContext::with_filter(
+                self.output.clone(),
+                self.stats.clone(),
+                self.arena.clone(),
+                filter,
+            ),
+            None => {
+                TsDemuxContext::new(self.output.clone(), self.stats.clone(), self.arena.clone())
+            }
+        };
         self.demux = demultiplex::Demultiplex::new(&mut self.ctx);
     }
 }
@@ -849,6 +867,29 @@ mod tests {
 
         assert_eq!(demux.stats().packets_processed, 0);
         assert_eq!(demux.stats().sync_errors, 0);
+    }
+
+    /// A reset must not widen what the demuxer accepts. `reset()` rebuilds
+    /// the parsing context, and rebuilding it unconditionally with
+    /// `TsDemuxContext::new` turned a `video_only()` demuxer into one that
+    /// accepted audio too — which matters because a seek resets the parser.
+    #[test]
+    fn reset_preserves_the_stream_filter() {
+        let mut demux = TsDemux::video_only();
+        let before = demux.ctx.stream_filter.clone();
+        assert!(before.is_some(), "video_only() must install a filter");
+
+        demux.reset();
+
+        assert_eq!(
+            demux.ctx.stream_filter, before,
+            "reset dropped the stream filter"
+        );
+
+        // And an unfiltered demuxer stays unfiltered.
+        let mut all = TsDemux::new();
+        all.reset();
+        assert!(all.ctx.stream_filter.is_none());
     }
 
     #[test]

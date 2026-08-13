@@ -46,7 +46,7 @@ check-sensor:
     cargo clippy --all-targets --features {{sensor_features}},image-codecs,zenoh-unstable -- -D warnings
 
 # Pure-Rust media/container feature combo (mirrors CI's media checks)
-media_features := "mp4-demux,mkv-demux,audio-aac,audio-vorbis,http"
+media_features := "mp4-demux,mkv-demux,mpeg-ts,audio-aac,audio-vorbis,http"
 
 # Check + test + lint the media/container combo (mirrors CI)
 check-media:

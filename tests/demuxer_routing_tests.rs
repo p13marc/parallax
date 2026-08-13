@@ -539,8 +539,8 @@ async fn ts_demux_element_routes_av_branches() {
 
     let src = pipeline.add_source("src", appsrc);
     let demux = pipeline.add_demuxer("tsdemux", TsDemuxElement::new());
-    let vs = pipeline.add_sink("video_sink", video_sink);
-    let as_ = pipeline.add_sink("audio_sink", audio_sink);
+    let vs = pipeline.add_async_sink("video_sink", video_sink);
+    let as_ = pipeline.add_async_sink("audio_sink", audio_sink);
     pipeline.link(src, demux).unwrap();
     pipeline.link_pads(demux, "video", vs, "sink").unwrap();
     pipeline.link_pads(demux, "audio", as_, "sink").unwrap();
