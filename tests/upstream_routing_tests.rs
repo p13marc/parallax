@@ -460,7 +460,7 @@ async fn a_fed_demuxer_is_flushed_and_sees_the_translated_segment() {
     use parallax::element::{Demuxer, PadAddedCallback, PadId, RoutedOutput};
     use parallax::event::{SeekEvent, SeekPosition};
     use parallax::format::Caps;
-    use parallax::pipeline::seek::DurationQuery;
+    use parallax::pipeline::seek::{DurationQuery, SeekTranslation};
 
     const TOTAL: u64 = 4096;
 
@@ -517,6 +517,14 @@ async fn a_fed_demuxer_is_flushed_and_sees_the_translated_segment() {
     impl Demuxer for TranslatingDemuxer {
         fn demux(&mut self, buffer: Buffer) -> Result<RoutedOutput> {
             Ok(RoutedOutput::single(PadId(0), buffer))
+        }
+
+        fn seek_translations(&self) -> Vec<SeekTranslation> {
+            vec![SeekTranslation {
+                from: SegmentFormat::Time,
+                to: SegmentFormat::Bytes,
+                duration: None,
+            }]
         }
 
         fn pad_name(&self, _pad: PadId) -> String {
@@ -586,8 +594,21 @@ async fn a_fed_demuxer_is_flushed_and_sees_the_translated_segment() {
     pipeline.link(src, demux).unwrap();
     pipeline.link_pads(demux, "video", snk, "sink").unwrap();
 
+    // Before start: the graph already answers TIME, not the source's BYTES.
+    let pre = pipeline.query_seekable();
+    assert!(pre.seekable);
+    assert_eq!(pre.format, SegmentFormat::Time);
+
     let executor = Executor::new();
     let handle = executor.start(&mut pipeline).unwrap();
+
+    // And the running pipeline agrees — the two surfaces share the fold.
+    let live = handle.query_seekable();
+    assert_eq!(live.format, SegmentFormat::Time);
+    assert_eq!(
+        live.stop, 0,
+        "the demuxer knows no duration, so the TIME range is open"
+    );
 
     let tails = Arc::new(AtomicU64::new(0));
     let counted = tails.clone();

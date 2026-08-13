@@ -1608,7 +1608,20 @@ impl Pipeline {
             .filter_map(|node| node.element.as_ref())
             .map(|element| (element.is_seekable(), element.source_query_duration()))
             .collect();
-        crate::pipeline::seek::aggregate_seekable(answers.iter().map(|(s, d)| (*s, d.as_ref())))
+        // Every node, not just the sources: a translating demuxer is what
+        // turns a byte-seekable source into a TIME-seekable pipeline.
+        let translations: Vec<_> = self
+            .graph
+            .graph()
+            .node_indices()
+            .filter_map(|idx| self.graph.graph().node_weight(idx))
+            .filter_map(|node| node.element.as_ref())
+            .flat_map(|element| element.seek_translations())
+            .collect();
+        crate::pipeline::seek::aggregate_seekable(
+            answers.iter().map(|(s, d)| (*s, d.as_ref())),
+            &translations,
+        )
     }
 
     /// Query the current position from source elements.

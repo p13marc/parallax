@@ -82,6 +82,13 @@ pub struct DurationQuery {
 pub struct SeekableQuery {
     /// Whether seeking is supported.
     pub seekable: bool,
+    /// The format `start`/`stop` are expressed in, and the format a seek on
+    /// this pipeline should use.
+    ///
+    /// Usually the seekable source's own format, but a mid-graph element
+    /// that translates seeks *replaces* it: `filesrc ! tsdemux` seeks in
+    /// TIME even though only the source can seek, and it seeks in BYTES.
+    pub format: SegmentFormat,
     /// Start of seekable range (nanoseconds or bytes).
     pub start: u64,
     /// End of seekable range (nanoseconds or bytes).
@@ -93,29 +100,72 @@ impl SeekableQuery {
     pub fn not_seekable() -> Self {
         Self {
             seekable: false,
+            format: SegmentFormat::Time,
             start: 0,
             stop: 0,
         }
     }
 }
 
-/// Fold per-source `(is_seekable, duration)` answers into one
-/// [`SeekableQuery`]: the first seekable source wins, its duration (when
-/// known) bounds the range.
+/// A format conversion a mid-graph element performs on upstream seeks.
+///
+/// Declared by [`AsyncElementDyn::seek_translations`] and snapshotted at
+/// start: an element returning `{from: Time, to: Bytes}` accepts a TIME seek
+/// and forwards a BYTES one, which is what makes a byte-seekable source
+/// underneath present as TIME-seekable to the application.
+///
+/// [`AsyncElementDyn::seek_translations`]: crate::element::AsyncElementDyn::seek_translations
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeekTranslation {
+    /// The format this element accepts from downstream.
+    pub from: SegmentFormat,
+    /// The format it forwards upstream.
+    pub to: SegmentFormat,
+    /// What this element knows about the stream's total in `from`'s format.
+    ///
+    /// Almost always `None`: an element that could answer a TIME duration
+    /// query usually would not need to translate in the first place. When
+    /// it is known it bounds the translated range, which is otherwise open.
+    pub duration: Option<DurationQuery>,
+}
+
+/// Fold per-source `(is_seekable, duration)` answers and the graph's seek
+/// translations into one [`SeekableQuery`].
+///
+/// The first seekable source wins and its duration, when known, bounds the
+/// range. A translation whose `to` matches that source's format then
+/// **replaces** the reported format with its `from` — GStreamer's discipline,
+/// where a demuxer refuses BYTE seekability downstream and offers TIME
+/// instead. The range does not survive the swap (bytes are not nanoseconds),
+/// so it reopens unless the translating element itself knows a duration.
 ///
 /// Shared by the pre-start `Pipeline::query_seekable` and the runtime
 /// `PipelineHandle::query_seekable`, so the two surfaces cannot drift.
 pub(crate) fn aggregate_seekable<'a>(
     sources: impl IntoIterator<Item = (bool, Option<&'a DurationQuery>)>,
+    translations: &[SeekTranslation],
 ) -> SeekableQuery {
     for (seekable, duration) in sources {
-        if seekable {
-            return SeekableQuery {
-                seekable: true,
-                start: 0,
-                stop: duration.and_then(|d| d.duration).unwrap_or(0),
-            };
+        if !seekable {
+            continue;
         }
+        let format = duration.map(|d| d.format).unwrap_or(SegmentFormat::Time);
+        let mut query = SeekableQuery {
+            seekable: true,
+            format,
+            start: 0,
+            stop: duration.and_then(|d| d.duration).unwrap_or(0),
+        };
+        if let Some(t) = translations.iter().find(|t| t.to == format) {
+            query.format = t.from;
+            query.stop = t
+                .duration
+                .as_ref()
+                .filter(|d| d.format == t.from)
+                .and_then(|d| d.duration)
+                .unwrap_or(0);
+        }
+        return query;
     }
     SeekableQuery::not_seekable()
 }
@@ -223,20 +273,65 @@ mod tests {
             format: SegmentFormat::Time,
             duration: Some(2_000_000_000),
         };
-        let q = aggregate_seekable([(false, None), (true, Some(&time)), (true, None)]);
+        let q = aggregate_seekable([(false, None), (true, Some(&time)), (true, None)], &[]);
         assert_eq!(
             q,
             SeekableQuery {
                 seekable: true,
+                format: SegmentFormat::Time,
                 start: 0,
                 stop: 2_000_000_000
             }
         );
 
-        assert!(!aggregate_seekable([(false, Some(&time))]).seekable);
+        assert!(!aggregate_seekable([(false, Some(&time))], &[]).seekable);
         // Seekable with unknown duration: open-ended range, stop = 0.
-        let q = aggregate_seekable([(true, None)]);
+        let q = aggregate_seekable([(true, None)], &[]);
         assert!(q.seekable);
         assert_eq!(q.stop, 0);
+    }
+
+    #[test]
+    fn a_translation_replaces_the_reported_seek_format() {
+        let bytes = DurationQuery {
+            format: SegmentFormat::Bytes,
+            duration: Some(4096),
+        };
+        let to_time = SeekTranslation {
+            from: SegmentFormat::Time,
+            to: SegmentFormat::Bytes,
+            duration: None,
+        };
+
+        // filesrc alone: BYTES, bounded by the file size.
+        let q = aggregate_seekable([(true, Some(&bytes))], &[]);
+        assert_eq!(q.format, SegmentFormat::Bytes);
+        assert_eq!(q.stop, 4096);
+
+        // filesrc ! tsdemux: TIME, and the byte range does NOT carry over —
+        // reporting 4096 nanoseconds of seekable media would be a lie.
+        let q = aggregate_seekable([(true, Some(&bytes))], std::slice::from_ref(&to_time));
+        assert_eq!(q.format, SegmentFormat::Time);
+        assert_eq!(q.stop, 0, "a byte count is not a duration");
+
+        // A translator that knows the duration bounds the new range.
+        let knows = SeekTranslation {
+            duration: Some(DurationQuery {
+                format: SegmentFormat::Time,
+                duration: Some(30_000_000_000),
+            }),
+            ..to_time.clone()
+        };
+        let q = aggregate_seekable([(true, Some(&bytes))], &[knows]);
+        assert_eq!(q.stop, 30_000_000_000);
+
+        // A translation that does not apply to the source's format is inert.
+        let unrelated = SeekTranslation {
+            to: SegmentFormat::Default,
+            ..to_time
+        };
+        let q = aggregate_seekable([(true, Some(&bytes))], &[unrelated]);
+        assert_eq!(q.format, SegmentFormat::Bytes);
+        assert_eq!(q.stop, 4096);
     }
 }

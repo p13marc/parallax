@@ -546,6 +546,10 @@ struct RuntimeControls {
     /// Pipeline-wide flush epoch; see [`Message::Buffer`]. Bumped by the seek
     /// handler inside producer tasks, read by every consuming task.
     flush_epoch: Arc<AtomicU64>,
+    /// Seek format conversions declared by mid-graph elements (#163), from
+    /// every node as it spawns — a fed demuxer is not a source and so gets
+    /// no `SourceControl` to hang this on.
+    translations: Vec<crate::pipeline::seek::SeekTranslation>,
 }
 
 /// Handle to a running pipeline.
@@ -585,6 +589,9 @@ pub struct PipelineHandle {
     /// Sink-node inboxes (#163): the upstream-event entry points in a
     /// fully-async pipeline. Empty in hybrid mode (legacy source fan-out).
     upstream_entries: Vec<(String, tokio::sync::mpsc::UnboundedSender<Event>)>,
+    /// Seek format conversions declared by mid-graph elements, snapshotted
+    /// at start; see [`query_seekable`](Self::query_seekable).
+    translations: Vec<crate::pipeline::seek::SeekTranslation>,
     /// Pause gate watched by the source loops (see [`pause`](Self::pause)).
     pause_tx: watch::Sender<bool>,
     /// The shared clock wrapper, when the pipeline has a started clock.
@@ -893,6 +900,7 @@ impl PipelineHandle {
             self.controls
                 .iter()
                 .map(|c| (c.seekable, c.duration.as_ref())),
+            &self.translations,
         )
     }
 
@@ -1202,6 +1210,7 @@ impl Executor {
             pause_rx,
             position: Arc::new(AtomicU64::new(u64::MAX)),
             flush_epoch: Arc::new(AtomicU64::new(0)),
+            translations: Vec::new(),
         };
 
         // Execute based on scheduling mode
@@ -1322,6 +1331,7 @@ impl Executor {
             seed,
             controls: runtime.controls,
             upstream_entries: runtime.upstream_entries,
+            translations: runtime.translations,
             pause_tx,
             pausable,
             base_time: clock_info.map(|(_, b)| b).unwrap_or(ClockTime::NONE),
@@ -1846,6 +1856,11 @@ impl Executor {
         // Tell the element how much the graph below it can hold, so it can size
         // its output arena before the first frame builds it.
         element.set_output_budget(budget);
+
+        // Snapshotted here for the same reason `is_seekable` is: after spawn
+        // the element has moved into its task. Collected from every node, not
+        // just sources — the point is exactly the mid-graph translator.
+        runtime.translations.extend(element.seek_translations());
 
         // Take the channels this element type actually needs, inside the match.
         //

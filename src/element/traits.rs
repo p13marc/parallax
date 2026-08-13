@@ -1420,6 +1420,16 @@ pub trait Demuxer: Send {
         Some(event)
     }
 
+    /// Seek format conversions this demuxer performs on the way upstream.
+    ///
+    /// See [`AsyncElementDyn::seek_translations`]. A fed container demuxer
+    /// that turns a TIME seek into a BYTES seek on its source declares
+    /// `{from: Time, to: Bytes}` here, and the pipeline then reports itself
+    /// TIME-seekable.
+    fn seek_translations(&self) -> Vec<crate::pipeline::seek::SeekTranslation> {
+        Vec::new()
+    }
+
     /// Drop parser state that a flush invalidates.
     ///
     /// Called on `FlushStart` (output discarded) and again at EOS (output
@@ -1751,6 +1761,20 @@ pub trait AsyncElementDyn {
         _input: Option<Buffer>,
     ) -> impl std::future::Future<Output = Result<DemuxResult>> + Send {
         async { Ok(DemuxResult::Eos) }
+    }
+
+    /// Seek format conversions this element performs on the way upstream.
+    ///
+    /// An element whose `handle_upstream_event` answers a seek with
+    /// [`EventResult::Forward`] declares the conversion here, so the
+    /// pipeline can report what format it is seekable in *before* anyone
+    /// tries. Without it, `filesrc ! tsdemux` would advertise BYTES —
+    /// technically true of the source, useless to an application that wants
+    /// to seek to 30 seconds.
+    ///
+    /// Snapshotted at start alongside `is_seekable`. Default: none.
+    fn seek_translations(&self) -> Vec<crate::pipeline::seek::SeekTranslation> {
+        Vec::new()
     }
 
     /// Flush a demuxer, keeping the pad routing.
@@ -3273,6 +3297,10 @@ impl<D: Demuxer + Send + 'static> SendAsyncElementDyn for DemuxerAdapter<D> {
 
     fn handle_downstream_event(&mut self, event: Event) -> Option<Event> {
         self.inner.handle_downstream_event(event)
+    }
+
+    fn seek_translations(&self) -> Vec<crate::pipeline::seek::SeekTranslation> {
+        self.inner.seek_translations()
     }
 
     async fn flush_demux(&mut self) -> Result<Vec<(String, Buffer)>> {
