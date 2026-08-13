@@ -33,7 +33,6 @@ use std::sync::{Mutex, OnceLock, mpsc as std_mpsc};
 use std::thread;
 use std::time::Duration;
 
-use kanal::{Receiver, Sender, bounded};
 use libcamera::{
     camera::{Camera, CameraConfigurationStatus},
     camera_manager::{CameraManager, HotplugEvent},
@@ -47,6 +46,7 @@ use libcamera::{
     request::{RequestStatus, ReuseFlag},
     stream::StreamRole,
 };
+use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::clock::ClockTime;
 use crate::element::{AsyncSource, ExecutionHints, ProduceContext, ProduceResult};
@@ -307,9 +307,9 @@ const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// libcamera video capture source.
 pub struct LibCameraSrc {
     /// Receiver for captured frames.
-    receiver: Receiver<CapturedFrame>,
+    receiver: tokio_mpsc::Receiver<CapturedFrame>,
     /// Sender to request shutdown.
-    shutdown: Sender<()>,
+    shutdown: std_mpsc::SyncSender<()>,
     /// Thread handle.
     thread: Option<thread::JoinHandle<()>>,
     /// Configuration used.
@@ -358,8 +358,10 @@ impl LibCameraSrc {
     /// (or failed to), so configuration errors surface here instead of a
     /// source that silently never produces.
     pub fn with_camera_and_config(camera_id: &str, config: LibCameraConfig) -> Result<Self> {
-        let (frame_tx, frame_rx) = bounded::<CapturedFrame>(config.buffer_count);
-        let (shutdown_tx, shutdown_rx) = bounded::<()>(1);
+        // `.max(1)`: `buffer_count` is public and settable to 0, and tokio
+        // panics on a zero-capacity channel.
+        let (frame_tx, frame_rx) = tokio_mpsc::channel::<CapturedFrame>(config.buffer_count.max(1));
+        let (shutdown_tx, shutdown_rx) = std_mpsc::sync_channel::<()>(1);
         let (startup_tx, startup_rx) = std_mpsc::channel::<Result<NegotiatedInfo>>();
 
         let camera_id_owned = camera_id.to_string();
@@ -438,8 +440,8 @@ impl LibCameraSrc {
     fn capture_thread(
         camera_id: String,
         config: LibCameraConfig,
-        frame_tx: Sender<CapturedFrame>,
-        shutdown_rx: Receiver<()>,
+        frame_tx: tokio_mpsc::Sender<CapturedFrame>,
+        shutdown_rx: std_mpsc::Receiver<()>,
         startup_tx: &std_mpsc::Sender<Result<NegotiatedInfo>>,
     ) -> Result<()> {
         // Look up the camera via the process-wide shared manager
@@ -580,9 +582,10 @@ impl LibCameraSrc {
         // Main capture loop: receive completed requests, ship the frame,
         // recycle the request.
         loop {
-            // Stop on a shutdown message or a closed shutdown channel
-            // (kanal returns Ok(None) when the channel is just empty)
-            if !matches!(shutdown_rx.try_recv(), Ok(None)) {
+            // Stop on a shutdown message or a dropped sender — the element
+            // signals both ways (an explicit send in Drop, and the sender
+            // dying with the struct).
+            if !matches!(shutdown_rx.try_recv(), Err(std_mpsc::TryRecvError::Empty)) {
                 break;
             }
 
@@ -620,12 +623,13 @@ impl LibCameraSrc {
                         sequence: u64::from(request.sequence()),
                     };
                     match frame_tx.try_send(frame) {
-                        Ok(true) => {}
-                        Ok(false) => {
+                        Ok(()) => {}
+                        Err(tokio_mpsc::error::TrySendError::Full(_)) => {
                             // Consumer is behind; drop the frame (live source).
                             tracing::trace!("libcamera: frame channel full, dropping frame");
                         }
-                        Err(_) => break, // LibCameraSrc was dropped
+                        // LibCameraSrc was dropped
+                        Err(tokio_mpsc::error::TrySendError::Closed(_)) => break,
                     }
                 }
             }
@@ -739,13 +743,13 @@ impl AsyncSource for LibCameraSrc {
             }
 
             // Drain one frame from the receiver to keep the capture thread running
-            let _ = self.receiver.as_async().recv().await;
+            let _ = self.receiver.recv().await;
 
             return Ok(ProduceResult::WouldBlock);
         }
 
-        match self.receiver.as_async().recv().await {
-            Ok(frame) => {
+        match self.receiver.recv().await {
+            Some(frame) => {
                 let len = frame.data.len();
                 if len > 0 && len <= ctx.output().len() {
                     ctx.output()[..len].copy_from_slice(&frame.data);
@@ -767,7 +771,7 @@ impl AsyncSource for LibCameraSrc {
                     Ok(ProduceResult::WouldBlock)
                 }
             }
-            Err(_) => Ok(ProduceResult::Eos),
+            None => Ok(ProduceResult::Eos),
         }
     }
 

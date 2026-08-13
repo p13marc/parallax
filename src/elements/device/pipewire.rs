@@ -29,8 +29,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
-use kanal::{Receiver, Sender, bounded};
 use pipewire as pw;
+use std::sync::mpsc as std_mpsc;
+use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::element::{AsyncSink, AsyncSource, ExecutionHints, ProduceContext, ProduceResult};
 use crate::error::Result;
@@ -87,7 +88,7 @@ pub fn enumerate_audio_nodes() -> Result<Vec<PipeWireNodeInfo>> {
 
     // Create main loop and context in a thread
     // PipeWire requires its own main loop
-    let (tx, rx) = bounded::<Vec<PipeWireNodeInfo>>(1);
+    let (tx, rx) = std_mpsc::sync_channel::<Vec<PipeWireNodeInfo>>(1);
 
     thread::spawn(move || {
         let main_loop = match pw::main_loop::MainLoop::new(None) {
@@ -190,9 +191,9 @@ pub fn enumerate_audio_nodes() -> Result<Vec<PipeWireNodeInfo>> {
 /// PipeWire audio/video capture source.
 pub struct PipeWireSrc {
     /// Receiver for captured buffers.
-    receiver: Receiver<Vec<u8>>,
+    receiver: tokio_mpsc::Receiver<Vec<u8>>,
     /// Sender to request shutdown.
-    _shutdown: Sender<()>,
+    _shutdown: std_mpsc::SyncSender<()>,
     /// Thread handle.
     _thread: Option<thread::JoinHandle<()>>,
     /// Target being captured.
@@ -282,8 +283,8 @@ impl PipeWireSrc {
     fn new(target: PipeWireTarget) -> Result<Self> {
         pw::init();
 
-        let (buffer_tx, buffer_rx) = bounded::<Vec<u8>>(16);
-        let (shutdown_tx, shutdown_rx) = bounded::<()>(1);
+        let (buffer_tx, buffer_rx) = tokio_mpsc::channel::<Vec<u8>>(16);
+        let (shutdown_tx, shutdown_rx) = std_mpsc::sync_channel::<()>(1);
 
         let target_clone = target.clone();
         let thread = thread::spawn(move || {
@@ -317,8 +318,8 @@ impl PipeWireSrc {
     /// Main capture thread.
     fn capture_thread(
         target: PipeWireTarget,
-        buffer_tx: Sender<Vec<u8>>,
-        shutdown_rx: Receiver<()>,
+        buffer_tx: tokio_mpsc::Sender<Vec<u8>>,
+        shutdown_rx: std_mpsc::Receiver<()>,
     ) {
         let main_loop = match pw::main_loop::MainLoop::new(None) {
             Ok(ml) => ml,
@@ -406,8 +407,18 @@ impl PipeWireSrc {
         // Run main loop until shutdown
         loop {
             // Check for shutdown
-            if shutdown_rx.try_recv().is_ok() {
-                break;
+            // Break on an explicit shutdown message OR a dropped sender:
+            // `_shutdown` is never sent to, it is dropped with the element,
+            // so Disconnected IS the shutdown signal.
+            //
+            // This used to read `if shutdown_rx.try_recv().is_ok() { break }`,
+            // which was wrong twice over: kanal answered `Ok(None)` on an
+            // empty-but-open channel, so both PipeWire main loops broke on
+            // their first iteration and the elements never actually ran — and
+            // it would have missed the drop-based shutdown even so.
+            match shutdown_rx.try_recv() {
+                Ok(()) | Err(std_mpsc::TryRecvError::Disconnected) => break,
+                Err(std_mpsc::TryRecvError::Empty) => {}
             }
 
             main_loop
@@ -435,14 +446,14 @@ impl AsyncSource for PipeWireSrc {
                 }
 
                 // Drain one buffer from the receiver to keep the capture thread running
-                let _ = self.receiver.as_async().recv().await;
+                let _ = self.receiver.recv().await;
 
                 return Ok(ProduceResult::WouldBlock);
             }
         }
 
-        match self.receiver.as_async().recv().await {
-            Ok(data) => {
+        match self.receiver.recv().await {
+            Some(data) => {
                 let len = data.len();
                 if len > 0 {
                     ctx.output()[..len].copy_from_slice(&data);
@@ -451,7 +462,7 @@ impl AsyncSource for PipeWireSrc {
                     Ok(ProduceResult::WouldBlock)
                 }
             }
-            Err(_) => Ok(ProduceResult::Eos),
+            None => Ok(ProduceResult::Eos),
         }
     }
 
@@ -472,9 +483,9 @@ impl AsyncSource for PipeWireSrc {
 /// PipeWire audio playback sink.
 pub struct PipeWireSink {
     /// Sender for buffers to play.
-    sender: Sender<Vec<u8>>,
+    sender: tokio_mpsc::Sender<Vec<u8>>,
     /// Sender to request shutdown.
-    _shutdown: Sender<()>,
+    _shutdown: std_mpsc::SyncSender<()>,
     /// Thread handle.
     _thread: Option<thread::JoinHandle<()>>,
 }
@@ -506,8 +517,8 @@ impl PipeWireSink {
     /// Main playback thread.
     fn playback_thread(
         _device: Option<String>,
-        buffer_rx: Receiver<Vec<u8>>,
-        shutdown_rx: Receiver<()>,
+        mut buffer_rx: tokio_mpsc::Receiver<Vec<u8>>,
+        shutdown_rx: std_mpsc::Receiver<()>,
     ) {
         let main_loop = match pw::main_loop::MainLoop::new(None) {
             Ok(ml) => ml,
@@ -547,8 +558,6 @@ impl PipeWireSink {
             }
         };
 
-        let buffer_rx_clone = buffer_rx.clone();
-
         let _listener = stream
             .add_local_listener_with_user_data(())
             .process(move |stream, _| {
@@ -556,7 +565,7 @@ impl PipeWireSink {
                 if let Some(mut pw_buffer) = stream.dequeue_buffer() {
                     if let Some(data) = pw_buffer.datas_mut().first_mut() {
                         // Check if we have data to play
-                        if let Ok(Some(audio_data)) = buffer_rx_clone.try_recv() {
+                        if let Ok(audio_data) = buffer_rx.try_recv() {
                             if let Some(slice) = data.data() {
                                 let copy_len = audio_data.len().min(slice.len());
                                 slice[..copy_len].copy_from_slice(&audio_data[..copy_len]);
@@ -583,8 +592,18 @@ impl PipeWireSink {
 
         // Run main loop until shutdown
         loop {
-            if shutdown_rx.try_recv().is_ok() {
-                break;
+            // Break on an explicit shutdown message OR a dropped sender:
+            // `_shutdown` is never sent to, it is dropped with the element,
+            // so Disconnected IS the shutdown signal.
+            //
+            // This used to read `if shutdown_rx.try_recv().is_ok() { break }`,
+            // which was wrong twice over: kanal answered `Ok(None)` on an
+            // empty-but-open channel, so both PipeWire main loops broke on
+            // their first iteration and the elements never actually ran — and
+            // it would have missed the drop-based shutdown even so.
+            match shutdown_rx.try_recv() {
+                Ok(()) | Err(std_mpsc::TryRecvError::Disconnected) => break,
+                Err(std_mpsc::TryRecvError::Empty) => {}
             }
             main_loop
                 .loop_()
@@ -597,7 +616,6 @@ impl AsyncSink for PipeWireSink {
     async fn consume(&mut self, ctx: &crate::element::ConsumeContext<'_>) -> Result<()> {
         let data = ctx.input().to_vec();
         self.sender
-            .as_async()
             .send(data)
             .await
             .map_err(|e| DeviceError::PipeWire(e.to_string()))?;
