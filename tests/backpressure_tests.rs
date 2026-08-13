@@ -89,7 +89,7 @@ mod link_monitoring {
         let sink = AppSink::with_max_buffers(1);
         let sink_handle = sink.handle();
         let s = pipeline.add_source("appsrc", src);
-        let k = pipeline.add_sink("appsink", sink);
+        let k = pipeline.add_async_sink("appsink", sink);
         let link = pipeline
             .link_pads_full(s, "src", k, "sink", LinkPolicy::Block, Some(8))
             .unwrap();
@@ -175,7 +175,7 @@ mod link_monitoring {
         let sink = AppSink::with_max_buffers(1);
         let sink_handle = sink.handle();
         let s = pipeline.add_source("gated", GatedSource::new(40, skipped.clone()));
-        let k = pipeline.add_sink("appsink", sink);
+        let k = pipeline.add_async_sink("appsink", sink);
         // Drop policy, as a live source would use — but the gate closes at
         // the high mark (6), before the channel (8) can fill, so nothing is
         // actually dropped: the source skips instead.

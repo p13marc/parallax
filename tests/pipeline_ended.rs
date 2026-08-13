@@ -175,7 +175,7 @@ async fn ended(handle: &PipelineHandle, what: &str) -> EndReason {
 fn live_pipeline(calls: Arc<AtomicU64>) -> Pipeline {
     let mut pipeline = Pipeline::new();
     let src = pipeline.add_source("src", InfiniteSource::new(calls));
-    let snk = pipeline.add_sink("sink", AppSink::with_max_buffers(4).drop_on_full(true));
+    let snk = pipeline.add_async_sink("sink", AppSink::with_max_buffers(4).drop_on_full(true));
     pipeline.link(src, snk).unwrap();
     pipeline
 }

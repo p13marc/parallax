@@ -128,8 +128,8 @@ async fn routed_buffers_reach_only_their_pads_links() {
 
     let src = pipeline.add_source("src", appsrc);
     let demux = pipeline.add_demuxer("demux", ParityDemuxer::new());
-    let even = pipeline.add_sink("even_sink", even_sink);
-    let odd = pipeline.add_sink("odd_sink", odd_sink);
+    let even = pipeline.add_async_sink("even_sink", even_sink);
+    let odd = pipeline.add_async_sink("odd_sink", odd_sink);
     pipeline.link(src, demux).unwrap();
     pipeline.link_pads(demux, "even", even, "sink").unwrap();
     pipeline.link_pads(demux, "odd", odd, "sink").unwrap();
@@ -171,8 +171,8 @@ async fn source_style_demuxer_produces_and_routes() {
             outputs: vec![(PadId(0), Caps::any()), (PadId(1), Caps::any())],
         },
     );
-    let even = pipeline.add_sink("even_sink", even_sink);
-    let odd = pipeline.add_sink("odd_sink", odd_sink);
+    let even = pipeline.add_async_sink("even_sink", even_sink);
+    let odd = pipeline.add_async_sink("odd_sink", odd_sink);
     pipeline.link_pads(demux, "even", even, "sink").unwrap();
     pipeline.link_pads(demux, "odd", odd, "sink").unwrap();
 
@@ -228,8 +228,8 @@ async fn mp4_demux_source_routes_av_branches() {
     let audio_handle = audio_sink.handle();
 
     let node = pipeline.add_demuxer("mp4demux", Mp4DemuxSource::new(demux));
-    let vs = pipeline.add_sink("video_sink", video_sink);
-    let as_ = pipeline.add_sink("audio_sink", audio_sink);
+    let vs = pipeline.add_async_sink("video_sink", video_sink);
+    let as_ = pipeline.add_async_sink("audio_sink", audio_sink);
     pipeline.link_pads(node, "video", vs, "sink").unwrap();
     pipeline.link_pads(node, "audio", as_, "sink").unwrap();
 
@@ -305,7 +305,7 @@ async fn mp4_demux_source_loops_at_eos() {
         "mp4demux",
         Mp4DemuxSource::video_only(demux).with_loop(true),
     );
-    let vs = pipeline.add_sink("video_sink", sink);
+    let vs = pipeline.add_async_sink("video_sink", sink);
     pipeline.link_pads(node, "video", vs, "sink").unwrap();
 
     let executor = Executor::new();
@@ -364,7 +364,7 @@ async fn mp4_demux_source_seeks_at_runtime() {
     let video_sink = AppSink::with_max_buffers(2);
     let video_handle = video_sink.handle();
     let node = pipeline.add_demuxer("mp4demux", Mp4DemuxSource::new(demux));
-    let vs = pipeline.add_sink("video_sink", video_sink);
+    let vs = pipeline.add_async_sink("video_sink", video_sink);
     pipeline.link_pads(node, "video", vs, "sink").unwrap();
 
     let executor = Executor::new();
@@ -461,7 +461,7 @@ async fn mp4_demux_source_snap_after_seeks_at_runtime() {
     let video_sink = AppSink::with_max_buffers(2);
     let video_handle = video_sink.handle();
     let node = pipeline.add_demuxer("mp4demux", Mp4DemuxSource::new(demux));
-    let vs = pipeline.add_sink("video_sink", video_sink);
+    let vs = pipeline.add_async_sink("video_sink", video_sink);
     pipeline.link_pads(node, "video", vs, "sink").unwrap();
 
     let executor = Executor::new();
@@ -605,7 +605,7 @@ async fn unlinked_pads_drop_instead_of_broadcasting() {
 
     let src = pipeline.add_source("src", appsrc);
     let demux = pipeline.add_demuxer("demux", ParityDemuxer::new());
-    let even = pipeline.add_sink("even_sink", even_sink);
+    let even = pipeline.add_async_sink("even_sink", even_sink);
     pipeline.link(src, demux).unwrap();
     // The "odd" pad is deliberately left unlinked.
     pipeline.link_pads(demux, "even", even, "sink").unwrap();
@@ -647,8 +647,8 @@ async fn demuxer_pads_each_get_stream_start_and_segment() {
     let even_handle = even_sink.handle();
     let odd_sink = AppSink::with_max_buffers(16);
     let odd_handle = odd_sink.handle();
-    let ev = pipeline.add_sink("even_sink", even_sink);
-    let od = pipeline.add_sink("odd_sink", odd_sink);
+    let ev = pipeline.add_async_sink("even_sink", even_sink);
+    let od = pipeline.add_async_sink("odd_sink", odd_sink);
     pipeline.link(src, demux).unwrap();
     pipeline.link_pads(demux, "even", ev, "sink").unwrap();
     pipeline.link_pads(demux, "odd", od, "sink").unwrap();
@@ -722,8 +722,8 @@ async fn fed_demuxer_reanchors_segments_after_upstream_seek() {
     let even_handle = even_sink.handle();
     let odd_sink = AppSink::with_max_buffers(16);
     let odd_handle = odd_sink.handle();
-    let ev = pipeline.add_sink("even_sink", even_sink);
-    let od = pipeline.add_sink("odd_sink", odd_sink);
+    let ev = pipeline.add_async_sink("even_sink", even_sink);
+    let od = pipeline.add_async_sink("odd_sink", odd_sink);
     pipeline.link(src, demux).unwrap();
     pipeline.link_pads(demux, "even", ev, "sink").unwrap();
     pipeline.link_pads(demux, "odd", od, "sink").unwrap();

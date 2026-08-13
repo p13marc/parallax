@@ -113,7 +113,7 @@ async fn bitrate_and_resolution_change_on_a_running_pipeline() {
     let s = pipeline.add_source("src", src);
     let sc = pipeline.add_filter("scale", scaler);
     let e = pipeline.add_filter("enc", encoder);
-    let k = pipeline.add_sink("sink", sink);
+    let k = pipeline.add_async_sink("sink", sink);
     pipeline.link(s, sc).unwrap();
     pipeline.link(sc, e).unwrap();
     pipeline.link(e, k).unwrap();
@@ -215,7 +215,7 @@ async fn resolution_can_be_lowered_and_restored_while_running() {
     let s = pipeline.add_source("src", src);
     let sc = pipeline.add_filter("scale", scaler);
     let e = pipeline.add_filter("enc", encoder);
-    let k = pipeline.add_sink("sink", sink);
+    let k = pipeline.add_async_sink("sink", sink);
     pipeline.link(s, sc).unwrap();
     pipeline.link(sc, e).unwrap();
     pipeline.link(e, k).unwrap();
@@ -277,7 +277,7 @@ async fn run_with_change(
     let mut pipeline = Pipeline::new();
     let s = pipeline.add_source("src", src);
     let e = pipeline.add_filter("enc", encoder);
-    let k = pipeline.add_sink("sink", sink);
+    let k = pipeline.add_async_sink("sink", sink);
     pipeline.link(s, e).unwrap();
     pipeline.link(e, k).unwrap();
 
@@ -420,7 +420,7 @@ async fn encoder_stats_are_readable_on_a_running_pipeline() {
     let mut pipeline = Pipeline::new();
     let s = pipeline.add_source("src", src);
     let e = pipeline.add_filter("enc", encoder);
-    let k = pipeline.add_sink("sink", sink);
+    let k = pipeline.add_async_sink("sink", sink);
     pipeline.link(s, e).unwrap();
     pipeline.link(e, k).unwrap();
 

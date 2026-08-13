@@ -79,8 +79,8 @@ async fn mkv_routes_av_branches() {
     let audio_handle = audio_sink.handle();
 
     let node = pipeline.add_demuxer("mkvdemux", demux);
-    let vs = pipeline.add_sink("video_sink", video_sink);
-    let as_ = pipeline.add_sink("audio_sink", audio_sink);
+    let vs = pipeline.add_async_sink("video_sink", video_sink);
+    let as_ = pipeline.add_async_sink("audio_sink", audio_sink);
     pipeline.link_pads(node, "video", vs, "sink").unwrap();
     pipeline.link_pads(node, "audio", as_, "sink").unwrap();
 
@@ -157,7 +157,7 @@ async fn mkv_seeks_at_runtime() {
     let video_sink = AppSink::with_max_buffers(2);
     let video_handle = video_sink.handle();
     let node = pipeline.add_demuxer("mkvdemux", demux);
-    let vs = pipeline.add_sink("video_sink", video_sink);
+    let vs = pipeline.add_async_sink("video_sink", video_sink);
     pipeline.link_pads(node, "video", vs, "sink").unwrap();
 
     let executor = Executor::new();
@@ -221,7 +221,7 @@ async fn mkv_snap_before_seeks_at_runtime() {
     let video_sink = AppSink::with_max_buffers(2);
     let video_handle = video_sink.handle();
     let node = pipeline.add_demuxer("mkvdemux", demux);
-    let vs = pipeline.add_sink("video_sink", video_sink);
+    let vs = pipeline.add_async_sink("video_sink", video_sink);
     pipeline.link_pads(node, "video", vs, "sink").unwrap();
 
     let executor = Executor::new();
@@ -276,7 +276,7 @@ async fn mkv_video_only_loops_at_eos() {
     let sink = AppSink::with_max_buffers(4);
     let sink_handle = sink.handle();
     let node = pipeline.add_demuxer("mkvdemux", demux);
-    let vs = pipeline.add_sink("video_sink", sink);
+    let vs = pipeline.add_async_sink("video_sink", sink);
     pipeline.link_pads(node, "video", vs, "sink").unwrap();
 
     let executor = Executor::new();
@@ -578,7 +578,7 @@ async fn demuxer_rooted_pipeline_reports_seekable() {
     let sink = AppSink::with_max_buffers(4);
     let sink_handle = sink.handle();
     let node = pipeline.add_demuxer("mkvdemux", demux);
-    let vs = pipeline.add_sink("video_sink", sink);
+    let vs = pipeline.add_async_sink("video_sink", sink);
     pipeline.link_pads(node, "video", vs, "sink").unwrap();
 
     let executor = Executor::new();

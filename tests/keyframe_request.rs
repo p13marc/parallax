@@ -92,7 +92,7 @@ async fn keyframe_handle_reaches_running_encoder() {
     let mut pipeline = Pipeline::new();
     let s = pipeline.add_source("src", src);
     let e = pipeline.add_filter("enc", encoder);
-    let k = pipeline.add_sink("sink", sink);
+    let k = pipeline.add_async_sink("sink", sink);
     pipeline.link(s, e).unwrap();
     pipeline.link(e, k).unwrap();
 
@@ -152,7 +152,7 @@ async fn in_band_metadata_flag_forces_idr() {
     let mut pipeline = Pipeline::new();
     let s = pipeline.add_source("src", src);
     let e = pipeline.add_filter("enc", quiet_encoder());
-    let k = pipeline.add_sink("sink", sink);
+    let k = pipeline.add_async_sink("sink", sink);
     pipeline.link(s, e).unwrap();
     pipeline.link(e, k).unwrap();
 

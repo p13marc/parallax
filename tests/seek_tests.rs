@@ -302,7 +302,7 @@ async fn runtime_flush_seek_sheds_the_queued_backlog() {
     let sink_handle = sink.handle();
     let src = pipeline.add_source("src", source);
     let mid = pipeline.add_filter("mid", PassThrough::new());
-    let snk = pipeline.add_sink("snk", sink);
+    let snk = pipeline.add_async_sink("snk", sink);
     // The wide queue sits *upstream* of the transform: its 16 stale buffers
     // can only reach the sink after the transform re-checks them, and by then
     // the seek's epoch bump has landed. The narrow sink-side queue bounds the
@@ -429,7 +429,7 @@ async fn multi_source_seek_bumps_epoch_once() {
         );
         let sink = AppSink::with_max_buffers(2);
         handles.push(sink.handle());
-        let snk = pipeline.add_sink(format!("sink_{name}"), sink);
+        let snk = pipeline.add_async_sink(format!("sink_{name}"), sink);
         pipeline.link(src, snk).unwrap();
     }
 

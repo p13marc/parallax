@@ -3,8 +3,8 @@
 //! Allows applications to pull buffers from a pipeline programmatically.
 
 use crate::buffer::Buffer;
-use crate::element::{ConsumeContext, Sink};
-use crate::error::{Error, Result};
+use crate::element::{AsyncSink, ConsumeContext};
+use crate::error::Result;
 use crate::pipeline::{EndReason, StreamError};
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
@@ -107,6 +107,109 @@ impl AppSinkInner {
     fn lock(&self) -> std::sync::MutexGuard<'_, AppSinkState> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    /// Try to enqueue without waiting.
+    ///
+    /// Deliberately **not** async: keeping the lock inside a plain fn is what
+    /// guarantees no `MutexGuard` is ever alive across an await — which would
+    /// both deadlock and fail `AsyncSink::consume`'s `Send` bound.
+    fn try_enqueue(&self, buffer: &Buffer) -> Enqueued {
+        let mut state = self.lock();
+        // Flushing: the app is discarding this window of the stream. Drop the
+        // buffer rather than erroring — the executor treats any Err from a
+        // sink as fatal, so returning one here would turn every seek into a
+        // teardown (the same reasoning as `AppSrc::produce`).
+        if state.flushing {
+            state.total_dropped += 1;
+            return Enqueued::Accepted;
+        }
+        if state.queue.len() >= state.max_buffers {
+            if state.drop_on_full {
+                state.total_dropped += 1;
+                return Enqueued::Accepted;
+            }
+            return Enqueued::Full;
+        }
+        state.queue.push_back(buffer.clone());
+        state.total_received += 1;
+        drop(state);
+        self.data_available.notify_one();
+        self.data_available_async.notify_one();
+        Enqueued::Accepted
+    }
+
+    /// Enqueue, awaiting space when the queue is full.
+    ///
+    /// This is the whole point of #168: a full queue parks this *task*, never
+    /// the worker thread it happens to be running on.
+    async fn enqueue(&self, buffer: &Buffer) {
+        loop {
+            let mut wait = std::pin::pin!(self.space_available_async.notified());
+            // Register BEFORE the check, and eagerly: `notify_one` (a pull
+            // freeing space) leaves a permit behind for a later waiter, but
+            // `notify_waiters` (set_flushing / clear / FlushStart) wakes only
+            // those already registered and leaves nothing. Without `enable()`
+            // a flush landing between the check and the first poll would be
+            // lost, and this sink would wait forever on a queue nobody is
+            // going to drain.
+            wait.as_mut().enable();
+            match self.try_enqueue(buffer) {
+                Enqueued::Accepted => return,
+                Enqueued::Full => wait.await,
+            }
+        }
+    }
+
+    /// Enqueue from a plain thread, parking it until there is room.
+    fn enqueue_blocking(&self, buffer: &Buffer) {
+        let mut state = self.lock();
+        loop {
+            if state.flushing {
+                state.total_dropped += 1;
+                return;
+            }
+            if state.queue.len() < state.max_buffers {
+                break;
+            }
+            if state.drop_on_full {
+                state.total_dropped += 1;
+                return;
+            }
+            state = wait_ok(self.space_available.wait(state));
+        }
+        state.queue.push_back(buffer.clone());
+        state.total_received += 1;
+        drop(state);
+        self.data_available.notify_one();
+        self.data_available_async.notify_one();
+    }
+
+    /// Drop everything queued and wake every waiter, sync and async.
+    ///
+    /// Shared by `clear()`, `set_flushing(true)` and the FlushStart event so
+    /// the four notifications cannot drift apart again — the FlushStart arm
+    /// used to signal only the sync condvar, which an async waiter never sees.
+    fn clear_queue(&self, count_as_dropped: bool) {
+        let mut state = self.lock();
+        let dropped = state.queue.len();
+        state.queue.clear();
+        if count_as_dropped {
+            state.total_dropped += dropped as u64;
+        }
+        drop(state);
+        self.space_available.notify_all();
+        self.space_available_async.notify_waiters();
+        self.data_available.notify_all();
+        self.data_available_async.notify_waiters();
+    }
+}
+
+/// What a non-blocking enqueue attempt did.
+enum Enqueued {
+    /// Handled — queued, or deliberately discarded (`drop_on_full`, flushing).
+    Accepted,
+    /// Full with `drop_on_full` off: the caller must wait for space.
+    Full,
 }
 
 /// Unwrap a condvar wait, ignoring poison — see [`AppSinkInner::lock`].
@@ -248,40 +351,29 @@ impl Default for AppSink {
     }
 }
 
-impl Sink for AppSink {
-    fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
-        let mut state = self.inner.lock();
+impl AppSink {
+    /// Queue a buffer from a plain thread, parking it until there is room.
+    ///
+    /// The element-side twin of [`AppSinkHandle::pull_buffer_blocking`], for
+    /// feeders that are not tokio tasks. Never call it from inside a runtime:
+    /// it parks the worker, which is exactly what #168 was about.
+    pub fn push_blocking(&mut self, buffer: &Buffer) {
+        self.inner.enqueue_blocking(buffer);
+    }
+}
 
-        if state.flushing {
-            return Err(Error::Element("appsink is flushing".into()));
-        }
-
-        // Handle full queue.
-        //
-        // NOTE: this condvar wait blocks the executor task's thread — a tokio
-        // worker — until the application pulls. That is the *designed*
-        // back-pressure path (AppSrc::produce deliberately refuses to do the
-        // same and returns WouldBlock instead), but it is worth knowing about:
-        // an application that stops pulling stalls a runtime worker. Use
-        // `drop_on_full(true)` when the consumer is allowed to fall behind.
-        while state.queue.len() >= state.max_buffers && !state.flushing {
-            if state.drop_on_full {
-                state.total_dropped += 1;
-                return Ok(());
-            }
-            state = wait_ok(self.inner.space_available.wait(state));
-        }
-
-        if state.flushing {
-            return Err(Error::Element("appsink is flushing".into()));
-        }
-
-        // Clone the buffer from the context to store it
-        state.queue.push_back(ctx.buffer().clone());
-        state.total_received += 1;
-
-        self.inner.data_available.notify_one();
-        self.inner.data_available_async.notify_one();
+impl AsyncSink for AppSink {
+    /// Queue the buffer, awaiting space when the queue is full.
+    ///
+    /// `AsyncSink` rather than `Sink` on purpose (#168). The old sync impl
+    /// waited on a condvar, which parks the tokio worker — and because the
+    /// push before it wakes the application's puller into that same worker's
+    /// non-stealable LIFO slot, the puller was stranded on a thread that
+    /// would never run it again: total deadlock, not even interruptible by
+    /// `abort()`. Awaiting parks the task instead, so the worker stays free
+    /// and the puller runs.
+    async fn consume(&mut self, ctx: &ConsumeContext<'_>) -> Result<()> {
+        self.inner.enqueue(ctx.buffer()).await;
         Ok(())
     }
 
@@ -299,17 +391,10 @@ impl Sink for AppSink {
         match &event {
             crate::event::Event::Eos => self.send_eos(),
             crate::event::Event::Error(err) => self.send_error(err.clone()),
-            crate::event::Event::FlushStart => {
-                // Queued-but-unpulled buffers are stale the moment a flush
-                // starts; drop them so the application cannot pull pre-seek
-                // data after the flush sequence.
-                let mut state = self.inner.lock();
-                let dropped = state.queue.len();
-                state.total_dropped += dropped as u64;
-                state.queue.clear();
-                drop(state);
-                self.inner.space_available.notify_all();
-            }
+            // Queued-but-unpulled buffers are stale the moment a flush
+            // starts; drop them so the application cannot pull pre-seek data
+            // after the flush sequence.
+            crate::event::Event::FlushStart => self.inner.clear_queue(true),
             _ => {}
         }
         Some(event)
@@ -330,7 +415,16 @@ impl AppSinkHandle {
         loop {
             // Register for the wakeup *before* looking at the queue, or a push
             // landing between the check and the await would be missed.
-            let notified = self.inner.data_available_async.notified();
+            //
+            // `enable()` is what makes that true for both signals: a push uses
+            // `notify_one`, which leaves a permit for a waiter that registers
+            // later, but `end()` and `clear()` use `notify_waiters`, which
+            // wakes only those already registered and leaves nothing behind.
+            // With a bare `notified()` — which registers on first poll, not at
+            // creation — an EOS landing between the check and the await is
+            // lost, and this pull waits forever on a stream that has ended.
+            let mut notified = std::pin::pin!(self.inner.data_available_async.notified());
+            notified.as_mut().enable();
 
             if let Some(outcome) = self.take_or_end() {
                 return outcome;
@@ -452,7 +546,10 @@ impl AppSinkHandle {
     /// ```
     pub async fn ended(&self) -> EndReason {
         loop {
-            let notified = self.inner.data_available_async.notified();
+            // Registered eagerly for the same reason as `pull_buffer`: `end()`
+            // signals with `notify_waiters`, which leaves no permit behind.
+            let mut notified = std::pin::pin!(self.inner.data_available_async.notified());
+            notified.as_mut().enable();
             {
                 let state = self.inner.lock();
                 if state.queue.is_empty()
@@ -530,16 +627,12 @@ impl AppSinkHandle {
     }
 
     /// Clear the queue.
+    ///
+    /// Wakes every waiter, sync and async — a clear can be what drains the
+    /// last buffer, so `ended()` waiters need the same nudge a final pull
+    /// would have given them.
     pub fn clear(&self) {
-        let mut state = self.inner.lock();
-        state.queue.clear();
-        drop(state);
-        self.inner.space_available.notify_all();
-        self.inner.space_available_async.notify_waiters();
-        // A clear can be what drains the last buffer, so `ended()` waiters need
-        // the same nudge a final pull would have given them.
-        self.inner.data_available.notify_all();
-        self.inner.data_available_async.notify_waiters();
+        self.inner.clear_queue(false);
     }
 
     /// Get the current queue length.
@@ -597,18 +690,18 @@ mod tests {
         assert!(!sink.is_ended());
     }
 
-    #[test]
-    fn test_appsink_consume_pull() {
+    #[tokio::test]
+    async fn test_appsink_consume_pull() {
         let mut sink = AppSink::new();
         let handle = sink.handle();
 
         let buf0 = create_test_buffer(0);
         let ctx0 = ConsumeContext::new(&buf0);
-        sink.consume(&ctx0).unwrap();
+        sink.consume(&ctx0).await.unwrap();
 
         let buf1 = create_test_buffer(1);
         let ctx1 = ConsumeContext::new(&buf1);
-        sink.consume(&ctx1).unwrap();
+        sink.consume(&ctx1).await.unwrap();
 
         assert_eq!(handle.queue_len(), 2);
 
@@ -625,14 +718,14 @@ mod tests {
         assert_eq!(buf.metadata().sequence, 1);
     }
 
-    #[test]
-    fn test_appsink_eos() {
+    #[tokio::test]
+    async fn test_appsink_eos() {
         let mut sink = AppSink::new();
         let handle = sink.handle();
 
         let buf0 = create_test_buffer(0);
         let ctx0 = ConsumeContext::new(&buf0);
-        sink.consume(&ctx0).unwrap();
+        sink.consume(&ctx0).await.unwrap();
         sink.send_eos();
 
         assert!(sink.is_ended());
@@ -647,8 +740,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_appsink_try_pull() {
+    #[tokio::test]
+    async fn test_appsink_try_pull() {
         let mut sink = AppSink::new();
         let handle = sink.handle();
 
@@ -657,29 +750,112 @@ mod tests {
 
         let buf0 = create_test_buffer(0);
         let ctx0 = ConsumeContext::new(&buf0);
-        sink.consume(&ctx0).unwrap();
+        sink.consume(&ctx0).await.unwrap();
 
         assert!(matches!(handle.try_pull_buffer(), Pulled::Buffer(_)));
     }
 
-    #[test]
-    fn test_appsink_drop_on_full() {
+    #[tokio::test]
+    async fn test_appsink_drop_on_full() {
         let mut sink = AppSink::with_max_buffers(2).drop_on_full(true);
 
         let buf0 = create_test_buffer(0);
         let ctx0 = ConsumeContext::new(&buf0);
-        sink.consume(&ctx0).unwrap();
+        sink.consume(&ctx0).await.unwrap();
 
         let buf1 = create_test_buffer(1);
         let ctx1 = ConsumeContext::new(&buf1);
-        sink.consume(&ctx1).unwrap();
+        sink.consume(&ctx1).await.unwrap();
 
         let buf2 = create_test_buffer(2);
         let ctx2 = ConsumeContext::new(&buf2);
-        sink.consume(&ctx2).unwrap(); // Should be dropped
+        sink.consume(&ctx2).await.unwrap(); // Should be dropped
 
         assert_eq!(sink.queue_len(), 2);
         assert_eq!(sink.stats().total_dropped, 1);
+    }
+
+    /// #168: a full sink parks its *task*, not its worker — and resumes as
+    /// soon as the application makes room.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_full_appsink_awaits_space_instead_of_blocking() {
+        let mut sink = AppSink::with_max_buffers(1);
+        let handle = sink.handle();
+
+        let first = create_test_buffer(0);
+        sink.consume(&ConsumeContext::new(&first)).await.unwrap();
+
+        // Spawned, not polled locally: if this regresses to a condvar it parks
+        // worker A, and the timeout below still runs on worker B — a failure
+        // rather than a hung suite.
+        let second = create_test_buffer(1);
+        let task = tokio::spawn(async move {
+            sink.consume(&ConsumeContext::new(&second)).await.unwrap();
+            sink
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!task.is_finished(), "a full sink must wait for space");
+
+        assert!(matches!(handle.try_pull_buffer(), Pulled::Buffer(_)));
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("freeing space must wake the waiting consume")
+            .unwrap();
+        assert_eq!(handle.queue_len(), 1);
+    }
+
+    /// The reason the await registers with `enable()`: `set_flushing` signals
+    /// with `notify_waiters`, which leaves no permit for a late registrant.
+    /// With a bare `notified()` this test hangs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flushing_releases_a_parked_consume() {
+        let mut sink = AppSink::with_max_buffers(1);
+        let handle = sink.handle();
+        let first = create_test_buffer(0);
+        sink.consume(&ConsumeContext::new(&first)).await.unwrap();
+
+        let second = create_test_buffer(1);
+        let task = tokio::spawn(async move {
+            sink.consume(&ConsumeContext::new(&second)).await.unwrap();
+            sink
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!task.is_finished());
+
+        handle.set_flushing(true);
+        let sink = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("set_flushing must wake a parked consume")
+            .unwrap();
+
+        // Flushing discards rather than erroring: an Err here would be fatal
+        // to the sink task, turning a seek into a teardown.
+        assert_eq!(sink.stats().total_dropped, 1);
+    }
+
+    /// `clear()` frees space, so a parked consume completes and its buffer is
+    /// queued (unlike the flushing case, which discards).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clear_releases_a_parked_consume() {
+        let mut sink = AppSink::with_max_buffers(1);
+        let handle = sink.handle();
+        let first = create_test_buffer(0);
+        sink.consume(&ConsumeContext::new(&first)).await.unwrap();
+
+        let second = create_test_buffer(1);
+        let task = tokio::spawn(async move {
+            sink.consume(&ConsumeContext::new(&second)).await.unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!task.is_finished());
+
+        handle.clear();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("clear must wake a parked consume")
+            .unwrap();
+        assert_eq!(handle.queue_len(), 1);
     }
 
     #[test]
@@ -691,7 +867,7 @@ mod tests {
             for i in 0..10 {
                 let buf = create_test_buffer(i);
                 let ctx = ConsumeContext::new(&buf);
-                sink.consume(&ctx).unwrap();
+                sink.push_blocking(ctx.buffer());
             }
             sink.send_eos();
         });
@@ -705,36 +881,36 @@ mod tests {
         assert_eq!(received.len(), 10);
     }
 
-    #[test]
-    fn test_appsink_clear() {
+    #[tokio::test]
+    async fn test_appsink_clear() {
         let mut sink = AppSink::new();
         let handle = sink.handle();
 
         let buf0 = create_test_buffer(0);
         let ctx0 = ConsumeContext::new(&buf0);
-        sink.consume(&ctx0).unwrap();
+        sink.consume(&ctx0).await.unwrap();
 
         let buf1 = create_test_buffer(1);
         let ctx1 = ConsumeContext::new(&buf1);
-        sink.consume(&ctx1).unwrap();
+        sink.consume(&ctx1).await.unwrap();
 
         handle.clear();
 
         assert_eq!(handle.queue_len(), 0);
     }
 
-    #[test]
-    fn test_appsink_stats() {
+    #[tokio::test]
+    async fn test_appsink_stats() {
         let mut sink = AppSink::new();
         let handle = sink.handle();
 
         let buf0 = create_test_buffer(0);
         let ctx0 = ConsumeContext::new(&buf0);
-        sink.consume(&ctx0).unwrap();
+        sink.consume(&ctx0).await.unwrap();
 
         let buf1 = create_test_buffer(1);
         let ctx1 = ConsumeContext::new(&buf1);
-        sink.consume(&ctx1).unwrap();
+        sink.consume(&ctx1).await.unwrap();
 
         handle.try_pull_buffer();
 
@@ -756,7 +932,7 @@ mod tests {
 
         let buf = create_test_buffer(7);
         let ctx = ConsumeContext::new(&buf);
-        sink.consume(&ctx).unwrap();
+        sink.consume(&ctx).await.unwrap();
 
         let pulled = pull.await.unwrap().buffer().expect("a buffer");
         assert_eq!(pulled.metadata().sequence, 7);
@@ -794,7 +970,7 @@ mod tests {
         for seq in 0..3 {
             let buf = create_test_buffer(seq);
             let ctx = ConsumeContext::new(&buf);
-            sink.consume(&ctx).unwrap();
+            sink.consume(&ctx).await.unwrap();
         }
 
         // AppSink::stats() is unreachable on a running pipeline (the element is

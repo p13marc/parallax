@@ -4,11 +4,6 @@
 //! sources; each hop's element may handle the event (running the flush trio
 //! from its own task) or pass it on. Multi-path delivery (fan-out diamonds)
 //! is deduplicated by seek seqnum.
-//!
-//! AppSinks here use `drop_on_full`: a burst-producing source can trap a
-//! puller task in the sink worker's non-stealable LIFO slot while the
-//! sink's blocking `consume` parks that worker — a pre-existing pathology
-//! independent of upstream routing (reproduced on the parent commit).
 
 use parallax::buffer::{Buffer, MemoryHandle};
 use parallax::clock::ClockTime;
@@ -60,12 +55,9 @@ struct CountingSeekableSource {
 
 impl Source for CountingSeekableSource {
     fn produce(&mut self, _ctx: &mut ProduceContext) -> Result<ProduceResult> {
-        // Finite burst, then a live-but-idle stream: an unbounded spinning
-        // source wedges AppSink's blocking consume (pre-existing pathology,
-        // independent of #163 — reproduced on the parent commit).
-        if self.produced >= 50 {
-            return Ok(ProduceResult::WouldBlock);
-        }
+        // Slots return through the release queue, so an endless producer
+        // must reclaim before it acquires.
+        arena().reclaim();
         let slot = match arena().acquire() {
             Some(s) => s,
             None => return Ok(ProduceResult::WouldBlock),
@@ -141,9 +133,9 @@ async fn transform_handles_upstream_seek_midgraph() {
             seeks: xfm_seeks.clone(),
         },
     );
-    let appsink = AppSink::with_max_buffers(2).drop_on_full(true);
+    let appsink = AppSink::with_max_buffers(2);
     let sink_handle = appsink.handle();
-    let snk = pipeline.add_sink("sink", appsink);
+    let snk = pipeline.add_async_sink("sink", appsink);
     pipeline.link(src, xfm).unwrap();
     pipeline.link(xfm, snk).unwrap();
 
@@ -222,9 +214,9 @@ async fn upstream_event_probes_fire_per_hop() {
             seeks: source_seeks.clone(),
         },
     );
-    let appsink = AppSink::with_max_buffers(2).drop_on_full(true);
+    let appsink = AppSink::with_max_buffers(2);
     let sink_handle = appsink.handle();
-    let snk = pipeline.add_sink("sink", appsink);
+    let snk = pipeline.add_async_sink("sink", appsink);
     pipeline.link(src, snk).unwrap();
 
     let log: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
@@ -280,12 +272,12 @@ async fn diamond_delivers_seek_once() {
             seeks: source_seeks.clone(),
         },
     );
-    let a = AppSink::with_max_buffers(2).drop_on_full(true);
+    let a = AppSink::with_max_buffers(2);
     let a_handle = a.handle();
-    let b = AppSink::with_max_buffers(2).drop_on_full(true);
+    let b = AppSink::with_max_buffers(2);
     let b_handle = b.handle();
-    let sa = pipeline.add_sink("sink_a", a);
-    let sb = pipeline.add_sink("sink_b", b);
+    let sa = pipeline.add_async_sink("sink_a", a);
+    let sb = pipeline.add_async_sink("sink_b", b);
     pipeline.link(src, sa).unwrap();
     pipeline.link_lossy(src, sb).unwrap();
 

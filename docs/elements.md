@@ -27,7 +27,7 @@ For the element *trait system* (how to write your own), see [getting-started.md]
 | Element | Description |
 |---------|-------------|
 | `AppSrc` (+ `AppSrcHandle`) | Push buffers from application code into a pipeline |
-| `AppSink` (+ `AppSinkHandle`) | Pull buffers out of a pipeline into application code — see [Reading the end of a stream](#reading-the-end-of-a-stream) |
+| `AppSink` (+ `AppSinkHandle`) | Pull buffers out of a pipeline into application code — add it with `add_async_sink`; a full queue back-pressures upstream by awaiting space (never parking a worker), or use `drop_on_full(true)` to shed instead. See [Reading the end of a stream](#reading-the-end-of-a-stream) |
 | `AutoVideoSink` `[display]` | Display video in a window (winit + softbuffer); frame dimensions from per-buffer metadata (`Metadata::video_dims`, both conventions) when present, else guessed from RGBA buffer size. `sync=true` paces presentation — see below |
 
 ### Reading the end of a stream

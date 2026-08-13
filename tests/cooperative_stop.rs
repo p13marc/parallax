@@ -106,7 +106,7 @@ async fn stop_ends_live_source_with_clean_eos() {
 
     let mut pipeline = Pipeline::new();
     let src = pipeline.add_source("src", InfiniteSource::new(calls.clone()));
-    let snk = pipeline.add_sink("sink", sink);
+    let snk = pipeline.add_async_sink("sink", sink);
     pipeline.link(src, snk).unwrap();
 
     let executor = Executor::new();
@@ -139,7 +139,7 @@ async fn abort_also_ends_live_source() {
 
     let mut pipeline = Pipeline::new();
     let src = pipeline.add_source("src", InfiniteSource::new(calls.clone()));
-    let snk = pipeline.add_sink("sink", sink);
+    let snk = pipeline.add_async_sink("sink", sink);
     pipeline.link(src, snk).unwrap();
 
     let executor = Executor::new();

@@ -62,7 +62,7 @@ async fn a_panicking_source_terminates_the_sink_with_a_reason() {
 
     let mut pipeline = Pipeline::new();
     let src = pipeline.add_source("src", PanickingSource);
-    let snk = pipeline.add_sink("sink", sink);
+    let snk = pipeline.add_async_sink("sink", sink);
     pipeline.link(src, snk).unwrap();
 
     let executor = Executor::new();
@@ -103,7 +103,7 @@ async fn a_panicking_transform_terminates_the_sink_with_a_reason() {
     let mut pipeline = Pipeline::new();
     let src = pipeline.add_source("src", NullSource::new(4));
     let xfm = pipeline.add_filter("enc", PanickingTransform);
-    let snk = pipeline.add_sink("sink", sink);
+    let snk = pipeline.add_async_sink("sink", sink);
     pipeline.link(src, xfm).unwrap();
     pipeline.link(xfm, snk).unwrap();
 

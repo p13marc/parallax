@@ -143,7 +143,7 @@ async fn a_failing_muxer_terminates_its_sink() {
     let a = pipeline.add_source("a", NullSource::new(4));
     let b = pipeline.add_source("b", NullSource::new(4));
     let mux = pipeline.add_muxer("mux", FailingMuxer::new());
-    let snk = pipeline.add_sink("sink", sink);
+    let snk = pipeline.add_async_sink("sink", sink);
     // Muxer nodes start with a single "sink" pad; the executor keeps a
     // receiver per link, so both sources feed it.
     pipeline.link(a, mux).unwrap();

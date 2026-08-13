@@ -795,7 +795,7 @@ mod mp4_roundtrip_tests {
         let sink_handle = appsink.handle();
         let src = pipeline.add_source("src", appsrc);
         let dec = pipeline.add_transform("aacdec", AudioDecoderElement::new(decoder));
-        let sink = pipeline.add_sink("sink", appsink);
+        let sink = pipeline.add_async_sink("sink", appsink);
         pipeline.link(src, dec).unwrap();
         pipeline.link(dec, sink).unwrap();
 

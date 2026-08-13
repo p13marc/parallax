@@ -11,7 +11,7 @@
 use std::time::Duration;
 
 use parallax::buffer::{Buffer, MemoryHandle};
-use parallax::element::{ConsumeContext, Sink};
+use parallax::element::{AsyncSink, ConsumeContext};
 use parallax::elements::{AppSink, EndReason, Pulled};
 use parallax::memory::SharedArena;
 use parallax::metadata::Metadata;
@@ -31,9 +31,9 @@ fn buffer(seq: u64) -> Buffer {
     )
 }
 
-fn push(sink: &mut AppSink, seq: u64) {
+async fn push(sink: &mut AppSink, seq: u64) {
     let buf = buffer(seq);
-    sink.consume(&ConsumeContext::new(&buf)).unwrap();
+    sink.consume(&ConsumeContext::new(&buf)).await.unwrap();
 }
 
 /// The headline. These two were the same value before.
@@ -113,7 +113,7 @@ async fn queued_buffers_drain_before_the_end_is_reported() {
     let handle = sink.handle();
 
     for seq in 0..3 {
-        push(&mut sink, seq);
+        push(&mut sink, seq).await;
     }
     sink.send_error(StreamError::new("enc", "boom"));
 
@@ -156,7 +156,7 @@ async fn flushing_is_not_ending() {
     assert!(!handle.is_ended(), "flushing is not terminal");
 
     handle.set_flushing(false);
-    push(&mut sink, 42);
+    push(&mut sink, 42).await;
     match handle.try_pull_buffer() {
         Pulled::Buffer(b) => assert_eq!(b.metadata().sequence, 42),
         other => panic!("the sink did not recover from flushing: {other:?}"),
@@ -170,7 +170,7 @@ async fn ended_waits_until_the_queue_is_drained() {
     let mut sink = AppSink::new();
     let handle = sink.handle();
 
-    push(&mut sink, 0);
+    push(&mut sink, 0).await;
     sink.send_eos();
 
     let waiter = {
@@ -198,7 +198,7 @@ async fn a_consumer_can_select_over_pull_and_ended() {
     let handle = sink.handle();
 
     for seq in 0..4 {
-        push(&mut sink, seq);
+        push(&mut sink, seq).await;
     }
     sink.send_error(StreamError::new("cam", "cable pulled"));
 
@@ -227,7 +227,7 @@ async fn stats_report_termination_without_saying_why() {
     let mut sink = AppSink::new();
     let handle = sink.handle();
 
-    push(&mut sink, 0);
+    push(&mut sink, 0).await;
     assert!(!handle.stats().ended);
 
     sink.send_error(StreamError::anonymous("no node to blame"));

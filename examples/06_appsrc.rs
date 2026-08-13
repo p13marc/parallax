@@ -44,7 +44,7 @@ async fn main() -> Result<()> {
     let pipeline_arena = SharedArena::new(256, 8)?;
     let mut pipeline = Pipeline::new();
     let src = pipeline.add_source_with_arena("appsrc", appsrc, pipeline_arena);
-    let sink = pipeline.add_sink("appsink", appsink);
+    let sink = pipeline.add_async_sink("appsink", appsink);
     pipeline.link(src, sink)?;
 
     // Spawn producer thread

@@ -897,7 +897,7 @@ mod tests {
         let sink = AppSink::with_max_buffers(2);
         let sink_handle = sink.handle();
         let s = pipeline.add_source("httpsrc", src);
-        let k = pipeline.add_sink("appsink", sink);
+        let k = pipeline.add_async_sink("appsink", sink);
         // Tight link capacity: backpressure parks the source mid-stream, so
         // the seek deterministically lands before EOS.
         pipeline

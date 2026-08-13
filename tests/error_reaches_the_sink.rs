@@ -54,7 +54,7 @@ async fn a_source_error_reaches_the_sink_as_an_error() {
 
     let mut pipeline = Pipeline::new();
     let src = pipeline.add_source("src", FailingSource);
-    let snk = pipeline.add_sink("sink", sink);
+    let snk = pipeline.add_async_sink("sink", sink);
     pipeline.link(src, snk).unwrap();
 
     let executor = Executor::new();
@@ -84,7 +84,7 @@ async fn a_transform_error_reaches_the_sink_as_an_error() {
     let mut pipeline = Pipeline::new();
     let src = pipeline.add_source("src", NullSource::new(5));
     let xfm = pipeline.add_filter("failing-transform", FailingTransform);
-    let snk = pipeline.add_sink("sink", sink);
+    let snk = pipeline.add_async_sink("sink", sink);
     pipeline.link(src, xfm).unwrap();
     pipeline.link(xfm, snk).unwrap();
 
@@ -115,7 +115,7 @@ async fn a_clean_run_still_ends_cleanly() {
 
     let mut pipeline = Pipeline::new();
     let src = pipeline.add_source("src", NullSource::new(5));
-    let snk = pipeline.add_sink("sink", sink);
+    let snk = pipeline.add_async_sink("sink", sink);
     pipeline.link(src, snk).unwrap();
 
     let executor = Executor::new();

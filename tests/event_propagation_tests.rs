@@ -262,7 +262,7 @@ async fn non_flushing_seek_queues_behind_data() {
     let src = pipeline.add_source("src", appsrc);
     let appsink = AppSink::with_max_buffers(32);
     let sink_handle = appsink.handle();
-    let snk = pipeline.add_sink("sink", appsink);
+    let snk = pipeline.add_async_sink("sink", appsink);
     pipeline.link(src, snk).unwrap();
 
     let sink_log = log_probe(&mut pipeline, PadRef::sink(snk));
@@ -397,7 +397,7 @@ async fn filesrc_seek_bytes_repositions() {
     let src = pipeline.add_source("src", FileSrc::new(&path).with_chunk_size(1024));
     let appsink = AppSink::with_max_buffers(4);
     let sink_handle = appsink.handle();
-    let sink = pipeline.add_sink("sink", appsink);
+    let sink = pipeline.add_async_sink("sink", appsink);
     pipeline.link(src, sink).unwrap();
 
     let executor = Executor::new();
@@ -527,7 +527,7 @@ async fn initial_segment_anchors_position_for_nonzero_streams() {
     let src = pipeline.add_source("src", appsrc);
     let appsink = AppSink::with_max_buffers(4);
     let sink_handle = appsink.handle();
-    let snk = pipeline.add_sink("sink", appsink);
+    let snk = pipeline.add_async_sink("sink", appsink);
     pipeline.link(src, snk).unwrap();
 
     let executor = Executor::new();
@@ -594,7 +594,7 @@ async fn post_seek_segment_carries_rate_and_stop() {
     let src = pipeline.add_source("src", FileSrc::new(&path).with_chunk_size(1024));
     let appsink = AppSink::with_max_buffers(2);
     let sink_handle = appsink.handle();
-    let snk = pipeline.add_sink("sink", appsink);
+    let snk = pipeline.add_async_sink("sink", appsink);
     pipeline.link(src, snk).unwrap();
     let segments = segment_probe(&mut pipeline, PadRef::sink(snk));
 
