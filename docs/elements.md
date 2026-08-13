@@ -190,7 +190,7 @@ let (w, h) = info.wait_for_dimensions(0).await.ok_or("session ended")?;
 
 | Element | Description |
 |---------|-------------|
-| `IpcSrc` / `IpcSink` | Zero-copy cross-process transport (shared arena + Unix socket, fd passing) |
+| `IpcSrc` / `IpcSink` | Zero-copy cross-process transport (shared arena + Unix socket, fd passing). `IpcSink` is an **async sink** — add it with `add_async_sink`; it awaits a peer connection and peer acknowledgements rather than parking a worker on either, and warns after 5 s of silence |
 | `MemorySrc` / `MemorySink` | In-memory source / collecting sink |
 | `SharedMemorySink` | Thread-safe collecting sink |
 

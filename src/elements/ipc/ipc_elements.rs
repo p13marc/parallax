@@ -30,7 +30,7 @@
 
 use super::protocol::{ControlMessage, SerializableMetadata, frame_message, unframe_message};
 use crate::buffer::{Buffer, MemoryHandle};
-use crate::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
+use crate::element::{AsyncSink, ConsumeContext, ProduceContext, ProduceResult, Source};
 use crate::error::{Error, Result};
 use crate::format::Caps;
 use crate::memory::{SharedArena, SharedIpcSlotRef};
@@ -38,6 +38,35 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+/// Accept one connection without blocking; `Ok(None)` = nobody waiting.
+///
+/// A blocking `accept()` inside an element parks a tokio worker until the
+/// peer shows up — which for an IPC pipeline may be never, and a handful of
+/// those takes the whole runtime down (#172).
+fn accept_nonblocking(listener: &UnixListener) -> Result<Option<UnixStream>> {
+    listener.set_nonblocking(true).ok();
+    let accepted = listener.accept();
+    listener.set_nonblocking(false).ok();
+    match accepted {
+        Ok((socket, _addr)) => {
+            // The accepted socket inherits nothing from the listener's flags
+            // on Linux, but be explicit: everything after this is blocking
+            // request/response on small control messages.
+            socket.set_nonblocking(false).ok();
+            Ok(Some(socket))
+        }
+        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(e) => Err(Error::Io(std::io::Error::new(
+            e.kind(),
+            format!("Failed to accept IPC connection: {}", e),
+        ))),
+    }
+}
+
+/// How long a sink waits on a silent peer before saying so.
+const STALL_WARN_AFTER: Duration = Duration::from_secs(5);
 
 /// IPC sink that sends buffers to another process.
 ///
@@ -114,9 +143,12 @@ impl IpcSink {
     }
 
     /// Initialize the connection and arena.
-    fn ensure_connected(&mut self) -> Result<()> {
+    ///
+    /// `Ok(false)` means the server is listening and no peer has connected
+    /// yet; the caller re-polls rather than blocking on `accept`.
+    fn ensure_connected(&mut self) -> Result<bool> {
         if self.socket.is_some() {
-            return Ok(());
+            return Ok(true);
         }
 
         if self.is_server {
@@ -132,14 +164,12 @@ impl IpcSink {
                 })?);
             }
 
-            // Accept connection
+            // Accept without parking the caller on a peer that may never
+            // arrive: `Ok(false)` means "listening, nobody yet".
             let listener = self.listener.as_ref().unwrap();
-            let (socket, _addr) = listener.accept().map_err(|e| {
-                Error::Io(std::io::Error::new(
-                    e.kind(),
-                    format!("Failed to accept IPC connection: {}", e),
-                ))
-            })?;
+            let Some(socket) = accept_nonblocking(listener)? else {
+                return Ok(false);
+            };
             self.socket = Some(socket);
 
             // Create arena and send registration
@@ -161,7 +191,7 @@ impl IpcSink {
             self.socket = Some(socket);
         }
 
-        Ok(())
+        Ok(true)
     }
 
     /// Send arena registration to the source via SCM_RIGHTS.
@@ -253,6 +283,28 @@ impl IpcSink {
         }
     }
 
+    /// One poll interval of an unbounded wait, warning once it gets long.
+    ///
+    /// The warning is the whole point of tracking the start: an IPC sink
+    /// stuck on a silent peer used to be indistinguishable from a slow one.
+    async fn stall_tick(since: &mut Option<Instant>, what: &str) {
+        match since {
+            Some(start) => {
+                if start.elapsed() >= STALL_WARN_AFTER {
+                    tracing::warn!(
+                        "ipcsink: waiting {:.0}s — {what}",
+                        start.elapsed().as_secs_f32()
+                    );
+                    // Re-arm so the warning repeats at the same interval
+                    // instead of once per poll.
+                    *start = Instant::now();
+                }
+            }
+            None => *since = Some(Instant::now()),
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
     /// Process any pending acknowledgments.
     fn process_acks(&mut self) -> Result<()> {
         while let Some(msg) = self.recv_message()? {
@@ -265,15 +317,24 @@ impl IpcSink {
     }
 }
 
-impl Sink for IpcSink {
-    fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
-        self.ensure_connected()?;
+impl AsyncSink for IpcSink {
+    /// Async because both of this sink's waits are unbounded: a peer that
+    /// never connects, and a peer that stops acknowledging. As a sync `Sink`
+    /// they were `thread::sleep` loops, so each stuck peer permanently
+    /// consumed a tokio worker — and a `thread::sleep` in a sync `consume`
+    /// also stalls the runtime's time driver for every other task (#172).
+    /// The waits are still unbounded; they just no longer cost a thread.
+    async fn consume(&mut self, ctx: &ConsumeContext<'_>) -> Result<()> {
+        let mut waiting_since: Option<Instant> = None;
+        while !self.ensure_connected()? {
+            Self::stall_tick(&mut waiting_since, "no peer has connected").await;
+        }
         self.process_acks()?;
 
-        // Wait if too many pending
+        // Wait for the peer to release slots.
+        let mut waiting_since: Option<Instant> = None;
         while self.pending_slots.len() >= self.max_pending {
-            // Block and wait for ack
-            std::thread::sleep(std::time::Duration::from_micros(100));
+            Self::stall_tick(&mut waiting_since, "peer is not acknowledging buffers").await;
             self.process_acks()?;
         }
 
@@ -363,9 +424,12 @@ impl IpcSrc {
     }
 
     /// Initialize the connection.
-    fn ensure_connected(&mut self) -> Result<()> {
+    ///
+    /// `Ok(false)` means no peer has connected yet — `produce` turns that
+    /// into `WouldBlock`, which the executor already paces.
+    fn ensure_connected(&mut self) -> Result<bool> {
         if self.socket.is_some() {
-            return Ok(());
+            return Ok(true);
         }
 
         if self.is_server {
@@ -380,14 +444,12 @@ impl IpcSrc {
                 })?);
             }
 
-            // Accept connection
+            // See IpcSink::ensure_connected — same non-blocking accept, and
+            // here `Ok(false)` becomes a `WouldBlock` produce.
             let listener = self.listener.as_ref().unwrap();
-            let (socket, _addr) = listener.accept().map_err(|e| {
-                Error::Io(std::io::Error::new(
-                    e.kind(),
-                    format!("Failed to accept IPC connection: {}", e),
-                ))
-            })?;
+            let Some(socket) = accept_nonblocking(listener)? else {
+                return Ok(false);
+            };
             self.socket = Some(socket);
         } else {
             // Connect to existing socket
@@ -400,7 +462,7 @@ impl IpcSrc {
             self.socket = Some(socket);
         }
 
-        Ok(())
+        Ok(true)
     }
 
     /// Send a control message.
@@ -493,7 +555,12 @@ impl IpcSrc {
 
 impl Source for IpcSrc {
     fn produce(&mut self, _ctx: &mut ProduceContext) -> Result<ProduceResult> {
-        self.ensure_connected()?;
+        // No peer yet: hand the task back to the executor, which paces the
+        // retry. This used to block inside `accept()` and park a worker for
+        // as long as the peer took to appear (#172).
+        if !self.ensure_connected()? {
+            return Ok(ProduceResult::WouldBlock);
+        }
 
         // If no arenas registered yet, receive the arena registration first
         if self.arena_cache.is_empty() {
