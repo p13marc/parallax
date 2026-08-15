@@ -1,42 +1,18 @@
-# Runner-disk maintenance (#176). Dispatch manually:
-#   POST /repos/marcpardo/parallax/actions/workflows/maintenance.yml/dispatches
-#
-# The job containers bind-mount the persistent per-repo /workspace and the
-# runner's /srv/cache, so this is the tracked, in-band way to inspect and
-# reclaim what stale runs left behind — without shell access to the host.
+# Temporary sccache diagnosis (#176) — deleted once ci.yml carries the fix.
 name: maintenance
 on:
   workflow_dispatch:
-    inputs:
-      clean:
-        description: "delete stale target dirs and cap the sccache spool (yes/no)"
-        required: false
-        default: "no"
 
 jobs:
   disk:
     runs-on: ubuntu-24.04
     steps:
-      - name: report
+      - name: sccache-facts
         run: |
           set -x
-          df -h
-          du -x -h --max-depth=2 /workspace 2>/dev/null | sort -rh | head -30 || true
-          du -x -h --max-depth=1 /srv/cache 2>/dev/null | sort -rh | head -10 || true
-          ls -la /srv/cache 2>/dev/null || true
-          du -x -h --max-depth=1 /opt /var/lib/docker 2>/dev/null | tail -5 || true
-      - name: clean
-        if: ${{ inputs.clean == 'yes' }}
-        run: |
-          set -x
-          # target/ dirs are pure build product — every job rebuilds its own,
-          # and sccache makes the rebuild cheap. Delete all of them.
-          find /workspace -maxdepth 4 -type d -name target -prune -print \
-            -exec rm -rf {} + 2>/dev/null || true
-          # The sccache disk spool (grows without a cap on runners whose S3
-          # credentials are absent; SCCACHE_CACHE_SIZE only bounds it going
-          # forward).
-          for d in /srv/cache/sccache /srv/cache/cache; do
-            [ -d "$d" ] && du -sh "$d" && rm -rf "$d"/* || true
-          done
-          df -h
+          df -h | grep -vE "tmpfs|shm"
+          ls -la /srv/cache/bin/ || true
+          touch /srv/cache/bin/.write-probe && echo WRITABLE && rm /srv/cache/bin/.write-probe || echo READ-ONLY
+          env | grep -iE "sccache|aws|s3" || echo "no sccache/s3 env"
+          /srv/cache/bin/sccache --start-server || true
+          /srv/cache/bin/sccache --show-stats || true
