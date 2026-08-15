@@ -18,7 +18,7 @@
 #![cfg(feature = "http")]
 
 use crate::buffer::{Buffer, MemoryHandle};
-use crate::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
+use crate::element::{AsyncSink, ConsumeContext, ProduceContext, ProduceResult, Source};
 use crate::error::{Error, Result};
 use crate::event::{Event, EventResult, SeekEvent, SeekType, SegmentFormat};
 use crate::memory::{OutputArena, OutputBudget, defaults};
@@ -482,35 +482,56 @@ impl HttpSink {
     }
 }
 
-impl Sink for HttpSink {
-    fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
-        let data = ctx.input();
+impl AsyncSink for HttpSink {
+    /// One blocking ureq round-trip per buffer, run on tokio's blocking pool
+    /// (#172): a slow server stalls this element's future, not a runtime
+    /// worker. The 30 s default `timeout` bounds how long the pool thread is
+    /// held.
+    async fn consume(&mut self, ctx: &ConsumeContext<'_>) -> Result<()> {
+        // Owned copies for the 'static closure — an HTTP body write copies
+        // the payload into the socket anyway.
+        let data = ctx.input().to_vec();
+        let len = data.len() as u64;
+        let url = self.url.clone();
+        let method = self.method;
+        let timeout = self.timeout;
+        let content_type = self.content_type.clone();
+        let headers = self.headers.clone();
 
-        let mut request = match self.method {
-            HttpMethod::Post => ureq::post(&self.url),
-            HttpMethod::Put => ureq::put(&self.url),
-            HttpMethod::Patch => ureq::patch(&self.url),
-        };
+        let status = tokio::task::spawn_blocking(move || {
+            let mut request = match method {
+                HttpMethod::Post => ureq::post(&url),
+                HttpMethod::Put => ureq::put(&url),
+                HttpMethod::Patch => ureq::patch(&url),
+            };
 
-        if let Some(timeout) = self.timeout {
-            request = request.config().timeout_global(Some(timeout)).build();
-        }
+            if let Some(timeout) = timeout {
+                request = request.config().timeout_global(Some(timeout)).build();
+            }
 
-        request = request.header("Content-Type", self.content_type.as_str());
+            request = request.header("Content-Type", content_type.as_str());
 
-        for (name, value) in &self.headers {
-            request = request.header(name.as_str(), value.as_str());
-        }
+            for (name, value) in &headers {
+                request = request.header(name.as_str(), value.as_str());
+            }
 
-        let response = request
-            .send(data)
-            .map_err(|e| Error::Element(format!("HTTP error: {}", e)))?;
+            request
+                .send(&data[..])
+                .map(|response| response.status().as_u16())
+                .map_err(|e| Error::Element(format!("HTTP error: {}", e)))
+        })
+        .await
+        .map_err(|e| Error::Element(format!("http sink task join error: {}", e)))??;
 
-        self.last_status = Some(response.status().as_u16());
-        self.bytes_written += data.len() as u64;
+        self.last_status = Some(status);
+        self.bytes_written += len;
         self.requests_sent += 1;
 
         Ok(())
+    }
+
+    fn name(&self) -> &str {
+        &self.name
     }
 }
 

@@ -12,7 +12,7 @@
 #![cfg(feature = "websocket")]
 
 use crate::buffer::{Buffer, MemoryHandle};
-use crate::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
+use crate::element::{AsyncSink, ConsumeContext, ProduceContext, ProduceResult, Source};
 use crate::error::{Error, Result};
 use crate::memory::{OutputArena, OutputBudget, defaults};
 use crate::metadata::Metadata;
@@ -356,16 +356,14 @@ impl WebSocketSink {
     }
 }
 
-impl Sink for WebSocketSink {
-    fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
-        self.ensure_connected()?;
-
-        let socket = self
-            .socket
-            .as_mut()
-            .ok_or_else(|| Error::Element("not connected".into()))?;
-
+impl AsyncSink for WebSocketSink {
+    /// The blocking tungstenite connect/send runs on tokio's blocking pool
+    /// (#172): the socket moves into the closure and back, so a peer that
+    /// stops reading stalls this element's future — and one pool thread —
+    /// instead of a runtime worker.
+    async fn consume(&mut self, ctx: &ConsumeContext<'_>) -> Result<()> {
         let data = ctx.input();
+        let len = data.len() as u64;
 
         let message = match self.message_type {
             WsMessageType::Binary => Message::binary(data.to_vec()),
@@ -375,14 +373,41 @@ impl Sink for WebSocketSink {
             }
         };
 
-        socket
-            .send(message)
-            .map_err(|e| Error::Element(format!("WebSocket send error: {}", e)))?;
+        let taken = self.socket.take();
+        let url = self.url.clone();
+        let (socket, result) = tokio::task::spawn_blocking(move || {
+            let mut socket = match taken {
+                Some(socket) => socket,
+                None => match connect(url.as_str()) {
+                    Ok((socket, _response)) => socket,
+                    Err(e) => {
+                        return (
+                            None,
+                            Err(Error::Element(format!("WebSocket connect error: {}", e))),
+                        );
+                    }
+                },
+            };
+            let result = socket
+                .send(message)
+                .map_err(|e| Error::Element(format!("WebSocket send error: {}", e)));
+            (Some(socket), result)
+        })
+        .await
+        .map_err(|e| Error::Element(format!("websocket sink task join error: {}", e)))?;
 
-        self.bytes_written += data.len() as u64;
+        self.socket = socket;
+        self.connected = self.socket.is_some();
+        result?;
+
+        self.bytes_written += len;
         self.messages_sent += 1;
 
         Ok(())
+    }
+
+    fn name(&self) -> &str {
+        &self.name
     }
 }
 

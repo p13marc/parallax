@@ -89,8 +89,8 @@ anything, so `Aborted` comes from the handle alone.
 | `UnixSrc` / `UnixSink` | Unix domain sockets (`UnixMode`). `UnixSink` is an async sink — accept/connect/write all await (the old broken `AsyncUnixSrc`/`AsyncUnixSink` pair, which re-connected per call, is deleted) |
 | `UdpMulticastSrc` / `UdpMulticastSink` | Multicast group receive/send |
 | `HttpSrc` `[http]` | HTTP GET source; byte-seekable via `Range` when the server supports it (probed at pipeline start) |
-| `HttpSink` `[http]` | HTTP POST/PUT sink |
-| `WebSocketSrc` / `WebSocketSink` `[websocket]` | WebSocket message I/O |
+| `HttpSink` `[http]` | HTTP POST/PUT sink (async sink — one blocking ureq request per buffer on the blocking pool, bounded by `with_timeout`, 30 s default) |
+| `WebSocketSrc` / `WebSocketSink` `[websocket]` | WebSocket message I/O. The sink is an async sink: connect/send run on the blocking pool, so a stalled peer pends the element, not a runtime worker |
 | `ZenohSrc` / `ZenohSink` `[zenoh]` | Zenoh subscribe/publish on key expressions |
 | `ZenohQueryable` / `ZenohQuerier` `[zenoh]` | Zenoh query handling / querying |
 
