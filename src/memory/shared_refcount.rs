@@ -287,11 +287,24 @@ impl ReleaseQueue {
         }
     }
 
+    /// How long `try_pop` waits for a producer that has reserved a ring entry
+    /// but not yet stored its index, before giving up on this call.
+    ///
+    /// The push is a two-phase commit (reserve tail, then write), so the gap
+    /// is normally a few instructions — but the producer can be preempted
+    /// inside it, and an unbounded wait here livelocked the consumer on
+    /// loaded machines (#171). Giving up is always safe: the entry stays in
+    /// the ring for the next `reclaim()` to collect.
+    const POP_SPIN_BUDGET: u32 = 128;
+
     /// Try to pop a slot index from the queue.
     ///
-    /// Returns `Some(slot_index)` if successful, `None` if queue is empty.
-    /// Only the owner should call this.
+    /// Returns `Some(slot_index)` if successful, `None` if the queue is empty
+    /// or its head entry is still being written (see [`Self::POP_SPIN_BUDGET`]).
+    /// Only the owner should call this, and one caller at a time — concurrent
+    /// consumers can erase each other's entries (see `ArenaHeader::reclaim_lock`).
     fn try_pop(&self) -> Option<u32> {
+        let mut spins = 0u32;
         loop {
             let head = self.head.load(Ordering::Acquire);
             let tail = self.tail.load(Ordering::Acquire);
@@ -306,7 +319,12 @@ impl ReleaseQueue {
 
             // Check if the producer has finished writing
             if slot_index == QUEUE_EMPTY {
-                // Producer reserved but hasn't written yet, spin
+                // Producer reserved but hasn't written yet. Wait briefly; if
+                // it was preempted mid-push, bail out rather than livelock.
+                if spins >= Self::POP_SPIN_BUDGET {
+                    return None;
+                }
+                spins += 1;
                 std::hint::spin_loop();
                 continue;
             }
@@ -379,8 +397,17 @@ struct ArenaHeader {
     /// Recorded so a client can validate the stride rather than trust it.
     /// Added in format v4.
     alignment: AtomicU32,
+    /// Serializes [`SharedArena::reclaim`] across clones (0 = unlocked).
+    ///
+    /// The release queue is MPSC and reclaim is its single consumer; two
+    /// threads draining it concurrently can pop the same ring entry, and the
+    /// loser's slot-clear can erase an index a wrapped producer has already
+    /// refilled — leaking that slot forever. Carved out of the v4 reserved
+    /// bytes: memfd memory is zero-filled, so pre-existing arenas read as
+    /// unlocked and the format version is unchanged.
+    reclaim_lock: AtomicU32,
     /// Reserved for future use.
-    _reserved: [u8; 8],
+    _reserved: [u8; 4],
 }
 
 impl ArenaHeader {
@@ -665,6 +692,7 @@ impl SharedArena {
             h.slot_stride.store(slot_stride as u32, Ordering::Release);
             h.alignment.store(alignment as u32, Ordering::Release);
             h.refcount.store(1, Ordering::Release); // Initial refcount = 1
+            h.reclaim_lock.store(0, Ordering::Release);
         }
 
         // Initialize release queue
@@ -881,6 +909,15 @@ impl SharedArena {
             return 0;
         }
 
+        // The release queue is MPSC and this is its single consumer. Arena
+        // clones share the mapping, so two threads can reach this point at
+        // once — serialize them. The loser returns 0 immediately, which is
+        // fine: the holder is draining the same queue.
+        let header = unsafe { self.header.as_ref() };
+        if header.reclaim_lock.swap(1, Ordering::Acquire) != 0 {
+            return 0;
+        }
+
         let mut reclaimed = 0;
         let queue = unsafe { self.release_queue.as_ref() };
 
@@ -895,6 +932,7 @@ impl SharedArena {
             }
         }
 
+        header.reclaim_lock.store(0, Ordering::Release);
         reclaimed
     }
 
@@ -1505,6 +1543,63 @@ mod tests {
                 assert_eq!(queue.try_pop(), Some(round * 100 + i));
             }
             assert!(queue.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_stalled_producer_cannot_livelock_the_consumer() {
+        let queue = Box::new(ReleaseQueue {
+            head: AtomicU32::new(0),
+            tail: AtomicU32::new(0),
+            _pad: [0; 56],
+            slots: std::array::from_fn(|_| AtomicU32::new(QUEUE_EMPTY)),
+        });
+
+        // Simulate a producer preempted mid-push: tail is reserved but the
+        // index was never stored. Before #171 this spun forever.
+        queue.tail.store(1, Ordering::Release);
+        assert_eq!(queue.try_pop(), None);
+
+        // The producer finishes its store — the entry becomes poppable.
+        queue.slots[0].store(42, Ordering::Release);
+        assert_eq!(queue.try_pop(), Some(42));
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn concurrent_reclaims_do_not_lose_slots() {
+        use std::sync::Arc;
+
+        // reclaim() is serialized internally; hammering it from many threads
+        // while the ring wraps must never leak a slot. 3 rounds × 64 slots
+        // wraps nothing by itself, so push the ring around with repetition.
+        let arena = Arc::new(SharedArena::new(512, 64).unwrap());
+
+        for _ in 0..20 {
+            let slots: Vec<_> = std::iter::from_fn(|| arena.acquire()).collect();
+            assert_eq!(slots.len(), 64);
+            drop(slots);
+
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let arena = Arc::clone(&arena);
+                    std::thread::spawn(move || arena.reclaim())
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+            // A drain may have been cut short (lock held, spin budget); a few
+            // follow-up reclaims must find everything. Bounded, so a genuinely
+            // lost slot fails the assert instead of hanging the test.
+            for _ in 0..100 {
+                if arena.free_count() == 64 {
+                    break;
+                }
+                arena.reclaim();
+                std::thread::yield_now();
+            }
+            assert_eq!(arena.free_count(), 64);
         }
     }
 
