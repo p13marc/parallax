@@ -11,7 +11,7 @@
 
 use crate::error::{Error, Result};
 use rustix::event::{EventfdFlags, eventfd};
-use rustix::fd::OwnedFd;
+use rustix::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::time::Duration;
 
 /// Linux eventfd: a kernel counter usable as a cross-thread wake-up.
@@ -37,6 +37,34 @@ impl EventFd {
             async_fd: std::sync::OnceLock::new(),
             fd,
         })
+    }
+
+    /// Adopt an eventfd received from a peer process (SCM_RIGHTS,
+    /// [`crate::memory::ipc::recv_fds`]).
+    ///
+    /// Defensively sets `O_NONBLOCK`: every wait path here assumes it.
+    /// SCM_RIGHTS shares the open file description, so the flag set at
+    /// creation normally survives the trip — but the sender is another
+    /// process; make the invariant local rather than assumed. There is no
+    /// cheap way to verify the fd *is* an eventfd; a wrong fd surfaces as
+    /// read/write errors, never memory unsafety.
+    pub fn from_owned_fd(fd: OwnedFd) -> Result<Self> {
+        let flags = rustix::fs::fcntl_getfl(&fd)
+            .map_err(|e| Error::Io(std::io::Error::other(format!("eventfd fcntl: {}", e))))?;
+        if !flags.contains(rustix::fs::OFlags::NONBLOCK) {
+            rustix::fs::fcntl_setfl(&fd, flags | rustix::fs::OFlags::NONBLOCK)
+                .map_err(|e| Error::Io(std::io::Error::other(format!("eventfd fcntl: {}", e))))?;
+        }
+        Ok(Self {
+            async_fd: std::sync::OnceLock::new(),
+            fd,
+        })
+    }
+
+    /// Borrow the fd, e.g. to pass it via SCM_RIGHTS
+    /// ([`crate::memory::ipc::send_fds`]).
+    pub fn fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
     }
 
     /// Signal the eventfd (increment counter).
@@ -148,6 +176,12 @@ impl EventFd {
     }
 }
 
+impl AsFd for EventFd {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,6 +210,38 @@ mod tests {
         assert!(efd.wait_timeout(Duration::from_secs(1)).unwrap());
         // Both notifies drained by the one read: a second wait times out.
         assert!(!efd.wait_timeout(Duration::from_millis(10)).unwrap());
+    }
+
+    #[test]
+    fn from_owned_fd_round_trips_over_scm_rights() {
+        use crate::memory::ipc::{recv_fds, send_fds};
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+
+        let original = EventFd::new().unwrap();
+        send_fds(&a, &[original.fd()], b"bell").unwrap();
+
+        let mut buf = [0u8; 16];
+        let (_, fds) = recv_fds(&b, &mut buf).unwrap();
+        let adopted = EventFd::from_owned_fd(fds.into_iter().next().unwrap()).unwrap();
+
+        // Same open file description: a notify on either side wakes the other.
+        original.notify().unwrap();
+        assert!(adopted.try_wait().unwrap());
+        adopted.notify().unwrap();
+        assert!(original.try_wait().unwrap());
+    }
+
+    #[test]
+    fn from_owned_fd_restores_nonblock() {
+        let efd = EventFd::new().unwrap();
+        // Simulate a sender that cleared the flag.
+        let flags = rustix::fs::fcntl_getfl(&efd.fd).unwrap();
+        rustix::fs::fcntl_setfl(&efd.fd, flags - rustix::fs::OFlags::NONBLOCK).unwrap();
+
+        let raw = efd.fd;
+        let adopted = EventFd::from_owned_fd(raw).unwrap();
+        // A blocking fd would hang here; NONBLOCK makes it Ok(false).
+        assert!(!adopted.try_wait().unwrap());
     }
 
     #[test]

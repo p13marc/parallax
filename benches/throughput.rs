@@ -23,8 +23,8 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use parallax::buffer::{Buffer, MemoryHandle};
 use parallax::element::Element;
 use parallax::elements::{NullSink, NullSource, PassThrough};
-use parallax::memory::EventFd;
 use parallax::memory::SharedArena;
+use parallax::memory::{EventFd, IpcChannel, IpcDescriptor, SharedIpcSlotRef};
 use parallax::metadata::Metadata;
 use parallax::pipeline::rt_bridge::{AsyncRtBridge, BridgeConfig};
 use parallax::pipeline::rt_scheduler::{RtConfig, SchedulingMode};
@@ -258,6 +258,65 @@ fn bench_rt_bridge_ring(c: &mut Criterion) {
     group.finish();
 }
 
+/// The cross-process IPC descriptor ring (#179) — encode + push + pop +
+/// decode + ack, the full per-buffer cost of the shm data plane. The
+/// doorbell notify writes are included (push rings them internally — they
+/// ARE part of the per-buffer cost); `bench_eventfd` prices the syscall
+/// pair in isolation.
+fn bench_ipc_ring(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ipc_ring");
+
+    for &capacity in &[16u32, 256] {
+        let chan = IpcChannel::create(capacity).expect("channel");
+        let slot = SharedIpcSlotRef {
+            arena_id: 42,
+            slot_index: 7,
+            data_offset: 4096,
+            len: 4096,
+        };
+        let mut meta = Metadata::new();
+        meta.pts = parallax::clock::ClockTime::from_nanos(1_000_000);
+        meta.sequence = 1;
+
+        group.throughput(Throughput::Elements(1));
+        group.bench_function(BenchmarkId::new("push_pop", capacity), |b| {
+            let mut seq = 0u64;
+            b.iter(|| {
+                let desc = IpcDescriptor::encode(seq, &slot, &meta);
+                assert!(chan.try_push_desc(desc));
+                let got = chan.try_pop_desc().expect("ring not empty");
+                let decoded = got.decode().expect("decode");
+                black_box(&decoded);
+                chan.try_push_ack(got.seq).expect("ack");
+                black_box(chan.try_pop_ack().expect("ack present"));
+                // Drain the doorbells so their counters stay small.
+                let _ = chan.data_doorbell().try_wait();
+                let _ = chan.ack_doorbell().try_wait();
+                seq += 1;
+            });
+        });
+
+        group.bench_function(BenchmarkId::new("fill_drain", capacity), |b| {
+            let mut seq = 0u64;
+            b.iter(|| {
+                for _ in 0..capacity {
+                    assert!(chan.try_push_desc(IpcDescriptor::encode(seq, &slot, &meta)));
+                    seq += 1;
+                }
+                while let Some(d) = chan.try_pop_desc() {
+                    black_box(&d);
+                    chan.try_push_ack(d.seq).expect("ack");
+                }
+                while chan.try_pop_ack().is_some() {}
+                let _ = chan.data_doorbell().try_wait();
+                let _ = chan.ack_doorbell().try_wait();
+            });
+        });
+    }
+
+    group.finish();
+}
+
 /// `EventFd` notify/wait — the wakeup an RT thread costs an async task.
 ///
 /// Measured without a blocking wait, so this is the syscall pair, not the
@@ -295,6 +354,7 @@ criterion_group!(
     bench_fanout_width,
     bench_fanout_policy,
     bench_rt_bridge_ring,
+    bench_ipc_ring,
     bench_eventfd,
     bench_noop_config_sanity,
 );

@@ -55,6 +55,7 @@ mod dmabuf;
 mod eventfd;
 mod huge_pages;
 pub mod ipc;
+mod ipc_ring;
 mod mapped_file;
 mod segment;
 mod shared_refcount;
@@ -65,6 +66,7 @@ pub use buffer_pool::{BufferPool, FixedBufferPool, PoolStats, PooledBuffer};
 pub use dmabuf::DmaBufSegment;
 pub use eventfd::EventFd;
 pub use huge_pages::{HugePageSegment, HugePageSize};
+pub use ipc_ring::{DEFAULT_IPC_RING_CAPACITY, IpcChannel, IpcChannelState, IpcDescriptor};
 pub use mapped_file::MappedFileSegment;
 pub use segment::{IpcHandle, MemorySegment, MemoryType};
 pub use shared_refcount::{
