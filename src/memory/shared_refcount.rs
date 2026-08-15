@@ -509,12 +509,46 @@ impl SlotHeader {
     }
 }
 
-/// Global counter for generating unique arena IDs.
-static ARENA_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+/// Per-process counter for generating unique arena IDs.
+static ARENA_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Generate a unique arena ID.
+/// Random per-process base for arena IDs, drawn once from the kernel.
+static ARENA_ID_BASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// Generate a process-unique arena ID: a random 64-bit base plus a counter.
+///
+/// The ID keys `SharedArenaCache` and the IPC arena registries across
+/// processes, so it must not collide between peers (#178). A plain counter
+/// starting at 1 made every process mint 1, 2, 3, …, which collides as soon
+/// as one process maps arenas from two creators. The random base makes
+/// cross-process collision negligible (and is pid-reuse-proof, unlike
+/// mixing the pid in); the counter keeps in-process IDs distinct.
 fn next_arena_id() -> u64 {
-    ARENA_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+    let base = *ARENA_ID_BASE.get_or_init(|| {
+        let mut bytes = [0u8; 8];
+        let mut filled = 0;
+        while filled < bytes.len() {
+            match rustix::rand::getrandom(
+                &mut bytes[filled..],
+                rustix::rand::GetRandomFlags::empty(),
+            ) {
+                Ok(n) => filled += n,
+                Err(rustix::io::Errno::INTR) => {}
+                // getrandom cannot fail on any supported kernel; if it
+                // somehow does, a time-derived base still beats `1`.
+                Err(_) => {
+                    let t = std::time::UNIX_EPOCH
+                        .elapsed()
+                        .map(|d| d.as_nanos() as u64)
+                        .unwrap_or(0);
+                    bytes = (t ^ (std::process::id() as u64).rotate_left(32)).to_ne_bytes();
+                    break;
+                }
+            }
+        }
+        u64::from_ne_bytes(bytes)
+    });
+    base.wrapping_add(ARENA_ID_COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
 /// Calculate memory layout for arena with custom alignment.
@@ -1612,6 +1646,20 @@ mod tests {
         assert_eq!(arena.allocated_count(), 0);
         assert!(arena.is_owner());
         assert_eq!(arena.pending_count(), 0);
+    }
+
+    #[test]
+    fn arena_ids_are_process_unique_not_a_counter_from_one() {
+        // #178: ids key cross-process caches, so every process minting
+        // 1, 2, 3, … collides as soon as one process maps arenas from two
+        // creators. The id is now a random 64-bit base plus a counter:
+        // distinct within the process, and the old deterministic low ids
+        // only reachable at ~2^-50 odds (this assertion is probabilistic
+        // by nature — a failure here means the base was not randomized).
+        let a = SharedArena::new(64, 1).unwrap();
+        let b = SharedArena::new(64, 1).unwrap();
+        assert_ne!(a.id(), b.id());
+        assert!(a.id().max(b.id()) > 1 << 12);
     }
 
     #[test]
