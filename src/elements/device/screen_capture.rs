@@ -460,11 +460,11 @@ impl ScreenCaptureSrc {
         // Use ThreadLoop instead of MainLoop - it runs in its own thread
         // and is what OBS and other applications use for portal screen capture
         let thread_loop =
-            unsafe { pw::thread_loop::ThreadLoop::new(Some("parallax-capture"), None) }
+            unsafe { pw::thread_loop::ThreadLoopRc::new(Some("parallax-capture"), None) }
                 .map_err(|e| format!("Failed to create thread loop: {}", e))?;
 
         // Create context with the thread loop
-        let context = pw::context::Context::new(&thread_loop)
+        let context = pw::context::ContextRc::new(&thread_loop, None)
             .map_err(|e| format!("Failed to create context: {}", e))?;
 
         // Start the thread loop BEFORE connecting (following OBS pattern)
@@ -477,7 +477,7 @@ impl ScreenCaptureSrc {
 
         // Connect using the fd from the portal (with lock held)
         let core = context
-            .connect_fd(pw_fd, None)
+            .connect_fd_rc(pw_fd, None)
             .map_err(|e| format!("Failed to connect via fd: {}", e))?;
         tracing::debug!("Connected to core via fd");
 
@@ -490,7 +490,7 @@ impl ScreenCaptureSrc {
             *pw::keys::MEDIA_ROLE => "Screen",
         };
 
-        let stream = pw::stream::Stream::new(&core, "parallax-screen-capture", props)
+        let stream = pw::stream::StreamRc::new(core, "parallax-screen-capture", props)
             .map_err(|e| format!("Failed to create stream: {}", e))?;
         tracing::debug!("Stream created");
 
@@ -691,7 +691,7 @@ impl ScreenCaptureSrc {
 
                 let count = frame_count_clone.fetch_add(1, Ordering::Relaxed) + 1;
 
-                if count <= 5 || count % 30 == 0 {
+                if count <= 5 || count.is_multiple_of(30) {
                     tracing::debug!(
                         "Captured frame {}: {}x{}, {} bytes, pts={} (pw_ts={})",
                         count,
@@ -811,7 +811,7 @@ impl ScreenCaptureSrc {
                 Err(RecvTimeoutError::Timeout) => {
                     // No shutdown yet, continue
                     let count = frame_count.load(Ordering::Relaxed);
-                    if count > 0 && count % 30 == 0 {
+                    if count > 0 && count.is_multiple_of(30) {
                         tracing::debug!("Still capturing, total frames: {}", count);
                     }
                 }
@@ -910,11 +910,11 @@ impl Source for ScreenCaptureSrc {
 
     fn produce(&mut self, _ctx: &mut ProduceContext) -> Result<ProduceResult> {
         // Check if we've reached the frame limit (check frames we've actually output)
-        if let Some(max) = self.config.max_frames {
-            if self.frames_produced >= max {
-                tracing::info!("Screen capture: reached max frames ({})", max);
-                return Ok(ProduceResult::Eos);
-            }
+        if let Some(max) = self.config.max_frames
+            && self.frames_produced >= max
+        {
+            tracing::info!("Screen capture: reached max frames ({})", max);
+            return Ok(ProduceResult::Eos);
         }
 
         // Lazy initialization: if not initialized, do it now
@@ -940,7 +940,7 @@ impl Source for ScreenCaptureSrc {
         {
             self.frames_dropped += 1;
             flow_state.record_drop();
-            if self.frames_dropped == 1 || self.frames_dropped % 30 == 0 {
+            if self.frames_dropped == 1 || self.frames_dropped.is_multiple_of(30) {
                 tracing::warn!(
                     "Screen capture: dropping frame due to backpressure (total dropped: {})",
                     self.frames_dropped

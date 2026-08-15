@@ -87,7 +87,7 @@ jobs:
       image: fedora:44
     steps:
       # no node in fedora:44 → install it first so JS actions work
-      - run: dnf install -y nodejs git gcc gcc-c++ clang-devel libcamera-devel systemd-devel pkgconf-pkg-config tar xz zstd
+      - run: dnf install -y nodejs git gcc gcc-c++ clang-devel libcamera-devel systemd-devel pipewire-devel pkgconf-pkg-config tar xz zstd
       - uses: https://data.forgejo.org/actions/checkout@v7.0.1
       - uses: https://github.com/dtolnay/rust-toolchain@stable
         with:
@@ -100,6 +100,11 @@ jobs:
         with:
           tool: cargo-nextest
       - run: cargo clippy --all-targets --features libcamera -- -D warnings
+      # #170: pipewire/screen-capture had no compiling job, which is how the
+      # libspa 0.8 breakage (and before it, the e1f345b shutdown bug) went
+      # unnoticed. Folded in here rather than a new job so the runner disk
+      # carries one fedora target dir, not two (#176).
+      - run: cargo clippy --all-targets --features pipewire,screen-capture -- -D warnings
       - run: cargo nextest run --features libcamera -E 'test(libcamera) | test(monitor)'
 
   # Compile-check the Vulkan Video GPU path (no runner has a capable GPU, so
@@ -118,8 +123,7 @@ jobs:
       - run: cargo check --all-targets --features image-jpeg,vulkan-video
 
   # Feature gates no other job compiles. `display` builds here; `pipewire` and
-  # `screen-capture` cannot (libspa 0.8 vs pipewire >= 1.6, see #170), which is
-  # how a shutdown bug lived in pipewire.rs unnoticed.
+  # `screen-capture` build in the libcamera fedora job (#170).
   display-check:
     runs-on: ubuntu-24.04
     steps:

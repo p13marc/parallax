@@ -41,10 +41,10 @@ use super::DeviceError;
 
 /// Check if PipeWire is available on this system.
 pub fn is_available() -> bool {
-    // Initialize PipeWire - this always succeeds in pipewire 0.8+
+    // Initialize PipeWire - this always succeeds
     pw::init();
     // Try to create a main loop to verify PipeWire is available
-    pw::main_loop::MainLoop::new(None).is_ok()
+    pw::main_loop::MainLoopRc::new(None).is_ok()
 }
 
 /// PipeWire capture target.
@@ -91,7 +91,7 @@ pub fn enumerate_audio_nodes() -> Result<Vec<PipeWireNodeInfo>> {
     let (tx, rx) = std_mpsc::sync_channel::<Vec<PipeWireNodeInfo>>(1);
 
     thread::spawn(move || {
-        let main_loop = match pw::main_loop::MainLoop::new(None) {
+        let main_loop = match pw::main_loop::MainLoopRc::new(None) {
             Ok(ml) => ml,
             Err(_) => {
                 let _ = tx.send(Vec::new());
@@ -99,7 +99,7 @@ pub fn enumerate_audio_nodes() -> Result<Vec<PipeWireNodeInfo>> {
             }
         };
 
-        let context = match pw::context::Context::new(&main_loop) {
+        let context = match pw::context::ContextRc::new(&main_loop, None) {
             Ok(ctx) => ctx,
             Err(_) => {
                 let _ = tx.send(Vec::new());
@@ -107,7 +107,7 @@ pub fn enumerate_audio_nodes() -> Result<Vec<PipeWireNodeInfo>> {
             }
         };
 
-        let core = match context.connect(None) {
+        let core = match context.connect_rc(None) {
             Ok(c) => c,
             Err(_) => {
                 let _ = tx.send(Vec::new());
@@ -130,30 +130,29 @@ pub fn enumerate_audio_nodes() -> Result<Vec<PipeWireNodeInfo>> {
         let _listener = registry
             .add_listener_local()
             .global(move |global| {
-                if global.type_ == pw::types::ObjectType::Node {
-                    if let Some(props) = &global.props {
-                        let name = props.get("node.name").unwrap_or("unknown").to_string();
-                        let description =
-                            props.get("node.description").unwrap_or(&name).to_string();
-                        let media_class = props.get("media.class").unwrap_or("").to_string();
+                if global.type_ == pw::types::ObjectType::Node
+                    && let Some(props) = &global.props
+                {
+                    let name = props.get("node.name").unwrap_or("unknown").to_string();
+                    let description = props.get("node.description").unwrap_or(&name).to_string();
+                    let media_class = props.get("media.class").unwrap_or("").to_string();
 
-                        // Filter to audio nodes
-                        if media_class.contains("Audio") {
-                            let is_capture =
-                                media_class.contains("Source") || media_class.contains("Input");
-                            let is_playback =
-                                media_class.contains("Sink") || media_class.contains("Output");
+                    // Filter to audio nodes
+                    if media_class.contains("Audio") {
+                        let is_capture =
+                            media_class.contains("Source") || media_class.contains("Input");
+                        let is_playback =
+                            media_class.contains("Sink") || media_class.contains("Output");
 
-                            if let Ok(mut nodes) = nodes_clone.lock() {
-                                nodes.push(PipeWireNodeInfo {
-                                    id: global.id,
-                                    name,
-                                    description,
-                                    media_class,
-                                    is_capture,
-                                    is_playback,
-                                });
-                            }
+                        if let Ok(mut nodes) = nodes_clone.lock() {
+                            nodes.push(PipeWireNodeInfo {
+                                id: global.id,
+                                name,
+                                description,
+                                media_class,
+                                is_capture,
+                                is_playback,
+                            });
                         }
                     }
                 }
@@ -165,9 +164,9 @@ pub fn enumerate_audio_nodes() -> Result<Vec<PipeWireNodeInfo>> {
 
         // Run main loop briefly to collect objects
         for _ in 0..10 {
-            main_loop
-                .loop_()
-                .iterate(std::time::Duration::from_millis(10));
+            main_loop.loop_().iterate(pw::loop_::Timeout::Finite(
+                std::time::Duration::from_millis(10),
+            ));
             if done_clone.load(Ordering::SeqCst) {
                 break;
             }
@@ -275,6 +274,7 @@ impl PipeWireSrc {
     }
 
     /// Create a source for a specific PipeWire node ID.
+    #[cfg(feature = "screen-capture")]
     fn new_with_node_id(node_id: u32) -> Result<Self> {
         Self::new(PipeWireTarget::Camera(format!("node:{}", node_id)))
     }
@@ -321,7 +321,7 @@ impl PipeWireSrc {
         buffer_tx: tokio_mpsc::Sender<Vec<u8>>,
         shutdown_rx: std_mpsc::Receiver<()>,
     ) {
-        let main_loop = match pw::main_loop::MainLoop::new(None) {
+        let main_loop = match pw::main_loop::MainLoopRc::new(None) {
             Ok(ml) => ml,
             Err(e) => {
                 tracing::error!("Failed to create PipeWire main loop: {}", e);
@@ -329,7 +329,7 @@ impl PipeWireSrc {
             }
         };
 
-        let context = match pw::context::Context::new(&main_loop) {
+        let context = match pw::context::ContextRc::new(&main_loop, None) {
             Ok(ctx) => ctx,
             Err(e) => {
                 tracing::error!("Failed to create PipeWire context: {}", e);
@@ -337,7 +337,7 @@ impl PipeWireSrc {
             }
         };
 
-        let core = match context.connect(None) {
+        let core = match context.connect_rc(None) {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!("Failed to connect to PipeWire: {}", e);
@@ -360,7 +360,7 @@ impl PipeWireSrc {
             *pw::keys::MEDIA_ROLE => "Production",
         };
 
-        let stream = match pw::stream::Stream::new(&core, "parallax-capture", props) {
+        let stream = match pw::stream::StreamRc::new(core, "parallax-capture", props) {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!("Failed to create PipeWire stream: {}", e);
@@ -374,16 +374,16 @@ impl PipeWireSrc {
             .add_local_listener_with_user_data(())
             .process(move |stream, _| {
                 // Get buffer from stream
-                if let Some(mut pw_buffer) = stream.dequeue_buffer() {
-                    if let Some(data) = pw_buffer.datas_mut().first_mut() {
-                        let chunk = data.chunk();
-                        let size = chunk.size() as usize;
-                        if size > 0 {
-                            // Copy data to a Vec for sending
-                            if let Some(slice) = data.data() {
-                                let bytes = slice[..size].to_vec();
-                                let _ = buffer_tx_clone.try_send(bytes);
-                            }
+                if let Some(mut pw_buffer) = stream.dequeue_buffer()
+                    && let Some(data) = pw_buffer.datas_mut().first_mut()
+                {
+                    let chunk = data.chunk();
+                    let size = chunk.size() as usize;
+                    if size > 0 {
+                        // Copy data to a Vec for sending
+                        if let Some(slice) = data.data() {
+                            let bytes = slice[..size].to_vec();
+                            let _ = buffer_tx_clone.try_send(bytes);
                         }
                     }
                 }
@@ -421,9 +421,9 @@ impl PipeWireSrc {
                 Err(std_mpsc::TryRecvError::Empty) => {}
             }
 
-            main_loop
-                .loop_()
-                .iterate(std::time::Duration::from_millis(10));
+            main_loop.loop_().iterate(pw::loop_::Timeout::Finite(
+                std::time::Duration::from_millis(10),
+            ));
         }
     }
 }
@@ -432,24 +432,24 @@ impl AsyncSource for PipeWireSrc {
     async fn produce(&mut self, ctx: &mut ProduceContext<'_>) -> Result<ProduceResult> {
         // Check for downstream backpressure before receiving
         // PipeWire is a live source - dropping data is better than accumulating lag
-        if let Some(ref flow_state) = self.flow_state {
-            if !flow_state.should_produce() {
-                // Drop this buffer due to backpressure
-                self.frames_dropped += 1;
-                flow_state.record_drop();
+        if let Some(ref flow_state) = self.flow_state
+            && !flow_state.should_produce()
+        {
+            // Drop this buffer due to backpressure
+            self.frames_dropped += 1;
+            flow_state.record_drop();
 
-                if self.frames_dropped == 1 || self.frames_dropped % 30 == 0 {
-                    tracing::warn!(
-                        "PipeWire: dropping data due to backpressure (total dropped: {})",
-                        self.frames_dropped
-                    );
-                }
-
-                // Drain one buffer from the receiver to keep the capture thread running
-                let _ = self.receiver.recv().await;
-
-                return Ok(ProduceResult::WouldBlock);
+            if self.frames_dropped == 1 || self.frames_dropped.is_multiple_of(30) {
+                tracing::warn!(
+                    "PipeWire: dropping data due to backpressure (total dropped: {})",
+                    self.frames_dropped
+                );
             }
+
+            // Drain one buffer from the receiver to keep the capture thread running
+            let _ = self.receiver.recv().await;
+
+            return Ok(ProduceResult::WouldBlock);
         }
 
         match self.receiver.recv().await {
@@ -499,8 +499,8 @@ impl PipeWireSink {
     pub fn audio(device: Option<&str>) -> Result<Self> {
         pw::init();
 
-        let (buffer_tx, buffer_rx) = bounded::<Vec<u8>>(16);
-        let (shutdown_tx, shutdown_rx) = bounded::<()>(1);
+        let (buffer_tx, buffer_rx) = tokio_mpsc::channel::<Vec<u8>>(16);
+        let (shutdown_tx, shutdown_rx) = std_mpsc::sync_channel::<()>(1);
 
         let device = device.map(|s| s.to_string());
         let thread = thread::spawn(move || {
@@ -520,7 +520,7 @@ impl PipeWireSink {
         mut buffer_rx: tokio_mpsc::Receiver<Vec<u8>>,
         shutdown_rx: std_mpsc::Receiver<()>,
     ) {
-        let main_loop = match pw::main_loop::MainLoop::new(None) {
+        let main_loop = match pw::main_loop::MainLoopRc::new(None) {
             Ok(ml) => ml,
             Err(e) => {
                 tracing::error!("Failed to create PipeWire main loop: {}", e);
@@ -528,7 +528,7 @@ impl PipeWireSink {
             }
         };
 
-        let context = match pw::context::Context::new(&main_loop) {
+        let context = match pw::context::ContextRc::new(&main_loop, None) {
             Ok(ctx) => ctx,
             Err(e) => {
                 tracing::error!("Failed to create PipeWire context: {}", e);
@@ -536,7 +536,7 @@ impl PipeWireSink {
             }
         };
 
-        let core = match context.connect(None) {
+        let core = match context.connect_rc(None) {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!("Failed to connect to PipeWire: {}", e);
@@ -550,7 +550,7 @@ impl PipeWireSink {
             *pw::keys::MEDIA_ROLE => "Music",
         };
 
-        let stream = match pw::stream::Stream::new(&core, "parallax-playback", props) {
+        let stream = match pw::stream::StreamRc::new(core, "parallax-playback", props) {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!("Failed to create PipeWire stream: {}", e);
@@ -562,18 +562,16 @@ impl PipeWireSink {
             .add_local_listener_with_user_data(())
             .process(move |stream, _| {
                 // Get buffer from stream to fill
-                if let Some(mut pw_buffer) = stream.dequeue_buffer() {
-                    if let Some(data) = pw_buffer.datas_mut().first_mut() {
-                        // Check if we have data to play
-                        if let Ok(audio_data) = buffer_rx.try_recv() {
-                            if let Some(slice) = data.data() {
-                                let copy_len = audio_data.len().min(slice.len());
-                                slice[..copy_len].copy_from_slice(&audio_data[..copy_len]);
-                                let chunk = data.chunk_mut();
-                                *chunk.size_mut() = copy_len as u32;
-                            }
-                        }
-                    }
+                if let Some(mut pw_buffer) = stream.dequeue_buffer()
+                    && let Some(data) = pw_buffer.datas_mut().first_mut()
+                    // Check if we have data to play
+                    && let Ok(audio_data) = buffer_rx.try_recv()
+                    && let Some(slice) = data.data()
+                {
+                    let copy_len = audio_data.len().min(slice.len());
+                    slice[..copy_len].copy_from_slice(&audio_data[..copy_len]);
+                    let chunk = data.chunk_mut();
+                    *chunk.size_mut() = copy_len as u32;
                 }
             })
             .register();
@@ -605,9 +603,9 @@ impl PipeWireSink {
                 Ok(()) | Err(std_mpsc::TryRecvError::Disconnected) => break,
                 Err(std_mpsc::TryRecvError::Empty) => {}
             }
-            main_loop
-                .loop_()
-                .iterate(std::time::Duration::from_millis(10));
+            main_loop.loop_().iterate(pw::loop_::Timeout::Finite(
+                std::time::Duration::from_millis(10),
+            ));
         }
     }
 }

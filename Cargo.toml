@@ -145,7 +145,7 @@ oxideav-core = { version = "0.1", optional = true }
 fdk-aac = { version = "0.6", optional = true }
 
 # PipeWire (audio/video capture and playback)
-pipewire = { version = "0.8", optional = true }
+pipewire = { version = "0.10", optional = true }
 
 # libcamera (modern camera API; needs system libcamera >= 0.4 with dev headers,
 # the crate picks matching pregenerated bindings via pkg-config at build time)
