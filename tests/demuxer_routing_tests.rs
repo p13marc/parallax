@@ -365,7 +365,21 @@ async fn mp4_demux_source_seeks_at_runtime() {
     let video_handle = video_sink.handle();
     let node = pipeline.add_demuxer("mp4demux", Mp4DemuxSource::new(demux));
     let vs = pipeline.add_async_sink("video_sink", video_sink);
-    pipeline.link_pads(node, "video", vs, "sink").unwrap();
+    // Capacity 2 on purpose: with the default 16 (+ the sink's queue of 2)
+    // the whole remainder of the 20-frame fixture fits in flight, so a fast
+    // demuxer can reach EOS before the hop-by-hop seek arrives and the test
+    // races scheduling. A small channel guarantees the producer is parked on
+    // back-pressure when the seek lands.
+    pipeline
+        .link_pads_full(
+            node,
+            "video",
+            vs,
+            "sink",
+            parallax::pipeline::LinkPolicy::Block,
+            Some(2),
+        )
+        .unwrap();
 
     let executor = Executor::new();
     let mut handle = executor.start(&mut pipeline).unwrap();
@@ -462,7 +476,21 @@ async fn mp4_demux_source_snap_after_seeks_at_runtime() {
     let video_handle = video_sink.handle();
     let node = pipeline.add_demuxer("mp4demux", Mp4DemuxSource::new(demux));
     let vs = pipeline.add_async_sink("video_sink", video_sink);
-    pipeline.link_pads(node, "video", vs, "sink").unwrap();
+    // Capacity 2 on purpose: with the default 16 (+ the sink's queue of 2)
+    // the whole remainder of the 20-frame fixture fits in flight, so a fast
+    // demuxer can reach EOS before the hop-by-hop seek arrives and the test
+    // races scheduling. A small channel guarantees the producer is parked on
+    // back-pressure when the seek lands.
+    pipeline
+        .link_pads_full(
+            node,
+            "video",
+            vs,
+            "sink",
+            parallax::pipeline::LinkPolicy::Block,
+            Some(2),
+        )
+        .unwrap();
 
     let executor = Executor::new();
     let mut handle = executor.start(&mut pipeline).unwrap();

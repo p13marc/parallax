@@ -158,7 +158,20 @@ async fn mkv_seeks_at_runtime() {
     let video_handle = video_sink.handle();
     let node = pipeline.add_demuxer("mkvdemux", demux);
     let vs = pipeline.add_async_sink("video_sink", video_sink);
-    pipeline.link_pads(node, "video", vs, "sink").unwrap();
+    // Capacity 2: with the default 16 the whole 20-frame fixture fits in
+    // flight and a fast demuxer can hit EOS before the seek arrives (the
+    // race that made this test flake under load). Back-pressure guarantees
+    // the producer is parked when the seek lands.
+    pipeline
+        .link_pads_full(
+            node,
+            "video",
+            vs,
+            "sink",
+            parallax::pipeline::LinkPolicy::Block,
+            Some(2),
+        )
+        .unwrap();
 
     let executor = Executor::new();
     let mut handle = executor.start(&mut pipeline).unwrap();
@@ -222,7 +235,20 @@ async fn mkv_snap_before_seeks_at_runtime() {
     let video_handle = video_sink.handle();
     let node = pipeline.add_demuxer("mkvdemux", demux);
     let vs = pipeline.add_async_sink("video_sink", video_sink);
-    pipeline.link_pads(node, "video", vs, "sink").unwrap();
+    // Capacity 2: with the default 16 the whole 20-frame fixture fits in
+    // flight and a fast demuxer can hit EOS before the seek arrives (the
+    // race that made this test flake under load). Back-pressure guarantees
+    // the producer is parked when the seek lands.
+    pipeline
+        .link_pads_full(
+            node,
+            "video",
+            vs,
+            "sink",
+            parallax::pipeline::LinkPolicy::Block,
+            Some(2),
+        )
+        .unwrap();
 
     let executor = Executor::new();
     let mut handle = executor.start(&mut pipeline).unwrap();
