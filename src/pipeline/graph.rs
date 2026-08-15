@@ -1466,6 +1466,28 @@ impl Pipeline {
             )));
         }
 
+        // Only muxers consume more than one input (#183): every other node
+        // type reads exactly one input branch, and the executor would
+        // silently discard the rest — `src_a ! sink` + `src_b ! sink` used
+        // to compile and lose src_b's stream without a word.
+        if sink_node.element_type() != crate::element::ElementType::Muxer {
+            let already_fed = self
+                .graph
+                .graph()
+                .neighbors_directed(sink.0, daggy::petgraph::Direction::Incoming)
+                .next()
+                .is_some();
+            if already_fed {
+                return Err(Error::InvalidSegment(format!(
+                    "'{}' already has an input link; only muxers accept multiple inputs — \
+                     a {:?} reads a single input and the extra branch would be silently \
+                     dropped. Use a Muxer to merge streams.",
+                    sink_node.name,
+                    sink_node.element_type(),
+                )));
+            }
+        }
+
         // Create the link
         let mut link = Link::with_pads(src_pad, sink_pad).with_policy(policy);
         link.capacity = capacity;
