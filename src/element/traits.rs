@@ -2559,6 +2559,13 @@ impl<E: Element + Send + 'static> SendAsyncElementDyn for ElementAdapter<E> {
         self.inner.handle_upstream_event(event)
     }
 
+    // #164: without this override the dyn default swallowed the call, so a
+    // mid-graph element (Queue2's FlushStart handling, for one) never saw
+    // downstream events in a running pipeline.
+    fn handle_downstream_event(&mut self, event: Event) -> Option<Event> {
+        self.inner.handle_downstream_event(event)
+    }
+
     fn set_bus(&mut self, bus: crate::pipeline::bus::BusHandle) {
         self.inner.set_bus(bus);
     }
@@ -2654,6 +2661,13 @@ impl SendAsyncElementDyn for BoxedElementAdapter {
         self.inner.handle_upstream_event(event)
     }
 
+    // #164: without this override the dyn default swallowed the call, so a
+    // mid-graph element (Queue2's FlushStart handling, for one) never saw
+    // downstream events in a running pipeline.
+    fn handle_downstream_event(&mut self, event: Event) -> Option<Event> {
+        self.inner.handle_downstream_event(event)
+    }
+
     fn set_bus(&mut self, bus: crate::pipeline::bus::BusHandle) {
         self.inner.set_bus(bus);
     }
@@ -2736,6 +2750,12 @@ impl<T: Transform + Send + 'static> SendAsyncElementDyn for TransformAdapter<T> 
     // the author trait so mid-graph elements can handle or translate them.
     fn handle_upstream_event(&mut self, event: &Event) -> EventResult {
         self.inner.handle_upstream_event(event)
+    }
+
+    // #164: without this override the dyn default swallowed the call — see
+    // ElementAdapter.
+    fn handle_downstream_event(&mut self, event: Event) -> Option<Event> {
+        self.inner.handle_downstream_event(event)
     }
 
     fn set_output_budget(&mut self, budget: crate::memory::OutputBudget) {
@@ -3164,6 +3184,12 @@ impl<T: AsyncTransform + Send + 'static> SendAsyncElementDyn for AsyncTransformA
     // the author trait so mid-graph elements can handle or translate them.
     fn handle_upstream_event(&mut self, event: &Event) -> EventResult {
         self.inner.handle_upstream_event(event)
+    }
+
+    // #164: without this override the dyn default swallowed the call — see
+    // ElementAdapter.
+    fn handle_downstream_event(&mut self, event: Event) -> Option<Event> {
+        self.inner.handle_downstream_event(event)
     }
 
     fn set_output_budget(&mut self, budget: crate::memory::OutputBudget) {
@@ -4015,5 +4041,110 @@ mod tests {
         };
         let hints = muxer.execution_hints();
         assert!(!hints.is_rt_safe());
+    }
+
+    /// #164: the mid-graph adapters must forward `handle_downstream_event`
+    /// to the author trait. Before the fix the dyn default swallowed the
+    /// call, so an `Element`'s FlushStart handling (Queue2's ring drop) was
+    /// dead code in a running pipeline.
+    mod downstream_event_forwarding {
+        use super::*;
+
+        /// Records the downstream events it is offered.
+        struct RecordingElement {
+            seen: Vec<&'static str>,
+        }
+
+        fn label(event: &Event) -> &'static str {
+            match event {
+                Event::FlushStart => "flush-start",
+                Event::Eos => "eos",
+                _ => "other",
+            }
+        }
+
+        impl Element for RecordingElement {
+            fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
+                Ok(Some(buffer))
+            }
+            fn handle_downstream_event(&mut self, event: Event) -> Option<Event> {
+                self.seen.push(label(&event));
+                Some(event)
+            }
+        }
+
+        struct RecordingTransform {
+            seen: Vec<&'static str>,
+        }
+
+        impl Transform for RecordingTransform {
+            fn transform(&mut self, buffer: Buffer) -> Result<Output> {
+                Ok(Output::single(buffer))
+            }
+            fn handle_downstream_event(&mut self, event: Event) -> Option<Event> {
+                self.seen.push(label(&event));
+                Some(event)
+            }
+        }
+
+        struct RecordingAsyncTransform {
+            seen: Vec<&'static str>,
+        }
+
+        impl AsyncTransform for RecordingAsyncTransform {
+            async fn transform(&mut self, buffer: Buffer) -> Result<Output> {
+                Ok(Output::single(buffer))
+            }
+            fn handle_downstream_event(&mut self, event: Event) -> Option<Event> {
+                self.seen.push(label(&event));
+                Some(event)
+            }
+        }
+
+        #[test]
+        fn element_adapter_forwards() {
+            let mut adapter = ElementAdapter::new(RecordingElement { seen: vec![] });
+            let out = SendAsyncElementDyn::handle_downstream_event(&mut adapter, Event::FlushStart);
+            assert!(matches!(out, Some(Event::FlushStart)));
+            assert_eq!(adapter.inner.seen, ["flush-start"]);
+        }
+
+        #[test]
+        fn boxed_element_adapter_forwards() {
+            // The recorder is behind a Box<dyn Element>, so observe through
+            // the returned event only: a consuming inner (None) must surface.
+            struct Consuming;
+            impl Element for Consuming {
+                fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
+                    Ok(Some(buffer))
+                }
+                fn handle_downstream_event(&mut self, _event: Event) -> Option<Event> {
+                    None
+                }
+            }
+            let mut adapter = BoxedElementAdapter::new(Box::new(Consuming));
+            let out = SendAsyncElementDyn::handle_downstream_event(&mut adapter, Event::FlushStart);
+            assert!(
+                out.is_none(),
+                "the inner element consumed the event; the dyn default would \
+                 have returned Some without ever offering it"
+            );
+        }
+
+        #[test]
+        fn transform_adapter_forwards() {
+            let mut adapter = TransformAdapter::new(RecordingTransform { seen: vec![] });
+            let out = SendAsyncElementDyn::handle_downstream_event(&mut adapter, Event::Eos);
+            assert!(matches!(out, Some(Event::Eos)));
+            assert_eq!(adapter.inner.seen, ["eos"]);
+        }
+
+        #[test]
+        fn async_transform_adapter_forwards() {
+            let mut adapter = AsyncTransformAdapter::new(RecordingAsyncTransform { seen: vec![] });
+            let out = SendAsyncElementDyn::handle_downstream_event(&mut adapter, Event::FlushStart);
+            assert!(matches!(out, Some(Event::FlushStart)));
+            assert_eq!(adapter.inner.seen, ["flush-start"]);
+        }
     }
 }
