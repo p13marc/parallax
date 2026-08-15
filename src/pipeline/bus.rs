@@ -146,6 +146,23 @@ pub enum MessageKind {
         estimated_total: Option<ClockTime>,
     },
 
+    /// Progressive-download progress from a download-mode `Queue2` (#164).
+    ///
+    /// The range-structured companion to [`Buffering`](Self::Buffering)'s
+    /// percentage: a seek-bar UI shades `ranges` to show which byte seeks
+    /// are instant. Posted throttled (the queue's rate-estimate cadence),
+    /// not per buffer. Poll-anytime access to the same data is
+    /// `Queue2RangesHandle`.
+    DownloadProgress {
+        /// Merged downloaded byte spans `(start, end)`, ascending, in true
+        /// stream offsets.
+        ranges: Vec<(u64, u64)>,
+        /// Total expected stream size, when known.
+        total: Option<u64>,
+        /// Stream offset of the next byte the queue expects to receive.
+        write_pos: u64,
+    },
+
     // --- Async state changes ---
     /// Async state change started.
     AsyncStart,
@@ -235,6 +252,17 @@ impl fmt::Display for MessageKind {
             MessageKind::LatencyChanged => write!(f, "LatencyChanged"),
             MessageKind::Buffering { percent, mode, .. } => {
                 write!(f, "Buffering: {percent}% ({mode:?})")
+            }
+            MessageKind::DownloadProgress {
+                ranges,
+                total,
+                write_pos,
+            } => {
+                write!(
+                    f,
+                    "DownloadProgress: {} range(s), write_pos {write_pos}, total {total:?}",
+                    ranges.len()
+                )
             }
             MessageKind::AsyncStart => write!(f, "AsyncStart"),
             MessageKind::AsyncDone { running_time } => {

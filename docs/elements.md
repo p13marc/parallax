@@ -142,7 +142,7 @@ let (w, h) = info.wait_for_dimensions(0).await.ok_or("session ended")?;
 
 | Element | Description |
 |---------|-------------|
-| `Queue2` | Network buffering: `stream` (memory ring), `download` (progressive file), `timeshift` (circular file); posts `Buffering` messages |
+| `Queue2` | Network buffering: `stream` (memory ring), `download` (progressive file), `timeshift` (circular file); posts `Buffering` messages. Download mode is seek-aware (#164): buffers' `Metadata.offset` (stamped by `FileSrc`/`HttpSrc`) keeps `DownloadedRanges` in true stream offsets across seeks (sparse download file, honest holes), a forward byte seek within `seek_forward_threshold` (default 512 KiB) is **absorbed** — the queue answers `Handled`, flushes downstream from its own task, and skips through arriving data to the target with no upstream traffic — while everything else passes through to the source. Progress: clone `Queue2RangesHandle` via `control()` before start (ranges/total/write_pos), or watch throttled `DownloadProgress` bus messages |
 | `Inspect` | 1-in/1-out passthrough counter (buffers/bytes). **Not** a fan-out — it was called `Tee` and never was one. Fan-out needs no element: link one src-pad to several sinks (see [pipeline.md](pipeline.md#fan-out)). `tee` survives as a deprecated parse alias |
 | `Funnel` | N-to-1 merge (`FunnelInput` handles) |
 | `InputSelector` / `OutputSelector` | Switch between N inputs / route to one of N outputs |

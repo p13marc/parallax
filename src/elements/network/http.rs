@@ -322,15 +322,18 @@ impl Source for HttpSrc {
         match reader.read(slot.data_mut()) {
             Ok(0) => Ok(ProduceResult::Eos),
             Ok(n) => {
+                // `bytes_read` is the absolute stream position (handle_seek
+                // resets it to the Range target), so it is this chunk's true
+                // offset — stamped for byte-aware consumers (Queue2, #164).
+                let offset = self.bytes_read;
                 self.bytes_read += n as u64;
                 let seq = self.sequence;
                 self.sequence += 1;
 
+                let mut metadata = Metadata::from_sequence(seq);
+                metadata.offset = Some(offset);
                 let handle = MemoryHandle::with_len(slot, n);
-                Ok(ProduceResult::OwnBuffer(Buffer::new(
-                    handle,
-                    Metadata::from_sequence(seq),
-                )))
+                Ok(ProduceResult::OwnBuffer(Buffer::new(handle, metadata)))
             }
             Err(e) => Err(Error::Io(e)),
         }
@@ -765,6 +768,11 @@ mod tests {
             panic!("expected data");
         };
         assert_eq!(first.as_bytes(), &body[..64]);
+        assert_eq!(
+            first.metadata().offset,
+            Some(0),
+            "buffers carry their absolute stream offset (#164)"
+        );
 
         let result = src.handle_upstream_event(&Event::Seek(SeekEvent::new_bytes(700)));
         assert!(matches!(
@@ -775,9 +783,20 @@ mod tests {
         ));
         assert_eq!(src.query_position().unwrap().position, Some(700));
 
+        // The first post-seek buffer is stamped with the seek target.
+        let ProduceResult::OwnBuffer(resumed) = src.produce(&mut ctx).unwrap() else {
+            panic!("expected post-seek data");
+        };
+        assert_eq!(resumed.metadata().offset, Some(700), "post-seek offset");
+        assert_eq!(resumed.as_bytes(), &body[700..764]);
+
         let mut out = Vec::new();
         drain(&mut src, &mut out);
-        assert_eq!(out, &body[700..], "stream resumed at the seek offset");
+        assert_eq!(
+            out,
+            &body[764..],
+            "stream continues after the stamped chunk"
+        );
         assert_eq!(src.bytes_read(), 1000);
     }
 

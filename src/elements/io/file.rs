@@ -130,6 +130,12 @@ impl Source for FileSrc {
         // Ensure file is open first
         self.ensure_open()?;
 
+        // Stream offset of this chunk's first byte — `bytes_read` is the
+        // absolute file position (handle_seek resets it), so stamping it as
+        // `Metadata.offset` gives downstream byte-aware elements (Queue2's
+        // download ranges, #164) the truth even across seeks.
+        let offset = self.bytes_read;
+
         if ctx.has_buffer() {
             // Use the provided buffer
             let output = ctx.output();
@@ -143,6 +149,7 @@ impl Source for FileSrc {
 
             self.bytes_read += bytes_read as u64;
             ctx.set_sequence(self.sequence);
+            ctx.metadata_mut().offset = Some(offset);
             self.sequence += 1;
 
             Ok(ProduceResult::Produced(bytes_read))
@@ -163,7 +170,8 @@ impl Source for FileSrc {
             }
 
             self.bytes_read += bytes_read as u64;
-            let metadata = Metadata::from_sequence(self.sequence);
+            let mut metadata = Metadata::from_sequence(self.sequence);
+            metadata.offset = Some(offset);
             self.sequence += 1;
 
             // Create buffer with only the bytes we read
@@ -410,6 +418,11 @@ mod tests {
 
         assert_eq!(buffer.as_bytes(), content);
         assert_eq!(buffer.metadata().sequence, 0);
+        assert_eq!(
+            buffer.metadata().offset,
+            Some(0),
+            "buffers carry their absolute file offset (#164)"
+        );
         assert_eq!(src.bytes_read(), content.len() as u64);
 
         // Next read should return None (EOF)
@@ -431,10 +444,15 @@ mod tests {
         let mut total_read = 0;
         let mut chunk_count = 0;
 
-        while let Some(bytes) = produce_buffer(&mut src) {
-            total_read += bytes.len();
+        while let Some(buffer) = produce_buffer_with_meta(&mut src) {
+            assert_eq!(
+                buffer.metadata().offset,
+                Some(total_read as u64),
+                "each chunk is stamped with its absolute offset (#164)"
+            );
+            total_read += buffer.len();
             chunk_count += 1;
-            assert!(bytes.len() <= 100);
+            assert!(buffer.len() <= 100);
         }
 
         assert_eq!(total_read, 1000);

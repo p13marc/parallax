@@ -28,6 +28,7 @@
 //! | [`ThrottleControl`] | `Throttle` | framerate (drop-based) |
 //! | `JpegQualityControl` | `JpegEncoder` | JPEG quality 1..=100 |
 //! | [`ValveControl`] | `Valve` | open / close |
+//! | [`Queue2RangesHandle`] | `Queue2` (download mode) | *read-only*: downloaded byte ranges, total, write position |
 //! | [`GainControl`] | `Gain` | audio volume (`set_factor`, `set_db`) |
 //! | [`FlowStateHandle`] | `Pipeline::monitor_link` | backpressure signalling to live sources |
 //!
@@ -473,7 +474,7 @@ pub struct EncoderStats {
 // Re-exports: one place to find every runtime handle
 // ============================================================================
 
-pub use crate::elements::flow::ValveControl;
+pub use crate::elements::flow::{Queue2RangesHandle, ValveControl};
 pub use crate::elements::timing::ThrottleControl;
 pub use crate::elements::transform::{GainControl, ScaleControl};
 pub use crate::pipeline::flow::FlowStateHandle;
