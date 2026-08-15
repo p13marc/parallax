@@ -41,13 +41,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
-/// How long a blocked `acquire` sleeps before re-checking the arena.
+/// Ceiling on one doorbell wait.
 ///
-/// A slot detached by [`PooledBuffer::into_buffer`] returns through the arena's
-/// release queue, which notifies nobody, so waiting purely on the condvar can
-/// sleep through a slot becoming free. Short enough to be invisible next to a
-/// frame interval, long enough that the re-check costs nothing.
-const DETACH_POLL: Duration = Duration::from_millis(2);
+/// In-protocol, every last-reference drop that can unblock this pool happens
+/// in this process and rings the arena doorbell (`IpcSink`/`IpcPublisher`
+/// hold their clone until the peer acks, so the owner-side drop is last).
+/// This bounds the damage if some out-of-protocol *remote* peer drops the
+/// true last reference: the release-queue entry is there, only the wake-up
+/// is missing. A fallback, not a schedule — 100x coarser than the 2 ms
+/// detach poll it replaced (#180).
+const REMOTE_RELEASE_SAFETY_NET: Duration = Duration::from_millis(250);
 
 // ============================================================================
 // BufferPool Trait
@@ -245,18 +248,12 @@ impl PooledBuffer {
 impl Drop for PooledBuffer {
     fn drop(&mut self) {
         if let Some(slot) = self.slot.take() {
-            // Return the slot to the arena's release queue BEFORE notifying,
-            // or a woken waiter can find nothing to reclaim, re-wait, and
-            // never be notified again (the slot would otherwise drop after
-            // this body, in field-drop order).
+            // Dropping the slot pushes it to the arena's release queue and
+            // rings the arena doorbell — the same wake-up path a detached
+            // buffer takes when its last `SharedSlotRef` drops downstream
+            // (#180). Nothing pool-side to notify any more.
             drop(slot);
             self.pool_inner.stats.in_use.fetch_sub(1, Ordering::Relaxed);
-            // Notify while holding the pool mutex: a waiter holds it from
-            // its failed try_acquire() until it parks in wait(), so an
-            // unlocked notify could fire in that window and be lost — the
-            // waiter would then sleep forever (lost wakeup).
-            let _guard = self.pool_inner.mutex.lock().unwrap();
-            self.pool_inner.notify.notify_one();
         }
         // If slot is None, it was detached via into_buffer()
     }
@@ -306,14 +303,12 @@ pub struct FixedBufferPool {
 
 /// Shared pool state (referenced by both pool and pooled buffers).
 struct PoolInner {
-    /// The underlying shared arena.
+    /// The underlying shared arena. Its doorbell is the pool's wait
+    /// primitive: every returning slot — detached or not — rings it from
+    /// `SharedSlotRef::drop` (#180).
     arena: SharedArena,
     /// Statistics tracking.
     stats: PoolStatsInner,
-    /// Notification for waiters.
-    notify: std::sync::Condvar,
-    /// Mutex for condition variable.
-    mutex: std::sync::Mutex<()>,
 }
 
 /// Internal statistics tracking.
@@ -360,8 +355,6 @@ impl FixedBufferPool {
                     waits: AtomicU64::new(0),
                     detached: AtomicU64::new(0),
                 },
-                notify: std::sync::Condvar::new(),
-                mutex: std::sync::Mutex::new(()),
             }),
         }))
     }
@@ -379,26 +372,20 @@ impl BufferPool for FixedBufferPool {
             return Ok(buffer);
         }
 
-        // Slow path: wait for a buffer
+        // Slow path: park on the arena doorbell (#180). Every returning
+        // slot — dropped OR detached-and-dropped-downstream — rings it
+        // from `SharedSlotRef::drop`.
         self.inner.stats.waits.fetch_add(1, Ordering::Relaxed);
 
-        let mut guard = self.inner.mutex.lock().unwrap();
+        let waiter = self.inner.arena.doorbell().register();
         loop {
+            // Re-check AFTER register(): the doorbell's fence pair makes
+            // "registered, then saw nothing free" imply "the producer will
+            // see us and ring".
             if let Some(buffer) = self.try_acquire() {
                 return Ok(buffer);
             }
-
-            // Poll rather than wait outright, because not every returning slot
-            // rings the bell: `into_buffer()` detaches, so the slot comes back
-            // through `SharedSlotRef::drop` -> the arena's release queue, and
-            // `PooledBuffer::drop` — the only thing that notifies — never runs.
-            // Detaching is the *normal* path for a buffer sent downstream, so a
-            // pure `wait()` here sleeps through the common case.
-            //
-            // The notify still fires for undetached returns and keeps those
-            // immediate; this bounds the damage for the rest.
-            let (g, _) = self.inner.notify.wait_timeout(guard, DETACH_POLL).unwrap();
-            guard = g;
+            waiter.wait(REMOTE_RELEASE_SAFETY_NET);
         }
     }
 
@@ -424,12 +411,11 @@ impl BufferPool for FixedBufferPool {
             return Ok(Some(buffer));
         }
 
-        // Slow path with timeout
+        // Slow path: doorbell wait with a deadline (#180).
         self.inner.stats.waits.fetch_add(1, Ordering::Relaxed);
 
-        let mut guard = self.inner.mutex.lock().unwrap();
         let deadline = std::time::Instant::now() + timeout;
-
+        let waiter = self.inner.arena.doorbell().register();
         loop {
             if let Some(buffer) = self.try_acquire() {
                 return Ok(Some(buffer));
@@ -439,16 +425,7 @@ impl BufferPool for FixedBufferPool {
             if remaining.is_zero() {
                 return Ok(None);
             }
-
-            // Capped for the same reason `acquire` polls: a detached slot
-            // returns without a notify, and waiting out the caller's full
-            // timeout would report failure with a free slot sitting there.
-            let (new_guard, _) = self
-                .inner
-                .notify
-                .wait_timeout(guard, remaining.min(DETACH_POLL))
-                .unwrap();
-            guard = new_guard;
+            waiter.wait(remaining.min(REMOTE_RELEASE_SAFETY_NET));
         }
     }
 
@@ -480,12 +457,8 @@ impl BufferPool for FixedBufferPool {
     }
 }
 
-// Implement Drop to wake any waiting threads when pool is destroyed
-impl Drop for FixedBufferPool {
-    fn drop(&mut self) {
-        self.inner.notify.notify_all();
-    }
-}
+// No Drop needed: waiters hold Arc<PoolInner>, so the arena (and its
+// doorbell) outlives them, and every wait is bounded by the safety net.
 
 #[cfg(test)]
 mod tests {
@@ -741,5 +714,61 @@ mod tests {
             "waited {elapsed:?} for a slot freed almost immediately — the \
              timeout was slept out instead of polled"
         );
+    }
+
+    #[test]
+    fn wake_latency_is_doorbell_fast() {
+        // #180: the wake must come from the doorbell ring, not the 250 ms
+        // safety-net timeout. 100 ms is generous against scheduler noise
+        // while still catching "only the safety net woke us".
+        let pool = FixedBufferPool::new(1024, 1).unwrap();
+        let detached = pool.acquire().unwrap().into_buffer();
+
+        let waiter = {
+            let pool = Arc::clone(&pool);
+            std::thread::spawn(move || {
+                let b = pool.acquire().unwrap();
+                (std::time::Instant::now(), b.capacity())
+            })
+        };
+
+        std::thread::sleep(Duration::from_millis(30));
+        let dropped_at = std::time::Instant::now();
+        drop(detached);
+
+        let (woke_at, cap) = waiter.join().unwrap();
+        assert_eq!(cap, 1024);
+        let latency = woke_at.saturating_duration_since(dropped_at);
+        assert!(
+            latency < Duration::from_millis(100),
+            "woke {latency:?} after the drop — doorbell missed, safety net fired"
+        );
+    }
+
+    #[test]
+    fn doorbell_ping_pong_never_loses_a_wakeup() {
+        // Two threads fighting over a pool of one, every acquire bounded:
+        // a lost doorbell wakeup surfaces as a timed-out acquire.
+        let pool = FixedBufferPool::new(64, 1).unwrap();
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let pool = Arc::clone(&pool);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..5_000u32 {
+                    let got = pool.acquire_timeout(Duration::from_secs(5)).unwrap();
+                    let buf = got.unwrap_or_else(|| panic!("acquire {i} timed out — lost wakeup"));
+                    // Alternate detached and plain returns so both drop
+                    // paths ring.
+                    if i % 2 == 0 {
+                        drop(buf.into_buffer());
+                    } else {
+                        drop(buf);
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 }

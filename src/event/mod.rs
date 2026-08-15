@@ -892,6 +892,11 @@ impl CustomEvent {
 ///
 /// This unified type allows buffers and events to flow through the same
 /// channels, ensuring proper ordering of serialized events with data.
+// Boxing the Buffer variant would put a heap allocation on every buffer
+// hop — the exact cost the executor's data path is ratcheted to zero on
+// (tests/media_alloc_tests.rs). The size gap is inherent: a Buffer embeds
+// its arena handle by value so that clone/drop stay allocation-free.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum PipelineItem {
     /// A data buffer.

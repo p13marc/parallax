@@ -1382,7 +1382,7 @@ impl Executor {
         Vec<Arc<AsyncRtBridge>>,
         Option<JoinHandle<Result<()>>>,
     )> {
-        use crate::pipeline::rt_bridge::EventFd;
+        use crate::memory::EventFd;
         use crate::pipeline::rt_scheduler::{BoundaryDirection, spawn_data_thread};
 
         // Create bridges at boundaries

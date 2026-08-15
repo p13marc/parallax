@@ -30,6 +30,7 @@
 use super::defaults;
 use super::shared_refcount::{SharedArena, SharedSlotRef};
 use crate::error::{Error, Result};
+use std::time::Duration;
 
 /// The slot count an element's output arena should have, as computed by the
 /// executor from the graph it is about to run.
@@ -302,6 +303,42 @@ impl OutputArena {
         }
     }
 
+    /// [`admit`](Self::admit), but wait up to `timeout` for a slot before
+    /// giving up (#180).
+    ///
+    /// For call sites that would rather stall briefly than shed — an encoder
+    /// shedding a packet leaves a `frame_num` gap until the next IDR, so one
+    /// or two frame intervals of waiting can be the better trade. Not wired
+    /// into any built-in element; opting in is a per-element latency
+    /// decision. Blocks the calling thread — keep it off Tokio workers for
+    /// anything longer than a frame interval.
+    pub fn admit_within(&mut self, timeout: Duration) -> Result<()> {
+        if self.admit().is_ok() {
+            return Ok(());
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        // Clone so the waiter's borrow doesn't overlap `admit(&mut self)`;
+        // the doorbell Arc is shared across clones, so rings still land.
+        let arena = self
+            .arena
+            .as_ref()
+            .expect("admit only fails on a built arena")
+            .clone();
+        let waiter = arena.doorbell().register();
+        loop {
+            // Re-check after registering (doorbell fence pair closes the
+            // lost-wakeup window); admit() reclaims — and sweeps orphans.
+            if self.admit().is_ok() {
+                return Ok(());
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(Error::PoolExhausted);
+            }
+            waiter.wait(remaining.min(Duration::from_millis(250)));
+        }
+    }
+
     /// Acquire a slot big enough for `len` bytes, building the arena if needed.
     ///
     /// The arena's slot size is fixed at build time, from `len` and
@@ -496,6 +533,54 @@ mod tests {
         drop(held);
         assert!(out.admit().is_ok());
         assert!(out.acquire(64, "t").is_ok());
+    }
+
+    #[test]
+    fn admit_within_passes_trivially_before_the_arena_exists() {
+        let mut out = OutputArena::new(2);
+        assert!(out.admit_within(Duration::from_millis(1)).is_ok());
+    }
+
+    #[test]
+    fn admit_within_wakes_when_a_slot_frees() {
+        // #180: a slot dropped from another thread rings the arena doorbell
+        // and unblocks admit_within well before its deadline.
+        let mut out = OutputArena::new(2);
+        out.set_slots(2);
+        let held: Vec<_> = (0..2).map(|_| out.acquire(64, "t").unwrap()).collect();
+        assert!(matches!(out.admit(), Err(Error::PoolExhausted)));
+
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            drop(held);
+        });
+
+        let started = std::time::Instant::now();
+        out.admit_within(Duration::from_secs(5)).unwrap();
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_millis(200),
+            "admit_within took {waited:?} — the doorbell missed and only a \
+             timeout slice woke it"
+        );
+        releaser.join().unwrap();
+    }
+
+    #[test]
+    fn admit_within_gives_up_at_the_deadline() {
+        let mut out = OutputArena::new(2);
+        out.set_slots(2);
+        let _held: Vec<_> = (0..2).map(|_| out.acquire(64, "t").unwrap()).collect();
+
+        let started = std::time::Instant::now();
+        let result = out.admit_within(Duration::from_millis(50));
+        assert!(matches!(result, Err(Error::PoolExhausted)));
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(45),
+            "returned early: {waited:?}"
+        );
+        assert!(waited < Duration::from_secs(2), "overslept: {waited:?}");
     }
 
     #[test]

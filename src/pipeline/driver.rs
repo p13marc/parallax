@@ -40,7 +40,7 @@
 //! ```
 
 use crate::error::{Error, Result};
-use crate::pipeline::rt_bridge::EventFd;
+use crate::memory::EventFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};

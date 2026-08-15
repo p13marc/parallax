@@ -60,7 +60,8 @@
 
 use crate::element::{AsyncElementDyn, DynAsyncElement};
 use crate::error::{Error, Result};
-use crate::pipeline::rt_bridge::{AsyncRtBridge, BridgeConfig, EventFd};
+use crate::memory::EventFd;
+use crate::pipeline::rt_bridge::{AsyncRtBridge, BridgeConfig};
 use crate::pipeline::{NodeId, Pipeline};
 use std::collections::HashMap;
 use std::sync::Arc;

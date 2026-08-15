@@ -76,7 +76,7 @@ pub use graph::{
 };
 pub use parser::{ParsedElement, ParsedPipeline, PropertyValue, parse_pipeline};
 pub use probe::{PadDirection, PadRef, ProbeData, ProbeId, ProbeRegistry, ProbeReturn, ProbeType};
-pub use rt_bridge::{AsyncRtBridge, BridgeConfig, EventFd, SharedBridge, shared_bridge};
+pub use rt_bridge::{AsyncRtBridge, BridgeConfig, SharedBridge, shared_bridge};
 pub use rt_scheduler::{
     ActivationRecord, BoundaryDirection, BoundaryEdge, DataThreadHandle, GraphPartition,
     NodeStatus, RtConfig, RtScheduler, SchedulingMode, spawn_data_thread,

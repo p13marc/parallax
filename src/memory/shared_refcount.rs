@@ -91,6 +91,9 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::Duration;
+
+use super::eventfd::EventFd;
 
 /// Magic number to identify valid arena headers.
 const ARENA_MAGIC: u64 = 0x504C585F4152454E; // "PLX_AREN" in ASCII
@@ -671,6 +674,102 @@ fn calculate_layout_aligned(
     )
 }
 
+/// Process-local wake-up for slot releases (#180).
+///
+/// The release queue notifies nobody by design (release stays O(1) and
+/// wait-free); the price was that waiters polled — `FixedBufferPool` in
+/// 2 ms slices. The doorbell closes that gap: a last-reference drop rings
+/// it after pushing to the queue, and blocking waiters
+/// (`FixedBufferPool::acquire`, `OutputArena::admit_within`) park on the
+/// eventfd instead of polling.
+///
+/// Deliberately NOT in shared memory: an eventfd is a per-process resource,
+/// so a *remote* peer's drop cannot ring the owner's doorbell — waiters
+/// carry a coarse safety-net timeout for that case (the queue entry is
+/// there; only the wake-up is missing). The eventfd is created lazily on
+/// first wait so the majority of arenas (no blocking waiters) never carry
+/// an fd, and a zero-waiter ring costs one fence + one relaxed load, no
+/// syscall — which keeps `SharedSlotRef::drop` cheap.
+pub(crate) struct Doorbell {
+    /// Created by the first waiter. `None` inside means creation failed
+    /// (fd exhaustion); waiters then degrade to a short sleep-poll.
+    event: std::sync::OnceLock<Option<EventFd>>,
+    /// Threads currently between `register()` and their wake-up.
+    waiters: AtomicU32,
+}
+
+impl Doorbell {
+    fn new() -> Self {
+        Self {
+            event: std::sync::OnceLock::new(),
+            waiters: AtomicU32::new(0),
+        }
+    }
+
+    /// Producer side. Call AFTER making the resource visible (queue push /
+    /// orphan count).
+    ///
+    /// # Lost-wakeup proof
+    ///
+    /// Producer: push (P), `fence(SeqCst)` (F1), load `waiters` (L).
+    /// Waiter: init fd + `fetch_add(waiters)` (A), `fence(SeqCst)` (F2),
+    /// re-check the resource (R), park on the fd. SeqCst fences are totally
+    /// ordered, so either F1 < F2 — then P is visible to R and the waiter
+    /// never parks on a stale view — or F2 < F1 — then A (and the fd
+    /// initialization sequenced before it) is visible to L, the producer
+    /// notifies, and the eventfd counter is sticky: even a notify landing
+    /// between the waiter's failed re-check and its park leaves the fd
+    /// readable, so the park returns immediately.
+    #[inline]
+    pub(crate) fn ring(&self) {
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if self.waiters.load(Ordering::Relaxed) > 0
+            && let Some(Some(event)) = self.event.get()
+        {
+            // A failed write is covered by the waiter's safety-net timeout.
+            let _ = event.notify();
+        }
+    }
+
+    /// Waiter side: register, then re-check the resource, then `wait`.
+    /// RAII so a panicking or early-returning waiter cannot leave the
+    /// count stuck high.
+    pub(crate) fn register(&self) -> DoorbellWaiter<'_> {
+        // fd first: a producer that observes our waiters increment must be
+        // able to resolve the fd (see ring's proof).
+        let _ = self.event.get_or_init(|| EventFd::new().ok());
+        self.waiters.fetch_add(1, Ordering::Relaxed);
+        std::sync::atomic::fence(Ordering::SeqCst);
+        DoorbellWaiter { bell: self }
+    }
+}
+
+/// RAII registration on a [`Doorbell`]; de-registers on drop.
+pub(crate) struct DoorbellWaiter<'a> {
+    bell: &'a Doorbell,
+}
+
+impl DoorbellWaiter<'_> {
+    /// Park until rung or `timeout` elapses. Returns true if rung; the
+    /// caller re-checks the resource either way.
+    pub(crate) fn wait(&self, timeout: Duration) -> bool {
+        match self.bell.event.get() {
+            Some(Some(event)) => event.wait_timeout(timeout).unwrap_or(false),
+            // Degraded mode (no fd): a bounded sleep-poll.
+            _ => {
+                std::thread::sleep(timeout.min(Duration::from_millis(10)));
+                false
+            }
+        }
+    }
+}
+
+impl Drop for DoorbellWaiter<'_> {
+    fn drop(&mut self) {
+        self.bell.waiters.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Arena with shared-memory reference counting and lock-free release queue.
 ///
 /// This arena stores refcounts in the shared memory itself, enabling true
@@ -723,6 +822,10 @@ pub struct SharedArena {
     arena_id: u64,
     /// Whether this is the owner (can acquire/reclaim) or a client (clone/drop only).
     is_owner: bool,
+    /// Release doorbell, shared by all in-process clones (#180). A
+    /// `from_fd` client gets its own — it cannot ring the owner's, and
+    /// the owner's waiters cover that with a safety-net timeout.
+    doorbell: Arc<Doorbell>,
 }
 
 impl SharedArena {
@@ -848,6 +951,7 @@ impl SharedArena {
             slot_count,
             arena_id,
             is_owner: true,
+            doorbell: Arc::new(Doorbell::new()),
         })
     }
 
@@ -981,6 +1085,7 @@ impl SharedArena {
             slot_count,
             arena_id,
             is_owner: false, // Client cannot acquire new slots
+            doorbell: Arc::new(Doorbell::new()),
         })
     }
 
@@ -1081,6 +1186,11 @@ impl SharedArena {
         unsafe { self.header.as_ref() }
             .orphaned
             .load(Ordering::Relaxed) as usize
+    }
+
+    /// The release doorbell (#180), for blocking waiters.
+    pub(crate) fn doorbell(&self) -> &Doorbell {
+        &self.doorbell
     }
 
     /// Get the number of slots pending in the release queue.
@@ -1307,6 +1417,7 @@ impl Clone for SharedArena {
             slot_count: self.slot_count,
             arena_id: self.arena_id,
             is_owner: self.is_owner,
+            doorbell: Arc::clone(&self.doorbell),
         }
     }
 }
@@ -1524,6 +1635,10 @@ impl Drop for SharedSlotRef {
                 let header = unsafe { self.arena.header.as_ref() };
                 header.orphaned.fetch_add(1, Ordering::Release);
             }
+            // Wake any blocking waiter in THIS process (#180). Rings on the
+            // orphan path too — a sweep-capable reclaim frees either. With
+            // no waiters this is a fence + relaxed load, no syscall.
+            self.arena.doorbell.ring();
         }
     }
 }

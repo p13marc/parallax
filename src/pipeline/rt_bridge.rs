@@ -35,14 +35,10 @@
 
 use crate::buffer::Buffer;
 use crate::error::{Error, Result};
+use crate::memory::EventFd;
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-
-#[cfg(target_os = "linux")]
-use rustix::event::{EventfdFlags, eventfd};
-#[cfg(target_os = "linux")]
-use rustix::fd::OwnedFd;
 
 // ============================================================================
 // Configuration
@@ -85,133 +81,8 @@ impl BridgeConfig {
     }
 }
 
-// ============================================================================
-// EventFd Wrapper
-// ============================================================================
-
-/// Cross-platform eventfd abstraction.
-///
-/// On Linux, this uses the native eventfd syscall.
-/// On other platforms, this falls back to atomics with polling.
-#[cfg(target_os = "linux")]
-pub struct EventFd {
-    fd: OwnedFd,
-}
-
-#[cfg(target_os = "linux")]
-impl EventFd {
-    /// Create a new eventfd with initial value 0.
-    pub fn new() -> Result<Self> {
-        let fd = eventfd(0, EventfdFlags::NONBLOCK | EventfdFlags::CLOEXEC)
-            .map_err(|e| Error::Io(std::io::Error::other(format!("eventfd: {}", e))))?;
-        Ok(Self { fd })
-    }
-
-    /// Signal the eventfd (increment counter).
-    ///
-    /// This is safe to call from any thread, including RT threads.
-    pub fn notify(&self) -> Result<()> {
-        let val: u64 = 1;
-        let bytes = val.to_ne_bytes();
-        rustix::io::write(&self.fd, &bytes)
-            .map_err(|e| Error::Io(std::io::Error::other(format!("eventfd write: {}", e))))?;
-        Ok(())
-    }
-
-    /// Try to read from the eventfd (non-blocking).
-    ///
-    /// Returns `true` if the eventfd was signaled, `false` if it would block.
-    pub fn try_wait(&self) -> Result<bool> {
-        let mut buf = [0u8; 8];
-        match rustix::io::read(&self.fd, &mut buf) {
-            Ok(8) => Ok(true),
-            Ok(_) => Ok(false),
-            Err(rustix::io::Errno::WOULDBLOCK) => Ok(false),
-            Err(e) => Err(Error::Io(std::io::Error::other(format!(
-                "eventfd read: {}",
-                e
-            )))),
-        }
-    }
-
-    /// Wait asynchronously for the eventfd to be signaled.
-    ///
-    /// This uses tokio's async file descriptor support.
-    pub async fn wait_async(&self) -> Result<()> {
-        use std::os::unix::io::AsFd;
-        use tokio::io::Interest;
-        use tokio::io::unix::AsyncFd;
-
-        let async_fd =
-            AsyncFd::with_interest(self.fd.as_fd(), Interest::READABLE).map_err(Error::Io)?;
-
-        loop {
-            let mut guard = async_fd.readable().await.map_err(Error::Io)?;
-
-            match self.try_wait() {
-                Ok(true) => return Ok(()),
-                Ok(false) => {
-                    guard.clear_ready();
-                    continue;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-    }
-
-    /// Get the raw file descriptor for use with epoll/select.
-    #[cfg(target_os = "linux")]
-    pub fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
-        use std::os::unix::io::AsRawFd;
-        self.fd.as_raw_fd()
-    }
-}
-
-/// Fallback EventFd for non-Linux platforms using atomics.
-#[cfg(not(target_os = "linux"))]
-pub struct EventFd {
-    counter: AtomicU64,
-}
-
-#[cfg(not(target_os = "linux"))]
-impl EventFd {
-    pub fn new() -> Result<Self> {
-        Ok(Self {
-            counter: AtomicU64::new(0),
-        })
-    }
-
-    pub fn notify(&self) -> Result<()> {
-        self.counter.fetch_add(1, Ordering::Release);
-        Ok(())
-    }
-
-    pub fn try_wait(&self) -> Result<bool> {
-        loop {
-            let val = self.counter.load(Ordering::Acquire);
-            if val == 0 {
-                return Ok(false);
-            }
-            if self
-                .counter
-                .compare_exchange(val, val - 1, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                return Ok(true);
-            }
-        }
-    }
-
-    pub async fn wait_async(&self) -> Result<()> {
-        // Polling fallback for non-Linux
-        loop {
-            if self.try_wait()? {
-                return Ok(());
-            }
-            tokio::time::sleep(std::time::Duration::from_micros(100)).await;
-        }
-    }
-}
+// EventFd lives in `crate::memory::eventfd` (#180 moved it beside its
+// newest consumer, the arena release-queue doorbell); re-imported above.
 
 // ============================================================================
 // Ring Buffer Slot

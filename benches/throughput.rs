@@ -23,9 +23,10 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use parallax::buffer::{Buffer, MemoryHandle};
 use parallax::element::Element;
 use parallax::elements::{NullSink, NullSource, PassThrough};
+use parallax::memory::EventFd;
 use parallax::memory::SharedArena;
 use parallax::metadata::Metadata;
-use parallax::pipeline::rt_bridge::{AsyncRtBridge, BridgeConfig, EventFd};
+use parallax::pipeline::rt_bridge::{AsyncRtBridge, BridgeConfig};
 use parallax::pipeline::rt_scheduler::{RtConfig, SchedulingMode};
 use parallax::pipeline::{Executor, LinkPolicy, Pipeline, UnifiedExecutorConfig as ExecutorConfig};
 use std::hint::black_box;

@@ -149,10 +149,15 @@ that would have drained the channel it is waiting on, which deadlocks rather tha
 merely stalling. Elements that allocate their own output buffers use an arena
 sized up front instead; see [Output arenas](#output-arenas) below.
 
-Note also that the pool's condvar only fires for *undetached* returns. A buffer
-sent downstream has been through `into_buffer()`, so its slot comes back via the
-arena's release queue and nothing rings the bell; `acquire()` therefore polls as
-well as waiting.
+A blocked `acquire()` parks on the arena's **release doorbell** — a process-local
+eventfd rung by every last-reference drop, detached or not, right after the slot
+enters the release queue. The zero-waiter ring costs no syscall (a fence plus one
+relaxed load), so releasing stays cheap when nobody waits. The doorbell cannot
+hear a drop in *another* process, so waits carry a coarse 250 ms safety-net
+re-check for that out-of-protocol case; in-protocol, the IPC senders hold their
+clone until the peer acks, making the owner-side drop the last one.
+`OutputArena::admit_within(timeout)` offers the same bounded wait to elements
+that would rather stall briefly than shed.
 
 Sensible slot sizes/counts for common media (1080p YUV, encoded video, audio periods, TS/MP4 mux buffers, …) are provided as constants in `parallax::memory::defaults`.
 
