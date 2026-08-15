@@ -16,6 +16,11 @@ env:
   # shared compiler cache: sccache (mounted from the runner VM) -> garage S3
   # on vm-runner-01; S3 endpoint+credentials come from the runner's env_file
   RUSTC_WRAPPER: /srv/cache/bin/sccache
+  # #176: cap the on-disk spool. Only the local-disk backend reads this —
+  # when the S3 credentials are present it is inert, but when they are
+  # missing sccache silently falls back to a local cache that grew without
+  # bound and helped fill the runner's disk (ENOSPC in run 127).
+  SCCACHE_CACHE_SIZE: 10G
   CARGO_INCREMENTAL: "0"
 
 jobs:
