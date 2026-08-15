@@ -49,9 +49,9 @@ Everything — including the bookkeeping — lives inside the shared mapping:
 
 - **Clone** (`SharedSlotRef::clone`, `slice()`, `slot_from_ipc`) → `fetch_add` on the slot refcount.
 - **Drop** → `fetch_sub`; the process that drops the last reference pushes the slot index onto the `ReleaseQueue` (lock-free, O(1)).
-- **Reclaim** — the owner calls `arena.reclaim()` (done automatically by pools before acquiring) and pops released indices, marking slots free: O(k) in released slots, never O(n) in pool size.
+- **Reclaim** — the owner calls `arena.reclaim()` (done automatically by pools before acquiring) and pops released indices, marking slots free: O(k) in released slots. If a release ever met a full ring, the drop was counted in the header's `orphaned` field and the next `reclaim()` runs a one-shot O(n) sweep of the slot headers to recover those slots — a slot's state+refcount share one atomic word, so `(Allocated, rc=0)` unambiguously means "released" and the sweep can never free a live or mid-acquire slot.
 
-Refcount overflow is guarded (panics past `i32::MAX`); reconstruction from IPC validates arena id, slot bounds, and `Allocated` state, so a peer cannot resurrect a freed slot.
+Refcount overflow is guarded (panics past `i32::MAX`); reconstruction from IPC validates arena id, slot bounds, and liveness in one CAS (`try_inc_ref`), so a peer can neither resurrect a freed slot nor a released one whose refcount already hit zero — a stale ref resolves to `None`. `IpcSink` upholds the sender half of that contract by holding a live `Buffer` clone for every un-acked slot.
 
 ### Sending buffers to another process
 
@@ -276,7 +276,7 @@ magnitude rather than targets.
 | `Buffer::clone` (any process) | the above plus a `Metadata` clone | ~90 ns empty metadata |
 | Slot acquire + release + reclaim | O(n) scan (n = pool size; pools pre-reclaim) | ~280 ns, flat in slot size |
 | Slot release | O(1) lock-free queue push | — |
-| Owner reclaim | O(k), k = released slots | — |
+| Owner reclaim | O(k), k = released slots (one-shot O(n) sweep only after a ring overflow) | — |
 | Cross-process send | O(1) after one-time arena fd pass | ~13 µs to map an arena |
 | `Buffer::slice` | O(1), zero-copy | — |
 

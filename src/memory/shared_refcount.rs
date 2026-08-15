@@ -11,11 +11,12 @@
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────────┐
-//! │ ArenaHeader (128 bytes, cache-line aligned)                     │
+//! │ ArenaHeader (64 bytes, cache-line aligned)                      │
 //! │ ┌─────────────────────────────────────────────────────────────┐ │
 //! │ │ magic: u64          │ version: u32  │ slot_count: u32       │ │
 //! │ │ slot_size: u32      │ data_offset: u32                      │ │
-//! │ │ arena_id: u64                                               │ │
+//! │ │ arena_id: u64       │ slot_headers_offset │ refcount        │ │
+//! │ │ slot_stride │ alignment │ reclaim_lock │ orphaned           │ │
 //! │ └─────────────────────────────────────────────────────────────┘ │
 //! ├─────────────────────────────────────────────────────────────────┤
 //! │ ReleaseQueue (in shared memory, MPSC lock-free)                 │
@@ -26,8 +27,8 @@
 //! ├─────────────────────────────────────────────────────────────────┤
 //! │ SlotHeader[0..N] (8 bytes each, naturally aligned)              │
 //! │ ┌────────────┬────────────┬────────────┬────────────┐          │
-//! │ │refcount:u32│refcount:u32│refcount:u32│refcount:u32│ ...      │
-//! │ │state:u32   │state:u32   │state:u32   │state:u32   │          │
+//! │ │ word: u64  │ word: u64  │ word: u64  │ word: u64  │ ...      │
+//! │ │ (state<<32 | refcount, one atomic)                │          │
 //! │ └────────────┴────────────┴────────────┴────────────┘          │
 //! ├─────────────────────────────────────────────────────────────────┤
 //! │ SlotData[0..N] (slot_size bytes each)                           │
@@ -44,7 +45,11 @@
 //! owner drains this queue to reclaim slots.
 //!
 //! This avoids O(n) scanning - release is O(1) and reclaim is O(k) where
-//! k is the number of released slots.
+//! k is the number of released slots. If a release ever finds the ring
+//! full, the drop is counted in `ArenaHeader::orphaned` and the owner's
+//! next `reclaim()` does a one-shot O(n) sweep of the slot headers to
+//! recover the orphans (#177) — sound because the packed slot word makes
+//! (Allocated, rc=0) unambiguous.
 //!
 //! # Cross-Process Semantics
 //!
@@ -95,9 +100,17 @@ const ARENA_MAGIC: u64 = 0x504C585F4152454E; // "PLX_AREN" in ASCII
 /// v4 added `slot_stride` and `alignment` to [`ArenaHeader`]. Before that a
 /// client mapping the arena had to *guess* the stride, and guessed 64-byte
 /// rounding — silently mis-addressing every slot of a 32-byte-aligned arena
-/// whose slot size was not already a multiple of 64. The bump is required
-/// rather than cosmetic: a v3 writer leaves those bytes zeroed.
-const ARENA_VERSION: u32 = 4;
+/// whose slot size was not already a multiple of 64.
+///
+/// v5 packs each [`SlotHeader`]'s state+refcount into one `AtomicU64` and
+/// adds the `orphaned` counter (#177). The byte layout is unchanged on
+/// little-endian, but the bump is required, not cosmetic: a v4 peer CASes
+/// the state half-word independently, so its `try_acquire` could interleave
+/// between a v5 peer's 64-bit transitions — e.g. succeed against a slot a
+/// v5 orphan sweep is concurrently freeing — recreating the very
+/// double-allocation race the packing removes. `validate()`'s exact
+/// equality check makes mixed-version mapping impossible.
+const ARENA_VERSION: u32 = 5;
 
 /// Size of the release queue (must be power of 2 for efficient modulo).
 /// This limits how many slots can be pending release at once.
@@ -140,6 +153,8 @@ pub struct ArenaMetrics {
     pub free_slots: usize,
     /// Number of slots pending release (in the release queue).
     pub pending_release: usize,
+    /// Slots orphaned by a full release queue, awaiting the sweep (#177).
+    pub orphaned: usize,
     /// Total arena memory in bytes (including headers).
     pub total_bytes: usize,
     /// Bytes used by allocated slots (allocated_slots * slot_size).
@@ -406,8 +421,15 @@ struct ArenaHeader {
     /// bytes: memfd memory is zero-filled, so pre-existing arenas read as
     /// unlocked and the format version is unchanged.
     reclaim_lock: AtomicU32,
-    /// Reserved for future use.
-    _reserved: [u8; 4],
+    /// Count of slots whose last reference dropped while the release queue
+    /// was full (#177). Such a slot sits at (Allocated, rc=0), invisible to
+    /// `free_count`/`has_free`. Lives in shared memory, not process-local:
+    /// the last drop can happen in a *client* process, and only the owner
+    /// can sweep. A nonzero value tells the next [`SharedArena::reclaim`]
+    /// to sweep all slot headers. Carved out of v4's reserved bytes (struct
+    /// size unchanged); v5 is a semantic break anyway — see
+    /// [`ARENA_VERSION`]. Added in format v5.
+    orphaned: AtomicU32,
 }
 
 impl ArenaHeader {
@@ -431,56 +453,103 @@ impl ArenaHeader {
     }
 }
 
-/// Per-slot header (in shared memory).
+/// Per-slot header (in shared memory): state in bits 63..32, refcount in
+/// bits 31..0 of one atomic word.
 ///
-/// This is 8 bytes to maintain natural alignment.
+/// One word so the Free→Allocated transition and the initial refcount are a
+/// single CAS — there is no observable (Allocated, rc=0) window during
+/// acquire, which is what makes the orphan sweep in [`SharedArena::reclaim`]
+/// sound (#177). (Allocated, rc=0) has exactly one meaning: "released,
+/// awaiting the owner". It is absorbing until the owner's `try_free`:
+/// rc can only leave 0 via `try_acquire` (requires Free) or `try_inc_ref`
+/// (refuses rc=0). On little-endian the packing reproduces the old
+/// two-field byte layout (rc at bytes 0..4, state at 4..8), but nothing
+/// depends on that — the packing is defined on the u64 value, and all
+/// peers of one arena run the same format version on one host.
 #[repr(C, align(8))]
 struct SlotHeader {
-    /// Reference count (atomic, works across processes).
-    refcount: AtomicU32,
-    /// Slot state (Free, Allocated).
-    state: AtomicU32,
+    word: AtomicU64,
 }
+
+/// Mask of the refcount half of a [`SlotHeader`] word.
+const SLOT_RC_MASK: u64 = u32::MAX as u64;
+
+const fn slot_word(state: SlotState, rc: u32) -> u64 {
+    ((state as u64) << 32) | rc as u64
+}
+
+/// (Free, 0) — also the memfd zero-fill value, so a fresh mapping is valid.
+const SLOT_FREE: u64 = slot_word(SlotState::Free, 0);
+/// (Allocated, 1) — the state right after a successful acquire.
+const SLOT_ALLOCATED_1: u64 = slot_word(SlotState::Allocated, 1);
+/// (Allocated, 0) — released, awaiting the owner's reclaim or sweep.
+const SLOT_RELEASED: u64 = slot_word(SlotState::Allocated, 0);
 
 impl SlotHeader {
     /// Initialize a new slot header.
     fn init(&self) {
-        self.refcount.store(0, Ordering::Release);
-        self.state.store(SlotState::Free as u32, Ordering::Release);
+        self.word.store(SLOT_FREE, Ordering::Release);
     }
 
-    /// Try to acquire this slot (transition Free -> Allocated with refcount=1).
+    /// Try to acquire this slot: (Free, 0) → (Allocated, 1) in one CAS.
     ///
-    /// Returns true if successful, false if slot was not free.
+    /// Returns true if successful, false if the slot was not free.
     fn try_acquire(&self) -> bool {
-        // CAS: Free -> Allocated
-        let result = self.state.compare_exchange(
-            SlotState::Free as u32,
-            SlotState::Allocated as u32,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-
-        if result.is_ok() {
-            // Set initial refcount
-            self.refcount.store(1, Ordering::Release);
-            true
-        } else {
-            false
-        }
+        // AcqRel: Acquire pairs with try_free's Release so the new holder is
+        // ordered after the previous holder's release chain; Release
+        // publishes ownership. Failure Relaxed: nothing is dereferenced.
+        self.word
+            .compare_exchange(
+                SLOT_FREE,
+                SLOT_ALLOCATED_1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_ok()
     }
 
-    /// Increment refcount (for clone).
+    /// Increment refcount (for clone) — caller already holds a reference.
     ///
     /// # Panics
     ///
     /// Panics if refcount would overflow (> 2^31).
     fn inc_ref(&self) {
-        let old = self.refcount.fetch_add(1, Ordering::AcqRel);
-        if old > i32::MAX as u32 {
-            // Overflow protection - this should never happen in practice
-            self.refcount.fetch_sub(1, Ordering::AcqRel);
+        // Relaxed (Arc precedent): visibility of the slot data came with the
+        // reference being cloned. The +1 cannot carry into the state bits:
+        // the panic threshold keeps rc far below 2^32.
+        let old = self.word.fetch_add(1, Ordering::Relaxed) & SLOT_RC_MASK;
+        if old > i32::MAX as u64 {
+            self.word.fetch_sub(1, Ordering::Relaxed);
             panic!("SharedSlotRef refcount overflow");
+        }
+    }
+
+    /// Increment refcount only if the slot is (Allocated, rc >= 1).
+    ///
+    /// Refuses to resurrect a released slot: an IPC ref to a slot whose
+    /// refcount already hit 0 is stale by protocol (the sender must keep the
+    /// slot alive until the receiver maps it), and blindly incrementing
+    /// would race the owner's reclaim/sweep into a double allocation.
+    fn try_inc_ref(&self) -> bool {
+        let mut cur = self.word.load(Ordering::Relaxed);
+        loop {
+            if (cur >> 32) != SlotState::Allocated as u64 || (cur & SLOT_RC_MASK) == 0 {
+                return false;
+            }
+            if (cur & SLOT_RC_MASK) > i32::MAX as u64 {
+                panic!("SharedSlotRef refcount overflow");
+            }
+            // Acquire on success: the mapper reads slot data the producer
+            // wrote before publishing the ref.
+            match self.word.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(v) => cur = v,
+            }
         }
     }
 
@@ -488,24 +557,40 @@ impl SlotHeader {
     ///
     /// Returns true if this was the last reference (refcount hit 0).
     fn dec_ref(&self) -> bool {
-        let old = self.refcount.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(old > 0, "refcount underflow");
-        old == 1
+        // AcqRel: Release so this holder's data writes happen-before whoever
+        // frees/reacquires the slot; Acquire so the last dropper is ordered
+        // after every other dropper (Arc uses Release + an acquire fence on
+        // the last drop; an unconditional AcqRel RMW is equivalent).
+        let old = self.word.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(old & SLOT_RC_MASK > 0, "refcount underflow");
+        old & SLOT_RC_MASK == 1
     }
 
-    /// Mark slot as free (called by owner after draining from queue).
-    fn mark_free(&self) {
-        self.state.store(SlotState::Free as u32, Ordering::Release);
+    /// (Allocated, 0) → (Free, 0). Owner-only, under `reclaim_lock`.
+    ///
+    /// The single reclaim/sweep primitive: it can never free a live or
+    /// mid-acquire slot, because neither ever *is* (Allocated, 0).
+    fn try_free(&self) -> bool {
+        // Acquire pairs with the final dec_ref's Release; Release makes the
+        // Free store the tail of the chain the next try_acquire picks up.
+        self.word
+            .compare_exchange(
+                SLOT_RELEASED,
+                SLOT_FREE,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_ok()
     }
 
     /// Get current refcount (for debugging).
     fn refcount(&self) -> u32 {
-        self.refcount.load(Ordering::Acquire)
+        (self.word.load(Ordering::Acquire) & SLOT_RC_MASK) as u32
     }
 
     /// Get current state.
     fn state(&self) -> SlotState {
-        SlotState::from_u32(self.state.load(Ordering::Acquire))
+        SlotState::from_u32((self.word.load(Ordering::Acquire) >> 32) as u32)
     }
 }
 
@@ -727,6 +812,7 @@ impl SharedArena {
             h.alignment.store(alignment as u32, Ordering::Release);
             h.refcount.store(1, Ordering::Release); // Initial refcount = 1
             h.reclaim_lock.store(0, Ordering::Release);
+            h.orphaned.store(0, Ordering::Release);
         }
 
         // Initialize release queue
@@ -958,9 +1044,26 @@ impl SharedArena {
         while let Some(slot_index) = queue.try_pop() {
             if (slot_index as usize) < self.slot_count {
                 let sh = unsafe { &*self.slot_headers.as_ptr().add(slot_index as usize) };
-                // Double-check refcount is still 0 (might have been re-acquired)
-                if sh.refcount() == 0 {
-                    sh.mark_free();
+                // try_free CASes (Allocated, 0) -> (Free, 0), so a slot that
+                // was re-referenced between push and pop is skipped; a later
+                // drop re-pushes it.
+                if sh.try_free() {
+                    reclaimed += 1;
+                }
+            }
+        }
+
+        // Recover slots orphaned by a full ring (#177). swap(0) claims every
+        // orphan counted so far; one that races in after the swap re-arms
+        // the counter and the *next* reclaim sweeps. Deliberately not
+        // "decrement by slots found": the sweep also frees slots pushed to
+        // the ring after the drain above, so found-count and orphan-count
+        // need not match, and residue arithmetic either leaks or pins the
+        // counter above zero (an O(n) sweep on every reclaim).
+        if header.orphaned.swap(0, Ordering::Acquire) > 0 {
+            for i in 0..self.slot_count {
+                let sh = unsafe { &*self.slot_headers.as_ptr().add(i) };
+                if sh.try_free() {
                     reclaimed += 1;
                 }
             }
@@ -968,6 +1071,16 @@ impl SharedArena {
 
         header.reclaim_lock.store(0, Ordering::Release);
         reclaimed
+    }
+
+    /// Number of slots currently orphaned by a full release queue (#177).
+    ///
+    /// Nonzero means the next [`reclaim`](Self::reclaim) will sweep all slot
+    /// headers to recover them.
+    pub fn orphaned_count(&self) -> usize {
+        unsafe { self.header.as_ref() }
+            .orphaned
+            .load(Ordering::Relaxed) as usize
     }
 
     /// Get the number of slots pending in the release queue.
@@ -1090,6 +1203,7 @@ impl SharedArena {
             allocated_slots: allocated,
             free_slots: free,
             pending_release: pending,
+            orphaned: self.orphaned_count(),
             total_bytes: self.total_size,
             used_bytes: allocated * self.slot_size,
             utilization_percent: if self.slot_count > 0 {
@@ -1126,7 +1240,11 @@ impl SharedArena {
     /// This is used by client processes to access a slot that was
     /// sent via IPC. The refcount is incremented atomically.
     ///
-    /// Returns `None` if the slot is not in Allocated state.
+    /// Returns `None` if the slot is not live: not Allocated, or released
+    /// (refcount already 0). Resurrection from rc=0 is refused — the sender
+    /// must keep the slot alive until the receiver maps it, so a released
+    /// slot means the ref is stale, and incrementing anyway would race the
+    /// owner's reclaim into a double allocation (#177).
     pub fn slot_from_ipc(&self, ipc_ref: &SharedIpcSlotRef) -> Option<SharedSlotRef> {
         if ipc_ref.arena_id != self.arena_id {
             return None; // Wrong arena
@@ -1138,13 +1256,10 @@ impl SharedArena {
 
         let sh = unsafe { &*self.slot_headers.as_ptr().add(ipc_ref.slot_index as usize) };
 
-        // Check slot is allocated
-        if sh.state() != SlotState::Allocated {
+        // Atomically: verify (Allocated, rc >= 1) and increment.
+        if !sh.try_inc_ref() {
             return None;
         }
-
-        // Increment refcount
-        sh.inc_ref();
 
         Some(SharedSlotRef {
             arena: self.clone(),
@@ -1400,10 +1515,15 @@ impl Drop for SharedSlotRef {
         if was_last {
             // Push slot index to release queue
             let queue = unsafe { self.release_queue.as_ref() };
-            // If queue is full, the slot will be leaked until the owner
-            // does a full scan. This is a tradeoff for lock-free operation.
-            // In practice, the queue should be sized large enough.
-            let _ = queue.try_push(self.slot_index);
+            if !queue.try_push(self.slot_index) {
+                // Ring full: the slot sits at (Allocated, rc=0), invisible
+                // to has_free/free_count. Count it so the owner's next
+                // reclaim() sweeps the slot headers and recovers it (#177).
+                // Release: the released slot word is in the happens-before
+                // past of a reclaim that Acquire-observes this count.
+                let header = unsafe { self.arena.header.as_ref() };
+                header.orphaned.fetch_add(1, Ordering::Release);
+            }
         }
     }
 }
@@ -1768,6 +1888,111 @@ mod tests {
         assert_eq!(ipc_ref.arena_id, arena.id());
         assert_eq!(ipc_ref.slot_index as usize, slot.slot_index());
         assert_eq!(ipc_ref.len, slot.len());
+    }
+
+    #[test]
+    fn a_full_release_queue_orphans_and_reclaim_recovers() {
+        // #177: more live slots than ring entries, all dropped at once —
+        // the overflow beyond RELEASE_QUEUE_SIZE used to leak forever.
+        let extra = 64;
+        let count = RELEASE_QUEUE_SIZE + extra;
+        let arena = SharedArena::new(64, count).unwrap();
+
+        let slots: Vec<_> = (0..count).map(|_| arena.acquire().unwrap()).collect();
+        assert_eq!(arena.free_count(), 0);
+        drop(slots);
+
+        assert_eq!(
+            arena.orphaned_count(),
+            extra,
+            "drops past ring capacity must be counted, not lost"
+        );
+        assert_eq!(arena.free_count(), 0, "release alone frees nothing");
+
+        let reclaimed = arena.reclaim();
+        assert_eq!(reclaimed, count, "drain + sweep must recover every slot");
+        assert_eq!(arena.free_count(), count);
+        assert_eq!(arena.orphaned_count(), 0);
+
+        // The arena is fully usable again.
+        let again: Vec<_> = (0..count).map(|_| arena.acquire().unwrap()).collect();
+        assert_eq!(again.len(), count);
+    }
+
+    #[test]
+    fn sweep_never_frees_a_live_or_mid_acquire_slot() {
+        // #177 soundness: acquire is a single CAS to (Allocated, 1), so the
+        // sweep's (Allocated, 0) -> Free CAS can never free a slot that a
+        // concurrent acquirer just handed out. Each thread writes a unique
+        // token into its slot and verifies it survives; a double allocation
+        // corrupts a token. Ring pressure (slot_count > ring) guarantees
+        // orphans, so the sweep path really runs.
+        use std::sync::Barrier;
+        let count = RELEASE_QUEUE_SIZE + 76;
+        let arena = SharedArena::new(64, count).unwrap();
+
+        // Fill the ring with orphan-generating pressure first.
+        let warm: Vec<_> = (0..count).map(|_| arena.acquire().unwrap()).collect();
+        drop(warm);
+        assert!(arena.orphaned_count() > 0);
+
+        let barrier = std::sync::Arc::new(Barrier::new(10));
+        let mut handles = Vec::new();
+        for t in 0..8u64 {
+            let arena = arena.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for i in 0..2000u64 {
+                    let Some(mut slot) = arena.acquire() else {
+                        arena.reclaim();
+                        continue;
+                    };
+                    let token = (t << 32) | i;
+                    slot.data_mut()[..8].copy_from_slice(&token.to_ne_bytes());
+                    std::thread::yield_now();
+                    let read = u64::from_ne_bytes(slot.data()[..8].try_into().unwrap());
+                    assert_eq!(read, token, "double allocation corrupted a live slot");
+                }
+            }));
+        }
+        for _ in 0..2 {
+            let arena = arena.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..4000 {
+                    arena.reclaim();
+                    std::thread::yield_now();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        arena.reclaim();
+        assert_eq!(arena.free_count(), count, "every slot must come back");
+    }
+
+    #[test]
+    fn slot_from_ipc_refuses_a_released_slot() {
+        // #177: resurrection from rc=0 would race the owner's reclaim into
+        // a double allocation, so a stale ipc_ref must resolve to None.
+        let arena = SharedArena::new(4096, 4).unwrap();
+        let slot = arena.acquire().unwrap();
+        let ipc_ref = slot.ipc_ref();
+
+        // Live slot: the ref resolves.
+        let mapped = arena.slot_from_ipc(&ipc_ref).unwrap();
+        drop(mapped);
+
+        // Released slot (rc hit 0, sitting in the ring): refused.
+        drop(slot);
+        assert!(
+            arena.slot_from_ipc(&ipc_ref).is_none(),
+            "a released slot must not be resurrected"
+        );
     }
 
     #[test]

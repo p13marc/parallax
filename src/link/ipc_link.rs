@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 use crate::memory::{SharedArena, SharedArenaCache, ipc};
 use crate::metadata::Metadata;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 
@@ -109,7 +109,16 @@ pub struct IpcPublisher {
     /// Map from segment base pointer to segment_id (for deduplication)
     segment_ids: HashMap<usize, u32>,
     next_segment_id: u32,
+    /// Buffers sent but not yet acknowledged by the subscriber. The live
+    /// clone is what keeps each slot's refcount above zero until the peer
+    /// maps it: `slot_from_ipc` refuses to resurrect a released slot
+    /// (#177), so dropping our reference before the ack would race the
+    /// subscriber's mapping.
+    in_flight: VecDeque<Buffer>,
 }
+
+/// Cap on unacknowledged buffers; past this, `send` blocks for an ack.
+const MAX_IN_FLIGHT: usize = 64;
 
 impl IpcPublisher {
     /// Create a new publisher bound to the given socket path.
@@ -130,6 +139,7 @@ impl IpcPublisher {
             stream: None,
             segment_ids: HashMap::new(),
             next_segment_id: 0,
+            in_flight: VecDeque::new(),
         })
     }
 
@@ -142,6 +152,7 @@ impl IpcPublisher {
             stream: Some(stream),
             segment_ids: HashMap::new(),
             next_segment_id: 0,
+            in_flight: VecDeque::new(),
         }
     }
 
@@ -195,7 +206,43 @@ impl IpcPublisher {
         let stream = self.stream.as_mut().unwrap();
         stream.write_all(&header.to_bytes())?;
 
+        self.in_flight.push_back(buffer);
+        self.drain_acks()?;
+
         Ok(())
+    }
+
+    /// Retire acknowledged in-flight buffers.
+    ///
+    /// The subscriber writes one ack byte per mapped buffer. Drains
+    /// whatever acks have arrived without blocking; if the in-flight
+    /// window is full, blocks for one ack first (backpressure).
+    fn drain_acks(&mut self) -> Result<()> {
+        use std::io::Read;
+        let stream = self.stream.as_ref().unwrap();
+
+        if self.in_flight.len() > MAX_IN_FLIGHT {
+            let mut byte = [0u8; 1];
+            (&*stream).read_exact(&mut byte)?;
+            self.in_flight.pop_front();
+        }
+
+        stream.set_nonblocking(true)?;
+        let mut acks = [0u8; 64];
+        let drained = loop {
+            match (&*stream).read(&mut acks) {
+                Ok(0) => break Ok(()), // peer closed; buffers retire on drop
+                Ok(n) => {
+                    for _ in 0..n {
+                        self.in_flight.pop_front();
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break Ok(()),
+                Err(e) => break Err(e.into()),
+            }
+        };
+        stream.set_nonblocking(false)?;
+        drained
     }
 
     /// Send end-of-stream signal.
@@ -258,6 +305,34 @@ impl IpcPublisher {
         self.segment_ids.insert(arena_id as usize, id);
 
         Ok(id)
+    }
+}
+
+impl Drop for IpcPublisher {
+    fn drop(&mut self) {
+        // Hold the slot pins until the subscriber has mapped everything we
+        // queued: the socket delivers data written before close, so buffers
+        // can still be mapped after our side is gone — and a pin dropped
+        // before the peer's `slot_from_ipc` turns that mapping into a
+        // refused stale ref (#177). Bounded: a peer that stopped reading
+        // forfeits after the timeout (its mappings were doomed regardless).
+        let Some(stream) = &self.stream else { return };
+        if self.in_flight.is_empty() {
+            return;
+        }
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+        use std::io::Read;
+        let mut byte = [0u8; 1];
+        while !self.in_flight.is_empty() {
+            match (&*stream).read(&mut byte) {
+                Ok(0) => break, // peer closed; nothing left to map
+                Ok(_) => {
+                    self.in_flight.pop_front();
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
     }
 }
 
@@ -406,6 +481,12 @@ impl IpcSubscriber {
 
                 let handle = MemoryHandle::with_len(slot, len);
                 let metadata = Metadata::from_sequence(header.sequence);
+
+                // The slot is mapped (our refcount is in); tell the
+                // publisher it may release its pin. Best-effort: a gone
+                // publisher can't use the ack anyway.
+                use std::io::Write;
+                let _ = (&self.stream).write_all(&[1u8]);
 
                 Ok(Some(Buffer::new(handle, metadata)))
             }

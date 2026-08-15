@@ -90,8 +90,12 @@ pub struct IpcSink {
     is_server: bool,
     /// Listener for incoming connections (server mode).
     listener: Option<UnixListener>,
-    /// Pending slots waiting for acknowledgment.
-    pending_slots: VecDeque<SharedIpcSlotRef>,
+    /// Pending slots waiting for acknowledgment, each pinned by a live
+    /// `Buffer` clone. The clone is what keeps the slot's refcount above
+    /// zero until the peer acks: `slot_from_ipc` refuses to resurrect a
+    /// released slot (#177), so sending a bare ref and dropping the buffer
+    /// would race the peer's mapping against our executor's drop.
+    pending_slots: VecDeque<(SharedIpcSlotRef, Buffer)>,
     /// Maximum pending buffers before blocking.
     max_pending: usize,
     /// Capabilities.
@@ -309,8 +313,9 @@ impl IpcSink {
     fn process_acks(&mut self) -> Result<()> {
         while let Some(msg) = self.recv_message()? {
             if let ControlMessage::BufferDone { slot } = msg {
-                // Remove from pending
-                self.pending_slots.retain(|s| s != &slot);
+                // Remove from pending; dropping the Buffer clone releases
+                // our hold on the slot.
+                self.pending_slots.retain(|(s, _)| s != &slot);
             }
         }
         Ok(())
@@ -351,7 +356,7 @@ impl AsyncSink for IpcSink {
         };
         self.send_message(&msg)?;
 
-        self.pending_slots.push_back(slot_ref);
+        self.pending_slots.push_back((slot_ref, buffer.clone()));
 
         Ok(())
     }
