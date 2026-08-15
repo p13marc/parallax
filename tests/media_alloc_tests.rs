@@ -218,12 +218,11 @@ mod decode_convert {
 /// workaround for kanal's cancel-unsafe recv) and nothing failed. Removing
 /// kanal took that box away again; this test is what keeps it away.
 ///
-/// Measured `per_hop`: **2.0 → 1.0** across that removal.
-///
-/// The number is not supposed to be zero. What remains per hop is dynosaur's
-/// `dyn(box)` future, allocated once per `element.process()` call — see
-/// `DynAsyncElement` in `src/element/traits.rs`. Driving that to zero is a
-/// separate piece of work.
+/// Measured `per_hop`: **2.0 → 1.0** across the kanal removal, **1.0 → 0.0**
+/// with #175's inline fast path — sync elements dispatch through
+/// `process_inline` instead of dynosaur's per-call `Box::pin`. A hop through
+/// a sync element now allocates nothing; a reintroduced per-buffer box in
+/// the executor or the dispatch layer fails the budget below.
 mod executor_steady_state {
     use super::tracked;
     use parallax::elements::{NullSink, NullSource, PassThrough};
@@ -271,10 +270,19 @@ mod executor_steady_state {
         (hi - lo) as f64 / (HI - LO) as f64
     }
 
-    /// Budget for one hop's per-buffer allocations. Measured at 1.0; the
-    /// headroom is deliberately under one allocation, or the ratchet could
-    /// not catch a single reintroduced box.
-    const BUDGET: f64 = 1.5;
+    /// Budget for one hop's per-buffer allocations. Measured at 0.0 (#175);
+    /// the headroom is deliberately under one allocation, or the ratchet
+    /// could not catch a single reintroduced box.
+    const BUDGET: f64 = 0.5;
+
+    /// Budget for the hop-independent per-buffer intercept — what the
+    /// source+sink pair costs per buffer regardless of pipeline length.
+    /// Measured at 1.0 after #175 removed `SourceResult::Buffer`'s
+    /// `Box<Buffer>` and the source/sink boxed futures (2.0+ before);
+    /// under-one headroom so a single reintroduced per-buffer box trips it.
+    /// The per-hop slope cannot see any of this — it cancels in the
+    /// subtraction — which is why the intercept is pinned separately.
+    const INTERCEPT_BUDGET: f64 = 1.5;
 
     #[test]
     fn executor_per_hop_alloc_budget() {
@@ -289,6 +297,10 @@ mod executor_steady_state {
         assert!(
             per_hop <= BUDGET,
             "executor per-hop steady state: {per_hop:.2} allocs/buffer/hop (budget {BUDGET})"
+        );
+        assert!(
+            one <= INTERCEPT_BUDGET,
+            "executor per-buffer intercept: {one:.2} allocs/buffer (budget {INTERCEPT_BUDGET})"
         );
     }
 }

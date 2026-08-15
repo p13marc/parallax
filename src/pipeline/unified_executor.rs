@@ -2399,6 +2399,51 @@ async fn guard<T>(node: &str, call: impl std::future::Future<Output = Result<T>>
     }
 }
 
+// Hot-path dispatch (#175): an element whose adapter wraps a sync author
+// trait declares `dispatches_inline()`, and the task calls the `*_inline`
+// form — same body, no boxed future, zero allocations. Genuinely async
+// elements take the erased `async` path, whose future dynosaur boxes per
+// call. Each task samples the flag once, before its loop.
+//
+// These helpers are plain `async fn`s so `guard`'s catch_unwind wraps the
+// inline body exactly like the async one — a panic inside either surfaces
+// as `Error::Panic` naming the element.
+
+async fn hybrid_process(
+    mut element: &mut DynAsyncElement<'static>,
+    inline: bool,
+    input: Option<Buffer>,
+) -> Result<Option<Buffer>> {
+    if inline {
+        element.process_inline(input)
+    } else {
+        element.process(input).await
+    }
+}
+
+async fn hybrid_process_source(
+    mut element: &mut DynAsyncElement<'static>,
+    inline: bool,
+) -> Result<crate::element::SourceResult> {
+    if inline {
+        element.process_source_inline()
+    } else {
+        element.process_source().await
+    }
+}
+
+async fn hybrid_process_demux(
+    mut element: &mut DynAsyncElement<'static>,
+    inline: bool,
+    input: Option<Buffer>,
+) -> Result<crate::element::DemuxResult> {
+    if inline {
+        element.process_demux_inline(input)
+    } else {
+        element.process_demux(input).await
+    }
+}
+
 /// Send a terminal error to every branch, **always blocking**.
 ///
 /// Same reasoning as [`broadcast_eos`]: a dropped terminal message wedges the
@@ -2826,6 +2871,7 @@ fn spawn_source_task(
     share: TaskGuard,
 ) -> JoinHandle<Result<()>> {
     tokio::spawn(reporting(share, async move {
+        let inline_dispatch = element.dispatches_inline();
         tracing::debug!("source '{}' started", name);
         events.send_node_started(&name);
 
@@ -2923,9 +2969,8 @@ fn spawn_source_task(
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
             tracing::trace!("source '{}': calling process_source", name);
-            match guard(&name, element.process_source()).await {
+            match guard(&name, hybrid_process_source(&mut element, inline_dispatch)).await {
                 Ok(SourceResult::Buffer(buffer)) => {
-                    let buffer = *buffer;
                     count += 1;
                     would_block_count = 0; // Reset
 
@@ -3081,6 +3126,7 @@ fn spawn_sink_task(
     }
 
     tokio::spawn(reporting(share, async move {
+        let inline_dispatch = element.dispatches_inline();
         tracing::debug!("sink '{}' started", name);
         events.send_node_started(&name);
 
@@ -3248,7 +3294,12 @@ fn spawn_sink_task(
                         }
                         tracers.notify_buffer(&name, &buffer);
                         let pts = buffer.metadata().pts;
-                        match guard(&name, element.process(Some(buffer))).await {
+                        match guard(
+                            &name,
+                            hybrid_process(&mut element, inline_dispatch, Some(buffer)),
+                        )
+                        .await
+                        {
                             Ok(_) => {
                                 shed.reset();
                                 tracers.notify_buffer_processed(&name);
@@ -3313,7 +3364,11 @@ fn spawn_sink_task(
                     }
                     tracers.notify_buffer(&name, &buffer);
                     let pts = buffer.metadata().pts;
-                    let result = guard(&name, element.process(Some(buffer))).await;
+                    let result = guard(
+                        &name,
+                        hybrid_process(&mut element, inline_dispatch, Some(buffer)),
+                    )
+                    .await;
                     tracers.notify_buffer_processed(&name);
                     match result {
                         Ok(_) => {
@@ -3384,6 +3439,7 @@ fn spawn_transform_task(
     share: TaskGuard,
 ) -> JoinHandle<Result<()>> {
     tokio::spawn(reporting(share, async move {
+        let inline_dispatch = element.dispatches_inline();
         tracing::debug!("transform '{}' started", name);
         events.send_node_started(&name);
 
@@ -3532,7 +3588,11 @@ fn spawn_transform_task(
                         // send().await sits between them and back-pressure gets
                         // billed as this element's processing time.
                         tracers.notify_buffer(&name, &buffer);
-                        let result = guard(&name, element.process(Some(buffer))).await;
+                        let result = guard(
+                            &name,
+                            hybrid_process(&mut element, inline_dispatch, Some(buffer)),
+                        )
+                        .await;
                         tracers.notify_buffer_processed(&name);
 
                         match result {
@@ -3676,7 +3736,11 @@ fn spawn_transform_task(
                     }
 
                     tracers.notify_buffer(&name, &buffer);
-                    let result = guard(&name, element.process(Some(buffer))).await;
+                    let result = guard(
+                        &name,
+                        hybrid_process(&mut element, inline_dispatch, Some(buffer)),
+                    )
+                    .await;
                     tracers.notify_buffer_processed(&name);
 
                     match result {
@@ -3832,6 +3896,7 @@ fn spawn_demuxer_task(
     share: TaskGuard,
 ) -> JoinHandle<Result<()>> {
     tokio::spawn(reporting(share, async move {
+        let inline_dispatch = element.dispatches_inline();
         tracing::debug!("demuxer '{}' started", name);
         events.send_node_started(&name);
 
@@ -3935,7 +4000,11 @@ fn spawn_demuxer_task(
                         // broadcast, or downstream back-pressure is billed as
                         // demux time.
                         tracers.notify_buffer(&name, &buffer);
-                        let result = guard(&name, element.process_demux(Some(buffer))).await;
+                        let result = guard(
+                            &name,
+                            hybrid_process_demux(&mut element, inline_dispatch, Some(buffer)),
+                        )
+                        .await;
                         tracers.notify_buffer_processed(&name);
 
                         match result {
@@ -4051,7 +4120,12 @@ fn spawn_demuxer_task(
                         // trailing partial frame keeps its pad — the old
                         // flush() broadcast sent it down every branch.
                         loop {
-                            match guard(&name, element.process_demux(None)).await {
+                            match guard(
+                                &name,
+                                hybrid_process_demux(&mut element, inline_dispatch, None),
+                            )
+                            .await
+                            {
                                 Ok(DemuxResult::Routed(routed)) if !routed.is_empty() => {
                                     for (pad, out) in routed {
                                         route_demux_buffer(
@@ -4180,7 +4254,12 @@ fn spawn_demuxer_task(
                     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 }
 
-                match guard(&name, element.process_demux(None)).await {
+                match guard(
+                    &name,
+                    hybrid_process_demux(&mut element, inline_dispatch, None),
+                )
+                .await
+                {
                     Ok(DemuxResult::Routed(routed)) => {
                         // Same stamp-at-send rule as spawn_source_task: a seek
                         // handled in this iteration's control drain already
@@ -4260,6 +4339,7 @@ fn spawn_muxer_task(
     use futures::stream::{FuturesUnordered, StreamExt};
 
     tokio::spawn(reporting(share, async move {
+        let inline_dispatch = element.dispatches_inline();
         tracing::debug!("muxer '{}' started", name);
         events.send_node_started(&name);
 
@@ -4397,7 +4477,11 @@ fn spawn_muxer_task(
                     // what makes "how long is this muxer taking" answerable at
                     // all. It previously had no instrumentation whatsoever.
                     tracers.notify_buffer(&name, &buffer);
-                    let result = guard(&name, element.process(Some(buffer))).await;
+                    let result = guard(
+                        &name,
+                        hybrid_process(&mut element, inline_dispatch, Some(buffer)),
+                    )
+                    .await;
                     tracers.notify_buffer_processed(&name);
 
                     match result {
@@ -4479,7 +4563,9 @@ fn spawn_muxer_task(
                     eos_count += 1;
                     if eos_count >= total {
                         // Flush any remaining data from final processing
-                        if let Ok(Some(out)) = guard(&name, element.process(None)).await {
+                        if let Ok(Some(out)) =
+                            guard(&name, hybrid_process(&mut element, inline_dispatch, None)).await
+                        {
                             if !segment_sent {
                                 segment_sent = true;
                                 emit_event(

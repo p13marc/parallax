@@ -17,6 +17,10 @@ use std::ffi::{CStr, c_char, c_int, c_void};
 /// bump is not a compatibility inconvenience — it is undefined behaviour.
 ///
 /// History:
+/// - **6**: inline fast-path slots (`dispatches_inline` + `process_inline`/
+///   `process_source_inline`/`process_demux_inline`), the dead `process_all`
+///   slot removed, and `SourceResult::Buffer` holding its `Buffer` inline —
+///   vtable layout and a return layout changed (#175).
 /// - **5**: `EventResult::Forward` (push-mode seek translation) plus
 ///   `AsyncElementDyn::seek_translations` — both the return layout and the
 ///   vtable changed.
@@ -25,7 +29,7 @@ use std::ffi::{CStr, c_char, c_int, c_void};
 /// - **3**: `AsyncElementDyn::process_demux` (demuxer routing).
 /// - **2**: `AsyncElementDyn::set_output_budget` (executor-sized output arenas).
 /// - **1**: initial hand-rolled `#[repr(C)]` descriptor ABI.
-pub const PARALLAX_ABI_VERSION: u32 = 5;
+pub const PARALLAX_ABI_VERSION: u32 = 6;
 
 /// Function pointer type for creating element instances.
 ///
@@ -398,7 +402,7 @@ mod tests {
     fn test_abi_version() {
         // Pinned so a vtable change to AsyncElementDyn has to be a decision.
         // 2: set_output_budget.
-        assert_eq!(PARALLAX_ABI_VERSION, 5);
+        assert_eq!(PARALLAX_ABI_VERSION, 6);
     }
 
     #[test]

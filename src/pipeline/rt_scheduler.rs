@@ -841,6 +841,11 @@ pub fn spawn_data_thread(
                                 Some(buffer) => sync_elem.process_sync(buffer),
                                 None => Ok(None),
                             }
+                        } else if element.dispatches_inline() {
+                            // Sync author trait behind an async facade: call
+                            // the inline body directly (#175) — no runtime,
+                            // no boxed future.
+                            element.process_inline(input)
                         } else {
                             // Fallback for non-RT-safe elements in Hybrid mode.
                             // This is suboptimal but allows gradual migration.

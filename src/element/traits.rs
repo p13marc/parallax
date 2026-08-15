@@ -435,9 +435,10 @@ impl ExactSizeIterator for OutputIter {}
 /// yet (WouldBlock) vs end of stream (Eos), which the executor handles
 /// differently.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // Intentional: no heap allocation on the per-buffer path (#175)
 pub enum SourceResult {
     /// A buffer was produced.
-    Buffer(Box<Buffer>),
+    Buffer(Buffer),
     /// No data available yet, try again later.
     WouldBlock,
     /// End of stream reached.
@@ -447,7 +448,7 @@ pub enum SourceResult {
 /// Result of one demuxer step, with the pad routing intact.
 ///
 /// This is what [`AsyncElementDyn::process_demux`] returns to the executor:
-/// unlike `process`/`process_all`, which erase *which pad* each buffer
+/// unlike `process`, which erases *which pad* each buffer
 /// belongs on, the routed form is what makes per-pad delivery possible at
 /// all (#76).
 #[derive(Debug)]
@@ -1649,10 +1650,45 @@ pub trait AsyncElementDyn {
     /// - For transforms: `input` is `Some`, returns transformed buffer
     async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>>;
 
-    /// Process and return all outputs (for transforms that produce multiple).
+    /// Whether the hot-path methods may be called through their `*_inline`
+    /// forms instead of the async ones.
     ///
-    /// Default implementation wraps `process` in a single-element output.
-    async fn process_all(&mut self, input: Option<Buffer>) -> Result<Output>;
+    /// Erased async dispatch boxes a future per call — one heap allocation
+    /// per buffer per hop (#175). Adapters wrapping *sync* author traits
+    /// answer `true` and make the inline forms the canonical bodies; the
+    /// executor then never touches the boxed path for them. Genuinely async
+    /// elements keep the default `false`.
+    ///
+    /// Contract: `true` promises that the `*_inline` methods matching this
+    /// element's [`element_type`](Self::element_type) are implemented.
+    fn dispatches_inline(&self) -> bool {
+        false
+    }
+
+    /// Synchronous fast path for [`process`](Self::process).
+    ///
+    /// Only called when [`dispatches_inline`](Self::dispatches_inline) is
+    /// `true`. (`SyncElement::process_sync` is a different, RT-scheduler
+    /// facing method — hence the `_inline` name.)
+    fn process_inline(&mut self, _input: Option<Buffer>) -> Result<Option<Buffer>> {
+        Err(crate::error::Error::Element(
+            "process_inline called on an async element".into(),
+        ))
+    }
+
+    /// Synchronous fast path for [`process_source`](Self::process_source).
+    fn process_source_inline(&mut self) -> Result<SourceResult> {
+        Err(crate::error::Error::Element(
+            "process_source_inline called on an async element".into(),
+        ))
+    }
+
+    /// Synchronous fast path for [`process_demux`](Self::process_demux).
+    fn process_demux_inline(&mut self, _input: Option<Buffer>) -> Result<DemuxResult> {
+        Err(crate::error::Error::Element(
+            "process_demux_inline called on an async element".into(),
+        ))
+    }
 
     /// Get the input caps (for validation).
     fn input_caps(&self) -> Caps {
@@ -1969,6 +2005,11 @@ impl<T: SyncElement> SyncElementAdapter<T> {
 }
 
 impl<T: SyncElement + 'static> SendAsyncElementDyn for SyncElementAdapter<T> {
+    // Sync author trait: the inline forms are the canonical bodies (#175).
+    fn dispatches_inline(&self) -> bool {
+        true
+    }
+
     fn set_output_budget(&mut self, budget: crate::memory::OutputBudget) {
         self.inner.set_output_budget(budget);
     }
@@ -1981,18 +2022,15 @@ impl<T: SyncElement + 'static> SendAsyncElementDyn for SyncElementAdapter<T> {
         ElementType::Transform
     }
 
-    async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
+    fn process_inline(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
         match input {
             Some(buffer) => self.inner.process_sync(buffer),
             None => Ok(None),
         }
     }
 
-    async fn process_all(&mut self, input: Option<Buffer>) -> Result<Output> {
-        match input {
-            Some(buffer) => self.inner.process_sync(buffer).map(Output::from),
-            None => Ok(Output::None),
-        }
+    async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
+        SendAsyncElementDyn::process_inline(self, input)
     }
 
     fn execution_hints(&self) -> ExecutionHints {
@@ -2102,6 +2140,11 @@ impl<S: Source> SourceAdapter<S> {
 }
 
 impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
+    // Sync author trait: the inline forms are the canonical bodies (#175).
+    fn dispatches_inline(&self) -> bool {
+        true
+    }
+
     fn set_output_budget(&mut self, budget: crate::memory::OutputBudget) {
         self.inner.set_output_budget(budget);
     }
@@ -2114,7 +2157,7 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
         ElementType::Source
     }
 
-    async fn process(&mut self, _input: Option<Buffer>) -> Result<Option<Buffer>> {
+    fn process_inline(&mut self, _input: Option<Buffer>) -> Result<Option<Buffer>> {
         // Priority: pool > arena > no buffer
         //
         // If a pool is configured, use it (provides backpressure and stats).
@@ -2207,10 +2250,8 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
         }
     }
 
-    async fn process_all(&mut self, input: Option<Buffer>) -> Result<Output> {
-        AsyncElementDyn::process(self, input)
-            .await
-            .map(Output::from)
+    async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
+        SendAsyncElementDyn::process_inline(self, input)
     }
 
     fn output_caps(&self) -> Caps {
@@ -2225,7 +2266,7 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
         self.inner.execution_hints()
     }
 
-    async fn process_source(&mut self) -> Result<SourceResult> {
+    fn process_source_inline(&mut self) -> Result<SourceResult> {
         // Helper to configure clock and bus on context
         let configure_clock = |ctx: &mut ProduceContext| {
             if let Some(ref clock) = self.clock {
@@ -2243,15 +2284,11 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
                     let mut ctx = ProduceContext::with_pool(slot, pool.as_ref());
                     configure_clock(&mut ctx);
                     match self.inner.produce(&mut ctx)? {
-                        ProduceResult::Produced(n) => {
-                            Ok(SourceResult::Buffer(Box::new(ctx.finalize(n))))
-                        }
+                        ProduceResult::Produced(n) => Ok(SourceResult::Buffer(ctx.finalize(n))),
                         ProduceResult::Eos => Ok(SourceResult::Eos),
-                        ProduceResult::OwnBuffer(buffer) => {
-                            Ok(SourceResult::Buffer(Box::new(buffer)))
-                        }
+                        ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(buffer)),
                         ProduceResult::OwnDmaBuf(dmabuf) => {
-                            Ok(SourceResult::Buffer(Box::new(dmabuf.to_buffer(arena)?)))
+                            Ok(SourceResult::Buffer(dmabuf.to_buffer(arena)?))
                         }
                         ProduceResult::WouldBlock => Ok(SourceResult::WouldBlock),
                     }
@@ -2259,9 +2296,7 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
                     let mut ctx = ProduceContext::with_pool_only(pool.as_ref());
                     configure_clock(&mut ctx);
                     match self.inner.produce(&mut ctx)? {
-                        ProduceResult::OwnBuffer(buffer) => {
-                            Ok(SourceResult::Buffer(Box::new(buffer)))
-                        }
+                        ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(buffer)),
                         ProduceResult::OwnDmaBuf(_) => Err(crate::error::Error::BufferPool(
                             "arena exhausted, cannot convert DmaBuf to Buffer".into(),
                         )),
@@ -2276,7 +2311,7 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
                 let mut ctx = ProduceContext::with_pool_only(pool.as_ref());
                 configure_clock(&mut ctx);
                 match self.inner.produce(&mut ctx)? {
-                    ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(Box::new(buffer))),
+                    ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(buffer)),
                     ProduceResult::OwnDmaBuf(_) => Err(crate::error::Error::BufferPool(
                         "no arena configured, cannot convert DmaBuf to Buffer".into(),
                     )),
@@ -2292,13 +2327,11 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
                 let mut ctx = ProduceContext::new(slot);
                 configure_clock(&mut ctx);
                 match self.inner.produce(&mut ctx)? {
-                    ProduceResult::Produced(n) => {
-                        Ok(SourceResult::Buffer(Box::new(ctx.finalize(n))))
-                    }
+                    ProduceResult::Produced(n) => Ok(SourceResult::Buffer(ctx.finalize(n))),
                     ProduceResult::Eos => Ok(SourceResult::Eos),
-                    ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(Box::new(buffer))),
+                    ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(buffer)),
                     ProduceResult::OwnDmaBuf(dmabuf) => {
-                        Ok(SourceResult::Buffer(Box::new(dmabuf.to_buffer(arena)?)))
+                        Ok(SourceResult::Buffer(dmabuf.to_buffer(arena)?))
                     }
                     ProduceResult::WouldBlock => Ok(SourceResult::WouldBlock),
                 }
@@ -2306,7 +2339,7 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
                 let mut ctx = ProduceContext::without_buffer();
                 configure_clock(&mut ctx);
                 match self.inner.produce(&mut ctx)? {
-                    ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(Box::new(buffer))),
+                    ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(buffer)),
                     ProduceResult::OwnDmaBuf(_) => Err(crate::error::Error::BufferPool(
                         "arena exhausted, cannot convert DmaBuf to Buffer".into(),
                     )),
@@ -2321,7 +2354,7 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
             let mut ctx = ProduceContext::without_buffer();
             configure_clock(&mut ctx);
             match self.inner.produce(&mut ctx)? {
-                ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(Box::new(buffer))),
+                ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(buffer)),
                 ProduceResult::OwnDmaBuf(_) => Err(crate::error::Error::BufferPool(
                     "no arena configured, cannot convert DmaBuf to Buffer".into(),
                 )),
@@ -2332,6 +2365,10 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
                 )),
             }
         }
+    }
+
+    async fn process_source(&mut self) -> Result<SourceResult> {
+        SendAsyncElementDyn::process_source_inline(self)
     }
 
     fn set_clock(&mut self, clock: Arc<dyn Clock>, base_time: ClockTime) {
@@ -2396,6 +2433,11 @@ impl<S: Sink> SinkAdapter<S> {
 }
 
 impl<S: Sink + Send + 'static> SendAsyncElementDyn for SinkAdapter<S> {
+    // Sync author trait: the inline forms are the canonical bodies (#175).
+    fn dispatches_inline(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         self.inner.name()
     }
@@ -2410,7 +2452,7 @@ impl<S: Sink + Send + 'static> SendAsyncElementDyn for SinkAdapter<S> {
         self.inner.handle_upstream_event(event)
     }
 
-    async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
+    fn process_inline(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
         if let Some(ref buffer) = input {
             let mut ctx = ConsumeContext::new(buffer);
             if let Some((clock, base_time)) = &self.clock {
@@ -2421,10 +2463,8 @@ impl<S: Sink + Send + 'static> SendAsyncElementDyn for SinkAdapter<S> {
         Ok(None)
     }
 
-    async fn process_all(&mut self, input: Option<Buffer>) -> Result<Output> {
-        AsyncElementDyn::process(self, input)
-            .await
-            .map(Output::from)
+    async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
+        SendAsyncElementDyn::process_inline(self, input)
     }
 
     fn input_caps(&self) -> Caps {
@@ -2473,6 +2513,11 @@ impl<E: Element> ElementAdapter<E> {
 }
 
 impl<E: Element + Send + 'static> SendAsyncElementDyn for ElementAdapter<E> {
+    // Sync author trait: the inline forms are the canonical bodies (#175).
+    fn dispatches_inline(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         self.inner.name()
     }
@@ -2495,17 +2540,15 @@ impl<E: Element + Send + 'static> SendAsyncElementDyn for ElementAdapter<E> {
         self.inner.set_output_budget(budget);
     }
 
-    async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
+    fn process_inline(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
         match input {
             Some(buffer) => self.inner.process(buffer),
             None => Ok(None),
         }
     }
 
-    async fn process_all(&mut self, input: Option<Buffer>) -> Result<Output> {
-        AsyncElementDyn::process(self, input)
-            .await
-            .map(Output::from)
+    async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
+        SendAsyncElementDyn::process_inline(self, input)
     }
 
     fn input_caps(&self) -> Caps {
@@ -2565,6 +2608,11 @@ impl BoxedElementAdapter {
 }
 
 impl SendAsyncElementDyn for BoxedElementAdapter {
+    // Sync author trait: the inline forms are the canonical bodies (#175).
+    fn dispatches_inline(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         self.inner.name()
     }
@@ -2587,17 +2635,15 @@ impl SendAsyncElementDyn for BoxedElementAdapter {
         self.inner.set_output_budget(budget);
     }
 
-    async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
+    fn process_inline(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
         match input {
             Some(buffer) => self.inner.process(buffer),
             None => Ok(None),
         }
     }
 
-    async fn process_all(&mut self, input: Option<Buffer>) -> Result<Output> {
-        AsyncElementDyn::process(self, input)
-            .await
-            .map(Output::from)
+    async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
+        SendAsyncElementDyn::process_inline(self, input)
     }
 
     fn input_caps(&self) -> Caps {
@@ -2646,6 +2692,11 @@ impl<T: Transform> TransformAdapter<T> {
 }
 
 impl<T: Transform + Send + 'static> SendAsyncElementDyn for TransformAdapter<T> {
+    // Sync author trait: the inline forms are the canonical bodies (#175).
+    fn dispatches_inline(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         self.inner.name()
     }
@@ -2664,7 +2715,7 @@ impl<T: Transform + Send + 'static> SendAsyncElementDyn for TransformAdapter<T> 
         self.inner.set_output_budget(budget);
     }
 
-    async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
+    fn process_inline(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
         // First, return any pending buffers from previous multi-output
         if !self.pending.is_empty() {
             return Ok(Some(self.pending.remove(0)));
@@ -2691,17 +2742,8 @@ impl<T: Transform + Send + 'static> SendAsyncElementDyn for TransformAdapter<T> 
         }
     }
 
-    async fn process_all(&mut self, input: Option<Buffer>) -> Result<Output> {
-        // Return pending first
-        if !self.pending.is_empty() {
-            let pending = std::mem::take(&mut self.pending);
-            return Ok(Output::from(pending));
-        }
-
-        match input {
-            Some(buffer) => self.inner.transform(buffer),
-            None => Ok(Output::None),
-        }
+    async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
+        SendAsyncElementDyn::process_inline(self, input)
     }
 
     fn input_caps(&self) -> Caps {
@@ -2874,12 +2916,6 @@ impl<S: AsyncSource + Send + 'static> SendAsyncElementDyn for AsyncSourceAdapter
         }
     }
 
-    async fn process_all(&mut self, input: Option<Buffer>) -> Result<Output> {
-        AsyncElementDyn::process(self, input)
-            .await
-            .map(Output::from)
-    }
-
     fn output_caps(&self) -> Caps {
         self.inner.output_caps()
     }
@@ -2909,13 +2945,11 @@ impl<S: AsyncSource + Send + 'static> SendAsyncElementDyn for AsyncSourceAdapter
                 let mut ctx = ProduceContext::new(slot);
                 configure_clock(&mut ctx);
                 match self.inner.produce(&mut ctx).await? {
-                    ProduceResult::Produced(n) => {
-                        Ok(SourceResult::Buffer(Box::new(ctx.finalize(n))))
-                    }
+                    ProduceResult::Produced(n) => Ok(SourceResult::Buffer(ctx.finalize(n))),
                     ProduceResult::Eos => Ok(SourceResult::Eos),
-                    ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(Box::new(buffer))),
+                    ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(buffer)),
                     ProduceResult::OwnDmaBuf(dmabuf) => {
-                        Ok(SourceResult::Buffer(Box::new(dmabuf.to_buffer(arena)?)))
+                        Ok(SourceResult::Buffer(dmabuf.to_buffer(arena)?))
                     }
                     ProduceResult::WouldBlock => Ok(SourceResult::WouldBlock),
                 }
@@ -2923,7 +2957,7 @@ impl<S: AsyncSource + Send + 'static> SendAsyncElementDyn for AsyncSourceAdapter
                 let mut ctx = ProduceContext::without_buffer();
                 configure_clock(&mut ctx);
                 match self.inner.produce(&mut ctx).await? {
-                    ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(Box::new(buffer))),
+                    ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(buffer)),
                     ProduceResult::OwnDmaBuf(_) => Err(crate::error::Error::BufferPool(
                         "arena exhausted, cannot convert DmaBuf to Buffer".into(),
                     )),
@@ -2938,7 +2972,7 @@ impl<S: AsyncSource + Send + 'static> SendAsyncElementDyn for AsyncSourceAdapter
             let mut ctx = ProduceContext::without_buffer();
             configure_clock(&mut ctx);
             match self.inner.produce(&mut ctx).await? {
-                ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(Box::new(buffer))),
+                ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(buffer)),
                 ProduceResult::OwnDmaBuf(_) => Err(crate::error::Error::BufferPool(
                     "no arena configured, cannot convert DmaBuf to Buffer".into(),
                 )),
@@ -3036,12 +3070,6 @@ impl<S: AsyncSink + Send + 'static> SendAsyncElementDyn for AsyncSinkAdapter<S> 
             self.inner.consume(&ctx).await?;
         }
         Ok(None)
-    }
-
-    async fn process_all(&mut self, input: Option<Buffer>) -> Result<Output> {
-        AsyncElementDyn::process(self, input)
-            .await
-            .map(Output::from)
     }
 
     fn input_caps(&self) -> Caps {
@@ -3142,19 +3170,6 @@ impl<T: AsyncTransform + Send + 'static> SendAsyncElementDyn for AsyncTransformA
         }
     }
 
-    async fn process_all(&mut self, input: Option<Buffer>) -> Result<Output> {
-        // Return pending first
-        if !self.pending.is_empty() {
-            let pending = std::mem::take(&mut self.pending);
-            return Ok(Output::from(pending));
-        }
-
-        match input {
-            Some(buffer) => self.inner.transform(buffer).await,
-            None => Ok(Output::None),
-        }
-    }
-
     fn input_caps(&self) -> Caps {
         self.inner.input_caps()
     }
@@ -3235,6 +3250,11 @@ impl<D: Demuxer> DemuxerAdapter<D> {
 }
 
 impl<D: Demuxer + Send + 'static> SendAsyncElementDyn for DemuxerAdapter<D> {
+    // Sync author trait: the inline forms are the canonical bodies (#175).
+    fn dispatches_inline(&self) -> bool {
+        true
+    }
+
     fn set_output_budget(&mut self, budget: crate::memory::OutputBudget) {
         self.inner.set_output_budget(budget);
     }
@@ -3247,7 +3267,7 @@ impl<D: Demuxer + Send + 'static> SendAsyncElementDyn for DemuxerAdapter<D> {
         ElementType::Demuxer
     }
 
-    async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
+    fn process_inline(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
         // First return any pending buffers
         if !self.pending.is_empty() {
             let (_, buffer) = self.pending.remove(0);
@@ -3271,24 +3291,8 @@ impl<D: Demuxer + Send + 'static> SendAsyncElementDyn for DemuxerAdapter<D> {
         }
     }
 
-    async fn process_all(&mut self, input: Option<Buffer>) -> Result<Output> {
-        // Return pending first
-        if !self.pending.is_empty() {
-            let pending: Vec<Buffer> = std::mem::take(&mut self.pending)
-                .into_iter()
-                .map(|(_, b)| b)
-                .collect();
-            return Ok(Output::from(pending));
-        }
-
-        match input {
-            Some(buffer) => {
-                let routed = self.inner.demux(buffer)?;
-                let buffers: Vec<Buffer> = routed.into_iter().map(|(_, b)| b).collect();
-                Ok(Output::from(buffers))
-            }
-            None => Ok(Output::None),
-        }
+    async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
+        SendAsyncElementDyn::process_inline(self, input)
     }
 
     fn handle_upstream_event(&mut self, event: &Event) -> EventResult {
@@ -3340,7 +3344,7 @@ impl<D: Demuxer + Send + 'static> SendAsyncElementDyn for DemuxerAdapter<D> {
         self.inner.query_duration()
     }
 
-    async fn process_demux(&mut self, input: Option<Buffer>) -> Result<DemuxResult> {
+    fn process_demux_inline(&mut self, input: Option<Buffer>) -> Result<DemuxResult> {
         let routed = match input {
             Some(buffer) => self.inner.demux(buffer)?,
             None => match self.inner.produce()? {
@@ -3355,6 +3359,10 @@ impl<D: Demuxer + Send + 'static> SendAsyncElementDyn for DemuxerAdapter<D> {
                 .map(|(pad, buffer)| (self.inner.pad_name(pad), buffer))
                 .collect(),
         ))
+    }
+
+    async fn process_demux(&mut self, input: Option<Buffer>) -> Result<DemuxResult> {
+        SendAsyncElementDyn::process_demux_inline(self, input)
     }
 
     fn input_caps(&self) -> Caps {
@@ -3429,6 +3437,11 @@ impl<M: Muxer> MuxerAdapter<M> {
 }
 
 impl<M: Muxer + Send + 'static> SendAsyncElementDyn for MuxerAdapter<M> {
+    // Sync author trait: the inline forms are the canonical bodies (#175).
+    fn dispatches_inline(&self) -> bool {
+        true
+    }
+
     fn set_output_budget(&mut self, budget: crate::memory::OutputBudget) {
         self.inner.set_output_budget(budget);
     }
@@ -3447,7 +3460,7 @@ impl<M: Muxer + Send + 'static> SendAsyncElementDyn for MuxerAdapter<M> {
         ElementType::Muxer
     }
 
-    async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
+    fn process_inline(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
         match input {
             Some(buffer) => {
                 // When used through the generic adapter, we don't have pad info
@@ -3464,10 +3477,8 @@ impl<M: Muxer + Send + 'static> SendAsyncElementDyn for MuxerAdapter<M> {
         }
     }
 
-    async fn process_all(&mut self, input: Option<Buffer>) -> Result<Output> {
-        AsyncElementDyn::process(self, input)
-            .await
-            .map(Output::from)
+    async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
+        SendAsyncElementDyn::process_inline(self, input)
     }
 
     fn input_caps(&self) -> Caps {

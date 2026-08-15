@@ -886,7 +886,6 @@ impl<T: SendPipelineElement + 'static> super::traits::SendAsyncElementDyn
             ProcessOutput::Buffer(b) => Ok(Some(b)),
             ProcessOutput::Buffers(mut v) => {
                 // Return first buffer, discard rest (limitation of legacy interface)
-                // For proper multi-output, use process_all
                 Ok(if v.is_empty() {
                     None
                 } else {
@@ -896,11 +895,6 @@ impl<T: SendPipelineElement + 'static> super::traits::SendAsyncElementDyn
             ProcessOutput::Eos => Ok(None),
             ProcessOutput::Pending => Ok(None),
         }
-    }
-
-    async fn process_all(&mut self, input: Option<Buffer>) -> Result<super::traits::Output> {
-        let output = SendPipelineElement::process(&mut self.inner, input).await?;
-        Ok(output.into())
     }
 
     fn input_caps(&self) -> Caps {
