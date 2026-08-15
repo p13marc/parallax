@@ -277,7 +277,7 @@ Full catalog with feature flags in **[docs/elements.md](docs/elements.md)**. Sum
 | **Codecs** | H.264 (OpenH264), AV1 encode (rav1e) / decode (dav1d), Opus, AAC (FDK encode, Symphonia decode), FLAC/MP3/Vorbis (Symphonia), JPEG (zune-jpeg), PNG |
 | **Devices** | `V4l2Src` (DMA-BUF export), `LibCameraSrc`, `PipeWireSrc`/`PipeWireSink`, `ScreenCaptureSrc` (XDG portal), `AlsaSrc`/`AlsaSink` (provides hardware clock) |
 | **Streaming out** | `HlsSink` (TS segments + M3U8, ABR variants), `DashSink` (fMP4 + MPD, live & VOD) |
-| **IPC** | `IpcSrc`/`IpcSink` (zero-copy cross-process), `MemorySrc`/`MemorySink` |
+| **IPC** | `IpcSrc`/`IpcSink` (zero-copy cross-process over a shm descriptor ring) |
 
 ## Infrastructure at a glance
 
@@ -313,7 +313,7 @@ Default features are **empty** — everything below is opt-in.
 | `av1-encode` | AV1 encoder (rav1e, pure Rust) | nasm recommended |
 | `av1-decode` | AV1 decoder (dav1d) | libdav1d |
 | `software-codecs` | All of the above | |
-| `vulkan-video` | Vulkan Video GPU decode (**experimental scaffold**, see status) | Vulkan 1.3 |
+| `vulkan-video` | Vulkan Video H.264 GPU decode (**hardware-unvalidated**, see status) | Vulkan 1.3 |
 | **Audio codecs** | | |
 | `audio-codecs` | FLAC+MP3+AAC+Vorbis decoders (Symphonia, pure Rust) | — |
 | `audio-flac` / `audio-mp3` / `audio-aac` / `audio-vorbis` | Individual Symphonia decoders | — |
@@ -339,7 +339,7 @@ Default features are **empty** — everything below is opt-in.
 
 ## Examples
 
-38 numbered examples, one concept each (`cargo run --example <name> [--features ...]`):
+42 numbered examples, one concept each (`cargo run --example <name> [--features ...]`):
 
 | Range | Topic |
 |-------|-------|
@@ -349,6 +349,7 @@ Default features are **empty** — everything below is opt-in.
 | `22`–`26` | Devices & streaming: V4L2 (`v4l2`), display (`display`), HLS, DASH |
 | `41`–`46` | Converters, PipeWire (`pipewire`), ALSA (`alsa`), libcamera (`libcamera`), DMA-BUF negotiation (`v4l2`), screen capture (`screen-capture,h264,mp4-demux`) |
 | `47`–`56` | Infrastructure: flow control, clocks, element retrieval, hybrid scheduling, bus, seeking, probes, tracers, Queue2 buffering, typefind |
+| `57`–`59` | RTSP capture/display (`rtsp`), window events (`display`) |
 
 (Numbers 12, 19, 21, 27–40 are retired/unassigned.)
 
@@ -364,15 +365,15 @@ Default features are **empty** — everything below is opt-in.
 | Cross-process send | O(1) after setup | Arena fd sent once; then only tiny refs |
 | 1080p I420→RGBA (`simd-colorspace`) | ~0.9 ms | AVX2/AVX-512 via `yuv` crate |
 
-`cargo bench` runs the colorspace benchmark; the memory/throughput benches are being rewritten after a memory-API refactor.
+`cargo bench` runs all four benches (memory_pool, throughput, media_path, colorspace) — arena/clone costs, pipeline EOS throughput, the IPC descriptor ring, and colorspace conversion.
 
 ## Project status
 
 Honest accounting of where things stand:
 
-- **Solid:** memory subsystem, pipeline graph + executor (async & hybrid RT), element library, caps negotiation, bus/probes/tracers/seek, plugin loading, typed pipelines. 1112 tests pass.
+- **Solid:** memory subsystem, pipeline graph + executor (async & hybrid RT), element library, caps negotiation, bus/probes/tracers/seek, plugin loading, typed pipelines. The full test suite runs in CI (`just check`).
 - **Functional but young:** RTSP client, HLS/DASH sinks, MP4/TS muxing, device capture (V4L2/PipeWire/ALSA/libcamera/screen).
-- **Scaffolding:** `vulkan-video` — the Vulkan context, video session, DPB, and DMA-BUF import/export are real, but the H.264 decoder does not yet submit actual decode commands; no GPU encode. Treat it as a preview.
+- **Hardware-unvalidated:** `vulkan-video` — H.264 decode really submits work (session, DPB, POC/reference management, per-frame command submission, RAII memory) and decodes a fixture in tests, but no capable GPU has validated it yet (RADV is the target; ANV needs Gen12+); no GPU encode, no H.265/AV1. See #3.
 - **Removed:** process isolation/sandboxing for untrusted elements was prototyped and backed out (fork-safety concerns); it may return in a different form. See [docs/security.md](docs/security.md).
 - **Not started:** RDMA, CUDA interop.
 

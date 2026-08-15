@@ -8,7 +8,7 @@ A map of the public API surface. For complete signatures and doc comments, run `
 use parallax::prelude::*;
 ```
 
-brings in: `Buffer`, `Metadata`/`BufferFlags`/`RtpMeta`, clock types (`Clock`, `ClockTime`, `ClockProvider`, `PipelineClock`, `SystemClock`), element traits (`Source`, `Sink`, `Element`, `Transform`, async variants, `DynAsyncElement`), `Event`/`PipelineItem`/`TagList`, format types (`Caps`, `MediaCaps`, `ElementMediaCaps`, `FormatMemoryCap`, …), `MemorySegment`/`MemoryType`, `Pipeline`/`Executor`, and `Error`/`Result`.
+brings in: `Buffer`, `Metadata`/`BufferFlags`/`RtpMeta`, clock types (`Clock`, `ClockTime`, `ClockProvider`, `PipelineClock`, `SystemClock`), element traits (`Source`, `Sink`, `Element`, `Transform`, async variants, `DynAsyncElement`), `Event`/`PipelineItem`/`TagList`, format types (`Caps`, `MediaCaps`, `ElementMediaCaps`, `FormatMemoryCap`, …), `MemoryType`, `Pipeline`/`Executor`, and `Error`/`Result`.
 
 ## Modules
 
@@ -30,7 +30,7 @@ brings in: `Buffer`, `Metadata`/`BufferFlags`/`RtpMeta`, clock types (`Clock`, `
 | `typefind::{TypeFindRegistry, MediaType, TypeFindResult, TypeFindProbability}` | Content detection |
 | `flow::{FlowSignal, FlowStateHandle, WaterMarks}` | Backpressure primitives (produced by `Pipeline::monitor_link`) |
 | `driver::{TimerDriver, ManualDriver, DriverConfig, DriverStats}` | RT cycle pacing |
-| `rt_bridge::{AsyncRtBridge, BridgeConfig, EventFd}` | Async↔RT boundary |
+| `rt_bridge::{AsyncRtBridge, BridgeConfig}` | Async↔RT boundary (`EventFd` lives in `parallax::memory`) |
 | `events::{PipelineEvent, EventSender, EventReceiver, EventStream}` | Typed event channel (distinct from the bus) |
 
 ### `parallax::element`
@@ -56,9 +56,9 @@ brings in: `Buffer`, `Metadata`/`BufferFlags`/`RtpMeta`, clock types (`Clock`, `
 |------|---------|
 | `SharedArena`, `SharedSlotRef`, `SharedIpcSlotRef`, `SharedArenaCache`, `ArenaMetrics` | memfd arena with cross-process refcounting |
 | `BufferPool` (trait), `FixedBufferPool`, `PooledBuffer`, `PoolStats` | Pipeline buffer pools with backpressure |
-| `DmaBufSegment`, `HugePageSegment`/`HugePageSize`, `MappedFileSegment` | Alternative segments |
-| `MemorySegment` (trait), `MemoryType`, `IpcHandle` | Segment abstraction |
-| `AtomicBitmap` | Lock-free slot bitmap utility |
+| `DmaBufSegment` | DMA-BUF fd wrapper (CPU-mapped) |
+| `MemoryType` | Memory vocabulary for caps negotiation |
+| `IpcChannel`, `IpcDescriptor`, `EventFd` | The IPC data plane (#179): shm descriptor/ack rings + doorbells |
 | `ipc::{send_fds, recv_fds, send_segment_handle, recv_segment_handle}` | SCM_RIGHTS fd passing |
 | `defaults::*` | Slot size/count constants for common media |
 
@@ -92,7 +92,7 @@ The built-in element library — full catalog in [elements.md](elements.md).
 
 ### `parallax::gpu` (feature `vulkan-video`)
 
-`Codec`/`VideoProfile`/`ChromaFormat`, `GpuFrame`/`GpuPixelFormat`, traits `GpuMemory`/`HwVideoDecoder`/`HwVideoEncoder`, `vulkan::{VulkanContext, VulkanH264Decoder, VideoSession, Dpb, VulkanGpuMemory}`. **Experimental scaffold** — the decode path does not yet submit real hardware decode commands.
+`Codec`/`VideoProfile`/`ChromaFormat`, `GpuFrame`/`GpuPixelFormat`, traits `GpuMemory`/`HwVideoDecoder`/`HwVideoEncoder`, `vulkan::{VulkanContext, VulkanH264Decoder, VideoSession, Dpb, VulkanGpuMemory}`. H.264 decode really submits work; **hardware-unvalidated** (see #3), no encode/H.265/AV1.
 
 ### `parallax::error`
 

@@ -14,8 +14,6 @@
 //! | Backend | Use Case |
 //! |---------|----------|
 //! | [`SharedArena`] | **Primary**: Cross-process zero-copy buffers |
-//! | [`HugePageSegment`] | Large allocations, reduced TLB misses |
-//! | [`MappedFileSegment`] | Persistent storage, file I/O |
 //! | [`DmaBufSegment`] | GPU-importable buffers, zero-copy capture |
 //!
 //! # Design Rationale
@@ -47,28 +45,22 @@
 //! // Send ipc_ref over Unix socket...
 //! ```
 
-mod bitmap;
 mod budget;
 mod buffer_pool;
 pub mod defaults;
 mod dmabuf;
 mod eventfd;
-mod huge_pages;
 pub mod ipc;
 mod ipc_ring;
-mod mapped_file;
 mod segment;
 mod shared_refcount;
 
-pub use bitmap::AtomicBitmap;
 pub use budget::{OutputArena, OutputBudget};
 pub use buffer_pool::{BufferPool, FixedBufferPool, PoolStats, PooledBuffer};
 pub use dmabuf::DmaBufSegment;
 pub use eventfd::EventFd;
-pub use huge_pages::{HugePageSegment, HugePageSize};
 pub use ipc_ring::{DEFAULT_IPC_RING_CAPACITY, IpcChannel, IpcChannelState, IpcDescriptor};
-pub use mapped_file::MappedFileSegment;
-pub use segment::{IpcHandle, MemorySegment, MemoryType};
+pub use segment::MemoryType;
 pub use shared_refcount::{
     ArenaMetrics, SharedArena, SharedArenaCache, SharedIpcSlotRef, SharedSlotRef,
 };

@@ -22,7 +22,7 @@
 //! ```
 
 use crate::error::Result;
-use crate::memory::{IpcHandle, MemorySegment, MemoryType};
+use crate::memory::MemoryType;
 use rustix::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use rustix::mm::{MapFlags, ProtFlags};
 use std::ptr::NonNull;
@@ -223,32 +223,10 @@ unsafe impl Send for DmaBufSegment {}
 // Mutable access requires &mut self, which Rust enforces.
 unsafe impl Sync for DmaBufSegment {}
 
-impl MemorySegment for DmaBufSegment {
-    fn as_ptr(&self) -> *const u8 {
-        self.ptr.as_ptr()
-    }
-
-    fn as_mut_ptr(&self) -> Option<*mut u8> {
-        if self.read_only {
-            None
-        } else {
-            Some(self.ptr.as_ptr())
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    fn memory_type(&self) -> MemoryType {
+impl DmaBufSegment {
+    /// The memory type this segment reports in caps terms.
+    pub fn memory_type(&self) -> MemoryType {
         MemoryType::DmaBuf
-    }
-
-    fn ipc_handle(&self) -> Option<IpcHandle> {
-        Some(IpcHandle::Fd {
-            fd: self.fd.as_raw_fd(),
-            size: self.len,
-        })
     }
 }
 
@@ -276,10 +254,8 @@ mod tests {
 
         let segment = DmaBufSegment::from_fd(fd, 4096).unwrap();
 
-        assert_eq!(segment.len(), 4096);
         assert_eq!(segment.size(), 4096);
         assert_eq!(segment.memory_type(), MemoryType::DmaBuf);
-        assert!(segment.ipc_handle().is_some());
         assert!(!segment.is_read_only());
     }
 
@@ -303,30 +279,13 @@ mod tests {
         let fd = rustix::fs::memfd_create("test_ro", rustix::fs::MemfdFlags::CLOEXEC).unwrap();
         rustix::fs::ftruncate(&fd, 512).unwrap();
 
-        let segment = DmaBufSegment::from_fd_readonly(fd, 512).unwrap();
+        let mut segment = DmaBufSegment::from_fd_readonly(fd, 512).unwrap();
 
         assert!(segment.is_read_only());
-        // Use the MemorySegment trait's as_mut_ptr which returns Option
-        assert!(segment.as_mut_ptr().is_none());
+        assert!(segment.as_mut_slice().is_none());
 
         // Reading should still work
         let _ = segment.as_slice();
-    }
-
-    #[test]
-    fn test_dmabuf_ipc_handle() {
-        let fd = rustix::fs::memfd_create("test_ipc", rustix::fs::MemfdFlags::CLOEXEC).unwrap();
-        rustix::fs::ftruncate(&fd, 2048).unwrap();
-
-        let segment = DmaBufSegment::from_fd(fd, 2048).unwrap();
-        let handle = segment.ipc_handle().unwrap();
-
-        match handle {
-            IpcHandle::Fd { fd: _, size } => {
-                assert_eq!(size, 2048);
-            }
-            _ => panic!("Expected IpcHandle::Fd"),
-        }
     }
 
     #[test]

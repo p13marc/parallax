@@ -188,8 +188,6 @@ tempfile = "3.24.0"
 [features]
 default = []
 macros = ["parallax-macros"]  # Plugin authoring macros
-huge-pages = []       # MAP_HUGETLB support
-rdma = []             # Future: RDMA support
 vulkan-video = ["dep:ash", "dep:h264-reader"]  # Vulkan Video codecs
 software-codecs = ["av1-encode", "av1-decode", "h264", "vpx"]  # All software video codecs
 av1-encode = ["dep:rav1e"]  # AV1 encoder (requires nasm on x86_64)

@@ -10,7 +10,7 @@ Completed plans have been removed (see git history). Only plans with an existing
 
 | # | Plan | Priority | Effort | Progress |
 |---|------|----------|--------|----------|
-| 11 | [GPU Codec Framework](11_GPU_CODEC_FRAMEWORK.md) | Medium-High | Large | 🟡 ~60% — Vulkan context/session/DPB/DMA-BUF memory done; decode command submission not wired into `VulkanH264Decoder`; no encode |
+| 11 | [GPU Codec Framework](11_GPU_CODEC_FRAMEWORK.md) | Medium-High | Large | 🟡 ~80% — H.264 decode fully wired (submission, POC/DPB refs, RAII memory) and fixture-tested; hardware validation pending (#3); no encode, no H.265/AV1 |
 | 16 | [Process Isolation](16_PROCESS_ISOLATION.md) | Low | Large | ⬜ Not started — **note:** the earlier scaffolding (`src/execution/`) was removed in `da6df59`; any implementation starts from scratch with a spawn-based design |
 
 ## Proposed Plans (no plan file yet)

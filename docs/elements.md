@@ -191,8 +191,6 @@ let (w, h) = info.wait_for_dimensions(0).await.ok_or("session ended")?;
 | Element | Description |
 |---------|-------------|
 | `IpcSrc` / `IpcSink` | Zero-copy cross-process transport (#179): payloads in shared arenas, per-buffer descriptors + acks in a shared-memory SPSC ring pair with eventfd doorbells; the Unix socket carries only registration/fd-passing/overflow-metadata/teardown. `IpcSink` is an **async sink** (`add_async_sink`), `IpcSrc` an **async source** (`add_async_source`); both await their peer rather than parking a worker, warn after 5 s of silence, and are start-order independent (a client retries until the server binds) |
-| `MemorySrc` / `MemorySink` | In-memory source / collecting sink |
-| `SharedMemorySink` | Thread-safe collecting sink |
 
 ## Mux / Demux — `elements::mux`, `elements::demux`
 

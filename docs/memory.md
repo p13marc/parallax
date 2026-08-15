@@ -259,13 +259,7 @@ What an element should do on exhaustion depends on what it would corrupt:
 
 ## Other segment types
 
-All implement the `MemorySegment` trait (`as_ptr`, `len`, `memory_type`, `ipc_handle`, …):
-
-| Type | Backing | IPC | Notes |
-|------|---------|-----|-------|
-| `DmaBufSegment` | DMA-BUF fd (V4L2 `VIDIOC_EXPBUF`, DRM, GPU export) | fd | `DmaBufBuffer` wraps it with metadata; `into_fd()` recovers the fd; `to_buffer(arena)` copies into CPU memory when needed |
-| `MappedFileSegment` | file `MAP_SHARED` | by path | persistent buffers; `sync()`/`resize()` |
-| `HugePageSegment` | `memfd_create(MFD_HUGETLB)` + `MAP_SHARED` (2 MB / 1 GB) | fd | `new()` errors when the hugetlb pool is empty; `new_or_fallback()` degrades to normal pages and *says so* — `fell_back()`, `memory_type()` reports `Cpu`, and `page_count()`/`prefault()` use `effective_page_size()` |
+One other segment type exists: `DmaBufSegment` — a DMA-BUF fd (V4L2 `VIDIOC_EXPBUF`, DRM, GPU export) mapped for CPU access. `DmaBufBuffer` wraps it with metadata; `into_fd()` recovers the fd; `to_buffer(arena)` copies into CPU memory when needed. (The old `MemorySegment` trait and the `MappedFileSegment`/`HugePageSegment` backends were deleted in the 2026-08 dead-surface sweep — an abstraction layer nothing consumed polymorphically.)
 
 `MemoryType` (`Cpu`, `HugePages`, `MappedFile`, `DmaBuf`, `GpuAccessible`, `GpuDevice`, `RdmaRegistered`) participates in caps negotiation, so pipelines can select DMA-BUF vs CPU paths per link — see [formats.md](formats.md).
 

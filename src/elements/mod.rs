@@ -187,7 +187,7 @@ pub use app::{
 pub use app::{AutoVideoSink, AutoVideoSinkHandle, VideoKey, VideoWindowEvent};
 
 // IPC
-pub use ipc::{IpcSink, IpcSrc, MemorySink, MemorySinkStats, MemorySrc, SharedMemorySink};
+pub use ipc::{IpcSink, IpcSrc};
 
 // Timing
 pub use timing::{

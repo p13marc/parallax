@@ -29,7 +29,7 @@ This document describes how the pieces of Parallax fit together. Detailed guides
                                │
 ┌──────────────────────────────▼─────────────────────────────────────┐
 │  Shared-memory foundation (all CPU buffers are memfd-backed)       │
-│  SharedArena · FixedBufferPool · DmaBufSegment · MappedFileSegment │
+│  SharedArena · FixedBufferPool · DmaBufSegment · IpcChannel │
 │  cross-process refcounts + lock-free release queue in shared mem   │
 └────────────────────────────────────────────────────────────────────┘
 ```

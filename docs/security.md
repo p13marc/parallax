@@ -46,7 +46,7 @@ The crate denies `unsafe_op_in_unsafe_fn` and concentrates `unsafe` in:
 - `src/plugin/` — dynamic loading and C-ABI marshalling (double-boxed trait objects).
 - FFI codec/device bindings behind feature flags.
 
-Known sharp edge: `MemorySegment::as_mut_slice` can alias if callers violate its exclusive-access contract, and `SharedArena::from_fd` trusts the fd's header (it is `unsafe` accordingly).
+Known sharp edge: `SharedArena::from_fd` (and `IpcChannel::from_fds`) trust the fd's header beyond the magic/version/size validation — they are `unsafe` accordingly.
 
 ## Deployment guidance
 

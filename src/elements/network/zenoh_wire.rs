@@ -51,9 +51,10 @@ pub const KEY_EXPR_META: &str = "zenoh/key_expr";
 pub const CUSTOM_META: &str = "zenoh/custom";
 
 /// Custom byte-entry keys that [`ZenohSrc`](super::ZenohSrc) recognizes and
-/// re-inserts under their own metadata key via
-/// [`Metadata::set_bytes`]. Extend as new well-known keys appear.
-const KNOWN_CUSTOM_KEYS: &[&str] = &["stanag/klv", "h264/sei"];
+/// re-inserts under their own metadata key via [`Metadata::set_bytes`].
+/// One list for every wire (the IPC overflow path uses the same one);
+/// extend it there as new well-known keys appear.
+use crate::elements::ipc::protocol::KNOWN_CUSTOM_KEYS;
 
 /// Buffer metadata as serialized on the zenoh wire (version 1).
 ///
