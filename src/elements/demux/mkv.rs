@@ -323,6 +323,13 @@ pub struct MkvDemux<R: Read + Seek> {
     /// Reusable frame to avoid a fresh allocation per block.
     frame: Frame,
     looping: bool,
+    /// Trick-play rate from the last handled seek (#165): while > 1.0,
+    /// only video keyframes are emitted — fast-forward as GStreamer's
+    /// keyframe trick mode (audio is muted; every skipped frame would
+    /// need decode work the rate makes pointless). A rate-1.0 seek
+    /// restores normal playback. PTS are untouched: the post-seek
+    /// Segment carries the rate and sinks pace by segment running time.
+    trick_rate: f64,
     /// Drop non-keyframe video frames until the first keyframe (set after a
     /// seek so a decoder never sees a mid-GOP entry).
     video_resync: bool,
@@ -428,6 +435,7 @@ impl<R: Read + Seek> MkvDemux<R> {
                 .grow_to_fit(),
             frame: Frame::default(),
             looping: false,
+            trick_rate: 1.0,
             video_resync: false,
             pending: None,
             skip: Vec::new(),
@@ -840,6 +848,12 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
                 self.video_resync = false;
             }
 
+            // Fast-forward (#165): keyframes only, no audio.
+            if self.trick_rate > 1.0 && (!is_video || !is_key) {
+                discarded += 1;
+                continue;
+            }
+
             // Convert straight into the slot (the take/restore dance frees
             // the `&self.frame` borrow for the `&mut self` call). On arena
             // exhaustion the raw payload is copied once into the pending
@@ -985,6 +999,9 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
             tracing::info!("mkvdemux: seek to {target_ns} ns (tick {ticks}, {snap:?})");
             self.pending = None;
             self.video_resync = true;
+            // Trick play (#165): the seek's rate governs playback until the
+            // next handled seek changes it.
+            self.trick_rate = if seek.rate > 0.0 { seek.rate } else { 1.0 };
             // Per-track skip on EVERY path: the cue lands at (or before) the
             // skip target's cluster, the crate's narrow phase only guarantees
             // the first block, and the rewind fallback starts at zero — in

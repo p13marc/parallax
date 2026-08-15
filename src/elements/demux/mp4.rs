@@ -1133,6 +1133,12 @@ pub struct Mp4DemuxSource<R: Read + Seek + Send> {
     primed: bool,
     /// Restart from the top at EOS instead of ending (see [`with_loop`](Self::with_loop)).
     looping: bool,
+    /// Trick-play rate from the last handled seek (#165): while > 1.0,
+    /// only video keyframes are emitted (audio muted) — fast-forward as
+    /// GStreamer's keyframe trick mode. A rate-1.0 seek restores normal
+    /// playback. PTS untouched: the post-seek Segment carries the rate
+    /// and sinks pace by segment running time.
+    trick_rate: f64,
 }
 
 impl<R: Read + Seek + Send> Mp4DemuxSource<R> {
@@ -1159,6 +1165,7 @@ impl<R: Read + Seek + Send> Mp4DemuxSource<R> {
             pending,
             primed: false,
             looping: false,
+            trick_rate: 1.0,
         }
     }
 
@@ -1218,6 +1225,24 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for Mp4DemuxSource<R> {
                 self.refill(i)?;
             }
             self.primed = true;
+        }
+
+        // Fast-forward (#165): drop pending samples that are not video
+        // keyframes before interleaving, refilling as we go. Reads still
+        // touch every sample (a stss-walk fast path is a later slice);
+        // only decode-side work is saved, which is the expensive part.
+        if self.trick_rate > 1.0 {
+            for i in 0..self.tracks.len() {
+                loop {
+                    match &self.pending[i] {
+                        Some(s) if self.tracks[i].1.0 != 0 || !s.is_keyframe => {
+                            self.pending[i] = None;
+                            self.refill(i)?;
+                        }
+                        _ => break,
+                    }
+                }
+            }
         }
 
         // Emit the pending sample with the smallest DTS.
@@ -1283,6 +1308,9 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for Mp4DemuxSource<R> {
                     *slot = None;
                 }
                 self.primed = false;
+                // Trick play (#165): the seek's rate governs playback until
+                // the next handled seek changes it.
+                self.trick_rate = if seek.rate > 0.0 { seek.rate } else { 1.0 };
                 // The keyframe actually landed on (may be before the
                 // request) — Segment/SeekDone report it (#162).
                 EventResult::handled_at(point.time_ns as i64)

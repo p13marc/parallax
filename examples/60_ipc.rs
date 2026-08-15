@@ -60,7 +60,7 @@ impl Source for StampedSource {
             pixel_format: PixelFormat::I420,
             framerate: Framerate::new(25, 1),
         }));
-        if n % 5 == 0 {
+        if n.is_multiple_of(5) {
             // Rides the control socket as MetaOverflow, re-attached by the
             // receiver — the one part of Metadata too dynamic for the ring.
             meta.set_klv(vec![0x4B, 0x4C, 0x56, n as u8]);

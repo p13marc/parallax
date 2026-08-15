@@ -647,3 +647,87 @@ fn subtitle_tracks_listed_not_routed() {
         }
     }
 }
+
+/// #165 fast-forward: a rate>1 seek switches MkvDemux to keyframe-only
+/// output; a rate-1.0 seek restores every frame. Looping for the same
+/// reason as the MP4 twin: trick-mode discards generate no backpressure.
+#[tokio::test(flavor = "multi_thread")]
+async fn mkv_fast_forward_emits_keyframes_only() {
+    use parallax::clock::ClockTime;
+    use parallax::event::SeekEvent;
+
+    let demux = open(H264_AAC_MKV).video_only().with_loop(true);
+
+    let mut pipeline = Pipeline::new();
+    let video_sink = AppSink::with_max_buffers(2);
+    let video_handle = video_sink.handle();
+    let node = pipeline.add_demuxer("mkvdemux", demux);
+    let vs = pipeline.add_async_sink("video_sink", video_sink);
+    pipeline
+        .link_pads_full(
+            node,
+            "video",
+            vs,
+            "sink",
+            parallax::pipeline::LinkPolicy::Block,
+            Some(2),
+        )
+        .unwrap();
+
+    let executor = Executor::new();
+    let handle = executor.start(&mut pipeline).unwrap();
+
+    for _ in 0..2 {
+        assert!(matches!(
+            video_handle.pull_buffer().await,
+            Pulled::Buffer(_)
+        ));
+    }
+
+    // Phase 1: fast-forward. MKV's forward snap lands the first keyframe
+    // at/after 600 ms (1000 ms); while rate > 1 only keyframes flow.
+    let seek = SeekEvent::new_time(ClockTime::from_millis(600)).with_rate(2.0);
+    assert!(handle.seek(seek).await);
+
+    let mut pts = Vec::new();
+    while pts.len() < 12 {
+        match video_handle.pull_buffer().await {
+            Pulled::Buffer(b) => pts.push(b.metadata().pts.nanos() / 1_000_000),
+            Pulled::Flushing | Pulled::Empty => tokio::task::yield_now().await,
+            other => panic!("stream ended during fast-forward: {other:?}"),
+        }
+    }
+    let landing = pts
+        .iter()
+        .position(|p| *p == 1000)
+        .expect("landing at 1000");
+    assert!(
+        pts.len() - landing >= 6,
+        "expected several trick frames after the landing: {pts:?}"
+    );
+    assert!(
+        pts[landing..].iter().all(|p| p.is_multiple_of(500)),
+        "fast-forward emitted a non-keyframe: {pts:?}"
+    );
+
+    // Phase 2: a rate-1.0 seek restores normal playback (forward snap lands
+    // the 1500 ms keyframe, then every 100 ms frame follows).
+    assert!(handle.seek_time(ClockTime::from_millis(1200)).await);
+    let mut pts2 = Vec::new();
+    while pts2.len() < 16 {
+        match video_handle.pull_buffer().await {
+            Pulled::Buffer(b) => pts2.push(b.metadata().pts.nanos() / 1_000_000),
+            Pulled::Flushing | Pulled::Empty => tokio::task::yield_now().await,
+            other => panic!("stream ended after the restore seek: {other:?}"),
+        }
+    }
+    handle.stop();
+    while let Pulled::Buffer(_) = video_handle.pull_buffer().await {}
+    handle.wait().await.unwrap();
+
+    let expected = [1500, 1600, 1700, 1800, 1900];
+    assert!(
+        pts2.windows(expected.len()).any(|w| w == expected),
+        "normal playback restored after the rate-1.0 seek: {pts2:?}"
+    );
+}
