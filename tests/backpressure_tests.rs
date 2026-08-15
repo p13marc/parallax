@@ -180,7 +180,7 @@ mod link_monitoring {
         // the high mark (6), before the channel (8) can fill, so nothing is
         // actually dropped: the source skips instead.
         let link = pipeline
-            .link_pads_full(s, "src", k, "sink", LinkPolicy::Drop, Some(8))
+            .link_pads_full(s, "src", k, "sink", LinkPolicy::DropNewest, Some(8))
             .unwrap();
         let flow = pipeline
             .monitor_link_with(link, WaterMarks::new(6, 1))

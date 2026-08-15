@@ -220,7 +220,7 @@ async fn a_link_can_override_the_channel_capacity() {
             "src",
             sink,
             "sink",
-            LinkPolicy::Drop,
+            LinkPolicy::DropNewest,
             Some(FRAMES as usize * 2), // deep enough that nothing can be dropped
         )
         .unwrap();

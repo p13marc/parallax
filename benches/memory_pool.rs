@@ -190,7 +190,7 @@ fn bench_pool_acquire(c: &mut Criterion) {
     });
 
     // Exhausted pool: try_acquire must report failure rather than block. This
-    // is what a `LinkPolicy::Drop` branch does when it falls behind.
+    // is what a `LinkPolicy::DropNewest` branch does when it falls behind.
     let small = FixedBufferPool::new(buffer_size, 2).expect("pool");
     let _held: Vec<_> = (0..2).map(|_| small.acquire().expect("held")).collect();
     group.bench_function("try_acquire_exhausted", |b| {

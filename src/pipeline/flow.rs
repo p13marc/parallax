@@ -14,7 +14,7 @@
 //!
 //! A source that received a handle via `set_flow_state` checks
 //! `should_produce()` before doing capture work and skips the frame while
-//! the signal is [`FlowSignal::Busy`] — cheaper than `LinkPolicy::Drop`
+//! the signal is [`FlowSignal::Busy`] — cheaper than `LinkPolicy::DropNewest`
 //! alone, which can only discard the frame *after* it was captured and
 //! copied. At the low watermark the signal returns to
 //! [`FlowSignal::Ready`] and production resumes.

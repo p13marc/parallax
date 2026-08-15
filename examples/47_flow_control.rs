@@ -112,7 +112,8 @@ async fn main() -> Result<()> {
 
     // A live branch: Drop policy (a stalled sink must not wedge the camera),
     // shallow channel, monitored with explicit watermarks.
-    let link = pipeline.link_pads_full(src, "src", sink, "sink", LinkPolicy::Drop, Some(8))?;
+    let link =
+        pipeline.link_pads_full(src, "src", sink, "sink", LinkPolicy::DropNewest, Some(8))?;
     let flow = pipeline.monitor_link_with(link, WaterMarks::new(6, 2))?;
 
     // Hand the source its gate before start (elements move into their tasks).

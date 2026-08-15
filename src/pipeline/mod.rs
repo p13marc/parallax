@@ -51,6 +51,7 @@ mod events;
 pub mod factory;
 pub mod flow;
 mod graph;
+mod leaky;
 pub mod parser;
 pub mod probe;
 pub mod rt_bridge;

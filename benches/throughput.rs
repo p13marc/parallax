@@ -27,7 +27,7 @@ use parallax::memory::SharedArena;
 use parallax::metadata::Metadata;
 use parallax::pipeline::rt_bridge::{AsyncRtBridge, BridgeConfig, EventFd};
 use parallax::pipeline::rt_scheduler::{RtConfig, SchedulingMode};
-use parallax::pipeline::{Executor, Pipeline, UnifiedExecutorConfig as ExecutorConfig};
+use parallax::pipeline::{Executor, LinkPolicy, Pipeline, UnifiedExecutorConfig as ExecutorConfig};
 use std::hint::black_box;
 
 /// How many buffers each end-to-end run pushes. Large enough that per-run
@@ -154,20 +154,29 @@ fn bench_fanout_width(c: &mut Criterion) {
     group.finish();
 }
 
-/// `LinkPolicy::Block` against `link_lossy` on an asymmetric fan-out.
+/// `LinkPolicy::Block` against the two lossy policies on an asymmetric fan-out.
 ///
 /// One branch is deliberately slower (four passthrough stages deep). Under
-/// `Block` the source is throttled to the slow branch; under `Drop` the slow
-/// branch degrades itself. The gap between the two is the head-of-line
-/// blocking that #39 removed.
+/// `Block` the source is throttled to the slow branch; under the lossy
+/// policies the slow branch degrades itself — DropNewest sheds the incoming
+/// buffer, DropOldest (#169) evicts the queued one. The gap against Block is
+/// the head-of-line blocking that #39 removed.
 fn bench_fanout_policy(c: &mut Criterion) {
     let mut group = c.benchmark_group("fanout_policy");
     group.sample_size(20);
     group.throughput(Throughput::Elements(BUFFERS));
     let rt = runtime();
 
-    for lossy in [false, true] {
-        let label = if lossy { "drop" } else { "block" };
+    for policy in [
+        LinkPolicy::Block,
+        LinkPolicy::DropNewest,
+        LinkPolicy::DropOldest,
+    ] {
+        let label = match policy {
+            LinkPolicy::Block => "block",
+            LinkPolicy::DropNewest => "drop_newest",
+            LinkPolicy::DropOldest => "drop_oldest",
+        };
         group.bench_function(BenchmarkId::new("slow_branch", label), |b| {
             b.iter(|| {
                 rt.block_on(async {
@@ -180,11 +189,7 @@ fn bench_fanout_policy(c: &mut Criterion) {
 
                     // Slow branch: a chain of stages, so it drains later.
                     let head = pipeline.add_filter("slow0", PassThrough::new());
-                    if lossy {
-                        pipeline.link_lossy(src, head).expect("link");
-                    } else {
-                        pipeline.link(src, head).expect("link");
-                    }
+                    pipeline.link_with(src, head, policy).expect("link");
                     let mut prev = head;
                     for i in 1..4 {
                         let f = pipeline.add_filter(format!("slow{i}"), PassThrough::new());

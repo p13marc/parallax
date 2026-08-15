@@ -1579,22 +1579,41 @@ impl Executor {
     }
 
     /// Build channel network recursively.
+    /// Materialize one link into a channel pair + optional flow monitor.
+    ///
+    /// `DropOldest` links get the leaky (evicting) channel; everything else
+    /// uses tokio mpsc. This pairing is what `send_buffer`'s dispatch relies
+    /// on.
+    fn make_link_channel(
+        &self,
+        link: &crate::pipeline::Link,
+    ) -> (BranchTx, BranchRx, Option<Arc<LinkFlowMonitor>>) {
+        // `.max(1)`: tokio panics on a zero-capacity channel where
+        // kanal made a rendezvous channel, and both
+        // `link_pads_full(.., Some(0))`
+        // and `with_channel_capacity(0)` are public. Clamping here also
+        // keeps `WaterMarks::from_capacity` off a degenerate 0/0 band.
+        let capacity = link.capacity.unwrap_or(self.config.channel_capacity).max(1);
+        let (tx, rx) = if link.policy == LinkPolicy::DropOldest {
+            let (tx, rx) = crate::pipeline::leaky::channel::<Message>(capacity);
+            (BranchTx::Leaky(tx), BranchRx::Leaky(rx))
+        } else {
+            let (tx, rx) = message_channel::<Message>(capacity);
+            (BranchTx::Mpsc(tx), BranchRx::Mpsc(rx))
+        };
+        let flow = link.flow_state.as_ref().map(|state| {
+            let marks = link
+                .watermarks
+                .unwrap_or_else(|| WaterMarks::from_capacity(capacity));
+            Arc::new(LinkFlowMonitor::new(marks, state.clone()))
+        });
+        (tx, rx, flow)
+    }
+
     fn build_channels(&self, pipeline: &Pipeline, node_id: NodeId, network: &mut ChannelNetwork) {
         for (child_id, link) in pipeline.children(node_id) {
             if !network.has_channel(node_id, &link.src_pad, child_id, &link.sink_pad) {
-                // `.max(1)`: tokio panics on a zero-capacity channel where
-                // kanal made a rendezvous channel, and both
-                // `link_pads_full(.., Some(0))`
-                // and `with_channel_capacity(0)` are public. Clamping here also
-                // keeps `WaterMarks::from_capacity` off a degenerate 0/0 band.
-                let capacity = link.capacity.unwrap_or(self.config.channel_capacity).max(1);
-                let (tx, rx) = message_channel::<Message>(capacity);
-                let flow = link.flow_state.as_ref().map(|state| {
-                    let marks = link
-                        .watermarks
-                        .unwrap_or_else(|| WaterMarks::from_capacity(capacity));
-                    Arc::new(LinkFlowMonitor::new(marks, state.clone()))
-                });
+                let (tx, rx, flow) = self.make_link_channel(link);
                 network.add_channel(
                     node_id,
                     link.src_pad.clone(),
@@ -1628,20 +1647,23 @@ impl Executor {
                 .any(|e| e.source == node_id && e.sink == child_id);
 
             if is_boundary {
-                continue; // Bridge handles this
+                // Bridge handles this. The bridge is a bare SPSC ring with no
+                // policy hook, so a non-default LinkPolicy is silently a Block
+                // here — worth a trace when someone asked for lossy.
+                if link.policy != LinkPolicy::Block {
+                    tracing::debug!(
+                        "boundary edge {:?} -> {:?} is bridged; LinkPolicy::{:?} does not apply",
+                        node_id,
+                        child_id,
+                        link.policy
+                    );
+                }
+                continue;
             }
 
             if async_set.contains(&child_id) {
                 if !network.has_channel(node_id, &link.src_pad, child_id, &link.sink_pad) {
-                    // See the sibling in `build_channels`: tokio panics on 0.
-                    let capacity = link.capacity.unwrap_or(self.config.channel_capacity).max(1);
-                    let (tx, rx) = message_channel::<Message>(capacity);
-                    let flow = link.flow_state.as_ref().map(|state| {
-                        let marks = link
-                            .watermarks
-                            .unwrap_or_else(|| WaterMarks::from_capacity(capacity));
-                        Arc::new(LinkFlowMonitor::new(marks, state.clone()))
-                    });
+                    let (tx, rx, flow) = self.make_link_channel(link);
                     network.add_channel(
                         node_id,
                         link.src_pad.clone(),
@@ -2197,6 +2219,32 @@ enum Message {
 
 type ChannelKey = (NodeId, String, NodeId, String);
 
+/// The sending half of a link channel: tokio mpsc for `Block`/`DropNewest`
+/// links, the drop-oldest [`leaky`] channel for `DropOldest` ones (tokio's
+/// `Sender` cannot evict a queued message, so that policy needs its own
+/// primitive). Paired with [`BranchRx`] by construction in `build_channels`.
+#[derive(Clone)]
+enum BranchTx {
+    Mpsc(MsgSender<Message>),
+    Leaky(crate::pipeline::leaky::LeakySender<Message>),
+}
+
+/// The receiving half matching [`BranchTx`].
+enum BranchRx {
+    Mpsc(MsgReceiver<Message>),
+    Leaky(crate::pipeline::leaky::LeakyReceiver<Message>),
+}
+
+impl BranchRx {
+    /// Queued messages, for flow-monitor sampling.
+    fn len(&self) -> usize {
+        match self {
+            BranchRx::Mpsc(rx) => rx.len(),
+            BranchRx::Leaky(rx) => rx.len(),
+        }
+    }
+}
+
 /// One downstream branch of a src-pad, with the policy of the link that made it.
 ///
 /// The old code flattened a pad's outputs to a bare `Vec<AsyncSender>`, which
@@ -2204,7 +2252,7 @@ type ChannelKey = (NodeId, String, NodeId, String);
 /// slow branch differently from a fast one.
 #[derive(Clone)]
 struct OutputBranch {
-    tx: MsgSender<Message>,
+    tx: BranchTx,
     policy: LinkPolicy,
     /// Name of the element on the far end, for drop reporting.
     sink_name: String,
@@ -2220,10 +2268,13 @@ impl OutputBranch {
     ///
     /// tokio's `Sender` has no `len()`; `max_capacity - capacity` is exact
     /// here because nothing in this file calls `reserve()`, and it can never
-    /// exceed the capacity.
+    /// exceed the capacity. The leaky sender tracks its length directly.
     #[inline]
     fn occupancy(&self) -> usize {
-        self.tx.max_capacity() - self.tx.capacity()
+        match &self.tx {
+            BranchTx::Mpsc(tx) => tx.max_capacity() - tx.capacity(),
+            BranchTx::Leaky(tx) => tx.len(),
+        }
     }
 
     /// Send a buffer, honouring the link policy.
@@ -2232,28 +2283,80 @@ impl OutputBranch {
     /// a producer stop instead of spinning: a source feeding a sink that had
     /// died used to run at 100% CPU into a closed channel (#85,
     /// `tests/no_hang_on_error.rs`). A **full** channel is not that — under
-    /// `Drop` the buffer is shed and the branch stays live.
+    /// the lossy policies the buffer (incoming or oldest-queued) is shed and
+    /// the branch stays live.
     ///
     /// NOTE: `send().await` must never appear as a `select!` branch. tokio
     /// guarantees the message was not *sent* if the future is cancelled, but
     /// the message is *dropped*. Nothing here sends inside a select; keep it
     /// that way.
     async fn send_buffer(&self, buffer: Buffer, epoch: u64, tracers: &TracerRegistry) -> bool {
-        let sent = match self.policy {
-            LinkPolicy::Block => self.tx.send(Message::Buffer(buffer, epoch)).await.is_ok(),
-            LinkPolicy::Drop => match self.tx.try_send(Message::Buffer(buffer, epoch)) {
+        let msg = Message::Buffer(buffer, epoch);
+        let sent = match (&self.tx, self.policy) {
+            (BranchTx::Mpsc(tx), LinkPolicy::Block) => tx.send(msg).await.is_ok(),
+            (BranchTx::Mpsc(tx), LinkPolicy::DropNewest) => match tx.try_send(msg) {
                 Ok(()) => true,
                 Err(TrySendError::Full(_)) => {
-                    tracers.notify_drop(&self.sink_name);
+                    self.record_drop(tracers);
                     true
                 }
                 Err(TrySendError::Closed(_)) => false,
             },
+            (BranchTx::Leaky(tx), _) => {
+                use crate::pipeline::leaky::LossyPush;
+                match tx.send_lossy(msg) {
+                    LossyPush::Sent => true,
+                    LossyPush::SentEvictedOldest(_old) => {
+                        self.record_drop(tracers);
+                        true
+                    }
+                    LossyPush::Closed(_) => false,
+                }
+            }
+            (BranchTx::Mpsc(_), LinkPolicy::DropOldest) => {
+                unreachable!("build_channels pairs DropOldest links with a leaky channel")
+            }
         };
         if let Some(flow) = &self.flow {
             flow.update(self.occupancy());
         }
+        // The lossy paths never suspend: try_send and send_lossy are
+        // synchronous, so a producer whose buffers are always accepted (or
+        // shed) would never yield — and a consumer task woken by these sends
+        // lands in this worker's non-stealable LIFO slot, where a
+        // never-yielding producer starves it forever (the AppSink lesson,
+        // gotcha 15). Block links get this for free: tokio's mpsc send
+        // participates in the coop budget even when it returns Ready.
+        // `consume_budget` charges the same budget here, forcing a yield
+        // every ~128 sends instead of every send.
+        if self.policy != LinkPolicy::Block {
+            tokio::task::coop::consume_budget().await;
+        }
         sent
+    }
+
+    /// Report one shed buffer on this link.
+    ///
+    /// Policy drops are expected steady-state behaviour of a deliberately
+    /// lossy branch — a tracer notification and a metric, not a warning
+    /// ladder like the arena-exhaustion sheds.
+    fn record_drop(&self, tracers: &TracerRegistry) {
+        tracers.notify_drop(&self.sink_name);
+        crate::observability::record_buffer_dropped("pipeline", &self.sink_name);
+    }
+
+    /// Send a control message (EOS / in-band event / terminal error),
+    /// **always delivered** whatever the link policy.
+    ///
+    /// Mpsc links block for room; the leaky channel enqueues past capacity
+    /// without blocking (control is rare and bounded). Either way a lossy
+    /// policy never sheds control — a dropped FlushStop or EOS wedges the
+    /// subtree below it forever.
+    async fn send_control(&self, msg: Message) -> bool {
+        match &self.tx {
+            BranchTx::Mpsc(tx) => tx.send(msg).await.is_ok(),
+            BranchTx::Leaky(tx) => tx.send_control(msg),
+        }
     }
 }
 
@@ -2261,20 +2364,25 @@ impl OutputBranch {
 /// plus that link's flow monitor. `recv`/`try_recv` sample occupancy after
 /// every receive, which is the half of the monitoring that observes drains.
 struct InputBranch {
-    rx: MsgReceiver<Message>,
+    rx: BranchRx,
     flow: Option<Arc<LinkFlowMonitor>>,
 }
 
 impl InputBranch {
     /// Receive one message; `None` once every sender is gone.
     ///
-    /// **Cancel-safe, and it must stay that way.** tokio guarantees that a
-    /// dropped `recv` future consumed no message, which is what lets the
-    /// consuming loops below race this against their upstream inbox in a
-    /// plain `select!`. Anything added before that await — a permit, a
-    /// stashed value — would be lost when a select loser is dropped.
+    /// **Cancel-safe, and it must stay that way.** Both channel kinds
+    /// guarantee that a dropped `recv` future consumed no message (tokio
+    /// documents it; the leaky receiver pops synchronously in the returning
+    /// poll), which is what lets the consuming loops below race this against
+    /// their upstream inbox in a plain `select!`. Anything added before that
+    /// await — a permit, a stashed value — would be lost when a select loser
+    /// is dropped.
     async fn recv(&mut self) -> Option<Message> {
-        let msg = self.rx.recv().await;
+        let msg = match &mut self.rx {
+            BranchRx::Mpsc(rx) => rx.recv().await,
+            BranchRx::Leaky(rx) => rx.recv().await,
+        };
         if let Some(flow) = &self.flow {
             flow.update(self.rx.len());
         }
@@ -2283,7 +2391,10 @@ impl InputBranch {
 
     /// Non-blocking receive, for the sink's paused drain.
     fn try_recv(&mut self) -> std::result::Result<Message, TryRecvError> {
-        let msg = self.rx.try_recv();
+        let msg = match &mut self.rx {
+            BranchRx::Mpsc(rx) => rx.try_recv(),
+            BranchRx::Leaky(rx) => rx.try_recv(),
+        };
         if let Some(flow) = &self.flow {
             flow.update(self.rx.len());
         }
@@ -2327,24 +2438,24 @@ fn is_stale(epoch: u64, current: &AtomicU64) -> bool {
     epoch < current.load(Ordering::Acquire)
 }
 
-/// Send EOS to every branch, **always blocking**.
+/// Send EOS to every branch, **always delivered**.
 ///
-/// A dropped EOS would leave the branch's sink waiting forever, so `Drop` does
-/// not apply to it. Only buffers are ever dropped.
+/// A dropped EOS would leave the branch's sink waiting forever, so the lossy
+/// policies do not apply to it. Only buffers are ever dropped.
 async fn broadcast_eos(branches: &[OutputBranch]) {
     for branch in branches {
-        let _ = branch.tx.send(Message::Eos).await;
+        let _ = branch.send_control(Message::Eos).await;
     }
 }
 
-/// Send an in-band event to every branch, **always blocking**.
+/// Send an in-band event to every branch, **always delivered**.
 ///
 /// Events are control flow, not payload: a dropped FlushStop would leave the
-/// branch's subtree discarding buffers forever, so `LinkPolicy::Drop` does not
+/// branch's subtree discarding buffers forever, so the lossy policies do not
 /// apply — same reasoning as [`broadcast_eos`].
 async fn broadcast_event(branches: &[OutputBranch], event: &Event) {
     for branch in branches {
-        let _ = branch.tx.send(Message::Event(event.clone())).await;
+        let _ = branch.send_control(Message::Event(event.clone())).await;
     }
 }
 
@@ -2444,7 +2555,7 @@ async fn hybrid_process_demux(
     }
 }
 
-/// Send a terminal error to every branch, **always blocking**.
+/// Send a terminal error to every branch, **always delivered**.
 ///
 /// Same reasoning as [`broadcast_eos`]: a dropped terminal message wedges the
 /// branch's sink. This is what makes a failed pipeline distinguishable from a
@@ -2452,7 +2563,7 @@ async fn hybrid_process_demux(
 /// report a clean end of stream.
 async fn broadcast_error(branches: &[OutputBranch], error: &StreamError) {
     for branch in branches {
-        let _ = branch.tx.send(Message::Error(error.clone())).await;
+        let _ = branch.send_control(Message::Error(error.clone())).await;
     }
 }
 
@@ -2497,8 +2608,8 @@ impl ChannelNetwork {
         src_pad: String,
         sink: NodeId,
         sink_pad: String,
-        tx: MsgSender<Message>,
-        rx: MsgReceiver<Message>,
+        tx: BranchTx,
+        rx: BranchRx,
         policy: LinkPolicy,
         sink_name: String,
         flow: Option<Arc<LinkFlowMonitor>>,

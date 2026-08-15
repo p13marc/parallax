@@ -82,7 +82,8 @@ Each **link** — not each pad, since fan-out means several links leave one pad 
 | Policy | Behaviour |
 |--------|-----------|
 | `Block` (default) | Wait for room. Back-pressures upstream — and, on a fan-out, **every sibling branch with it**. |
-| `Drop` | Drop the buffer and carry on. Degrades *this* branch alone. |
+| `DropNewest` | Drop the **incoming** buffer and carry on (GStreamer leaky-upstream). Degrades *this* branch alone; the consumer sees the oldest queued data. |
+| `DropOldest` | Evict the **oldest queued** buffer to make room (GStreamer leaky-downstream, #169). Also degrades this branch alone, but the consumer always sees the freshest data — right for live preview/monitoring. |
 
 This matters more than it sounds. With every branch blocking, a persistently slow branch fills
 its channel and stalls the source and all its siblings — so a cheap 2 fps preview drags down a
@@ -90,15 +91,17 @@ full-rate H.264 branch, which is the opposite of what anyone predicts. Make the 
 allowed to fall behind lossy.
 
 ```rust,ignore
-p.link_lossy(src, preview)?;                                   // Drop, default pads
-p.link_with(src, preview, LinkPolicy::Drop)?;                  // same thing, explicit
-p.link_pads_with(src, "src", preview, "sink", LinkPolicy::Drop)?;
+p.link_lossy(src, preview)?;                                   // DropNewest, default pads
+p.link_with(src, preview, LinkPolicy::DropNewest)?;            // same thing, explicit
+p.link_with(src, monitor, LinkPolicy::DropOldest)?;            // keep the freshest frame
+p.link_pads_with(src, "src", preview, "sink", LinkPolicy::DropNewest)?;
 p.link_pads_full(src, "src", rec, "sink", LinkPolicy::Block, Some(64))?;  // deeper queue
 ```
 
-**EOS is never dropped**, whatever the policy — a sink that missed it would wait forever. Only
-buffers are. Dropped buffers are reported to `TracerRegistry::notify_drop`, so `DropTracer`
-counts them.
+**EOS and in-band events are never dropped or evicted**, whatever the policy — a sink that
+missed them would wait forever. Only buffers are. Dropped buffers are reported to
+`TracerRegistry::notify_drop` (so `DropTracer` counts them) and to the
+`parallax_buffers_dropped` metric.
 
 ### Element retrieval
 
@@ -371,7 +374,7 @@ for (name, report) in registry.reports() {
 }
 ```
 
-Built-in tracers: `LatencyTracer` (per-element min/avg/max processing time), `FramerateTracer` (buffers/sec), `DropTracer` (buffers dropped on `LinkPolicy::Drop` links). They cover **every** element, transforms included — so an encoder's cost shows up in the latency report, which is usually the number you actually wanted. Environment activation:
+Built-in tracers: `LatencyTracer` (per-element min/avg/max processing time), `FramerateTracer` (buffers/sec), `DropTracer` (buffers dropped on lossy links). They cover **every** element, transforms included — so an encoder's cost shows up in the latency report, which is usually the number you actually wanted. Environment activation:
 
 ```bash
 PARALLAX_TRACERS="latency;framerate;drops" ./my_pipeline   # tracers
@@ -389,13 +392,13 @@ Live sources (cameras, screen, audio) produce at a fixed rate regardless of down
 In a task-per-element engine the link channel *is* the queue, so that is where occupancy is observable. `Pipeline::monitor_link` attaches watermarks to a link and returns a `FlowStateHandle` the executor drives at runtime — `Busy` when the channel fills past the high mark, back to `Ready` when it drains to the low mark (sampled after every send *and* every receive, so the signal releases even while a gated source is idle):
 
 ```rust
-let link = pipeline.link_with(cam, enc, LinkPolicy::Drop)?;
+let link = pipeline.link_with(cam, enc, LinkPolicy::DropNewest)?;
 let flow = pipeline.monitor_link(link)?;   // 80/20 of the link capacity
 // or: pipeline.monitor_link_with(link, WaterMarks::new(24, 4))?
 pipeline.get_element_mut::<V4l2Src>("cam").unwrap().set_flow_state(flow);
 ```
 
-The source checks `should_produce()` before doing capture work and skips the frame while the link is backed up — cheaper than `LinkPolicy::Drop` alone, which discards the frame only *after* it was captured and copied. RT/bridge boundary edges carry no channel and are not monitored.
+The source checks `should_produce()` before doing capture work and skips the frame while the link is backed up — cheaper than a lossy policy alone, which discards the frame only *after* it was captured and copied. RT/bridge boundary edges carry no channel and are not monitored.
 
 - **`FlowSignal`**: `Ready` | `Busy`, polled by the source via `FlowStateHandle::should_produce()`
 - **`WaterMarks`**: high/low occupancy thresholds (default 80%/20% of the link capacity)

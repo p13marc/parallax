@@ -391,12 +391,22 @@ pub enum LinkPolicy {
     /// sibling branch with it. The default, and correct when no data may be lost.
     #[default]
     Block,
-    /// Drop the buffer and carry on. Degrades **this** branch only, which is
-    /// what keeps a slow consumer from stalling the source and its siblings.
+    /// Drop the **incoming** buffer and carry on (GStreamer's leaky-upstream).
+    /// Degrades **this** branch only, which is what keeps a slow consumer from
+    /// stalling the source and its siblings. The consumer sees the *oldest*
+    /// queued data; under sustained overload its view falls ever further
+    /// behind real time.
     ///
-    /// EOS is never dropped, whatever the policy: a sink that misses it would
-    /// wait forever.
-    Drop,
+    /// EOS and in-band events are never dropped, whatever the policy: a sink
+    /// that misses them would wait forever.
+    DropNewest,
+    /// Drop the **oldest queued** buffer to make room (GStreamer's
+    /// leaky-downstream). Also degrades this branch only, but the consumer
+    /// always sees the freshest data — the right trade for live preview or
+    /// monitoring branches where an old frame is worthless.
+    ///
+    /// EOS and in-band events are never dropped or evicted.
+    DropOldest,
 }
 
 /// A link between two nodes in the pipeline.
@@ -1377,9 +1387,14 @@ impl Pipeline {
     /// pipeline.link_lossy(camera, preview)?;   // may; it degrades alone
     /// ```
     ///
+    /// This uses [`LinkPolicy::DropNewest`] (incoming buffers are shed while
+    /// the queue is full). A live-preview branch that should always show the
+    /// freshest frame instead wants
+    /// `link_with(src, sink, LinkPolicy::DropOldest)`.
+    ///
     /// EOS is still delivered blocking, whatever the policy.
     pub fn link_lossy(&mut self, src: NodeId, sink: NodeId) -> Result<LinkId> {
-        self.link_with(src, sink, LinkPolicy::Drop)
+        self.link_with(src, sink, LinkPolicy::DropNewest)
     }
 
     /// Link two nodes with an explicit [`LinkPolicy`], using default pad names.
@@ -1904,7 +1919,7 @@ impl Pipeline {
     /// the link is backed up:
     ///
     /// ```rust,ignore
-    /// let link = pipeline.link_with(cam, enc, LinkPolicy::Drop)?;
+    /// let link = pipeline.link_with(cam, enc, LinkPolicy::DropNewest)?;
     /// let flow = pipeline.monitor_link(link)?;
     /// pipeline.get_element_mut::<V4l2Src>("cam").unwrap().set_flow_state(flow);
     /// ```

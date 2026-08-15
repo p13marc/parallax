@@ -57,7 +57,7 @@ async fn main() -> Result<()> {
 
     // The channel between the two nodes holds at most 2 buffers; once it is
     // full the source's send waits — that IS the backpressure. `Block` is the
-    // default policy (no data loss); `LinkPolicy::Drop` would shed instead.
+    // default policy (no data loss); `LinkPolicy::DropNewest` would shed instead.
     pipeline.link_pads_full(src, "src", sink, "sink", LinkPolicy::Block, Some(2))?;
 
     pipeline.run().await

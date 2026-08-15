@@ -872,7 +872,7 @@ impl ScreenCaptureSrc {
     /// from monitoring the outgoing link:
     ///
     /// ```rust,ignore
-    /// let link = pipeline.link_with(cap, enc, LinkPolicy::Drop)?;
+    /// let link = pipeline.link_with(cap, enc, LinkPolicy::DropNewest)?;
     /// let flow = pipeline.monitor_link(link)?;
     /// pipeline
     ///     .get_element_mut::<ScreenCaptureSrc>("cap")
