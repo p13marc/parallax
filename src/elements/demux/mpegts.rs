@@ -25,7 +25,9 @@
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::clock::ClockTime;
 use crate::error::{Error, Result};
-use crate::event::{Event, EventResult, SeekPosition, SeekType, SegmentFormat};
+use crate::event::{
+    Event, EventResult, SeekEvent, SeekFlags, SeekPosition, SeekType, SegmentFormat,
+};
 use crate::memory::{OutputArena, OutputBudget, defaults};
 use crate::metadata::Metadata;
 
@@ -990,6 +992,36 @@ pub struct TsDemuxElement {
     outputs: Vec<(crate::element::PadId, crate::format::Caps)>,
     /// EOS drain state: the executor calls `produce()` until Eos.
     drained: bool,
+    /// In-flight ACCURATE seek being iterated on (#173).
+    refine: Option<RefineState>,
+    /// A corrected seek staged for the executor's `take_upstream_event` poll.
+    refined_out: Option<Event>,
+}
+
+/// State of an [`SeekFlags::ACCURATE`] seek across refinement rounds (#173).
+///
+/// A single-shot linear estimate is exact for CBR and approximate for VBR.
+/// With ACCURATE set, the demuxer keeps the seek in flight after forwarding:
+/// each flush re-arms `awaiting_pts`, the first post-flush PTS is compared
+/// against the target, and a miss beyond [`TsDemuxElement::REFINE_THRESHOLD`]
+/// forwards a corrected BYTES seek — same seqnum, one refinement round
+/// deeper — re-estimated from an index that now holds anchors observed at
+/// the mis-landing. Bounded by `rounds_left`; the last landing is reported
+/// regardless.
+///
+/// [`SeekFlags::ACCURATE`]: crate::event::SeekFlags::ACCURATE
+#[derive(Debug)]
+struct RefineState {
+    /// The last BYTES seek forwarded (carries seqnum + current round).
+    seek: SeekEvent,
+    /// The TIME target the application asked for.
+    target: ClockTime,
+    /// Byte offset of the last estimate, to detect a stalled index.
+    last_offset: u64,
+    /// Corrections still allowed.
+    rounds_left: u8,
+    /// Armed by each flush: the next PTS seen is a landing to judge.
+    awaiting_pts: bool,
 }
 
 impl TsDemuxElement {
@@ -1010,6 +1042,8 @@ impl TsDemuxElement {
                 (PadId(2), Caps::any()),
             ],
             drained: false,
+            refine: None,
+            refined_out: None,
         }
     }
 
@@ -1044,9 +1078,78 @@ impl Default for TsDemuxElement {
     }
 }
 
+impl TsDemuxElement {
+    /// A landing this far off an ACCURATE target triggers a correction.
+    ///
+    /// Half a second: comfortably above the jitter between a byte offset and
+    /// the first PES PTS behind it (a GOP is typically shorter), and small
+    /// enough that a VBR miss of seconds is always corrected.
+    const REFINE_THRESHOLD: ClockTime = ClockTime::from_millis(500);
+    /// Corrections per seek. Each costs a full flush round trip through the
+    /// executor; past this the landing is reported as-is.
+    const MAX_REFINE_ROUNDS: u8 = 3;
+
+    /// Judge the first post-flush landing of an in-flight ACCURATE seek and
+    /// stage a corrected BYTES seek when it missed (#173).
+    fn maybe_refine(&mut self, frames: &[TsFrame]) {
+        let Some(state) = &mut self.refine else {
+            return;
+        };
+        if !state.awaiting_pts {
+            return;
+        }
+        let Some(pts) = frames.iter().find_map(|f| f.pts) else {
+            return;
+        };
+        state.awaiting_pts = false;
+
+        let err = ClockTime::from_nanos(pts.nanos().abs_diff(state.target.nanos()));
+        if err <= Self::REFINE_THRESHOLD || state.rounds_left == 0 {
+            tracing::debug!(
+                "tsdemux: ACCURATE seek landed at {pts} for target {} (err {err}), done",
+                state.target
+            );
+            self.refine = None;
+            return;
+        }
+        // The index has been improving the whole time: the mis-landed round's
+        // packets were observed at their true offsets, so the anchors now
+        // bracket (or closely precede) the target.
+        let next = self.demux.estimate_byte_offset(state.target);
+        match next {
+            Some(offset) if offset != state.last_offset => {
+                state.rounds_left -= 1;
+                state.last_offset = offset;
+                let refined = state
+                    .seek
+                    .derive_refined(SegmentFormat::Bytes, SeekPosition::set(offset as i64));
+                tracing::debug!(
+                    "tsdemux: ACCURATE seek landed at {pts} for target {} (err {err}), \
+                     round {} corrects to byte {offset}",
+                    state.target,
+                    refined.refine_round(),
+                );
+                state.seek = refined.clone();
+                self.refined_out = Some(Event::Seek(refined));
+            }
+            _ => {
+                // Same estimate again (or none): the index can do no better,
+                // and repeating the seek would loop on the same landing.
+                tracing::debug!(
+                    "tsdemux: ACCURATE seek stuck at {pts} for target {} (err {err}), \
+                     index cannot improve — reporting the landing",
+                    state.target
+                );
+                self.refine = None;
+            }
+        }
+    }
+}
+
 impl crate::element::Demuxer for TsDemuxElement {
     fn demux(&mut self, buffer: Buffer) -> Result<crate::element::RoutedOutput> {
         let frames = self.demux.push(buffer.as_bytes())?;
+        self.maybe_refine(&frames);
         Ok(Self::route(frames))
     }
 
@@ -1125,9 +1228,24 @@ impl crate::element::Demuxer for TsDemuxElement {
             return EventResult::NotHandled;
         };
         tracing::debug!("tsdemux: TIME {target} estimated at byte {offset}");
-        EventResult::forward(Event::Seek(
-            seek.derive(SegmentFormat::Bytes, SeekPosition::set(offset as i64)),
-        ))
+        let derived = seek.derive(SegmentFormat::Bytes, SeekPosition::set(offset as i64));
+        // ACCURATE (#173): keep the seek in flight — the first post-flush PTS
+        // is judged in `maybe_refine`, which stages corrections through
+        // `take_upstream_event`. A new seek (any flavour) supersedes an old
+        // refinement: its epoch outranks every round of the previous seqnum.
+        self.refine = if seek.flags.contains(SeekFlags::ACCURATE) {
+            Some(RefineState {
+                seek: derived.clone(),
+                target,
+                last_offset: offset,
+                rounds_left: Self::MAX_REFINE_ROUNDS,
+                awaiting_pts: false,
+            })
+        } else {
+            None
+        };
+        self.refined_out = None;
+        EventResult::forward(Event::Seek(derived))
     }
 
     /// Learn where the source landed, and how big the stream is.
@@ -1149,7 +1267,15 @@ impl crate::element::Demuxer for TsDemuxElement {
         self.demux.reset_parser();
         // A post-seek EOS must drain again.
         self.drained = false;
+        // Each flush starts a fresh landing: the next PTS judges it (#173).
+        if let Some(state) = &mut self.refine {
+            state.awaiting_pts = true;
+        }
         Ok(routed)
+    }
+
+    fn take_upstream_event(&mut self) -> Option<Event> {
+        self.refined_out.take()
     }
 }
 
@@ -1379,6 +1505,105 @@ mod tests {
                 .unwrap();
             assert_eq!(off % TS_PACKET_SIZE as u64, 0, "target {target}");
         }
+    }
+
+    /// Hand-build a routed frame carrying only what `maybe_refine` reads.
+    fn frame_with_pts(pts: ClockTime) -> TsFrame {
+        let arena = crate::memory::SharedArena::new(64, 2).unwrap();
+        let slot = arena.acquire().unwrap();
+        TsFrame {
+            buffer: Buffer::new(MemoryHandle::with_len(slot, 8), Metadata::from_sequence(0)),
+            pid: 0x100,
+            stream_type: TsStreamType::H264,
+            pts: Some(pts),
+            dts: None,
+        }
+    }
+
+    /// #173: an ACCURATE seek that lands off-target stages a corrected BYTES
+    /// seek — same seqnum, next refinement round — from an index improved by
+    /// the mis-landing itself, and stops once the landing is close enough.
+    #[test]
+    fn an_accurate_seek_stages_corrections_until_it_lands() {
+        let mut el = TsDemuxElement::new();
+        use crate::element::Demuxer;
+
+        // A misleadingly slow start: anchors at (0s, 0) and (1s, packet 100).
+        // Extrapolating 5s from these lands at packet 500 — far short on a
+        // stream whose real rate ramps up.
+        let mut head = pcr_packet(0x100, 0);
+        for _ in 0..99 {
+            head.extend(plain_packet(0x100));
+        }
+        head.extend(pcr_packet(0x100, 90_000));
+        el.demux.push(&head).unwrap();
+
+        let target = ClockTime::from_secs(5);
+        let seek = SeekEvent::new_time(target)
+            .with_flags(SeekFlags::FLUSH | SeekFlags::KEY_UNIT | SeekFlags::ACCURATE);
+        let result = el.handle_upstream_event(&Event::Seek(seek.clone()));
+        let EventResult::Forward(translated) = result else {
+            panic!("expected a translated seek, got {result:?}");
+        };
+        let Event::Seek(bytes_seek) = &*translated else {
+            panic!("expected a BYTES seek");
+        };
+        let first_offset = bytes_seek.start.position as u64;
+        assert_eq!(first_offset, 500 * TS_PACKET_SIZE as u64);
+
+        // The flush trio arrives; the demuxer arms itself to judge the next
+        // PTS. The source's Segment reports where it actually resumed.
+        el.flush().unwrap();
+        el.handle_downstream_event(Event::Segment(crate::event::SegmentEvent::new_bytes(
+            first_offset,
+            None,
+        )));
+        // A PCR observed at the landing: the index learns (2s, packet 500).
+        el.demux.push(&pcr_packet(0x100, 2 * 90_000)).unwrap();
+
+        // The first post-flush frame says 2s — a 3-second miss.
+        el.maybe_refine(&[frame_with_pts(ClockTime::from_secs(2))]);
+        let refined = el.take_upstream_event().expect("a correction was staged");
+        let Event::Seek(refined) = refined else {
+            panic!("expected a refined seek");
+        };
+        assert_eq!(refined.seqnum(), seek.seqnum(), "same logical seek");
+        assert_eq!(refined.refine_round(), 1);
+        assert!(refined.epoch() > seek.epoch(), "the correction outranks");
+        // Local slope at the landing: (1s, 100p) -> (2s, 500p) is 400 p/s, so
+        // 5s ≈ packet 500 + 3 x 400 = 1700.
+        assert_eq!(refined.start.position as u64, 1700 * TS_PACKET_SIZE as u64);
+        assert!(el.take_upstream_event().is_none(), "staged exactly once");
+
+        // Round 2 lands within the threshold: refinement ends, nothing more
+        // is staged, and the executor is free to post SeekDone.
+        el.flush().unwrap();
+        el.maybe_refine(&[frame_with_pts(ClockTime::from_millis(4_800))]);
+        assert!(el.take_upstream_event().is_none());
+        assert!(el.refine.is_none(), "the seek is no longer in flight");
+    }
+
+    /// Without ACCURATE nothing changes: one shot, no in-flight state.
+    #[test]
+    fn a_plain_seek_stages_no_corrections() {
+        let mut el = TsDemuxElement::new();
+        use crate::element::Demuxer;
+
+        let mut head = pcr_packet(0x100, 0);
+        for _ in 0..99 {
+            head.extend(plain_packet(0x100));
+        }
+        head.extend(pcr_packet(0x100, 90_000));
+        el.demux.push(&head).unwrap();
+
+        let seek = SeekEvent::new_time(ClockTime::from_secs(5));
+        assert!(matches!(
+            el.handle_upstream_event(&Event::Seek(seek)),
+            EventResult::Forward(_)
+        ));
+        el.flush().unwrap();
+        el.maybe_refine(&[frame_with_pts(ClockTime::from_secs(2))]);
+        assert!(el.take_upstream_event().is_none());
     }
 
     #[test]

@@ -2646,7 +2646,7 @@ fn forward_to_parents(
 /// mid-graph tasks (transform/demuxer/muxer), where `NotHandled` forwards
 /// the event to every parent inbox. A handling task runs the flush trio
 /// from its own loop, between its process calls, so the epoch discipline
-/// holds wherever the seek terminates. `last_seek_seqnum` dedups multi-path
+/// holds wherever the seek terminates. `last_seek_epoch` dedups multi-path
 /// delivery (a diamond delivers the same seek along every branch); a seek
 /// with a seqnum at or below the last seen one is dropped — newer wins.
 async fn handle_upstream_hop(
@@ -2659,19 +2659,22 @@ async fn handle_upstream_hop(
     flush_epoch: &AtomicU64,
     bus: &BusHandle,
     parents: &[(String, tokio::sync::mpsc::UnboundedSender<Event>)],
-    last_seek_seqnum: &mut u64,
+    last_seek_epoch: &mut u64,
     warn_unhandled_seek: bool,
     pending_translation: &mut Option<PendingTranslation>,
 ) -> bool {
     if let Event::Seek(seek) = event {
-        if seek.seqnum() <= *last_seek_seqnum {
+        // Ordered by epoch, not seqnum (#173): a refinement round shares its
+        // seek's seqnum but must pass this guard, while a diamond's duplicate
+        // delivery of the same round must not.
+        if seek.epoch() <= *last_seek_epoch {
             tracing::debug!(
                 "'{name}': seek {} already seen (multi-path delivery), dropped",
                 seek.seqnum()
             );
             return false;
         }
-        *last_seek_seqnum = seek.seqnum();
+        *last_seek_epoch = seek.epoch();
     }
 
     match probe_registry.invoke_event(src_pad, event, false) {
@@ -2707,15 +2710,16 @@ async fn handle_upstream_hop(
                 // flush trio arrives promptly instead of queueing behind
                 // seconds of data.
                 //
-                // The epoch BECOMES the seek's seqnum (seqnums are globally
-                // strictly increasing, so monotonicity holds). fetch_max is
-                // what makes a multi-source seek transition exactly once:
-                // every handling source calls it with the SAME seqnum (Clone
-                // shares it), the second call is a no-op, and each caller's
-                // own AcqRel RMW guarantees its later loads see ≥ seqnum —
-                // so no source's post-seek buffers can be stamped stale by a
-                // sibling handling the same seek.
-                flush_epoch.fetch_max(seek.seqnum(), Ordering::AcqRel);
+                // The epoch BECOMES the seek's epoch ordinal — seqnum and
+                // refinement round folded into one monotonic value (#173);
+                // for an ordinary seek that is just the seqnum scaled.
+                // fetch_max is what makes a multi-source seek transition
+                // exactly once: every handling source calls it with the SAME
+                // value (Clone shares it), the second call is a no-op, and
+                // each caller's own AcqRel RMW guarantees its later loads see
+                // ≥ it — so no source's post-seek buffers can be stamped
+                // stale by a sibling handling the same seek.
+                flush_epoch.fetch_max(seek.epoch(), Ordering::AcqRel);
                 if let Some(ev) = emit(Event::FlushStart) {
                     broadcast_event(outputs, &ev).await;
                 }
@@ -2901,7 +2905,7 @@ fn spawn_source_task(
         let bytes_native = byte_total.is_some();
         let byte_total = byte_total.flatten();
         let mut segment_sent = false;
-        let mut last_seek_seqnum: u64 = 0;
+        let mut last_seek_epoch: u64 = 0;
         // #163 phase B: set when this element converts a seek into another
         // format and forwards it upstream; cleared when the completion is
         // reported in the format the application asked in.
@@ -2938,7 +2942,7 @@ fn spawn_source_task(
                     &flush_epoch,
                     &bus,
                     &upstream.parents,
-                    &mut last_seek_seqnum,
+                    &mut last_seek_epoch,
                     warn_unhandled_seek,
                     &mut pending_translation,
                 )
@@ -2960,7 +2964,7 @@ fn spawn_source_task(
                         &flush_epoch,
                         &bus,
                         &upstream.parents,
-                        &mut last_seek_seqnum,
+                        &mut last_seek_epoch,
                         warn_unhandled_seek,
                         &mut pending_translation,
                     )
@@ -3142,7 +3146,7 @@ fn spawn_sink_task(
                 Some(hop) => (Some(hop.rx), hop.parents),
                 None => (None, Vec::new()),
             };
-            let mut last_seek_seqnum: u64 = 0;
+            let mut last_seek_epoch: u64 = 0;
             // #163 phase B: set when this element converts a seek into another
             // format and forwards it upstream; cleared when the completion is
             // reported in the format the application asked in.
@@ -3182,7 +3186,7 @@ fn spawn_sink_task(
                                     &flush_epoch,
                                     &bus,
                                     &up_parents,
-                                    &mut last_seek_seqnum,
+                                    &mut last_seek_epoch,
                                     false,
                                     &mut pending_translation,
                                 )
@@ -3261,7 +3265,7 @@ fn spawn_sink_task(
                                 &flush_epoch,
                                 &bus,
                                 &up_parents,
-                                &mut last_seek_seqnum,
+                                &mut last_seek_epoch,
                                 false,
                                 &mut pending_translation,
                             )
@@ -3506,7 +3510,7 @@ fn spawn_transform_task(
                 Some(hop) => (Some(hop.rx), hop.parents),
                 None => (None, Vec::new()),
             };
-            let mut last_seek_seqnum: u64 = 0;
+            let mut last_seek_epoch: u64 = 0;
             // #163 phase B: set when this element converts a seek into another
             // format and forwards it upstream; cleared when the completion is
             // reported in the format the application asked in.
@@ -3542,7 +3546,7 @@ fn spawn_transform_task(
                                 &flush_epoch,
                                 &bus,
                                 &up_parents,
-                                &mut last_seek_seqnum,
+                                &mut last_seek_epoch,
                                 false,
                                 &mut pending_translation,
                             )
@@ -3921,7 +3925,7 @@ fn spawn_demuxer_task(
             .await;
         }
         let mut segment_pads: HashSet<String> = HashSet::new();
-        let mut last_seek_seqnum: u64 = 0;
+        let mut last_seek_epoch: u64 = 0;
         // #163 phase B: set when this element converts a seek into another
         // format and forwards it upstream; cleared when the completion is
         // reported in the format the application asked in.
@@ -3962,7 +3966,7 @@ fn spawn_demuxer_task(
                                 &flush_epoch,
                                 &bus,
                                 &up_parents,
-                                &mut last_seek_seqnum,
+                                &mut last_seek_epoch,
                                 warn_unhandled_seek,
                                 &mut pending_translation,
                             )
@@ -4007,6 +4011,37 @@ fn spawn_demuxer_task(
                         .await;
                         tracers.notify_buffer_processed(&name);
 
+                        // ACCURATE refinement (#173): the element saw the
+                        // first post-flush PTS inside `process_demux` and may
+                        // have staged a corrected seek. Collect it BEFORE the
+                        // routing loop — a pending correction means this
+                        // batch is the mis-landed round, whose SeekDone must
+                        // be held (the next round re-arms the same
+                        // `pending_translation`).
+                        let refining = match element.take_upstream_event() {
+                            Some(event) if !up_parents.is_empty() => {
+                                tracing::debug!(
+                                    "demuxer '{}': forwarding refined {} upstream",
+                                    name,
+                                    event.name()
+                                );
+                                forward_to_parents(&up_parents, &event);
+                                true
+                            }
+                            Some(event) => {
+                                bus.post_warning(
+                                    format!(
+                                        "'{name}' staged an upstream {} but has no \
+                                         upstream peer — dropped",
+                                        event.name()
+                                    ),
+                                    None,
+                                );
+                                false
+                            }
+                            None => false,
+                        };
+
                         match result {
                             Ok(DemuxResult::Routed(routed)) => {
                                 for (pad, out) in routed {
@@ -4034,8 +4069,12 @@ fn spawn_demuxer_task(
                                     // which is not the question the
                                     // application asked; the first post-flush
                                     // buffer's PTS is the honest landing in
-                                    // the format it did ask in.
-                                    if anchored && let Some(pt) = pending_translation.take() {
+                                    // the format it did ask in. A seek still
+                                    // being refined does not complete (#173).
+                                    if anchored
+                                        && !refining
+                                        && let Some(pt) = pending_translation.take()
+                                    {
                                         bus.post(crate::pipeline::bus::MessageKind::SeekDone {
                                             seqnum: pt.seqnum,
                                             source: name.clone(),
@@ -4208,7 +4247,7 @@ fn spawn_demuxer_task(
                             &flush_epoch,
                             &bus,
                             &hop.parents,
-                            &mut last_seek_seqnum,
+                            &mut last_seek_epoch,
                             warn_unhandled_seek,
                             &mut pending_translation,
                         )
@@ -4241,7 +4280,7 @@ fn spawn_demuxer_task(
                                 &flush_epoch,
                                 &bus,
                                 &hop.parents,
-                                &mut last_seek_seqnum,
+                                &mut last_seek_epoch,
                                 warn_unhandled_seek,
                                 &mut pending_translation,
                             )
@@ -4400,7 +4439,7 @@ fn spawn_muxer_task(
             Some(hop) => (Some(hop.rx), hop.parents),
             None => (None, Vec::new()),
         };
-        let mut last_seek_seqnum: u64 = 0;
+        let mut last_seek_epoch: u64 = 0;
         // #163 phase B: set when this element converts a seek into another
         // format and forwards it upstream; cleared when the completion is
         // reported in the format the application asked in.
@@ -4434,7 +4473,7 @@ fn spawn_muxer_task(
                         &flush_epoch,
                         &bus,
                         &up_parents,
-                        &mut last_seek_seqnum,
+                        &mut last_seek_epoch,
                         false,
                         &mut pending_translation,
                     )

@@ -1441,6 +1441,25 @@ pub trait Demuxer: Send {
         Ok(RoutedOutput::new())
     }
 
+    /// An upstream event this demuxer wants sent toward its sources (#173).
+    ///
+    /// Polled by the executor after every `demux` call — the only way a
+    /// *fed* element can originate upstream traffic from its data path,
+    /// since `handle_upstream_event` only ever answers events arriving from
+    /// downstream. The one in-tree use is ACCURATE seek refinement: a
+    /// demuxer that translated a TIME seek observes the first post-flush
+    /// PTS in `demux`, decides the landing missed, and stashes a
+    /// [`SeekEvent::derive_refined`] BYTES seek here instead of letting
+    /// `SeekDone` report the miss.
+    ///
+    /// While this returns `Some` for a translated seek, the executor holds
+    /// that seek's `SeekDone` — completion is reported once refinement stops.
+    ///
+    /// [`SeekEvent::derive_refined`]: crate::event::SeekEvent::derive_refined
+    fn take_upstream_event(&mut self) -> Option<Event> {
+        None
+    }
+
     /// Whether this demuxer supports seeking.
     ///
     /// A source-style demuxer that implements `handle_upstream_event` for
@@ -1811,6 +1830,14 @@ pub trait AsyncElementDyn {
     /// Snapshotted at start alongside `is_seekable`. Default: none.
     fn seek_translations(&self) -> Vec<crate::pipeline::seek::SeekTranslation> {
         Vec::new()
+    }
+
+    /// An upstream event this element wants sent toward its sources (#173).
+    ///
+    /// Polled by the demuxer task after every `process_demux` — see
+    /// [`Demuxer::take_upstream_event`]. Default: none.
+    fn take_upstream_event(&mut self) -> Option<Event> {
+        None
     }
 
     /// Flush a demuxer, keeping the pad routing.
@@ -3305,6 +3332,10 @@ impl<D: Demuxer + Send + 'static> SendAsyncElementDyn for DemuxerAdapter<D> {
 
     fn seek_translations(&self) -> Vec<crate::pipeline::seek::SeekTranslation> {
         self.inner.seek_translations()
+    }
+
+    fn take_upstream_event(&mut self) -> Option<Event> {
+        self.inner.take_upstream_event()
     }
 
     async fn flush_demux(&mut self) -> Result<Vec<(String, Buffer)>> {

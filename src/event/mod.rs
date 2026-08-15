@@ -483,6 +483,16 @@ pub struct SeekEvent {
     /// `MessageKind::SeekDone` carries it so applications can tell which
     /// seek completed (GStreamer's seqnum discipline).
     seqnum: u64,
+    /// Refinement round within this seqnum (#173).
+    ///
+    /// 0 for an application seek and for plain [`derive`](Self::derive);
+    /// [`derive_refined`](Self::derive_refined) increments it. Private like
+    /// `seqnum`, and for the same reason: it participates in
+    /// [`epoch`](Self::epoch), so a same-seqnum refinement outranks its
+    /// earlier rounds — passing the executor's newest-wins dedup and
+    /// shedding the mis-landed round's in-flight data — without minting a
+    /// seqnum, which would break SeekDone correlation.
+    refine_round: u16,
     /// Seek rate (1.0 = normal, 2.0 = 2x speed, -1.0 = reverse).
     pub rate: f64,
     /// Format of start/stop positions.
@@ -509,6 +519,7 @@ impl SeekEvent {
     pub fn new(format: SegmentFormat, start: SeekPosition) -> Self {
         Self {
             seqnum: SEEK_SEQNUM.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            refine_round: 0,
             rate: 1.0,
             format,
             flags: SeekFlags::FLUSH,
@@ -578,12 +589,48 @@ impl SeekEvent {
     pub fn derive(&self, format: SegmentFormat, start: SeekPosition) -> Self {
         Self {
             seqnum: self.seqnum,
+            refine_round: self.refine_round,
             rate: self.rate,
             flags: self.flags,
             format,
             start,
             stop: SeekPosition::none(),
         }
+    }
+
+    /// [`derive`](Self::derive), one refinement round deeper (#173).
+    ///
+    /// For a push-mode demuxer iterating on an [`SeekFlags::ACCURATE`] seek:
+    /// after observing where a translated seek actually landed, it forwards a
+    /// corrected seek that keeps the seqnum — SeekDone still correlates, the
+    /// flush epoch still converges — but carries a higher round, so
+    /// [`epoch`](Self::epoch) outranks the mis-landed attempt and the
+    /// executor treats that attempt's data as stale instead of dropping the
+    /// correction as a duplicate.
+    pub fn derive_refined(&self, format: SegmentFormat, start: SeekPosition) -> Self {
+        let mut refined = self.derive(format, start);
+        refined.refine_round = self.refine_round.saturating_add(1);
+        refined
+    }
+
+    /// The refinement round (0 = the application's original request).
+    pub fn refine_round(&self) -> u16 {
+        self.refine_round
+    }
+
+    /// The flush-epoch ordinal this seek transitions the pipeline to.
+    ///
+    /// `seqnum` and `refine_round` folded into one monotonic value: any
+    /// newer seek outranks any round of an older one, and within a seqnum
+    /// each refinement round outranks the last. The executor's flush epoch
+    /// and its newest-wins seek dedup both order by this. Rounds saturate at
+    /// 15 — refinement is bounded at 2-3 rounds in practice, and a burst
+    /// past 15 merely stops shedding between further rounds rather than
+    /// breaking monotonicity.
+    pub fn epoch(&self) -> u64 {
+        self.seqnum
+            .saturating_mul(16)
+            .saturating_add(u64::from(self.refine_round.min(15)))
     }
 }
 
@@ -1034,6 +1081,35 @@ mod tests {
         // stop does not survive a format change: converting it needs its own
         // estimate, so the caller must chain with_stop deliberately.
         assert_eq!(derived.stop.seek_type, SeekType::None);
+    }
+
+    #[test]
+    fn refinement_rounds_share_the_seqnum_but_outrank_by_epoch() {
+        let original = SeekEvent::new_time(ClockTime::from_secs(5));
+        let round1 = original.derive_refined(SegmentFormat::Bytes, SeekPosition::set(1_000));
+        let round2 = round1.derive_refined(SegmentFormat::Bytes, SeekPosition::set(2_000));
+
+        // Same logical seek throughout — SeekDone still correlates.
+        assert_eq!(round1.seqnum(), original.seqnum());
+        assert_eq!(round2.seqnum(), original.seqnum());
+        assert_eq!(original.refine_round(), 0);
+        assert_eq!(round1.refine_round(), 1);
+        assert_eq!(round2.refine_round(), 2);
+
+        // Epoch strictly increases per round, so a correction passes the
+        // executor's newest-wins dedup and sheds the mis-landed round.
+        assert!(original.epoch() < round1.epoch());
+        assert!(round1.epoch() < round2.epoch());
+
+        // ...but any NEWER seek outranks every round of an older one.
+        let newer = SeekEvent::new_time(ClockTime::from_secs(9));
+        assert!(newer.epoch() > round2.epoch());
+
+        // Plain derive stays within the current round: translation is not
+        // refinement.
+        let translated = round1.derive(SegmentFormat::Bytes, SeekPosition::set(3_000));
+        assert_eq!(translated.refine_round(), 1);
+        assert_eq!(translated.epoch(), round1.epoch());
     }
 
     #[test]

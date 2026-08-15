@@ -306,7 +306,7 @@ let seek = SeekEvent::new_time(ClockTime::from_secs(30))
 handle.seek(seek).await;
 ```
 
-The synthesized `Segment` and `SeekDone` report the keyframe actually landed on. MKV resolves the direction at cue granularity and degrades to forward snapping on cue-less files; `ACCURATE` is accepted but not yet implemented (it needs decoder clipping).
+The synthesized `Segment` and `SeekDone` report the keyframe actually landed on. MKV resolves the direction at cue granularity and degrades to forward snapping on cue-less files; `ACCURATE` triggers iterative refinement in push-mode demuxers (#173): `TsDemuxElement` compares the first post-seek PTS with the target and, past a 500 ms threshold, forwards a corrected byte seek (same seqnum, next refinement round) up to 3 times before reporting the landing; the decoder-clipping half is still open.
 
 ### Seeking a fed demuxer (`filesrc ! tsdemux`)
 

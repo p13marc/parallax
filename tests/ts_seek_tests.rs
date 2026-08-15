@@ -184,6 +184,131 @@ async fn a_fed_ts_demuxer_seeks_in_time() {
     );
 }
 
+/// #173: on a VBR stream the single-shot linear estimate is badly wrong, and
+/// `SeekFlags::ACCURATE` iterates until the landing is honest.
+///
+/// The fixture's frame size grows linearly, so the byte curve is quadratic in
+/// time: extrapolating from the early (small-frame) anchors undershoots a
+/// far target by many seconds. Each refinement round observes the
+/// mis-landing's PCRs, re-estimates from the local slope, and converges —
+/// Newton's method by flush round trip.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_accurate_seek_on_vbr_iterates_to_the_target() {
+    use parallax::event::{SeekEvent, SeekFlags};
+
+    // 20 seconds at 25 fps, ramping 512 B → ~12.5 KB per frame (~3.3 MB).
+    let config = TsMuxConfig::new()
+        .add_track(TsMuxTrack::new(VIDEO_PID, TsMuxStreamType::H264).video())
+        .psi_interval(50)
+        .pcr_interval_ms(40);
+    let mut mux = TsMux::new(config);
+    let mut out = Vec::new();
+    for frame in 0..FRAMES {
+        let pts = ClockTime::from_nanos(frame * 1_000_000_000 / FPS);
+        let payload = vec![(frame % 251) as u8; 512 + frame as usize * 24];
+        out.extend(
+            mux.write_pes(VIDEO_PID, &payload, Some(pts), Some(pts))
+                .unwrap(),
+        );
+    }
+    let mut file = NamedTempFile::new().unwrap();
+    std::io::Write::write_all(file.as_file_mut(), &out).unwrap();
+    std::io::Write::flush(file.as_file_mut()).unwrap();
+
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_source("src", FileSrc::new(file.path()).with_chunk_size(100 * 188));
+    let demux = pipeline.add_demuxer("tsdemux", TsDemuxElement::new());
+    let sink = AppSink::with_max_buffers(4);
+    let sink_handle = sink.handle();
+    let snk = pipeline.add_async_sink("sink", sink);
+    pipeline.link(src, demux).unwrap();
+    pipeline.link_pads(demux, "video", snk, "sink").unwrap();
+
+    let executor = Executor::new();
+    let mut handle = executor.start(&mut pipeline).unwrap();
+    let mut bus = handle.take_bus().unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let puller = tokio::spawn(async move {
+        loop {
+            match sink_handle.pull_buffer().await {
+                Pulled::Buffer(b) => {
+                    if tx.send(b.metadata().pts).is_err() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                Pulled::Ended(_) => break,
+                Pulled::Empty | Pulled::Flushing => tokio::task::yield_now().await,
+            }
+        }
+    });
+
+    // Anchor the index on the slow early stream, then aim deep into the
+    // fast region.
+    let mut seen = 0;
+    while seen < 20 {
+        match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+            Ok(Some(_)) => seen += 1,
+            Ok(None) => panic!("stream ended before the seek could be issued"),
+            Err(_) => panic!("no frames within 5s; got {seen}"),
+        }
+    }
+
+    let target = ClockTime::from_secs(15);
+    let seek = SeekEvent::new_time(target)
+        .with_flags(SeekFlags::FLUSH | SeekFlags::KEY_UNIT | SeekFlags::ACCURATE);
+    assert!(handle.seek(seek).await, "the seek was dispatched");
+
+    // The intermediate rounds' mis-landed frames are epoch-stale and shed;
+    // wait for a frame near the target.
+    let mut landed = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+            Ok(Some(pts)) if pts >= ClockTime::from_millis(14_400) => {
+                landed = Some(pts);
+                break;
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    let landed = landed.expect("no frame near the accurate target arrived");
+    assert!(
+        landed <= ClockTime::from_millis(15_700),
+        "landed at {landed}, past the 15s target's tolerance"
+    );
+
+    handle.stop();
+    let _ = puller.await;
+    handle.wait().await.unwrap();
+
+    // Exactly one TIME completion, reported near the target — the refinement
+    // rounds held it back until the landing was worth reporting.
+    let mut time_dones = Vec::new();
+    while let Some(msg) = bus.poll() {
+        if let MessageKind::SeekDone {
+            format, position, ..
+        } = msg.kind
+            && format == SegmentFormat::Time
+        {
+            time_dones.push(position);
+        }
+    }
+    assert_eq!(
+        time_dones.len(),
+        1,
+        "refinement must complete once: {time_dones:?}"
+    );
+    let position = time_dones[0].expect("the demuxer reported where it landed");
+    assert!(
+        (14_400_000_000..=15_700_000_000).contains(&position),
+        "SeekDone reported {position} ns — the ACCURATE landing missed 15s"
+    );
+}
+
 /// A seek issued before the index has anything in it must not be answered
 /// with a made-up offset. The demuxer refuses, the seek travels on to
 /// `FileSrc`, which cannot service a TIME seek either — and the pipeline says
