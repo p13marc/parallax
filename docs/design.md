@@ -1,6 +1,6 @@
 # Parallax: Design Document
 
-*Last substantive revision: July 2026. This document records why Parallax is built the way it is, what was tried and abandoned, and how it positions against the current landscape.*
+*Last substantive revision: August 2026. This document records why Parallax is built the way it is, what was tried and abandoned, and how it positions against the current landscape.*
 
 ## Executive Summary
 
@@ -16,7 +16,7 @@ Parallax is a Rust-native streaming pipeline engine designed to compete with GSt
 |-----------|-----------|-------------------|
 | Language / safety | C + GObject; bindings for Rust | Rust throughout; `unsafe` confined to memory/FFI boundaries |
 | Zero-copy IPC | Opt-in (`unixfd` elements since 1.24, careful BufferPool setup) | Default: all buffers memfd-backed; refcounts in shared memory |
-| Cross-process refcounting | Message-coordinated (also PipeWire's model) | Atomics in the shared mapping; lock-free release queue; no messages |
+| Cross-process refcounting | Message-coordinated (also PipeWire's model) | Atomics in the shared mapping; lock-free release queue; no messages for *ownership* (buffer handoff uses channels by design — principle 8) |
 | Caps + allocation | Caps negotiation and ALLOCATION query are separate phases | Format and memory type negotiated together (`FormatMemoryCap`) |
 | Element development | ~200 lines of GObject boilerplate in C; ~100 in gstreamer-rs | ~20 lines: implement one trait |
 | Scheduling | Thread-per-element + queues; threadshare (Rust/Tokio) exists as a plugin | Unified executor: Tokio + RT threads with lock-free bridges, hint-driven |
@@ -31,7 +31,7 @@ None of these make Parallax "better than GStreamer" in general — GStreamer's e
 
 There is no Heap-vs-SharedMemory distinction for pipeline buffers. `memfd_create` + `MAP_SHARED` costs the same as malloc'd pages and is always shareable by fd. One fd per **arena** (not per buffer) keeps fd usage at O(pipelines).
 
-The novel part is the refcount placement: slot refcounts and the release queue are data structures *inside* the shared mapping, so `clone`/`drop` are plain atomics from any process, and the owner reclaims released slots in O(k) from a lock-free MPSC ring. PipeWire, by contrast, coordinates per-process refcounts with messages; GStreamer's unixfd plugin transfers buffers but doesn't share ownership semantics.
+The novel part is the refcount placement: slot refcounts and the release queue are data structures *inside* the shared mapping, so `clone`/`drop` are plain atomics from any process, and the owner reclaims released slots in O(k) from a lock-free MPSC ring. PipeWire, by contrast, coordinates per-process refcounts with messages; GStreamer's unixfd plugin transfers buffers but doesn't share ownership semantics. ("No messages" is about *ownership*: handing a buffer to the next element still goes through a channel — see principle 8.)
 
 Consequence accepted: trust granularity is the arena. Any process holding the arena fd can touch every slot. Per-buffer OS-enforced permissions (PROT_READ-only slot mappings) were part of the original design and remain future work — see "History" below.
 
@@ -60,6 +60,12 @@ memfd, SCM_RIGHTS, eventfd, DMA-BUF, MAP_HUGETLB are the foundation. Abstracting
 ### 7. Pure Rust where the ecosystem allows
 
 Preferred: rav1e, Symphonia, zune-jpeg, png, mp4, mpeg2ts-reader (pure Rust). Accepted C where unavoidable: OpenH264 (patent license value), dav1d (decode speed), libopus, FDK-AAC. Watching: **rav1d** (the Rust dav1d port, ~5% from parity) as a future pure-Rust AV1 decode swap.
+
+### 8. Data plane, signaling plane
+
+Shared memory is the **data plane**; channels are the **signaling plane**. What crosses an in-process link is a ~400-byte `Buffer` *handle* (slot reference + metadata), moved by value — zero payload copies and zero heap allocations per buffer per hop, ratcheted by `tests/media_alloc_tests.rs`. The payload never leaves its arena. This is PipeWire's shape (shm buffers, fd-based wakeups — PipeWire does not put its wakeup queue in shared memory either), not a contradiction of principle 1. Nor is it "tokio mpsc everywhere": each edge gets the cheapest primitive that satisfies its invariants — tokio mpsc for data links, the drop-oldest leaky channel for lossy ones, unbounded inboxes where boundedness would deadlock upstream events, and a custom lock-free SPSC ring + eventfd (`AsyncRtBridge`) at async↔RT boundaries, proof the project builds a custom queue where it pays.
+
+The controlled experiment is on record: the kanal channel was adopted for synthetic speed and removed (commits `260c0e6`, `7bbd12f`) when its cancel-unsafe recv *lost messages* — a swallowed EOS hangs a consumer forever. Real-path cost of the revert was noise (decode 0.3%); only channel ping-pong microbenchmarks regressed. Any future replacement must satisfy six invariants, each a shipped bug fix with a regression test: cancel-safe recv; closed-sender detection distinct from full; occupancy readable from both ends without locking; three link policies on one primitive with control-message immunity; tokio coop-budget participation; and the `OutputBudget` contract (link capacity feeds arena sizing). The long-form evidence — measurements, prior art, the kanal record — is in [reports/2026-08-15-channel-architecture-vs-shm-queue.md](reports/2026-08-15-channel-architecture-vs-shm-queue.md).
 
 ## History: Explored and Removed
 
@@ -105,6 +111,8 @@ Pipeline::parse("zenoh_sub key=factory/camera/1 ! display-element")?;
 | In-process | the executor's per-edge `tokio::sync::mpsc` channel | zero (move) |
 | Cross-process | `IpcSrc`/`IpcSink` | zero (shared pages; ~bytes of metadata per buffer) |
 | Cross-machine | `ZenohSrc`/`ZenohSink`, TCP links | serialize (rkyv) |
+
+The in-process row's "zero (move)" is principle 8 in action: the channel carries a handle, the arena carries the pixels.
 
 ## Competitive Landscape (as of mid-2026)
 
@@ -198,6 +206,9 @@ Framework maturity phases (details in `plans/`):
 - [DMA-BUF documentation](https://docs.kernel.org/driver-api/dma-buf.html)
 - [Kernel: exchanging pixel buffers (formats + modifiers)](https://docs.kernel.org/userspace-api/dma-buf-alloc-exchange.html)
 - [ext-image-copy-capture-v1](https://wayland.app/protocols/ext-image-copy-capture-v1)
+- [PipeWire scheduling internals](https://docs.pipewire.org/page_scheduling.html) (eventfd wakeups + activation records — the signaling-plane prior art for principle 8)
+- [iceoryx2](https://github.com/eclipse-iceoryx/iceoryx2) (shm data plane as a library; async/tokio integration still an open roadmap item)
+- [tokio `AsyncFd`](https://docs.rs/tokio/latest/tokio/io/unix/struct.AsyncFd.html) (the canonical fd↔async bridge, used by `AsyncRtBridge` and the arena doorbell)
 
 ### Codecs & protocols
 - [rav1e](https://github.com/xiph/rav1e) · [rav1d perf bounty](https://www.memorysafety.org/blog/rav1d-perf-bounty/) · [OpenH264 2.6.0](https://github.com/cisco/openh264/releases/tag/v2.6.0)

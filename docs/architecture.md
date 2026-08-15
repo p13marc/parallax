@@ -104,7 +104,7 @@ Details: [scheduling.md](scheduling.md).
 | `IpcPublisher`/`IpcSubscriber` | Unix socket + shared arena | zero-copy — only a small ref crosses the socket; the arena fd is passed once via SCM_RIGHTS |
 | `NetworkSender`/`NetworkReceiver` | TCP | serialized with rkyv (framed: `PRLX` magic, version, CRC32) |
 
-The `IpcSrc`/`IpcSink` elements wrap the IPC link so multi-process pipelines compose like everything else.
+The `IpcSrc`/`IpcSink` elements speak their own equivalent protocol (`src/elements/ipc/`) so multi-process pipelines compose like everything else. Why an engine built on shared memory moves in-process buffers through tokio channels — the data-plane/signaling-plane split — is design.md's principle 8, [Data plane, signaling plane](design.md#8-data-plane-signaling-plane).
 
 ### 7. Typed layer (`src/typed/`, `src/temporal/`)
 
