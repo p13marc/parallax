@@ -13,7 +13,7 @@
 //! let pipeline = PipelineBuilder::new()
 //!     .source(VideoTestSrc::new())
 //!     .then(VideoScale::new(1920, 1080, 1280, 720))
-//!     .sink(FileSink::new("output.yuv"))
+//!     .async_sink(FileSink::new("output.yuv"))
 //!     .build()?;
 //!
 //! pipeline.run().await?;
@@ -269,7 +269,7 @@ impl PipelineBuilder<HasSource> {
     /// let pipeline = PipelineBuilder::new()
     ///     .source(src)
     ///     .then(transform)
-    ///     .sink(FileSink::new("output.bin"))
+    ///     .async_sink(FileSink::new("output.bin"))
     ///     .build()?;
     /// ```
     pub fn sink<S: Sink + 'static>(self, sink: S) -> PipelineBuilder<Complete> {
@@ -735,7 +735,7 @@ impl BuiltPipeline {
 /// let pipeline = (
 ///     from(VideoTestSrc::new())
 ///     >> VideoScale::new(...)
-///     >> to(FileSink::new("out.yuv"))
+///     >> to(NullSink::new())
 /// ).into_pipeline();
 /// ```
 pub fn from<S: Source>(source: S) -> FromSource<S> {

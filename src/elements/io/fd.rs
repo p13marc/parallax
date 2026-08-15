@@ -2,10 +2,12 @@
 //!
 //! Read from and write to raw file descriptors.
 
-use crate::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
+use crate::element::{AsyncSink, ConsumeContext, ProduceContext, ProduceResult, Source};
 use crate::error::{Error, Result};
 use rustix::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use tokio::io::Interest;
+use tokio::io::unix::AsyncFd;
 
 /// A source that reads from a file descriptor.
 ///
@@ -30,6 +32,12 @@ pub struct FdSrc {
 
 /// A sink that writes to a file descriptor.
 ///
+/// An [`AsyncSink`] (#172): pollable fds (pipes, sockets, ttys) register with
+/// the tokio reactor, so a full pipe pends the element's future instead of
+/// parking a tokio worker in a blocking `write`. Fds epoll refuses (regular
+/// files) fall back to direct writes, which the page cache bounds.
+/// Register with `add_async_sink`.
+///
 /// # Example
 ///
 /// ```rust,ignore
@@ -46,6 +54,17 @@ pub struct FdSink {
     name: String,
     fd: FdHolder,
     bytes_written: u64,
+    mode: WriteMode,
+}
+
+/// How the sink waits for the fd, decided at the first `consume`.
+enum WriteMode {
+    /// Not yet probed against the reactor.
+    Unprobed,
+    /// Readiness-driven: await `writable()` before each write attempt.
+    Poll(AsyncFd<RawFd>),
+    /// Not pollable (regular file): write directly.
+    Direct,
 }
 
 enum FdHolder {
@@ -156,6 +175,7 @@ impl FdSink {
             name: format!("fdsink-{}", fd),
             fd: FdHolder::Borrowed(fd),
             bytes_written: 0,
+            mode: WriteMode::Unprobed,
         }
     }
 
@@ -166,6 +186,7 @@ impl FdSink {
             name: format!("fdsink-{}", raw),
             fd: FdHolder::Owned(fd),
             bytes_written: 0,
+            mode: WriteMode::Unprobed,
         }
     }
 
@@ -194,18 +215,41 @@ impl FdSink {
     }
 }
 
-impl Sink for FdSink {
-    fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
+impl AsyncSink for FdSink {
+    async fn consume(&mut self, ctx: &ConsumeContext<'_>) -> Result<()> {
+        // Probe on first use, not at construction: `AsyncFd` needs a reactor,
+        // and elements are built before the pipeline starts.
+        if matches!(self.mode, WriteMode::Unprobed) {
+            self.mode = match AsyncFd::with_interest(self.fd.as_raw_fd(), Interest::WRITABLE) {
+                Ok(afd) => WriteMode::Poll(afd),
+                // epoll refuses regular files — their writes cannot pend
+                // indefinitely anyway, only as long as a page-cache flush.
+                Err(_) => WriteMode::Direct,
+            };
+        }
+
         let data = ctx.input();
         let mut written = 0;
 
         while written < data.len() {
-            match rustix::io::write(&self.fd, &data[written..]) {
-                Ok(n) => {
-                    written += n;
+            if let WriteMode::Poll(afd) = &self.mode {
+                let mut guard = afd
+                    .writable()
+                    .await
+                    .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
+                match guard.try_io(|inner| {
+                    let fd = unsafe { BorrowedFd::borrow_raw(*inner.get_ref()) };
+                    rustix::io::write(fd, &data[written..]).map_err(std::io::Error::from)
+                }) {
+                    Ok(Ok(n)) => written += n,
+                    Ok(Err(e)) => return Err(Error::Io(e)),
+                    // Spurious readiness: cleared, wait again.
+                    Err(_would_block) => continue,
                 }
-                Err(e) => {
-                    return Err(Error::Io(e.into()));
+            } else {
+                match rustix::io::write(&self.fd, &data[written..]) {
+                    Ok(n) => written += n,
+                    Err(e) => return Err(Error::Io(e.into())),
                 }
             }
         }
@@ -266,8 +310,8 @@ mod tests {
         assert_eq!(src.bytes_read(), 15);
     }
 
-    #[test]
-    fn test_fdsink_to_pipe() {
+    #[tokio::test]
+    async fn test_fdsink_to_pipe() {
         // Create a pipe using rustix
         let (read_fd, write_fd) = rustix::pipe::pipe().unwrap();
 
@@ -283,7 +327,7 @@ mod tests {
 
         // Consume buffer
         let consume_ctx = ConsumeContext::new(&buffer);
-        sink.consume(&consume_ctx).unwrap();
+        sink.consume(&consume_ctx).await.unwrap();
         drop(sink);
 
         // Read and verify using rustix
@@ -335,8 +379,8 @@ mod tests {
         assert_eq!(src.buffers_produced(), 1);
     }
 
-    #[test]
-    fn test_fdsink_bytes_written() {
+    #[tokio::test]
+    async fn test_fdsink_bytes_written() {
         let (_read_fd, write_fd) = rustix::pipe::pipe().unwrap();
 
         let mut sink = FdSink::from_owned(write_fd);
@@ -347,7 +391,7 @@ mod tests {
         ctx.output()[..5].copy_from_slice(b"hello");
         let buffer = ctx.finalize(5);
         let consume_ctx = ConsumeContext::new(&buffer);
-        sink.consume(&consume_ctx).unwrap();
+        sink.consume(&consume_ctx).await.unwrap();
 
         assert_eq!(sink.bytes_written(), 5);
 
@@ -357,7 +401,7 @@ mod tests {
         ctx.output()[..5].copy_from_slice(b"world");
         let buffer = ctx.finalize(5);
         let consume_ctx = ConsumeContext::new(&buffer);
-        sink.consume(&consume_ctx).unwrap();
+        sink.consume(&consume_ctx).await.unwrap();
 
         assert_eq!(sink.bytes_written(), 10);
     }

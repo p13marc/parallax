@@ -9,8 +9,8 @@ For the element *trait system* (how to write your own), see [getting-started.md]
 | Element | Description |
 |---------|-------------|
 | `FileSrc` | Reads a file in chunks; seekable (bytes), reports position/duration |
-| `FileSink` | Writes buffers to a file |
-| `FdSrc` / `FdSink` | Read/write a raw file descriptor |
+| `FileSink` | Writes buffers to a file (async sink — `add_async_sink`; tokio::fs, flushed per buffer) |
+| `FdSrc` / `FdSink` | Read/write a raw file descriptor. `FdSink` is an async sink: pollable fds (pipes, sockets, ttys) wait on the reactor, regular files fall back to direct writes |
 | `ConsoleSink` | Debug-prints buffers (`ConsoleFormat`: text/hex/…) |
 
 ## Testing — `elements::testing`
@@ -28,7 +28,7 @@ For the element *trait system* (how to write your own), see [getting-started.md]
 |---------|-------------|
 | `AppSrc` (+ `AppSrcHandle`) | Push buffers from application code into a pipeline |
 | `AppSink` (+ `AppSinkHandle`) | Pull buffers out of a pipeline into application code — add it with `add_async_sink`; a full queue back-pressures upstream by awaiting space (never parking a worker), or use `drop_on_full(true)` to shed instead. See [Reading the end of a stream](#reading-the-end-of-a-stream) |
-| `AutoVideoSink` `[display]` | Display video in a window (winit + softbuffer); frame dimensions from per-buffer metadata (`Metadata::video_dims`, both conventions) when present, else guessed from RGBA buffer size. `sync=true` paces presentation — see below |
+| `AutoVideoSink` `[display]` | Display video in a window (winit + softbuffer); frame dimensions from per-buffer metadata (`Metadata::video_dims`, both conventions) when present, else guessed from RGBA buffer size. `sync=true` paces presentation — see below. Async sink since #172: the pacing wait is an await, so a frozen clock pends the future instead of parking a worker |
 
 ### Reading the end of a stream
 
@@ -86,7 +86,7 @@ anything, so `Aborted` comes from the handle alone.
 |---------|-------------|
 | `TcpSrc` / `TcpSink` / `AsyncTcpSrc` / `AsyncTcpSink` | TCP client/server streaming (`TcpMode`) |
 | `UdpSrc` / `UdpSink` / `AsyncUdpSrc` / `AsyncUdpSink` | UDP datagrams |
-| `UnixSrc` / `UnixSink` / `AsyncUnixSrc` / `AsyncUnixSink` | Unix domain sockets (`UnixMode`) |
+| `UnixSrc` / `UnixSink` | Unix domain sockets (`UnixMode`). `UnixSink` is an async sink — accept/connect/write all await (the old broken `AsyncUnixSrc`/`AsyncUnixSink` pair, which re-connected per call, is deleted) |
 | `UdpMulticastSrc` / `UdpMulticastSink` | Multicast group receive/send |
 | `HttpSrc` `[http]` | HTTP GET source; byte-seekable via `Range` when the server supports it (probed at pipeline start) |
 | `HttpSink` `[http]` | HTTP POST/PUT sink |

@@ -35,7 +35,7 @@ async fn main() -> Result<()> {
 
     let mut pipeline = Pipeline::new();
     let src = pipeline.add_source_with_arena("filesrc", FileSrc::new(&input_path), arena);
-    let sink = pipeline.add_sink("filesink", FileSink::new(&output_path));
+    let sink = pipeline.add_async_sink("filesink", FileSink::new(&output_path));
     pipeline.link(src, sink)?;
 
     // Run

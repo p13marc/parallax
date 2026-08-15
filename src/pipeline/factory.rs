@@ -1,7 +1,7 @@
 //! Element factory for creating elements from parsed descriptions.
 
 use crate::element::{
-    DynAsyncElement, ElementAdapter, SinkAdapter, SourceAdapter, TransformAdapter,
+    AsyncSinkAdapter, DynAsyncElement, ElementAdapter, SinkAdapter, SourceAdapter, TransformAdapter,
 };
 use crate::elements::{FileSink, FileSrc, Inspect, NullSink, NullSource, PassThrough};
 use crate::error::{Error, Result};
@@ -197,7 +197,7 @@ fn create_filesink(
         })?;
 
     let sink = FileSink::new(&location);
-    Ok(DynAsyncElement::new_box(SinkAdapter::new(sink)))
+    Ok(DynAsyncElement::new_box(AsyncSinkAdapter::new(sink)))
 }
 
 #[cfg(feature = "display")]
@@ -229,7 +229,7 @@ fn create_autovideosink(
         sink = sink.with_max_lateness(std::time::Duration::from_millis(ms));
     }
 
-    Ok(DynAsyncElement::new_box(SinkAdapter::new(sink)))
+    Ok(DynAsyncElement::new_box(AsyncSinkAdapter::new(sink)))
 }
 
 fn create_videoconvert(

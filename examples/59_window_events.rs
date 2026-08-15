@@ -26,7 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The window handle must be taken BEFORE Executor::start moves the sink.
     let window = sink.handle();
-    let sink_id = pipeline.add_sink("display", sink);
+    let sink_id = pipeline.add_async_sink("display", sink);
     pipeline.link(src, sink_id)?;
 
     let executor = Executor::new();

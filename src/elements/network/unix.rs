@@ -3,19 +3,20 @@
 //! Provides local IPC via Unix domain sockets with lower overhead than TCP.
 //!
 //! - [`UnixSrc`]: Reads data from a Unix socket connection
-//! - [`UnixSink`]: Writes data to a Unix socket connection
-//! - [`AsyncUnixSrc`]: Async version of UnixSrc
-//! - [`AsyncUnixSink`]: Async version of UnixSink
+//! - [`UnixSink`]: Writes data to a Unix socket connection (an `AsyncSink`)
+//!
+//! The old `AsyncUnixSrc`/`AsyncUnixSink` pair was deleted with #172: neither
+//! implemented an element trait, and both re-connected (server mode: re-bound
+//! the socket path) on every call, which was never a usable transport.
+//! `UnixSink` itself is the async one now.
 
-use crate::buffer::{Buffer, MemoryHandle};
-use crate::element::{AsyncSource, ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
+use crate::element::{AsyncSink, ConsumeContext, ProduceContext, ProduceResult, Source};
 use crate::error::{Error, Result};
-use crate::memory::{OutputArena, OutputBudget, defaults};
-use crate::metadata::Metadata;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 
 /// Mode of operation for Unix socket source.
 #[derive(Debug, Clone)]
@@ -215,6 +216,11 @@ impl Drop for UnixSrc {
 
 /// A Unix domain socket sink that writes data to a local connection.
 ///
+/// An [`AsyncSink`] (#172): the accept, the connect and every write await on
+/// tokio's reactor, so a peer that never connects — or connects and stops
+/// reading — pends this element's future instead of parking a tokio worker
+/// (the same liveness class as `IpcSink`). Register with `add_async_sink`.
+///
 /// Can operate in two modes:
 /// - **Client mode**: Connects to an existing Unix socket
 /// - **Server mode**: Creates a socket and waits for a connection
@@ -232,8 +238,11 @@ impl Drop for UnixSrc {
 /// ```
 pub struct UnixSink {
     name: String,
-    stream: Option<UnixStream>,
+    stream: Option<tokio::net::UnixStream>,
+    /// Bound eagerly (std, no reactor needed at construction), converted to a
+    /// tokio listener at the first `consume`.
     listener: Option<UnixListener>,
+    tokio_listener: Option<tokio::net::UnixListener>,
     mode: UnixMode,
     connected: bool,
     bytes_written: u64,
@@ -251,6 +260,7 @@ impl UnixSink {
             name,
             stream: None,
             listener: None,
+            tokio_listener: None,
             mode: UnixMode::Client(path),
             connected: false,
             bytes_written: 0,
@@ -273,6 +283,7 @@ impl UnixSink {
             name,
             stream: None,
             listener: Some(listener),
+            tokio_listener: None,
             mode: UnixMode::Server(path),
             connected: false,
             bytes_written: 0,
@@ -305,25 +316,22 @@ impl UnixSink {
         }
     }
 
-    fn ensure_connected(&mut self) -> Result<()> {
+    async fn ensure_connected(&mut self) -> Result<()> {
         if self.connected {
             return Ok(());
         }
 
         match &self.mode {
             UnixMode::Client(path) => {
-                let stream = UnixStream::connect(path)?;
-                if let Some(timeout) = self.write_timeout {
-                    stream.set_write_timeout(Some(timeout))?;
-                }
-                self.stream = Some(stream);
+                self.stream = Some(tokio::net::UnixStream::connect(path).await?);
             }
             UnixMode::Server(_) => {
-                if let Some(ref listener) = self.listener {
-                    let (stream, _) = listener.accept()?;
-                    if let Some(timeout) = self.write_timeout {
-                        stream.set_write_timeout(Some(timeout))?;
-                    }
+                if let Some(listener) = self.listener.take() {
+                    listener.set_nonblocking(true)?;
+                    self.tokio_listener = Some(tokio::net::UnixListener::from_std(listener)?);
+                }
+                if let Some(ref listener) = self.tokio_listener {
+                    let (stream, _) = listener.accept().await?;
                     self.stream = Some(stream);
                 }
             }
@@ -334,9 +342,9 @@ impl UnixSink {
     }
 }
 
-impl Sink for UnixSink {
-    fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
-        self.ensure_connected()?;
+impl AsyncSink for UnixSink {
+    async fn consume(&mut self, ctx: &ConsumeContext<'_>) -> Result<()> {
+        self.ensure_connected().await?;
 
         let stream = self
             .stream
@@ -344,7 +352,16 @@ impl Sink for UnixSink {
             .ok_or_else(|| Error::Element("not connected".into()))?;
 
         let data = ctx.input();
-        stream.write_all(data)?;
+        // tokio streams have no socket-level write timeout; the deadline
+        // wraps the future instead, which covers the same stall.
+        match self.write_timeout {
+            Some(limit) => tokio::time::timeout(limit, stream.write_all(data))
+                .await
+                .map_err(|_| {
+                    Error::Element(format!("unix sink write timed out after {limit:?}"))
+                })??,
+            None => stream.write_all(data).await?,
+        }
         self.bytes_written += data.len() as u64;
 
         Ok(())
@@ -365,214 +382,13 @@ impl Drop for UnixSink {
     }
 }
 
-/// Async Unix domain socket source.
-///
-/// Uses tokio for async I/O operations.
-pub struct AsyncUnixSrc {
-    name: String,
-    path: PathBuf,
-    mode: UnixMode,
-    buffer_size: usize,
-    bytes_read: u64,
-    sequence: u64,
-    /// Arena for buffer allocation.
-    output: OutputArena,
-}
-
-impl AsyncUnixSrc {
-    /// Create a new async Unix socket source in client mode.
-    pub fn connect<P: AsRef<Path>>(path: P) -> Self {
-        let path = path.as_ref().to_path_buf();
-        let name = format!("async-unixsrc-{}", path.display());
-
-        Self {
-            name,
-            path: path.clone(),
-            mode: UnixMode::Client(path),
-            buffer_size: 64 * 1024,
-            bytes_read: 0,
-            sequence: 0,
-            output: OutputArena::new(defaults::SOURCE_SLOT_COUNT),
-        }
-    }
-
-    /// Create a new async Unix socket source in server mode.
-    pub fn listen<P: AsRef<Path>>(path: P) -> Self {
-        let path = path.as_ref().to_path_buf();
-        let name = format!("async-unixsrc-listener-{}", path.display());
-
-        Self {
-            name,
-            path: path.clone(),
-            mode: UnixMode::Server(path),
-            buffer_size: 64 * 1024,
-            bytes_read: 0,
-            sequence: 0,
-            output: OutputArena::new(defaults::SOURCE_SLOT_COUNT),
-        }
-    }
-
-    /// Set the buffer size for reads.
-    pub fn with_buffer_size(mut self, size: usize) -> Self {
-        self.buffer_size = size.max(1);
-        self
-    }
-
-    /// Set a custom name.
-    pub fn with_name(mut self, name: impl Into<String>) -> Self {
-        self.name = name.into();
-        self
-    }
-
-    /// Get the number of bytes read so far.
-    pub fn bytes_read(&self) -> u64 {
-        self.bytes_read
-    }
-}
-
-impl AsyncSource for AsyncUnixSrc {
-    fn set_output_budget(&mut self, budget: OutputBudget) {
-        self.output.set_budget(budget);
-    }
-
-    async fn produce(&mut self, ctx: &mut ProduceContext<'_>) -> Result<ProduceResult> {
-        // For async, we use std blocking I/O wrapped in spawn_blocking
-        // A full async implementation would use tokio::net::UnixStream
-        let path = self.path.clone();
-        let buffer_size = self.buffer_size;
-        let is_server = matches!(self.mode, UnixMode::Server(_));
-
-        let result = tokio::task::spawn_blocking(move || {
-            let stream = if is_server {
-                let _ = std::fs::remove_file(&path);
-                let listener = UnixListener::bind(&path)?;
-                let (stream, _) = listener.accept()?;
-                stream
-            } else {
-                UnixStream::connect(&path)?
-            };
-
-            let mut buf = vec![0u8; buffer_size];
-            let n = (&stream).read(&mut buf)?;
-            buf.truncate(n);
-            Ok::<_, Error>(buf)
-        })
-        .await
-        .map_err(|e| Error::Element(format!("task join error: {}", e)))??;
-
-        if result.is_empty() {
-            return Ok(ProduceResult::Eos);
-        }
-
-        self.bytes_read += result.len() as u64;
-        let seq = self.sequence;
-        self.sequence += 1;
-
-        // Check if we can use the pre-allocated buffer
-        if ctx.has_buffer() && ctx.capacity() >= result.len() {
-            let output = ctx.output();
-            output[..result.len()].copy_from_slice(&result);
-            ctx.set_sequence(seq);
-            Ok(ProduceResult::Produced(result.len()))
-        } else {
-            // Fall back to creating our own buffer from arena
-            // Initialize arena lazily if needed
-            let Some(mut slot) = self.output.try_acquire(self.buffer_size, "unixsrc")? else {
-                return Ok(ProduceResult::WouldBlock);
-            };
-            slot.data_mut()[..result.len()].copy_from_slice(&result);
-
-            let handle = MemoryHandle::with_len(slot, result.len());
-            Ok(ProduceResult::OwnBuffer(Buffer::new(
-                handle,
-                Metadata::from_sequence(seq),
-            )))
-        }
-    }
-
-    fn name(&self) -> &str {
-        &self.name
-    }
-}
-
-/// Async Unix domain socket sink.
-pub struct AsyncUnixSink {
-    name: String,
-    path: PathBuf,
-    mode: UnixMode,
-    bytes_written: u64,
-}
-
-impl AsyncUnixSink {
-    /// Create a new async Unix socket sink in client mode.
-    pub fn connect<P: AsRef<Path>>(path: P) -> Self {
-        let path = path.as_ref().to_path_buf();
-        let name = format!("async-unixsink-{}", path.display());
-
-        Self {
-            name,
-            path: path.clone(),
-            mode: UnixMode::Client(path),
-            bytes_written: 0,
-        }
-    }
-
-    /// Create a new async Unix socket sink in server mode.
-    pub fn listen<P: AsRef<Path>>(path: P) -> Self {
-        let path = path.as_ref().to_path_buf();
-        let name = format!("async-unixsink-listener-{}", path.display());
-
-        Self {
-            name,
-            path: path.clone(),
-            mode: UnixMode::Server(path),
-            bytes_written: 0,
-        }
-    }
-
-    /// Set a custom name.
-    pub fn with_name(mut self, name: impl Into<String>) -> Self {
-        self.name = name.into();
-        self
-    }
-
-    /// Get the number of bytes written so far.
-    pub fn bytes_written(&self) -> u64 {
-        self.bytes_written
-    }
-
-    /// Consume a buffer asynchronously.
-    pub async fn consume_async(&mut self, buffer: Buffer) -> Result<()> {
-        let path = self.path.clone();
-        let data = buffer.as_bytes().to_vec();
-        let len = data.len();
-        let is_server = matches!(self.mode, UnixMode::Server(_));
-
-        tokio::task::spawn_blocking(move || {
-            let mut stream = if is_server {
-                let _ = std::fs::remove_file(&path);
-                let listener = UnixListener::bind(&path)?;
-                let (stream, _) = listener.accept()?;
-                stream
-            } else {
-                UnixStream::connect(&path)?
-            };
-
-            stream.write_all(&data)?;
-            Ok::<_, Error>(())
-        })
-        .await
-        .map_err(|e| Error::Element(format!("task join error: {}", e)))??;
-
-        self.bytes_written += len as u64;
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::{Buffer, MemoryHandle};
     use crate::memory::SharedArena;
+    use crate::metadata::Metadata;
+    use std::io::Write;
     use std::sync::OnceLock;
     use std::thread;
     use tempfile::tempdir;
@@ -591,8 +407,8 @@ mod tests {
         Buffer::new(handle, Metadata::from_sequence(seq))
     }
 
-    #[test]
-    fn test_unix_roundtrip() -> Result<()> {
+    #[tokio::test]
+    async fn test_unix_roundtrip() -> Result<()> {
         let dir = tempdir().unwrap();
         let socket_path = dir.path().join("test.sock");
 
@@ -623,15 +439,15 @@ mod tests {
         });
 
         // Give server time to start listening
-        thread::sleep(Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let mut sink = UnixSink::connect(&socket_path)?;
         let buf1 = make_buffer(b"Hello", 0);
         let ctx1 = ConsumeContext::new(&buf1);
-        sink.consume(&ctx1)?;
+        sink.consume(&ctx1).await?;
         let buf2 = make_buffer(b" World", 1);
         let ctx2 = ConsumeContext::new(&buf2);
-        sink.consume(&ctx2)?;
+        sink.consume(&ctx2).await?;
 
         let received = server.join().unwrap()?;
         assert_eq!(received, b"Hello World");

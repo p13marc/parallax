@@ -45,7 +45,7 @@ async fn main() -> Result<()> {
     let encoder = pipeline.add_filter("h264enc", H264Encoder::new(H264EncoderConfig::new())?);
 
     // File sink
-    let sink = pipeline.add_sink("filesink", FileSink::new(&output_path));
+    let sink = pipeline.add_async_sink("filesink", FileSink::new(&output_path));
 
     pipeline.link(src, convert)?;
     pipeline.link(convert, encoder)?;

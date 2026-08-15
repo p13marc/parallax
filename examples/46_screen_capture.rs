@@ -147,7 +147,7 @@ async fn main() -> Result<()> {
     let convert = pipeline.add_filter("videoconvert", converter);
     let enc = pipeline.add_filter("h264enc", encoder);
     let mux = pipeline.add_filter("mp4mux", mp4_mux);
-    let sink = pipeline.add_sink("filesink", file_sink);
+    let sink = pipeline.add_async_sink("filesink", file_sink);
 
     pipeline.link(src, convert)?;
     pipeline.link(convert, enc)?;

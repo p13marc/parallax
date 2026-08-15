@@ -113,7 +113,7 @@ async fn main() -> Result<()> {
     let muxer = pipeline.add_muxer("tsmux", mux);
 
     // File sink
-    let sink = pipeline.add_sink("filesink", FileSink::new(output_path));
+    let sink = pipeline.add_async_sink("filesink", FileSink::new(output_path));
 
     // Link: video and data → mux → file
     pipeline.link(video_src, muxer)?;

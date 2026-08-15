@@ -1,13 +1,14 @@
 //! File-based source and sink elements.
 
-use crate::element::{ConsumeContext, ProduceContext, ProduceResult, Sink, Source};
+use crate::element::{AsyncSink, ConsumeContext, ProduceContext, ProduceResult, Source};
 use crate::error::Result;
 use crate::event::{Event, EventResult, SeekEvent, SeekType, SegmentFormat};
 use crate::memory::{OutputArena, OutputBudget, defaults};
 use crate::pipeline::seek::{DurationQuery, PositionQuery};
 use std::fs::File;
-use std::io::{Read, Seek, Write};
+use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
+use tokio::io::AsyncWriteExt;
 
 /// A source element that reads from a file.
 ///
@@ -245,25 +246,26 @@ impl FileSrc {
 
 /// A sink element that writes to a file.
 ///
+/// An [`AsyncSink`] (#172): writes go through `tokio::fs`, so a slow disk
+/// pends the element's future instead of parking a tokio worker inside a
+/// sync `consume`. Register with `add_async_sink`.
+///
 /// # Example
 ///
 /// ```rust,ignore
 /// use parallax::elements::FileSink;
-/// use parallax::element::{Sink, ConsumeContext};
+/// use parallax::element::{AsyncSink, ConsumeContext};
 ///
 /// let mut sink = FileSink::create("output.bin")?;
 ///
 /// // Write buffers using ConsumeContext
 /// let ctx = ConsumeContext::new(&buffer);
-/// sink.consume(&ctx)?;
-///
-/// // Flush and close
-/// sink.flush()?;
+/// sink.consume(&ctx).await?;
 /// ```
 pub struct FileSink {
     name: String,
     path: PathBuf,
-    file: Option<File>,
+    file: Option<tokio::fs::File>,
     bytes_written: u64,
     buffers_written: u64,
 }
@@ -294,7 +296,7 @@ impl FileSink {
         Ok(Self {
             name,
             path,
-            file: Some(file),
+            file: Some(tokio::fs::File::from_std(file)),
             bytes_written: 0,
             buffers_written: 0,
         })
@@ -316,27 +318,33 @@ impl FileSink {
     }
 
     /// Flush the file.
-    pub fn flush(&mut self) -> Result<()> {
+    pub async fn flush(&mut self) -> Result<()> {
         if let Some(file) = &mut self.file {
-            file.flush()?;
+            file.flush().await?;
         }
         Ok(())
     }
 
     /// Ensure the file is open.
-    fn ensure_open(&mut self) -> Result<&mut File> {
+    async fn ensure_open(&mut self) -> Result<&mut tokio::fs::File> {
         if self.file.is_none() {
-            self.file = Some(File::create(&self.path)?);
+            self.file = Some(tokio::fs::File::create(&self.path).await?);
         }
         Ok(self.file.as_mut().unwrap())
     }
 }
 
-impl Sink for FileSink {
-    fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
-        let file = self.ensure_open()?;
+impl AsyncSink for FileSink {
+    async fn consume(&mut self, ctx: &ConsumeContext<'_>) -> Result<()> {
         let data = ctx.input();
-        file.write_all(data)?;
+        let file = self.ensure_open().await?;
+        file.write_all(data).await?;
+        // Flush per buffer: `write_all` only hands the bytes to tokio's
+        // blocking pool. Waiting for the write keeps two properties the sync
+        // sink had — an I/O error surfaces on *this* buffer, and when the
+        // pipeline reports EOS the file's content is really there (tests and
+        // muxer finalization read it immediately after `wait()`).
+        file.flush().await?;
         self.bytes_written += data.len() as u64;
         self.buffers_written += 1;
         Ok(())
@@ -344,13 +352,6 @@ impl Sink for FileSink {
 
     fn name(&self) -> &str {
         &self.name
-    }
-}
-
-impl Drop for FileSink {
-    fn drop(&mut self) {
-        // Best effort flush on drop
-        let _ = self.flush();
     }
 }
 
@@ -440,8 +441,8 @@ mod tests {
         assert_eq!(chunk_count, 10);
     }
 
-    #[test]
-    fn test_filesink_writes_file() {
+    #[tokio::test]
+    async fn test_filesink_writes_file() {
         let temp = NamedTempFile::new().unwrap();
         let path = temp.path().to_path_buf();
 
@@ -457,7 +458,7 @@ mod tests {
 
             // Use ConsumeContext
             let ctx = ConsumeContext::new(&buffer);
-            sink.consume(&ctx).unwrap();
+            sink.consume(&ctx).await.unwrap();
             assert_eq!(sink.bytes_written(), 13);
             assert_eq!(sink.buffers_written(), 1);
         }
@@ -481,8 +482,8 @@ mod tests {
         assert!(sink.file.is_none());
     }
 
-    #[test]
-    fn test_roundtrip() {
+    #[tokio::test]
+    async fn test_roundtrip() {
         let temp = NamedTempFile::new().unwrap();
         let path = temp.path().to_path_buf();
 
@@ -497,7 +498,7 @@ mod tests {
 
             // Use ConsumeContext
             let ctx = ConsumeContext::new(&buffer);
-            sink.consume(&ctx).unwrap();
+            sink.consume(&ctx).await.unwrap();
         }
 
         // Read it back

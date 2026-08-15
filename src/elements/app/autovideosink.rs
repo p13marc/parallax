@@ -26,7 +26,7 @@
 
 use crate::buffer::Buffer;
 use crate::clock::ClockTime;
-use crate::element::{ConsumeContext, Sink};
+use crate::element::{AsyncSink, ConsumeContext};
 use crate::error::{Error, Result};
 use crate::format::{Caps, PixelFormat};
 use std::num::NonZeroU32;
@@ -508,7 +508,7 @@ impl Drop for AutoVideoSink {
     }
 }
 
-impl Sink for AutoVideoSink {
+impl AsyncSink for AutoVideoSink {
     fn handle_downstream_event(
         &mut self,
         event: crate::event::Event,
@@ -536,7 +536,7 @@ impl Sink for AutoVideoSink {
         Some(event)
     }
 
-    fn consume(&mut self, ctx: &ConsumeContext) -> Result<()> {
+    async fn consume(&mut self, ctx: &ConsumeContext<'_>) -> Result<()> {
         let data = ctx.input();
 
         tracing::debug!("AutoVideoSink: received buffer with {} bytes", data.len());
@@ -570,9 +570,10 @@ impl Sink for AutoVideoSink {
                 .to_option()
         {
             let mut pace = self.pacer.schedule(pts, now, self.max_lateness);
-            // Blocking here is the point: it is what back-pressures the
-            // decoder and the source down to real time. Other sync sinks
-            // block on their I/O for the same reason.
+            // Waiting here is the point: it is what back-pressures the
+            // decoder and the source down to real time. Since #172 the wait
+            // is an await, so it pends this element's future instead of
+            // parking a tokio worker.
             //
             // The wait polls the clock in short slices instead of sleeping the
             // full delay: against a clock frozen by `PipelineHandle::pause`
@@ -583,7 +584,7 @@ impl Sink for AutoVideoSink {
             // frozen-clock stall, where the deficit never shrinks but stays
             // under the cap.
             while let Pace::Wait(delay) = pace {
-                thread::sleep(delay.min(Duration::from_millis(10)));
+                tokio::time::sleep(delay.min(Duration::from_millis(10))).await;
                 match ctx.running_time().to_option() {
                     Some(now) => pace = self.pacer.schedule(pts, now, self.max_lateness),
                     None => break,
@@ -1266,7 +1267,7 @@ mod tests {
 
     #[test]
     fn a_time_segment_is_stored_and_re_anchors() {
-        use crate::element::Sink;
+        use crate::element::AsyncSink;
         use crate::event::{Event, SegmentEvent};
 
         let mut sink = AutoVideoSink::new();

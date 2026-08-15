@@ -97,8 +97,8 @@ pub mod util;
 // Network
 pub use network::{AsyncTcpSink, AsyncTcpSrc, TcpMode, TcpSink, TcpSrc};
 pub use network::{AsyncUdpSink, AsyncUdpSrc, UdpSink, UdpSrc};
-pub use network::{AsyncUnixSink, AsyncUnixSrc, UnixMode, UnixSink, UnixSrc};
 pub use network::{UdpMulticastSink, UdpMulticastSrc, UdpMulticastStats};
+pub use network::{UnixMode, UnixSink, UnixSrc};
 
 #[cfg(feature = "http")]
 pub use network::{HttpMethod, HttpSink, HttpSinkStats, HttpSrc};

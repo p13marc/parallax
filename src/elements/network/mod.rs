@@ -32,7 +32,7 @@ pub use tcp::{AsyncTcpSink, AsyncTcpSrc, TcpMode, TcpSink, TcpSrc};
 pub use udp::{AsyncUdpSink, AsyncUdpSrc, UdpSink, UdpSrc};
 
 // Unix domain sockets
-pub use unix::{AsyncUnixSink, AsyncUnixSrc, UnixMode, UnixSink, UnixSrc};
+pub use unix::{UnixMode, UnixSink, UnixSrc};
 
 // Multicast
 pub use multicast::{UdpMulticastSink, UdpMulticastSrc, UdpMulticastStats};

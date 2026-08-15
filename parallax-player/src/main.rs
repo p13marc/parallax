@@ -655,7 +655,7 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
         VideoCodecKind::Other(codec) => bail!("video track is {codec} — no decoder for it yet"),
     };
     let cvt = pipeline.add_filter("convert", convert);
-    let snk = pipeline.add_sink("display", sink);
+    let snk = pipeline.add_async_sink("display", sink);
     // Deep branch links decouple the two consumers: the demuxer emits in DTS
     // order, so if the video branch backpressures at its exact rate the audio
     // branch starves, the device underruns, the audio-master clock freezes,

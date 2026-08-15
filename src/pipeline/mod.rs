@@ -17,7 +17,7 @@
 //! let pipeline = PipelineBuilder::new()
 //!     .source(VideoTestSrc::new())
 //!     .then(VideoScale::new(1920, 1080, 1280, 720))
-//!     .sink(FileSink::new("output.yuv"))
+//!     .async_sink(FileSink::new("output.yuv"))
 //!     .build()?;
 //!
 //! pipeline.run().await?;

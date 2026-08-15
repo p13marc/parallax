@@ -96,7 +96,7 @@ async fn main() -> Result<()> {
     let src = pipeline.add_async_source("rtsp", session);
     let dec = pipeline.add_filter("decode", H264Decoder::new()?);
     let cvt = pipeline.add_filter("convert", convert);
-    let sink = pipeline.add_sink("display", AutoVideoSink::new().with_title("Parallax RTSP"));
+    let sink = pipeline.add_async_sink("display", AutoVideoSink::new().with_title("Parallax RTSP"));
     pipeline.link(src, dec)?;
     pipeline.link(dec, cvt)?;
     pipeline.link(cvt, sink)?;

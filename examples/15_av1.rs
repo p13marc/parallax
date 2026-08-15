@@ -62,7 +62,7 @@ async fn main() -> Result<()> {
     let mut pipeline = Pipeline::new();
     let s = pipeline.add_source("appsrc", src);
     let e = pipeline.add_filter("av1enc", encoder);
-    let k = pipeline.add_sink("filesink", FileSink::new(&output_path));
+    let k = pipeline.add_async_sink("filesink", FileSink::new(&output_path));
     pipeline.link(s, e)?;
     pipeline.link(e, k)?;
 
