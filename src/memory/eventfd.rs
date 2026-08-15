@@ -16,6 +16,15 @@ use std::time::Duration;
 
 /// Linux eventfd: a kernel counter usable as a cross-thread wake-up.
 pub struct EventFd {
+    /// Cached tokio registration, created lazily by the first `wait_async`
+    /// (#181 — a fresh `AsyncFd` per wait cost an epoll ADD+DEL syscall
+    /// pair per wakeup cycle). Declared BEFORE `fd`: fields drop in
+    /// declaration order, so the registration deregisters from the reactor
+    /// before the fd closes. Binds to the first runtime that awaits it —
+    /// fine for every current consumer (bridges/drivers/doorbells are
+    /// created and consumed within one executor run); `notify`/`try_wait`
+    /// bypass it entirely (raw fd I/O), so RT threads are unaffected.
+    async_fd: std::sync::OnceLock<tokio::io::unix::AsyncFd<std::os::unix::io::RawFd>>,
     fd: OwnedFd,
 }
 
@@ -24,7 +33,10 @@ impl EventFd {
     pub fn new() -> Result<Self> {
         let fd = eventfd(0, EventfdFlags::NONBLOCK | EventfdFlags::CLOEXEC)
             .map_err(|e| Error::Io(std::io::Error::other(format!("eventfd: {}", e))))?;
-        Ok(Self { fd })
+        Ok(Self {
+            async_fd: std::sync::OnceLock::new(),
+            fd,
+        })
     }
 
     /// Signal the eventfd (increment counter).
@@ -94,14 +106,26 @@ impl EventFd {
 
     /// Wait asynchronously for the eventfd to be signaled.
     ///
-    /// This uses tokio's async file descriptor support.
+    /// This uses tokio's async file descriptor support. The epoll
+    /// registration is created once and cached (#181); `clear_ready()` on
+    /// the would-block path keeps the edge-triggered readiness honest, and
+    /// readiness is deliberately NOT cleared after a successful read — the
+    /// worst case is one spurious poll on the next wait, while clearing
+    /// could swallow the edge of a concurrent `notify`.
     pub async fn wait_async(&self) -> Result<()> {
-        use std::os::unix::io::AsFd;
         use tokio::io::Interest;
         use tokio::io::unix::AsyncFd;
 
-        let async_fd =
-            AsyncFd::with_interest(self.fd.as_fd(), Interest::READABLE).map_err(Error::Io)?;
+        let async_fd = match self.async_fd.get() {
+            Some(afd) => afd,
+            None => {
+                let afd = AsyncFd::with_interest(self.as_raw_fd(), Interest::READABLE)
+                    .map_err(Error::Io)?;
+                // Single-consumer in practice; on a theoretical race the
+                // winner's registration is kept and ours drops (deregisters).
+                self.async_fd.get_or_init(|| afd)
+            }
+        };
 
         loop {
             let mut guard = async_fd.readable().await.map_err(Error::Io)?;

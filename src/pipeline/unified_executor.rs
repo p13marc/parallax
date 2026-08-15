@@ -2369,24 +2369,33 @@ struct InputBranch {
 }
 
 impl InputBranch {
-    /// Receive one message; `None` once every sender is gone.
+    /// Poll for one message; `Ready(None)` once every sender is gone.
     ///
     /// **Cancel-safe, and it must stay that way.** Both channel kinds
-    /// guarantee that a dropped `recv` future consumed no message (tokio
-    /// documents it; the leaky receiver pops synchronously in the returning
+    /// guarantee that an abandoned poll consumed no message (tokio documents
+    /// `poll_recv`; the leaky receiver pops synchronously in the returning
     /// poll), which is what lets the consuming loops below race this against
-    /// their upstream inbox in a plain `select!`. Anything added before that
-    /// await — a permit, a stashed value — would be lost when a select loser
-    /// is dropped.
-    async fn recv(&mut self) -> Option<Message> {
+    /// their upstream inbox in a plain `select!`, and the muxer drive many
+    /// branches through one fair-poll future (#181). Anything stashed across
+    /// polls would be lost when a select loser is dropped.
+    ///
+    /// Samples the flow monitor on every `Ready`, the receive-side half of
+    /// link monitoring (the half that observes drains).
+    fn poll_recv(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Message>> {
         let msg = match &mut self.rx {
-            BranchRx::Mpsc(rx) => rx.recv().await,
-            BranchRx::Leaky(rx) => rx.recv().await,
+            BranchRx::Mpsc(rx) => std::task::ready!(rx.poll_recv(cx)),
+            BranchRx::Leaky(rx) => std::task::ready!(rx.poll_recv(cx)),
         };
         if let Some(flow) = &self.flow {
             flow.update(self.rx.len());
         }
-        msg
+        std::task::Poll::Ready(msg)
+    }
+
+    /// Receive one message; `None` once every sender is gone. Cancel-safe:
+    /// see [`poll_recv`](Self::poll_recv), which this wraps.
+    async fn recv(&mut self) -> Option<Message> {
+        std::future::poll_fn(|cx| self.poll_recv(cx)).await
     }
 
     /// Non-blocking receive, for the sink's paused drain.
@@ -2399,6 +2408,74 @@ impl InputBranch {
             flow.update(self.rx.len());
         }
         msg
+    }
+}
+
+/// The muxer's input set: a rotating fair poll over every input branch.
+///
+/// Replaces the `FuturesUnordered` + re-armed `recv_one` scheme, whose
+/// re-push allocated one `Arc<Task>` per received message per branch — the
+/// last per-buffer heap allocation on the executor's data path (#181).
+/// `next_msg` polls the branches round-robin starting one past the last
+/// winner (so a chatty input cannot starve the others) and allocates
+/// nothing in steady state.
+///
+/// Cancel-safe as a `select!` branch: a message is consumed only in the
+/// poll that returns it, and the receivers live *here* — owned by the loop,
+/// not the dropped future — so losing the select loses nothing. A waker
+/// left registered by an abandoned poll can only re-wake this same task.
+struct MuxInputs {
+    /// Live branches with their pad names. Retired (swap_remove) on
+    /// EOS/error/close; order across branches carries no guarantee, only
+    /// per-branch FIFO does.
+    branches: Vec<(String, InputBranch)>,
+    /// Fairness cursor: polling starts here.
+    next: usize,
+}
+
+impl MuxInputs {
+    fn new(inputs_by_pad: HashMap<String, Vec<InputBranch>>) -> Self {
+        let branches = inputs_by_pad
+            .into_iter()
+            .flat_map(|(pad, rxs)| rxs.into_iter().map(move |rx| (pad.clone(), rx)))
+            .collect();
+        Self { branches, next: 0 }
+    }
+
+    fn len(&self) -> usize {
+        self.branches.len()
+    }
+
+    /// `Ready(Some((idx, msg)))` for one branch's message (`msg == None` =
+    /// that branch closed); `Ready(None)` once every branch is retired.
+    fn poll_next(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<(usize, Option<Message>)>> {
+        if self.branches.is_empty() {
+            return std::task::Poll::Ready(None);
+        }
+        let n = self.branches.len();
+        for i in 0..n {
+            let idx = (self.next + i) % n;
+            if let std::task::Poll::Ready(msg) = self.branches[idx].1.poll_recv(cx) {
+                self.next = (idx + 1) % n;
+                return std::task::Poll::Ready(Some((idx, msg)));
+            }
+        }
+        std::task::Poll::Pending
+    }
+
+    async fn next_msg(&mut self) -> Option<(usize, Option<Message>)> {
+        std::future::poll_fn(|cx| self.poll_next(cx)).await
+    }
+
+    /// Retire a branch that ended (EOS, error, or closed channel).
+    fn retire(&mut self, idx: usize) {
+        self.branches.swap_remove(idx);
+        if self.next >= self.branches.len() {
+            self.next = 0;
+        }
     }
 }
 
@@ -4486,8 +4563,6 @@ fn spawn_muxer_task(
     bus: BusHandle,
     share: TaskGuard,
 ) -> JoinHandle<Result<()>> {
-    use futures::stream::{FuturesUnordered, StreamExt};
-
     tokio::spawn(reporting(share, async move {
         let inline_dispatch = element.dispatches_inline();
         tracing::debug!("muxer '{}' started", name);
@@ -4512,31 +4587,13 @@ fn spawn_muxer_task(
         .await;
         let mut segment_sent = false;
 
-        // One pending receive per input, re-armed after each message.
-        //
-        // `FuturesUnordered` drops a future once it resolves, so the previous
-        // version — which collected one `rx.recv()` future per input and never
-        // pushed another — delivered exactly *one* buffer per input pad and
-        // then fell out of the loop. A two-input muxer muxed two buffers,
-        // whatever the stream length.
-        async fn recv_one(
-            pad: String,
-            mut rx: InputBranch,
-        ) -> (String, InputBranch, Option<Message>) {
-            let msg = rx.recv().await;
-            (pad, rx, msg)
-        }
+        // All input branches behind one rotating fair poll (#181). Its
+        // predecessor re-armed a `recv_one` future into a `FuturesUnordered`
+        // per received message — one `Arc<Task>` allocation per buffer per
+        // branch, the last per-buffer allocation on the data path.
+        let mut inputs = MuxInputs::new(inputs_by_pad);
 
-        let mut receivers: FuturesUnordered<_> = inputs_by_pad
-            .into_iter()
-            .flat_map(|(pad, rxs)| {
-                rxs.into_iter()
-                    .map(move |rx| recv_one(pad.clone(), rx))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-
-        let total = receivers.len();
+        let total = inputs.len();
         let mut eos_count = 0;
         // Flushes are counted across inputs like EOS: FlushStart forwards on
         // the first arrival, FlushStop once every started flush has stopped —
@@ -4559,18 +4616,18 @@ fn spawn_muxer_task(
             // Upstream events (#163) take priority over data; a muxer that
             // does not handle one forwards it to every input branch's
             // parent. The inbox is tokio mpsc (cancel-safe), and
-            // `FuturesUnordered::next` is a Stream poll whose inner recv
-            // futures are never dropped mid-flight — both branches are safe
-            // to lose.
+            // `MuxInputs::next_msg` consumes a message only in the poll
+            // that returns it, with the receivers owned outside the future
+            // — both branches are safe to lose.
             let item = match up_rx.as_mut() {
                 Some(rx_up) => {
                     tokio::select! {
                         biased;
                         ev = rx_up.recv() => Err(ev),
-                        item = receivers.next() => Ok(item),
+                        item = inputs.next_msg() => Ok(item),
                     }
                 }
-                None => Ok(receivers.next().await),
+                None => Ok(inputs.next_msg().await),
             };
             let item = match item {
                 Err(Some(event)) => {
@@ -4598,13 +4655,15 @@ fn spawn_muxer_task(
                 }
                 Ok(i) => i,
             };
-            let Some((pad, rx, msg)) = item else {
+            let Some((idx, msg)) = item else {
+                // Every branch retired: same terminal condition as the
+                // drained FuturesUnordered before it.
                 break;
             };
-            // Keep listening on this input unless it just ended; the EOS and
-            // error arms deliberately let it drop.
-            if matches!(msg, Some(Message::Buffer(..) | Message::Event(_))) {
-                receivers.push(recv_one(pad, rx));
+            // A branch that just ended (EOS, error, closed) stops being
+            // polled; live branches simply stay in the set.
+            if !matches!(msg, Some(Message::Buffer(..) | Message::Event(_))) {
+                inputs.retire(idx);
             }
             match msg {
                 Some(Message::Buffer(buffer, epoch)) => {

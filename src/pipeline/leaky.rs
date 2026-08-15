@@ -4,7 +4,8 @@
 //! sender that can evict the oldest *queued* buffer when the channel is full.
 //! `tokio::sync::mpsc` cannot do that — its `Sender` has no pop, and the
 //! `Receiver` is owned by the consumer task — so those links get this channel
-//! instead: a mutex-guarded `VecDeque` with a [`Notify`] for receiver wakeup.
+//! instead: a mutex-guarded `VecDeque` with an [`AtomicWaker`] for receiver
+//! wakeup.
 //!
 //! Two invariants the executor relies on:
 //!
@@ -18,17 +19,19 @@
 //!   (EOS, errors, flush pairs, segments) is rare and bounded, so the
 //!   overshoot is transient; buffers are what a leaky link sheds.
 //!
-//! `recv` is cancel-safe: the `Notify` future is registered (`enable`) *before*
-//! the queue is checked, the pop happens synchronously in the poll that
-//! returns the value, and nothing is stashed across the single await. A
-//! cancelled `recv` may have consumed a stored `notify_one` permit, but the
-//! next call re-registers before checking the queue, so a non-empty queue is
-//! always seen without needing a permit (the AppSink idiom).
+//! Receiving is [`poll_recv`](LeakyReceiver::poll_recv)-first (#181: the muxer
+//! fair-poll needs a genuine `Poll` API), with `recv` as a thin `poll_fn`
+//! wrapper. Cancel-safety is by construction: the pop happens synchronously in
+//! the poll that returns the value, and nothing is stashed across polls. The
+//! waker is registered *while holding the queue lock* with the queue known
+//! empty, so a sender's wake — which happens strictly after it releases that
+//! lock — can never be missed by a receiver that returned `Pending`.
 
+use futures::task::AtomicWaker;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::Notify;
+use std::task::{Context, Poll};
 use tokio::sync::mpsc::error::TryRecvError;
 
 /// Create a leaky channel bounded (for buffers) at `capacity` entries.
@@ -39,7 +42,7 @@ pub(crate) fn channel<T>(capacity: usize) -> (LeakySender<T>, LeakyReceiver<T>) 
             rx_alive: true,
             tx_count: 1,
         }),
-        notify: Notify::new(),
+        waker: AtomicWaker::new(),
         capacity: capacity.max(1),
         len: AtomicUsize::new(0),
     });
@@ -54,9 +57,10 @@ pub(crate) fn channel<T>(capacity: usize) -> (LeakySender<T>, LeakyReceiver<T>) 
 struct Shared<T> {
     /// Held only for O(1) / short-scan operations, never across an await.
     state: Mutex<State<T>>,
-    /// Wakes the receiver on enqueue; `notify_one` only, so a stored permit
-    /// exists for a not-yet-registered receiver.
-    notify: Notify,
+    /// Wakes the receiver on enqueue and on last-sender drop. Registered by
+    /// `poll_recv` under the state lock; a register/wake race resolves in
+    /// the waker's favor (AtomicWaker's contract).
+    waker: AtomicWaker,
     /// The buffer bound. Control entries may push past it (see module docs).
     capacity: usize,
     /// Occupancy snapshot for flow monitors — readable without the lock.
@@ -103,7 +107,7 @@ impl<T> Drop for LeakySender<T> {
         };
         if last {
             // Wake a receiver waiting on a channel that will never fill again.
-            self.shared.notify.notify_one();
+            self.shared.waker.wake();
         }
     }
 }
@@ -130,7 +134,7 @@ impl<T> LeakySender<T> {
         st.queue.push_back((item, true));
         self.shared.len.store(st.queue.len(), Ordering::Release);
         drop(st);
-        self.shared.notify.notify_one();
+        self.shared.waker.wake();
         match evicted {
             Some(old) => LossyPush::SentEvictedOldest(old),
             None => LossyPush::Sent,
@@ -149,7 +153,7 @@ impl<T> LeakySender<T> {
         st.queue.push_back((item, false));
         self.shared.len.store(st.queue.len(), Ordering::Release);
         drop(st);
-        self.shared.notify.notify_one();
+        self.shared.waker.wake();
         true
     }
 
@@ -175,31 +179,39 @@ impl<T> Drop for LeakyReceiver<T> {
 }
 
 impl<T> LeakyReceiver<T> {
+    /// Poll for the next message (#181 — the executor's muxer fair-poll
+    /// drives receivers by `Poll`, no per-message future allocation).
+    ///
+    /// Returns `Ready(None)` once every sender is gone and the queue is
+    /// drained. Cancel-safe by construction: the pop happens in the poll
+    /// that returns the value, and nothing is stashed across polls.
+    pub(crate) fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
+        let mut st = self.shared.state.lock().unwrap();
+        if let Some((item, _)) = st.queue.pop_front() {
+            self.shared.len.store(st.queue.len(), Ordering::Release);
+            return Poll::Ready(Some(item));
+        }
+        if st.tx_count == 0 {
+            return Poll::Ready(None);
+        }
+        // Registered while holding the lock with the queue known empty: a
+        // sender that enqueued before us was seen above, and one that
+        // enqueues after us wakes strictly after this register (its wake
+        // follows its lock acquisition, which follows our unlock).
+        self.shared.waker.register(cx.waker());
+        Poll::Pending
+    }
+
     /// Receive the next message, waiting if the queue is empty.
     ///
     /// Returns `None` once every sender is gone and the queue is drained.
+    /// Cancel-safe: see [`poll_recv`](Self::poll_recv), which this wraps.
     ///
-    /// Cancel-safe: the pop happens synchronously in the poll that returns
-    /// the value; a cancelled call consumes no message.
+    /// Production code drives the receiver through `InputBranch::poll_recv`;
+    /// only this module's tests await it directly.
+    #[cfg(test)]
     pub(crate) async fn recv(&mut self) -> Option<T> {
-        loop {
-            // Register before checking the queue: a push that lands between
-            // the check and the await must find this waiter (or leave a
-            // permit via notify_one, which `enable` also observes).
-            let mut notified = std::pin::pin!(self.shared.notify.notified());
-            notified.as_mut().enable();
-            {
-                let mut st = self.shared.state.lock().unwrap();
-                if let Some((item, _)) = st.queue.pop_front() {
-                    self.shared.len.store(st.queue.len(), Ordering::Release);
-                    return Some(item);
-                }
-                if st.tx_count == 0 {
-                    return None;
-                }
-            }
-            notified.await;
-        }
+        std::future::poll_fn(|cx| self.poll_recv(cx)).await
     }
 
     /// Non-blocking receive, mirroring tokio's semantics: `Disconnected` only

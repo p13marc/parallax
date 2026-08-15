@@ -304,3 +304,103 @@ mod executor_steady_state {
         );
     }
 }
+
+/// The muxer loop's per-buffer allocations (#181).
+///
+/// The old loop re-armed a `recv_one` future into a `FuturesUnordered` per
+/// received message — one `Arc<Task>` allocation per buffer per input
+/// branch, the last per-buffer allocation on the executor's data path. The
+/// rotating fair poll (`MuxInputs`) allocates nothing in steady state; this
+/// ratchet keeps it that way.
+mod muxer_steady_state {
+    use super::tracked;
+    use parallax::elements::{NullSink, NullSource};
+    use parallax::pipeline::{Executor, Pipeline};
+
+    /// A minimal N-to-1 muxer that forwards whatever it is handed.
+    struct PassThroughMuxer {
+        inputs: Vec<(parallax::element::PadId, parallax::format::Caps)>,
+    }
+
+    impl parallax::element::Muxer for PassThroughMuxer {
+        fn mux(
+            &mut self,
+            input: parallax::element::MuxerInput,
+        ) -> parallax::error::Result<Option<parallax::buffer::Buffer>> {
+            Ok(Some(input.buffer))
+        }
+
+        fn name(&self) -> &str {
+            "passthrough_muxer"
+        }
+
+        fn inputs(&self) -> &[(parallax::element::PadId, parallax::format::Caps)] {
+            &self.inputs
+        }
+
+        fn on_pad_added(&mut self, _callback: parallax::element::PadAddedCallback) {}
+    }
+
+    /// Total allocations for `sources` NullSources feeding one muxer into a
+    /// NullSink, run to EOS. Current-thread runtime for the same reason as
+    /// `executor_steady_state`: the tracking allocator counts thread-locally.
+    fn run(sources: usize, buffers: u64) -> u64 {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let (_, allocs) = tracked(|| {
+            rt.block_on(async {
+                let mut p = Pipeline::new();
+                let mux = p.add_muxer("mux", PassThroughMuxer { inputs: Vec::new() });
+                for i in 0..sources {
+                    let src = p.add_source(format!("src{i}"), NullSource::new(buffers));
+                    p.link(src, mux).expect("link");
+                }
+                let snk = p.add_sink("sink", NullSink::new());
+                p.link(mux, snk).expect("link");
+                Executor::new().run(&mut p).await.expect("run");
+            })
+        });
+        allocs
+    }
+
+    const LO: u64 = 100;
+    const HI: u64 = 1_100;
+
+    fn slope(sources: usize) -> f64 {
+        let lo = run(sources, LO);
+        let hi = run(sources, HI);
+        assert!(hi >= lo, "allocation counter went backwards: {hi} < {lo}");
+        (hi - lo) as f64 / (HI - LO) as f64
+    }
+
+    /// Per-branch per-buffer budget. Each extra branch brings a whole extra
+    /// *source*, whose per-buffer intercept is 1.0 (pinned separately by
+    /// `executor_steady_state`) — that cost cannot cancel here, so the
+    /// branch slope floor is 1.0 with the muxer contributing 0.0 on top.
+    /// The re-armed `FuturesUnordered` added another 1.0 (measured 2.0
+    /// before #181); under-one headroom above the floor means a single
+    /// reintroduced per-message allocation in the muxer loop trips this.
+    const PER_BRANCH_BUDGET: f64 = 1.5;
+
+    #[test]
+    fn muxer_per_branch_alloc_budget() {
+        let _ = run(1, 32); // warm lazy globals
+        let one = slope(1);
+        let three = slope(3);
+        // Subtracting the 1-source slope cancels the sink and muxer-output
+        // per-buffer costs; what remains is one source intercept plus the
+        // muxer's own per-branch per-message cost.
+        let per_branch = (three - one) / 2.0;
+        println!(
+            "muxer: {one:.2} allocs/buffer at 1 source, {three:.2} at 3 sources \
+             => {per_branch:.2} per buffer per branch"
+        );
+        assert!(
+            per_branch <= PER_BRANCH_BUDGET,
+            "muxer per-branch steady state: {per_branch:.2} allocs/buffer/branch \
+             (budget {PER_BRANCH_BUDGET})"
+        );
+    }
+}
