@@ -994,11 +994,25 @@ pub struct H264Decoder {
     pending: VecDeque<Metadata>,
     /// Frames drained by [`Element::flush`], handed out one per call.
     ///
-    /// `None` until the first flush; `Some(empty)` afterwards, so the decoder
-    /// is drained exactly once.
+    /// `None` outside a drain; `Some(remaining)` while one is being handed
+    /// out. Reset once empty, so each flush *cycle* (a seek's FlushStart, the
+    /// real EOS) drains exactly once — the old once-per-lifetime latch meant
+    /// a seek's discarded drain consumed the only one, and the tail of the
+    /// stream was silently lost at EOS.
     flushed: Option<VecDeque<DecodedFrame>>,
     /// Buffers emitted so far, the source of the output sequence number.
     frames_out: u64,
+    /// Consecutive access units skipped because openh264 refused them.
+    ///
+    /// A post-seek stream legitimately starts with pictures whose references
+    /// predate the seek — open-GOP sync samples have leading pictures that
+    /// reference the previous GOP, and openh264 reports each as an error
+    /// (`dsRefLost`). Same policy as the Vulkan decoder's frame_num-gap
+    /// handling: warn and skip until the stream resyncs, instead of decoding
+    /// corrupt or killing a live pipeline. Reset on the first successful
+    /// decode; a stream that never recovers still errors via
+    /// [`MAX_CONSECUTIVE_DECODE_SKIPS`].
+    skipped_aus: u32,
 }
 
 /// Cap on in-flight access-unit metadata.
@@ -1008,20 +1022,34 @@ pub struct H264Decoder {
 /// frames; past this the oldest entry is the one that will never be claimed.
 const MAX_PENDING_METADATA: usize = 64;
 
+/// Give up after this many *consecutive* refused access units.
+///
+/// Post-seek reference loss clears within a GOP (a few seconds of frames at
+/// worst); a stream still refusing after this many AUs is genuinely
+/// undecodable and the error should surface instead of playing silence
+/// forever. ~10 s at 30 fps.
+const MAX_CONSECUTIVE_DECODE_SKIPS: u32 = 300;
+
 impl H264Decoder {
-    /// Create a new H.264 decoder.
-    pub fn new() -> Result<Self> {
-        // NoFlush is load-bearing: the wrapper's default (`Flush::Flush`)
-        // force-drains openh264's DPB on every decode call that produces no
-        // immediate picture. B-frame streams legitimately delay output for
-        // reordering, and a mid-stream force-flush corrupts the decoder's
-        // NAL bookkeeping — openh264 then fails with dsOutOfMemory a few
-        // AUs later (reproduced on H.264 Main WEB-DL streams). Delayed
-        // frames drain through `Element::flush` at EOS instead.
+    /// Build the underlying openh264 instance.
+    ///
+    /// NoFlush is load-bearing: the wrapper's default (`Flush::Flush`)
+    /// force-drains openh264's DPB on every decode call that produces no
+    /// immediate picture. B-frame streams legitimately delay output for
+    /// reordering, and a mid-stream force-flush corrupts the decoder's
+    /// NAL bookkeeping — openh264 then fails with dsOutOfMemory a few
+    /// AUs later (reproduced on H.264 Main WEB-DL streams). Delayed
+    /// frames drain through `Element::flush` at EOS instead.
+    fn build_decoder() -> Result<Decoder> {
         let config = openh264::decoder::DecoderConfig::new()
             .flush_after_decode(openh264::decoder::Flush::NoFlush);
-        let decoder = Decoder::with_api_config(OpenH264API::from_source(), config)
-            .map_err(|e| Error::Config(format!("Failed to create H.264 decoder: {:?}", e)))?;
+        Decoder::with_api_config(OpenH264API::from_source(), config)
+            .map_err(|e| Error::Config(format!("Failed to create H.264 decoder: {:?}", e)))
+    }
+
+    /// Create a new H.264 decoder.
+    pub fn new() -> Result<Self> {
+        let decoder = Self::build_decoder()?;
 
         // Slot size comes from the first decoded frame, so 4K works without
         // the hard-coded 4 MiB ceiling this used to carry; the floor keeps a
@@ -1038,6 +1066,7 @@ impl H264Decoder {
             pending: VecDeque::new(),
             flushed: None,
             frames_out: 0,
+            skipped_aus: 0,
         })
     }
 
@@ -1252,10 +1281,33 @@ impl Element for H264Decoder {
         // Single-copy hot path: the DecodedYUV borrows `self.decoder`, so
         // the slot copy runs over the *other* fields while it is alive —
         // no intermediate DecodedFrame, no plane Vecs (#139).
-        let yuv = self
-            .decoder
-            .decode(buffer.as_bytes())
-            .map_err(|e| Error::Config(format!("H.264 decode failed: {:?}", e)))?;
+        let yuv = match self.decoder.decode(buffer.as_bytes()) {
+            Ok(yuv) => yuv,
+            Err(e) => {
+                // A refused AU is a stream discontinuity, not a dead
+                // decoder: after a seek, open-GOP leading pictures reference
+                // frames from before the flush and openh264 reports each as
+                // dsRefLost. Skip the AU — the pictures were unpresentable
+                // anyway — and withdraw its metadata (no frame will ever
+                // claim it). Only a stream that never recovers is an error.
+                self.pending.pop_back();
+                self.skipped_aus += 1;
+                if self.skipped_aus > MAX_CONSECUTIVE_DECODE_SKIPS {
+                    return Err(Error::Config(format!(
+                        "H.264 decode failed for {} consecutive access units, giving up: {e:?}",
+                        self.skipped_aus
+                    )));
+                }
+                if self.skipped_aus == 1 || self.skipped_aus.is_multiple_of(100) {
+                    tracing::warn!(
+                        "h264decoder: skipping refused access unit ({} in a row): {e:?}",
+                        self.skipped_aus
+                    );
+                }
+                return Ok(None);
+            }
+        };
+        self.skipped_aus = 0;
         match yuv {
             Some(yuv) => {
                 self.frame_count += 1;
@@ -1269,6 +1321,34 @@ impl Element for H264Decoder {
             }
             None => Ok(None),
         }
+    }
+
+    /// A flushing seek: rebuild openh264 instead of draining it mid-stream.
+    ///
+    /// `flush_remaining` is an EOS operation — after it, openh264 refuses
+    /// further input (dsRefLost on every AU, the snapped keyframe included)
+    /// until it happens to resync at a later IDR, which shows up as seconds
+    /// of black after a seek. A fresh instance decodes the post-seek
+    /// keyframe immediately (container demuxers emit SPS/PPS in-band on
+    /// keyframes). Pre-seek pending metadata is dropped with it — those AUs'
+    /// frames are gone, and leaving the entries would mis-stamp post-seek
+    /// frames with pre-seek timestamps.
+    fn handle_downstream_event(
+        &mut self,
+        event: crate::event::Event,
+    ) -> Option<crate::event::Event> {
+        if matches!(event, crate::event::Event::FlushStart) {
+            match Self::build_decoder() {
+                Ok(fresh) => self.decoder = fresh,
+                // Keep the old instance: the refused-AU skip path still
+                // recovers at the next IDR, just slower.
+                Err(e) => tracing::error!("h264decoder: rebuild on flush failed: {e}"),
+            }
+            self.pending.clear();
+            self.flushed = None;
+            self.skipped_aus = 0;
+        }
+        Some(event)
     }
 
     /// Drain pictures openh264 still holds when the stream ends.
@@ -1286,7 +1366,14 @@ impl Element for H264Decoder {
                 let source = self.take_pending_metadata();
                 Ok(Some(self.frame_to_buffer(&frame, source)?))
             }
-            None => Ok(None),
+            None => {
+                // Drain cycle complete: re-arm. A seek's FlushStart runs a
+                // (discarded) drain through here too, and with a
+                // once-per-lifetime latch that drain would eat the only one,
+                // silently dropping the reordering tail at the real EOS.
+                self.flushed = None;
+                Ok(None)
+            }
         }
     }
 }
@@ -2408,8 +2495,90 @@ mod tests {
             assert!(drained < 64, "flush never terminated");
         }
 
-        // Draining is one-shot: a second round must not re-enter the decoder.
+        // The cycle terminates: an immediate second call stays None.
         assert!(Element::flush(&mut decoder).unwrap().is_none());
+
+        // But the latch is per *cycle*, not per lifetime: a seek's FlushStart
+        // runs a discarded drain through this same path, and decoding (plus a
+        // fresh drain) must still work afterwards — with the old
+        // once-per-lifetime latch the post-seek tail was silently lost.
+        let mut post_drain_frames = 0;
+        for i in 5..10u64 {
+            let frame = detailed_frame(width, height, i as u8);
+            let au = encoder
+                .encode_yuv420_at(&frame, width as u32, height as u32)
+                .unwrap();
+            if !au.is_empty()
+                && decoder
+                    .process(au_buffer(&au, i * 40_000_000, 40_000_000))
+                    .unwrap()
+                    .is_some()
+            {
+                post_drain_frames += 1;
+            }
+        }
+        let mut second_cycle = 0;
+        while Element::flush(&mut decoder).unwrap().is_some() {
+            second_cycle += 1;
+            assert!(second_cycle < 64, "second flush cycle never terminated");
+        }
+        assert!(
+            post_drain_frames + second_cycle > 0,
+            "decode after a drain cycle still produces frames \
+             (process: {post_drain_frames}, second drain: {second_cycle})"
+        );
+    }
+
+    /// A refused access unit (post-seek reference loss, missing parameter
+    /// sets) is skipped, not fatal — the Vulkan decoder's policy, ported.
+    #[test]
+    fn a_refused_access_unit_is_skipped_not_fatal() {
+        let (width, height) = (64usize, 64usize);
+        let mut encoder = H264Encoder::new(H264EncoderConfig::new()).unwrap();
+
+        let mut aus = Vec::new();
+        for i in 0..3u64 {
+            let frame = detailed_frame(width, height, i as u8);
+            let au = encoder
+                .encode_yuv420_at(&frame, width as u32, height as u32)
+                .unwrap();
+            if !au.is_empty() {
+                aus.push(au);
+            }
+        }
+        assert!(aus.len() >= 2, "need an IDR and a dependent AU");
+
+        // Feeding a dependent AU to a fresh decoder (no SPS/PPS, no
+        // reference) is exactly what the first post-seek leading pictures
+        // look like. It must be skipped, not kill the element.
+        let mut decoder = H264Decoder::new().unwrap();
+        let out = decoder
+            .process(au_buffer(&aus[1], 0, 40_000_000))
+            .expect("a refused AU is not an element failure");
+        assert!(out.is_none(), "nothing decodable came out");
+        assert_eq!(decoder.skipped_aus, 1);
+        assert!(
+            decoder.pending.is_empty(),
+            "the skipped AU's metadata was withdrawn — no frame will claim it"
+        );
+
+        // The stream resyncs at the IDR: decoding proceeds and the skip
+        // counter resets.
+        let mut produced = false;
+        for (i, au) in aus.iter().enumerate() {
+            if decoder
+                .process(au_buffer(au, i as u64 * 40_000_000, 40_000_000))
+                .expect("the resynced stream decodes")
+                .is_some()
+            {
+                produced = true;
+            }
+        }
+        while Element::flush(&mut decoder).unwrap().is_some() {
+            produced = true;
+        }
+        assert!(produced, "frames come out after the resync");
+        assert_eq!(decoder.skipped_aus, 0, "reset on the first success");
     }
 
     #[test]
