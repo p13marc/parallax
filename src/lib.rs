@@ -62,7 +62,6 @@ pub mod error;
 pub mod event;
 pub mod format;
 pub mod gpu;
-pub mod link;
 pub mod memory;
 pub mod metadata;
 pub mod negotiation;

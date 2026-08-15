@@ -32,7 +32,7 @@ Cross-process pipelines share arenas by fd. Anyone holding the arena fd can read
 
 ### Network links
 
-`NetworkSender`/`NetworkReceiver` frame payloads with a magic, version, length, and CRC32, and validate rkyv payloads on receipt. There is **no encryption or authentication** — run network links over trusted networks or tunnel them (WireGuard, TLS-terminating proxies). The same applies to the HTTP/WebSocket/RTP/Zenoh elements unless the underlying transport is secured (e.g. Zenoh's own security config).
+The network elements (TCP, HTTP, WebSocket, RTP, Zenoh) carry **no encryption or authentication** of their own — run them over trusted networks or tunnel them (WireGuard, TLS-terminating proxies), unless the underlying transport is secured (e.g. Zenoh's own security config). Where payloads are rkyv-framed they are validated on receipt, and the IPC control protocol bounds message sizes and errors (never panics) on malformed input.
 
 ### Parsers and codecs
 

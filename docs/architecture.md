@@ -96,15 +96,15 @@ All execution is in-process. (A process-isolation strategy for untrusted element
 
 Details: [scheduling.md](scheduling.md).
 
-### 6. Links across boundaries (`src/link/`)
+### 6. Links across boundaries
 
 | Link | Transport | Copy semantics |
 |------|-----------|----------------|
 | pipeline link | `tokio::sync::mpsc` channel, one per graph edge (in-process) | move — refcount only |
-| `IpcPublisher`/`IpcSubscriber` | Unix socket + shared arena | zero-copy — only a small ref crosses the socket; the arena fd is passed once via SCM_RIGHTS |
-| `NetworkSender`/`NetworkReceiver` | TCP | serialized with rkyv (framed: `PRLX` magic, version, CRC32) |
+| `IpcSrc`/`IpcSink` elements | shm descriptor + ack rings with eventfd doorbells (#179); Unix socket for registration/fd-passing only | zero-copy — a 128-byte descriptor in shared memory per buffer; arena fds passed once via SCM_RIGHTS |
+| network elements (`AsyncTcpSrc`/`TcpSink`, `ZenohSrc`/`ZenohSink`, …) | TCP / Zenoh | serialized (rkyv) |
 
-The `IpcSrc`/`IpcSink` elements speak their own equivalent protocol (`src/elements/ipc/`) so multi-process pipelines compose like everything else. Why an engine built on shared memory moves in-process buffers through tokio channels — the data-plane/signaling-plane split — is design.md's principle 8, [Data plane, signaling plane](design.md#8-data-plane-signaling-plane).
+(The old `src/link/` layer — `IpcPublisher`/`IpcSubscriber`, `NetworkSender`/`NetworkReceiver` — was a second, unused implementation of the same protocols and was removed with #179.) Why an engine built on shared memory moves in-process buffers through tokio channels — the data-plane/signaling-plane split — is design.md's principle 8, [Data plane, signaling plane](design.md#8-data-plane-signaling-plane).
 
 ### 7. Typed layer (`src/typed/`, `src/temporal/`)
 

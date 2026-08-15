@@ -82,10 +82,6 @@ The built-in element library — full catalog in [elements.md](elements.md).
 
 `VideoConvert`, `AudioConvert`/`AudioChannelMix`/`ChannelLayout`, `AudioResample`/`ResampleQuality`, `ScaleEngine`/`ScaleMode`, plus this module's own `PixelFormat`/`SampleFormat`/`ColorMatrix` (distinct from `format::` — see [formats.md](formats.md#pitfalls)).
 
-### `parallax::link`
-
-`IpcPublisher`/`IpcSubscriber` (shared-memory IPC), `NetworkSender`/`NetworkReceiver` (TCP + rkyv, framed with magic/version/CRC32). In-process links need no type: the executor gives every graph edge its own `tokio::sync::mpsc` channel (capacity via `link_pads_full`, loss via `LinkPolicy`).
-
 ### `parallax::plugin`
 
 `PluginDescriptor`/`ElementDescriptor` (`#[repr(C)]`), `PARALLAX_ABI_VERSION`, `Plugin`, `PluginLoader`, `PluginRegistry`, `PluginError`, `PluginInfo`/`ElementInfo`, `define_plugin!`. See [plugins.md](plugins.md).
