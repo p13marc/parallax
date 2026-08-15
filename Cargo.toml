@@ -405,3 +405,6 @@ name = "55_queue2_buffering"
 
 [[example]]
 name = "56_typefind"
+
+[[example]]
+name = "60_ipc"

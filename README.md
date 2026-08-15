@@ -339,7 +339,7 @@ Default features are **empty** — everything below is opt-in.
 
 ## Examples
 
-42 numbered examples, one concept each (`cargo run --example <name> [--features ...]`):
+43 numbered examples, one concept each (`cargo run --example <name> [--features ...]`):
 
 | Range | Topic |
 |-------|-------|
@@ -350,6 +350,7 @@ Default features are **empty** — everything below is opt-in.
 | `41`–`46` | Converters, PipeWire (`pipewire`), ALSA (`alsa`), libcamera (`libcamera`), DMA-BUF negotiation (`v4l2`), screen capture (`screen-capture,h264,mp4-demux`) |
 | `47`–`56` | Infrastructure: flow control, clocks, element retrieval, hybrid scheduling, bus, seeking, probes, tracers, Queue2 buffering, typefind |
 | `57`–`59` | RTSP capture/display (`rtsp`), window events (`display`) |
+| `60` | Two-process zero-copy IPC over the shm descriptor ring |
 
 (Numbers 12, 19, 21, 27–40 are retired/unassigned.)
 
