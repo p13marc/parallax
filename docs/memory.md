@@ -229,8 +229,8 @@ handled where it happens rather than prevented here.
 ## Running out of slots
 
 `Error::PoolExhausted` is the **one error the executor does not treat as fatal**
-— in a *transform* task. When a transform cannot acquire an output slot, the
-executor drops that buffer,
+— in *transform* and *sink* tasks. When such an element cannot acquire an
+output slot, the executor drops that buffer,
 counts it on the `DropTracer` and the `parallax_buffers_dropped` metric, logs a
 rate-limited warning (1st, 10th, 100th… consecutive), and carries on. For live
 media that is the correct trade: a dropped frame is recoverable, a dead capture
@@ -238,7 +238,7 @@ session is not. Set `ExecutorConfig::shed_fatal_after` to opt back into failing 
 a batch transcode should stop rather than quietly write a file with gaps.
 
 Every other `Err` from `process()` still terminates the element. So do *all*
-errors from a source, sink, demuxer or muxer task, which have no shed arm — which
+errors from a source, demuxer or muxer task, which have no shed arm — which
 is why a source must use `try_acquire` and stall rather than reporting
 exhaustion at all.
 

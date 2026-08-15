@@ -323,6 +323,95 @@ async fn shed_fatal_after_turns_shedding_back_into_a_failure() {
     assert!(format!("{err}").contains("shed"), "unhelpful error: {err}");
 }
 
+/// A sink whose allocation fails for the first `fail_first` buffers — the
+/// shape of an encoder-backed sink whose output arena is momentarily full.
+struct ExhaustedSink {
+    fail_first: usize,
+    seen: usize,
+    consumed: Arc<AtomicUsize>,
+}
+
+impl ExhaustedSink {
+    fn failing(fail_first: usize) -> Self {
+        Self {
+            fail_first,
+            seen: 0,
+            consumed: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn consumed(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.consumed)
+    }
+}
+
+impl Sink for ExhaustedSink {
+    fn consume(&mut self, _ctx: &ConsumeContext) -> Result<()> {
+        self.seen += 1;
+        if self.seen <= self.fail_first {
+            return Err(parallax::error::Error::PoolExhausted);
+        }
+        self.consumed.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "exhausted-sink"
+    }
+}
+
+/// #174: `PoolExhausted` from a *sink* must shed the frame, not kill the run —
+/// the same contract transforms have had since #84.
+#[tokio::test]
+async fn a_sink_that_cannot_allocate_sheds_instead_of_dying() {
+    let sink = ExhaustedSink::failing(10);
+    let consumed = sink.consumed();
+
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_source("src", CountingSource::new(50));
+    let snk = pipeline.add_sink("sink", sink);
+    pipeline.link(src, snk).unwrap();
+
+    let executor = Executor::with_config(ExecutorConfig::default());
+    let handle = executor.start(&mut pipeline).unwrap();
+
+    let result = tokio::time::timeout(Duration::from_secs(15), handle.wait())
+        .await
+        .expect("pipeline hung");
+
+    assert!(
+        result.is_ok(),
+        "sink exhaustion should shed, not fail the pipeline: {:?}",
+        result.err()
+    );
+    let got = consumed.load(Ordering::SeqCst);
+    assert_eq!(
+        got, 40,
+        "the 10 exhausted frames should shed and the remaining 40 arrive"
+    );
+}
+
+/// `shed_fatal_after` applies to the sink arm too — the policy is uniform.
+#[tokio::test]
+async fn sink_shedding_respects_shed_fatal_after() {
+    let sink = ExhaustedSink::failing(usize::MAX);
+
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_source("src", CountingSource::new(500));
+    let snk = pipeline.add_sink("sink", sink);
+    pipeline.link(src, snk).unwrap();
+
+    let executor = Executor::with_config(ExecutorConfig::default().with_shed_fatal_after(5));
+    let handle = executor.start(&mut pipeline).unwrap();
+
+    let result = tokio::time::timeout(Duration::from_secs(15), handle.wait())
+        .await
+        .expect("pipeline hung");
+
+    let err = result.expect_err("shed_fatal_after(5) should have failed the run");
+    assert!(format!("{err}").contains("shed"), "unhelpful error: {err}");
+}
+
 /// The arena tracks the channel it feeds, whatever the channel's depth.
 #[tokio::test]
 async fn the_arena_scales_with_the_channel_capacity() {

@@ -449,8 +449,9 @@ impl Drop for TaskGuard {
 /// Run a task body, recording its failure before the guard releases the count.
 ///
 /// Wrapping the whole body rather than editing each error arm is deliberate:
-/// the arms disagree about what they report — the two `shed_fatal_after` paths
-/// return `Err` without telling anyone at all — and a new arm added later would
+/// the arms disagree about what they report — the `shed_fatal_after` paths
+/// (transform and sink) return `Err` without telling anyone at all — and a new
+/// arm added later would
 /// have to remember. Here the ordering that makes "error beats EOS" work
 /// (record, *then* release the count) is a property of the code shape.
 async fn reporting(share: TaskGuard, body: impl Future<Output = Result<()>>) -> Result<()> {
@@ -1948,6 +1949,7 @@ impl Executor {
                     runtime.pause_rx.clone(),
                     hop,
                     bus,
+                    ShedTracker::new(self.config.shed_fatal_after),
                     share,
                 )
             }
@@ -3032,6 +3034,7 @@ fn spawn_sink_task(
     pause_rx: watch::Receiver<bool>,
     upstream: Option<UpstreamHop>,
     bus: BusHandle,
+    mut shed: ShedTracker,
     share: TaskGuard,
 ) -> JoinHandle<Result<()>> {
     // Advance the shared last-presented-PTS cell. `max` keeps it monotonic
@@ -3245,12 +3248,24 @@ fn spawn_sink_task(
                         }
                         tracers.notify_buffer(&name, &buffer);
                         let pts = buffer.metadata().pts;
-                        if let Err(e) = guard(&name, element.process(Some(buffer))).await {
-                            events.send_error(e.to_string(), Some(name.clone()));
-                            return Err(e);
+                        match guard(&name, element.process(Some(buffer))).await {
+                            Ok(_) => {
+                                shed.reset();
+                                tracers.notify_buffer_processed(&name);
+                                present(&position, pts);
+                            }
+                            // Same rule as the transform arm (gotcha 13): a sink
+                            // that allocates — an encoder-backed sink, a sink
+                            // with its own output arena — sheds the frame
+                            // instead of killing a live pipeline.
+                            Err(Error::PoolExhausted) => {
+                                shed.record(&name, &tracers)?;
+                            }
+                            Err(e) => {
+                                events.send_error(e.to_string(), Some(name.clone()));
+                                return Err(e);
+                            }
                         }
-                        tracers.notify_buffer_processed(&name);
-                        present(&position, pts);
                     }
                     Some(Message::Event(event)) => {
                         deliver_sink_event(
@@ -3300,11 +3315,21 @@ fn spawn_sink_task(
                     let pts = buffer.metadata().pts;
                     let result = guard(&name, element.process(Some(buffer))).await;
                     tracers.notify_buffer_processed(&name);
-                    if let Err(e) = result {
-                        events.send_error(e.to_string(), Some(name.clone()));
-                        return Err(e);
+                    match result {
+                        Ok(_) => {
+                            shed.reset();
+                            present(&position, pts);
+                        }
+                        // Mirrors the channel path: arena exhaustion is flow
+                        // control, not failure.
+                        Err(Error::PoolExhausted) => {
+                            shed.record(&name, &tracers)?;
+                        }
+                        Err(e) => {
+                            events.send_error(e.to_string(), Some(name.clone()));
+                            return Err(e);
+                        }
                     }
-                    present(&position, pts);
                 }
                 // Check if we're done (EOS + empty)
                 if bridge.is_done() {
