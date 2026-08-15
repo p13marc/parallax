@@ -100,14 +100,70 @@ impl VideoFrame {
         }
     }
 
+    /// Borrow this frame as the view type the encoder traits take.
+    pub fn as_view(&self) -> VideoFrameRef<'_> {
+        VideoFrameRef {
+            width: self.width,
+            height: self.height,
+            format: self.format,
+            pts: self.pts,
+            data: &self.data,
+            stride_y: self.stride_y,
+            stride_u: self.stride_u,
+            stride_v: self.stride_v,
+        }
+    }
+
     /// Get Y plane data.
     pub fn y_plane(&self) -> &[u8] {
+        self.as_view().y_plane()
+    }
+
+    /// Get U plane data.
+    pub fn u_plane(&self) -> &[u8] {
+        self.as_view().u_plane()
+    }
+
+    /// Get V plane data.
+    pub fn v_plane(&self) -> &[u8] {
+        self.as_view().v_plane()
+    }
+}
+
+/// A borrowed view of a raw video frame (see [`VideoFrame`] for the owned form).
+///
+/// This is what [`VideoEncoder::encode`](super::VideoEncoder::encode) takes:
+/// `EncoderElement` builds one directly over the input buffer's bytes, so
+/// encoding a frame copies nothing.
+#[derive(Clone, Copy, Debug)]
+pub struct VideoFrameRef<'a> {
+    /// Frame width in pixels.
+    pub width: u32,
+    /// Frame height in pixels.
+    pub height: u32,
+    /// Pixel format.
+    pub format: PixelFormat,
+    /// Presentation timestamp (in timebase units).
+    pub pts: i64,
+    /// Frame data (planar layout), borrowed from the producer.
+    pub data: &'a [u8],
+    /// Stride for Y plane.
+    pub stride_y: usize,
+    /// Stride for U plane.
+    pub stride_u: usize,
+    /// Stride for V plane.
+    pub stride_v: usize,
+}
+
+impl<'a> VideoFrameRef<'a> {
+    /// Get Y plane data.
+    pub fn y_plane(&self) -> &'a [u8] {
         let y_size = self.stride_y * self.height as usize;
         &self.data[..y_size]
     }
 
     /// Get U plane data.
-    pub fn u_plane(&self) -> &[u8] {
+    pub fn u_plane(&self) -> &'a [u8] {
         let y_size = self.stride_y * self.height as usize;
         let uv_height = match self.format {
             PixelFormat::I422 | PixelFormat::I444 => self.height as usize,
@@ -118,7 +174,7 @@ impl VideoFrame {
     }
 
     /// Get V plane data.
-    pub fn v_plane(&self) -> &[u8] {
+    pub fn v_plane(&self) -> &'a [u8] {
         let y_size = self.stride_y * self.height as usize;
         let uv_height = match self.format {
             PixelFormat::I422 | PixelFormat::I444 => self.height as usize,
@@ -150,5 +206,17 @@ mod tests {
         assert_eq!(frame.y_plane().len(), 16 * 16);
         assert_eq!(frame.u_plane().len(), 8 * 8);
         assert_eq!(frame.v_plane().len(), 8 * 8);
+    }
+
+    #[test]
+    fn view_planes_match_owned() {
+        let mut frame = VideoFrame::new(16, 16, PixelFormat::I422);
+        for (i, b) in frame.data.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let view = frame.as_view();
+        assert_eq!(view.y_plane(), frame.y_plane());
+        assert_eq!(view.u_plane(), frame.u_plane());
+        assert_eq!(view.v_plane(), frame.v_plane());
     }
 }

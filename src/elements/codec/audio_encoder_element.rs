@@ -21,7 +21,7 @@
 //! pipeline.add_node("encoder", DynAsyncElement::new_box(TransformAdapter::new(element)));
 //! ```
 
-use super::audio_traits::{AudioEncoder, AudioSampleFormat, AudioSamples};
+use super::audio_traits::{AudioEncoder, AudioSampleFormat, AudioSamplesRef};
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{ExecutionHints, Output, Transform};
 use crate::error::Result;
@@ -31,7 +31,7 @@ use std::collections::VecDeque;
 /// Wraps an [`AudioEncoder`] to work as a pipeline [`Transform`] element.
 ///
 /// This wrapper handles:
-/// - Converting input buffers to [`AudioSamples`]
+/// - Viewing input buffers as [`AudioSamplesRef`]s (no copy)
 /// - Managing encoder buffering
 /// - Flushing remaining packets at EOS
 /// - Calculating timestamps
@@ -120,16 +120,20 @@ impl<E: AudioEncoder> AudioEncoderElement<E> {
         &mut self.encoder
     }
 
-    /// Convert input buffer to AudioSamples.
-    fn buffer_to_samples(&self, buffer: &Buffer) -> AudioSamples {
-        let data = buffer.as_bytes().to_vec();
+    /// View the input buffer as audio samples (no copy).
+    ///
+    /// The lifetime is named on purpose: the returned view borrows `buffer`,
+    /// not `self`, so the caller can go on to `self.encoder.encode(samples)`
+    /// while the view is live.
+    fn buffer_to_samples<'a>(&self, buffer: &'a Buffer) -> AudioSamplesRef<'a> {
+        let data = buffer.as_bytes();
         let pts = buffer.metadata().pts.nanos() as i64;
 
         let bytes_per_sample = self.format.bytes_per_sample();
         let total_samples = data.len() / bytes_per_sample;
         let samples_per_channel = total_samples / self.channels as usize;
 
-        AudioSamples {
+        AudioSamplesRef {
             data,
             format: self.format,
             channels: self.channels,
@@ -195,7 +199,7 @@ impl<E: AudioEncoder + 'static> Transform for AudioEncoderElement<E> {
         self.frames_in += 1;
 
         // Encode samples
-        let packets = self.encoder.encode(&samples)?;
+        let packets = self.encoder.encode(samples)?;
 
         // If no packets, encoder is buffering
         if packets.is_empty() {

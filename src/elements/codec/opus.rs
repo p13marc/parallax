@@ -33,7 +33,7 @@
 //!
 //! // Encode samples (must be 960 samples per channel for 20ms frames)
 //! let samples = AudioSamples::from_s16(&pcm_data, 2, 48000);
-//! let packets = encoder.encode(&samples)?;
+//! let packets = encoder.encode(samples.as_view())?;
 //!
 //! // Decode packets
 //! for packet in packets {
@@ -50,7 +50,9 @@
 //! - **Arch**: `sudo pacman -S opus`
 //! - **macOS**: `brew install opus`
 
-use super::audio_traits::{AudioDecoder, AudioEncoder, AudioSampleFormat, AudioSamples};
+use super::audio_traits::{
+    AudioDecoder, AudioEncoder, AudioSampleFormat, AudioSamples, AudioSamplesRef,
+};
 use crate::error::{Error, Result};
 
 use opus::{Application, Channels, Decoder as OpusDecoderInner, Encoder as OpusEncoderInner};
@@ -215,7 +217,7 @@ impl OpusEncoder {
 impl AudioEncoder for OpusEncoder {
     type Packet = Vec<u8>;
 
-    fn encode(&mut self, samples: &AudioSamples) -> Result<Vec<Self::Packet>> {
+    fn encode(&mut self, samples: AudioSamplesRef<'_>) -> Result<Vec<Self::Packet>> {
         // Convert input to S16 if needed
         let input_s16: Vec<i16> = match samples.format {
             AudioSampleFormat::S16 => samples
@@ -451,7 +453,7 @@ mod tests {
         }
 
         let input = AudioSamples::from_s16(&pcm, 2, 48000);
-        let packets = encoder.encode(&input).unwrap();
+        let packets = encoder.encode(input.as_view()).unwrap();
 
         // Should produce exactly 1 packet for 20ms frame
         assert_eq!(packets.len(), 1);
@@ -473,13 +475,13 @@ mod tests {
         let small_input: Vec<i16> = vec![0i16; 480 * 2]; // 480 samples stereo
         let samples = AudioSamples::from_s16(&small_input, 2, 48000);
 
-        let packets = encoder.encode(&samples).unwrap();
+        let packets = encoder.encode(samples.as_view()).unwrap();
         // Should buffer, no output yet
         assert!(packets.is_empty());
         assert!(encoder.has_pending());
 
         // Send more samples to complete the frame
-        let packets = encoder.encode(&samples).unwrap();
+        let packets = encoder.encode(samples.as_view()).unwrap();
         // Now should output a packet
         assert_eq!(packets.len(), 1);
     }
@@ -491,7 +493,7 @@ mod tests {
         // Send partial frame
         let small_input: Vec<i16> = vec![0i16; 100 * 2]; // 100 samples stereo
         let samples = AudioSamples::from_s16(&small_input, 2, 48000);
-        encoder.encode(&samples).unwrap();
+        encoder.encode(samples.as_view()).unwrap();
 
         // Flush should pad and encode remaining
         let packets = encoder.flush().unwrap();

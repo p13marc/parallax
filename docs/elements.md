@@ -209,7 +209,7 @@ N-to-1 synchronization (PTS alignment across pads) is provided by `element::muxe
 
 ## Codecs — `elements::codec`
 
-Codec surface rule (#160): video decoders implement `Element` directly; audio codecs implement `AudioDecoder`/`AudioEncoder` wrapped by `AudioDecoderElement`/`AudioEncoderElement`; video encoders implement `VideoEncoder` wrapped by `EncoderElement`. All codec traits have `flush()` for EOS draining.
+Codec surface rule (#160): video decoders implement `Element` directly; audio codecs implement `AudioDecoder`/`AudioEncoder` wrapped by `AudioDecoderElement`/`AudioEncoderElement`; video encoders implement `VideoEncoder` wrapped by `EncoderElement`. All codec traits have `flush()` for EOS draining. Encoder input is borrowed (#146): `VideoEncoder::encode` takes a `VideoFrameRef<'_>` and `AudioEncoder::encode` an `AudioSamplesRef<'_>`, so the wrappers feed the input buffer's bytes without copying; the owned `VideoFrame`/`AudioSamples` remain the decoder-output types and convert with `as_view()`.
 
 | Codec | Types | Feature | Notes |
 |-------|-------|---------|-------|

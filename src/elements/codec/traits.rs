@@ -14,7 +14,7 @@
 //! impl VideoEncoder for MyEncoder {
 //!     type Packet = Vec<u8>;
 //!
-//!     fn encode(&mut self, frame: &VideoFrame) -> Result<Vec<Self::Packet>> {
+//!     fn encode(&mut self, frame: VideoFrameRef<'_>) -> Result<Vec<Self::Packet>> {
 //!         // Encode frame, may return 0 or more packets
 //!     }
 //!
@@ -24,7 +24,7 @@
 //! }
 //! ```
 
-use super::common::VideoFrame;
+use super::common::VideoFrameRef;
 use crate::error::{Error, Result};
 
 /// Frame type hint for encoded frames.
@@ -61,7 +61,7 @@ pub enum FrameType {
 ///
 /// // Encode frames
 /// for frame in frames {
-///     for packet in encoder.encode(&frame)? {
+///     for packet in encoder.encode(frame.as_view())? {
 ///         // Process encoded packet
 ///     }
 /// }
@@ -77,10 +77,14 @@ pub trait VideoEncoder: Send {
 
     /// Encode a video frame.
     ///
+    /// Takes a borrowed view so callers can feed pipeline buffers without
+    /// copying; an encoder that needs the data beyond the call copies it
+    /// into its own structures (they all do anyway).
+    ///
     /// Returns zero or more encoded packets. The encoder may buffer
     /// frames internally (for B-frame reordering, lookahead, etc.),
     /// so not every input frame produces immediate output.
-    fn encode(&mut self, frame: &VideoFrame) -> Result<Vec<Self::Packet>>;
+    fn encode(&mut self, frame: VideoFrameRef<'_>) -> Result<Vec<Self::Packet>>;
 
     /// Flush any buffered frames at end-of-stream.
     ///

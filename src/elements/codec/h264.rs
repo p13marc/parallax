@@ -902,11 +902,11 @@ impl Element for H264Encoder {
 impl super::traits::VideoEncoder for H264Encoder {
     type Packet = Vec<u8>;
 
-    fn encode(&mut self, frame: &super::common::VideoFrame) -> Result<Vec<Self::Packet>> {
+    fn encode(&mut self, frame: super::common::VideoFrameRef<'_>) -> Result<Vec<Self::Packet>> {
         // A frame of a different size is not an error: OpenH264 re-initialises
         // and emits a fresh IDR, which is exactly how a live resolution change
         // is supposed to look.
-        let encoded = self.encode_yuv420_at(&frame.data, frame.width, frame.height)?;
+        let encoded = self.encode_yuv420_at(frame.data, frame.width, frame.height)?;
 
         if encoded.is_empty() {
             Ok(Vec::new())
@@ -1974,7 +1974,9 @@ mod tests {
             stride_v: 80,
         };
 
-        let packets = encoder.encode(&frame).expect("a resize is not an error");
+        let packets = encoder
+            .encode(frame.as_view())
+            .expect("a resize is not an error");
         assert!(!packets.is_empty());
     }
 

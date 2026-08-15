@@ -231,7 +231,7 @@ pub use util::{Identity, IdentityStats, PassThrough};
 
 // Video codecs - common types
 #[cfg(any(feature = "av1-encode", feature = "av1-decode"))]
-pub use codec::{PixelFormat as CodecPixelFormat, VideoFrame};
+pub use codec::{PixelFormat as CodecPixelFormat, VideoFrame, VideoFrameRef};
 
 // Video codecs - H.264
 #[cfg(feature = "h264")]
@@ -296,7 +296,7 @@ pub use codec::Eac3Decoder;
 ))]
 pub use codec::{
     AudioDecoder, AudioDecoderElement, AudioEncoder, AudioEncoderElement, AudioSampleFormat,
-    AudioSamples,
+    AudioSamples, AudioSamplesRef,
 };
 
 // Image codecs - common types

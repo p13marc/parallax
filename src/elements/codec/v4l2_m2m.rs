@@ -50,7 +50,7 @@ use v4l2r::memory::MmapHandle;
 use v4l2r::nix::sys::time::{TimeVal, TimeValLike};
 use v4l2r::{Format, QueueType};
 
-use super::common::{PixelFormat, VideoFrame};
+use super::common::{PixelFormat, VideoFrameRef};
 use super::traits::VideoEncoder;
 use crate::error::{Error, Result};
 
@@ -589,7 +589,7 @@ fn raw_fourcc_for(format: PixelFormat) -> Result<&'static [u8; 4]> {
 impl VideoEncoder for V4l2M2mH264Encoder {
     type Packet = Vec<u8>;
 
-    fn encode(&mut self, frame: &VideoFrame) -> Result<Vec<Vec<u8>>> {
+    fn encode(&mut self, frame: VideoFrameRef<'_>) -> Result<Vec<Vec<u8>>> {
         if frame.format != self.config.pixel_format {
             return Err(Error::Element(format!(
                 "V4L2 M2M: frame is {:?}, encoder configured for {:?}",
@@ -825,9 +825,9 @@ impl Drop for Streaming {
     }
 }
 
-/// Copy a [`VideoFrame`] into a single-plane OUTPUT buffer, honoring the
+/// Copy a [`VideoFrameRef`] into a single-plane OUTPUT buffer, honoring the
 /// driver's row stride (`bytesperline`). Returns the bytes used.
-fn fill_output_plane(dst: &mut [u8], format: &Format, frame: &VideoFrame) -> Result<usize> {
+fn fill_output_plane(dst: &mut [u8], format: &Format, frame: VideoFrameRef<'_>) -> Result<usize> {
     let plane = format.plane_fmt.first().ok_or_else(|| {
         Error::Element("V4L2 M2M: driver reported a format without planes".to_string())
     })?;
@@ -977,6 +977,7 @@ pub fn find_m2m_encoder(fourcc: &[u8; 4]) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::elements::codec::common::VideoFrame;
 
     /// #38: the config carries no geometry at all — it cannot lie about a
     /// resolution it was never told.
@@ -1092,14 +1093,14 @@ mod tests {
             *b = i as u8;
         }
         let mut dst_a = vec![0u8; W * H * 3 / 2];
-        let used = fill_output_plane(&mut dst_a, &format, &frame).unwrap();
+        let used = fill_output_plane(&mut dst_a, &format, frame.as_view()).unwrap();
         assert_eq!(used, W * H * 3 / 2);
 
         // EncoderElement convention: stride_u = stride_y, stride_v = 0.
         frame.stride_u = frame.stride_y;
         frame.stride_v = 0;
         let mut dst_b = vec![0u8; W * H * 3 / 2];
-        fill_output_plane(&mut dst_b, &format, &frame).unwrap();
+        fill_output_plane(&mut dst_b, &format, frame.as_view()).unwrap();
 
         assert_eq!(dst_a, dst_b, "same bytes regardless of stride convention");
         assert_eq!(&dst_a[..], &frame.data[..], "tight NV12 copies verbatim");
@@ -1118,7 +1119,7 @@ mod tests {
         let mut frame = VideoFrame::new(W as u32, H as u32, PixelFormat::Nv12);
         frame.data.fill(0xAA);
         let mut dst = vec![0u8; sizeimage];
-        fill_output_plane(&mut dst, &format, &frame).unwrap();
+        fill_output_plane(&mut dst, &format, frame.as_view()).unwrap();
 
         // First luma row: 8 payload bytes then 4 padding bytes.
         assert_eq!(&dst[..W], &[0xAA; W]);
@@ -1185,7 +1186,7 @@ mod tests {
         let mut packets = 0usize;
         for seq in 0..10 {
             let frame = test_frame(640, 480, input_format, seq);
-            packets += encoder.encode(&frame).expect("encode").len();
+            packets += encoder.encode(frame.as_view()).expect("encode").len();
         }
         packets += encoder.flush().expect("flush").len();
         assert_eq!(packets, 10, "every queued frame must come back encoded");
@@ -1194,7 +1195,10 @@ mod tests {
         let mut packets = 0usize;
         for seq in 0..3 {
             let frame = test_frame(640, 480, input_format, seq);
-            packets += encoder.encode(&frame).expect("encode after re-arm").len();
+            packets += encoder
+                .encode(frame.as_view())
+                .expect("encode after re-arm")
+                .len();
         }
         packets += encoder.flush().expect("second flush").len();
         assert_eq!(packets, 3, "encoder must restart cleanly after a drain");
@@ -1223,7 +1227,7 @@ mod tests {
 
         for seq in 0..5 {
             encoder
-                .encode(&test_frame(640, 480, input_format, seq))
+                .encode(test_frame(640, 480, input_format, seq).as_view())
                 .expect("encode");
         }
 
@@ -1241,7 +1245,7 @@ mod tests {
         let mut packets = 0;
         for seq in 5..10 {
             packets += encoder
-                .encode(&test_frame(640, 480, input_format, seq))
+                .encode(test_frame(640, 480, input_format, seq).as_view())
                 .expect("encoding must continue after a control change")
                 .len();
         }
@@ -1270,7 +1274,7 @@ mod tests {
                 encoder.force_keyframe();
             }
             let frame = test_frame(640, 480, input_format, seq);
-            all_packets.extend(encoder.encode(&frame).expect("encode"));
+            all_packets.extend(encoder.encode(frame.as_view()).expect("encode"));
         }
         all_packets.extend(encoder.flush().expect("flush"));
 

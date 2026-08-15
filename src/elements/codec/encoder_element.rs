@@ -21,7 +21,7 @@
 //! pipeline.add_node("encoder", DynAsyncElement::new_box(TransformAdapter::new(element)));
 //! ```
 
-use super::common::VideoFrame;
+use super::common::VideoFrameRef;
 use super::traits::VideoEncoder;
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{ExecutionHints, Output, Transform};
@@ -33,7 +33,7 @@ use std::collections::VecDeque;
 /// Wraps a [`VideoEncoder`] to work as a pipeline [`Transform`] element.
 ///
 /// This wrapper handles:
-/// - Converting input buffers to [`VideoFrame`]
+/// - Viewing input buffers as [`VideoFrameRef`]s (no copy)
 /// - Managing encoder buffering (B-frames, lookahead)
 /// - Flushing remaining packets at EOS
 /// - Preserving timestamps
@@ -158,12 +158,16 @@ impl<E: VideoEncoder> EncoderElement<E> {
         &mut self.encoder
     }
 
-    /// Convert input buffer to VideoFrame, honoring format renegotiation.
+    /// View the input buffer as a frame, honoring format renegotiation.
     ///
     /// The buffer is authoritative about its own geometry and layout. If it
     /// declares nothing, this errors instead of reusing a stale value — the
     /// silent-corruption mode #38 exists to remove.
-    fn buffer_to_frame(&mut self, buffer: &Buffer) -> Result<VideoFrame> {
+    ///
+    /// The lifetime is named on purpose: the returned view borrows `buffer`,
+    /// not `self`, so the caller can go on to `self.encoder.encode(frame)`
+    /// while the view is live.
+    fn buffer_to_frame<'a>(&mut self, buffer: &'a Buffer) -> Result<VideoFrameRef<'a>> {
         match buffer.metadata().format {
             Some(MediaFormat::VideoRaw(vf)) => {
                 if self.format != Some(vf) {
@@ -214,12 +218,12 @@ impl<E: VideoEncoder> EncoderElement<E> {
             _ => (stride_y / 2, stride_y / 2),
         };
 
-        Ok(VideoFrame {
+        Ok(VideoFrameRef {
             width,
             height: declared.height,
             format,
             pts: buffer.metadata().pts.nanos() as i64,
-            data: buffer.as_bytes().to_vec(),
+            data: buffer.as_bytes(),
             stride_y,
             stride_u,
             stride_v,
@@ -379,7 +383,7 @@ impl<E: VideoEncoder + 'static> Transform for EncoderElement<E> {
 
         // Encode frame
         let started = std::time::Instant::now();
-        let packets = self.encoder.encode(&frame)?;
+        let packets = self.encoder.encode(frame)?;
         let elapsed_ns = started.elapsed().as_nanos() as u64;
 
         // If no packets, the encoder is buffering (lookahead) or rate control
@@ -509,7 +513,7 @@ mod tests {
 
     impl VideoEncoder for RecordingEncoder {
         type Packet = Vec<u8>;
-        fn encode(&mut self, frame: &VideoFrame) -> Result<Vec<Vec<u8>>> {
+        fn encode(&mut self, frame: VideoFrameRef<'_>) -> Result<Vec<Vec<u8>>> {
             self.frames.push((
                 frame.width,
                 frame.height,

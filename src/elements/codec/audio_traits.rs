@@ -14,7 +14,7 @@
 //! impl AudioEncoder for MyEncoder {
 //!     type Packet = Vec<u8>;
 //!
-//!     fn encode(&mut self, samples: &AudioSamples) -> Result<Vec<Self::Packet>> {
+//!     fn encode(&mut self, samples: AudioSamplesRef<'_>) -> Result<Vec<Self::Packet>> {
 //!         // Encode samples, may return 0 or more packets
 //!     }
 //!
@@ -112,8 +112,62 @@ impl AudioSamples {
         )
     }
 
+    /// Borrow these samples as the view type [`AudioEncoder::encode`] takes.
+    pub fn as_view(&self) -> AudioSamplesRef<'_> {
+        AudioSamplesRef {
+            data: &self.data,
+            format: self.format,
+            channels: self.channels,
+            sample_rate: self.sample_rate,
+            samples_per_channel: self.samples_per_channel,
+            pts: self.pts,
+        }
+    }
+
     /// Get samples as S16 slice (only valid if format is S16).
     pub fn as_s16(&self) -> Option<&[i16]> {
+        self.as_view().as_s16()
+    }
+
+    /// Get samples as F32 slice (only valid if format is F32).
+    pub fn as_f32(&self) -> Option<&[f32]> {
+        self.as_view().as_f32()
+    }
+
+    /// Total frame size in bytes.
+    pub fn frame_size(&self) -> usize {
+        self.as_view().frame_size()
+    }
+
+    /// Duration in nanoseconds.
+    pub fn duration_nanos(&self) -> u64 {
+        self.as_view().duration_nanos()
+    }
+}
+
+/// A borrowed view of interleaved PCM (see [`AudioSamples`] for the owned form).
+///
+/// This is what [`AudioEncoder::encode`] takes: `AudioEncoderElement` builds one
+/// directly over the input buffer's bytes, so encoding copies nothing.
+#[derive(Clone, Copy, Debug)]
+pub struct AudioSamplesRef<'a> {
+    /// Raw sample data (interleaved), borrowed from the producer.
+    pub data: &'a [u8],
+    /// Sample format.
+    pub format: AudioSampleFormat,
+    /// Number of channels (1 = mono, 2 = stereo).
+    pub channels: u32,
+    /// Sample rate in Hz.
+    pub sample_rate: u32,
+    /// Number of samples per channel.
+    pub samples_per_channel: usize,
+    /// Presentation timestamp in nanoseconds.
+    pub pts: i64,
+}
+
+impl<'a> AudioSamplesRef<'a> {
+    /// Get samples as S16 slice (only valid if format is S16).
+    pub fn as_s16(&self) -> Option<&'a [i16]> {
         if self.format != AudioSampleFormat::S16 {
             return None;
         }
@@ -124,7 +178,7 @@ impl AudioSamples {
     }
 
     /// Get samples as F32 slice (only valid if format is F32).
-    pub fn as_f32(&self) -> Option<&[f32]> {
+    pub fn as_f32(&self) -> Option<&'a [f32]> {
         if self.format != AudioSampleFormat::F32 {
             return None;
         }
@@ -168,7 +222,7 @@ impl AudioSamples {
 ///
 /// // Encode audio frames
 /// for samples in audio_frames {
-///     for packet in encoder.encode(&samples)? {
+///     for packet in encoder.encode(samples.as_view())? {
 ///         // Process encoded packet
 ///     }
 /// }
@@ -184,9 +238,13 @@ pub trait AudioEncoder: Send {
 
     /// Encode audio samples.
     ///
+    /// Takes a borrowed view so callers can feed pipeline buffers without
+    /// copying; an encoder that needs the samples beyond the call copies
+    /// them into its own accumulator (they all do anyway).
+    ///
     /// Returns zero or more encoded packets. The encoder may buffer
     /// samples internally to form complete frames.
-    fn encode(&mut self, samples: &AudioSamples) -> Result<Vec<Self::Packet>>;
+    fn encode(&mut self, samples: AudioSamplesRef<'_>) -> Result<Vec<Self::Packet>>;
 
     /// Flush any buffered samples at end-of-stream.
     ///

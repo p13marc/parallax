@@ -25,7 +25,7 @@
 //!
 //! // Encode samples (S16 interleaved)
 //! let samples = AudioSamples::from_s16(&pcm_data, 2, 44100);
-//! let packets = encoder.encode(&samples)?;
+//! let packets = encoder.encode(samples.as_view())?;
 //! ```
 //!
 //! # Build Dependencies
@@ -37,7 +37,7 @@
 //! - **Arch**: `sudo pacman -S libfdk-aac`
 //! - **macOS**: `brew install fdk-aac`
 
-use super::audio_traits::{AudioEncoder, AudioSampleFormat, AudioSamples};
+use super::audio_traits::{AudioEncoder, AudioSampleFormat, AudioSamples, AudioSamplesRef};
 use crate::error::{Error, Result};
 
 use fdk_aac::enc::{BitRate, ChannelMode, Encoder, EncoderParams};
@@ -141,7 +141,7 @@ impl AacEncoder {
 impl AudioEncoder for AacEncoder {
     type Packet = Vec<u8>;
 
-    fn encode(&mut self, samples: &AudioSamples) -> Result<Vec<Self::Packet>> {
+    fn encode(&mut self, samples: AudioSamplesRef<'_>) -> Result<Vec<Self::Packet>> {
         // Convert input to S16 if needed
         let input_s16: Vec<i16> = match samples.format {
             AudioSampleFormat::S16 => samples
@@ -246,7 +246,7 @@ mod tests {
         let pcm: Vec<i16> = vec![0i16; 1024 * 2];
         let samples = AudioSamples::from_s16(&pcm, 2, 44100);
 
-        let packets = encoder.encode(&samples).unwrap();
+        let packets = encoder.encode(samples.as_view()).unwrap();
         // Should produce exactly 1 packet
         assert_eq!(packets.len(), 1);
         // AAC packet should have data
@@ -261,13 +261,13 @@ mod tests {
         let small_input: Vec<i16> = vec![0i16; 512 * 2];
         let samples = AudioSamples::from_s16(&small_input, 2, 44100);
 
-        let packets = encoder.encode(&samples).unwrap();
+        let packets = encoder.encode(samples.as_view()).unwrap();
         // Should buffer, no output yet
         assert!(packets.is_empty());
         assert!(encoder.has_pending());
 
         // Send more samples to complete the frame
-        let packets = encoder.encode(&samples).unwrap();
+        let packets = encoder.encode(samples.as_view()).unwrap();
         // Now should output a packet
         assert_eq!(packets.len(), 1);
     }
@@ -279,7 +279,7 @@ mod tests {
         // Send partial frame
         let small_input: Vec<i16> = vec![0i16; 100 * 2];
         let samples = AudioSamples::from_s16(&small_input, 2, 44100);
-        encoder.encode(&samples).unwrap();
+        encoder.encode(samples.as_view()).unwrap();
 
         // Flush should pad and encode remaining
         let packets = encoder.flush().unwrap();

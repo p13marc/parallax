@@ -19,7 +19,7 @@ use crate::element::{Element, ExecutionHints};
 use crate::error::{Error, Result};
 use crate::memory::{OutputArena, OutputBudget, defaults};
 
-use super::common::{PixelFormat, VideoFrame};
+use super::common::{PixelFormat, VideoFrameRef};
 use super::traits::VideoEncoder;
 
 /// Configuration for the rav1e AV1 encoder.
@@ -402,7 +402,7 @@ impl Drop for Rav1eEncoder {
 impl VideoEncoder for Rav1eEncoder {
     type Packet = Vec<u8>;
 
-    fn encode(&mut self, frame: &VideoFrame) -> Result<Vec<Self::Packet>> {
+    fn encode(&mut self, frame: VideoFrameRef<'_>) -> Result<Vec<Self::Packet>> {
         // Validate frame format
         if frame.format != PixelFormat::I420 {
             return Err(Error::InvalidSegment(format!(
@@ -416,7 +416,7 @@ impl VideoEncoder for Rav1eEncoder {
 
         // Encode the frame
         match self.encode_frame(
-            &frame.data,
+            frame.data,
             frame.width as usize,
             frame.height as usize,
             frame.pts as u64,

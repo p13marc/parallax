@@ -83,7 +83,7 @@ fn main() -> Result<()> {
     // Encode
     println!("Encoding...");
     let mut all_packets = Vec::new();
-    let packets = encoder.encode(&input_samples)?;
+    let packets = encoder.encode(input_samples.as_view())?;
     all_packets.extend(packets);
 
     // Flush any remaining buffered samples
@@ -177,7 +177,7 @@ fn demonstrate_frame_sizes() -> Result<()> {
         let pcm: Vec<i16> = vec![0i16; samples * channels as usize];
         let input = AudioSamples::from_s16(&pcm, channels, sample_rate);
 
-        let packets = encoder.encode(&input)?;
+        let packets = encoder.encode(input.as_view())?;
         if let Some(packet) = packets.first() {
             println!(
                 "  {} ({} samples): {} bytes encoded",

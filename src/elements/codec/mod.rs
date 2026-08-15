@@ -112,7 +112,7 @@
 
 // Common types (video frames, pixel formats)
 mod common;
-pub use common::{PixelFormat, VideoFrame};
+pub use common::{PixelFormat, VideoFrame, VideoFrameRef};
 
 // Runtime control handles. These live in `crate::control` — the one module that
 // documents the clone-before-start invariant — and are re-exported here so the
@@ -128,7 +128,9 @@ pub use traits::{FrameType, VideoEncoder};
 
 // Audio codec traits
 mod audio_traits;
-pub use audio_traits::{AudioDecoder, AudioEncoder, AudioSampleFormat, AudioSamples};
+pub use audio_traits::{
+    AudioDecoder, AudioEncoder, AudioSampleFormat, AudioSamples, AudioSamplesRef,
+};
 
 // Video element wrappers.
 //
