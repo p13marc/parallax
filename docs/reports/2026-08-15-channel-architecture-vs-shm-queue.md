@@ -284,6 +284,12 @@ lost wakeups) dominate the engineering cost. ([thingbuf comparison](https://gith
 
 ### 6.1 The IPC data path is where "a queue on our memory model" belongs
 
+> **Implemented by #179** (`memory::IpcChannel` + the IpcSink/IpcSrc rewrite), with two
+> simplifications over the sketch below: SPSC needs no per-entry commit word (a single
+> `head.store(Release)` publishes the whole descriptor atomically), and the ack doorbell doubles
+> as the space doorbell (the in-flight bound makes both rings never-full by construction). The
+> section is kept as written for the record.
+
 Current per-buffer mechanics (`src/elements/ipc/ipc_elements.rs`):
 
 - `IpcSink::consume` rkyv-serializes `ControlMessage::BufferReady{slot, metadata}` into a fresh

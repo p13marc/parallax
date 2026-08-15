@@ -122,6 +122,43 @@ pub fn recv_fds(socket: &UnixStream, data_buf: &mut [u8]) -> Result<(usize, Vec<
     Ok((result.bytes, fds))
 }
 
+/// Non-blocking [`recv_fds`]: `Ok(None)` when no data is queued.
+///
+/// Uses `MSG_DONTWAIT`, so the socket's own blocking mode is irrelevant —
+/// no mode flipping (which is how the old IPC element read path could
+/// desync a stream). `Ok(Some((0, _)))` means the peer closed the socket.
+pub fn recv_fds_nonblocking(
+    socket: &UnixStream,
+    data_buf: &mut [u8],
+) -> Result<Option<(usize, Vec<OwnedFd>)>> {
+    if data_buf.is_empty() {
+        return Err(Error::InvalidSegment("data buffer cannot be empty".into()));
+    }
+
+    let mut ancillary_space: [MaybeUninit<u8>; 64] = [const { MaybeUninit::uninit() }; 64];
+    let mut ancillary = RecvAncillaryBuffer::new(&mut ancillary_space);
+
+    let mut iov = [IoSliceMut::new(data_buf)];
+    let result = match recvmsg(socket, &mut iov, &mut ancillary, RecvFlags::DONTWAIT) {
+        Ok(r) => r,
+        // (WOULDBLOCK == AGAIN on Linux.)
+        Err(rustix::io::Errno::WOULDBLOCK) => return Ok(None),
+        Err(rustix::io::Errno::INTR) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+
+    let mut fds = Vec::new();
+    for msg in ancillary.drain() {
+        if let RecvAncillaryMessage::ScmRights(rights) = msg {
+            for fd in rights {
+                fds.push(fd);
+            }
+        }
+    }
+
+    Ok(Some((result.bytes, fds)))
+}
+
 /// Helper to send a single file descriptor with size metadata.
 ///
 /// This is a convenience function for the common case of sending a single

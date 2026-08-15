@@ -51,7 +51,7 @@ Everything — including the bookkeeping — lives inside the shared mapping:
 - **Drop** → `fetch_sub`; the process that drops the last reference pushes the slot index onto the `ReleaseQueue` (lock-free, O(1)).
 - **Reclaim** — the owner calls `arena.reclaim()` (done automatically by pools before acquiring) and pops released indices, marking slots free: O(k) in released slots. If a release ever met a full ring, the drop was counted in the header's `orphaned` field and the next `reclaim()` runs a one-shot O(n) sweep of the slot headers to recover those slots — a slot's state+refcount share one atomic word, so `(Allocated, rc=0)` unambiguously means "released" and the sweep can never free a live or mid-acquire slot.
 
-Refcount overflow is guarded (panics past `i32::MAX`); reconstruction from IPC validates arena id, slot bounds, and liveness in one CAS (`try_inc_ref`), so a peer can neither resurrect a freed slot nor a released one whose refcount already hit zero — a stale ref resolves to `None`. `IpcSink` upholds the sender half of that contract by holding a live `Buffer` clone for every un-acked slot.
+Refcount overflow is guarded (panics past `i32::MAX`); reconstruction from IPC validates arena id, slot bounds, and liveness in one CAS (`try_inc_ref`), so a peer can neither resurrect a freed slot nor a released one whose refcount already hit zero — a stale ref resolves to `None`. `IpcSink` upholds the sender half of that contract by holding a live `Buffer` clone for every in-flight descriptor, released only when the peer's post-mapping ack returns through the ack ring (#179).
 
 ### Sending buffers to another process
 
@@ -78,9 +78,9 @@ assert_eq!(&slot.data()[..5], b"hello");
 // slot shares the refcount with process A — drop from either side is correct
 ```
 
-The `IpcSrc`/`IpcSink` elements (and `link::IpcPublisher`/`IpcSubscriber`) implement this protocol for you, including EOS and error signaling.
+The `IpcSrc`/`IpcSink` elements implement this protocol for you — and since #179 their per-buffer path does not even use the socket. A small memfd **ring segment** (`memory::IpcChannel`, ~9 KiB at the default capacity of 64) carries two SPSC rings: 128-byte `IpcDescriptor` entries sink→src (the slot ref plus every fixed metadata field — pts/dts/duration, sequence, flags, offset, `MediaFormat`, RTP meta) and `u64` ack seqs src→sink, with an eventfd doorbell per direction passed over SCM_RIGHTS. The socket remains the control plane: `RegisterChannel` (ring + doorbell fds), `RegisterArena` (each buffer arena's fd, sent on first sight *before* the first descriptor referencing it), `MetaOverflow` (known custom-map entries such as `stanag/klv`, sent before the descriptor they annotate), and `Shutdown`; graceful EOS rides a state word in the ring segment. The sink bounds in-flight descriptors at the ring capacity — that bound is its pin table and is what makes both rings never-full by construction — and a standing reaper task releases pins as acks arrive, independent of new buffers (reaping only on consume would deadlock a source whose arena is no larger than the in-flight window).
 
-`memory::ipc` primitives: `send_fds`/`recv_fds` (up to 4 fds per message via `SCM_RIGHTS`), `send_segment_handle`/`recv_segment_handle` (fd + size pair).
+`memory::ipc` primitives: `send_fds`/`recv_fds`/`recv_fds_nonblocking` (up to 4 fds per message via `SCM_RIGHTS`), `send_segment_handle`/`recv_segment_handle` (fd + size pair).
 
 Arena format **v4** records `slot_stride` and `alignment` in the header, so a client reads the true stride instead of assuming 64-byte rounding — arenas from `new_avx` (32-byte alignment) are safe to share cross-process. `from_fd` validates the recorded stride against `slot_size` and `alignment` and that every slot fits the mapping, refusing the arena rather than handing back one that mis-addresses slots.
 

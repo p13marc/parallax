@@ -1,325 +1,110 @@
-//! Control protocol for element processes.
+//! Control-plane protocol for the IPC elements.
 //!
-//! Defines the messages exchanged between the supervisor and element processes
-//! over Unix sockets. Uses rkyv for zero-copy serialization.
+//! Since #179 the hot path — per-buffer descriptors and acks — rides the
+//! shared-memory ring ([`crate::memory::IpcChannel`]); the Unix socket
+//! carries only what genuinely needs a stream: registration (with fds via
+//! SCM_RIGHTS), rare overflow metadata, and teardown. That is the
+//! data-plane/signaling-plane split of design.md principle 8.
+//!
+//! Messages are rkyv-encoded with a 4-byte LE length prefix. The length is
+//! peer-controlled, so it is bounded ([`MAX_CONTROL_MESSAGE_SIZE`]) and a
+//! malformed body is an error, never a panic.
 
-use crate::format::MediaCaps;
-use crate::memory::SharedIpcSlotRef;
-use crate::metadata::Metadata;
+use crate::error::{Error, Result};
 
-/// Control message sent between supervisor and element processes.
+/// Upper bound on one framed control message.
 ///
-/// All messages are serialized with rkyv and sent over Unix sockets with
-/// length-prefixed framing.
-#[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-#[rkyv(derive(Debug))]
+/// Registration and shutdown are tiny; the only variable-size message is
+/// `MetaOverflow`, whose entries are bounded custom-metadata payloads (KLV
+/// packets, SEI). 64 KiB is generous for those and small enough that a
+/// hostile length prefix cannot balloon an allocation.
+pub const MAX_CONTROL_MESSAGE_SIZE: usize = 64 * 1024;
+
+/// Custom-metadata keys forwarded across the IPC boundary.
+///
+/// Keys are `&'static str` in [`crate::metadata::Metadata`], so only keys
+/// known at compile time can be re-attached on the receiving side. Mirrors
+/// `zenoh_wire::KNOWN_CUSTOM_KEYS` (feature-gated, hence the small
+/// duplication); keep the two lists in sync when adding keys.
+pub const KNOWN_CUSTOM_KEYS: &[&str] = &["stanag/klv", "h264/sei"];
+
+/// Control messages between IpcSink and IpcSrc.
+///
+/// Every variant is sink→src; the src's only signal back to the sink is
+/// the ack ring (and closing the socket).
+#[derive(Clone, Debug, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum ControlMessage {
-    /// Initialize element with negotiated caps.
-    ///
-    /// Sent from supervisor to element after spawning.
-    Init {
-        /// Negotiated media capabilities.
-        caps: SerializableCaps,
+    /// The ring channel handshake. Accompanied by three fds via SCM_RIGHTS,
+    /// in [`crate::memory::IpcChannel::fds`] order:
+    /// `[ring segment, data doorbell, ack doorbell]`. Sent once, first.
+    RegisterChannel {
+        /// Ring capacity, for validation (the segment header self-describes;
+        /// a mismatch means a protocol bug).
+        capacity: u32,
     },
 
-    /// A buffer is ready for processing.
-    ///
-    /// Sent from supervisor to element (for sinks) or from element to
-    /// supervisor (for sources).
-    BufferReady {
-        /// Reference to the buffer in shared memory.
-        slot: SharedIpcSlotRef,
-        /// Buffer metadata.
-        metadata: SerializableMetadata,
-    },
-
-    /// Buffer processing is complete, slot can be reused.
-    ///
-    /// Sent from element to supervisor after processing a BufferReady message.
-    BufferDone {
-        /// The slot that was processed.
-        slot: SharedIpcSlotRef,
-    },
-
-    /// Request a state change.
-    ///
-    /// Sent from supervisor to element.
-    StateChange {
-        /// The new state to transition to.
-        new_state: ElementState,
-    },
-
-    /// Acknowledge a state change.
-    ///
-    /// Sent from element to supervisor after completing a state transition.
-    StateChanged {
-        /// The new current state.
-        state: ElementState,
-    },
-
-    /// Report an error.
-    ///
-    /// Can be sent by either side.
-    Error {
-        /// Error code (0 = success, non-zero = error).
-        code: u32,
-        /// Human-readable error message.
-        message: String,
-    },
-
-    /// End of stream signal.
-    ///
-    /// Sent when a source has no more data.
-    Eos,
-
-    /// Request graceful shutdown.
-    ///
-    /// Sent from supervisor to element.
-    Shutdown,
-
-    /// Acknowledge shutdown is complete.
-    ///
-    /// Sent from element to supervisor before exiting.
-    ShutdownAck,
-
-    /// Heartbeat ping (liveness check).
-    ///
-    /// Sent from supervisor to element.
-    Ping {
-        /// Sequence number for matching responses.
-        seq: u64,
-    },
-
-    /// Heartbeat pong (liveness response).
-    ///
-    /// Sent from element to supervisor in response to Ping.
-    Pong {
-        /// Sequence number from the Ping.
-        seq: u64,
-    },
-
-    /// Arena registration.
-    ///
-    /// Sent when a new shared memory arena needs to be mapped.
-    /// The arena fd is sent via SCM_RIGHTS alongside this message.
+    /// A buffer arena the sink is about to reference. Accompanied by one fd
+    /// (the arena memfd). Sent register-on-first-sight, always *before* the
+    /// first descriptor whose `arena_id` matches — socket FIFO plus the
+    /// ring publish give the src a happens-before it can rely on.
     RegisterArena {
-        /// Unique arena identifier.
+        /// The arena's process-unique id (#178), as the descriptors carry it.
         arena_id: u64,
-        /// Size of the arena in bytes.
-        size: usize,
-        /// Size of each slot in the arena.
-        slot_size: usize,
-        /// Number of slots in the arena.
-        slot_count: usize,
     },
 
-    /// Statistics report.
-    ///
-    /// Periodically sent from element to supervisor.
-    Stats {
-        /// Number of buffers processed.
-        buffers_processed: u64,
-        /// Total bytes processed.
-        bytes_processed: u64,
-        /// Average processing time in nanoseconds.
-        avg_process_time_ns: u64,
-        /// Current memory usage in bytes.
-        memory_usage: u64,
+    /// Custom-metadata overflow for the descriptor with this `seq`. Sent
+    /// *before* that descriptor is pushed (same ordering argument as
+    /// `RegisterArena`); the descriptor carries the meta-overflow presence
+    /// bit so the src knows to collect this first.
+    MetaOverflow {
+        /// The descriptor's ack-correlation seq.
+        seq: u64,
+        /// `(key, bytes)` pairs; only [`KNOWN_CUSTOM_KEYS`] survive the trip.
+        entries: Vec<(String, Vec<u8>)>,
     },
+
+    /// Teardown backstop for abnormal paths. Graceful EOS rides the ring
+    /// segment's state word, not the socket.
+    Shutdown,
 }
 
-/// Element state.
+/// Frame a message: 4-byte LE length prefix + rkyv bytes.
 ///
-/// Elements transition through these states during their lifecycle.
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
-)]
-#[rkyv(derive(Debug))]
-#[repr(u8)]
-pub enum ElementState {
-    /// Initial state - element is created but not initialized.
-    #[default]
-    Null = 0,
-
-    /// Element is initialized and ready to process.
-    Ready = 1,
-
-    /// Element is actively processing data.
-    Playing = 2,
-
-    /// Element is paused (can resume quickly).
-    Paused = 3,
-}
-
-impl ElementState {
-    /// Check if state allows processing buffers.
-    pub fn can_process(&self) -> bool {
-        matches!(self, Self::Playing)
-    }
-
-    /// Check if state transition is valid.
-    pub fn can_transition_to(&self, new_state: Self) -> bool {
-        use ElementState::*;
-        matches!(
-            (self, new_state),
-            // From Null
-            (Null, Ready) |
-            // From Ready
-            (Ready, Playing) | (Ready, Null) |
-            // From Playing
-            (Playing, Paused) | (Playing, Ready) |
-            // From Paused
-            (Paused, Playing) | (Paused, Ready)
-        )
-    }
-}
-
-impl std::fmt::Display for ElementState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Null => write!(f, "Null"),
-            Self::Ready => write!(f, "Ready"),
-            Self::Playing => write!(f, "Playing"),
-            Self::Paused => write!(f, "Paused"),
-        }
-    }
-}
-
-/// Serializable version of MediaCaps for IPC.
-///
-/// This is a simplified representation that can be serialized with rkyv.
-#[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-#[rkyv(derive(Debug))]
-pub struct SerializableCaps {
-    /// Format type identifier.
-    pub format_type: u32,
-    /// Format-specific data (JSON or binary).
-    pub format_data: Vec<u8>,
-    /// Memory type.
-    pub memory_type: u32,
-}
-
-impl SerializableCaps {
-    /// Create from MediaCaps.
-    pub fn from_caps(_caps: &MediaCaps) -> Self {
-        // NOTE: Stub implementation - caps serialization via rkyv handles most cases
-        Self {
-            format_type: 0,
-            format_data: Vec::new(),
-            memory_type: 0,
-        }
-    }
-}
-
-/// Serializable version of Metadata for IPC.
-#[derive(Clone, Debug, Default, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-#[rkyv(derive(Debug))]
-pub struct SerializableMetadata {
-    /// Buffer flags.
-    pub flags: u8,
-    /// Presentation timestamp in nanoseconds.
-    pub pts: Option<u64>,
-    /// Decode timestamp in nanoseconds.
-    pub dts: Option<u64>,
-    /// Duration in nanoseconds.
-    pub duration: Option<u64>,
-    /// Sequence number.
-    pub sequence: u64,
-    /// Stream identifier.
-    pub stream_id: Option<u32>,
-}
-
-impl SerializableMetadata {
-    /// Create from Metadata.
-    pub fn from_metadata(meta: &Metadata) -> Self {
-        Self {
-            flags: meta.flags.bits(),
-            pts: if meta.pts.is_some() {
-                Some(meta.pts.nanos())
-            } else {
-                None
-            },
-            dts: if meta.dts.is_some() {
-                Some(meta.dts.nanos())
-            } else {
-                None
-            },
-            duration: if meta.duration.is_some() {
-                Some(meta.duration.nanos())
-            } else {
-                None
-            },
-            sequence: meta.sequence,
-            stream_id: if meta.stream_id != 0 {
-                Some(meta.stream_id)
-            } else {
-                None
-            },
-        }
-    }
-
-    /// Convert to Metadata.
-    pub fn to_metadata(&self) -> Metadata {
-        use crate::clock::ClockTime;
-        use crate::metadata::BufferFlags;
-
-        let mut meta = Metadata::from_sequence(self.sequence);
-
-        if let Some(pts) = self.pts {
-            meta.pts = ClockTime::from_nanos(pts);
-        }
-        if let Some(dts) = self.dts {
-            meta.dts = ClockTime::from_nanos(dts);
-        }
-        if let Some(duration) = self.duration {
-            meta.duration = ClockTime::from_nanos(duration);
-        }
-        if let Some(stream_id) = self.stream_id {
-            meta.stream_id = stream_id;
-        }
-
-        // Set flags
-        meta.flags = BufferFlags::from_bits(self.flags);
-
-        meta
-    }
-}
-
-/// Frame a message for sending.
-///
-/// Returns a buffer with length prefix followed by serialized message.
+/// Panics only on rkyv failing to serialize our own value, which is a bug,
+/// not an input condition.
 pub fn frame_message(msg: &ControlMessage) -> Vec<u8> {
-    let serialized = rkyv::to_bytes::<rkyv::rancor::Error>(msg).expect("serialization failed");
-    let len = serialized.len() as u32;
-
-    let mut framed = Vec::with_capacity(4 + serialized.len());
-    framed.extend_from_slice(&len.to_le_bytes());
-    framed.extend_from_slice(&serialized);
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(msg).expect("serialization failed");
+    let mut framed = Vec::with_capacity(4 + bytes.len());
+    framed.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    framed.extend_from_slice(&bytes);
     framed
 }
 
-/// Unframe a message from a buffer.
+/// Parse one framed message from the front of `data`.
 ///
-/// Returns the message and the number of bytes consumed.
-/// Returns None if the buffer doesn't contain a complete message.
-pub fn unframe_message(buf: &[u8]) -> Option<(ControlMessage, usize)> {
-    if buf.len() < 4 {
-        return None;
+/// - `Ok(Some((msg, consumed)))` — one whole frame parsed.
+/// - `Ok(None)` — the frame is incomplete; read more and retry.
+/// - `Err` — the peer sent garbage (oversized length, undecodable body).
+pub fn unframe_message(data: &[u8]) -> Result<Option<(ControlMessage, usize)>> {
+    if data.len() < 4 {
+        return Ok(None);
+    }
+    let len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    if len > MAX_CONTROL_MESSAGE_SIZE {
+        return Err(Error::Element(format!(
+            "ipc control message length {len} exceeds the {MAX_CONTROL_MESSAGE_SIZE} bound"
+        )));
+    }
+    if data.len() < 4 + len {
+        return Ok(None);
     }
 
-    let len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-    if buf.len() < 4 + len {
-        return None;
-    }
-
-    // Copy to aligned buffer for rkyv
-    let mut aligned = rkyv::util::AlignedVec::<8>::new();
-    aligned.extend_from_slice(&buf[4..4 + len]);
-
-    let msg: ControlMessage = rkyv::from_bytes::<ControlMessage, rkyv::rancor::Error>(&aligned)
-        .expect("deserialization failed");
-
-    Some((msg, 4 + len))
+    // rkyv wants aligned bytes; the frame arrives at arbitrary offset.
+    let mut aligned = rkyv::util::AlignedVec::<8>::with_capacity(len);
+    aligned.extend_from_slice(&data[4..4 + len]);
+    let msg = rkyv::from_bytes::<ControlMessage, rkyv::rancor::Error>(&aligned)
+        .map_err(|e| Error::Element(format!("undecodable ipc control message: {e}")))?;
+    Ok(Some((msg, 4 + len)))
 }
 
 #[cfg(test)]
@@ -327,139 +112,66 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_element_state_transitions() {
-        use ElementState::*;
-
-        assert!(Null.can_transition_to(Ready));
-        assert!(!Null.can_transition_to(Playing));
-        assert!(!Null.can_transition_to(Paused));
-
-        assert!(Ready.can_transition_to(Playing));
-        assert!(Ready.can_transition_to(Null));
-        assert!(!Ready.can_transition_to(Paused));
-
-        assert!(Playing.can_transition_to(Paused));
-        assert!(Playing.can_transition_to(Ready));
-        assert!(!Playing.can_transition_to(Null));
-
-        assert!(Paused.can_transition_to(Playing));
-        assert!(Paused.can_transition_to(Ready));
-        assert!(!Paused.can_transition_to(Null));
-    }
-
-    #[test]
-    fn test_element_state_can_process() {
-        assert!(!ElementState::Null.can_process());
-        assert!(!ElementState::Ready.can_process());
-        assert!(ElementState::Playing.can_process());
-        assert!(!ElementState::Paused.can_process());
-    }
-
-    #[test]
-    fn test_message_framing() {
-        let msg = ControlMessage::Ping { seq: 42 };
-        let framed = frame_message(&msg);
-
-        let (decoded, consumed) = unframe_message(&framed).unwrap();
-        assert_eq!(consumed, framed.len());
-
-        if let ControlMessage::Ping { seq } = decoded {
-            assert_eq!(seq, 42);
-        } else {
-            panic!("Wrong message type");
-        }
-    }
-
-    #[test]
-    fn test_message_framing_partial() {
-        let msg = ControlMessage::Pong { seq: 123 };
-        let framed = frame_message(&msg);
-
-        // Incomplete buffer
-        assert!(unframe_message(&framed[..2]).is_none());
-        assert!(unframe_message(&framed[..4]).is_none());
-        assert!(unframe_message(&framed[..framed.len() - 1]).is_none());
-
-        // Complete buffer
-        assert!(unframe_message(&framed).is_some());
-    }
-
-    #[test]
-    fn test_serializable_metadata_roundtrip() {
-        use crate::clock::ClockTime;
-        use crate::metadata::BufferFlags;
-
-        let original = Metadata::from_sequence(42)
-            .with_pts(ClockTime::from_millis(1000))
-            .with_dts(ClockTime::from_millis(900))
-            .with_duration(ClockTime::from_millis(33))
-            .with_stream_id(1)
-            .with_flags(BufferFlags::SYNC_POINT | BufferFlags::DISCONT);
-
-        let serializable = SerializableMetadata::from_metadata(&original);
-        let recovered = serializable.to_metadata();
-
-        assert_eq!(recovered.sequence, 42);
-        assert_eq!(recovered.pts, ClockTime::from_millis(1000));
-        assert_eq!(recovered.dts, ClockTime::from_millis(900));
-        assert_eq!(recovered.duration, ClockTime::from_millis(33));
-        assert_eq!(recovered.stream_id, 1);
-        assert!(recovered.flags.contains(BufferFlags::SYNC_POINT));
-        assert!(recovered.flags.contains(BufferFlags::DISCONT));
-    }
-
-    #[test]
-    fn test_control_message_variants() {
-        // Test each variant serializes correctly
-        let messages = vec![
-            ControlMessage::Init {
-                caps: SerializableCaps {
-                    format_type: 1,
-                    format_data: vec![1, 2, 3],
-                    memory_type: 0,
-                },
+    fn framing_round_trips_every_variant() {
+        let messages = [
+            ControlMessage::RegisterChannel { capacity: 64 },
+            ControlMessage::RegisterArena { arena_id: u64::MAX },
+            ControlMessage::MetaOverflow {
+                seq: 42,
+                entries: vec![
+                    ("stanag/klv".into(), vec![1, 2, 3]),
+                    ("h264/sei".into(), vec![0xFF; 100]),
+                ],
             },
-            ControlMessage::BufferReady {
-                slot: SharedIpcSlotRef::new(1, 0, 0, 1024),
-                metadata: SerializableMetadata::default(),
-            },
-            ControlMessage::BufferDone {
-                slot: SharedIpcSlotRef::new(1, 0, 0, 1024),
-            },
-            ControlMessage::StateChange {
-                new_state: ElementState::Playing,
-            },
-            ControlMessage::StateChanged {
-                state: ElementState::Playing,
-            },
-            ControlMessage::Error {
-                code: 1,
-                message: "test error".into(),
-            },
-            ControlMessage::Eos,
             ControlMessage::Shutdown,
-            ControlMessage::ShutdownAck,
-            ControlMessage::Ping { seq: 1 },
-            ControlMessage::Pong { seq: 1 },
-            ControlMessage::RegisterArena {
-                arena_id: 1,
-                size: 1024 * 1024,
-                slot_size: 4096,
-                slot_count: 256,
-            },
-            ControlMessage::Stats {
-                buffers_processed: 100,
-                bytes_processed: 1000000,
-                avg_process_time_ns: 5000,
-                memory_usage: 10000,
-            },
         ];
-
         for msg in messages {
             let framed = frame_message(&msg);
-            let (decoded, _) = unframe_message(&framed).unwrap();
-            // Just verify it decodes without panic
-            let _ = format!("{:?}", decoded);
+            let (parsed, consumed) = unframe_message(&framed).unwrap().unwrap();
+            assert_eq!(parsed, msg);
+            assert_eq!(consumed, framed.len());
         }
+    }
+
+    #[test]
+    fn partial_frames_ask_for_more() {
+        let framed = frame_message(&ControlMessage::Shutdown);
+        assert!(unframe_message(&framed[..2]).unwrap().is_none());
+        assert!(unframe_message(&framed[..4]).unwrap().is_none());
+        assert!(
+            unframe_message(&framed[..framed.len() - 1])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn two_frames_parse_in_sequence() {
+        let a = frame_message(&ControlMessage::RegisterArena { arena_id: 1 });
+        let b = frame_message(&ControlMessage::Shutdown);
+        let mut joined = a.clone();
+        joined.extend_from_slice(&b);
+
+        let (first, consumed) = unframe_message(&joined).unwrap().unwrap();
+        assert_eq!(first, ControlMessage::RegisterArena { arena_id: 1 });
+        assert_eq!(consumed, a.len());
+        let (second, consumed2) = unframe_message(&joined[consumed..]).unwrap().unwrap();
+        assert_eq!(second, ControlMessage::Shutdown);
+        assert_eq!(consumed2, b.len());
+    }
+
+    #[test]
+    fn hostile_input_errors_instead_of_panicking() {
+        // Oversized length prefix: must not allocate 4 GB or panic.
+        let mut oversized = Vec::new();
+        oversized.extend_from_slice(&u32::MAX.to_le_bytes());
+        oversized.extend_from_slice(&[0u8; 64]);
+        assert!(unframe_message(&oversized).is_err());
+
+        // Well-sized garbage body: an error, never a panic.
+        let mut garbage = Vec::new();
+        garbage.extend_from_slice(&16u32.to_le_bytes());
+        garbage.extend_from_slice(&[0xA5u8; 16]);
+        assert!(unframe_message(&garbage).is_err());
     }
 }
