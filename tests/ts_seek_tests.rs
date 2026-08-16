@@ -348,3 +348,161 @@ async fn a_seek_before_any_pcr_is_refused_rather_than_guessed() {
         }
     }
 }
+
+/// #165: a fed demuxer's pads re-anchor with the translated seek's shape.
+///
+/// Two regressions pinned here. A flushing rate-2.0 TIME seek must come back
+/// out of the demuxer's video pad as a Time segment carrying rate 2.0 — the
+/// re-anchor used to be a hardcoded rate-1.0 `initial_segment_for`, so every
+/// fed demuxer silently dropped trick-play rate. And a follow-up NON-flushing
+/// seek must produce a new pad segment at all (pads only re-anchored on
+/// FlushStop, which a queued seek never sends) with `base` = the running time
+/// already consumed, taken at the in-band byte-Segment boundary so running
+/// time stays monotonic across the queued handoff.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fed_demuxer_reanchors_with_rate_and_base() {
+    use std::sync::{Arc, Mutex};
+
+    use parallax::event::{Event, SeekEvent, SeekFlags, SegmentEvent};
+    use parallax::pipeline::probe::{PadRef, ProbeData, ProbeReturn, ProbeType};
+
+    let file = fixture();
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_source("src", FileSrc::new(file.path()).with_chunk_size(100 * 188));
+    let demux = pipeline.add_demuxer("tsdemux", TsDemuxElement::new());
+    let sink = AppSink::with_max_buffers(4);
+    let sink_handle = sink.handle();
+    let snk = pipeline.add_async_sink("sink", sink);
+    pipeline.link(src, demux).unwrap();
+    pipeline.link_pads(demux, "video", snk, "sink").unwrap();
+
+    // The demuxer's own pad segments. The upstream byte segment is swallowed
+    // before src-pad probes, so only Time re-anchors land here.
+    let segments: Arc<Mutex<Vec<SegmentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let segments_probe = segments.clone();
+    let _ = pipeline.add_probe(PadRef::src(demux), ProbeType::EVENT_DOWN, move |data| {
+        if let ProbeData::Event(Event::Segment(seg)) = data
+            && seg.format == SegmentFormat::Time
+        {
+            segments_probe.lock().unwrap().push(seg.clone());
+        }
+        ProbeReturn::Ok
+    });
+
+    let executor = Executor::new();
+    let handle = executor.start(&mut pipeline).unwrap();
+
+    // Pull in the background, paced (see a_fed_ts_demuxer_seeks_in_time).
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let puller = tokio::spawn(async move {
+        loop {
+            match sink_handle.pull_buffer().await {
+                Pulled::Buffer(b) => {
+                    if tx.send(b.metadata().pts).is_err() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                Pulled::Ended(_) => break,
+                Pulled::Empty | Pulled::Flushing => tokio::task::yield_now().await,
+            }
+        }
+    });
+
+    let mut seen = 0;
+    while seen < 20 {
+        match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+            Ok(Some(_)) => seen += 1,
+            Ok(None) => panic!("stream ended before the first seek"),
+            Err(_) => panic!("no frames within 5s; got {seen}"),
+        }
+    }
+
+    // Flushing trick-play seek: 2x from 7s.
+    let seek = SeekEvent::new_time(ClockTime::from_secs(7)).with_rate(2.0);
+    assert!(handle.seek(seek).await, "the flushing seek was dispatched");
+
+    // Drain until post-seek data lands.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut landed = false;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+            Ok(Some(pts)) if pts >= ClockTime::from_secs(6) => {
+                landed = true;
+                break;
+            }
+            Ok(Some(_)) => {}
+            _ => break,
+        }
+    }
+    assert!(landed, "no frame at or after the 7s target arrived");
+
+    let trick_seg = segments
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("a re-anchor segment after the flushing seek");
+    assert_eq!(
+        trick_seg.rate, 2.0,
+        "the pad re-anchor carries the translated seek's rate: {trick_seg:?}"
+    );
+    assert_eq!(trick_seg.base, 0, "a flushing seek restarts running time");
+    assert!(
+        (6_000_000_000..=9_000_000_000).contains(&trick_seg.start),
+        "re-anchor starts near the 7s target: {trick_seg:?}"
+    );
+    let n_before = segments.lock().unwrap().len();
+
+    // Queued (non-flushing) seek back to 2s at rate 1.0. Nothing is flushed:
+    // the source's byte segment rides FIFO behind the queued data and the
+    // pad re-anchors exactly at that boundary.
+    let queued = SeekEvent::new_time(ClockTime::from_secs(2)).with_flags(SeekFlags::KEY_UNIT); // no FLUSH
+    assert!(handle.seek(queued).await, "the queued seek was dispatched");
+
+    // Post-seek data shows up as a PTS drop back below 5s.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut dropped_back = false;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+            Ok(Some(pts)) if pts <= ClockTime::from_secs(5) => {
+                dropped_back = true;
+                break;
+            }
+            Ok(Some(_)) => {}
+            _ => break,
+        }
+    }
+    assert!(dropped_back, "no post-seek frame near 2s arrived");
+
+    handle.stop();
+    let _ = puller.await;
+    handle.wait().await.unwrap();
+
+    let segs = segments.lock().unwrap().clone();
+    assert!(
+        segs.len() > n_before,
+        "a NON-flushing translated seek re-anchors the pad (got {} segments, had {n_before})",
+        segs.len()
+    );
+    let queued_seg = &segs[n_before];
+    assert_eq!(queued_seg.rate, 1.0, "rate restored: {queued_seg:?}");
+    assert!(
+        queued_seg.base > 0,
+        "the queued re-anchor accumulates consumed running time: {queued_seg:?}"
+    );
+    assert!(
+        (500_000_000..=4_000_000_000).contains(&queued_seg.start),
+        "re-anchor starts near the 2s target: {queued_seg:?}"
+    );
+    // Monotonic across the boundary: mapping the new segment's own start
+    // through it must not run backwards past the base it inherited.
+    let mapped = queued_seg
+        .to_running_time(ClockTime::from_nanos(queued_seg.start as u64))
+        .nanos() as i64;
+    assert!(
+        mapped >= queued_seg.base,
+        "running time continues from the accumulated base ({mapped} < {})",
+        queued_seg.base
+    );
+}

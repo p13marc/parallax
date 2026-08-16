@@ -2600,6 +2600,32 @@ fn initial_segment_for(buffer: &Buffer) -> SegmentEvent {
     }
 }
 
+/// Shape of the Time segments a fed demuxer re-anchors its pads with after
+/// a seek it translated upstream (#165). Without it every re-anchor was a
+/// bare `initial_segment_for` — rate 1.0, base 0 — so a fed demuxer dropped
+/// trick-play rate entirely and non-flushing seeks lost their accumulated
+/// base at the translation boundary. The shape is sticky: it describes the
+/// output timeline until the next translated seek replaces it, so a later
+/// unrelated re-anchor still carries the trick-play rate.
+struct PadReanchor {
+    rate: f64,
+    base: i64,
+    stop: Option<ClockTime>,
+}
+
+/// The segment a pad anchors with at its first routed buffer: the plain
+/// lazy initial segment normally, or the translated seek's shape (rate,
+/// base, stop) around this pad's own first post-seek PTS — the honest
+/// per-pad landing, same convention as the translated SeekDone.
+fn anchor_segment_for(buffer: &Buffer, reanchor: Option<&PadReanchor>) -> SegmentEvent {
+    match (reanchor, buffer.metadata().pts.to_option()) {
+        (Some(r), Some(pts)) => SegmentEvent::new_time(pts, r.stop)
+            .with_rate(r.rate)
+            .with_base(r.base),
+        _ => initial_segment_for(buffer),
+    }
+}
+
 /// Producer-side view of the outgoing segment (#165): the Time segment last
 /// put on the wire plus how far playback advanced under it. This is what a
 /// *non-flushing* seek's successor segment needs — its `base` is the running
@@ -2960,6 +2986,15 @@ struct PendingTranslation {
     seqnum: u64,
     /// The format the application seeked in (the outward one).
     format: SegmentFormat,
+    /// The original seek's rate — the fed demuxer's re-anchored pad
+    /// segments must carry it or trick play dies at the translation (#165).
+    rate: f64,
+    /// Whether the original seek flushes. A non-flushing translation gets
+    /// no FlushStop back from the source, so the fed demuxer clears its
+    /// pad-anchor set itself and accumulates `base` (#165).
+    flushing: bool,
+    /// The original seek's absolute stop, when it set one.
+    stop: Option<u64>,
 }
 
 /// Which side of a consuming task's data-vs-upstream select fired.
@@ -3248,6 +3283,12 @@ async fn handle_upstream_hop(
             *pending_translation = Some(PendingTranslation {
                 seqnum: seek.seqnum(),
                 format: seek.format,
+                rate: seek.rate,
+                flushing: seek.flags.contains(crate::event::SeekFlags::FLUSH),
+                stop: match seek.stop.seek_type {
+                    SeekType::Set => Some(seek.stop.position.max(0) as u64),
+                    _ => None,
+                },
             });
             tracing::debug!(
                 "'{name}': translated seek {} to {:?}, forwarding upstream",
@@ -4329,40 +4370,31 @@ async fn route_demux_buffer(
     tracers: &TracerRegistry,
     unrouted: &mut u64,
     segment_pads: &mut HashSet<String>,
+    reanchor: Option<&PadReanchor>,
     src_pad: &crate::pipeline::probe::PadRef,
     probes: &ProbeRegistry,
-) -> bool {
-    let mut anchored = false;
+) -> Option<SegmentEvent> {
+    let mut anchored = None;
     match outputs_by_pad.get(pad) {
         Some(branches) => {
             // Per-pad lazy initial segment, anchored at this pad's first
             // buffer (#165): each elementary stream carries its own PTS
             // domain, so pads anchor independently.
             if segment_pads.insert(pad.to_string()) {
-                anchored = true;
-                emit_event(
-                    branches,
-                    src_pad,
-                    probes,
-                    Event::Segment(initial_segment_for(&buffer)),
-                )
-                .await;
+                let seg = anchor_segment_for(&buffer, reanchor);
+                emit_event(branches, src_pad, probes, Event::Segment(seg.clone())).await;
+                anchored = Some(seg);
             }
             broadcast(branches, buffer, epoch, tracers).await;
         }
         None if pad.is_empty() => {
             // Legacy broadcast pad: one shared segment for every branch.
             if segment_pads.insert(String::new()) {
-                anchored = true;
+                let seg = anchor_segment_for(&buffer, reanchor);
                 for branches in outputs_by_pad.values() {
-                    emit_event(
-                        branches,
-                        src_pad,
-                        probes,
-                        Event::Segment(initial_segment_for(&buffer)),
-                    )
-                    .await;
+                    emit_event(branches, src_pad, probes, Event::Segment(seg.clone())).await;
                 }
+                anchored = Some(seg);
             }
             for branches in outputs_by_pad.values() {
                 broadcast(branches, buffer.clone(), epoch, tracers).await;
@@ -4431,6 +4463,12 @@ fn spawn_demuxer_task(
         // segment is broadcast to all pads anyway); ~one frame of A/V skew
         // in base is a documented approximation.
         let mut segment_tracker = SegmentTracker::default();
+        // Fed branch only (#165): the translated seek's segment shape for
+        // pad re-anchors, and whether the next pad anchor should (re)install
+        // into the tracker — true at start and after every un-anchor, so
+        // "one node, one base" survives re-anchor cycles.
+        let mut pad_reanchor: Option<PadReanchor> = None;
+        let mut tracker_needs_install = true;
         let mut segment_seek: Option<ActiveSegmentSeek> = None;
         let mut last_seek_epoch: u64 = 0;
         // #163 phase B: set when this element converts a seek into another
@@ -4476,7 +4514,7 @@ fn spawn_demuxer_task(
                                 &mut last_seek_epoch,
                                 warn_unhandled_seek,
                                 &mut pending_translation,
-                                None,
+                                Some(&mut segment_tracker),
                             )
                             .await;
                             continue;
@@ -4570,10 +4608,22 @@ fn spawn_demuxer_task(
                                         &tracers,
                                         &mut unrouted,
                                         &mut segment_pads,
+                                        pad_reanchor.as_ref(),
                                         &src_pad,
                                         &probe_registry,
                                     )
                                     .await;
+                                    // Same "one node, one base" rule as the
+                                    // source-style branch: the first pad
+                                    // anchoring after an un-anchor installs
+                                    // the node's tracker segment (#165).
+                                    if let Some(seg) = &anchored
+                                        && tracker_needs_install
+                                    {
+                                        segment_tracker.installed(seg);
+                                        tracker_needs_install = false;
+                                    }
+                                    segment_tracker.observe(pts);
                                     // #163 phase B: a seek this demuxer
                                     // translated completes here, not at the
                                     // source. The source answered in BYTES,
@@ -4582,7 +4632,7 @@ fn spawn_demuxer_task(
                                     // buffer's PTS is the honest landing in
                                     // the format it did ask in. A seek still
                                     // being refined does not complete (#173).
-                                    if anchored
+                                    if anchored.is_some()
                                         && !refining
                                         && let Some(pt) = pending_translation.take()
                                     {
@@ -4623,6 +4673,30 @@ fn spawn_demuxer_task(
                                 tracing::warn!("flush error in '{}': {}", name, e);
                             }
                         }
+                        // #165: an in-band Segment from upstream marks the
+                        // exact boundary where the input timeline changed.
+                        // While a translated seek is pending, that boundary
+                        // is where the pads re-anchor with the original
+                        // seek's shape — rate, stop, and (for a NON-flushing
+                        // seek, whose only boundary marker this is: no
+                        // FlushStop ever comes back) the base accumulated
+                        // through the queued drain, taken here so running
+                        // time stays monotonic across the FIFO boundary.
+                        if let Event::Segment(_) = &event
+                            && let Some(pt) = &pending_translation
+                        {
+                            pad_reanchor = Some(PadReanchor {
+                                rate: pt.rate,
+                                base: if pt.flushing {
+                                    0
+                                } else {
+                                    segment_tracker.accumulated_base()
+                                },
+                                stop: pt.stop.map(ClockTime::from_nanos),
+                            });
+                            segment_pads.clear();
+                            tracker_needs_install = true;
+                        }
                         // Events go to every output pad, like EOS does.
                         if let Some(fwd) = element.handle_downstream_event(event) {
                             match &fwd {
@@ -4645,7 +4719,10 @@ fn spawn_demuxer_task(
                                 // the source below a fed demuxer), each pad
                                 // re-anchors with a fresh Time segment at its
                                 // first post-seek buffer.
-                                Event::FlushStop(_) => segment_pads.clear(),
+                                Event::FlushStop(_) => {
+                                    segment_pads.clear();
+                                    tracker_needs_install = true;
+                                }
                                 _ => {}
                             }
                             match probe_registry.invoke_event(&src_pad, &fwd, true) {
@@ -4687,6 +4764,7 @@ fn spawn_demuxer_task(
                                             &tracers,
                                             &mut unrouted,
                                             &mut segment_pads,
+                                            pad_reanchor.as_ref(),
                                             &src_pad,
                                             &probe_registry,
                                         )
@@ -4715,6 +4793,7 @@ fn spawn_demuxer_task(
                                         &tracers,
                                         &mut unrouted,
                                         &mut segment_pads,
+                                        pad_reanchor.as_ref(),
                                         &src_pad,
                                         &probe_registry,
                                     )
@@ -4836,6 +4915,7 @@ fn spawn_demuxer_task(
                                 &tracers,
                                 &mut unrouted,
                                 &mut segment_pads,
+                                None,
                                 &src_pad,
                                 &probe_registry,
                             )
@@ -4844,11 +4924,10 @@ fn spawn_demuxer_task(
                             // running-time anchor (#165); later pads anchor
                             // on the wire but not in the tracker -- one
                             // node, one base.
-                            if anchored && segment_tracker.current.is_none() {
-                                segment_tracker.installed(&SegmentEvent::new_time(
-                                    pts.to_option().unwrap_or(ClockTime::ZERO),
-                                    None,
-                                ));
+                            if let Some(seg) = &anchored
+                                && segment_tracker.current.is_none()
+                            {
+                                segment_tracker.installed(seg);
                             }
                             segment_tracker.observe(pts);
                         }
