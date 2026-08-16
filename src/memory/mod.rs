@@ -57,7 +57,7 @@ mod shared_refcount;
 
 pub use budget::{OutputArena, OutputBudget};
 pub use buffer_pool::{BufferPool, FixedBufferPool, PoolStats, PooledBuffer};
-pub use dmabuf::DmaBufSegment;
+pub use dmabuf::{DmaBufReleaseHook, DmaBufSegment, DmaBufSlot};
 pub use eventfd::EventFd;
 pub use ipc_ring::{DEFAULT_IPC_RING_CAPACITY, IpcChannel, IpcChannelState, IpcDescriptor};
 pub use segment::MemoryType;

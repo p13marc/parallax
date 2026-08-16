@@ -230,6 +230,94 @@ impl DmaBufSegment {
     }
 }
 
+// ============================================================================
+// DmaBufSlot — the refcounted, releasable unit behind MemoryHandle::DmaBuf
+// ============================================================================
+
+/// Release hook: called with the producer-side buffer index when the last
+/// reference to a [`DmaBufSlot`] drops. For a V4L2 source this re-queues the
+/// buffer to the driver (QBUF); tests use it to observe recycling.
+pub type DmaBufReleaseHook = Box<dyn Fn(u32) + Send + Sync>;
+
+/// A refcounted dmabuf-backed slot (#145) — the DmaBuf counterpart of
+/// [`SharedSlotRef`](crate::memory::SharedSlotRef)'s discipline: cloning a
+/// buffer clones an `Arc<DmaBufSlot>`, and the LAST drop fires the release
+/// hook so the producer can recycle the underlying driver buffer.
+///
+/// The `segment` is itself `Arc`'d so a pooled producer keeps one long-lived
+/// mmap per driver buffer across recycles; dropping the slot returns the
+/// *index* to the producer, it does not unmap anything.
+pub struct DmaBufSlot {
+    /// The mapped dmabuf. Shared with the producer's pool for pooled slots.
+    segment: std::sync::Arc<DmaBufSegment>,
+    /// Producer-side buffer index (V4L2 QBUF index); 0 for one-shot slots.
+    index: u32,
+    /// Fired exactly once, from `Drop` — i.e. when the last
+    /// `Arc<DmaBufSlot>` clone goes away.
+    release: Option<DmaBufReleaseHook>,
+}
+
+impl DmaBufSlot {
+    /// One-shot slot: owns its segment, no recycle hook (imports, tests).
+    pub fn new(segment: DmaBufSegment) -> Self {
+        Self {
+            segment: std::sync::Arc::new(segment),
+            index: 0,
+            release: None,
+        }
+    }
+
+    /// Pooled slot: shared segment plus a recycle hook called with `index`
+    /// on last drop (the V4L2 re-queue path).
+    pub fn with_release(
+        segment: std::sync::Arc<DmaBufSegment>,
+        index: u32,
+        hook: DmaBufReleaseHook,
+    ) -> Self {
+        Self {
+            segment,
+            index,
+            release: Some(hook),
+        }
+    }
+
+    /// The mapped segment.
+    pub fn segment(&self) -> &DmaBufSegment {
+        &self.segment
+    }
+
+    /// Producer-side buffer index.
+    pub fn index(&self) -> u32 {
+        self.index
+    }
+
+    /// The dmabuf fd — the GPU-import hook (#62: `import_dmabuf` takes
+    /// exactly this).
+    pub fn fd(&self) -> BorrowedFd<'_> {
+        self.segment.as_fd()
+    }
+}
+
+impl Drop for DmaBufSlot {
+    fn drop(&mut self) {
+        if let Some(hook) = self.release.take() {
+            hook(self.index);
+        }
+    }
+}
+
+impl std::fmt::Debug for DmaBufSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DmaBufSlot")
+            .field("fd", &self.segment.as_fd().as_raw_fd())
+            .field("index", &self.index)
+            .field("len", &self.segment.size())
+            .field("read_only", &self.segment.is_read_only())
+            .field("has_release", &self.release.is_some())
+            .finish()
+    }
+}
+
 impl std::fmt::Debug for DmaBufSegment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DmaBufSegment")
@@ -315,5 +403,121 @@ mod tests {
 
         assert!(debug_str.contains("DmaBufSegment"));
         assert!(debug_str.contains("len: 128"));
+    }
+}
+
+#[cfg(test)]
+mod slot_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+    fn memfd_segment(len: u64) -> DmaBufSegment {
+        let fd =
+            rustix::fs::memfd_create("dmabuf_slot_test", rustix::fs::MemfdFlags::CLOEXEC).unwrap();
+        rustix::fs::ftruncate(&fd, len).unwrap();
+        DmaBufSegment::from_fd(fd, len as usize).unwrap()
+    }
+
+    #[test]
+    fn release_hook_fires_once_on_last_drop_with_index() {
+        let fired = Arc::new(AtomicU32::new(0));
+        let index_seen = Arc::new(AtomicU64::new(u64::MAX));
+        let fired_hook = fired.clone();
+        let index_hook = index_seen.clone();
+
+        let segment = Arc::new(memfd_segment(4096));
+        let slot = Arc::new(DmaBufSlot::with_release(
+            segment,
+            7,
+            Box::new(move |idx| {
+                fired_hook.fetch_add(1, Ordering::SeqCst);
+                index_hook.store(idx as u64, Ordering::SeqCst);
+            }),
+        ));
+
+        let a = Arc::clone(&slot);
+        let b = Arc::clone(&slot);
+        drop(slot);
+        drop(a);
+        assert_eq!(fired.load(Ordering::SeqCst), 0, "clones still alive");
+        drop(b);
+        assert_eq!(fired.load(Ordering::SeqCst), 1, "fires exactly once");
+        assert_eq!(index_seen.load(Ordering::SeqCst), 7);
+    }
+
+    #[test]
+    fn one_shot_slot_has_no_hook_and_index_zero() {
+        let slot = DmaBufSlot::new(memfd_segment(1024));
+        assert_eq!(slot.index(), 0);
+        drop(slot); // no hook — must not panic
+    }
+
+    #[test]
+    fn pooled_slot_shares_the_segment_mapping() {
+        let segment = Arc::new(memfd_segment(1024));
+        let slot = DmaBufSlot::with_release(Arc::clone(&segment), 0, Box::new(|_| {}));
+        assert_eq!(
+            slot.segment().as_slice().as_ptr(),
+            segment.as_slice().as_ptr(),
+            "one mapping, shared"
+        );
+    }
+
+    /// Real dmabuf validation via /dev/udmabuf when available (skips
+    /// otherwise): a udmabuf-created fd exercises actual dma-buf f_ops.
+    #[test]
+    fn udmabuf_backed_segment_when_available() {
+        use rustix::fs::{MemfdFlags, SealFlags};
+
+        let Ok(dev) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/udmabuf")
+        else {
+            eprintln!("skipping: /dev/udmabuf unavailable");
+            return;
+        };
+
+        const SIZE: u64 = 4096;
+        let memfd = rustix::fs::memfd_create(
+            "udmabuf_source",
+            MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
+        )
+        .unwrap();
+        rustix::fs::ftruncate(&memfd, SIZE).unwrap();
+        rustix::fs::fcntl_add_seals(&memfd, SealFlags::SHRINK).unwrap();
+
+        #[repr(C)]
+        struct UdmabufCreate {
+            memfd: u32,
+            flags: u32,
+            offset: u64,
+            size: u64,
+        }
+        // _IOW('u', 0x42, struct udmabuf_create)
+        const UDMABUF_CREATE: libc::c_ulong = 0x4018_7542;
+        let arg = UdmabufCreate {
+            memfd: memfd.as_raw_fd() as u32,
+            flags: 0,
+            offset: 0,
+            size: SIZE,
+        };
+        let raw = unsafe { libc::ioctl(dev.as_fd().as_raw_fd(), UDMABUF_CREATE, &arg) };
+        if raw < 0 {
+            eprintln!(
+                "skipping: UDMABUF_CREATE failed ({})",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+        let dmabuf_fd = unsafe { <OwnedFd as rustix::fd::FromRawFd>::from_raw_fd(raw) };
+
+        let segment = DmaBufSegment::from_fd(dmabuf_fd, SIZE as usize).unwrap();
+        assert_eq!(segment.size(), SIZE as usize);
+        // A real dma-buf mmap: write through it and read back.
+        let mut segment = segment;
+        segment.as_mut_slice().unwrap()[..4].copy_from_slice(b"dmab");
+        assert_eq!(&segment.as_slice()[..4], b"dmab");
     }
 }

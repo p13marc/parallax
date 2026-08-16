@@ -1,44 +1,70 @@
 //! Buffer types for zero-copy data passing.
 
-use crate::memory::{MemoryType, SharedIpcSlotRef, SharedSlotRef};
+use crate::memory::{DmaBufSlot, MemoryType, SharedIpcSlotRef, SharedSlotRef};
 use crate::metadata::Metadata;
 use std::marker::PhantomData;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 /// Validation state for archived buffers.
 const NOT_VALIDATED: u8 = 0;
 const VALIDATED_OK: u8 = 1;
 
-/// Handle to a memory region backed by `SharedArena`.
+/// Handle to a buffer's backing memory (#145): a first-class enum, so ONE
+/// uniform [`Buffer`] type flows through the whole pipeline whatever the
+/// memory is.
 ///
-/// All buffers use `SharedSlotRef` which stores its refcount in shared memory,
-/// enabling true cross-process reference counting and zero-copy buffer sharing.
+/// - [`Cpu`](Self::Cpu): a `SharedArena` slot — refcount in shared memory,
+///   cross-process by construction. The overwhelmingly common case; the
+///   `new`/`with_len` constructors build it, so CPU call sites never name
+///   the variant.
+/// - [`DmaBuf`](Self::DmaBuf): a refcounted [`DmaBufSlot`] — a mapped
+///   dmabuf fd whose last drop fires the producer's release hook (a V4L2
+///   source re-queues the buffer to the driver). The mapping lives as long
+///   as the slot, so [`as_slice`](Self::as_slice) is infallible for both
+///   variants.
 ///
-/// Cloning a `MemoryHandle` is cheap: just an atomic increment of the refcount
-/// in shared memory.
-pub struct MemoryHandle {
-    /// The slot reference (refcount in shared memory).
-    slot: SharedSlotRef,
-    /// Offset within the slot (for sub-buffers).
-    offset: usize,
-    /// Length of this buffer's data.
-    len: usize,
+/// Cloning is cheap for both: a shared-memory refcount increment (Cpu) or
+/// an `Arc` bump (DmaBuf). Arena-specific accessors ([`slot`](Self::slot),
+/// [`ipc_ref`](Self::ipc_ref), [`arena_id`](Self::arena_id), …) return
+/// `Option` — `None` on a DmaBuf handle.
+pub enum MemoryHandle {
+    /// A `SharedArena` slot (refcount in shared memory).
+    #[non_exhaustive]
+    Cpu {
+        /// The slot reference.
+        slot: SharedSlotRef,
+        /// Offset within the slot (for sub-buffers).
+        offset: usize,
+        /// Length of this buffer's data.
+        len: usize,
+    },
+    /// A refcounted dmabuf slot (mapped fd + release hook).
+    #[non_exhaustive]
+    DmaBuf {
+        /// The shared slot; last clone's drop fires the release hook.
+        slot: Arc<DmaBufSlot>,
+        /// Offset within the mapping (for sub-buffers).
+        offset: usize,
+        /// Length of this buffer's data.
+        len: usize,
+    },
 }
 
 impl MemoryHandle {
-    /// Create a memory handle from a SharedSlotRef.
+    /// Create a CPU memory handle from a SharedSlotRef.
     ///
     /// The refcount is in shared memory, enabling cross-process reference counting.
     pub fn new(slot: SharedSlotRef) -> Self {
         let len = slot.len();
-        Self {
+        Self::Cpu {
             slot,
             offset: 0,
             len,
         }
     }
 
-    /// Create a memory handle with a specific length.
+    /// Create a CPU memory handle with a specific length.
     ///
     /// Useful when you have a slot but only wrote `len` bytes.
     ///
@@ -47,87 +73,167 @@ impl MemoryHandle {
     /// Panics if `len > slot.len()`.
     pub fn with_len(slot: SharedSlotRef, len: usize) -> Self {
         assert!(len <= slot.len(), "requested length exceeds slot size");
-        Self {
+        Self::Cpu {
             slot,
             offset: 0,
             len,
         }
     }
 
+    /// Create a DmaBuf memory handle covering the slot's whole mapping.
+    pub fn from_dmabuf(slot: Arc<DmaBufSlot>) -> Self {
+        let len = slot.segment().size();
+        Self::DmaBuf {
+            slot,
+            offset: 0,
+            len,
+        }
+    }
+
+    /// Create a DmaBuf memory handle over `offset..offset + len` of the
+    /// mapping (a V4L2 frame's `bytesused` is usually smaller than the
+    /// exported buffer).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `offset + len` exceeds the mapping.
+    pub fn from_dmabuf_with_len(slot: Arc<DmaBufSlot>, offset: usize, len: usize) -> Self {
+        assert!(
+            offset + len <= slot.segment().size(),
+            "requested range exceeds dmabuf size"
+        );
+        Self::DmaBuf { slot, offset, len }
+    }
+
     /// Get a pointer to the start of this handle's memory.
     pub fn as_ptr(&self) -> *const u8 {
-        unsafe { self.slot.as_ptr().add(self.offset) }
+        match self {
+            Self::Cpu { slot, offset, .. } => unsafe { slot.as_ptr().add(*offset) },
+            Self::DmaBuf { slot, offset, .. } => unsafe {
+                slot.segment().as_slice().as_ptr().add(*offset)
+            },
+        }
     }
 
     /// Get a mutable pointer to the start of this handle's memory.
-    pub fn as_mut_ptr(&mut self) -> *mut u8 {
-        unsafe { self.slot.as_mut_ptr().add(self.offset) }
+    ///
+    /// Private: only [`as_mut_slice`](Self::as_mut_slice) uses it, and only
+    /// after the writability check.
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.as_ptr() as *mut u8
     }
 
     /// Get the length of this handle's data.
     pub fn len(&self) -> usize {
-        self.len
+        match self {
+            Self::Cpu { len, .. } | Self::DmaBuf { len, .. } => *len,
+        }
     }
 
     /// Check if this handle has zero length.
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.len() == 0
     }
 
     /// Get this handle's data as a byte slice.
+    ///
+    /// Infallible for both variants: a DmaBuf slot keeps its mapping alive
+    /// for its whole life.
     pub fn as_slice(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.as_ptr(), self.len) }
+        unsafe { std::slice::from_raw_parts(self.as_ptr(), self.len()) }
     }
 
     /// Get this handle's data as a mutable byte slice.
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.as_mut_ptr(), self.len) }
+    ///
+    /// `None` for a read-only DmaBuf mapping
+    /// ([`DmaBufSegment::from_fd_readonly`](crate::memory::DmaBufSegment::from_fd_readonly)) —
+    /// CPU slots are always writable.
+    pub fn as_mut_slice(&mut self) -> Option<&mut [u8]> {
+        if let Self::DmaBuf { slot, .. } = self
+            && slot.segment().is_read_only()
+        {
+            return None;
+        }
+        let len = self.len();
+        Some(unsafe { std::slice::from_raw_parts_mut(self.as_mut_ptr(), len) })
     }
 
-    /// Get the memory type (always CPU for SharedArena).
+    /// Get the memory type of the backing.
     pub fn memory_type(&self) -> MemoryType {
-        MemoryType::Cpu
-    }
-
-    /// Get the offset within the slot.
-    pub fn offset(&self) -> usize {
-        self.offset
-    }
-
-    /// Get a reference to the underlying slot.
-    pub fn slot(&self) -> &SharedSlotRef {
-        &self.slot
-    }
-
-    /// Get an IPC reference for cross-process sharing.
-    pub fn ipc_ref(&self) -> SharedIpcSlotRef {
-        let base_ref = self.slot.ipc_ref();
-        SharedIpcSlotRef {
-            arena_id: base_ref.arena_id,
-            slot_index: base_ref.slot_index,
-            data_offset: base_ref.data_offset + self.offset,
-            len: self.len,
+        match self {
+            Self::Cpu { .. } => MemoryType::Cpu,
+            Self::DmaBuf { .. } => MemoryType::DmaBuf,
         }
     }
 
-    /// Get the arena ID.
-    pub fn arena_id(&self) -> u64 {
-        self.slot.arena_id()
+    /// Get the offset within the backing slot/mapping.
+    pub fn offset(&self) -> usize {
+        match self {
+            Self::Cpu { offset, .. } | Self::DmaBuf { offset, .. } => *offset,
+        }
     }
 
-    /// Get the arena's raw fd (for IPC).
-    pub fn arena_fd(&self) -> i32 {
-        self.slot.arena_fd()
+    /// The underlying arena slot; `None` for a DmaBuf handle.
+    pub fn slot(&self) -> Option<&SharedSlotRef> {
+        match self {
+            Self::Cpu { slot, .. } => Some(slot),
+            Self::DmaBuf { .. } => None,
+        }
     }
 
-    /// Get the arena's total size (for IPC).
-    pub fn arena_size(&self) -> usize {
-        self.slot.arena_size()
+    /// The underlying dmabuf slot; `None` for a Cpu handle.
+    pub fn dmabuf_slot(&self) -> Option<&Arc<DmaBufSlot>> {
+        match self {
+            Self::Cpu { .. } => None,
+            Self::DmaBuf { slot, .. } => Some(slot),
+        }
     }
 
-    /// Get the current refcount (for debugging).
+    /// The dmabuf fd, for GPU import (#62); `None` for a Cpu handle.
+    pub fn dmabuf_fd(&self) -> Option<rustix::fd::BorrowedFd<'_>> {
+        self.dmabuf_slot().map(|s| s.fd())
+    }
+
+    /// An IPC reference for cross-process sharing; `None` for a DmaBuf
+    /// handle (no arena identity — fd passing is the follow-up, see
+    /// `IpcSink`'s error).
+    pub fn ipc_ref(&self) -> Option<SharedIpcSlotRef> {
+        match self {
+            Self::Cpu { slot, offset, len } => {
+                let base_ref = slot.ipc_ref();
+                Some(SharedIpcSlotRef {
+                    arena_id: base_ref.arena_id,
+                    slot_index: base_ref.slot_index,
+                    data_offset: base_ref.data_offset + offset,
+                    len: *len,
+                })
+            }
+            Self::DmaBuf { .. } => None,
+        }
+    }
+
+    /// The arena ID; `None` for a DmaBuf handle.
+    pub fn arena_id(&self) -> Option<u64> {
+        self.slot().map(|s| s.arena_id())
+    }
+
+    /// The arena's raw fd (for IPC); `None` for a DmaBuf handle.
+    pub fn arena_fd(&self) -> Option<i32> {
+        self.slot().map(|s| s.arena_fd())
+    }
+
+    /// The arena's total size (for IPC); `None` for a DmaBuf handle.
+    pub fn arena_size(&self) -> Option<usize> {
+        self.slot().map(|s| s.arena_size())
+    }
+
+    /// Get the current refcount (for debugging). Cpu: the shared-memory
+    /// slot refcount; DmaBuf: the `Arc`'s strong count.
     pub fn refcount(&self) -> u32 {
-        self.slot.refcount()
+        match self {
+            Self::Cpu { slot, .. } => slot.refcount(),
+            Self::DmaBuf { slot, .. } => Arc::strong_count(slot) as u32,
+        }
     }
 
     /// Create a sub-handle (a view into a portion of this handle).
@@ -136,34 +242,64 @@ impl MemoryHandle {
     ///
     /// Panics if `offset + len > self.len()`.
     pub fn slice(&self, offset: usize, len: usize) -> Self {
-        assert!(offset + len <= self.len, "sub-handle exceeds parent bounds");
-
-        Self {
-            slot: self.slot.slice(self.offset + offset, len),
-            offset: 0, // The slice already includes the offset
-            len,
+        assert!(
+            offset + len <= self.len(),
+            "sub-handle exceeds parent bounds"
+        );
+        match self {
+            Self::Cpu {
+                slot, offset: base, ..
+            } => Self::Cpu {
+                slot: slot.slice(base + offset, len),
+                offset: 0, // The slice already includes the offset
+                len,
+            },
+            Self::DmaBuf {
+                slot, offset: base, ..
+            } => Self::DmaBuf {
+                slot: Arc::clone(slot),
+                offset: base + offset,
+                len,
+            },
         }
     }
 }
 
 impl Clone for MemoryHandle {
     fn clone(&self) -> Self {
-        Self {
-            slot: self.slot.clone(), // Increments refcount in shared memory
-            offset: self.offset,
-            len: self.len,
+        match self {
+            Self::Cpu { slot, offset, len } => Self::Cpu {
+                slot: slot.clone(), // Increments refcount in shared memory
+                offset: *offset,
+                len: *len,
+            },
+            Self::DmaBuf { slot, offset, len } => Self::DmaBuf {
+                slot: Arc::clone(slot),
+                offset: *offset,
+                len: *len,
+            },
         }
     }
 }
 
 impl std::fmt::Debug for MemoryHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MemoryHandle")
-            .field("arena_id", &self.slot.arena_id())
-            .field("offset", &self.offset)
-            .field("len", &self.len)
-            .field("refcount", &self.slot.refcount())
-            .finish()
+        match self {
+            Self::Cpu { slot, offset, len } => f
+                .debug_struct("MemoryHandle::Cpu")
+                .field("arena_id", &slot.arena_id())
+                .field("offset", offset)
+                .field("len", len)
+                .field("refcount", &slot.refcount())
+                .finish(),
+            Self::DmaBuf { slot, offset, len } => f
+                .debug_struct("MemoryHandle::DmaBuf")
+                .field("slot", slot)
+                .field("offset", offset)
+                .field("len", len)
+                .field("refs", &Arc::strong_count(slot))
+                .finish(),
+        }
     }
 }
 
@@ -263,8 +399,47 @@ impl<T> Buffer<T> {
     ///
     /// This allows in-place modification of buffer data without
     /// allocation, which is essential for RT-safe processing.
+    ///
+    /// # Panics
+    ///
+    /// Panics on a read-only DmaBuf mapping (#145) — nothing in-tree
+    /// produces one into a pipeline; the in-place-mutating elements are CPU
+    /// audio paths that never see dmabuf. Use
+    /// [`try_as_bytes_mut`](Self::try_as_bytes_mut) where the backing is
+    /// not statically known.
     pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        self.memory
+            .as_mut_slice()
+            .expect("buffer backed by a read-only dmabuf mapping cannot be mutated")
+    }
+
+    /// Get the buffer data as a mutable byte slice, or `None` for a
+    /// read-only DmaBuf mapping (#145).
+    pub fn try_as_bytes_mut(&mut self) -> Option<&mut [u8]> {
         self.memory.as_mut_slice()
+    }
+
+    /// Copy this buffer's payload into a fresh CPU arena slot (#145).
+    ///
+    /// Variant-agnostic replacement for the old `DmaBufBuffer::to_buffer`:
+    /// copies exactly [`len`](Self::len) bytes (not the whole mapping) and
+    /// carries the metadata over. The bridge for CPU-only consumers of a
+    /// dmabuf-producing element — `memorycopy` uses it.
+    pub fn copy_to_cpu(&self, arena: &crate::memory::SharedArena) -> crate::error::Result<Self> {
+        let mut slot = arena.acquire().ok_or(crate::error::Error::PoolExhausted)?;
+        let data = self.as_bytes();
+        if data.len() > slot.len() {
+            return Err(crate::error::Error::InvalidSegment(format!(
+                "arena slot too small: need {} bytes, slot is {}",
+                data.len(),
+                slot.len()
+            )));
+        }
+        slot.data_mut()[..data.len()].copy_from_slice(data);
+        Ok(Self::new(
+            MemoryHandle::with_len(slot, data.len()),
+            self.metadata.clone(),
+        ))
     }
 
     /// Get the length of the buffer data.
@@ -629,7 +804,7 @@ mod tests {
         let handle = MemoryHandle::new(slot);
         let buffer = Buffer::<()>::new(handle, Metadata::from_sequence(0));
 
-        let ipc_ref = buffer.memory().ipc_ref();
+        let ipc_ref = buffer.memory().ipc_ref().expect("cpu handle");
         assert_eq!(ipc_ref.arena_id, arena.id());
         assert_eq!(ipc_ref.len, 4096);
     }
@@ -645,7 +820,7 @@ mod tests {
         assert_eq!(sub.len(), 200);
 
         // IPC ref should reflect the slice
-        let ipc_ref = sub.memory().ipc_ref();
+        let ipc_ref = sub.memory().ipc_ref().expect("cpu handle");
         assert_eq!(ipc_ref.len, 200);
     }
 
@@ -663,7 +838,7 @@ mod tests {
         assert_eq!(&handle.as_slice()[0..5], b"hello");
 
         // Write via handle
-        handle.as_mut_slice()[5..10].copy_from_slice(b"world");
+        handle.as_mut_slice().expect("cpu is writable")[5..10].copy_from_slice(b"world");
 
         // Read via buffer
         let buffer = Buffer::<()>::new(handle, Metadata::from_sequence(0));
@@ -686,7 +861,10 @@ mod tests {
         let handle = MemoryHandle::new(slot);
         let buffer = Buffer::<()>::new(handle, Metadata::from_sequence(0));
 
-        assert_eq!(buffer.memory().slot().arena_id(), arena.id());
+        assert_eq!(
+            buffer.memory().slot().expect("cpu handle").arena_id(),
+            arena.id()
+        );
     }
 
     #[test]
@@ -696,5 +874,101 @@ mod tests {
         let slot = arena.acquire().unwrap();
         let handle = MemoryHandle::new(slot);
         let _ = handle.slice(900, 200); // 900 + 200 > 1024
+    }
+}
+
+#[cfg(test)]
+mod dmabuf_handle_tests {
+    use super::*;
+    use crate::memory::{DmaBufSegment, DmaBufSlot};
+    use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+
+    fn memfd_segment(len: u64) -> DmaBufSegment {
+        let fd = rustix::fs::memfd_create("buffer_dmabuf_test", rustix::fs::MemfdFlags::CLOEXEC)
+            .unwrap();
+        rustix::fs::ftruncate(&fd, len).unwrap();
+        DmaBufSegment::from_fd(fd, len as usize).unwrap()
+    }
+
+    fn dmabuf_buffer(len: u64) -> Buffer {
+        let slot = Arc::new(DmaBufSlot::new(memfd_segment(len)));
+        Buffer::new(MemoryHandle::from_dmabuf(slot), Metadata::from_sequence(0))
+    }
+
+    #[test]
+    fn dmabuf_handle_reports_its_type_and_no_arena() {
+        let buf = dmabuf_buffer(4096);
+        assert_eq!(buf.memory_type(), MemoryType::DmaBuf);
+        assert!(buf.memory().slot().is_none());
+        assert!(buf.memory().ipc_ref().is_none());
+        assert!(buf.memory().arena_id().is_none());
+        assert!(buf.memory().dmabuf_slot().is_some());
+        assert!(buf.memory().dmabuf_fd().is_some());
+    }
+
+    #[test]
+    fn clone_shares_the_slot_and_drop_releases_once() {
+        let fired = Arc::new(AtomicU32::new(0));
+        let hook_fired = fired.clone();
+        let segment = Arc::new(memfd_segment(1024));
+        let slot = Arc::new(DmaBufSlot::with_release(
+            segment,
+            3,
+            Box::new(move |_| {
+                hook_fired.fetch_add(1, AtomicOrdering::SeqCst);
+            }),
+        ));
+        let buf = Buffer::<()>::new(
+            MemoryHandle::from_dmabuf_with_len(slot, 0, 512),
+            Metadata::from_sequence(0),
+        );
+        assert_eq!(buf.len(), 512);
+        let clone = buf.clone();
+        assert_eq!(buf.memory().refcount(), 2);
+        drop(buf);
+        assert_eq!(fired.load(AtomicOrdering::SeqCst), 0);
+        drop(clone);
+        assert_eq!(fired.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn dmabuf_bytes_are_readable_and_writable() {
+        let mut buf = dmabuf_buffer(1024);
+        buf.as_bytes_mut()[..5].copy_from_slice(b"hello");
+        assert_eq!(&buf.as_bytes()[..5], b"hello");
+        assert!(buf.try_as_bytes_mut().is_some());
+    }
+
+    #[test]
+    fn readonly_mapping_refuses_mutation() {
+        let fd = rustix::fs::memfd_create("ro_dmabuf", rustix::fs::MemfdFlags::CLOEXEC).unwrap();
+        rustix::fs::ftruncate(&fd, 1024).unwrap();
+        let segment = DmaBufSegment::from_fd_readonly(fd, 1024).unwrap();
+        let mut buf = Buffer::<()>::new(
+            MemoryHandle::from_dmabuf(Arc::new(DmaBufSlot::new(segment))),
+            Metadata::from_sequence(0),
+        );
+        assert!(buf.try_as_bytes_mut().is_none());
+    }
+
+    #[test]
+    fn slice_offsets_into_the_mapping() {
+        let mut buf = dmabuf_buffer(1024);
+        buf.as_bytes_mut()[100..105].copy_from_slice(b"world");
+        let sub = buf.slice(100, 5);
+        assert_eq!(sub.as_bytes(), b"world");
+        assert_eq!(sub.memory_type(), MemoryType::DmaBuf);
+    }
+
+    #[test]
+    fn copy_to_cpu_copies_exactly_len_bytes() {
+        let arena = crate::memory::SharedArena::new(4096, 4).unwrap();
+        let mut buf = dmabuf_buffer(4096);
+        buf.as_bytes_mut()[..4].copy_from_slice(b"data");
+        let sub = buf.slice(0, 4);
+        let cpu = sub.copy_to_cpu(&arena).unwrap();
+        assert_eq!(cpu.memory_type(), MemoryType::Cpu);
+        assert_eq!(cpu.len(), 4, "len(), not the whole mapping");
+        assert_eq!(cpu.as_bytes(), b"data");
     }
 }

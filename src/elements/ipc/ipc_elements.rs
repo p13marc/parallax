@@ -365,7 +365,17 @@ impl AsyncSink for IpcSink {
         }
 
         let buffer = ctx.buffer();
-        let slot = buffer.memory().slot();
+        // The descriptor ring speaks arena identity — a dmabuf-backed buffer
+        // has none (#145). Per-buffer SCM_RIGHTS fd passing is the honest
+        // follow-up; until then, negotiate Cpu or insert `memorycopy`.
+        let (Some(slot), Some(ipc_ref)) = (buffer.memory().slot(), buffer.memory().ipc_ref())
+        else {
+            return Err(Error::Element(
+                "ipcsink: dmabuf-backed buffer cannot cross the descriptor ring; \
+                 negotiate Cpu memory upstream or insert a memorycopy"
+                    .into(),
+            ));
+        };
 
         // Register-on-first-sight: the descriptor names this arena, so its
         // fd must be with the peer before the descriptor is (socket FIFO +
@@ -388,11 +398,7 @@ impl AsyncSink for IpcSink {
         // Rare custom metadata overflows through the socket, before the
         // descriptor that references it.
         let overflow = overflow_entries(buffer.metadata());
-        let mut desc = crate::memory::IpcDescriptor::encode(
-            seq,
-            &buffer.memory().ipc_ref(),
-            buffer.metadata(),
-        );
+        let mut desc = crate::memory::IpcDescriptor::encode(seq, &ipc_ref, buffer.metadata());
         if !overflow.is_empty() {
             self.send_message(&ControlMessage::MetaOverflow {
                 seq,
