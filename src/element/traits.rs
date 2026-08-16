@@ -2282,7 +2282,6 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
                         ProduceResult::Produced(n) => Ok(Some(ctx.finalize(n))),
                         ProduceResult::Eos => Ok(None),
                         ProduceResult::OwnBuffer(buffer) => Ok(Some(buffer)),
-                        ProduceResult::OwnDmaBuf(dmabuf) => Ok(Some(dmabuf.to_buffer(arena)?)),
                         ProduceResult::WouldBlock => Ok(None),
                     }
                 } else {
@@ -2290,9 +2289,6 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
                     let mut ctx = ProduceContext::with_pool_only(pool.as_ref());
                     match self.inner.produce(&mut ctx)? {
                         ProduceResult::OwnBuffer(buffer) => Ok(Some(buffer)),
-                        ProduceResult::OwnDmaBuf(_) => Err(crate::error::Error::BufferPool(
-                            "arena exhausted, cannot convert DmaBuf to Buffer".into(),
-                        )),
                         ProduceResult::Eos => Ok(None),
                         ProduceResult::WouldBlock => Ok(None),
                         ProduceResult::Produced(_) => Err(crate::error::Error::BufferPool(
@@ -2305,9 +2301,6 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
                 let mut ctx = ProduceContext::with_pool_only(pool.as_ref());
                 match self.inner.produce(&mut ctx)? {
                     ProduceResult::OwnBuffer(buffer) => Ok(Some(buffer)),
-                    ProduceResult::OwnDmaBuf(_) => Err(crate::error::Error::BufferPool(
-                        "no arena configured, cannot convert DmaBuf to Buffer".into(),
-                    )),
                     ProduceResult::Eos => Ok(None),
                     ProduceResult::WouldBlock => Ok(None),
                     ProduceResult::Produced(_) => Err(crate::error::Error::BufferPool(
@@ -2323,7 +2316,6 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
                     ProduceResult::Produced(n) => Ok(Some(ctx.finalize(n))),
                     ProduceResult::Eos => Ok(None),
                     ProduceResult::OwnBuffer(buffer) => Ok(Some(buffer)),
-                    ProduceResult::OwnDmaBuf(dmabuf) => Ok(Some(dmabuf.to_buffer(arena)?)),
                     ProduceResult::WouldBlock => Ok(None),
                 }
             } else {
@@ -2331,9 +2323,6 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
                 let mut ctx = ProduceContext::without_buffer();
                 match self.inner.produce(&mut ctx)? {
                     ProduceResult::OwnBuffer(buffer) => Ok(Some(buffer)),
-                    ProduceResult::OwnDmaBuf(_) => Err(crate::error::Error::BufferPool(
-                        "arena exhausted, cannot convert DmaBuf to Buffer".into(),
-                    )),
                     ProduceResult::Eos => Ok(None),
                     ProduceResult::WouldBlock => Ok(None),
                     ProduceResult::Produced(_) => Err(crate::error::Error::BufferPool(
@@ -2346,9 +2335,6 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
             let mut ctx = ProduceContext::without_buffer();
             match self.inner.produce(&mut ctx)? {
                 ProduceResult::OwnBuffer(buffer) => Ok(Some(buffer)),
-                ProduceResult::OwnDmaBuf(_) => Err(crate::error::Error::BufferPool(
-                    "no arena configured, cannot convert DmaBuf to Buffer".into(),
-                )),
                 ProduceResult::Eos => Ok(None),
                 ProduceResult::WouldBlock => Ok(None),
                 ProduceResult::Produced(_) => Err(crate::error::Error::BufferPool(
@@ -2395,9 +2381,6 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
                         ProduceResult::Produced(n) => Ok(SourceResult::Buffer(ctx.finalize(n))),
                         ProduceResult::Eos => Ok(SourceResult::Eos),
                         ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(buffer)),
-                        ProduceResult::OwnDmaBuf(dmabuf) => {
-                            Ok(SourceResult::Buffer(dmabuf.to_buffer(arena)?))
-                        }
                         ProduceResult::WouldBlock => Ok(SourceResult::WouldBlock),
                     }
                 } else {
@@ -2405,9 +2388,6 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
                     configure_clock(&mut ctx);
                     match self.inner.produce(&mut ctx)? {
                         ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(buffer)),
-                        ProduceResult::OwnDmaBuf(_) => Err(crate::error::Error::BufferPool(
-                            "arena exhausted, cannot convert DmaBuf to Buffer".into(),
-                        )),
                         ProduceResult::Eos => Ok(SourceResult::Eos),
                         ProduceResult::WouldBlock => Ok(SourceResult::WouldBlock),
                         ProduceResult::Produced(_) => Err(crate::error::Error::BufferPool(
@@ -2420,9 +2400,6 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
                 configure_clock(&mut ctx);
                 match self.inner.produce(&mut ctx)? {
                     ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(buffer)),
-                    ProduceResult::OwnDmaBuf(_) => Err(crate::error::Error::BufferPool(
-                        "no arena configured, cannot convert DmaBuf to Buffer".into(),
-                    )),
                     ProduceResult::Eos => Ok(SourceResult::Eos),
                     ProduceResult::WouldBlock => Ok(SourceResult::WouldBlock),
                     ProduceResult::Produced(_) => Err(crate::error::Error::BufferPool(
@@ -2438,9 +2415,6 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
                     ProduceResult::Produced(n) => Ok(SourceResult::Buffer(ctx.finalize(n))),
                     ProduceResult::Eos => Ok(SourceResult::Eos),
                     ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(buffer)),
-                    ProduceResult::OwnDmaBuf(dmabuf) => {
-                        Ok(SourceResult::Buffer(dmabuf.to_buffer(arena)?))
-                    }
                     ProduceResult::WouldBlock => Ok(SourceResult::WouldBlock),
                 }
             } else {
@@ -2448,9 +2422,6 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
                 configure_clock(&mut ctx);
                 match self.inner.produce(&mut ctx)? {
                     ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(buffer)),
-                    ProduceResult::OwnDmaBuf(_) => Err(crate::error::Error::BufferPool(
-                        "arena exhausted, cannot convert DmaBuf to Buffer".into(),
-                    )),
                     ProduceResult::Eos => Ok(SourceResult::Eos),
                     ProduceResult::WouldBlock => Ok(SourceResult::WouldBlock),
                     ProduceResult::Produced(_) => Err(crate::error::Error::BufferPool(
@@ -2463,9 +2434,6 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
             configure_clock(&mut ctx);
             match self.inner.produce(&mut ctx)? {
                 ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(buffer)),
-                ProduceResult::OwnDmaBuf(_) => Err(crate::error::Error::BufferPool(
-                    "no arena configured, cannot convert DmaBuf to Buffer".into(),
-                )),
                 ProduceResult::Eos => Ok(SourceResult::Eos),
                 ProduceResult::WouldBlock => Ok(SourceResult::WouldBlock),
                 ProduceResult::Produced(_) => Err(crate::error::Error::BufferPool(
@@ -3034,7 +3002,6 @@ impl<S: AsyncSource + Send + 'static> SendAsyncElementDyn for AsyncSourceAdapter
                     ProduceResult::Produced(n) => Ok(Some(ctx.finalize(n))),
                     ProduceResult::Eos => Ok(None),
                     ProduceResult::OwnBuffer(buffer) => Ok(Some(buffer)),
-                    ProduceResult::OwnDmaBuf(dmabuf) => Ok(Some(dmabuf.to_buffer(arena)?)),
                     ProduceResult::WouldBlock => Ok(None),
                 }
             } else {
@@ -3042,9 +3009,6 @@ impl<S: AsyncSource + Send + 'static> SendAsyncElementDyn for AsyncSourceAdapter
                 let mut ctx = ProduceContext::without_buffer();
                 match self.inner.produce(&mut ctx).await? {
                     ProduceResult::OwnBuffer(buffer) => Ok(Some(buffer)),
-                    ProduceResult::OwnDmaBuf(_) => Err(crate::error::Error::BufferPool(
-                        "arena exhausted, cannot convert DmaBuf to Buffer".into(),
-                    )),
                     ProduceResult::Eos => Ok(None),
                     ProduceResult::WouldBlock => Ok(None),
                     ProduceResult::Produced(_) => Err(crate::error::Error::BufferPool(
@@ -3057,9 +3021,6 @@ impl<S: AsyncSource + Send + 'static> SendAsyncElementDyn for AsyncSourceAdapter
             let mut ctx = ProduceContext::without_buffer();
             match self.inner.produce(&mut ctx).await? {
                 ProduceResult::OwnBuffer(buffer) => Ok(Some(buffer)),
-                ProduceResult::OwnDmaBuf(_) => Err(crate::error::Error::BufferPool(
-                    "no arena configured, cannot convert DmaBuf to Buffer".into(),
-                )),
                 ProduceResult::Eos => Ok(None),
                 ProduceResult::WouldBlock => Ok(None),
                 ProduceResult::Produced(_) => Err(crate::error::Error::BufferPool(
@@ -3101,9 +3062,6 @@ impl<S: AsyncSource + Send + 'static> SendAsyncElementDyn for AsyncSourceAdapter
                     ProduceResult::Produced(n) => Ok(SourceResult::Buffer(ctx.finalize(n))),
                     ProduceResult::Eos => Ok(SourceResult::Eos),
                     ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(buffer)),
-                    ProduceResult::OwnDmaBuf(dmabuf) => {
-                        Ok(SourceResult::Buffer(dmabuf.to_buffer(arena)?))
-                    }
                     ProduceResult::WouldBlock => Ok(SourceResult::WouldBlock),
                 }
             } else {
@@ -3111,9 +3069,6 @@ impl<S: AsyncSource + Send + 'static> SendAsyncElementDyn for AsyncSourceAdapter
                 configure_clock(&mut ctx);
                 match self.inner.produce(&mut ctx).await? {
                     ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(buffer)),
-                    ProduceResult::OwnDmaBuf(_) => Err(crate::error::Error::BufferPool(
-                        "arena exhausted, cannot convert DmaBuf to Buffer".into(),
-                    )),
                     ProduceResult::Eos => Ok(SourceResult::Eos),
                     ProduceResult::WouldBlock => Ok(SourceResult::WouldBlock),
                     ProduceResult::Produced(_) => Err(crate::error::Error::BufferPool(
@@ -3126,9 +3081,6 @@ impl<S: AsyncSource + Send + 'static> SendAsyncElementDyn for AsyncSourceAdapter
             configure_clock(&mut ctx);
             match self.inner.produce(&mut ctx).await? {
                 ProduceResult::OwnBuffer(buffer) => Ok(SourceResult::Buffer(buffer)),
-                ProduceResult::OwnDmaBuf(_) => Err(crate::error::Error::BufferPool(
-                    "no arena configured, cannot convert DmaBuf to Buffer".into(),
-                )),
                 ProduceResult::Eos => Ok(SourceResult::Eos),
                 ProduceResult::WouldBlock => Ok(SourceResult::WouldBlock),
                 ProduceResult::Produced(_) => Err(crate::error::Error::BufferPool(

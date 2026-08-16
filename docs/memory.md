@@ -259,7 +259,7 @@ What an element should do on exhaustion depends on what it would corrupt:
 
 ## Other segment types
 
-One other segment type exists: `DmaBufSegment` — a DMA-BUF fd (V4L2 `VIDIOC_EXPBUF`, DRM, GPU export) mapped for CPU access. `DmaBufBuffer` wraps it with metadata; `into_fd()` recovers the fd; `to_buffer(arena)` copies into CPU memory when needed. (The old `MemorySegment` trait and the `MappedFileSegment`/`HugePageSegment` backends were deleted in the 2026-08 dead-surface sweep — an abstraction layer nothing consumed polymorphically.)
+One other backing exists: `DmaBufSegment` — a DMA-BUF fd (V4L2 `VIDIOC_EXPBUF`, DRM, GPU export) mapped for CPU access. Since #145 it flows through the pipeline as a first-class buffer backing: `MemoryHandle` is an enum, `Cpu{SharedSlotRef,..}` or `DmaBuf{Arc<DmaBufSlot>,..}` — a `DmaBufSlot` bundles the shared mapping with a release hook fired on last drop (a V4L2 source re-queues the buffer to the driver). `as_bytes()` works on both variants (the mapping lives as long as the slot); arena-only accessors (`slot()`, `ipc_ref()`, `arena_id()`) return `Option`. `Buffer::copy_to_cpu(&arena)` lands a dmabuf frame in CPU shm — `memorycopy` uses it when negotiation says a consumer needs CPU. (The old `DmaBufBuffer` side type and `ProduceResult::OwnDmaBuf` are gone; the `MemorySegment` trait and `MappedFileSegment`/`HugePageSegment` were deleted in the 2026-08 dead-surface sweep.)
 
 `MemoryType` (`Cpu`, `HugePages`, `MappedFile`, `DmaBuf`, `GpuAccessible`, `GpuDevice`, `RdmaRegistered`) participates in caps negotiation, so pipelines can select DMA-BUF vs CPU paths per link — see [formats.md](formats.md).
 

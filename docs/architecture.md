@@ -44,7 +44,7 @@ Everything above sits on the shared-memory foundation:
 - **`Buffer<T = ()>`** — a `MemoryHandle` (arena slot + offset + len) plus `Metadata`. Cloning is an atomic increment; `slice()` produces zero-copy sub-buffers. `Buffer<()>` is the dynamic form used throughout the pipeline; `Buffer<T>` carries a compile-time type tag.
 - **`Metadata`** — PTS/DTS/duration (`ClockTime`), sequence, stream id, `BufferFlags`, optional RTP header info and negotiated format, plus a typed extensible map for custom data (KLV, SEI, captions, app data).
 - **`FixedBufferPool`** — pipeline-level pool on top of `SharedArena` with blocking `acquire()` (backpressure) and statistics.
-- **DMA-BUF** (`DmaBufSegment`/`DmaBufBuffer`) — wraps device/GPU fds for the zero-copy capture path.
+- **DMA-BUF** (`DmaBufSegment`/`DmaBufSlot`, `MemoryHandle::DmaBuf`) — device/GPU fds flow through the pipeline as first-class buffers (#145), release-hook recycled back to the producer.
 
 Details: [memory.md](memory.md).
 
@@ -52,7 +52,7 @@ Details: [memory.md](memory.md).
 
 An element is a `Source`, `Sink`, `Element`/`Transform`, `Demuxer`, or `Muxer` implementation (or their async variants). Author traits are wrapped by adapters into a single type-erased runtime trait (`DynAsyncElement`, generated with trait-variant + dynosaur) that the executor drives.
 
-- Sources produce into pool-provided buffers via `ProduceContext` (`ProduceResult::Produced(n)`) or hand over their own buffers (`OwnBuffer`, `OwnDmaBuf`).
+- Sources produce into pool-provided buffers via `ProduceContext` (`ProduceResult::Produced(n)`) or hand over their own buffers (`OwnBuffer` — CPU-arena or dmabuf-backed alike, #145).
 - Elements declare **`ExecutionHints`** — `rt_safe`, `processing` (CPU/IO/memory-bound), `latency`, `memory` — which the executor uses to pick a strategy.
 - Elements may also expose caps (`output_media_caps`/`input_media_caps`), seeking (`is_seekable`/`query_duration` on the source traits), flow policies for live sources, and clocks (`as_clock_provider`).
 - A newer "simple" API (`SimpleSource`/`SimpleSink`/`SimpleTransform` + `Src`/`Snk`/`Xfm` wrappers) removes adapter boilerplate for straightforward elements.

@@ -458,7 +458,7 @@ Gated by any of `pipewire`, `libcamera`, `v4l2`, `alsa`. Backend detection/enume
 
 | Element | Feature | Capabilities |
 |---------|---------|--------------|
-| `V4l2Src` | `v4l2` | Camera capture; **DMA-BUF export** (`V4l2Config { dmabuf_export: true }` → `ProduceResult::OwnDmaBuf`); configurable frame rate (`framerate: Some((30, 1))`, clamped rate read back via `framerate()`); V4L2 monotonic timestamps |
+| `V4l2Src` | `v4l2` | Camera capture; **DMA-BUF flow-through** (#145: `dmabuf_export: true` + a downstream link that negotiated DmaBuf → zero-copy `MemoryHandle::DmaBuf` buffers, explicit QBUF/DQBUF with release-hook recycling; otherwise CPU copy); configurable frame rate (`framerate: Some((30, 1))`, clamped rate read back via `framerate()`) |
 | `LibCameraSrc` | `libcamera` | Modern camera API (Raspberry Pi, embedded, UVC); configurable frame rate via `FrameDurationLimits` (best-effort — UVC pipelines may ignore it); PTS from `SensorTimestamp` |
 | `PipeWireSrc` / `PipeWireSink` | `pipewire` | Audio/video via PipeWire; PTS from `spa_meta_header` |
 | `ScreenCaptureSrc` | `screen-capture` | XDG portal ScreenCast (Wayland-safe); cursor modes, session restore tokens |

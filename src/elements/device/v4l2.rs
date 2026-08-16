@@ -47,14 +47,14 @@ use v4l::io::traits::CaptureStream;
 use v4l::prelude::*;
 use v4l::video::Capture;
 
-use crate::buffer::{Buffer, DmaBufBuffer, MemoryHandle};
+use crate::buffer::{Buffer, MemoryHandle};
 use crate::clock::ClockTime;
 use crate::element::{ExecutionHints, ProduceContext, ProduceResult, Source};
 use crate::error::Result;
 use crate::format::{
     Caps, CapsValue, ElementMediaCaps, FormatMemoryCap, MemoryCaps, PixelFormat, VideoFormatCaps,
 };
-use crate::memory::{DmaBufSegment, OutputArena, OutputBudget, defaults};
+use crate::memory::{DmaBufSegment, DmaBufSlot, MemoryType, OutputArena, OutputBudget, defaults};
 use crate::metadata::Metadata;
 use crate::pipeline::flow::FlowStateHandle;
 
@@ -237,10 +237,26 @@ pub struct V4l2Src {
     output: OutputArena,
     /// Whether to export buffers as DMA-BUF file descriptors.
     dmabuf_export: bool,
-    /// Exported DMA-BUF file descriptors (one per buffer, when dmabuf_export is true).
-    exported_fds: Vec<OwnedFd>,
-    /// Frame sizes for each exported buffer (needed to create DmaBufSegment).
-    exported_sizes: Vec<usize>,
+    /// One long-lived mapping per exported buffer (#145) — mapped once at
+    /// open, shared by every in-flight [`DmaBufSlot`]. Replaces the old
+    /// per-frame try_clone + mmap.
+    dmabuf_segments: Vec<std::sync::Arc<DmaBufSegment>>,
+    /// Fed by each in-flight slot's last-drop hook; drained in `produce`
+    /// to re-queue (QBUF) the buffer — `buffer_count` is the real
+    /// backpressure depth.
+    dmabuf_release_tx: std::sync::mpsc::Sender<u32>,
+    dmabuf_release_rx: std::sync::mpsc::Receiver<u32>,
+    /// Buffers currently queued to the driver (dmabuf mode bookkeeping).
+    driver_queued: u32,
+    /// Whether the explicit-QBUF/STREAMON path has started.
+    dmabuf_streaming: bool,
+    /// Our own frame counter for dmabuf mode (the v4l crate keeps the
+    /// driver's per-buffer metadata private outside `next()`).
+    dmabuf_sequence: u64,
+    /// What the downstream link negotiated (#145): dmabuf is emitted ONLY
+    /// when this says `MemoryType::DmaBuf`; `None` (no negotiation ran)
+    /// keeps the CPU copy path — safe by default.
+    negotiated_memory: Option<MemoryType>,
     /// Flow state handle for downstream backpressure monitoring.
     flow_state: Option<FlowStateHandle>,
     /// Frames dropped due to backpressure.
@@ -375,10 +391,25 @@ impl V4l2Src {
 
         // Export buffers as DMA-BUF fds if requested
         let (exported_fds, exported_sizes) = if config.dmabuf_export {
-            Self::export_buffers(&dev, config.buffer_count, width, height, &actual_fourcc)?
+            Self::export_buffers(
+                &dev,
+                config.buffer_count,
+                width,
+                height,
+                &actual_fourcc,
+                driver_buffer_size,
+            )?
         } else {
             (Vec::new(), Vec::new())
         };
+
+        // Map each exported buffer once (#145). In-flight DmaBufSlots share
+        // these Arcs; dropping a slot returns its index, never unmaps.
+        let mut dmabuf_segments = Vec::with_capacity(exported_fds.len());
+        for (fd, size) in exported_fds.into_iter().zip(exported_sizes) {
+            dmabuf_segments.push(std::sync::Arc::new(DmaBufSegment::from_fd(fd, size)?));
+        }
+        let (dmabuf_release_tx, dmabuf_release_rx) = std::sync::mpsc::channel();
 
         Ok(Self {
             device: Some(dev),
@@ -393,8 +424,13 @@ impl V4l2Src {
             driver_buffer_size,
             output: OutputArena::new(defaults::VIDEO_CAPTURE_SLOT_COUNT),
             dmabuf_export: config.dmabuf_export,
-            exported_fds,
-            exported_sizes,
+            dmabuf_segments,
+            dmabuf_release_tx,
+            dmabuf_release_rx,
+            driver_queued: 0,
+            dmabuf_streaming: false,
+            dmabuf_sequence: 0,
+            negotiated_memory: None,
             flow_state: None,
             frames_dropped: 0,
             first_timestamp_usec: AtomicI64::new(i64::MIN),
@@ -408,12 +444,16 @@ impl V4l2Src {
         width: u32,
         height: u32,
         fourcc: &[u8; 4],
+        driver_buffer_size: Option<usize>,
     ) -> Result<(Vec<OwnedFd>, Vec<usize>)> {
         let device_fd = dev.handle().fd();
 
-        // Calculate frame size for this format
+        // Frame size: the driver's sizeimage is authoritative (#145 — the
+        // old per-fourcc estimate under-sized MJPG and over-sized nothing
+        // reliably); the estimate is only the fallback for drivers that
+        // report 0.
         let fourcc_str = std::str::from_utf8(fourcc).unwrap_or("????");
-        let frame_size = match fourcc_str {
+        let estimate = match fourcc_str {
             "MJPG" | "JPEG" => (width * height) as usize, // Estimate for compressed
             "YUYV" | "UYVY" => (width * height * 2) as usize,
             "NV12" | "NV21" => (width * height * 3 / 2) as usize,
@@ -423,6 +463,7 @@ impl V4l2Src {
             "GREY" | "Y800" => (width * height) as usize,
             _ => (width * height * 4) as usize, // Worst case
         };
+        let frame_size = driver_buffer_size.unwrap_or(estimate);
 
         let mut fds = Vec::with_capacity(buffer_count as usize);
         let mut sizes = Vec::with_capacity(buffer_count as usize);
@@ -592,6 +633,99 @@ impl V4l2Src {
     }
 }
 
+impl V4l2Src {
+    /// Whether produce() is in dmabuf flow-through mode (#145).
+    fn dmabuf_flow_active(&self) -> bool {
+        self.dmabuf_export
+            && self.negotiated_memory == Some(MemoryType::DmaBuf)
+            && !self.dmabuf_segments.is_empty()
+    }
+
+    /// Explicit QBUF/DQBUF capture (#145): each dequeued buffer index goes
+    /// downstream as a refcounted [`DmaBufSlot`] whose last drop sends the
+    /// index back for re-queueing. The driver only ever overwrites buffers
+    /// it owns, so an in-flight frame can never be torn — `buffer_count`
+    /// is the true backpressure depth, and all-slots-downstream surfaces
+    /// as `WouldBlock` rather than a deadlocked dequeue.
+    ///
+    /// The v4l crate keeps per-buffer driver metadata private outside
+    /// `next()`, so PTS comes from CLOCK_MONOTONIC at dequeue (the same
+    /// clock V4L2 stamps with; the in-kernel queue latency is the error
+    /// bound) and `sequence` from our own counter.
+    fn produce_dmabuf(&mut self) -> Result<ProduceResult> {
+        use v4l::io::traits::{CaptureStream, Stream as _};
+
+        let stream = self
+            .stream
+            .as_mut()
+            .ok_or_else(|| DeviceError::NotFound("device closed".to_string()))?;
+
+        if !self.dmabuf_streaming {
+            for index in 0..self.dmabuf_segments.len() {
+                CaptureStream::queue(stream, index).map_err(DeviceError::V4l2)?;
+            }
+            self.driver_queued = self.dmabuf_segments.len() as u32;
+            stream.start().map_err(DeviceError::V4l2)?;
+            self.dmabuf_streaming = true;
+        }
+
+        // Recycle slots released downstream: hand them back to the driver.
+        while let Ok(index) = self.dmabuf_release_rx.try_recv() {
+            CaptureStream::queue(stream, index as usize).map_err(DeviceError::V4l2)?;
+            self.driver_queued += 1;
+        }
+
+        // Downstream holds every buffer — a dequeue now would wait forever.
+        if self.driver_queued == 0 {
+            return Ok(ProduceResult::WouldBlock);
+        }
+
+        let index = CaptureStream::dequeue(stream).map_err(DeviceError::V4l2)? as u32;
+        self.driver_queued -= 1;
+
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: plain clock_gettime into a valid timespec.
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+        // Casts kept for portability: the libc time types differ per target.
+        #[allow(clippy::unnecessary_cast)]
+        let now_usec = ts.tv_sec as i64 * 1_000_000 + ts.tv_nsec as i64 / 1_000;
+        let _ = self.first_timestamp_usec.compare_exchange(
+            i64::MIN,
+            now_usec,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+        let first = self.first_timestamp_usec.load(Ordering::SeqCst);
+        let pts = ClockTime::from_nanos(((now_usec - first).max(0) as u64) * 1_000);
+
+        let mut metadata = Metadata::new().with_pts(pts);
+        metadata.sequence = self.dmabuf_sequence;
+        self.dmabuf_sequence += 1;
+        if self.frame_duration > ClockTime::ZERO {
+            metadata.duration = self.frame_duration;
+        }
+        self.stamp_geometry(&mut metadata);
+
+        let slot = std::sync::Arc::new(DmaBufSlot::with_release(
+            std::sync::Arc::clone(&self.dmabuf_segments[index as usize]),
+            index,
+            Box::new({
+                let tx = self.dmabuf_release_tx.clone();
+                move |idx| {
+                    let _ = tx.send(idx);
+                }
+            }),
+        ));
+        Ok(ProduceResult::OwnBuffer(Buffer::new(
+            MemoryHandle::from_dmabuf(slot),
+            metadata,
+        )))
+    }
+}
+
 impl Drop for V4l2Src {
     fn drop(&mut self) {
         // Ensure proper drop order: stream first, then device
@@ -602,6 +736,11 @@ impl Drop for V4l2Src {
 impl Source for V4l2Src {
     fn set_output_budget(&mut self, budget: OutputBudget) {
         self.output.set_budget(budget);
+    }
+
+    // #145: dmabuf is emitted only when the downstream link asked for it.
+    fn set_negotiated_memory(&mut self, memory: MemoryType) {
+        self.negotiated_memory = Some(memory);
     }
 
     fn produce(&mut self, ctx: &mut ProduceContext) -> Result<ProduceResult> {
@@ -621,49 +760,27 @@ impl Source for V4l2Src {
                 );
             }
 
-            // We need to dequeue and discard a frame to keep the driver happy
-            if let Some(stream) = self.stream.as_mut() {
+            // We need to dequeue and discard a frame to keep the driver
+            // happy. In dmabuf mode the explicit-QBUF bookkeeping owns the
+            // queue — leave the frame with the driver instead (capture
+            // simply stalls until a buffer frees up).
+            if !self.dmabuf_flow_active()
+                && let Some(stream) = self.stream.as_mut()
+            {
                 let _ = stream.next(); // Discard frame
             }
 
             return Ok(ProduceResult::WouldBlock);
         }
 
-        // DMA-BUF export path: capture frame and return DmaBufBuffer
-        if self.dmabuf_export && !self.exported_fds.is_empty() {
-            let stream = self
-                .stream
-                .as_mut()
-                .ok_or_else(|| DeviceError::NotFound("device closed".to_string()))?;
-
-            let (_buffer, meta) = stream.next().map_err(DeviceError::V4l2)?;
-            let buffer_index = (meta.sequence as usize) % self.exported_fds.len();
-
-            // Copy timestamp info before releasing the borrow
-            let timestamp = meta.timestamp;
-            let sequence = meta.sequence;
-
-            // Calculate PTS from V4L2 timestamp
-            let pts = self.calculate_pts(&timestamp);
-
-            // Clone the fd so the segment owns it (we keep the original for reuse)
-            let fd = self.exported_fds[buffer_index]
-                .try_clone()
-                .map_err(DeviceError::V4l2)?;
-
-            let size = self.exported_sizes[buffer_index];
-            let segment = DmaBufSegment::from_fd(fd, size)?;
-
-            let mut metadata = Metadata::new().with_pts(pts);
-            metadata.sequence = sequence as u64;
-            if self.frame_duration > ClockTime::ZERO {
-                metadata.duration = self.frame_duration;
-            }
-            self.stamp_geometry(&mut metadata);
-
-            return Ok(ProduceResult::OwnDmaBuf(DmaBufBuffer::new(
-                segment, metadata,
-            )));
+        // DMA-BUF flow-through (#145): only when the downstream link
+        // negotiated DmaBuf. The old path desynced the exported fd from the
+        // dequeued frame (index guessed from `sequence % n`), re-mmap'd per
+        // frame, and let MmapStream::next() hand the buffer back to the
+        // driver one produce() later while downstream might still be
+        // reading it — safe then only because everything was copied.
+        if self.dmabuf_flow_active() {
+            return self.produce_dmabuf();
         }
 
         // The slot size follows the driver's negotiated sizeimage, and the

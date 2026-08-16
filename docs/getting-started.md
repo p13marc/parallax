@@ -97,7 +97,7 @@ Key points:
 - `produce` returns a `ProduceResult`:
   - `Produced(n)` — wrote `n` bytes into the context's buffer (the zero-allocation fast path),
   - `OwnBuffer(buffer)` — the source made its own `Buffer` (fallback),
-  - `OwnDmaBuf(buffer)` — a DMA-BUF backed buffer (zero-copy device path),
+  - (a dmabuf-backed frame is just `OwnBuffer` with `MemoryHandle::DmaBuf` memory, #145),
   - `WouldBlock` — no data right now,
   - `Eos` — stream finished.
 - Transforms implement `Element` (`process(&mut self, Buffer) -> Result<Option<Buffer>>`) or the multi-output `Transform` trait. There are async variants (`AsyncSource`, `AsyncSink`, `AsyncTransform`) for real I/O.

@@ -508,9 +508,7 @@ mod tests {
                     received.push(buf.metadata().sequence);
                 }
                 ProduceResult::Eos => break,
-                ProduceResult::WouldBlock
-                | ProduceResult::Produced(_)
-                | ProduceResult::OwnDmaBuf(_) => {
+                ProduceResult::WouldBlock | ProduceResult::Produced(_) => {
                     // Shouldn't happen in this test, but handle gracefully
                 }
             }

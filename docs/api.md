@@ -43,7 +43,7 @@ brings in: `Buffer`, `Metadata`/`BufferFlags`/`RtpMeta`, clock types (`Clock`, `
 | `SimpleSource`, `SimpleSink`, `SimpleTransform` + `Src`/`Snk`/`Xfm` | Boilerplate-free element API (`ProcessOutput`) |
 | `PipelineElement` / `SendPipelineElement` | Unified next-gen element trait |
 | `ProduceContext`, `ConsumeContext`, `ProcessContext`, `ElementContext` | Contexts: pooled buffers, metadata setters, clock access, bus posting |
-| `ProduceResult` | `Produced(n)` / `Eos` / `OwnBuffer` / `OwnDmaBuf` / `WouldBlock` |
+| `ProduceResult` | `Produced(n)` / `Eos` / `OwnBuffer` / `WouldBlock` |
 | `Output`, `ProcessOutput`, `SourceResult` | Multi-output enums |
 | `ExecutionHints`, `TrustLevel`, `ProcessingHint`, `LatencyHint`, `MemoryHint` | Scheduling hints (profiles: `rt_safe()`, `io_bound()`, …) |
 | `*Adapter` (Source/Sink/Element/Transform/Muxer/…) | Wrap author traits into `DynAsyncElement` |
@@ -64,7 +64,7 @@ brings in: `Buffer`, `Metadata`/`BufferFlags`/`RtpMeta`, clock types (`Clock`, `
 
 ### `parallax::buffer` / `parallax::metadata`
 
-`Buffer<T = ()>` (`new`, `as_bytes[_mut]`, `slice`, `metadata[_mut]`, `into_dynamic`), `MemoryHandle`, `DmaBufBuffer`; `Metadata` (pts/dts/duration/sequence/stream_id/flags + typed custom map: `set`/`get`/`get_mut`/`remove`/`set_bytes`/`set_klv`/`set_sei`), `BufferFlags`, `RtpMeta`.
+`Buffer<T = ()>` (`new`, `as_bytes[_mut]`, `try_as_bytes_mut`, `copy_to_cpu`, `slice`, `metadata[_mut]`, `into_dynamic`), `MemoryHandle::{Cpu, DmaBuf}` (#145); `Metadata` (pts/dts/duration/sequence/stream_id/flags + typed custom map: `set`/`get`/`get_mut`/`remove`/`set_bytes`/`set_klv`/`set_sei`), `BufferFlags`, `RtpMeta`.
 
 ### `parallax::format` / `parallax::negotiation`
 

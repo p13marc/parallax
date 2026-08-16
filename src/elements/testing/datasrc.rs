@@ -200,7 +200,6 @@ mod tests {
             ProduceResult::Produced(n) => Ok(Some(ctx.finalize(n))),
             ProduceResult::Eos => Ok(None),
             ProduceResult::OwnBuffer(buf) => Ok(Some(buf)),
-            ProduceResult::OwnDmaBuf(dmabuf) => Ok(Some(dmabuf.to_buffer(arena)?)),
             ProduceResult::WouldBlock => Ok(None),
         }
     }
