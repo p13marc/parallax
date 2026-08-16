@@ -1118,12 +1118,7 @@ async fn mp4_segment_seek_loops_gaplessly() {
     );
 
     handle.stop();
-    loop {
-        match video_handle.pull_buffer().await {
-            Pulled::Buffer(_) | Pulled::Flushing | Pulled::Empty => {}
-            Pulled::Ended(_) => break,
-        }
-    }
+    while !matches!(video_handle.pull_buffer().await, Pulled::Ended(_)) {}
     handle.wait().await.unwrap();
 }
 
@@ -1415,11 +1410,14 @@ async fn mp4_accurate_seek_segment_starts_at_the_request() {
         }
     }
 
-    // Data starts at the snapped keyframe (stale pre-seek frames may race
-    // the flush; judge from the seek's own landing).
+    // Data starts at the snapped keyframe. Judge from the LAST 500 ms
+    // frame: startup playback can just reach 500 ms before the seek lands
+    // (a handful of frames fit in the sink/channel queues), and stale
+    // pre-seek frames may race the flush — the final stretch is always the
+    // seek's own playback.
     let landing = pts
         .iter()
-        .position(|p| *p == 500)
+        .rposition(|p| *p == 500)
         .unwrap_or_else(|| panic!("data starts at the 500 ms keyframe: {pts:?}"));
     assert_eq!(
         &pts[landing..landing + 4],
