@@ -587,6 +587,16 @@ impl AsyncSink for AutoVideoSink {
         self.qos.take().map(crate::event::Event::Qos)
     }
 
+    /// Declared latency (#184): pacing may hold a frame up to its lateness
+    /// budget past the ideal presentation time.
+    fn latency(&self) -> Option<crate::pipeline::seek::LatencyRange> {
+        self.sync.then(|| {
+            crate::pipeline::seek::LatencyRange::up_to(ClockTime::from_nanos(
+                self.max_lateness.as_nanos() as u64,
+            ))
+        })
+    }
+
     fn handle_downstream_event(
         &mut self,
         event: crate::event::Event,

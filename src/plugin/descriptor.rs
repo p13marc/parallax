@@ -17,6 +17,8 @@ use std::ffi::{CStr, c_char, c_int, c_void};
 /// bump is not a compatibility inconvenience — it is undefined behaviour.
 ///
 /// History:
+/// - **8**: `AsyncElementDyn::latency` (declared-latency aggregation, #184)
+///   — a new vtable slot.
 /// - **7**: `AsyncElementDyn::take_upstream_event` (demuxer-originated
 ///   upstream events, #173) plus `SeekEvent` gaining a private refinement
 ///   round — a new vtable slot and an event layout change.
@@ -32,7 +34,7 @@ use std::ffi::{CStr, c_char, c_int, c_void};
 /// - **3**: `AsyncElementDyn::process_demux` (demuxer routing).
 /// - **2**: `AsyncElementDyn::set_output_budget` (executor-sized output arenas).
 /// - **1**: initial hand-rolled `#[repr(C)]` descriptor ABI.
-pub const PARALLAX_ABI_VERSION: u32 = 7;
+pub const PARALLAX_ABI_VERSION: u32 = 8;
 
 /// Function pointer type for creating element instances.
 ///
@@ -405,7 +407,7 @@ mod tests {
     fn test_abi_version() {
         // Pinned so a vtable change to AsyncElementDyn has to be a decision.
         // 2: set_output_budget.
-        assert_eq!(PARALLAX_ABI_VERSION, 7);
+        assert_eq!(PARALLAX_ABI_VERSION, 8);
     }
 
     #[test]

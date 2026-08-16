@@ -77,6 +77,51 @@ pub struct DurationQuery {
     pub duration: Option<u64>,
 }
 
+/// An element's declared processing latency (#184).
+///
+/// Declared via the `latency()` trait method (jitter buffers, pacing
+/// sinks), summed along each source→sink path at start, with the pipeline
+/// figure being the worst path. Static and honest-but-coarse: it bounds
+/// buffering an element *deliberately* introduces, not measured wall time
+/// (that is [`LatencyTracer`](crate::pipeline::LatencyTracer)'s job).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LatencyRange {
+    /// Minimum latency the element always introduces.
+    pub min: crate::clock::ClockTime,
+    /// Upper bound the element may introduce.
+    pub max: crate::clock::ClockTime,
+}
+
+impl LatencyRange {
+    /// A fixed latency (min == max).
+    pub fn fixed(latency: crate::clock::ClockTime) -> Self {
+        Self {
+            min: latency,
+            max: latency,
+        }
+    }
+
+    /// Zero to `max` — an element that may hold data up to a bound.
+    pub fn up_to(max: crate::clock::ClockTime) -> Self {
+        Self {
+            min: crate::clock::ClockTime::ZERO,
+            max,
+        }
+    }
+
+    /// Sum of two ranges (saturating), for path accumulation.
+    pub fn plus(self, other: Self) -> Self {
+        Self {
+            min: crate::clock::ClockTime::from_nanos(
+                self.min.nanos().saturating_add(other.min.nanos()),
+            ),
+            max: crate::clock::ClockTime::from_nanos(
+                self.max.nanos().saturating_add(other.max.nanos()),
+            ),
+        }
+    }
+}
+
 /// Result of a seekable range query.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeekableQuery {

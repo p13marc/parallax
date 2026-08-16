@@ -133,8 +133,16 @@ pub enum MessageKind {
         /// Frames dropped in the window.
         dropped: u64,
     },
-    /// Latency changed — pipeline should recalculate latency.
-    LatencyChanged,
+    /// The pipeline's aggregate declared latency (#184). Posted once at
+    /// start when any element declares a latency (jitter buffers, pacing
+    /// sinks): the worst source→sink path's sum. Also queryable via
+    /// `PipelineHandle::latency()`.
+    LatencyChanged {
+        /// Minimum latency along the worst path.
+        min: ClockTime,
+        /// Maximum latency along the worst path.
+        max: ClockTime,
+    },
 
     // --- Buffering ---
     /// Network buffering progress (0-100%).
@@ -284,7 +292,9 @@ impl fmt::Display for MessageKind {
                      ({processed} presented, {dropped} dropped)"
                 )
             }
-            MessageKind::LatencyChanged => write!(f, "LatencyChanged"),
+            MessageKind::LatencyChanged { min, max } => {
+                write!(f, "LatencyChanged: {min} .. {max}")
+            }
             MessageKind::Buffering { percent, mode, .. } => {
                 write!(f, "Buffering: {percent}% ({mode:?})")
             }

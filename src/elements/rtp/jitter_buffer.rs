@@ -474,6 +474,14 @@ impl Element for RtpJitterBuffer {
     fn name(&self) -> &str {
         &self.name
     }
+
+    /// Declared latency (#184): the configured hold-back window is exactly
+    /// the latency this element introduces by design.
+    fn latency(&self) -> Option<crate::pipeline::seek::LatencyRange> {
+        Some(crate::pipeline::seek::LatencyRange::fixed(
+            crate::clock::ClockTime::from_millis(self.config.latency_ms),
+        ))
+    }
 }
 
 /// Information about packet loss for RTCP reporting.

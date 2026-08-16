@@ -818,6 +818,12 @@ pub trait Sink: Send {
         None
     }
 
+    /// The latency this sink deliberately introduces (#184) — e.g. a pacing
+    /// window. Summed into the pipeline latency at start. Default: none.
+    fn latency(&self) -> Option<crate::pipeline::seek::LatencyRange> {
+        None
+    }
+
     /// Get a clock provider if this sink can provide a clock.
     ///
     /// Audio sinks typically provide a hardware clock that can be used
@@ -898,6 +904,12 @@ pub trait AsyncSink: Send {
     /// An upstream event this sink wants to ORIGINATE (#184); see
     /// [`Sink::take_upstream_event`].
     fn take_upstream_event(&mut self) -> Option<Event> {
+        None
+    }
+
+    /// The latency this sink deliberately introduces (#184); see
+    /// [`Sink::latency`].
+    fn latency(&self) -> Option<crate::pipeline::seek::LatencyRange> {
         None
     }
 
@@ -1050,6 +1062,13 @@ pub trait Element: Send {
     /// Default implementation passes all events upstream.
     fn handle_upstream_event(&mut self, _event: &Event) -> EventResult {
         EventResult::NotHandled
+    }
+
+    /// The latency this element deliberately introduces (#184) — e.g. a
+    /// jitter buffer's depth. Summed into the pipeline latency at start.
+    /// Default: none.
+    fn latency(&self) -> Option<crate::pipeline::seek::LatencyRange> {
+        None
     }
 }
 
@@ -1856,6 +1875,20 @@ pub trait AsyncElementDyn {
         None
     }
 
+    /// The processing latency this element deliberately introduces (#184).
+    ///
+    /// Snapshotted at `Executor::start` and summed along each source→sink
+    /// path; the worst path becomes the pipeline latency, posted once as
+    /// `MessageKind::LatencyChanged` and queryable via
+    /// `PipelineHandle::latency()`. Declare it for elements that *hold*
+    /// data by design — jitter buffers, pacing sinks, sync'ing muxers.
+    /// Default: none (adds nothing to the path).
+    ///
+    /// ABI 8: adding this vtable slot is why the plugin ABI bumped.
+    fn latency(&self) -> Option<crate::pipeline::seek::LatencyRange> {
+        None
+    }
+
     /// Flush a demuxer, keeping the pad routing.
     ///
     /// The flat [`flush`](Self::flush) cannot serve a demuxer: it returns
@@ -2501,6 +2534,10 @@ impl<S: Sink + Send + 'static> SendAsyncElementDyn for SinkAdapter<S> {
         self.inner.take_upstream_event()
     }
 
+    fn latency(&self) -> Option<crate::pipeline::seek::LatencyRange> {
+        self.inner.latency()
+    }
+
     fn process_inline(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
         if let Some(ref buffer) = input {
             let mut ctx = ConsumeContext::new(buffer);
@@ -2579,6 +2616,11 @@ impl<E: Element + Send + 'static> SendAsyncElementDyn for ElementAdapter<E> {
     // the author trait so mid-graph elements can handle or translate them.
     fn handle_upstream_event(&mut self, event: &Event) -> EventResult {
         self.inner.handle_upstream_event(event)
+    }
+
+    // #184: declared latency feeds the start-time pipeline aggregate.
+    fn latency(&self) -> Option<crate::pipeline::seek::LatencyRange> {
+        self.inner.latency()
     }
 
     // #164: without this override the dyn default swallowed the call, so a
@@ -2681,6 +2723,11 @@ impl SendAsyncElementDyn for BoxedElementAdapter {
     // the author trait so mid-graph elements can handle or translate them.
     fn handle_upstream_event(&mut self, event: &Event) -> EventResult {
         self.inner.handle_upstream_event(event)
+    }
+
+    // #184: declared latency feeds the start-time pipeline aggregate.
+    fn latency(&self) -> Option<crate::pipeline::seek::LatencyRange> {
+        self.inner.latency()
     }
 
     // #164: without this override the dyn default swallowed the call, so a
@@ -3133,6 +3180,10 @@ impl<S: AsyncSink + Send + 'static> SendAsyncElementDyn for AsyncSinkAdapter<S> 
     // #184: sinks originate upstream events (QoS).
     fn take_upstream_event(&mut self) -> Option<Event> {
         self.inner.take_upstream_event()
+    }
+
+    fn latency(&self) -> Option<crate::pipeline::seek::LatencyRange> {
+        self.inner.latency()
     }
 
     async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {

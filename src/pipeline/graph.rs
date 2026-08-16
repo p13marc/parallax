@@ -1693,6 +1693,55 @@ impl Pipeline {
         None
     }
 
+    /// Aggregate the declared element latency (#184): each element's
+    /// [`latency()`](crate::element::AsyncElementDyn::latency) is summed
+    /// along every source→sink path and the worst path wins. `None` when no
+    /// element declares one — an all-default pipeline has nothing honest to
+    /// report. Snapshotted by `Executor::start` into
+    /// `PipelineHandle::latency()` and posted as
+    /// [`MessageKind::LatencyChanged`](crate::pipeline::bus::MessageKind::LatencyChanged).
+    pub fn query_latency(&self) -> Option<crate::pipeline::seek::LatencyRange> {
+        use crate::clock::ClockTime;
+        use crate::pipeline::seek::LatencyRange;
+
+        fn cumulative(
+            p: &Pipeline,
+            id: NodeId,
+            memo: &mut HashMap<NodeId, LatencyRange>,
+            any: &mut bool,
+        ) -> LatencyRange {
+            if let Some(v) = memo.get(&id) {
+                return *v;
+            }
+            let own = p
+                .get_node(id)
+                .and_then(|n| n.element.as_ref())
+                .and_then(|e| e.latency());
+            if own.is_some() {
+                *any = true;
+            }
+            let own = own.unwrap_or(LatencyRange::fixed(ClockTime::ZERO));
+            let worst_parent = p
+                .parents(id)
+                .into_iter()
+                .map(|(pid, _)| cumulative(p, pid, memo, any))
+                .max_by_key(|r| r.max.nanos())
+                .unwrap_or(LatencyRange::fixed(ClockTime::ZERO));
+            let total = worst_parent.plus(own);
+            memo.insert(id, total);
+            total
+        }
+
+        let mut memo = HashMap::new();
+        let mut any = false;
+        let worst = self
+            .sinks()
+            .into_iter()
+            .map(|s| cumulative(self, s, &mut memo, &mut any))
+            .max_by_key(|r| r.max.nanos());
+        if any { worst } else { None }
+    }
+
     /// Send an upstream event to all source elements.
     ///
     /// Returns `true` if any source handled the event.

@@ -600,6 +600,9 @@ pub struct PipelineHandle {
     /// Last-presented PTS in nanoseconds, written by the sink tasks;
     /// `u64::MAX` until a sink has presented (or after a flush reset it).
     position: Arc<AtomicU64>,
+    /// Aggregate declared latency (#184), snapshotted at start; `None`
+    /// when no element declared one.
+    latency: Option<crate::pipeline::seek::LatencyRange>,
 }
 
 impl PipelineHandle {
@@ -1004,6 +1007,15 @@ impl PipelineHandle {
         *self.pause_tx.borrow()
     }
 
+    /// The pipeline's aggregate declared latency (#184), snapshotted at
+    /// start: each element's declared `latency()` summed along every
+    /// source→sink path, worst path reported. `None` when no element
+    /// declares one. Also posted once at start as
+    /// [`MessageKind::LatencyChanged`](crate::pipeline::bus::MessageKind::LatencyChanged).
+    pub fn latency(&self) -> Option<crate::pipeline::seek::LatencyRange> {
+        self.latency
+    }
+
     /// Current stream position.
     ///
     /// The PTS of the last buffer any sink presented — monotonic between
@@ -1114,6 +1126,16 @@ impl Executor {
         // State transitions
         let old_state = pipeline.state();
         let bus_handle = pipeline.bus_handle().clone();
+        // Aggregate declared latency (#184), while the elements are still in
+        // the graph. Posted once — the variant is honest now: it appears
+        // exactly when a computed value exists.
+        let latency = pipeline.query_latency();
+        if let Some(l) = latency {
+            bus_handle.post(crate::pipeline::bus::MessageKind::LatencyChanged {
+                min: l.min,
+                max: l.max,
+            });
+        }
         let outcome = TerminalOutcome::new(bus_handle.clone());
         // The seed share, held for the whole of `start()`. Without it, a source
         // that runs dry before its siblings are even spawned would take the live
@@ -1333,6 +1355,7 @@ impl Executor {
             pausable,
             base_time: clock_info.map(|(_, b)| b).unwrap_or(ClockTime::NONE),
             position: runtime.position,
+            latency,
         })
     }
 
