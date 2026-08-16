@@ -713,6 +713,15 @@ impl SeekFlags {
     pub const ACCURATE: Self = Self(1 << 1);
     /// Seek to nearest keyframe.
     pub const KEY_UNIT: Self = Self(1 << 2);
+    /// Segment seek (#165): when playback reaches the seek's stop (or the
+    /// natural end), the pipeline posts
+    /// [`MessageKind::SegmentDone`](crate::pipeline::bus::MessageKind::SegmentDone)
+    /// on the bus INSTEAD of delivering EOS — the producer stays alive
+    /// awaiting the next seek. Respond with a non-flushing SEGMENT seek back
+    /// to the start for a gapless loop (the queued segment accumulates
+    /// `base`, so running time stays monotonic across laps). GStreamer's
+    /// `SEEK_FLAG_SEGMENT`, same bit.
+    pub const SEGMENT: Self = Self(1 << 3);
     /// Snap to position before target.
     pub const SNAP_BEFORE: Self = Self(1 << 4);
     /// Snap to position after target.

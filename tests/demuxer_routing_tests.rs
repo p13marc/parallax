@@ -951,3 +951,257 @@ async fn mp4_fast_forward_emits_keyframes_only() {
         "normal playback restored after the rate-1.0 seek: {pts2:?}"
     );
 }
+
+/// #165 SEGMENT seeks: a SEGMENT-flagged seek with a stop posts
+/// `SegmentDone` on the bus when playback reaches the stop — the sink never
+/// sees EOS, the producer idles — and the app's follow-up NON-flushing
+/// SEGMENT seek starts the next lap gaplessly: its queued segment carries
+/// the accumulated `base`, so running time is monotonic across laps.
+#[cfg(feature = "mp4-demux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn mp4_segment_seek_loops_gaplessly() {
+    use parallax::clock::ClockTime;
+    use parallax::elements::Mp4DemuxSource;
+    use parallax::elements::demux::Mp4Demux;
+    use parallax::elements::mux::{Mp4Mux, Mp4MuxConfig, Mp4VideoTrackConfig};
+    use parallax::event::{Event, SeekEvent, SeekFlags, SeekPosition, SegmentEvent};
+    use parallax::pipeline::bus::MessageKind;
+    use parallax::pipeline::probe::{PadRef, ProbeData, ProbeReturn, ProbeType};
+    use std::io::Cursor;
+    use std::sync::{Arc, Mutex};
+
+    // 20 frames at 100 ms, keyframe every 5 (t = 0/500/1000/1500 ms).
+    let mut mux = Mp4Mux::new(Cursor::new(Vec::new()), Mp4MuxConfig::default()).unwrap();
+    let sps = vec![0x67, 0x42, 0x00, 0x1f];
+    let pps = vec![0x68, 0xce, 0x3c, 0x80];
+    let video = mux
+        .add_video_track(Mp4VideoTrackConfig::h264(320, 240, &sps, &pps))
+        .unwrap();
+    let keyframe = [0x00, 0x00, 0x00, 0x02, 0x65, 0xAA];
+    let delta = [0x00, 0x00, 0x00, 0x02, 0x41, 0x9A];
+    for i in 0..20u64 {
+        let is_key = i.is_multiple_of(5);
+        let data: &[u8] = if is_key { &keyframe } else { &delta };
+        mux.write_video_sample(video, data, i * 100, 100, is_key)
+            .unwrap();
+    }
+    let mp4_data = mux.finish().unwrap().into_inner();
+    let demux = Mp4Demux::new(Cursor::new(mp4_data.clone()), mp4_data.len() as u64).unwrap();
+
+    let mut pipeline = Pipeline::new();
+    // Small queue + Block link: the producer stalls a few frames in, so a
+    // seek lands before startup playback can run past the assertions below.
+    let video_sink = AppSink::with_max_buffers(2);
+    let video_handle = video_sink.handle();
+    let node = pipeline.add_demuxer("mp4demux", Mp4DemuxSource::video_only(demux));
+    let vs = pipeline.add_async_sink("video_sink", video_sink);
+    pipeline
+        .link_pads_full(
+            node,
+            "video",
+            vs,
+            "sink",
+            parallax::pipeline::LinkPolicy::Block,
+            Some(2),
+        )
+        .unwrap();
+
+    let segments: Arc<Mutex<Vec<SegmentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let segments_probe = segments.clone();
+    let _ = pipeline.add_probe(PadRef::sink(vs), ProbeType::EVENT_DOWN, move |data| {
+        if let ProbeData::Event(Event::Segment(seg)) = data {
+            segments_probe.lock().unwrap().push(seg.clone());
+        }
+        ProbeReturn::Ok
+    });
+
+    let executor = Executor::new();
+    let mut handle = executor.start(&mut pipeline).unwrap();
+    let mut bus = handle.take_bus().unwrap();
+
+    for _ in 0..2 {
+        assert!(matches!(
+            video_handle.pull_buffer().await,
+            Pulled::Buffer(_)
+        ));
+    }
+
+    // Lap 1: flushing SEGMENT seek over [0, 800 ms).
+    let seek = SeekEvent::new_time(ClockTime::ZERO)
+        .with_flags(SeekFlags::FLUSH | SeekFlags::KEY_UNIT | SeekFlags::SEGMENT)
+        .with_stop(SeekPosition::set(800_000_000));
+    assert!(handle.seek(seek).await);
+
+    // Pull until SegmentDone arrives; the sink must never report Ended.
+    let mut lap1 = Vec::new();
+    let mut segment_done = None;
+    for _ in 0..2000 {
+        while let Some(msg) = bus.poll() {
+            if let MessageKind::SegmentDone {
+                seqnum, position, ..
+            } = msg.kind
+            {
+                segment_done = Some((seqnum, position));
+            }
+        }
+        match video_handle.try_pull_buffer() {
+            Pulled::Buffer(b) => {
+                lap1.push(b.metadata().pts.nanos() / 1_000_000);
+                continue;
+            }
+            Pulled::Ended(reason) => panic!("SEGMENT seek must not end the stream: {reason:?}"),
+            _ => {}
+        }
+        // SegmentDone posts when the PRODUCER exhausts the range; trailing
+        // frames may still be in flight — drain until the last one lands.
+        if segment_done.is_some() && lap1.contains(&700) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let (_seq1, done_pos) = segment_done.expect("SegmentDone posted");
+    assert_eq!(done_pos, Some(800_000_000), "position reports the stop");
+    assert!(
+        lap1.iter().all(|p| *p < 800),
+        "playback ended at the seek's stop: {lap1:?}"
+    );
+    assert!(
+        lap1.contains(&700),
+        "the last pre-stop frame was delivered: {lap1:?}"
+    );
+
+    // Lap 2: NON-flushing SEGMENT seek back to 0 — gapless.
+    let lap2_seek = SeekEvent::new_time(ClockTime::ZERO)
+        .with_flags(SeekFlags::KEY_UNIT | SeekFlags::SEGMENT)
+        .with_stop(SeekPosition::set(800_000_000));
+    assert!(handle.seek(lap2_seek).await);
+
+    let mut lap2 = Vec::new();
+    for _ in 0..2000 {
+        match video_handle.try_pull_buffer() {
+            Pulled::Buffer(b) => {
+                lap2.push(b.metadata().pts.nanos() / 1_000_000);
+                continue;
+            }
+            Pulled::Ended(reason) => panic!("lap 2 must not end the stream: {reason:?}"),
+            _ => {}
+        }
+        if lap2.len() >= 4 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        lap2.first() == Some(&0),
+        "lap 2 restarts at the seek target: {lap2:?}"
+    );
+
+    // The lap-2 segment accumulated base: 8 frames of lap 1 (0..=700 ms,
+    // anchored at 0, rate 1) -> 700 ms of running time.
+    let segs = segments.lock().unwrap().clone();
+    let lap2_seg = segs
+        .iter()
+        .rev()
+        .find(|s| s.base > 0)
+        .unwrap_or_else(|| panic!("lap-2 segment carries accumulated base: {segs:?}"));
+    assert_eq!(lap2_seg.base, 700_000_000, "{segs:?}");
+    assert_eq!(lap2_seg.start, 0);
+    // Monotonic running time across the lap boundary.
+    let lap1_seg = segs.iter().find(|s| s.base == 0 && s.start == 0).unwrap();
+    let end_of_lap1 = lap1_seg
+        .to_running_time(ClockTime::from_nanos(700_000_000))
+        .nanos();
+    let start_of_lap2 = lap2_seg.to_running_time(ClockTime::ZERO).nanos();
+    assert!(
+        start_of_lap2 >= end_of_lap1,
+        "gapless: lap 2 running time continues ({end_of_lap1} -> {start_of_lap2})"
+    );
+
+    handle.stop();
+    loop {
+        match video_handle.pull_buffer().await {
+            Pulled::Buffer(_) | Pulled::Flushing | Pulled::Empty => {}
+            Pulled::Ended(_) => break,
+        }
+    }
+    handle.wait().await.unwrap();
+}
+
+/// #165: a plain (non-SEGMENT) seek with a stop really ends at the stop —
+/// the sink sees EOS after the last pre-stop frame.
+#[cfg(feature = "mp4-demux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn mp4_plain_seek_with_stop_ends_at_stop() {
+    use parallax::clock::ClockTime;
+    use parallax::elements::Mp4DemuxSource;
+    use parallax::elements::demux::Mp4Demux;
+    use parallax::elements::mux::{Mp4Mux, Mp4MuxConfig, Mp4VideoTrackConfig};
+    use parallax::event::{SeekEvent, SeekPosition};
+    use std::io::Cursor;
+
+    let mut mux = Mp4Mux::new(Cursor::new(Vec::new()), Mp4MuxConfig::default()).unwrap();
+    let sps = vec![0x67, 0x42, 0x00, 0x1f];
+    let pps = vec![0x68, 0xce, 0x3c, 0x80];
+    let video = mux
+        .add_video_track(Mp4VideoTrackConfig::h264(320, 240, &sps, &pps))
+        .unwrap();
+    let keyframe = [0x00, 0x00, 0x00, 0x02, 0x65, 0xAA];
+    let delta = [0x00, 0x00, 0x00, 0x02, 0x41, 0x9A];
+    for i in 0..20u64 {
+        let is_key = i.is_multiple_of(5);
+        let data: &[u8] = if is_key { &keyframe } else { &delta };
+        mux.write_video_sample(video, data, i * 100, 100, is_key)
+            .unwrap();
+    }
+    let mp4_data = mux.finish().unwrap().into_inner();
+    let demux = Mp4Demux::new(Cursor::new(mp4_data.clone()), mp4_data.len() as u64).unwrap();
+
+    let mut pipeline = Pipeline::new();
+    let video_sink = AppSink::with_max_buffers(2);
+    let video_handle = video_sink.handle();
+    let node = pipeline.add_demuxer("mp4demux", Mp4DemuxSource::video_only(demux));
+    let vs = pipeline.add_async_sink("video_sink", video_sink);
+    pipeline
+        .link_pads_full(
+            node,
+            "video",
+            vs,
+            "sink",
+            parallax::pipeline::LinkPolicy::Block,
+            Some(2),
+        )
+        .unwrap();
+
+    let executor = Executor::new();
+    let handle = executor.start(&mut pipeline).unwrap();
+
+    for _ in 0..2 {
+        assert!(matches!(
+            video_handle.pull_buffer().await,
+            Pulled::Buffer(_)
+        ));
+    }
+
+    // Default flags (FLUSH | KEY_UNIT), stop at 800 ms, no SEGMENT.
+    let seek = SeekEvent::new_time(ClockTime::ZERO).with_stop(SeekPosition::set(800_000_000));
+    assert!(handle.seek(seek).await);
+
+    let mut pts = Vec::new();
+    loop {
+        match video_handle.pull_buffer().await {
+            Pulled::Buffer(b) => pts.push(b.metadata().pts.nanos() / 1_000_000),
+            Pulled::Flushing | Pulled::Empty => tokio::task::yield_now().await,
+            Pulled::Ended(_) => break,
+        }
+    }
+    // A stale pre-seek frame can race the flush; judge the post-landing
+    // tail (the last restart at 0), which is the seek's own playback.
+    let landing = pts.iter().rposition(|p| *p == 0).unwrap_or(0);
+    let tail = &pts[landing..];
+    assert!(
+        tail.iter().all(|p| *p < 800),
+        "nothing at/past the stop: {pts:?}"
+    );
+    assert!(tail.contains(&700), "last pre-stop frame arrived: {pts:?}");
+    handle.wait().await.unwrap();
+}

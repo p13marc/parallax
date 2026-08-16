@@ -731,3 +731,68 @@ async fn mkv_fast_forward_emits_keyframes_only() {
         "normal playback restored after the rate-1.0 seek: {pts2:?}"
     );
 }
+
+/// #165: a seek with a stop ends playback at the stop, not the file's end.
+/// (SEGMENT-flag behavior is pinned on the MP4 twin; here we pin the
+/// stop-honoring half for Matroska.)
+#[tokio::test(flavor = "multi_thread")]
+async fn mkv_seek_with_stop_ends_at_stop() {
+    use parallax::clock::ClockTime;
+    use parallax::event::{SeekEvent, SeekPosition};
+
+    let demux = open(H264_AAC_MKV).video_only();
+
+    let mut pipeline = Pipeline::new();
+    // Small queue + Block link so startup playback stalls a few frames in
+    // and the seek's flush sheds what little is in flight.
+    let video_sink = AppSink::with_max_buffers(2);
+    let video_handle = video_sink.handle();
+    let node = pipeline.add_demuxer("mkvdemux", demux);
+    let vs = pipeline.add_async_sink("video_sink", video_sink);
+    pipeline
+        .link_pads_full(
+            node,
+            "video",
+            vs,
+            "sink",
+            parallax::pipeline::LinkPolicy::Block,
+            Some(2),
+        )
+        .unwrap();
+
+    let executor = Executor::new();
+    let handle = executor.start(&mut pipeline).unwrap();
+
+    for _ in 0..2 {
+        assert!(matches!(
+            video_handle.pull_buffer().await,
+            Pulled::Buffer(_)
+        ));
+    }
+
+    // Fixture: 2 s, 20 frames at 10 fps. Stop at 1 s -> frames 0..=900 ms.
+    let seek = SeekEvent::new_time(ClockTime::ZERO).with_stop(SeekPosition::set(1_000_000_000));
+    assert!(handle.seek(seek).await);
+
+    let mut pts = Vec::new();
+    loop {
+        match video_handle.pull_buffer().await {
+            Pulled::Buffer(b) => pts.push(b.metadata().pts.nanos() / 1_000_000),
+            Pulled::Flushing | Pulled::Empty => tokio::task::yield_now().await,
+            Pulled::Ended(_) => break,
+        }
+    }
+    // Judge the post-landing tail (last restart at 0) — a stale pre-seek
+    // frame can race the flush.
+    let landing = pts.iter().rposition(|p| *p == 0).unwrap_or(0);
+    let tail = &pts[landing..];
+    assert!(
+        tail.iter().all(|p| *p < 1_000),
+        "nothing at/past the stop: {pts:?}"
+    );
+    assert!(
+        tail.iter().any(|p| *p >= 900),
+        "playback reached the last pre-stop frame: {pts:?}"
+    );
+    handle.wait().await.unwrap();
+}

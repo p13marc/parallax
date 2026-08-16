@@ -333,6 +333,11 @@ pub struct MkvDemux<R: Read + Seek> {
     /// Drop non-keyframe video frames until the first keyframe (set after a
     /// seek so a decoder never sees a mid-GOP entry).
     video_resync: bool,
+    /// Playback stop from the last handled seek's `stop`, in ticks (#165):
+    /// the first routed frame at or past it ends the run (the executor
+    /// turns that Eos into `SegmentDone` for a SEGMENT-flagged seek).
+    /// Cleared by a seek with no stop.
+    stop_ticks: Option<u64>,
     /// Converted frame waiting for an output slot. Arena exhaustion is flow
     /// control (the executor retries produce()), so the frame taken from the
     /// parser must survive the retry instead of being lost.
@@ -437,6 +442,7 @@ impl<R: Read + Seek> MkvDemux<R> {
             looping: false,
             trick_rate: 1.0,
             video_resync: false,
+            stop_ticks: None,
             pending: None,
             skip: Vec::new(),
             scan_budget: DEFAULT_SCAN_BUDGET,
@@ -528,6 +534,12 @@ impl<R: Read + Seek> MkvDemux<R> {
 
     /// Loop playback: at end of stream, seek back to the start and keep
     /// producing instead of reporting EOS.
+    ///
+    /// The rewind is silent (no events), so running time restarts each lap.
+    /// For gapless looping with monotonic running time, drive a
+    /// [`SeekFlags::SEGMENT`](crate::event::SeekFlags::SEGMENT) seek loop
+    /// from the bus instead (respond to `MessageKind::SegmentDone` with a
+    /// non-flushing SEGMENT seek back to the start, #165).
     pub fn with_loop(mut self, looping: bool) -> Self {
         self.looping = looping;
         self
@@ -807,6 +819,16 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
                 continue; // subtitle or extra track
             };
 
+            // Seek stop (#165): frames interleave in cluster time order, so
+            // the first routed frame at or past `stop` means every track is
+            // there — playback ends at the seek's stop, not the file's end.
+            if self
+                .stop_ticks
+                .is_some_and(|stop| self.frame.timestamp >= stop)
+            {
+                return Ok(DemuxerProduce::Eos);
+            }
+
             // Post-seek skip, strictly per track: only this track's own
             // first frame at/after the target clears its entry, so audio
             // interleaved ahead of video can no longer let pre-target video
@@ -1002,6 +1024,12 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
             // Trick play (#165): the seek's rate governs playback until the
             // next handled seek changes it.
             self.trick_rate = if seek.rate > 0.0 { seek.rate } else { 1.0 };
+            // Honor the seek's stop (#165): playback ends there. A seek
+            // without a stop clears any previous one.
+            self.stop_ticks = match seek.stop.seek_type {
+                SeekType::Set => Some(seek.stop.position.max(0) as u64 / self.timestamp_scale),
+                _ => None,
+            };
             // Per-track skip on EVERY path: the cue lands at (or before) the
             // skip target's cluster, the crate's narrow phase only guarantees
             // the first block, and the rewind fallback starts at zero — in

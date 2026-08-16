@@ -200,6 +200,26 @@ pub enum MessageKind {
         position: Option<u64>,
     },
 
+    /// A [`SeekFlags::SEGMENT`](crate::event::SeekFlags::SEGMENT) seek's
+    /// playback range finished (#165). Posted INSTEAD of the sinks seeing
+    /// EOS — the producer stays alive awaiting the next seek. Respond with
+    /// a non-flushing SEGMENT seek (back to the start for a gapless loop);
+    /// stop the pipeline with [`PipelineHandle::stop`] when done.
+    ///
+    /// [`PipelineHandle::stop`]: crate::pipeline::PipelineHandle::stop
+    SegmentDone {
+        /// Seqnum of the SEGMENT seek this completes (see
+        /// [`SeekDone`](Self::SeekDone) for the correlation discipline).
+        seqnum: u64,
+        /// The producing element whose segment ran out.
+        source: String,
+        /// Interpretation of `position`.
+        format: crate::event::SegmentFormat,
+        /// The seek's stop when it had one; `None` for a natural end
+        /// (no stop set — the stream simply ran out).
+        position: Option<u64>,
+    },
+
     // --- Application/Element-specific ---
     /// Element-specific structured message.
     Element {
@@ -278,6 +298,15 @@ impl fmt::Display for MessageKind {
             } => match position {
                 Some(p) => write!(f, "SeekDone #{seqnum} ({source}): {p} ({format:?})"),
                 None => write!(f, "SeekDone #{seqnum} ({source})"),
+            },
+            MessageKind::SegmentDone {
+                seqnum,
+                source,
+                format,
+                position,
+            } => match position {
+                Some(p) => write!(f, "SegmentDone #{seqnum} ({source}): {p} ({format:?})"),
+                None => write!(f, "SegmentDone #{seqnum} ({source})"),
             },
             MessageKind::Element {
                 structure_name,

@@ -2625,7 +2625,6 @@ struct HopOutcome {
     /// A Segment was emitted — the caller suppresses its lazy initial one.
     segment_emitted: bool,
     /// This task ran a seek to completion (the `Handled` arm).
-    #[allow(dead_code)] // consumed by the SEGMENT-seek slice (#165 commit 2)
     handled_seek: Option<HandledSeek>,
 }
 
@@ -2636,14 +2635,44 @@ impl HopOutcome {
     };
 }
 
-/// The facts of a seek this task just handled, kept for segment bookkeeping
-/// (#165: SEGMENT-flag detection in commit 2 reads `flags`/`stop`).
-#[allow(dead_code)]
+/// The facts of a seek this task just handled, kept for segment bookkeeping.
 struct HandledSeek {
     seqnum: u64,
     format: crate::event::SegmentFormat,
     flags: crate::event::SeekFlags,
     stop: Option<u64>,
+}
+
+/// A SEGMENT-flagged seek this producing task is playing out (#165).
+///
+/// When produce() reaches Eos while one is active, the task posts
+/// [`MessageKind::SegmentDone`](crate::pipeline::bus::MessageKind::SegmentDone)
+/// once instead of broadcasting EOS, then idles (control still drains) so
+/// the application's follow-up seek — non-flushing SEGMENT back to the
+/// start for a gapless loop — finds a live producer. `PipelineHandle::stop`
+/// still tears down cleanly via the loop's stop check.
+struct ActiveSegmentSeek {
+    seqnum: u64,
+    format: crate::event::SegmentFormat,
+    stop: Option<u64>,
+    done_posted: bool,
+}
+
+/// Fold a hop's outcome into the task's active-SEGMENT-seek state: any
+/// newly handled seek replaces the previous one (SEGMENT keeps the segment
+/// discipline armed, a plain seek disarms it).
+fn track_segment_seek(outcome: &HopOutcome, active: &mut Option<ActiveSegmentSeek>) {
+    if let Some(hs) = &outcome.handled_seek {
+        *active = hs
+            .flags
+            .contains(crate::event::SeekFlags::SEGMENT)
+            .then_some(ActiveSegmentSeek {
+                seqnum: hs.seqnum,
+                format: hs.format,
+                stop: hs.stop,
+                done_posted: false,
+            });
+    }
 }
 
 /// Probe-then-broadcast for an event emitted on a src pad: src-pad probes see
@@ -3239,6 +3268,7 @@ fn spawn_source_task(
         let byte_total = byte_total.flatten();
         let mut segment_sent = false;
         let mut segment_tracker = SegmentTracker::default();
+        let mut segment_seek: Option<ActiveSegmentSeek> = None;
         let mut last_seek_epoch: u64 = 0;
         // #163 phase B: set when this element converts a seek into another
         // format and forwards it upstream; cleared when the completion is
@@ -3266,7 +3296,7 @@ fn spawn_source_task(
             // The cost is that a source blocked inside `process_source` sees
             // the event only when that call returns — same caveat as `stop`.
             while let Ok(event) = upstream.rx.try_recv() {
-                segment_sent |= handle_upstream_hop(
+                let outcome = handle_upstream_hop(
                     &name,
                     &mut element,
                     &event,
@@ -3281,8 +3311,9 @@ fn spawn_source_task(
                     &mut pending_translation,
                     Some(&mut segment_tracker),
                 )
-                .await
-                .segment_emitted;
+                .await;
+                segment_sent |= outcome.segment_emitted;
+                track_segment_seek(&outcome, &mut segment_seek);
             }
 
             // Runtime pause (PipelineHandle::pause): stop producing until
@@ -3290,7 +3321,7 @@ fn spawn_source_task(
             // paused, and stop still wins.
             while *pause_rx.borrow() && !stop.load(Ordering::Acquire) {
                 while let Ok(event) = upstream.rx.try_recv() {
-                    segment_sent |= handle_upstream_hop(
+                    let outcome = handle_upstream_hop(
                         &name,
                         &mut element,
                         &event,
@@ -3305,8 +3336,9 @@ fn spawn_source_task(
                         &mut pending_translation,
                         Some(&mut segment_tracker),
                     )
-                    .await
-                    .segment_emitted;
+                    .await;
+                    segment_sent |= outcome.segment_emitted;
+                    track_segment_seek(&outcome, &mut segment_seek);
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
@@ -3380,6 +3412,23 @@ fn spawn_source_task(
                     tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                 }
                 Ok(SourceResult::Eos) => {
+                    // SEGMENT seek (#165): the segment ran out, not the
+                    // pipeline. Post SegmentDone once and idle awaiting the
+                    // app's follow-up seek; stop still tears down above.
+                    if let Some(ss) = segment_seek.as_mut() {
+                        if !ss.done_posted {
+                            ss.done_posted = true;
+                            bus.post(crate::pipeline::bus::MessageKind::SegmentDone {
+                                seqnum: ss.seqnum,
+                                source: name.clone(),
+                                format: ss.format,
+                                position: ss.stop,
+                            });
+                            tracing::info!("source '{}': segment done (seek {})", name, ss.seqnum);
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        continue;
+                    }
                     tracing::info!("source '{}': EOS after {} buffers", name, count);
                     broadcast_eos(&outputs).await;
                     for bridge in &output_bridges {
@@ -4276,6 +4325,7 @@ fn spawn_demuxer_task(
         // segment is broadcast to all pads anyway); ~one frame of A/V skew
         // in base is a documented approximation.
         let mut segment_tracker = SegmentTracker::default();
+        let mut segment_seek: Option<ActiveSegmentSeek> = None;
         let mut last_seek_epoch: u64 = 0;
         // #163 phase B: set when this element converts a seek into another
         // format and forwards it upstream; cleared when the completion is
@@ -4592,7 +4642,7 @@ fn spawn_demuxer_task(
                 // same polling contract as spawn_source_task.
                 if let Some(hop) = upstream.as_mut() {
                     while let Ok(event) = hop.rx.try_recv() {
-                        if handle_upstream_hop(
+                        let outcome = handle_upstream_hop(
                             &name,
                             &mut element,
                             &event,
@@ -4607,12 +4657,12 @@ fn spawn_demuxer_task(
                             &mut pending_translation,
                             Some(&mut segment_tracker),
                         )
-                        .await
-                        .segment_emitted
-                        {
+                        .await;
+                        if outcome.segment_emitted {
                             // The seek's segment went to every pad.
                             segment_pads.extend(outputs_by_pad.keys().cloned());
                         }
+                        track_segment_seek(&outcome, &mut segment_seek);
                     }
                 }
 
@@ -4627,7 +4677,7 @@ fn spawn_demuxer_task(
                 while *pause_rx.borrow() && !stop.load(Ordering::Acquire) {
                     if let Some(hop) = upstream.as_mut() {
                         while let Ok(event) = hop.rx.try_recv() {
-                            if handle_upstream_hop(
+                            let outcome = handle_upstream_hop(
                                 &name,
                                 &mut element,
                                 &event,
@@ -4642,11 +4692,11 @@ fn spawn_demuxer_task(
                                 &mut pending_translation,
                                 Some(&mut segment_tracker),
                             )
-                            .await
-                            .segment_emitted
-                            {
+                            .await;
+                            if outcome.segment_emitted {
                                 segment_pads.extend(outputs_by_pad.keys().cloned());
                             }
+                            track_segment_seek(&outcome, &mut segment_seek);
                         }
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -4707,6 +4757,27 @@ fn spawn_demuxer_task(
                         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                     }
                     Ok(DemuxResult::Eos) => {
+                        // SEGMENT seek (#165): post SegmentDone once and idle
+                        // awaiting the follow-up seek — same discipline as
+                        // spawn_source_task's Eos arm.
+                        if let Some(ss) = segment_seek.as_mut() {
+                            if !ss.done_posted {
+                                ss.done_posted = true;
+                                bus.post(crate::pipeline::bus::MessageKind::SegmentDone {
+                                    seqnum: ss.seqnum,
+                                    source: name.clone(),
+                                    format: ss.format,
+                                    position: ss.stop,
+                                });
+                                tracing::info!(
+                                    "demuxer '{}': segment done (seek {})",
+                                    name,
+                                    ss.seqnum
+                                );
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                            continue;
+                        }
                         tracing::info!("demuxer '{}': EOS after {} buffers", name, count);
                         for branches in outputs_by_pad.values() {
                             broadcast_eos(branches).await;

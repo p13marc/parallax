@@ -1139,6 +1139,12 @@ pub struct Mp4DemuxSource<R: Read + Seek + Send> {
     /// playback. PTS untouched: the post-seek Segment carries the rate
     /// and sinks pace by segment running time.
     trick_rate: f64,
+    /// Playback stop from the last handled seek's `stop` (#165): a track
+    /// whose next sample's PTS is at or past this counts as exhausted, so
+    /// playback really ends at `stop` (the executor turns the resulting Eos
+    /// into `SegmentDone` for a SEGMENT-flagged seek). Cleared by a seek
+    /// with no stop.
+    stop_ns: Option<u64>,
 }
 
 impl<R: Read + Seek + Send> Mp4DemuxSource<R> {
@@ -1166,6 +1172,7 @@ impl<R: Read + Seek + Send> Mp4DemuxSource<R> {
             primed: false,
             looping: false,
             trick_rate: 1.0,
+            stop_ns: None,
         }
     }
 
@@ -1189,6 +1196,12 @@ impl<R: Read + Seek + Send> Mp4DemuxSource<R> {
     /// allows one event loop per process ever, so tearing the pipeline down
     /// and rebuilding it cannot reopen the window. The stream then never
     /// ends on its own; stop it with [`PipelineHandle::stop`].
+    ///
+    /// The rewind is silent (no events), so running time restarts each lap.
+    /// For gapless looping with monotonic running time, drive a
+    /// [`SeekFlags::SEGMENT`](crate::event::SeekFlags::SEGMENT) seek loop
+    /// from the bus instead (respond to `MessageKind::SegmentDone` with a
+    /// non-flushing SEGMENT seek back to the start, #165).
     ///
     /// [`PipelineHandle::stop`]: crate::pipeline::PipelineHandle::stop
     pub fn with_loop(mut self, looping: bool) -> Self {
@@ -1245,13 +1258,20 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for Mp4DemuxSource<R> {
             }
         }
 
-        // Emit the pending sample with the smallest DTS.
+        // Emit the pending sample with the smallest DTS. A sample at or past
+        // the seek's stop counts its track as exhausted (#165) — playback
+        // ends at `stop`, not at the file's end.
+        let past_stop = |s: &Mp4Sample| {
+            self.stop_ns
+                .is_some_and(|stop| s.buffer.metadata().pts.nanos() >= stop)
+        };
         let next = self
             .pending
             .iter()
             .enumerate()
-            .filter_map(|(i, s)| s.as_ref().map(|s| (i, s.dts_ns)))
-            .min_by_key(|(_, dts)| *dts)
+            .filter_map(|(i, s)| s.as_ref().map(|s| (i, s)))
+            .filter(|(_, s)| !past_stop(s))
+            .min_by_key(|(_, s)| s.dts_ns)
             .map(|(i, _)| i);
 
         let Some(i) = next else {
@@ -1311,6 +1331,12 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for Mp4DemuxSource<R> {
                 // Trick play (#165): the seek's rate governs playback until
                 // the next handled seek changes it.
                 self.trick_rate = if seek.rate > 0.0 { seek.rate } else { 1.0 };
+                // Honor the seek's stop (#165): playback ends there. A seek
+                // without a stop clears any previous one.
+                self.stop_ns = match seek.stop.seek_type {
+                    SeekType::Set => Some(seek.stop.position.max(0) as u64),
+                    _ => None,
+                };
                 // The keyframe actually landed on (may be before the
                 // request) — Segment/SeekDone report it (#162).
                 EventResult::handled_at(point.time_ns as i64)
