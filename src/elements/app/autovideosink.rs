@@ -106,8 +106,71 @@ enum Pace {
     Present,
     /// Show it after this long.
     Wait(Duration),
-    /// Too late to be useful — drop it.
-    DropLate,
+    /// Too late to be useful — drop it, `late_ns` past the deadline.
+    DropLate {
+        /// How far past `max_lateness` the frame was (running time, ns).
+        late_ns: u64,
+    },
+}
+
+/// Length of one QoS aggregation window in running time (#184).
+const QOS_WINDOW_NS: u64 = 1_000_000_000;
+
+/// Aggregates presentation results into rate-limited QoS reports (#184).
+///
+/// The upstream transport has no dedup or rate limiting for non-seek
+/// events, so the origin throttles: counters accumulate over a ≥1 s window
+/// of running time and a single [`QosEvent`](crate::event::QosEvent) is
+/// staged at the window boundary — and only when something was actually
+/// dropped. The executor polls it via `AsyncSink::take_upstream_event`.
+#[derive(Debug, Default)]
+struct QosAggregator {
+    /// Running time when the current window opened.
+    window_start: Option<u64>,
+    processed: u64,
+    dropped: u64,
+    /// Worst lateness observed in the window.
+    worst_jitter_ns: i64,
+    /// The staged event, taken by the executor.
+    pending: Option<crate::event::QosEvent>,
+}
+
+impl QosAggregator {
+    fn presented(&mut self, now_ns: u64) {
+        self.processed += 1;
+        self.roll(now_ns);
+    }
+
+    fn dropped_late(&mut self, now_ns: u64, late_ns: u64) {
+        self.dropped += 1;
+        self.worst_jitter_ns = self.worst_jitter_ns.max(late_ns as i64);
+        self.roll(now_ns);
+    }
+
+    fn roll(&mut self, now_ns: u64) {
+        let start = *self.window_start.get_or_insert(now_ns);
+        if now_ns.saturating_sub(start) < QOS_WINDOW_NS {
+            return;
+        }
+        if self.dropped > 0 {
+            self.pending = Some(crate::event::QosEvent {
+                qos_type: crate::event::QosType::Underflow,
+                proportion: (self.processed + self.dropped) as f64 / self.processed.max(1) as f64,
+                jitter_ns: self.worst_jitter_ns,
+                timestamp: ClockTime::from_nanos(now_ns),
+                processed: self.processed,
+                dropped: self.dropped,
+            });
+        }
+        self.window_start = Some(now_ns);
+        self.processed = 0;
+        self.dropped = 0;
+        self.worst_jitter_ns = 0;
+    }
+
+    fn take(&mut self) -> Option<crate::event::QosEvent> {
+        self.pending.take()
+    }
 }
 
 /// Paces presentation in segment running time.
@@ -159,8 +222,9 @@ impl PtsPacer {
             };
         }
 
-        if now - target > max_lateness.as_nanos() as u64 {
-            Pace::DropLate
+        let deficit = now - target;
+        if deficit > max_lateness.as_nanos() as u64 {
+            Pace::DropLate { late_ns: deficit }
         } else {
             Pace::Present
         }
@@ -218,6 +282,9 @@ pub struct AutoVideoSink {
     segment: Option<crate::event::SegmentEvent>,
     /// Frames dropped for being late or for a full display channel.
     dropped: u64,
+    /// QoS origination (#184): lateness aggregated into rate-limited
+    /// upstream reports, polled via `take_upstream_event`.
+    qos: QosAggregator,
     /// Window-event channel, created when [`handle`](Self::handle) is called.
     /// `None` means no handle was taken and the event loop sends nothing —
     /// exactly the historical behavior.
@@ -357,6 +424,7 @@ impl AutoVideoSink {
             pacer: PtsPacer::default(),
             segment: None,
             dropped: 0,
+            qos: QosAggregator::default(),
             events: None,
             fullscreen: Arc::new(AtomicBool::new(false)),
             proxy: Arc::new(Mutex::new(None)),
@@ -513,6 +581,12 @@ impl Drop for AutoVideoSink {
 }
 
 impl AsyncSink for AutoVideoSink {
+    /// QoS origination (#184): the executor polls this after each consume;
+    /// the aggregator stages at most ~one event per second of running time.
+    fn take_upstream_event(&mut self) -> Option<crate::event::Event> {
+        self.qos.take().map(crate::event::Event::Qos)
+    }
+
     fn handle_downstream_event(
         &mut self,
         event: crate::event::Event,
@@ -573,6 +647,7 @@ impl AsyncSink for AutoVideoSink {
                 .map_or(meta.pts, |seg| seg.to_running_time(pts))
                 .to_option()
         {
+            let mut now_ns = now.nanos();
             let mut pace = self.pacer.schedule(pts, now, self.max_lateness);
             // Waiting here is the point: it is what back-pressures the
             // decoder and the source down to real time. Since #172 the wait
@@ -590,14 +665,19 @@ impl AsyncSink for AutoVideoSink {
             while let Pace::Wait(delay) = pace {
                 tokio::time::sleep(delay.min(Duration::from_millis(10))).await;
                 match ctx.running_time().to_option() {
-                    Some(now) => pace = self.pacer.schedule(pts, now, self.max_lateness),
+                    Some(now) => {
+                        now_ns = now.nanos();
+                        pace = self.pacer.schedule(pts, now, self.max_lateness);
+                    }
                     None => break,
                 }
             }
-            if pace == Pace::DropLate {
+            if let Pace::DropLate { late_ns } = pace {
+                self.qos.dropped_late(now_ns, late_ns);
                 self.drop_frame("late");
                 return Ok(());
             }
+            self.qos.presented(now_ns);
         }
 
         // Start display thread on first frame
@@ -1383,8 +1463,46 @@ mod tests {
                 ns(FRAME_25FPS + 41_000_000),
                 DEFAULT_MAX_LATENESS
             ),
-            Pace::DropLate
+            Pace::DropLate {
+                late_ns: 41_000_000
+            }
         );
+    }
+
+    #[test]
+    fn qos_aggregator_stages_only_after_a_window_with_drops() {
+        let mut agg = QosAggregator::default();
+        // A full window of clean presentation stages nothing.
+        agg.presented(0);
+        agg.presented(500_000_000);
+        agg.presented(1_100_000_000); // window rolls, dropped == 0
+        assert!(agg.take().is_none());
+
+        // Next window: 3 presented, 1 dropped -> proportion (3+1)/3.
+        agg.presented(1_200_000_000);
+        agg.presented(1_300_000_000);
+        agg.dropped_late(1_400_000_000, 70_000_000);
+        agg.presented(2_200_000_000); // rolls the window
+        let qos = agg.take().expect("staged after a window with drops");
+        assert_eq!(qos.qos_type, crate::event::QosType::Underflow);
+        assert_eq!(qos.processed, 3);
+        assert_eq!(qos.dropped, 1);
+        assert_eq!(qos.jitter_ns, 70_000_000);
+        assert!((qos.proportion - 4.0 / 3.0).abs() < 1e-9);
+        // One event per window: nothing new until the next roll.
+        assert!(agg.take().is_none());
+    }
+
+    #[test]
+    fn qos_aggregator_survives_zero_presented() {
+        let mut agg = QosAggregator::default();
+        agg.dropped_late(0, 10);
+        agg.dropped_late(1_500_000_000, 20); // rolls
+        let qos = agg.take().expect("staged");
+        assert_eq!(qos.processed, 0);
+        assert_eq!(qos.dropped, 2);
+        // Denominator clamps at 1 — no division by zero.
+        assert!((qos.proportion - 2.0).abs() < 1e-9);
     }
 
     #[test]

@@ -389,6 +389,10 @@ pub struct H264Encoder {
     applied_generation: u64,
     /// Arena for output buffer allocation, sized by the executor at start.
     output: OutputArena,
+    /// Consecutive QoS-underflow reports seen (#184). Skip-frames toggles
+    /// only on the second consecutive strong report — a rebuild costs an
+    /// IDR, so a flapping signal must not thrash the encoder.
+    qos_underflows: u32,
 }
 
 /// Build an OpenH264 encoder from our config.
@@ -475,6 +479,7 @@ impl H264Encoder {
             control: super::EncoderControl::new(),
             applied_generation: 0,
             output,
+            qos_underflows: 0,
         })
     }
 
@@ -783,6 +788,48 @@ fn contains_idr(data: &[u8]) -> bool {
 impl Element for H264Encoder {
     fn set_output_budget(&mut self, budget: OutputBudget) {
         self.output.set_budget(budget);
+    }
+
+    /// QoS consumer (#184): sustained downstream underflow turns on
+    /// rate-control frame skipping; recovery turns it back off.
+    ///
+    /// Hysteresis is load-bearing: `set_skip_frames` rebuilds the encoder
+    /// (IDR), so the toggle fires only on the SECOND consecutive strong
+    /// report (`proportion >= 1.5`), and a clearly-recovered report
+    /// (`proportion < 1.1`) restores. Observe-and-forward: `NotHandled`
+    /// keeps the event travelling toward the source.
+    fn handle_upstream_event(&mut self, event: &crate::event::Event) -> crate::event::EventResult {
+        use crate::event::{Event, EventResult, QosType};
+
+        if let Event::Qos(qos) = event {
+            match qos.qos_type {
+                QosType::Underflow if qos.proportion >= 1.5 => {
+                    self.qos_underflows += 1;
+                    if self.qos_underflows >= 2 && !self.config.skip_frames {
+                        tracing::info!(
+                            "h264enc: sustained QoS underflow (proportion {:.2}); \
+                             enabling rate-control frame skipping",
+                            qos.proportion
+                        );
+                        self.control.set_skip_frames(true);
+                    }
+                }
+                _ if qos.proportion < 1.1 => {
+                    self.qos_underflows = 0;
+                    if self.config.skip_frames {
+                        tracing::info!(
+                            "h264enc: QoS recovered (proportion {:.2}); \
+                             disabling frame skipping",
+                            qos.proportion
+                        );
+                        self.control.set_skip_frames(false);
+                    }
+                }
+                _ => {}
+            }
+            return EventResult::NotHandled;
+        }
+        EventResult::NotHandled
     }
 
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
@@ -2592,5 +2639,65 @@ mod tests {
         }
 
         assert_eq!(decoder.pending.len(), MAX_PENDING_METADATA);
+    }
+}
+
+#[cfg(test)]
+mod qos_tests {
+    use super::*;
+    use crate::clock::ClockTime;
+    use crate::control::Controllable;
+    use crate::event::{Event, QosEvent, QosType};
+
+    fn qos(proportion: f64) -> Event {
+        Event::Qos(QosEvent {
+            qos_type: QosType::Underflow,
+            proportion,
+            jitter_ns: 0,
+            timestamp: ClockTime::ZERO,
+            processed: 10,
+            dropped: 5,
+        })
+    }
+
+    #[test]
+    fn skip_frames_needs_two_consecutive_underflows() {
+        let mut enc = H264Encoder::new(H264EncoderConfig::new()).unwrap();
+        let control = enc.control();
+        let mut generation = 0u64;
+
+        // One strong report: hysteresis holds, nothing staged.
+        assert!(matches!(
+            Element::handle_upstream_event(&mut enc, &qos(2.0)),
+            crate::event::EventResult::NotHandled
+        ));
+        assert!(control.poll(&mut generation).is_none());
+
+        // Second consecutive: skip staged on the control.
+        let _ = Element::handle_upstream_event(&mut enc, &qos(2.0));
+        let params = control.poll(&mut generation).expect("skip staged");
+        assert_eq!(params.skip_frames, Some(true));
+    }
+
+    #[test]
+    fn recovery_resets_the_streak_and_restores() {
+        let mut enc = H264Encoder::new(H264EncoderConfig::new()).unwrap();
+        let control = enc.control();
+        let mut generation = 0u64;
+
+        // A recovered report between two strong ones resets the streak.
+        let _ = Element::handle_upstream_event(&mut enc, &qos(2.0));
+        let _ = Element::handle_upstream_event(&mut enc, &qos(1.0));
+        let _ = Element::handle_upstream_event(&mut enc, &qos(2.0));
+        assert!(
+            control.poll(&mut generation).is_none(),
+            "streak was reset — no skip staged"
+        );
+
+        // With skipping applied (simulate via config), recovery restores.
+        enc.config.skip_frames = true;
+        let _ = Element::handle_upstream_event(&mut enc, &qos(1.0));
+        let params = control.poll(&mut generation).expect("restore staged");
+        assert_eq!(params.skip_frames, Some(false));
     }
 }
