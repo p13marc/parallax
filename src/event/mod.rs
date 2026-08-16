@@ -593,6 +593,16 @@ impl SeekEvent {
         Self::new(SegmentFormat::Bytes, SeekPosition::set(position as i64))
     }
 
+    /// Create an instant rate change (#165): `rate` becomes the playback
+    /// rate immediately, with no flush, no repositioning, and no new
+    /// Segment — see [`SeekFlags::INSTANT_RATE_CHANGE`]. Position fields
+    /// are ignored by every consumer.
+    pub fn new_instant_rate(rate: f64) -> Self {
+        Self::new(SegmentFormat::Time, SeekPosition::none())
+            .with_rate(rate)
+            .with_flags(SeekFlags::INSTANT_RATE_CHANGE)
+    }
+
     /// The sequence number identifying this seek and everything it caused.
     pub fn seqnum(&self) -> u64 {
         self.seqnum
@@ -763,6 +773,19 @@ impl SeekFlags {
     pub const SNAP_BEFORE: Self = Self(1 << 4);
     /// Snap to position after target.
     pub const SNAP_AFTER: Self = Self(1 << 5);
+    /// Instant rate change (#165): apply `seek.rate` as the new playback
+    /// rate WITHOUT flushing, repositioning, or emitting a Segment — data
+    /// flow is untouched, only the running-time mapping changes. Parallax's
+    /// model is sink-terminated: every sink receives its own copy of the
+    /// seek (the sink-inbox fan-out) and a pacing sink applies the rate to
+    /// its own mapping immediately — no downstream event exists, because
+    /// an in-band one would arrive a queue-depth late, defeating "instant".
+    /// The seek never travels past the sinks (demuxers must not reposition
+    /// or change trick filtering), start/stop are ignored, and the sign
+    /// must match the current direction. One `SeekDone` is posted per
+    /// applying sink. GStreamer's `SEEK_FLAG_INSTANT_RATE_CHANGE`, same
+    /// bit; bits 6–8 stay free for its TRICKMODE family.
+    pub const INSTANT_RATE_CHANGE: Self = Self(1 << 9);
 
     /// Create empty flags.
     pub const fn empty() -> Self {

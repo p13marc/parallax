@@ -859,8 +859,13 @@ impl PipelineHandle {
     /// sequence has run.
     pub async fn seek(&self, seek: SeekEvent) -> bool {
         // The gate is unchanged: no source declared seekability → nothing
-        // is dispatched at all.
-        if !self.controls.iter().any(|c| c.seekable) {
+        // is dispatched at all. EXCEPT instant rate changes (#165): they
+        // terminate at the sinks and reposition nothing, so a live,
+        // unseekable pipeline may still change rate.
+        let instant_rate = seek
+            .flags
+            .contains(crate::event::SeekFlags::INSTANT_RATE_CHANGE);
+        if !instant_rate && !self.controls.iter().any(|c| c.seekable) {
             return false;
         }
         // #163: dispatch via the sinks so the seek travels hop-by-hop and
@@ -945,6 +950,18 @@ impl PipelineHandle {
     /// Seek to a byte offset (flushing). See [`Self::seek`].
     pub async fn seek_bytes(&self, position: u64) -> bool {
         self.seek(SeekEvent::new_bytes(position)).await
+    }
+
+    /// Change the playback rate instantly (#165), without flushing,
+    /// repositioning, or a new Segment — sink-terminated, so it also works
+    /// on live/unseekable pipelines. The rate's sign must match the current
+    /// direction (a pacing sink ignores a sign flip); one
+    /// [`MessageKind::SeekDone`](crate::pipeline::bus::MessageKind::SeekDone)
+    /// is posted per applying sink, and a later real seek's Segment
+    /// re-establishes its own rate. See
+    /// [`SeekFlags::INSTANT_RATE_CHANGE`](crate::event::SeekFlags::INSTANT_RATE_CHANGE).
+    pub async fn set_rate(&self, rate: f64) -> bool {
+        self.seek(SeekEvent::new_instant_rate(rate)).await
     }
 
     /// Pause the running pipeline. Idempotent.
@@ -3101,6 +3118,34 @@ async fn handle_upstream_hop(
         }
         return HopOutcome::NONE;
     };
+
+    // Instant rate change (#165): sink-terminated. The element either
+    // applied the new rate to its own mapping (Handled) or has no pacing to
+    // apply it to — either way the seek travels no further: no flush trio,
+    // no Segment (a segment would reposition the timeline), no upstream
+    // forwarding (a demuxer must not reposition or re-filter data flow).
+    // Every sink already received its own copy via the sink-inbox fan-out.
+    if seek
+        .flags
+        .contains(crate::event::SeekFlags::INSTANT_RATE_CHANGE)
+    {
+        match result {
+            EventResult::Handled { .. } => {
+                bus.post(crate::pipeline::bus::MessageKind::SeekDone {
+                    seqnum: seek.seqnum(),
+                    source: name.to_string(),
+                    format: seek.format,
+                    // Nothing repositioned; there is no landing to report.
+                    position: None,
+                });
+                tracing::info!("'{name}': instant rate change to {} applied", seek.rate);
+            }
+            _ => {
+                tracing::debug!("'{name}': instant rate change not applicable here; dropped");
+            }
+        }
+        return HopOutcome::NONE;
+    }
 
     match result {
         EventResult::Handled { position: landing } => {

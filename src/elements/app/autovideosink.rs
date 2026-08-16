@@ -599,6 +599,36 @@ impl AsyncSink for AutoVideoSink {
         self.qos.take().map(crate::event::Event::Qos)
     }
 
+    /// Instant rate change (#165): `seek.rate` replaces the current
+    /// segment's rate in this sink's own mapping, effective at the next
+    /// frame — the pacer re-anchors so running time continues from here
+    /// instead of jumping. Sign flips are rejected (reverse needs a real
+    /// seek: the data order itself must change); a later Segment (any real
+    /// seek) re-establishes its own rate. Everything else is not ours.
+    fn handle_upstream_event(&mut self, event: &crate::event::Event) -> crate::event::EventResult {
+        use crate::event::{Event, EventResult, SeekFlags};
+        if let Event::Seek(seek) = event
+            && seek.flags.contains(SeekFlags::INSTANT_RATE_CHANGE)
+        {
+            let Some(seg) = self.segment.as_mut() else {
+                // No mapping yet (nothing played): nothing to change.
+                return EventResult::NotHandled;
+            };
+            if seek.rate == 0.0 || seek.rate.signum() != seg.rate.signum() {
+                tracing::warn!(
+                    "autovideosink: instant rate {} rejected (direction change from {})",
+                    seek.rate,
+                    seg.rate
+                );
+                return EventResult::NotHandled;
+            }
+            seg.rate = seek.rate;
+            self.pacer.anchor = None;
+            return EventResult::handled();
+        }
+        EventResult::NotHandled
+    }
+
     /// Declared latency (#184): pacing may hold a frame up to its lateness
     /// budget past the ideal presentation time.
     fn latency(&self) -> Option<crate::pipeline::seek::LatencyRange> {
@@ -1630,5 +1660,49 @@ mod tests {
         sink.sync = false;
         sink.segment = Some(SegmentEvent::new_time(ns(700_000_000), None));
         assert!(!sink.clips_out_of_segment(ns(500_000_000)));
+    }
+
+    /// #165 instant rate change: same-sign rates replace the segment's rate
+    /// and re-anchor the pacer; sign flips, rate 0, and a mapping-less sink
+    /// decline. Only INSTANT_RATE_CHANGE seeks are ours.
+    #[test]
+    fn instant_rate_change_updates_the_mapping() {
+        use crate::element::AsyncSink;
+        use crate::event::{Event, EventResult, SeekEvent, SegmentEvent};
+
+        let mut sink = AutoVideoSink::new();
+
+        // No segment yet: nothing to change.
+        let ev = Event::Seek(SeekEvent::new_instant_rate(2.0));
+        assert!(matches!(
+            sink.handle_upstream_event(&ev),
+            EventResult::NotHandled
+        ));
+
+        sink.segment = Some(SegmentEvent::new_time(ns(0), None));
+        sink.pacer.anchor = Some((ns(0), ns(0)));
+        assert!(matches!(
+            sink.handle_upstream_event(&ev),
+            EventResult::Handled { .. }
+        ));
+        assert_eq!(sink.segment.as_ref().unwrap().rate, 2.0);
+        assert!(sink.pacer.anchor.is_none(), "pacer re-anchors");
+
+        // Sign flip and rate 0 decline; the mapping is untouched.
+        for bad in [-1.0, 0.0] {
+            let ev = Event::Seek(SeekEvent::new_instant_rate(bad));
+            assert!(matches!(
+                sink.handle_upstream_event(&ev),
+                EventResult::NotHandled
+            ));
+            assert_eq!(sink.segment.as_ref().unwrap().rate, 2.0);
+        }
+
+        // A regular seek is not ours (the executor routes it upstream).
+        let regular = Event::Seek(SeekEvent::new_time(ns(1_000)));
+        assert!(matches!(
+            sink.handle_upstream_event(&regular),
+            EventResult::NotHandled
+        ));
     }
 }

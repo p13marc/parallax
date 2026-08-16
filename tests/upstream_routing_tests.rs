@@ -869,3 +869,163 @@ async fn throttle_degrades_on_qos_underflow() {
     src_handle.end_stream();
     handle.wait().await.unwrap();
 }
+
+// ============================================================================
+// #165: INSTANT_RATE_CHANGE
+// ============================================================================
+
+/// A sink that applies instant rate changes (stand-in for AutoVideoSink's
+/// pacing) and records the rates it saw.
+struct RateSink {
+    rates: Arc<Mutex<Vec<f64>>>,
+}
+
+impl parallax::element::AsyncSink for RateSink {
+    async fn consume(&mut self, _ctx: &parallax::element::ConsumeContext<'_>) -> Result<()> {
+        Ok(())
+    }
+
+    fn handle_upstream_event(&mut self, event: &Event) -> EventResult {
+        if let Event::Seek(seek) = event
+            && seek
+                .flags
+                .contains(parallax::event::SeekFlags::INSTANT_RATE_CHANGE)
+        {
+            self.rates.lock().unwrap().push(seek.rate);
+            return EventResult::handled();
+        }
+        EventResult::NotHandled
+    }
+
+    fn name(&self) -> &str {
+        "rate_sink"
+    }
+}
+
+/// An unseekable source that counts every seek reaching it.
+struct UnseekableCountingSource {
+    produced: u64,
+    seeks: Arc<AtomicU64>,
+}
+
+impl Source for UnseekableCountingSource {
+    fn produce(&mut self, _ctx: &mut ProduceContext) -> Result<ProduceResult> {
+        arena().reclaim();
+        let slot = match arena().acquire() {
+            Some(s) => s,
+            None => return Ok(ProduceResult::WouldBlock),
+        };
+        self.produced += 1;
+        let mut meta = Metadata::from_sequence(self.produced);
+        meta.pts = ClockTime::from_millis(self.produced * 10);
+        Ok(ProduceResult::OwnBuffer(Buffer::new(
+            MemoryHandle::with_len(slot, 8),
+            meta,
+        )))
+    }
+
+    fn handle_upstream_event(&mut self, event: &Event) -> EventResult {
+        if let Event::Seek(_) = event {
+            self.seeks.fetch_add(1, Ordering::SeqCst);
+        }
+        EventResult::NotHandled
+    }
+}
+
+/// #165 INSTANT_RATE_CHANGE is sink-terminated: the applying sink posts
+/// SeekDone (position None), nothing is flushed, no new Segment is emitted,
+/// the seek never travels toward the source — and the seekability gate does
+/// not apply, so a live/unseekable pipeline can still change rate while a
+/// regular seek stays refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn instant_rate_change_terminates_at_the_sink() {
+    let source_seeks = Arc::new(AtomicU64::new(0));
+    let rates: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_source(
+        "src",
+        UnseekableCountingSource {
+            produced: 0,
+            seeks: source_seeks.clone(),
+        },
+    );
+    let snk = pipeline.add_async_sink(
+        "rate_sink",
+        RateSink {
+            rates: rates.clone(),
+        },
+    );
+    pipeline.link(src, snk).unwrap();
+
+    // Every event arriving at the sink pad: flushes and segments.
+    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_probe = events.clone();
+    let _ = pipeline.add_probe(
+        PadRef::sink(snk),
+        ProbeType::EVENT_DOWN | ProbeType::EVENT_FLUSH,
+        move |data| {
+            if let ProbeData::Event(ev) = data {
+                events_probe.lock().unwrap().push(ev.name().to_string());
+            }
+            ProbeReturn::Ok
+        },
+    );
+
+    let executor = Executor::new();
+    let mut handle = executor.start(&mut pipeline).unwrap();
+    let mut bus = handle.take_bus().unwrap();
+
+    // Let the stream establish itself (StreamStart + initial Segment).
+    wait_until(
+        || events.lock().unwrap().iter().any(|e| e == "segment"),
+        "the initial segment",
+    )
+    .await;
+
+    // The regular seek is gated: nothing here is seekable.
+    assert!(
+        !handle.seek_time(ClockTime::from_millis(100)).await,
+        "a regular seek must stay gated on an unseekable pipeline"
+    );
+
+    // The instant rate change is not gated, and the sink applies it.
+    assert!(handle.set_rate(2.0).await, "instant rate was dispatched");
+    wait_until(
+        || rates.lock().unwrap().as_slice() == [2.0],
+        "the sink to apply the rate",
+    )
+    .await;
+
+    handle.stop();
+    handle.wait().await.unwrap();
+
+    // Terminated at the sink: the source never saw it.
+    assert_eq!(source_seeks.load(Ordering::SeqCst), 0);
+
+    // No flush, no repositioning Segment: exactly the one initial segment.
+    let log = events.lock().unwrap().clone();
+    assert!(
+        !log.iter().any(|e| e == "flush-start" || e == "flush-stop"),
+        "an instant rate change must not flush: {log:?}"
+    );
+    assert_eq!(
+        log.iter().filter(|e| *e == "segment").count(),
+        1,
+        "no new segment may be emitted: {log:?}"
+    );
+
+    // SeekDone names the sink and carries no landing.
+    let mut done = None;
+    while let Some(msg) = bus.poll() {
+        if let MessageKind::SeekDone {
+            source, position, ..
+        } = msg.kind
+        {
+            done = Some((source, position));
+        }
+    }
+    let (source, position) = done.expect("SeekDone posted for the instant rate change");
+    assert_eq!(source, "rate_sink");
+    assert_eq!(position, None);
+}
