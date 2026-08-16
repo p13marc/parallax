@@ -79,9 +79,14 @@ The original "Principle 0" was per-element sandboxed processes (seccomp, namespa
 
 Early drafts chose [stabby](https://github.com/ZettaScaleLabs/stabby) for ABI-stable plugins. The shipped implementation is a hand-rolled `#[repr(C)]` descriptor + `extern "C"` factory functions loaded via libloading, with an ABI version gate (`PARALLAX_ABI_VERSION`) — simpler, no macro-heavy dependency, and sufficient because element trait objects are double-boxed and only cross the boundary opaquely. Cost: plugins must be built with the same toolchain/parallax version (enforced socially, not technically). stabby may be revisited if third-party plugin distribution becomes real.
 
-### `parallax-launch` CLI (not built)
+### `parallax-launch` CLI
 
-A gst-launch equivalent was designed (including a YAML multi-binary orchestration format). No binary ships today; `Pipeline::parse` provides the underlying capability. Still a good first-contribution target.
+Shipped with #187 as a bin target in the root crate (feature `cli`): parses a
+gst-launch-style description, runs to EOS/error, graceful ctrl-C, `-v` bus
+printing, `--list-elements`, `--dot`. The same change registered most of the
+element library with `ElementFactory` (see `docs/elements.md` § factory
+names), so `Pipeline::parse` users get the wider vocabulary too. The YAML
+multi-binary orchestration format from the early design was not pursued.
 
 ## Deployment Modes
 
@@ -183,7 +188,7 @@ Framework maturity phases (details in `plans/`):
 | Vulkan Video encode; rust-gpu compute converters | Planned |
 | Process isolation (redesigned, spawn-based) | Deferred (plan 16) |
 | WHIP sink; MoQ sink; Wayland ext-image-copy-capture source | Proposed |
-| `parallax-launch` CLI; full element registration in the parse factory | Proposed |
+| `parallax-launch` CLI; full element registration in the parse factory | **Shipped** (#187; feature `cli`) |
 | RDMA / GPUDirect | Future |
 
 ## References

@@ -128,7 +128,7 @@ pub struct ParsedPipeline {
 pub fn parse_pipeline(input: &str) -> Result<ParsedPipeline> {
     pipeline
         .parse(input.trim())
-        .map_err(|e| Error::InvalidSegment(format!("parse error: {e}")))
+        .map_err(|e| Error::Parse(format!("parse error: {e}")))
 }
 
 /// Parse a complete pipeline.

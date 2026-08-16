@@ -28,7 +28,7 @@ name = "parallax"
 
 [dependencies]
 # Async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "net", "fs", "io-util", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "fs", "io-util", "macros", "sync", "time", "signal"] }
 
 
 # Graph structure (enforces DAG)
@@ -177,9 +177,10 @@ quick-xml = "0.41"
 dynosaur = "0.3"
 trait-variant = "0.1"
 
+# CLI arg parsing for the parallax-launch binary (feature `cli`)
+clap = { version = "4", features = ["derive"], optional = true }
+
 [dev-dependencies]
-# "signal" is example-only (Ctrl-C handling); keep it out of the library deps
-tokio = { version = "1", features = ["signal"] }
 tokio-test = "0.4"
 criterion = "0.8"
 proptest = "1"
@@ -187,6 +188,7 @@ tempfile = "3.24.0"
 
 [features]
 default = []
+cli = ["dep:clap"]  # parallax-launch binary (gst-launch equivalent)
 macros = ["parallax-macros"]  # Plugin authoring macros
 vulkan-video = ["dep:ash", "dep:h264-reader"]  # Vulkan Video codecs
 software-codecs = ["av1-encode", "av1-decode", "h264", "vpx"]  # All software video codecs
@@ -231,6 +233,15 @@ alsa = ["dep:alsa"]  # ALSA audio capture/playback (fallback)
 device-capture = ["pipewire", "libcamera"]  # Recommended device capture stack
 device-all = ["pipewire", "libcamera", "screen-capture", "v4l2", "alsa"]  # All device capture
 hotplug = ["v4l2", "dep:udev"]  # udev video device hotplug monitoring
+
+[[bin]]
+name = "parallax-launch"
+path = "src/bin/parallax_launch.rs"
+required-features = ["cli"]
+
+[[test]]
+name = "launch_cli"
+required-features = ["cli"]
 
 [[bench]]
 name = "throughput"

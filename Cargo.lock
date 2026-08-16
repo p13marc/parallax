@@ -3603,6 +3603,7 @@ dependencies = [
  "ash",
  "ashpd",
  "bytes",
+ "clap",
  "criterion",
  "crossbeam-channel",
  "daggy",

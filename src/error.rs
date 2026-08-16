@@ -25,6 +25,10 @@ pub enum Error {
     #[error("invalid memory segment: {0}")]
     InvalidSegment(String),
 
+    /// Pipeline-description parse or element-construction error.
+    #[error("{0}")]
+    Parse(String),
+
     /// Buffer validation failed (rkyv).
     #[error("buffer validation failed: {0}")]
     ValidationFailed(String),

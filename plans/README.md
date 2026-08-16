@@ -22,7 +22,6 @@ Completed plans have been removed (see git history). Only plans with an existing
 | 26 | Video codec expansion | Medium-High | H.265 + VP8/VP9; consider rav1d for pure-Rust AV1 decode |
 | 27 | Container format expansion | Medium | MKV/WebM, FLV, WAV, Ogg (pure Rust crates exist); FLV is prerequisite for RTMP |
 | 28 | Streaming protocol expansion | Medium-High | WHIP (RFC 9725) sink, MoQ sink (Rust stacks exist), SRT, RTMP |
-| — | `parallax-launch` CLI | Medium | gst-launch equivalent; also register the full element library with `ElementFactory` |
 | — | Wayland `ext-image-copy-capture-v1` source | Low | Lower-latency screen capture without the portal/PipeWire path |
 
 **Legend:** ⬜ Not Started | 🟡 In Progress | ✅ Complete
@@ -30,6 +29,8 @@ Completed plans have been removed (see git history). Only plans with an existing
 ---
 
 ## Completed Plans (files removed)
+
+- **`parallax-launch` CLI + full ElementFactory registration** (#187): bin target behind the `cli` feature; ~65 factory names across all domains; strict unknown-property errors; gated-name diagnostics. See `docs/elements.md` § "Pipeline-string factory names".
 
 - **Phase 1** (Plans 00–08): Metadata API, codec wrappers, muxer sync, buffer pool, element trait consolidation, caps negotiation, builder DSL, events/tagging
 - **Phase 2** (Plans 09–10, 12–14): Format converters, code cleanup, additional codecs (Opus, AAC, Symphonia), device elements (V4L2, PipeWire, ALSA, libcamera, screen capture), streaming outputs (HLS, DASH)

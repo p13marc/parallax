@@ -4,6 +4,83 @@ Complete reference of built-in elements, organized by module under `src/elements
 
 For the element *trait system* (how to write your own), see [getting-started.md](getting-started.md) and [api.md](api.md).
 
+## Pipeline-string factory names
+
+`Pipeline::parse` (and the `parallax-launch` binary, feature `cli`) instantiate elements by factory name. Unknown properties are **hard errors**; `name=` sets the node name on any element. Feature-gated names error with the feature to enable. The grammar is a strictly linear chain — mux/demux, fan-out, and closure-taking elements (Map/Filter, AppSrc/AppSink) need the programmatic API.
+
+Always available:
+
+| Factory name | Type | Properties |
+|---|---|---|
+| `nullsource` | `NullSource` | `count` (default 100), `buffer-size` |
+| `nullsink` | `NullSink` | — |
+| `passthrough` | `PassThrough` | — |
+| `identity` | `Identity` | — |
+| `inspect` (alias `tee`) | `Inspect` | — |
+| `filesrc` | `FileSrc` | `location` (req), `chunk-size` |
+| `filesink` | `FileSink` | `location` (req) |
+| `fdsrc` / `fdsink` | `FdSrc`/`FdSink` | `fd` (req) |
+| `consolesink` | `ConsoleSink` | `format` = metadata\|hex\|text\|full, `prefix` |
+| `datasrc` | `DataSrc` | `data` (req), `chunk-size`, `repeat` (bool), `repeat-count` |
+| `testsrc` | `TestSrc` | `pattern` = zero\|ones\|counter\|random\|alternating\|sequence, `num-buffers`, `buffer-size`, `rate` (bytes/s), `seed` |
+| `videotestsrc` | `VideoTestSrc` | `pattern` = smpte\|checkerboard\|solid\|ball\|gradient\|black\|white\|red\|green\|blue\|circular\|snow, `width`+`height`, `num-buffers`, `framerate` (int or `"num/den"`), `format` = rgba\|rgb\|bgra\|bgr |
+| `videoconvert` | `VideoConvertElement` | `in-format`/`out-format` = rgb\|rgba\|bgr\|bgra\|i420\|nv12\|yuyv\|uyvy\|gray8, `width`+`height` |
+| `videoscale` | `VideoScale` | `width`+`height` (target), `max-width`, `max-height`, `method` = bilinear\|nearest; no props = passthrough |
+| `audioconvert` | `AudioConvertElement` | `from`/`to` = u8\|s16\|s16be\|s32\|s32be\|f32\|f32be, `channels` |
+| `audioresample` | `AudioResampleElement` | `in-rate` (req), `out-rate` (req), `channels`, `format`, `quality` = fast\|medium |
+| `audiodownmix` | `AudioDownmix` | — |
+| `gain` | `Gain` | `gain` (req, linear factor) |
+| `valve` | `Valve` | `open` (default true) |
+| `queue2` | `Queue2` (stream mode) | `max-size-bytes` (default 4 MiB), `low-percent`+`high-percent` |
+| `batch` / `unbatch` | `Batch`/`Unbatch` | `max-count` (req), `max-bytes`, `timeout-ms` / `chunk-size` (req) |
+| `buffertrim` | `BufferTrim` | `max-size` (req) |
+| `bufferslice` | `BufferSlice` | `offset` (req), `length` (req) |
+| `bufferpad` | `BufferPad` | `min-size` (req), `fill` (byte, default 0) |
+| `timestamper` | `Timestamper` | `mode` = system\|monotonic\|preserve\|pts\|dts |
+| `sequencenumber` | `SequenceNumber` | `increment` |
+| `delay` | `Delay` | `ms` (req) |
+| `throttle` | `Throttle` | exactly one of `interval-ms` \| `rate` (buffers/s) |
+| `ratelimiter` | `RateLimiter` | exactly one of `buffers-per-second` \| `bytes-per-second` \| `delay-ms` |
+| `timeout` / `debounce` | `Timeout`/`Debounce` | `ms` (req) |
+| `tcpsrc` / `tcpsink` | `AsyncTcpSrc`/`AsyncTcpSink` | `address` (req); src: `buffer-size` |
+| `udpsrc` / `udpsink` | `UdpSrc`/`UdpSink` | `address` (req), `timeout-ms`; src: `buffer-size` |
+| `unixsrc` / `unixsink` | `UnixSrc`/`UnixSink` | `path` (req), `listen` (bool), `timeout-ms`; src: `buffer-size` |
+| `multicastsrc` / `multicastsink` | `UdpMulticastSrc`/`Sink` | `group` (req), `port` (req); src: `buffer-size`, `timeout-ms`; sink: `ttl`, `loopback` |
+| `ipcsrc` / `ipcsink` | `IpcSrc`/`IpcSink` | `path` (req); sink: `capacity` |
+| `hlssink` | `HlsSink` | `location` (dir), `target-duration` (s), `playlist-length`, `playlist-name`, `segment-prefix`, `vod` (bool) |
+| `dashsink` | `DashSink` | `location` (dir), `segment-duration` (s), `segment-window`, `manifest-name`, `segment-prefix`, `live` (bool) |
+
+Feature-gated:
+
+| Factory name | Feature | Properties |
+|---|---|---|
+| `autovideosink` | `display` | `title`, `width`+`height`, `sync`, `max-lateness-ms` |
+| `v4l2src` | `v4l2` | `device` (default /dev/video0), `width`+`height`, `format` (fourcc, default YUYV), `buffer-count`, `framerate`, `dmabuf-export` |
+| `alsasrc` / `alsasink` | `alsa` | `device` (default "default"), `rate` (48000), `channels` (2), `format` = s16\|s32\|f32\|u8, `buffer-frames`, `period-frames` |
+| `screencapsrc` | `screen-capture` | `source-type` = monitor\|window\|any, `cursor` (bool), `max-frames` |
+| `pipewiresrc` / `pipewiresink` | `pipewire` | `device` (audio only — video needs a portal target) |
+| `libcamerasrc` | `libcamera` | `camera` (id) |
+| `httpsrc` / `httpsink` | `http` | src: `location` (req), `chunk-size`, `timeout-ms`; sink: `location` (req), `method` = post\|put, `content-type`, `timeout-ms` |
+| `wssrc` / `wssink` | `websocket` | `url` (req); sink: `mode` = binary\|text |
+| `h264enc` | `h264` | `bitrate` (bps), `fps`, `qp`, `keyframe-interval`, `threads`, `scene-change` (bool), `max-slice-len`, `skip-frames` (bool), `profile` = baseline\|main\|high, `complexity` = low\|medium\|high, `usage` = camera\|screen\|camera-offline\|screen-offline |
+| `h264dec` | `h264` | — |
+| `av1enc` | `av1-encode` | `speed`, `quantizer`, `bitrate` |
+| `av1dec` | `av1-decode` | — |
+| `vp8dec` / `vp9dec` | `vpx` | — |
+| `opusenc` | `opus` | `rate` (48000), `channels` (2), `bitrate` (128000), `application` = audio\|voip\|lowdelay (S16 input) |
+| `opusdec` | `opus` | `rate` (48000), `channels` (2) |
+| `jpegenc` / `jpegdec` | `image-jpeg` | enc: `quality` |
+| `pngenc` / `pngdec` | `image-png` | — |
+| `rtpsrc` | `rtp` | `address` (req, bind), `payload-type`, `clock-rate`, `buffer-size` |
+| `rtpsink` | `rtp` | `address` (req, dest), `payload-type`, `ssrc`, `clock-rate` |
+| `rtpjitterbuffer` | `rtp` | `latency-ms`, `max-packets`, `clock-rate`, `drop-late` (bool) |
+| `rtp{h264,h265,vp8,vp9,opus,av1}pay` | `rtp` | `mtu` |
+| `rtp{h264,h265,vp8,vp9,opus}depay` | `rtp` | — |
+
+Not registered (use the programmatic API): mux/demux elements (the linear grammar cannot name pads), zenoh (async constructors), `rtspsrc`, closure-taking transforms, `AppSrc`/`AppSink`, v4l2-m2m and Vulkan hardware codecs.
+
+Network and device constructors do their I/O (connect/bind/open) at parse time, so a bad address fails the parse rather than the run.
+
 ## I/O — `elements::io`
 
 | Element | Description |

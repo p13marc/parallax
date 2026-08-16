@@ -49,7 +49,15 @@ async fn main() -> parallax::Result<()> {
 
 The string grammar is a **linear chain**: `element prop=value ... ! element ...`. Values may be quoted strings, integers, floats, or booleans; `name=foo` gives the node a custom name for later retrieval. Branching (tee), caps filters, and bins are *not* expressible in the string syntax — use the programmatic API for those.
 
-Built-in factory names usable in `parse`: `filesrc`, `filesink`, `videotestsrc`, `videoconvert`, `passthrough`, `inspect` (`tee` is a deprecated alias), `nullsource`, `nullsink`, plus `autovideosink` (feature `display`) and `v4l2src` (feature `v4l2`). More can be registered through a `PluginRegistry` (`Pipeline::parse_with_factory`).
+Most of the element library is registered as factory names — ~37 always-on (`filesrc`, `videotestsrc`, `videoconvert`, `videoscale`, `queue2`, `tcpsrc`, `hlssink`, …) plus ~30 feature-gated ones (`h264enc`, `alsasink`, `rtpsrc`, …). See `docs/elements.md` § "Pipeline-string factory names" for the full table with properties. Unknown properties are hard errors; more names can be registered through a `PluginRegistry` (`Pipeline::parse_with_factory`).
+
+There is also a gst-launch-style binary (feature `cli`):
+
+```bash
+cargo run --features cli --bin parallax-launch -- \
+    videotestsrc num-buffers=100 ! videoconvert ! nullsink
+parallax-launch --list-elements   # what this build can parse
+```
 
 ### Build programmatically
 
