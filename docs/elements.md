@@ -61,6 +61,7 @@ Feature-gated:
 | `pipewiresrc` / `pipewiresink` | `pipewire` | `device` (audio only — video needs a portal target) |
 | `libcamerasrc` | `libcamera` | `camera` (id) |
 | `httpsrc` / `httpsink` | `http` | src: `location` (req), `chunk-size`, `timeout-ms`; sink: `location` (req), `method` = post\|put, `content-type`, `timeout-ms` |
+| `httpcachesrc` | `http` | `location` (req), `cache-file`, `chunk-size`, `timeout-ms` |
 | `wssrc` / `wssink` | `websocket` | `url` (req); sink: `mode` = binary\|text |
 | `h264enc` | `h264` | `bitrate` (bps), `fps`, `qp`, `keyframe-interval`, `threads`, `scene-change` (bool), `max-slice-len`, `skip-frames` (bool), `profile` = baseline\|main\|high, `complexity` = low\|medium\|high, `usage` = camera\|screen\|camera-offline\|screen-offline |
 | `h264dec` | `h264` | — |
@@ -166,6 +167,7 @@ anything, so `Aborted` comes from the handle alone.
 | `UnixSrc` / `UnixSink` | Unix domain sockets (`UnixMode`). `UnixSink` is an async sink — accept/connect/write all await (the old broken `AsyncUnixSrc`/`AsyncUnixSink` pair, which re-connected per call, is deleted) |
 | `UdpMulticastSrc` / `UdpMulticastSink` | Multicast group receive/send |
 | `HttpSrc` `[http]` | HTTP GET source; byte-seekable via `Range` when the server supports it (probed at pipeline start) |
+| `HttpCacheSrc` `[http]` | `HttpSrc` + a sparse on-disk cache (#188): everything downloaded is written through at true stream offsets, and a seek into an already-downloaded span is served **from disk** — no reconnect, no re-download (works even when the server refused ranges). Forward/hole seeks reconnect lazily at the target. Cache is an unlinked temp file by default; `with_cache_file` names a path. Progress: `Queue2RangesHandle` via `control()` + throttled `DownloadProgress` |
 | `HttpSink` `[http]` | HTTP POST/PUT sink (async sink — one blocking ureq request per buffer on the blocking pool, bounded by `with_timeout`, 30 s default) |
 | `WebSocketSrc` / `WebSocketSink` `[websocket]` | WebSocket message I/O. The sink is an async sink: connect/send run on the blocking pool, so a stalled peer pends the element, not a runtime worker |
 | `ZenohSrc` / `ZenohSink` `[zenoh]` | Zenoh subscribe/publish on key expressions |
@@ -219,7 +221,7 @@ let (w, h) = info.wait_for_dimensions(0).await.ok_or("session ended")?;
 
 | Element | Description |
 |---------|-------------|
-| `Queue2` | Network buffering: `stream` (memory ring), `download` (progressive file), `timeshift` (circular file); posts `Buffering` messages. Download mode is seek-aware (#164): buffers' `Metadata.offset` (stamped by `FileSrc`/`HttpSrc`) keeps `DownloadedRanges` in true stream offsets across seeks (sparse download file, honest holes), a forward byte seek within `seek_forward_threshold` (default 512 KiB) is **absorbed** — the queue answers `Handled`, flushes downstream from its own task, and skips through arriving data to the target with no upstream traffic — while everything else passes through to the source. Progress: clone `Queue2RangesHandle` via `control()` before start (ranges/total/write_pos), or watch throttled `DownloadProgress` bus messages |
+| `Queue2` | Network buffering: `stream` (memory ring), `download` (progressive file), `timeshift` (circular file); posts `Buffering` messages. Download mode is seek-aware (#164): buffers' `Metadata.offset` (stamped by `FileSrc`/`HttpSrc`) keeps `DownloadedRanges` in true stream offsets across seeks (sparse download file, honest holes), a forward byte seek within `seek_forward_threshold` (default 512 KiB) is **absorbed** — the queue answers `Handled`, flushes downstream from its own task, and skips through arriving data to the target with no upstream traffic — while everything else passes through to the source. Progress: clone `Queue2RangesHandle` via `control()` before start (ranges/total/write_pos), or watch throttled `DownloadProgress` bus messages. Serve-from-disk for *backward* seeks is structurally impossible mid-pipeline — that half is `HttpCacheSrc` (#188), a source that owns the cache |
 | `Inspect` | 1-in/1-out passthrough counter (buffers/bytes). **Not** a fan-out — it was called `Tee` and never was one. Fan-out needs no element: link one src-pad to several sinks (see [pipeline.md](pipeline.md#fan-out)). `tee` survives as a deprecated parse alias |
 | `Funnel` | N-to-1 merge (`FunnelInput` handles) |
 | `InputSelector` / `OutputSelector` | Switch between N inputs / route to one of N outputs |

@@ -55,6 +55,7 @@ pub const GATED_ELEMENTS: &[(&str, &str)] = &[
     ("pipewiresink", "pipewire"),
     ("libcamerasrc", "libcamera"),
     ("httpsrc", "http"),
+    ("httpcachesrc", "http"),
     ("httpsink", "http"),
     ("wssrc", "websocket"),
     ("wssink", "websocket"),

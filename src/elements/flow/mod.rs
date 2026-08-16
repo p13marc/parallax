@@ -30,6 +30,8 @@ mod valve;
 pub use concat::{Concat, ConcatStats, ConcatStream};
 pub use funnel::{Funnel, FunnelInput, FunnelStats};
 pub use inspect::Inspect;
+#[cfg(feature = "http")]
+pub(crate) use queue2::RangesShared;
 pub use queue2::{BufferingConfig, DownloadedRanges, Queue2, Queue2RangesHandle, Queue2Stats};
 pub use selector::{
     InputSelector, InputSelectorStats, OutputSelector, OutputSelectorStats, SelectorInput,

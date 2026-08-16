@@ -23,6 +23,7 @@ pub(super) fn register(f: &mut ElementFactory) {
     #[cfg(feature = "http")]
     {
         f.register("httpsrc", create_httpsrc);
+        f.register("httpcachesrc", create_httpcachesrc);
         f.register("httpsink", create_httpsink);
     }
     #[cfg(feature = "websocket")]
@@ -140,6 +141,23 @@ fn create_httpsrc(props: &Props) -> Result<Box<DynAsyncElement<'static>>> {
     use crate::elements::HttpSrc;
     let location = props.req_str("location")?;
     let mut src = HttpSrc::new(location)?;
+    if let Some(size) = props.get_usize("chunk-size")? {
+        src = src.with_chunk_size(size);
+    }
+    if let Some(t) = props.get_ms("timeout-ms")? {
+        src = src.with_timeout(t);
+    }
+    Ok(DynAsyncElement::new_box(SourceAdapter::new(src)))
+}
+
+#[cfg(feature = "http")]
+fn create_httpcachesrc(props: &Props) -> Result<Box<DynAsyncElement<'static>>> {
+    use crate::elements::HttpCacheSrc;
+    let location = props.req_str("location")?;
+    let mut src = HttpCacheSrc::new(location)?;
+    if let Some(path) = props.get_str("cache-file") {
+        src = src.with_cache_file(path)?;
+    }
     if let Some(size) = props.get_usize("chunk-size")? {
         src = src.with_chunk_size(size);
     }

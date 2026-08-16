@@ -15,6 +15,8 @@ mod unix;
 
 #[cfg(feature = "http")]
 mod http;
+#[cfg(feature = "http")]
+mod http_cache;
 
 #[cfg(feature = "websocket")]
 mod websocket;
@@ -40,6 +42,8 @@ pub use multicast::{UdpMulticastSink, UdpMulticastSrc, UdpMulticastStats};
 // HTTP (feature-gated)
 #[cfg(feature = "http")]
 pub use http::{HttpMethod, HttpSink, HttpSinkStats, HttpSrc};
+#[cfg(feature = "http")]
+pub use http_cache::HttpCacheSrc;
 
 // WebSocket (feature-gated)
 #[cfg(feature = "websocket")]

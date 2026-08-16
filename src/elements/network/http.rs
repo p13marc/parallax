@@ -79,23 +79,24 @@ pub struct HttpSrc {
     output: OutputArena,
 }
 
-/// Connection state behind the probe lock.
+/// Connection state behind the probe lock. Shared with `HttpCacheSrc`
+/// (#188), which reuses the ranged-GET/probe logic verbatim.
 #[derive(Default)]
-struct HttpConnection {
-    reader: Option<Box<dyn Read + Send>>,
+pub(crate) struct HttpConnection {
+    pub(crate) reader: Option<Box<dyn Read + Send>>,
     /// A connection attempt happened and its header answers are recorded
     /// (also set on failure, so the pre-start probe never retries — the
     /// real error resurfaces from `produce`).
-    probed: bool,
-    status_code: Option<u16>,
+    pub(crate) probed: bool,
+    pub(crate) status_code: Option<u16>,
     /// The server honors `Range` requests: it answered 206, or advertised
     /// `Accept-Ranges: bytes`.
-    seekable: bool,
+    pub(crate) seekable: bool,
     /// Total resource length from `Content-Range` (206) or
     /// `Content-Length` (200); `None` for chunked/unknown.
-    total_len: Option<u64>,
+    pub(crate) total_len: Option<u64>,
     /// Byte offset the next connection resumes from (set by a seek).
-    next_offset: u64,
+    pub(crate) next_offset: u64,
 }
 
 impl HttpSrc {
@@ -173,7 +174,7 @@ impl HttpSrc {
     /// ignore it answer a harmless 200. After a real seek (`next_offset >
     /// 0`) a 200 means the server ignored the Range — that errors loudly
     /// instead of silently re-downloading from the start.
-    fn connect(
+    pub(crate) fn connect(
         url: &str,
         timeout: Option<Duration>,
         headers: &[(String, String)],
@@ -549,28 +550,27 @@ pub struct HttpSinkStats {
     pub last_status: Option<u16>,
 }
 
+/// Minimal blocking HTTP/1.1 test server (no dev-dependency; the same
+/// TcpListener-thread pattern as the tcp.rs tests). One request per
+/// connection, `Connection: close`. Shared with the `HttpCacheSrc` tests
+/// (#188), which also count requests to prove serve-from-disk.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Write;
+pub(crate) mod testserver {
+    use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
 
-    // ------------------------------------------------------------------
-    // Minimal blocking HTTP/1.1 test server (no dev-dependency; the same
-    // TcpListener-thread pattern as the tcp.rs tests). One request per
-    // connection, `Connection: close`.
-    // ------------------------------------------------------------------
-
-    struct ServerOpts {
+    pub(crate) struct ServerOpts {
         /// Honor `Range: bytes=N-` with a 206 + Content-Range.
-        support_range: bool,
+        pub(crate) support_range: bool,
         /// Advertise `Accept-Ranges: bytes` on 200 responses.
-        advertise_accept_ranges: bool,
+        pub(crate) advertise_accept_ranges: bool,
         /// Force this status on every response (with a tiny error body).
-        status: u16,
+        pub(crate) status: u16,
         /// Include Content-Length (200) / Content-Range total (206).
-        send_length: bool,
+        pub(crate) send_length: bool,
     }
 
     impl Default for ServerOpts {
@@ -584,9 +584,19 @@ mod tests {
         }
     }
 
-    fn range_server(body: Vec<u8>, opts: ServerOpts) -> SocketAddr {
+    pub(crate) fn range_server(body: Vec<u8>, opts: ServerOpts) -> SocketAddr {
+        range_server_counted(body, opts).0
+    }
+
+    /// Like [`range_server`], returning a counter of requests served.
+    pub(crate) fn range_server_counted(
+        body: Vec<u8>,
+        opts: ServerOpts,
+    ) -> (SocketAddr, Arc<AtomicU64>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicU64::new(0));
+        let counter = requests.clone();
         thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
@@ -599,6 +609,7 @@ mod tests {
                         _ => break,
                     }
                 }
+                counter.fetch_add(1, Ordering::SeqCst);
                 let head = String::from_utf8_lossy(&head);
                 let range_start: Option<u64> = head.lines().find_map(|l| {
                     let (name, value) = l.split_once(':')?;
@@ -656,8 +667,15 @@ mod tests {
                 let _ = stream.write_all(&response);
             }
         });
-        addr
+        (addr, requests)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testserver::{ServerOpts, range_server};
+    use super::*;
+    use std::net::SocketAddr;
 
     fn body_of(len: usize) -> Vec<u8> {
         (0..len).map(|i| (i % 251) as u8).collect()

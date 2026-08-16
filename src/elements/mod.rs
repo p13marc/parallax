@@ -101,7 +101,7 @@ pub use network::{UdpMulticastSink, UdpMulticastSrc, UdpMulticastStats};
 pub use network::{UnixMode, UnixSink, UnixSrc};
 
 #[cfg(feature = "http")]
-pub use network::{HttpMethod, HttpSink, HttpSinkStats, HttpSrc};
+pub use network::{HttpCacheSrc, HttpMethod, HttpSink, HttpSinkStats, HttpSrc};
 
 #[cfg(feature = "websocket")]
 pub use network::{WebSocketSink, WebSocketSrc, WebSocketStats, WsMessageType};

@@ -136,6 +136,16 @@ impl DownloadedRanges {
         self.ranges.iter().map(|(s, e)| e - s).sum()
     }
 
+    /// End of the contiguous downloaded run containing `offset`, or `None`
+    /// when `offset` is a hole. "How many bytes can be served locally from
+    /// here before hitting the network" — the serve-from-disk query (#188).
+    pub fn contiguous_run_end(&self, offset: u64) -> Option<u64> {
+        self.ranges
+            .iter()
+            .find(|(start, end)| offset >= *start && offset < *end)
+            .map(|(_, end)| *end)
+    }
+
     fn merge(&mut self) {
         self.ranges.sort_by_key(|r| r.0);
         let mut merged = Vec::new();
@@ -157,16 +167,18 @@ impl DownloadedRanges {
 // Ranges Handle (download mode, #164)
 // ============================================================================
 
-/// The state a [`Queue2RangesHandle`] shares with its download-mode queue.
+/// The state a [`Queue2RangesHandle`] shares with its downloading element —
+/// download-mode [`Queue2`] or `HttpCacheSrc` (#188), which reuses the same
+/// handle shape.
 #[derive(Debug, Default)]
-struct RangesShared {
+pub(crate) struct RangesShared {
     /// Merged downloaded spans, in true stream offsets. Uncontended: the
     /// queue takes it per buffer, handles on demand — never across an await.
-    ranges: Mutex<DownloadedRanges>,
+    pub(crate) ranges: Mutex<DownloadedRanges>,
     /// Total expected stream size; 0 = unknown.
-    total: AtomicU64,
+    pub(crate) total: AtomicU64,
     /// Stream offset of the next byte the queue expects to receive.
-    write_pos: AtomicU64,
+    pub(crate) write_pos: AtomicU64,
 }
 
 /// Cloneable, poll-anytime view of a download-mode [`Queue2`]'s progress.
@@ -182,6 +194,13 @@ pub struct Queue2RangesHandle {
 }
 
 impl Queue2RangesHandle {
+    /// Handle over an element's shared ranges state (#188: also minted by
+    /// `HttpCacheSrc`).
+    #[cfg(feature = "http")]
+    pub(crate) fn from_shared(inner: Arc<RangesShared>) -> Self {
+        Self { inner }
+    }
+
     /// Merged downloaded byte spans `(start, end)`, ascending.
     pub fn ranges(&self) -> Vec<(u64, u64)> {
         self.inner.ranges.lock().unwrap().as_slice().to_vec()
