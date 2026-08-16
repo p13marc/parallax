@@ -3085,7 +3085,16 @@ async fn handle_upstream_hop(
                 SeekType::Set => Some(seek.start.position.max(0)),
                 _ => None,
             };
-            let start = landing.map(|p| p.max(0)).or(requested);
+            let reverse = seek.rate < 0.0;
+            // Reverse (#165): the segment covers [start, stop] and playback
+            // begins at the TOP — the element's reported landing is where
+            // decoding starts (near stop), NOT the segment's start. Forward
+            // keeps the landing-as-start rule (keyframe snap).
+            let start = if reverse {
+                requested.or(Some(0))
+            } else {
+                landing.map(|p| p.max(0)).or(requested)
+            };
             let segment_start = start.unwrap_or_else(|| {
                 tracing::warn!(
                     "source '{name}': relative seek with no reported landing; \
@@ -3099,11 +3108,32 @@ async fn handle_upstream_hop(
                 // seek's own format. A fed demuxer translating TIME→BYTES
                 // has no other way to learn the file size, and without it
                 // its byte estimate cannot be clamped to the last byte.
-                _ => element
-                    .source_query_duration()
-                    .filter(|d| d.format == seek.format)
-                    .and_then(|d| d.duration),
+                // For a reverse seek the element's landing IS the top of
+                // the range, and beats a possibly-unknown duration.
+                _ => {
+                    let duration = element
+                        .source_query_duration()
+                        .filter(|d| d.format == seek.format)
+                        .and_then(|d| d.duration);
+                    if reverse {
+                        landing.map(|p| p.max(0) as u64).or(duration)
+                    } else {
+                        duration
+                    }
+                }
             };
+            if reverse && stop.is_none() {
+                // An unmappable reverse segment would make every PTS
+                // out-of-segment; better to say so once than to emit it.
+                bus.post_warning(
+                    format!(
+                        "'{name}': reverse seek {} has no resolvable stop; \
+                         segment will be unmappable",
+                        seek.seqnum()
+                    ),
+                    None,
+                );
+            }
             let flushing = seek.flags.contains(crate::event::SeekFlags::FLUSH);
             let base = match (&tracker, flushing) {
                 (Some(t), false) => t.accumulated_base(),
@@ -3135,7 +3165,12 @@ async fn handle_upstream_hop(
                 seqnum: seek.seqnum(),
                 source: name.to_string(),
                 format: seek.format,
-                position: start.map(|p| p as u64),
+                // Reverse playback starts at the range's top.
+                position: if reverse {
+                    stop
+                } else {
+                    start.map(|p| p as u64)
+                },
             });
             tracing::info!(
                 "source '{name}': seek {} handled, segment starts at {segment_start}",
@@ -3478,8 +3513,14 @@ fn spawn_sink_task(
     // Advance the shared last-presented-PTS cell. `max` keeps it monotonic
     // against decoder reordering; the FlushStop reset is what lets a backwards
     // seek move it backwards.
-    fn present(position: &AtomicU64, pts: ClockTime) {
+    fn present(position: &AtomicU64, pts: ClockTime, reverse: bool) {
         let Some(pts) = pts.to_option() else { return };
+        if reverse {
+            // Reverse playback (#165): PTS legitimately decrease; max-only
+            // would freeze the reported position at the first frame.
+            position.store(pts.nanos(), Ordering::Release);
+            return;
+        }
         let _ = position.fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
             (cur == u64::MAX || pts.nanos() > cur).then_some(pts.nanos())
         });
@@ -3499,6 +3540,7 @@ fn spawn_sink_task(
         probe_registry: &ProbeRegistry,
         sink_pad: &crate::pipeline::probe::PadRef,
         position: &AtomicU64,
+        reverse: &mut bool,
     ) {
         match probe_registry.invoke_event(sink_pad, &event, true) {
             ProbeReturn::Drop | ProbeReturn::Handled => return,
@@ -3511,7 +3553,14 @@ fn spawn_sink_task(
                 position.store(u64::MAX, Ordering::Release);
             }
             Event::Segment(seg) if seg.format == crate::event::SegmentFormat::Time => {
-                position.store(seg.start.max(0) as u64, Ordering::Release);
+                // Reverse playback (#165) starts at the range's top.
+                *reverse = seg.rate < 0.0;
+                let anchor = if *reverse && seg.stop >= 0 {
+                    seg.stop as u64
+                } else {
+                    seg.start.max(0) as u64
+                };
+                position.store(anchor, Ordering::Release);
             }
             _ => {}
         }
@@ -3536,6 +3585,8 @@ fn spawn_sink_task(
                 None => (None, Vec::new()),
             };
             let mut last_seek_epoch: u64 = 0;
+            // Reverse playback (#165), from the current segment's rate.
+            let mut reverse = false;
             // #163 phase B: set when this element converts a seek into another
             // format and forwards it upstream; cleared when the completion is
             // reported in the format the application asked in.
@@ -3610,6 +3661,7 @@ fn spawn_sink_task(
                                     &probe_registry,
                                     &sink_pad,
                                     &position,
+                                    &mut reverse,
                                 );
                             }
                             Ok(terminal) => stashed = Some(terminal),
@@ -3698,7 +3750,7 @@ fn spawn_sink_task(
                             Ok(_) => {
                                 shed.reset();
                                 tracers.notify_buffer_processed(&name);
-                                present(&position, pts);
+                                present(&position, pts, reverse);
                             }
                             // Same rule as the transform arm (gotcha 13): a sink
                             // that allocates — an encoder-backed sink, a sink
@@ -3720,6 +3772,7 @@ fn spawn_sink_task(
                             &probe_registry,
                             &sink_pad,
                             &position,
+                            &mut reverse,
                         );
                     }
                     Some(Message::Eos) => {
@@ -3768,7 +3821,9 @@ fn spawn_sink_task(
                     match result {
                         Ok(_) => {
                             shed.reset();
-                            present(&position, pts);
+                            // RT bridges carry no events, so no segment can
+                            // flip this path into reverse.
+                            present(&position, pts, false);
                         }
                         // Mirrors the channel path: arena exhaustion is flow
                         // control, not failure.

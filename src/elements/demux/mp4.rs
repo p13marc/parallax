@@ -1145,6 +1145,14 @@ pub struct Mp4DemuxSource<R: Read + Seek + Send> {
     /// into `SegmentDone` for a SEGMENT-flagged seek). Cleared by a seek
     /// with no stop.
     stop_ns: Option<u64>,
+    /// Reverse playback cursor (#165, `trick_rate < 0`): the next backward
+    /// keyframe probe position. `None` while reverse is active means the
+    /// walk passed the range's bottom — Eos. Keyframe-only, video-only
+    /// (GStreamer's keyframe reverse trick mode); PTS stay true (decreasing)
+    /// and the reverse segment maps them to increasing running time.
+    reverse_cursor_ns: Option<u64>,
+    /// Bottom of the reverse range (the seek's `start`).
+    reverse_end_ns: u64,
 }
 
 impl<R: Read + Seek + Send> Mp4DemuxSource<R> {
@@ -1173,6 +1181,8 @@ impl<R: Read + Seek + Send> Mp4DemuxSource<R> {
             looping: false,
             trick_rate: 1.0,
             stop_ns: None,
+            reverse_cursor_ns: None,
+            reverse_end_ns: 0,
         }
     }
 
@@ -1221,6 +1231,41 @@ impl<R: Read + Seek + Send> Mp4DemuxSource<R> {
         }
         Ok(())
     }
+
+    /// Reverse trick mode (#165): walk video keyframes backward from the
+    /// cursor. Each call snaps the cursor to the previous sync sample,
+    /// emits it, and moves the cursor just below it; passing the range's
+    /// bottom (or keyframe 0) ends the walk. Audio is muted — its samples
+    /// are never read.
+    fn produce_reverse(&mut self) -> Result<crate::element::DemuxerProduce> {
+        use crate::element::{DemuxerProduce, RoutedOutput};
+
+        let Some((video_track, video_pad)) =
+            self.tracks.iter().find(|(_, pad)| pad.0 == 0).copied()
+        else {
+            return Ok(DemuxerProduce::Eos);
+        };
+        let Some(cursor) = self.reverse_cursor_ns else {
+            return Ok(DemuxerProduce::Eos);
+        };
+        let point = self.demux.seek_all_to_time(cursor, SeekSnap::Before)?;
+        let k = point.time_ns;
+        if k < self.reverse_end_ns {
+            self.reverse_cursor_ns = None;
+            return Ok(DemuxerProduce::Eos);
+        }
+        let Some(sample) = self.demux.read_sample(video_track)? else {
+            self.reverse_cursor_ns = None;
+            return Ok(DemuxerProduce::Eos);
+        };
+        // Strictly decreasing: the next probe sits below this keyframe, so
+        // SeekSnap::Before cannot land on it again — termination guaranteed.
+        self.reverse_cursor_ns = (k > self.reverse_end_ns && k > 0).then(|| k - 1);
+        Ok(DemuxerProduce::Routed(RoutedOutput::single(
+            video_pad,
+            sample.buffer,
+        )))
+    }
 }
 
 impl<R: Read + Seek + Send> crate::element::Demuxer for Mp4DemuxSource<R> {
@@ -1232,6 +1277,10 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for Mp4DemuxSource<R> {
 
     fn produce(&mut self) -> Result<crate::element::DemuxerProduce> {
         use crate::element::{DemuxerProduce, RoutedOutput};
+
+        if self.trick_rate < 0.0 {
+            return self.produce_reverse();
+        }
 
         if !self.primed {
             for i in 0..self.tracks.len() {
@@ -1313,6 +1362,44 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for Mp4DemuxSource<R> {
         if seek.format != SegmentFormat::Time || seek.start.seek_type != SeekType::Set {
             return EventResult::NotHandled;
         }
+
+        // Reverse (#165): keyframe-only backward walk over [start, stop).
+        // The reported landing is the TOP of the range — where playback
+        // begins; the executor builds the segment as [start, stop] with the
+        // seek's negative rate.
+        if seek.rate < 0.0 {
+            let start_ns = seek.start.position.max(0) as u64;
+            let stop_ns = match seek.stop.seek_type {
+                SeekType::Set => seek.stop.position.max(0) as u64,
+                _ => {
+                    let d = self.demux.duration_ns();
+                    if d == 0 {
+                        tracing::warn!(
+                            "mp4demux: reverse seek needs a stop or a known duration; refused"
+                        );
+                        return EventResult::Error;
+                    }
+                    d
+                }
+            };
+            if stop_ns <= start_ns {
+                tracing::warn!("mp4demux: reverse seek range is empty ({start_ns}..{stop_ns})");
+                return EventResult::Error;
+            }
+            for slot in &mut self.pending {
+                *slot = None;
+            }
+            self.primed = true; // reverse path bypasses forward priming
+            self.trick_rate = seek.rate;
+            self.stop_ns = None;
+            self.reverse_end_ns = start_ns;
+            self.reverse_cursor_ns = Some(stop_ns - 1);
+            tracing::info!(
+                "mp4demux: reverse seek over [{start_ns}, {stop_ns}) ns, keyframes only"
+            );
+            return EventResult::handled_at(stop_ns as i64);
+        }
+
         let snap = seek.flags.snap().unwrap_or(SeekSnap::Before);
         match self
             .demux
@@ -1329,8 +1416,10 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for Mp4DemuxSource<R> {
                 }
                 self.primed = false;
                 // Trick play (#165): the seek's rate governs playback until
-                // the next handled seek changes it.
+                // the next handled seek changes it (rate 0 is nonsense —
+                // treat as normal). A forward seek always leaves reverse.
                 self.trick_rate = if seek.rate > 0.0 { seek.rate } else { 1.0 };
+                self.reverse_cursor_ns = None;
                 // Honor the seek's stop (#165): playback ends there. A seek
                 // without a stop clears any previous one.
                 self.stop_ns = match seek.stop.seek_type {

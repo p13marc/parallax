@@ -331,7 +331,15 @@ impl SegmentEvent {
     /// synchronization. After a seek, running time continues from where it
     /// left off (accumulated in `base`).
     ///
-    /// Formula: `running_time = (pts - start) / |rate| + base`
+    /// Forward (`rate > 0`): `running_time = (pts - start) / |rate| + base`.
+    ///
+    /// Reverse (`rate < 0`, #165): playback runs the segment stop→start
+    /// with forward-increasing running time, so
+    /// `running_time = (stop - pts) / |rate| + base` — decreasing PTS map
+    /// to increasing running time, which is why sink pacing needs no
+    /// special casing. A reverse segment without a `stop` is unmappable
+    /// (`NONE` for every PTS), and PTS outside `[start, stop]` are
+    /// out-of-segment (`NONE`) in both directions.
     pub fn to_running_time(&self, pts: ClockTime) -> ClockTime {
         if pts == ClockTime::NONE || self.format != SegmentFormat::Time {
             return ClockTime::NONE;
@@ -340,7 +348,14 @@ impl SegmentEvent {
         if pts_ns < self.start {
             return ClockTime::NONE;
         }
-        let elapsed = (pts_ns - self.start) as f64;
+        let elapsed = if self.rate < 0.0 {
+            if self.stop < 0 || pts_ns > self.stop {
+                return ClockTime::NONE;
+            }
+            (self.stop - pts_ns) as f64
+        } else {
+            (pts_ns - self.start) as f64
+        };
         let scaled = (elapsed / self.rate.abs()) as i64;
         let result = scaled + self.base;
         if result < 0 {
@@ -375,7 +390,8 @@ impl SegmentEvent {
 
     /// Convert running time back to buffer PTS using this segment.
     ///
-    /// Inverse of [`to_running_time`](Self::to_running_time).
+    /// Inverse of [`to_running_time`](Self::to_running_time), including the
+    /// reverse mapping (`rate < 0`: `pts = stop - elapsed * |rate|`).
     pub fn running_time_to_pts(&self, running_time: ClockTime) -> ClockTime {
         if running_time == ClockTime::NONE || self.format != SegmentFormat::Time {
             return ClockTime::NONE;
@@ -386,8 +402,15 @@ impl SegmentEvent {
         }
         let elapsed = (rt - self.base) as f64;
         let scaled = (elapsed * self.rate.abs()) as i64;
-        let result = scaled + self.start;
-        if result < 0 {
+        let result = if self.rate < 0.0 {
+            if self.stop < 0 {
+                return ClockTime::NONE;
+            }
+            self.stop - scaled
+        } else {
+            scaled + self.start
+        };
+        if result < self.start || result < 0 {
             ClockTime::NONE
         } else {
             ClockTime::from_nanos(result as u64)

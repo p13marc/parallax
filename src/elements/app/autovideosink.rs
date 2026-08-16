@@ -121,6 +121,10 @@ enum Pace {
 /// latency and drop them. The anchor absorbs that latency; a new segment
 /// (seek or start) clears it so the next frame re-anchors.
 ///
+/// Reverse playback (#165) needs no special casing here: a reverse
+/// segment's `to_running_time` maps decreasing PTS to *increasing* running
+/// times, so this pacer sees a normal forward timeline.
+///
 /// [`SegmentEvent::to_running_time`]: crate::event::SegmentEvent::to_running_time
 #[derive(Debug, Default)]
 struct PtsPacer {

@@ -920,6 +920,13 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
         if seek.format != SegmentFormat::Time || seek.start.seek_type != SeekType::Set {
             return EventResult::NotHandled;
         }
+        // Reverse is MP4-only for now (#165): MkvDemux's scan-based produce
+        // (per-track skip + resync machinery) has no backward walk; refusing
+        // beats clamping the rate and silently playing forward.
+        if seek.rate < 0.0 {
+            tracing::warn!("mkvdemux: reverse playback is not supported; seek refused");
+            return EventResult::Error;
+        }
         let target_ns = seek.start.position.max(0) as u64;
         let ticks = target_ns / self.timestamp_scale;
 

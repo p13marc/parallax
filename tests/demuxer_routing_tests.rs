@@ -1205,3 +1205,126 @@ async fn mp4_plain_seek_with_stop_ends_at_stop() {
     assert!(tail.contains(&700), "last pre-stop frame arrived: {pts:?}");
     handle.wait().await.unwrap();
 }
+
+/// #165 reverse playback (MP4-only, keyframe trick mode): a rate<0 seek
+/// walks video keyframes backward from the range's top; PTS strictly
+/// decrease, every frame is a keyframe, mapped running times strictly
+/// increase, and the walk ends with EOS after keyframe 0.
+#[cfg(feature = "mp4-demux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn mp4_reverse_seek_walks_keyframes_backward() {
+    use parallax::clock::ClockTime;
+    use parallax::elements::Mp4DemuxSource;
+    use parallax::elements::demux::Mp4Demux;
+    use parallax::elements::mux::{Mp4Mux, Mp4MuxConfig, Mp4VideoTrackConfig};
+    use parallax::event::{Event, SeekEvent, SegmentEvent};
+    use parallax::pipeline::bus::MessageKind;
+    use parallax::pipeline::probe::{PadRef, ProbeData, ProbeReturn, ProbeType};
+    use std::io::Cursor;
+    use std::sync::{Arc, Mutex};
+
+    // 20 frames at 100 ms, keyframes at 0/500/1000/1500 ms; duration 2 s.
+    let mut mux = Mp4Mux::new(Cursor::new(Vec::new()), Mp4MuxConfig::default()).unwrap();
+    let sps = vec![0x67, 0x42, 0x00, 0x1f];
+    let pps = vec![0x68, 0xce, 0x3c, 0x80];
+    let video = mux
+        .add_video_track(Mp4VideoTrackConfig::h264(320, 240, &sps, &pps))
+        .unwrap();
+    let keyframe = [0x00, 0x00, 0x00, 0x02, 0x65, 0xAA];
+    let delta = [0x00, 0x00, 0x00, 0x02, 0x41, 0x9A];
+    for i in 0..20u64 {
+        let is_key = i.is_multiple_of(5);
+        let data: &[u8] = if is_key { &keyframe } else { &delta };
+        mux.write_video_sample(video, data, i * 100, 100, is_key)
+            .unwrap();
+    }
+    let mp4_data = mux.finish().unwrap().into_inner();
+    let demux = Mp4Demux::new(Cursor::new(mp4_data.clone()), mp4_data.len() as u64).unwrap();
+
+    let mut pipeline = Pipeline::new();
+    let video_sink = AppSink::with_max_buffers(2);
+    let video_handle = video_sink.handle();
+    let node = pipeline.add_demuxer("mp4demux", Mp4DemuxSource::video_only(demux));
+    let vs = pipeline.add_async_sink("video_sink", video_sink);
+    pipeline
+        .link_pads_full(
+            node,
+            "video",
+            vs,
+            "sink",
+            parallax::pipeline::LinkPolicy::Block,
+            Some(2),
+        )
+        .unwrap();
+
+    let segments: Arc<Mutex<Vec<SegmentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let segments_probe = segments.clone();
+    let _ = pipeline.add_probe(PadRef::sink(vs), ProbeType::EVENT_DOWN, move |data| {
+        if let ProbeData::Event(Event::Segment(seg)) = data {
+            segments_probe.lock().unwrap().push(seg.clone());
+        }
+        ProbeReturn::Ok
+    });
+
+    let executor = Executor::new();
+    let mut handle = executor.start(&mut pipeline).unwrap();
+    let mut bus = handle.take_bus().unwrap();
+
+    for _ in 0..2 {
+        assert!(matches!(
+            video_handle.pull_buffer().await,
+            Pulled::Buffer(_)
+        ));
+    }
+
+    // Reverse over the whole file: stop unset -> the demuxer resolves it
+    // from the duration and reports it as the landing.
+    let seek = SeekEvent::new_time(ClockTime::ZERO).with_rate(-1.0);
+    assert!(handle.seek(seek).await);
+
+    let mut pts = Vec::new();
+    loop {
+        match video_handle.pull_buffer().await {
+            Pulled::Buffer(b) => pts.push(b.metadata().pts.nanos() / 1_000_000),
+            Pulled::Flushing | Pulled::Empty => tokio::task::yield_now().await,
+            Pulled::Ended(_) => break,
+        }
+    }
+
+    // Post-seek tail: everything from the first top-of-range keyframe on.
+    let top = pts
+        .iter()
+        .position(|p| *p == 1_500)
+        .unwrap_or_else(|| panic!("reverse walk starts at the last keyframe: {pts:?}"));
+    let tail = &pts[top..];
+    assert_eq!(tail, &[1_500, 1_000, 500, 0], "keyframes backward: {pts:?}");
+
+    // SeekDone reports the range top for a reverse seek.
+    let mut seek_done_pos = None;
+    while let Some(msg) = bus.poll() {
+        if let MessageKind::SeekDone { position, .. } = msg.kind {
+            seek_done_pos = Some(position);
+        }
+    }
+    assert_eq!(seek_done_pos, Some(Some(2_000_000_000)));
+
+    // The reverse segment maps the decreasing PTS to increasing running
+    // times.
+    let segs = segments.lock().unwrap().clone();
+    let rseg = segs
+        .iter()
+        .find(|s| s.rate < 0.0)
+        .unwrap_or_else(|| panic!("a reverse segment was emitted: {segs:?}"));
+    assert_eq!(rseg.start, 0);
+    assert_eq!(rseg.stop, 2_000_000_000);
+    let rts: Vec<u64> = tail
+        .iter()
+        .map(|p| rseg.to_running_time(ClockTime::from_millis(*p)).nanos())
+        .collect();
+    assert!(
+        rts.windows(2).all(|w| w[0] < w[1]),
+        "running time increases in reverse: {rts:?}"
+    );
+
+    handle.wait().await.unwrap();
+}

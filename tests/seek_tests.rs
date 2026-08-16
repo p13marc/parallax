@@ -542,3 +542,83 @@ fn test_pipeline_seek_bytes() {
     let pos = pipeline.query_position().unwrap();
     assert_eq!(pos.position, Some(8));
 }
+
+/// #165 reverse playback: rate < 0 maps decreasing PTS to increasing
+/// running time — `running = (stop - pts) / |rate| + base`.
+#[test]
+fn test_segment_running_time_reverse() {
+    use parallax::clock::ClockTime;
+    use parallax::event::SegmentEvent;
+
+    let seg = SegmentEvent::new_time(
+        ClockTime::from_nanos(0),
+        Some(ClockTime::from_nanos(10_000)),
+    )
+    .with_rate(-1.0);
+
+    // PTS at the top of the range = running time 0.
+    assert_eq!(
+        seg.to_running_time(ClockTime::from_nanos(10_000)).nanos(),
+        0
+    );
+    // Decreasing PTS, increasing running time.
+    assert_eq!(
+        seg.to_running_time(ClockTime::from_nanos(7_500)).nanos(),
+        2_500
+    );
+    assert_eq!(
+        seg.to_running_time(ClockTime::from_nanos(0)).nanos(),
+        10_000
+    );
+    // Out of segment on both ends.
+    assert_eq!(
+        seg.to_running_time(ClockTime::from_nanos(10_001)),
+        ClockTime::NONE
+    );
+
+    // -2x halves the wall-clock spacing.
+    let fast = SegmentEvent::new_time(
+        ClockTime::from_nanos(0),
+        Some(ClockTime::from_nanos(10_000)),
+    )
+    .with_rate(-2.0);
+    assert_eq!(
+        fast.to_running_time(ClockTime::from_nanos(5_000)).nanos(),
+        2_500
+    );
+
+    // Inverse mapping round-trips.
+    assert_eq!(
+        seg.running_time_to_pts(ClockTime::from_nanos(2_500))
+            .nanos(),
+        7_500
+    );
+    // Base shifts the whole mapping.
+    let based = SegmentEvent::new_time(
+        ClockTime::from_nanos(0),
+        Some(ClockTime::from_nanos(10_000)),
+    )
+    .with_rate(-1.0)
+    .with_base(1_000);
+    assert_eq!(
+        based.to_running_time(ClockTime::from_nanos(10_000)).nanos(),
+        1_000
+    );
+}
+
+/// A reverse segment without a stop is unmappable — NONE for every PTS.
+#[test]
+fn test_segment_reverse_without_stop_is_unmappable() {
+    use parallax::clock::ClockTime;
+    use parallax::event::SegmentEvent;
+
+    let seg = SegmentEvent::new_time(ClockTime::from_nanos(0), None).with_rate(-1.0);
+    assert_eq!(
+        seg.to_running_time(ClockTime::from_nanos(5_000)),
+        ClockTime::NONE
+    );
+    assert_eq!(
+        seg.running_time_to_pts(ClockTime::from_nanos(5_000)),
+        ClockTime::NONE
+    );
+}
