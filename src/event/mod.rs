@@ -307,6 +307,15 @@ impl SegmentEvent {
         self.flags = flags;
         self
     }
+
+    /// Set the running-time base — the running time already consumed under
+    /// earlier segments (#165). A flushing seek restarts running time
+    /// (base 0); a non-flushing seek accumulates so running time stays
+    /// monotonic across the segment boundary.
+    pub fn with_base(mut self, base: i64) -> Self {
+        self.base = base;
+        self
+    }
 }
 
 impl Default for SegmentEvent {

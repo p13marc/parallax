@@ -2567,6 +2567,85 @@ fn initial_segment_for(buffer: &Buffer) -> SegmentEvent {
     }
 }
 
+/// Producer-side view of the outgoing segment (#165): the Time segment last
+/// put on the wire plus how far playback advanced under it. This is what a
+/// *non-flushing* seek's successor segment needs — its `base` is the running
+/// time already consumed, so running time stays monotonic across the queued
+/// boundary (GStreamer's `gst_segment_do_seek` non-flush rule).
+///
+/// One tracker per producing task. A source-style demuxer keeps a single
+/// tracker fed by the max PTS across its pads, so an A/V pair's accumulated
+/// base can skew by about one frame between streams — a documented
+/// approximation, revisit if multi-sink sync ever depends on it.
+#[derive(Default)]
+struct SegmentTracker {
+    /// The Time segment currently on the wire; `None` until one is emitted.
+    current: Option<SegmentEvent>,
+    /// Highest PTS stamped since `current` was installed.
+    last_pts: ClockTime,
+}
+
+impl SegmentTracker {
+    /// Record a produced buffer's PTS under the current segment.
+    fn observe(&mut self, pts: ClockTime) {
+        if pts != ClockTime::NONE && (self.last_pts == ClockTime::NONE || pts > self.last_pts) {
+            self.last_pts = pts;
+        }
+    }
+
+    /// A new segment went on the wire: it becomes current, nothing played
+    /// under it yet. Bytes segments are ignored — base is a Time concept.
+    fn installed(&mut self, segment: &SegmentEvent) {
+        if segment.format == crate::event::SegmentFormat::Time {
+            self.current = Some(segment.clone());
+            self.last_pts = ClockTime::NONE;
+        }
+    }
+
+    /// Base for a successor non-flushing segment: the running time of the
+    /// furthest position played under the outgoing segment. Falls back to
+    /// the outgoing segment's own base when nothing played under it (two
+    /// queued seeks back to back), and 0 when no segment exists yet.
+    fn accumulated_base(&self) -> i64 {
+        let Some(current) = &self.current else {
+            return 0;
+        };
+        if self.last_pts == ClockTime::NONE {
+            return current.base;
+        }
+        match current.to_running_time(self.last_pts).to_option() {
+            Some(rt) => rt.nanos() as i64,
+            None => current.base,
+        }
+    }
+}
+
+/// What one [`handle_upstream_hop`] call did, for the caller's bookkeeping.
+struct HopOutcome {
+    /// A Segment was emitted — the caller suppresses its lazy initial one.
+    segment_emitted: bool,
+    /// This task ran a seek to completion (the `Handled` arm).
+    #[allow(dead_code)] // consumed by the SEGMENT-seek slice (#165 commit 2)
+    handled_seek: Option<HandledSeek>,
+}
+
+impl HopOutcome {
+    const NONE: Self = Self {
+        segment_emitted: false,
+        handled_seek: None,
+    };
+}
+
+/// The facts of a seek this task just handled, kept for segment bookkeeping
+/// (#165: SEGMENT-flag detection in commit 2 reads `flags`/`stop`).
+#[allow(dead_code)]
+struct HandledSeek {
+    seqnum: u64,
+    format: crate::event::SegmentFormat,
+    flags: crate::event::SeekFlags,
+    stop: Option<u64>,
+}
+
 /// Probe-then-broadcast for an event emitted on a src pad: src-pad probes see
 /// each emitted event, and Drop/Handled suppresses the emission.
 async fn emit_event(
@@ -2876,6 +2955,12 @@ fn forward_to_parents(
 /// holds wherever the seek terminates. `last_seek_epoch` dedups multi-path
 /// delivery (a diamond delivers the same seek along every branch); a seek
 /// with a seqnum at or below the last seen one is dropped — newer wins.
+///
+/// `tracker` is the producing task's [`SegmentTracker`] (#165): a handled
+/// non-flushing Time seek's segment gets `base = accumulated running time`
+/// from it, and every emitted Time segment is installed back into it.
+/// Mid-graph tasks that emit no producer segments pass `None` — behavior is
+/// then exactly the pre-tracker one (base 0).
 async fn handle_upstream_hop(
     name: &str,
     element: &mut Box<DynAsyncElement<'static>>,
@@ -2889,7 +2974,8 @@ async fn handle_upstream_hop(
     last_seek_epoch: &mut u64,
     warn_unhandled_seek: bool,
     pending_translation: &mut Option<PendingTranslation>,
-) -> bool {
+    tracker: Option<&mut SegmentTracker>,
+) -> HopOutcome {
     if let Event::Seek(seek) = event {
         // Ordered by epoch, not seqnum (#173): a refinement round shares its
         // seek's seqnum but must pass this guard, while a diamond's duplicate
@@ -2899,13 +2985,13 @@ async fn handle_upstream_hop(
                 "'{name}': seek {} already seen (multi-path delivery), dropped",
                 seek.seqnum()
             );
-            return false;
+            return HopOutcome::NONE;
         }
         *last_seek_epoch = seek.epoch();
     }
 
     match probe_registry.invoke_event(src_pad, event, false) {
-        ProbeReturn::Drop | ProbeReturn::Handled => return false,
+        ProbeReturn::Drop | ProbeReturn::Handled => return HopOutcome::NONE,
         _ => {}
     }
 
@@ -2916,7 +3002,7 @@ async fn handle_upstream_hop(
             EventResult::Forward(translated) => forward_to_parents(parents, translated),
             _ => {}
         }
-        return false;
+        return HopOutcome::NONE;
     };
 
     match result {
@@ -2960,9 +3046,12 @@ async fn handle_upstream_hop(
             // else the requested position. Current/End-relative requests
             // have no absolute target — only the element knows where they
             // ended up (FileSrc reports it). The seek's rate and stop are
-            // carried so the segment's shape is right for trick play;
-            // `base` stays 0 and `applied_rate` 1.0 until rate ≠ 1.0
-            // playback actually lands (#165).
+            // carried so the segment's shape is right for trick play.
+            // A flushing seek restarts running time (`base` 0); a
+            // non-flushing seek accumulates the running time consumed under
+            // the outgoing segment into `base` (#165) so downstream running
+            // time stays monotonic across the queued boundary.
+            // `applied_rate` stays 1.0 until server-side trick modes exist.
             let requested = match seek.start.seek_type {
                 SeekType::Set => Some(seek.start.position.max(0)),
                 _ => None,
@@ -2986,6 +3075,11 @@ async fn handle_upstream_hop(
                     .filter(|d| d.format == seek.format)
                     .and_then(|d| d.duration),
             };
+            let flushing = seek.flags.contains(crate::event::SeekFlags::FLUSH);
+            let base = match (&tracker, flushing) {
+                (Some(t), false) => t.accumulated_base(),
+                _ => 0,
+            };
             let segment = match seek.format {
                 crate::event::SegmentFormat::Bytes => {
                     SegmentEvent::new_bytes(segment_start as u64, stop)
@@ -2995,7 +3089,11 @@ async fn handle_upstream_hop(
                     stop.map(ClockTime::from_nanos),
                 ),
             }
-            .with_rate(seek.rate);
+            .with_rate(seek.rate)
+            .with_base(base);
+            if let Some(t) = tracker {
+                t.installed(&segment);
+            }
             let segment_emitted = match emit(Event::Segment(segment)) {
                 Some(ev) => {
                     broadcast_event(outputs, &ev).await;
@@ -3014,7 +3112,15 @@ async fn handle_upstream_hop(
                 "source '{name}': seek {} handled, segment starts at {segment_start}",
                 seek.seqnum()
             );
-            segment_emitted
+            HopOutcome {
+                segment_emitted,
+                handled_seek: Some(HandledSeek {
+                    seqnum: seek.seqnum(),
+                    format: seek.format,
+                    flags: seek.flags,
+                    stop,
+                }),
+            }
         }
         EventResult::Forward(translated) => {
             if parents.is_empty() {
@@ -3022,7 +3128,7 @@ async fn handle_upstream_hop(
                     format!("'{name}' translated a seek but has no upstream peer"),
                     None,
                 );
-                return false;
+                return HopOutcome::NONE;
             }
             // The invariant `SeekEvent::derive` exists to preserve. A
             // replacement that renamed the seek would break flush-epoch
@@ -3039,7 +3145,7 @@ async fn handle_upstream_hop(
                         ),
                         None,
                     );
-                    return false;
+                    return HopOutcome::NONE;
                 }
             }
             *pending_translation = Some(PendingTranslation {
@@ -3056,12 +3162,12 @@ async fn handle_upstream_hop(
             // because `derive` kept the seqnum, `fetch_max` reaches exactly
             // the same value it otherwise would.
             forward_to_parents(parents, &translated);
-            false
+            HopOutcome::NONE
         }
         EventResult::NotHandled if !parents.is_empty() => {
             // Not ours — keep it travelling toward the sources.
             forward_to_parents(parents, event);
-            false
+            HopOutcome::NONE
         }
         EventResult::NotHandled => {
             // End of the route. Only warn when this element claimed
@@ -3072,11 +3178,11 @@ async fn handle_upstream_hop(
             } else {
                 tracing::debug!("'{name}': seek {} reached an unseekable end", seek.seqnum());
             }
-            false
+            HopOutcome::NONE
         }
         EventResult::Error => {
             bus.post_warning(format!("source '{name}': seek failed"), None);
-            false
+            HopOutcome::NONE
         }
     }
 }
@@ -3132,6 +3238,7 @@ fn spawn_source_task(
         let bytes_native = byte_total.is_some();
         let byte_total = byte_total.flatten();
         let mut segment_sent = false;
+        let mut segment_tracker = SegmentTracker::default();
         let mut last_seek_epoch: u64 = 0;
         // #163 phase B: set when this element converts a seek into another
         // format and forwards it upstream; cleared when the completion is
@@ -3172,8 +3279,10 @@ fn spawn_source_task(
                     &mut last_seek_epoch,
                     warn_unhandled_seek,
                     &mut pending_translation,
+                    Some(&mut segment_tracker),
                 )
-                .await;
+                .await
+                .segment_emitted;
             }
 
             // Runtime pause (PipelineHandle::pause): stop producing until
@@ -3194,8 +3303,10 @@ fn spawn_source_task(
                         &mut last_seek_epoch,
                         warn_unhandled_seek,
                         &mut pending_translation,
+                        Some(&mut segment_tracker),
                     )
-                    .await;
+                    .await
+                    .segment_emitted;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
@@ -3215,9 +3326,11 @@ fn spawn_source_task(
                         } else {
                             initial_segment_for(&buffer)
                         };
+                        segment_tracker.installed(&segment);
                         emit_event(&outputs, &src_pad, &probe_registry, Event::Segment(segment))
                             .await;
                     }
+                    segment_tracker.observe(buffer.metadata().pts);
 
                     // Invoke buffer probes
                     match probe_registry.invoke_buffer(&src_pad, &buffer) {
@@ -3416,6 +3529,7 @@ fn spawn_sink_task(
                                     &mut last_seek_epoch,
                                     false,
                                     &mut pending_translation,
+                                    None,
                                 )
                                 .await;
                             }
@@ -3495,6 +3609,7 @@ fn spawn_sink_task(
                                 &mut last_seek_epoch,
                                 false,
                                 &mut pending_translation,
+                                None,
                             )
                             .await;
                             continue;
@@ -3776,6 +3891,7 @@ fn spawn_transform_task(
                                 &mut last_seek_epoch,
                                 false,
                                 &mut pending_translation,
+                                None,
                             )
                             .await;
                             continue;
@@ -4155,6 +4271,11 @@ fn spawn_demuxer_task(
             .await;
         }
         let mut segment_pads: HashSet<String> = HashSet::new();
+        // #165: source-style demuxers accumulate non-flushing-seek base like
+        // sources. One tracker for the node (max PTS across pads -- the seek
+        // segment is broadcast to all pads anyway); ~one frame of A/V skew
+        // in base is a documented approximation.
+        let mut segment_tracker = SegmentTracker::default();
         let mut last_seek_epoch: u64 = 0;
         // #163 phase B: set when this element converts a seek into another
         // format and forwards it upstream; cleared when the completion is
@@ -4199,6 +4320,7 @@ fn spawn_demuxer_task(
                                 &mut last_seek_epoch,
                                 warn_unhandled_seek,
                                 &mut pending_translation,
+                                None,
                             )
                             .await;
                             continue;
@@ -4483,8 +4605,10 @@ fn spawn_demuxer_task(
                             &mut last_seek_epoch,
                             warn_unhandled_seek,
                             &mut pending_translation,
+                            Some(&mut segment_tracker),
                         )
                         .await
+                        .segment_emitted
                         {
                             // The seek's segment went to every pad.
                             segment_pads.extend(outputs_by_pad.keys().cloned());
@@ -4516,8 +4640,10 @@ fn spawn_demuxer_task(
                                 &mut last_seek_epoch,
                                 warn_unhandled_seek,
                                 &mut pending_translation,
+                                Some(&mut segment_tracker),
                             )
                             .await
+                            .segment_emitted
                             {
                                 segment_pads.extend(outputs_by_pad.keys().cloned());
                             }
@@ -4544,7 +4670,8 @@ fn spawn_demuxer_task(
                                 _ => {}
                             }
                             tracers.notify_buffer(&name, &out);
-                            route_demux_buffer(
+                            let pts = out.metadata().pts;
+                            let anchored = route_demux_buffer(
                                 &name,
                                 &pad,
                                 out,
@@ -4557,6 +4684,17 @@ fn spawn_demuxer_task(
                                 &probe_registry,
                             )
                             .await;
+                            // The first pad's lazy segment is the node's
+                            // running-time anchor (#165); later pads anchor
+                            // on the wire but not in the tracker -- one
+                            // node, one base.
+                            if anchored && segment_tracker.current.is_none() {
+                                segment_tracker.installed(&SegmentEvent::new_time(
+                                    pts.to_option().unwrap_or(ClockTime::ZERO),
+                                    None,
+                                ));
+                            }
+                            segment_tracker.observe(pts);
                         }
                     }
                     Ok(DemuxResult::WouldBlock) => {
@@ -4689,6 +4827,7 @@ fn spawn_muxer_task(
                         &mut last_seek_epoch,
                         false,
                         &mut pending_translation,
+                        None,
                     )
                     .await;
                     continue;
@@ -4878,6 +5017,74 @@ fn spawn_muxer_task(
 mod tests {
     use super::*;
     use crate::buffer::MemoryHandle;
+
+    mod segment_tracker {
+        use super::super::SegmentTracker;
+        use crate::clock::ClockTime;
+        use crate::event::SegmentEvent;
+
+        #[test]
+        fn no_segment_means_base_zero() {
+            let t = SegmentTracker::default();
+            assert_eq!(t.accumulated_base(), 0);
+        }
+
+        #[test]
+        fn accumulates_running_time_of_last_pts() {
+            let mut t = SegmentTracker::default();
+            t.installed(&SegmentEvent::new_time(ClockTime::from_nanos(1_000), None));
+            t.observe(ClockTime::from_nanos(4_000));
+            // (4000 - 1000) / 1.0 + 0
+            assert_eq!(t.accumulated_base(), 3_000);
+        }
+
+        #[test]
+        fn nothing_played_falls_back_to_current_base() {
+            let mut t = SegmentTracker::default();
+            t.installed(&SegmentEvent::new_time(ClockTime::from_nanos(0), None).with_base(7_000));
+            // Two queued seeks back to back: the second inherits the
+            // first's base rather than resetting to 0.
+            assert_eq!(t.accumulated_base(), 7_000);
+        }
+
+        #[test]
+        fn rate_scales_the_accumulation() {
+            let mut t = SegmentTracker::default();
+            t.installed(&SegmentEvent::new_time(ClockTime::from_nanos(0), None).with_rate(2.0));
+            t.observe(ClockTime::from_nanos(10_000));
+            // 10_000 elapsed at 2x = 5_000 of running time.
+            assert_eq!(t.accumulated_base(), 5_000);
+        }
+
+        #[test]
+        fn observe_keeps_the_max() {
+            let mut t = SegmentTracker::default();
+            t.installed(&SegmentEvent::new_time(ClockTime::ZERO, None));
+            t.observe(ClockTime::from_nanos(5_000));
+            t.observe(ClockTime::from_nanos(2_000)); // B-frame style regression
+            assert_eq!(t.accumulated_base(), 5_000);
+        }
+
+        #[test]
+        fn bytes_segments_are_ignored() {
+            let mut t = SegmentTracker::default();
+            t.installed(&SegmentEvent::new_bytes(0, None));
+            assert!(t.current.is_none());
+            assert_eq!(t.accumulated_base(), 0);
+        }
+
+        #[test]
+        fn install_resets_last_pts() {
+            let mut t = SegmentTracker::default();
+            t.installed(&SegmentEvent::new_time(ClockTime::ZERO, None));
+            t.observe(ClockTime::from_nanos(9_000));
+            t.installed(
+                &SegmentEvent::new_time(ClockTime::from_nanos(20_000), None).with_base(9_000),
+            );
+            // Nothing observed under the new segment yet.
+            assert_eq!(t.accumulated_base(), 9_000);
+        }
+    }
     use crate::element::{
         ConsumeContext, DynAsyncElement, ProduceContext, ProduceResult, Sink, SinkAdapter, Source,
         SourceAdapter,

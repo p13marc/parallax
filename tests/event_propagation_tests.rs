@@ -621,3 +621,149 @@ async fn post_seek_segment_carries_rate_and_stop() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A non-flushing seek's queued Segment carries `base` = the running time
+/// already consumed under the outgoing segment (#165), so downstream running
+/// time stays monotonic across the queued boundary. (A flushing seek keeps
+/// base 0 — running time restarts.)
+#[tokio::test(flavor = "multi_thread")]
+async fn non_flushing_seek_accumulates_base() {
+    use parallax::event::{Event, SeekEvent, SeekFlags, SeekPosition, SegmentEvent, SegmentFormat};
+
+    let mut pipeline = Pipeline::new();
+    let appsrc = AppSrc::with_max_buffers(32);
+    let src_handle = appsrc.handle();
+    let src = pipeline.add_source("src", appsrc);
+    let appsink = AppSink::with_max_buffers(32);
+    let sink_handle = appsink.handle();
+    let snk = pipeline.add_async_sink("sink", appsink);
+    pipeline.link(src, snk).unwrap();
+
+    let segments: Arc<Mutex<Vec<SegmentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let segments_probe = segments.clone();
+    let _ = pipeline.add_probe(PadRef::sink(snk), ProbeType::EVENT_DOWN, move |data| {
+        if let ProbeData::Event(Event::Segment(seg)) = data {
+            segments_probe.lock().unwrap().push(seg.clone());
+        }
+        ProbeReturn::Ok
+    });
+
+    let executor = Executor::new();
+    let handle = executor.start(&mut pipeline).unwrap();
+
+    // Three buffers, 1 ms apart, starting at t = 1 ms.
+    for pts in [1_000_000u64, 2_000_000, 3_000_000] {
+        src_handle.push_buffer(buffer_with_pts(pts)).await.unwrap();
+    }
+    wait_until(
+        || segments.lock().unwrap().len() >= 1,
+        "the lazy initial segment",
+    )
+    .await;
+    // The tracker's `last_pts` advances in the source task; wait for the
+    // data to be fully produced (visible at the sink) before seeking.
+    let mut pulled = 0;
+    while pulled < 3 {
+        if let Pulled::Buffer(_) = sink_handle.pull_buffer().await {
+            pulled += 1;
+        }
+    }
+
+    let seek = SeekEvent::new(SegmentFormat::Time, SeekPosition::set(10_000_000))
+        .with_flags(SeekFlags::empty());
+    assert!(handle.seek(seek).await);
+
+    wait_until(|| segments.lock().unwrap().len() >= 2, "the queued segment").await;
+
+    src_handle
+        .push_buffer(buffer_with_pts(10_000_000))
+        .await
+        .unwrap();
+    src_handle.end_stream();
+    while let Pulled::Buffer(_) = sink_handle.pull_buffer().await {}
+    handle.wait().await.unwrap();
+
+    let segs = segments.lock().unwrap().clone();
+    let initial = &segs[0];
+    let queued = &segs[1];
+    assert_eq!(initial.base, 0, "initial segment has no accumulated base");
+    assert_eq!(
+        initial.start, 1_000_000,
+        "initial segment anchors at the first buffer's PTS"
+    );
+    assert_eq!(queued.start, 10_000_000, "queued segment starts at target");
+    // Running time consumed under the initial segment: last PTS observed was
+    // 3 ms, anchored at 1 ms -> 2 ms.
+    assert_eq!(
+        queued.base, 2_000_000,
+        "queued segment's base is the running time consumed: {segs:?}"
+    );
+    // Monotonicity across the boundary: the new segment's start maps to at
+    // least where the old one left off.
+    let before = initial
+        .to_running_time(ClockTime::from_nanos(3_000_000))
+        .nanos();
+    let after = queued
+        .to_running_time(ClockTime::from_nanos(10_000_000))
+        .nanos();
+    assert!(
+        after >= before,
+        "running time is monotonic across the queued boundary ({before} -> {after})"
+    );
+}
+
+/// A FLUSHING seek after playback restarts running time: base stays 0.
+#[tokio::test(flavor = "multi_thread")]
+async fn flushing_seek_resets_base() {
+    use parallax::event::{Event, SeekEvent, SeekPosition, SegmentEvent, SegmentFormat};
+
+    let mut pipeline = Pipeline::new();
+    let appsrc = AppSrc::with_max_buffers(32);
+    let src_handle = appsrc.handle();
+    let src = pipeline.add_source("src", appsrc);
+    let appsink = AppSink::with_max_buffers(32);
+    let sink_handle = appsink.handle();
+    let snk = pipeline.add_async_sink("sink", appsink);
+    pipeline.link(src, snk).unwrap();
+
+    let segments: Arc<Mutex<Vec<SegmentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let segments_probe = segments.clone();
+    let _ = pipeline.add_probe(PadRef::sink(snk), ProbeType::EVENT_DOWN, move |data| {
+        if let ProbeData::Event(Event::Segment(seg)) = data {
+            segments_probe.lock().unwrap().push(seg.clone());
+        }
+        ProbeReturn::Ok
+    });
+
+    let executor = Executor::new();
+    let handle = executor.start(&mut pipeline).unwrap();
+
+    for pts in [1_000_000u64, 2_000_000, 3_000_000] {
+        src_handle.push_buffer(buffer_with_pts(pts)).await.unwrap();
+    }
+    let mut pulled = 0;
+    while pulled < 3 {
+        if let Pulled::Buffer(_) = sink_handle.pull_buffer().await {
+            pulled += 1;
+        }
+    }
+
+    // Default flags include FLUSH.
+    let seek = SeekEvent::new(SegmentFormat::Time, SeekPosition::set(10_000_000));
+    assert!(handle.seek(seek).await);
+    wait_until(
+        || segments.lock().unwrap().len() >= 2,
+        "the post-seek segment",
+    )
+    .await;
+
+    src_handle.end_stream();
+    while let Pulled::Buffer(_) = sink_handle.pull_buffer().await {}
+    handle.wait().await.unwrap();
+
+    let segs = segments.lock().unwrap().clone();
+    assert_eq!(
+        segs[1].base, 0,
+        "a flushing seek restarts running time: {segs:?}"
+    );
+}
