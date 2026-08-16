@@ -338,6 +338,14 @@ pub struct MkvDemux<R: Read + Seek> {
     /// turns that Eos into `SegmentDone` for a SEGMENT-flagged seek).
     /// Cleared by a seek with no stop.
     stop_ticks: Option<u64>,
+    /// Reverse playback cursor (#165, `trick_rate < 0`): the next backward
+    /// cue probe position in ticks. `None` while reverse is active means
+    /// the walk passed the range's bottom — Eos. Cue-granular (one keyframe
+    /// per cue point), video-only, true decreasing PTS; the reverse segment
+    /// maps them to increasing running time. Cue-less files refuse reverse.
+    reverse_cursor_ticks: Option<u64>,
+    /// Bottom of the reverse range (the seek's `start`), in ticks.
+    reverse_end_ticks: u64,
     /// Converted frame waiting for an output slot. Arena exhaustion is flow
     /// control (the executor retries produce()), so the frame taken from the
     /// parser must survive the retry instead of being lost.
@@ -443,6 +451,8 @@ impl<R: Read + Seek> MkvDemux<R> {
             trick_rate: 1.0,
             video_resync: false,
             stop_ticks: None,
+            reverse_cursor_ticks: None,
+            reverse_end_ticks: 0,
             pending: None,
             skip: Vec::new(),
             scan_budget: DEFAULT_SCAN_BUDGET,
@@ -753,6 +763,118 @@ impl<R: Read + Seek> MkvDemux<R> {
             _ => true, // audio frames are all sync points
         }
     }
+
+    /// Reverse trick mode (#165): walk cue points backward from the cursor.
+    ///
+    /// Each call repositions at the last cue at or before the cursor (the
+    /// same `file.seek(0)` + raw-reposition primitive the seek path uses),
+    /// scans that cluster forward for the cue's video keyframe, emits it,
+    /// and moves the cursor just below the cue. Granularity is the cue
+    /// table's — a keyframe between cue points is skipped, coarser than
+    /// MP4's exact stss walk but the honest best an index-driven walk can
+    /// do. Audio is muted; a cue whose keyframe the heuristic rejects is
+    /// skipped with an empty yield so termination never depends on the
+    /// bitstream probes.
+    fn produce_reverse(&mut self) -> Result<crate::element::DemuxerProduce> {
+        use crate::element::{DemuxerProduce, RoutedOutput};
+
+        let Some(&(video_track, video_pad)) = self.routed.iter().find(|(_, pad)| pad.0 == 0) else {
+            return Ok(DemuxerProduce::Eos);
+        };
+        let Some(cursor) = self.reverse_cursor_ticks else {
+            return Ok(DemuxerProduce::Eos);
+        };
+        let Some((cue_ticks, cluster_offset)) = self
+            .cues
+            .iter()
+            .rev()
+            .find(|c| c.time_ticks <= cursor)
+            .map(|c| (c.time_ticks, c.cluster_offset))
+        else {
+            self.reverse_cursor_ticks = None;
+            return Ok(DemuxerProduce::Eos);
+        };
+        if cue_ticks < self.reverse_end_ticks {
+            self.reverse_cursor_ticks = None;
+            return Ok(DemuxerProduce::Eos);
+        }
+        // Strictly decreasing across calls: the next probe sits below this
+        // cue, so the same cue can never be selected twice — termination is
+        // guaranteed by the walk, not by the scan below succeeding.
+        let next_cursor =
+            (cue_ticks > 0 && cue_ticks > self.reverse_end_ticks).then(|| cue_ticks - 1);
+
+        self.file
+            .seek(0)
+            .map_err(|e| Error::Config(format!("MKV reverse state reset failed: {e:?}")))?;
+        self.raw
+            .seek(std::io::SeekFrom::Start(cluster_offset))
+            .map_err(|e| Error::Config(format!("MKV reverse reposition failed: {e}")))?;
+
+        let codec = self
+            .tracks
+            .iter()
+            .find(|t| t.id == video_track)
+            .map(|t| t.codec.clone())
+            .unwrap_or(MkvCodec::Unknown);
+        loop {
+            let more = self
+                .file
+                .next_frame(&mut self.frame)
+                .map_err(|e| Error::Config(format!("MKV read error: {e:?}")))?;
+            let step = |this: &mut Self| {
+                this.reverse_cursor_ticks = next_cursor;
+                if next_cursor.is_some() {
+                    // Empty yield: the executor calls produce() again and
+                    // the walk continues from the previous cue.
+                    Ok(DemuxerProduce::Routed(RoutedOutput::new()))
+                } else {
+                    Ok(DemuxerProduce::Eos)
+                }
+            };
+            if !more {
+                return step(self);
+            }
+            if self.frame.track != video_track {
+                continue;
+            }
+            let ts = self.frame.timestamp;
+            if ts > cursor {
+                // Passed the window without finding the cue's keyframe.
+                return step(self);
+            }
+            if ts < cue_ticks {
+                continue;
+            }
+            if !self.is_keyframe(&codec, self.frame.is_keyframe, &self.frame.data) {
+                continue;
+            }
+            let duration = self.frame.duration;
+            let data = std::mem::take(&mut self.frame.data);
+            let result = self.emit_frame(video_track, &data, ts, duration, true);
+            self.frame.data = data;
+            // Advance BEFORE returning either way: on arena exhaustion the
+            // frame survives in `pending` and the retry must emit it and
+            // move on, not re-walk the cluster.
+            self.reverse_cursor_ticks = next_cursor;
+            return match result {
+                Ok(buffer) => Ok(DemuxerProduce::Routed(RoutedOutput::single(
+                    video_pad, buffer,
+                ))),
+                Err(e) => {
+                    self.pending = Some(PendingFrame {
+                        pad: video_pad,
+                        raw: self.frame.data.clone(),
+                        track: video_track,
+                        timestamp_ticks: ts,
+                        duration_ticks: duration,
+                        is_keyframe: true,
+                    });
+                    Err(e)
+                }
+            };
+        }
+    }
 }
 
 impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
@@ -784,6 +906,12 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
                     return Err(e);
                 }
             }
+        }
+
+        // Reverse trick mode (#165): dispatched after the pending drain so
+        // an arena-exhausted reverse keyframe is replayed, not re-walked.
+        if self.trick_rate < 0.0 {
+            return self.produce_reverse();
         }
 
         let mut discarded = 0usize;
@@ -920,12 +1048,42 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
         if seek.format != SegmentFormat::Time || seek.start.seek_type != SeekType::Set {
             return EventResult::NotHandled;
         }
-        // Reverse is MP4-only for now (#165): MkvDemux's scan-based produce
-        // (per-track skip + resync machinery) has no backward walk; refusing
-        // beats clamping the rate and silently playing forward.
+        // Reverse (#165): a backward cue walk. Needs a resolvable top of
+        // range and a cue table to walk — cue-less Matroska has no backward
+        // index at all, and refusing beats a whole-file keyframe scan.
         if seek.rate < 0.0 {
-            tracing::warn!("mkvdemux: reverse playback is not supported; seek refused");
-            return EventResult::Error;
+            let start_ns = seek.start.position.max(0) as u64;
+            let stop_ns = match seek.stop.seek_type {
+                SeekType::Set => seek.stop.position.max(0) as u64,
+                _ => match self.duration_ns() {
+                    Some(d) if d > 0 => d,
+                    _ => {
+                        tracing::warn!(
+                            "mkvdemux: reverse seek needs a stop or a known duration; refused"
+                        );
+                        return EventResult::Error;
+                    }
+                },
+            };
+            if stop_ns <= start_ns {
+                tracing::warn!("mkvdemux: reverse seek range is empty ({start_ns}..{stop_ns})");
+                return EventResult::Error;
+            }
+            if self.cues.is_empty() {
+                tracing::warn!("mkvdemux: reverse playback needs cues; cue-less file refused");
+                return EventResult::Error;
+            }
+            self.pending = None;
+            self.skip.clear();
+            self.video_resync = false;
+            self.stop_ticks = None;
+            self.trick_rate = seek.rate;
+            self.reverse_end_ticks = start_ns / self.timestamp_scale;
+            self.reverse_cursor_ticks = Some((stop_ns - 1) / self.timestamp_scale);
+            tracing::info!(
+                "mkvdemux: reverse seek over [{start_ns}, {stop_ns}) ns, cue keyframes only"
+            );
+            return EventResult::handled_at(stop_ns as i64);
         }
         let target_ns = seek.start.position.max(0) as u64;
         let ticks = target_ns / self.timestamp_scale;
@@ -1029,8 +1187,9 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
             self.pending = None;
             self.video_resync = true;
             // Trick play (#165): the seek's rate governs playback until the
-            // next handled seek changes it.
+            // next handled seek changes it. A forward seek leaves reverse.
             self.trick_rate = if seek.rate > 0.0 { seek.rate } else { 1.0 };
+            self.reverse_cursor_ticks = None;
             // Honor the seek's stop (#165): playback ends there. A seek
             // without a stop clears any previous one.
             self.stop_ticks = match seek.stop.seek_type {
