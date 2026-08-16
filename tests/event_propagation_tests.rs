@@ -656,7 +656,7 @@ async fn non_flushing_seek_accumulates_base() {
         src_handle.push_buffer(buffer_with_pts(pts)).await.unwrap();
     }
     wait_until(
-        || segments.lock().unwrap().len() >= 1,
+        || !segments.lock().unwrap().is_empty(),
         "the lazy initial segment",
     )
     .await;
