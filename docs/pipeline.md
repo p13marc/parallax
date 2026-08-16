@@ -309,7 +309,19 @@ let seek = SeekEvent::new_time(ClockTime::from_secs(30))
 handle.seek(seek).await;
 ```
 
-The synthesized `Segment` and `SeekDone` report the keyframe actually landed on. MKV resolves the direction at cue granularity and degrades to forward snapping on cue-less files; `ACCURATE` triggers iterative refinement in push-mode demuxers (#173): `TsDemuxElement` compares the first post-seek PTS with the target and, past a 500 ms threshold, forwards a corrected byte seek (same seqnum, next refinement round) up to 3 times before reporting the landing; the decoder-clipping half is still open.
+The synthesized `Segment` and `SeekDone` report the keyframe actually landed on. MKV resolves the direction at cue granularity and degrades to forward snapping on cue-less files; `ACCURATE` triggers iterative refinement in push-mode demuxers (#173): `TsDemuxElement` compares the first post-seek PTS with the target and, past a 500 ms threshold, forwards a corrected byte seek (same seqnum, next refinement round) up to 3 times before reporting the landing. For container demuxers, `ACCURATE` also changes what the synthesized `Segment` says: it starts at the **requested** time while data still starts at the snapped keyframe, and the decoders decode-but-drop the gap — the first frame you see is the one you asked for. `SeekDone` still reports the keyframe actually landed on.
+
+### Trick play
+
+The seek's `rate` shapes playback until the next handled seek: `rate > 1` puts the container demuxers into keyframe-only fast-forward (audio muted), `rate < 0` walks keyframes backward — MP4 exactly along its sync-sample table, MKV at cue granularity (cue-less files refuse; reverse also needs a stop or a known duration). PTS stay true in both modes; the post-seek `Segment` carries the rate, and a pacing sink maps them to forward running time.
+
+To change speed *without* repositioning — no flush, no keyframe snap, works on live pipelines — use an instant rate change:
+
+```rust
+handle.set_rate(2.0).await;   // SeekFlags::INSTANT_RATE_CHANGE under the hood
+```
+
+It terminates at the sinks: each pacing sink applies the rate to its own mapping immediately and posts `SeekDone` (position `None`). Sign flips are rejected (reverse needs a real seek — the data order itself must change), and any later real seek's `Segment` re-establishes its own rate.
 
 ### Seeking a fed demuxer (`filesrc ! tsdemux`)
 
