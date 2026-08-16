@@ -86,6 +86,17 @@ pub enum Event {
     /// Seek request.
     Seek(SeekEvent),
 
+    /// Quality-of-service feedback, sink → sources (#184).
+    ///
+    /// Observe-and-forward: a consumer (encoder, throttle) acts on it and
+    /// returns `NotHandled` so the event keeps travelling toward the
+    /// sources — QoS is advice to everyone on the path, not a request one
+    /// element owns. Origin-throttled (a sink emits at most ~1/s,
+    /// aggregating between emissions); in a diamond graph a shared
+    /// ancestor sees one delivery per path, so consumers should key on
+    /// [`QosEvent::proportion`] (idempotent), not accumulate the counters.
+    Qos(QosEvent),
+
     // ========== Bidirectional Events ==========
     /// Flush start - immediately discard buffered data.
     FlushStart,
@@ -123,7 +134,7 @@ impl Event {
 
     /// Check if this is an upstream event (flows against data).
     pub fn is_upstream(&self) -> bool {
-        matches!(self, Event::Seek(_))
+        matches!(self, Event::Seek(_) | Event::Qos(_))
     }
 
     /// Check if this is a bidirectional event.
@@ -161,6 +172,7 @@ impl Event {
             Event::CapsChanged(_) => "caps-changed",
             Event::Gap(_) => "gap",
             Event::Seek(_) => "seek",
+            Event::Qos(_) => "qos",
             Event::FlushStart => "flush-start",
             Event::FlushStop(_) => "flush-stop",
             Event::Pause => "pause",
@@ -817,6 +829,53 @@ pub enum SeekSnap {
     After,
     /// Land on whichever keyframe is closest to the target.
     Nearest,
+}
+
+// ============================================================================
+// QoS Event (#184)
+// ============================================================================
+
+/// What kind of quality problem a [`QosEvent`] reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QosType {
+    /// The consumer cannot keep up — frames arrive too late to present
+    /// (the common case: a slow sink asking producers to degrade).
+    Underflow,
+    /// The consumer is being flooded faster than it can process.
+    Overflow,
+}
+
+/// Quality-of-service feedback carried by [`Event::Qos`] (#184).
+///
+/// Originated by a sink (via `Sink::take_upstream_event` /
+/// `AsyncSink::take_upstream_event`, polled by the executor after each
+/// consume) and routed hop-by-hop toward the sources on the #163 upstream
+/// transport. The executor mirrors each one onto the bus as
+/// [`MessageKind::Qos`](crate::pipeline::bus::MessageKind::Qos).
+///
+/// Consumers act and forward (`EventResult::NotHandled`): the built-in
+/// [`Throttle`](crate::elements::Throttle) scales its rate down by
+/// `1/proportion`; the H.264 encoder turns on frame skipping under
+/// sustained pressure. Decisions should key on `proportion` — the counters
+/// are window totals that can double-count in diamond topologies.
+#[derive(Debug, Clone)]
+pub struct QosEvent {
+    /// The kind of pressure being reported.
+    pub qos_type: QosType,
+    /// Required-vs-achieved rate over the window: `1.0` = keeping up,
+    /// `2.0` = only half the frames were presentable in time. Computed by
+    /// the origin as `(processed + dropped) / processed`.
+    pub proportion: f64,
+    /// Lateness of the triggering frame in running time (ns; negative =
+    /// early). The worst observed in the window.
+    pub jitter_ns: i64,
+    /// Running time of the triggering frame ([`ClockTime::NONE`] when the
+    /// origin has no clock).
+    pub timestamp: ClockTime,
+    /// Frames presented in the window since this origin's previous event.
+    pub processed: u64,
+    /// Frames dropped in the window since this origin's previous event.
+    pub dropped: u64,
 }
 
 // ============================================================================

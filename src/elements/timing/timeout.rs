@@ -432,6 +432,42 @@ impl Element for Throttle {
     fn name(&self) -> &str {
         &self.name
     }
+
+    /// QoS consumer (#184): an `Underflow` report scales the interval up by
+    /// the reported proportion (i.e. the pass rate down by 1/proportion),
+    /// floored at 1 fps so a burst of pressure cannot close the valve
+    /// entirely. Observe-and-forward: returns `NotHandled` so the event
+    /// keeps travelling — QoS is advice to everyone on the path.
+    ///
+    /// Reduction-only: recovery is application policy, driven through
+    /// [`ThrottleControl::set_rate`] — sinks report pressure, not relief.
+    /// An unconfigured throttle (interval 0, pass-everything) does not
+    /// react; it has no rate to scale.
+    fn handle_upstream_event(&mut self, event: &crate::event::Event) -> crate::event::EventResult {
+        use crate::event::{Event, QosType};
+
+        if let Event::Qos(qos) = event
+            && qos.qos_type == QosType::Underflow
+            && qos.proportion > 1.0
+        {
+            let current = self.min_interval_ns.load(Ordering::Acquire);
+            if current > 0 && current != DROP_EVERYTHING_NS {
+                const ONE_FPS_NS: u64 = 1_000_000_000;
+                let scaled = ((current as f64 * qos.proportion) as u64)
+                    .min(ONE_FPS_NS)
+                    .max(current);
+                self.min_interval_ns.store(scaled, Ordering::Release);
+                tracing::info!(
+                    "throttle '{}': QoS underflow (proportion {:.2}), interval {} -> {} ns",
+                    self.name,
+                    qos.proportion,
+                    current,
+                    scaled
+                );
+            }
+        }
+        crate::event::EventResult::NotHandled
+    }
 }
 
 /// Statistics for Throttle element.

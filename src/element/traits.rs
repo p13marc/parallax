@@ -808,6 +808,16 @@ pub trait Sink: Send {
         EventResult::NotHandled
     }
 
+    /// An upstream event this sink wants to ORIGINATE (#184) — the sink
+    /// counterpart of [`Demuxer::take_upstream_event`]. The executor polls
+    /// this after each consume and routes the event toward the sources
+    /// (mirroring [`Event::Qos`] onto the bus). Rate-limit at the source:
+    /// the transport has no dedup for non-seek events, so a 60 fps sink
+    /// staging one per frame would flood every ancestor. Default: none.
+    fn take_upstream_event(&mut self) -> Option<Event> {
+        None
+    }
+
     /// Get a clock provider if this sink can provide a clock.
     ///
     /// Audio sinks typically provide a hardware clock that can be used
@@ -883,6 +893,12 @@ pub trait AsyncSink: Send {
     /// [`Sink::handle_upstream_event`].
     fn handle_upstream_event(&mut self, _event: &Event) -> EventResult {
         EventResult::NotHandled
+    }
+
+    /// An upstream event this sink wants to ORIGINATE (#184); see
+    /// [`Sink::take_upstream_event`].
+    fn take_upstream_event(&mut self) -> Option<Event> {
+        None
     }
 
     /// Get a clock provider if this sink can provide a clock.
@@ -2479,6 +2495,12 @@ impl<S: Sink + Send + 'static> SendAsyncElementDyn for SinkAdapter<S> {
         self.inner.handle_upstream_event(event)
     }
 
+    // #184: sinks originate upstream events (QoS). No ABI change: the dyn
+    // method predates this and defaults to None.
+    fn take_upstream_event(&mut self) -> Option<Event> {
+        self.inner.take_upstream_event()
+    }
+
     fn process_inline(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
         if let Some(ref buffer) = input {
             let mut ctx = ConsumeContext::new(buffer);
@@ -3106,6 +3128,11 @@ impl<S: AsyncSink + Send + 'static> SendAsyncElementDyn for AsyncSinkAdapter<S> 
     // the author trait so mid-graph elements can handle or translate them.
     fn handle_upstream_event(&mut self, event: &Event) -> EventResult {
         self.inner.handle_upstream_event(event)
+    }
+
+    // #184: sinks originate upstream events (QoS).
+    fn take_upstream_event(&mut self) -> Option<Event> {
+        self.inner.take_upstream_event()
     }
 
     async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {

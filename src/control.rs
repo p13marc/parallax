@@ -25,7 +25,7 @@
 //! | [`EncoderStatsHandle`] | `H264Encoder`, `EncoderElement` | *read-only*: frames, bytes, rate-control drops, encode time |
 //! | [`KeyframeHandle`] | `…::keyframe_handle()` | force the next frame to be an IDR |
 //! | [`ScaleControl`] | `VideoScale` | target resolution (`set_max_height`, `passthrough`) |
-//! | [`ThrottleControl`] | `Throttle` | framerate (drop-based) |
+//! | [`ThrottleControl`] | `Throttle` | framerate (drop-based; also auto-degrades on `Event::Qos` underflow, #184 — recovery stays app-driven through this handle) |
 //! | `JpegQualityControl` | `JpegEncoder` | JPEG quality 1..=100 |
 //! | [`ValveControl`] | `Valve` | open / close |
 //! | [`Queue2RangesHandle`] | `Queue2` (download mode) | *read-only*: downloaded byte ranges, total, write position |

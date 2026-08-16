@@ -3764,6 +3764,24 @@ fn spawn_sink_task(
                                 return Err(e);
                             }
                         }
+                        // #184: a sink is the natural QoS origin — poll for
+                        // an event it wants to send upstream. Routed toward
+                        // the sources on the #163 transport; QoS is also
+                        // mirrored onto the bus here, the single point where
+                        // sink-originated traffic surfaces.
+                        while let Some(event) = element.take_upstream_event() {
+                            if let Event::Qos(qos) = &event {
+                                bus.post_qos(qos);
+                            }
+                            if up_parents.is_empty() {
+                                tracing::debug!(
+                                    "sink '{name}': originated {} with no upstream peer",
+                                    event.name()
+                                );
+                            } else {
+                                forward_to_parents(&up_parents, &event);
+                            }
+                        }
                     }
                     Some(Message::Event(event)) => {
                         deliver_sink_event(

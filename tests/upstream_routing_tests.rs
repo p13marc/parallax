@@ -676,3 +676,196 @@ async fn a_fed_demuxer_is_flushed_and_sees_the_translated_segment() {
         "the FlushStart flush is discarded; only the EOS one is routed"
     );
 }
+
+// ============================================================================
+// QoS origination and consumption (#184)
+// ============================================================================
+
+/// An async sink that stages one `Event::Qos` after consuming a set number
+/// of buffers — the element-side origination API in miniature.
+struct QosReportingSink {
+    consumed: u64,
+    report_after: u64,
+    staged: Option<Event>,
+    reported: bool,
+}
+
+impl QosReportingSink {
+    fn new(report_after: u64) -> Self {
+        Self {
+            consumed: 0,
+            report_after,
+            staged: None,
+            reported: false,
+        }
+    }
+}
+
+impl parallax::element::AsyncSink for QosReportingSink {
+    async fn consume(&mut self, _ctx: &parallax::element::ConsumeContext<'_>) -> Result<()> {
+        self.consumed += 1;
+        if !self.reported && self.consumed >= self.report_after {
+            self.reported = true;
+            self.staged = Some(Event::Qos(parallax::event::QosEvent {
+                qos_type: parallax::event::QosType::Underflow,
+                proportion: 4.0,
+                jitter_ns: 7_000_000,
+                timestamp: ClockTime::from_nanos(123),
+                processed: self.report_after,
+                dropped: 3,
+            }));
+        }
+        Ok(())
+    }
+
+    fn take_upstream_event(&mut self) -> Option<Event> {
+        self.staged.take()
+    }
+
+    fn name(&self) -> &str {
+        "qos_sink"
+    }
+}
+
+/// #184: a sink-originated QoS event reaches the source's pad (hop-by-hop
+/// through a transform) and is mirrored on the bus with its fields intact.
+#[tokio::test(flavor = "multi_thread")]
+async fn qos_travels_from_sink_to_source_and_bus() {
+    use parallax::elements::{AppSrc, PassThrough};
+
+    let mut pipeline = Pipeline::new();
+    let appsrc = AppSrc::with_max_buffers(32);
+    let src_handle = appsrc.handle();
+    let src = pipeline.add_source("src", appsrc);
+    let xfm = pipeline.add_filter("mid", PassThrough::new());
+    let snk = pipeline.add_async_sink("qos_sink", QosReportingSink::new(3));
+    pipeline.link(src, xfm).unwrap();
+    pipeline.link(xfm, snk).unwrap();
+
+    // EVENT_UP probe on the source's src pad: the last hop of the route.
+    let seen: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_probe = seen.clone();
+    let _ = pipeline.add_probe(PadRef::src(src), ProbeType::EVENT_UP, move |data| {
+        if let ProbeData::Event(Event::Qos(q)) = data {
+            seen_probe.lock().unwrap().push(q.proportion);
+        }
+        ProbeReturn::Ok
+    });
+
+    let executor = Executor::new();
+    let mut handle = executor.start(&mut pipeline).unwrap();
+    let mut bus = handle.take_bus().unwrap();
+
+    for seq in 0..5u64 {
+        let slot = arena().acquire().expect("arena");
+        src_handle
+            .push_buffer(Buffer::new(
+                MemoryHandle::with_len(slot, 8),
+                Metadata::from_sequence(seq),
+            ))
+            .await
+            .unwrap();
+    }
+
+    wait_until(
+        || !seen.lock().unwrap().is_empty(),
+        "the QoS event at the source pad",
+    )
+    .await;
+    assert_eq!(seen.lock().unwrap().as_slice(), &[4.0]);
+
+    // Mirrored on the bus with the staged fields.
+    let mut bus_qos = None;
+    wait_until(
+        || {
+            while let Some(msg) = bus.poll() {
+                if let MessageKind::Qos {
+                    qos_type,
+                    proportion,
+                    jitter_ns,
+                    processed,
+                    dropped,
+                    ..
+                } = msg.kind
+                {
+                    bus_qos = Some((qos_type, proportion, jitter_ns, processed, dropped));
+                }
+            }
+            bus_qos.is_some()
+        },
+        "the QoS bus message",
+    )
+    .await;
+    assert_eq!(
+        bus_qos,
+        Some((parallax::event::QosType::Underflow, 4.0, 7_000_000, 3, 3))
+    );
+
+    src_handle.end_stream();
+    handle.wait().await.unwrap();
+}
+
+/// #184: a Throttle between source and sink observes a QoS underflow and
+/// scales its interval up by the reported proportion (rate down), visible
+/// through its pre-start control handle. The event still travels on to the
+/// source (observe-and-forward).
+#[tokio::test(flavor = "multi_thread")]
+async fn throttle_degrades_on_qos_underflow() {
+    use parallax::elements::{AppSrc, Throttle};
+
+    let mut pipeline = Pipeline::new();
+    let appsrc = AppSrc::with_max_buffers(32);
+    let src_handle = appsrc.handle();
+    let src = pipeline.add_source("src", appsrc);
+    let throttle = Throttle::from_millis(1);
+    let control = throttle.control();
+    let thr = pipeline.add_filter("throttle", throttle);
+    let snk = pipeline.add_async_sink("qos_sink", QosReportingSink::new(2));
+    pipeline.link(src, thr).unwrap();
+    pipeline.link(thr, snk).unwrap();
+
+    let up_at_src: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+    let up_probe = up_at_src.clone();
+    let _ = pipeline.add_probe(PadRef::src(src), ProbeType::EVENT_UP, move |data| {
+        if let ProbeData::Event(Event::Qos(_)) = data {
+            *up_probe.lock().unwrap() += 1;
+        }
+        ProbeReturn::Ok
+    });
+
+    let executor = Executor::new();
+    let handle = executor.start(&mut pipeline).unwrap();
+
+    let before = control.min_interval();
+    assert_eq!(before, Duration::from_millis(1));
+
+    // Push spaced-out buffers so the 1 ms throttle passes them all.
+    for seq in 0..4u64 {
+        let slot = arena().acquire().expect("arena");
+        src_handle
+            .push_buffer(Buffer::new(
+                MemoryHandle::with_len(slot, 8),
+                Metadata::from_sequence(seq),
+            ))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(3)).await;
+    }
+
+    // proportion 4.0 on a 1 ms interval -> 4 ms.
+    wait_until(
+        || control.min_interval() == Duration::from_millis(4),
+        "the throttle to scale its interval by the QoS proportion",
+    )
+    .await;
+
+    // Observe-and-forward: the source still saw the event.
+    wait_until(
+        || *up_at_src.lock().unwrap() > 0,
+        "the QoS event to continue to the source",
+    )
+    .await;
+
+    src_handle.end_stream();
+    handle.wait().await.unwrap();
+}

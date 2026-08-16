@@ -244,7 +244,7 @@ Elements post via their `BusHandle` (`ctx.post_message(...)` in produce/consume 
 Distinct from bus messages, `Event`s travel *through* the pipeline with the data (`src/event/`):
 
 - **Downstream**: `StreamStart`, `Segment`, `Tags`, `Eos`, `CapsChanged`, `Gap`
-- **Upstream**: `Seek` (QoS feedback lives on the bus as `MessageKind::Qos`)
+- **Upstream**: `Seek`, `Qos` (#184 — sink-originated quality feedback via `Sink::take_upstream_event`, routed hop-by-hop toward the sources and mirrored on the bus as `MessageKind::Qos`)
 - **Bidirectional**: `FlushStart`, `FlushStop`, `Custom`
 
 Serialized events share channels with buffers via `PipelineItem::{Buffer, Event}` so ordering is preserved; flush events also travel in-band; their immediacy comes from the flush epoch (a seek stamps all pre-seek buffers stale, and consumers shed them at receive speed). Elements handle them in `handle_downstream_event` / `handle_upstream_event` returning `EventResult::{Handled, NotHandled, Error}`.

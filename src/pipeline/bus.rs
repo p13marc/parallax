@@ -119,14 +119,19 @@ pub enum MessageKind {
     // --- Quality ---
     /// Quality-of-service: element is dropping data or running late.
     Qos {
-        /// Whether the element is currently live.
-        live: bool,
-        /// Running time of dropped/late buffer.
-        running_time: ClockTime,
-        /// Running time when the buffer should have arrived.
-        deadline: ClockTime,
-        /// Proportion of dropped vs processed (0.0 = none dropped).
+        /// The kind of pressure reported.
+        qos_type: crate::event::QosType,
+        /// Required-vs-achieved rate over the window (1.0 = keeping up,
+        /// 2.0 = only half the frames were presentable in time).
         proportion: f64,
+        /// Worst lateness observed in the window (ns; negative = early).
+        jitter_ns: i64,
+        /// Running time of the triggering frame.
+        running_time: ClockTime,
+        /// Frames presented in the window.
+        processed: u64,
+        /// Frames dropped in the window.
+        dropped: u64,
     },
     /// Latency changed — pipeline should recalculate latency.
     LatencyChanged,
@@ -266,8 +271,18 @@ impl fmt::Display for MessageKind {
             MessageKind::StreamCollection { streams } => {
                 write!(f, "StreamCollection: {} streams", streams.len())
             }
-            MessageKind::Qos { proportion, .. } => {
-                write!(f, "QoS: proportion={proportion:.2}")
+            MessageKind::Qos {
+                qos_type,
+                proportion,
+                processed,
+                dropped,
+                ..
+            } => {
+                write!(
+                    f,
+                    "QoS: {qos_type:?} proportion={proportion:.2} \
+                     ({processed} presented, {dropped} dropped)"
+                )
             }
             MessageKind::LatencyChanged => write!(f, "LatencyChanged"),
             MessageKind::Buffering { percent, mode, .. } => {
@@ -710,18 +725,14 @@ impl BusHandle {
     }
 
     /// Post a QoS message.
-    pub fn post_qos(
-        &self,
-        live: bool,
-        running_time: ClockTime,
-        deadline: ClockTime,
-        proportion: f64,
-    ) {
+    pub fn post_qos(&self, qos: &crate::event::QosEvent) {
         self.post(MessageKind::Qos {
-            live,
-            running_time,
-            deadline,
-            proportion,
+            qos_type: qos.qos_type,
+            proportion: qos.proportion,
+            jitter_ns: qos.jitter_ns,
+            running_time: qos.timestamp,
+            processed: qos.processed,
+            dropped: qos.dropped,
         });
     }
 
