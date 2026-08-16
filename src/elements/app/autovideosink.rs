@@ -492,6 +492,18 @@ impl AutoVideoSink {
         tracing::debug!("autovideosink: dropping frame ({reason})");
     }
 
+    /// Whether this PTS is out-of-segment pre-roll a sync sink should drop
+    /// (#165 ACCURATE clipping): below the current forward Time segment's
+    /// start. `sync=false` previews never clip.
+    fn clips_out_of_segment(&self, pts: crate::clock::ClockTime) -> bool {
+        self.sync
+            && pts != crate::clock::ClockTime::NONE
+            && self
+                .segment
+                .as_ref()
+                .is_some_and(|seg| seg.rate > 0.0 && (pts.nanos() as i64) < seg.start)
+    }
+
     /// Set expected dimensions (optional, auto-detected from first frame).
     pub fn with_size(self, width: u32, height: u32) -> Self {
         self.width.store(width, Ordering::SeqCst);
@@ -640,6 +652,17 @@ impl AsyncSink for AutoVideoSink {
 
         tracing::debug!("AutoVideoSink: detected dimensions {}x{}", width, height);
 
+        // ACCURATE-seek clipping (#165): a PTS below the segment start is
+        // out-of-segment pre-roll — data legitimately starts at the snapped
+        // keyframe, the segment at the requested time. A decoder normally
+        // drops these before they arrive; for pipelines without one the
+        // sync sink is the last line, and dropping beats the old
+        // blit-at-full-speed. `sync=false` previews keep every frame.
+        if self.clips_out_of_segment(meta.pts) {
+            self.drop_frame("out-of-segment");
+            return Ok(());
+        }
+
         // Presentation pacing (#66). Opt-in: a clock-less pipeline, an
         // un-timestamped stream, or plain `sync=false` all keep the historical
         // blit-on-arrival behaviour, so capture previews do not regress.
@@ -648,9 +671,9 @@ impl AsyncSink for AutoVideoSink {
             && let Some(pts) = meta.pts.to_option()
             && let Some(now) = ctx.running_time().to_option()
             // Map through the current segment (#165): (pts − start)/|rate| +
-            // base. A PTS before the segment start has no valid mapping
-            // (out-of-segment frame) — present it immediately rather than
-            // pace it; segment-clipping is a later slice.
+            // base. A PTS past the segment stop has no valid mapping
+            // (below-start ones were dropped above) — present it immediately
+            // rather than pace it.
             && let Some(pts) = self
                 .segment
                 .as_ref()
@@ -1579,5 +1602,33 @@ mod tests {
             pacer.schedule(ns(FRAME_25FPS), ns(FRAME_25FPS), DEFAULT_MAX_LATENESS),
             Pace::Present
         );
+    }
+
+    /// #165 ACCURATE clipping at the sink: below-segment-start PTS clip in
+    /// sync mode (forward rate only); reverse segments and sync=false never
+    /// clip, and an unmapped stream (no segment) never clips.
+    #[test]
+    fn out_of_segment_preroll_clips_only_in_sync_forward() {
+        use crate::event::SegmentEvent;
+
+        let mut sink = AutoVideoSink::new();
+        sink.sync = true;
+        assert!(!sink.clips_out_of_segment(ns(100)), "no segment, no clip");
+
+        sink.segment = Some(SegmentEvent::new_time(ns(700_000_000), None));
+        assert!(sink.clips_out_of_segment(ns(500_000_000)));
+        assert!(!sink.clips_out_of_segment(ns(700_000_000)));
+        assert!(!sink.clips_out_of_segment(ns(900_000_000)));
+        assert!(!sink.clips_out_of_segment(crate::clock::ClockTime::NONE));
+
+        // Reverse: PTS below start is the walk's own termination, not
+        // pre-roll.
+        sink.segment = Some(SegmentEvent::new_time(ns(0), Some(ns(2_000_000_000))).with_rate(-1.0));
+        assert!(!sink.clips_out_of_segment(ns(500_000_000)));
+
+        // sync=false previews keep everything.
+        sink.sync = false;
+        sink.segment = Some(SegmentEvent::new_time(ns(700_000_000), None));
+        assert!(!sink.clips_out_of_segment(ns(500_000_000)));
     }
 }

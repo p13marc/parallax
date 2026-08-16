@@ -70,6 +70,9 @@ pub struct VpxDecoder {
     frames_out: u64,
     frame_count: u64,
     bytes_decoded: u64,
+    /// ACCURATE-seek clipping (#165): decoded frames below the current Time
+    /// segment's start are dropped after decoding.
+    clip: super::common::SegmentClip,
 }
 
 // The context is only ever touched from one element task at a time; the
@@ -125,6 +128,7 @@ impl VpxDecoder {
             frames_out: 0,
             frame_count: 0,
             bytes_decoded: 0,
+            clip: Default::default(),
         })
     }
 
@@ -262,7 +266,21 @@ impl Element for VpxDecoder {
             // next decode call on this context.
             out = Some(self.image_to_buffer(unsafe { &*img }, source)?);
         }
+        // ACCURATE clipping (#165): decoded, but out-of-segment.
+        if let Some(b) = &out
+            && self.clip.clips(b.metadata().pts)
+        {
+            return Ok(None);
+        }
         Ok(out)
+    }
+
+    fn handle_downstream_event(
+        &mut self,
+        event: crate::event::Event,
+    ) -> Option<crate::event::Event> {
+        self.clip.observe(&event);
+        Some(event)
     }
 
     // libvpx (without frame-parallel mode) holds no shown frames back, so

@@ -1,5 +1,40 @@
 //! Common types for video codec elements.
 
+/// Decode-but-drop threshold for video decoders (#165 ACCURATE clipping).
+///
+/// Tracks the Time segment the decoder is playing under: a decoded frame
+/// whose PTS falls below `segment.start` (forward rate only) is dropped
+/// *after* decoding — the demuxer legitimately starts data at the snapped
+/// keyframe, but an ACCURATE seek's segment starts at the requested time,
+/// and the executor makes that gap out-of-segment precisely so decoders
+/// drop it here and the first shown frame is the request itself.
+#[cfg(any(feature = "h264", feature = "av1-decode", feature = "vpx"))]
+#[derive(Default)]
+pub(crate) struct SegmentClip {
+    below: Option<crate::clock::ClockTime>,
+}
+
+#[cfg(any(feature = "h264", feature = "av1-decode", feature = "vpx"))]
+impl SegmentClip {
+    /// Track a downstream event; Time segments update the threshold.
+    pub(crate) fn observe(&mut self, event: &crate::event::Event) {
+        if let crate::event::Event::Segment(seg) = event {
+            self.below = (seg.format == crate::event::SegmentFormat::Time
+                && seg.rate > 0.0
+                && seg.start > 0)
+                .then(|| crate::clock::ClockTime::from_nanos(seg.start as u64));
+        }
+    }
+
+    /// Whether a decoded frame with this PTS is out-of-segment (drop it).
+    pub(crate) fn clips(&self, pts: crate::clock::ClockTime) -> bool {
+        match self.below {
+            Some(start) => pts != crate::clock::ClockTime::NONE && pts < start,
+            None => false,
+        }
+    }
+}
+
 /// Pixel format for video frames.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PixelFormat {

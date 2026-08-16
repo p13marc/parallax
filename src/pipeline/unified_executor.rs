@@ -3157,9 +3157,18 @@ async fn handle_upstream_hop(
             // Reverse (#165): the segment covers [start, stop] and playback
             // begins at the TOP — the element's reported landing is where
             // decoding starts (near stop), NOT the segment's start. Forward
-            // keeps the landing-as-start rule (keyframe snap).
+            // keeps the landing-as-start rule (keyframe snap) — except under
+            // ACCURATE, where the segment starts at the REQUESTED time even
+            // though data starts at the snapped keyframe: everything between
+            // is out-of-segment, which is exactly what decoder/sink clipping
+            // keys on so the first shown frame is the request itself (#165).
+            // ACCURATE outranks the always-on KEY_UNIT here, or it would be
+            // unreachable. SeekDone still reports the honest landing.
+            let accurate = seek.flags.contains(crate::event::SeekFlags::ACCURATE);
             let start = if reverse {
                 requested.or(Some(0))
+            } else if accurate {
+                requested.or_else(|| landing.map(|p| p.max(0)))
             } else {
                 landing.map(|p| p.max(0)).or(requested)
             };
@@ -3233,11 +3242,13 @@ async fn handle_upstream_hop(
                 seqnum: seek.seqnum(),
                 source: name.to_string(),
                 format: seek.format,
-                // Reverse playback starts at the range's top.
+                // Reverse playback starts at the range's top; forward
+                // reports the element's landing (== segment start except
+                // under ACCURATE, whose segment starts at the request).
                 position: if reverse {
                     stop
                 } else {
-                    start.map(|p| p as u64)
+                    landing.map(|p| p.max(0) as u64).or(start.map(|p| p as u64))
                 },
             });
             tracing::info!(

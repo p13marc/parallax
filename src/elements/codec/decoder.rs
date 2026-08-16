@@ -57,6 +57,9 @@ pub struct Dav1dDecoder {
     pending_meta: std::collections::VecDeque<crate::metadata::Metadata>,
     last_dims: Option<(u32, u32)>,
     frames_out: u64,
+    /// ACCURATE-seek clipping (#165): decoded frames below the current Time
+    /// segment's start are dropped after decoding.
+    clip: super::common::SegmentClip,
 }
 
 impl Dav1dDecoder {
@@ -86,6 +89,7 @@ impl Dav1dDecoder {
             pending_meta: std::collections::VecDeque::new(),
             last_dims: None,
             frames_out: 0,
+            clip: Default::default(),
         }
     }
 
@@ -371,6 +375,10 @@ impl Element for Dav1dDecoder {
                 Ok(picture) => {
                     let out = self.picture_to_slot(&picture)?;
                     self.drain_pictures()?; // surplus, if any → owned queue
+                    // ACCURATE clipping (#165): decoded, out-of-segment.
+                    if self.clip.clips(out.metadata().pts) {
+                        return Ok(None);
+                    }
                     return Ok(Some(out));
                 }
                 Err(dav1d::Error::Again) => return Ok(None),
@@ -383,24 +391,52 @@ impl Element for Dav1dDecoder {
             }
         }
         // Frames already queued: keep display order — append the fresh
-        // pictures, emit the oldest.
+        // pictures, emit the oldest (skipping any that clip out-of-segment).
         self.drain_pictures()?;
-        self.emit_ready()
+        loop {
+            match self.emit_ready()? {
+                Some(b) if self.clip.clips(b.metadata().pts) => continue,
+                other => return Ok(other),
+            }
+        }
+    }
+
+    fn handle_downstream_event(
+        &mut self,
+        event: crate::event::Event,
+    ) -> Option<crate::event::Event> {
+        self.clip.observe(&event);
+        Some(event)
     }
 
     /// Drain the pictures dav1d still holds (its frame-delay pipeline) at
     /// EOS, one per call until empty.
     fn flush(&mut self) -> Result<Option<Buffer>> {
-        if let Some(buf) = self.emit_ready()? {
-            return Ok(Some(buf));
-        }
-        match self.decoder.get_picture() {
-            Ok(picture) => Ok(Some(self.picture_to_slot(&picture)?)),
-            Err(dav1d::Error::Again) => Ok(None),
-            Err(e) => Err(Error::InvalidSegment(format!(
-                "dav1d decode failed: {:?}",
-                e
-            ))),
+        // Loop, not a single step: a clipped frame must not end the drain —
+        // the executor stops calling flush() at the first None.
+        loop {
+            if let Some(buf) = self.emit_ready()? {
+                if self.clip.clips(buf.metadata().pts) {
+                    continue;
+                }
+                return Ok(Some(buf));
+            }
+            match self.decoder.get_picture() {
+                Ok(picture) => {
+                    let out = self.picture_to_slot(&picture)?;
+                    if self.clip.clips(out.metadata().pts) {
+                        continue;
+                    }
+                    return Ok(Some(out));
+                }
+                Err(dav1d::Error::Again) => return Ok(None),
+                Err(e) => {
+                    return Err(Error::InvalidSegment(format!(
+                        "dav1d decode failed: {:?}",
+                        e
+                    )));
+                }
+            }
         }
     }
 

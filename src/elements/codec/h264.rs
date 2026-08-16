@@ -1060,6 +1060,9 @@ pub struct H264Decoder {
     /// decode; a stream that never recovers still errors via
     /// [`MAX_CONSECUTIVE_DECODE_SKIPS`].
     skipped_aus: u32,
+    /// ACCURATE-seek clipping (#165): decoded frames below the current Time
+    /// segment's start are dropped after decoding.
+    clip: super::common::SegmentClip,
 }
 
 /// Cap on in-flight access-unit metadata.
@@ -1114,6 +1117,7 @@ impl H264Decoder {
             flushed: None,
             frames_out: 0,
             skipped_aus: 0,
+            clip: Default::default(),
         })
     }
 
@@ -1358,13 +1362,20 @@ impl Element for H264Decoder {
         match yuv {
             Some(yuv) => {
                 self.frame_count += 1;
-                Ok(Some(Self::yuv_to_slot(
+                let out = Self::yuv_to_slot(
                     &mut self.output,
                     &mut self.last_dims,
                     &mut self.pending,
                     &mut self.frames_out,
                     &yuv,
-                )?))
+                )?;
+                // ACCURATE clipping (#165): decoded, but out-of-segment —
+                // the pre-roll between the snapped keyframe and the
+                // requested time is decode-only.
+                if self.clip.clips(out.metadata().pts) {
+                    return Ok(None);
+                }
+                Ok(Some(out))
             }
             None => Ok(None),
         }
@@ -1384,6 +1395,7 @@ impl Element for H264Decoder {
         &mut self,
         event: crate::event::Event,
     ) -> Option<crate::event::Event> {
+        self.clip.observe(&event);
         if matches!(event, crate::event::Event::FlushStart) {
             match Self::build_decoder() {
                 Ok(fresh) => self.decoder = fresh,
@@ -1408,18 +1420,26 @@ impl Element for H264Decoder {
             self.flushed = Some(frames.into());
         }
 
-        match self.flushed.as_mut().and_then(VecDeque::pop_front) {
-            Some(frame) => {
-                let source = self.take_pending_metadata();
-                Ok(Some(self.frame_to_buffer(&frame, source)?))
-            }
-            None => {
-                // Drain cycle complete: re-arm. A seek's FlushStart runs a
-                // (discarded) drain through here too, and with a
-                // once-per-lifetime latch that drain would eat the only one,
-                // silently dropping the reordering tail at the real EOS.
-                self.flushed = None;
-                Ok(None)
+        // Loop, not a single pop: a clipped frame must not end the drain —
+        // the executor stops calling flush() at the first None.
+        loop {
+            match self.flushed.as_mut().and_then(VecDeque::pop_front) {
+                Some(frame) => {
+                    let source = self.take_pending_metadata();
+                    let out = self.frame_to_buffer(&frame, source)?;
+                    if self.clip.clips(out.metadata().pts) {
+                        continue;
+                    }
+                    return Ok(Some(out));
+                }
+                None => {
+                    // Drain cycle complete: re-arm. A seek's FlushStart runs
+                    // a (discarded) drain through here too, and with a
+                    // once-per-lifetime latch that drain would eat the only
+                    // one, silently dropping the reordering tail at EOS.
+                    self.flushed = None;
+                    return Ok(None);
+                }
             }
         }
     }
@@ -2699,5 +2719,97 @@ mod qos_tests {
         let _ = Element::handle_upstream_event(&mut enc, &qos(1.0));
         let params = control.poll(&mut generation).expect("restore staged");
         assert_eq!(params.skip_frames, Some(false));
+    }
+}
+
+#[cfg(test)]
+mod clip_tests {
+    use super::*;
+    use crate::buffer::MemoryHandle;
+    use crate::clock::ClockTime;
+    use crate::event::{Event, SegmentEvent};
+    use crate::memory::SharedArena;
+
+    const W: u32 = 320;
+    const H: u32 = 240;
+    const FRAME: usize = (W as usize * H as usize * 3) / 2;
+
+    fn encoded_aus(n: usize) -> Vec<Vec<u8>> {
+        let arena = SharedArena::new(FRAME, 4).unwrap();
+        let mut enc = H264Encoder::new(H264EncoderConfig::new()).unwrap();
+        let mut aus = Vec::new();
+        for i in 0..n {
+            arena.reclaim();
+            let mut slot = arena.acquire().unwrap();
+            let data = slot.data_mut();
+            let y = (W * H) as usize;
+            for (p, b) in data[..y].iter_mut().enumerate() {
+                *b = ((p + i * 7) % 256) as u8;
+            }
+            for b in data[y..FRAME].iter_mut() {
+                *b = 128;
+            }
+            let mut metadata = Metadata::new();
+            metadata.set_video_dims(W, H, crate::format::PixelFormat::I420);
+            metadata.pts = ClockTime::from_millis(i as u64 * 100);
+            let buf = Buffer::new(MemoryHandle::with_len(slot, FRAME), metadata);
+            if let Some(out) = enc.process(buf).unwrap() {
+                aus.push(out.as_bytes().to_vec());
+            }
+        }
+        while let Some(out) = Element::flush(&mut enc).unwrap() {
+            aus.push(out.as_bytes().to_vec());
+        }
+        aus
+    }
+
+    fn decode_all(dec: &mut H264Decoder, aus: &[Vec<u8>], arena: &SharedArena) -> Vec<u64> {
+        let mut pts = Vec::new();
+        for (i, au) in aus.iter().enumerate() {
+            arena.reclaim();
+            let mut slot = arena.acquire().unwrap();
+            slot.data_mut()[..au.len()].copy_from_slice(au);
+            let mut metadata = Metadata::new();
+            metadata.pts = ClockTime::from_millis(i as u64 * 100);
+            let buf = Buffer::new(MemoryHandle::with_len(slot, au.len()), metadata);
+            if let Some(out) = dec.process(buf).unwrap() {
+                pts.push(out.metadata().pts.nanos() / 1_000_000);
+            }
+        }
+        while let Some(out) = Element::flush(dec).unwrap() {
+            pts.push(out.metadata().pts.nanos() / 1_000_000);
+        }
+        pts
+    }
+
+    /// #165 ACCURATE clipping: with a Time segment installed, decoded frames
+    /// below its start are dropped (decode-but-drop); the rest pass. A
+    /// control decoder without the segment emits everything, pinning that
+    /// the drop is the segment's doing.
+    #[test]
+    fn decoder_clips_frames_below_segment_start() {
+        let aus = encoded_aus(8);
+        assert!(!aus.is_empty());
+        let max = aus.iter().map(Vec::len).max().unwrap();
+        let arena = SharedArena::new(max.max(1), 4).unwrap();
+
+        let mut control = H264Decoder::new().unwrap();
+        let all = decode_all(&mut control, &aus, &arena);
+        assert!(!all.is_empty(), "control decoder emitted nothing");
+
+        let mut clipped = H264Decoder::new().unwrap();
+        let seg = SegmentEvent::new_time(ClockTime::from_millis(350), None);
+        assert!(
+            Element::handle_downstream_event(&mut clipped, Event::Segment(seg)).is_some(),
+            "segment forwards on"
+        );
+        let kept = decode_all(&mut clipped, &aus, &arena);
+
+        let expected: Vec<u64> = all.iter().copied().filter(|p| *p >= 350).collect();
+        assert_eq!(
+            kept, expected,
+            "exactly the at-or-after-350ms frames survive (all: {all:?})"
+        );
+        assert!(kept.len() < all.len(), "something was actually clipped");
     }
 }

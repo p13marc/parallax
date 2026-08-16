@@ -581,8 +581,10 @@ impl SeekEvent {
         // KEY_UNIT describes what the container demuxers actually do: they
         // always snap to a keyframe, by default MP4 backward and MKV forward.
         // Add SNAP_BEFORE/SNAP_AFTER (both = nearest) to pick the direction
-        // explicitly. ACCURATE is accepted but not yet honored (needs
-        // decoder clipping).
+        // explicitly. Adding ACCURATE makes the segment start at the
+        // REQUESTED time while data still starts at the snapped keyframe —
+        // decoders decode-but-drop the gap, so the first shown frame is the
+        // request itself (#165).
         .with_flags(SeekFlags::FLUSH | SeekFlags::KEY_UNIT)
     }
 
