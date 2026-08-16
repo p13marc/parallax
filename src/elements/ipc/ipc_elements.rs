@@ -335,6 +335,16 @@ impl IpcSink {
 }
 
 impl AsyncSink for IpcSink {
+    /// The descriptor ring speaks arena identity, so only CPU (arena)
+    /// buffers can cross (#145) — pinning it here turns a dmabuf link into
+    /// a prepare()-time converter insertion instead of a runtime error.
+    fn input_media_caps(&self) -> crate::format::ElementMediaCaps {
+        crate::format::ElementMediaCaps::new(vec![crate::format::FormatMemoryCap::new(
+            crate::format::FormatCaps::Any,
+            crate::format::MemoryCaps::cpu_only(),
+        )])
+    }
+
     /// Async because both waits are unbounded: a peer that never connects,
     /// and a peer that stops acknowledging (#172). The ack wait parks on
     /// the ack doorbell (cancel-safe), timeout-sliced to keep the 5 s

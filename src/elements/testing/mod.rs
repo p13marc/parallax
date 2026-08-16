@@ -6,11 +6,13 @@
 //! - [`NullSource`], [`NullSink`]: Null elements for testing/benchmarking
 
 mod datasrc;
+mod dmabufsrc;
 mod null;
 mod testsrc;
 mod videotestsrc;
 
 pub use datasrc::DataSrc;
+pub use dmabufsrc::DmaBufTestSrc;
 pub use null::{NullSink, NullSource};
 pub use testsrc::{TestPattern, TestSrc};
 pub use videotestsrc::{AsyncVideoTestSrc, PixelFormat, VideoPattern, VideoTestSrc};

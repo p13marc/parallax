@@ -1845,7 +1845,14 @@ impl ElementMediaCaps {
     /// Each format in the Caps becomes a separate capability with CPU memory.
     pub fn from_caps(caps: &Caps) -> Self {
         if caps.is_any() {
-            return Self::any_cpu();
+            // The element declared nothing: any format, any memory (#145).
+            // Every `MemoryHandle::DmaBuf` keeps a live CPU mapping, so a
+            // byte-reading element genuinely handles dmabuf input, and the
+            // solver's fixate-to-Cpu default keeps plain pipelines on CPU
+            // memory. Elements that structurally need an arena slot pin
+            // cpu_only() explicitly (IpcSink); explicit per-format
+            // declarations below stay CPU-pinned.
+            return Self::any();
         }
 
         let caps_vec: SmallVec<[FormatMemoryCap; 2]> = caps

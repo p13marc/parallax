@@ -1488,6 +1488,9 @@ impl Executor {
                 if let Some(budget) = rt_budgets.get(&node_id) {
                     element.set_output_budget(*budget);
                 }
+                if let Some(memory) = pipeline.node_output_memory_type(node_id) {
+                    element.set_negotiated_memory(memory);
+                }
                 rt_elements.insert(node_id, element);
             }
         }
@@ -1898,6 +1901,13 @@ impl Executor {
         // Tell the element how much the graph below it can hold, so it can size
         // its output arena before the first frame builds it.
         element.set_output_budget(budget);
+
+        // #145: what memory the downstream link negotiated, so a
+        // dmabuf-capable source only emits dmabuf when the consumer wants
+        // it. None (no negotiation ran) leaves the safe CPU default.
+        if let Some(memory) = pipeline.node_output_memory_type(node_id) {
+            element.set_negotiated_memory(memory);
+        }
 
         // Snapshotted here for the same reason `is_seekable` is: after spawn
         // the element has moved into its task. Collected from every node, not

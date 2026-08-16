@@ -37,12 +37,21 @@ use std::sync::Arc;
 
 /// Memory copier for transferring buffers between memory types.
 ///
-/// Handles CPU <-> GPU transfers and similar operations.
+/// The DmaBuf→Cpu direction is real (#145): a dmabuf-backed buffer is
+/// copied into a CPU arena slot via [`Buffer::copy_to_cpu`], which is the
+/// bridge that keeps CPU-only consumers working behind a dmabuf-emitting
+/// source — visibly, as a graph node, the GStreamer way. A buffer that is
+/// already CPU passes through untouched.
+///
+/// The GPU directions remain pass-through stubs (PLAN-11, #62): no GPU
+/// memory backing exists to copy into yet.
 pub struct MemoryCopy {
     /// Source memory type.
     source_type: MemoryType,
     /// Target memory type.
     target_type: MemoryType,
+    /// Output arena for the DmaBuf→Cpu copy, grown to fit the frames seen.
+    output: crate::memory::OutputArena,
 }
 
 impl MemoryCopy {
@@ -51,6 +60,8 @@ impl MemoryCopy {
         Self {
             source_type,
             target_type,
+            output: crate::memory::OutputArena::new(crate::memory::defaults::TRANSFORM_SLOT_COUNT)
+                .grow_to_fit(),
         }
     }
 
@@ -63,12 +74,30 @@ impl MemoryCopy {
     pub fn gpu_to_cpu() -> Self {
         Self::new(MemoryType::GpuDevice, MemoryType::Cpu)
     }
+
+    /// Create a DMA-BUF to CPU copier (#145).
+    pub fn dmabuf_to_cpu() -> Self {
+        Self::new(MemoryType::DmaBuf, MemoryType::Cpu)
+    }
 }
 
 impl Element for MemoryCopy {
+    fn set_output_budget(&mut self, budget: crate::memory::OutputBudget) {
+        self.output.set_budget(budget);
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
-        // PLAN-11: Implement actual memory transfer (see plans/11_GPU_CODEC_FRAMEWORK.md)
-        // Would use GPU APIs or DMA for efficient transfers
+        // The real direction (#145): land a dmabuf frame in CPU shm for
+        // consumers that negotiated Cpu. Already-CPU input passes through —
+        // the graph edge asked for Cpu and that is what it is.
+        if self.target_type == MemoryType::Cpu && buffer.memory_type() == MemoryType::DmaBuf {
+            let mut slot = self.output.acquire(buffer.len(), "memorycopy")?;
+            let data = buffer.as_bytes();
+            slot.data_mut()[..data.len()].copy_from_slice(data);
+            let handle = crate::buffer::MemoryHandle::with_len(slot, data.len());
+            return Ok(Some(Buffer::new(handle, buffer.metadata().clone())));
+        }
+        // PLAN-11: GPU transfers (see plans/11_GPU_CODEC_FRAMEWORK.md).
         Ok(Some(buffer))
     }
 
@@ -310,6 +339,19 @@ pub fn builtin_registry() -> ConverterRegistry {
         axes: ConvertAxes::MEMORY,
         cost: 20,
         factory: Arc::new(|_request: &ConversionRequest| Box::new(MemoryCopy::gpu_to_cpu())),
+    });
+
+    // DMA-BUF to CPU copy (#145): the bridge behind a dmabuf-emitting
+    // source for CPU-only consumers.
+    registry.register(ConverterSpec {
+        name: "memorycopy",
+        from_format: FormatType::Any,
+        to_format: FormatType::Any,
+        from_memory: MemoryType::DmaBuf,
+        to_memory: MemoryType::Cpu,
+        axes: ConvertAxes::MEMORY,
+        cost: 20,
+        factory: Arc::new(|_request: &ConversionRequest| Box::new(MemoryCopy::dmabuf_to_cpu())),
     });
 
     registry

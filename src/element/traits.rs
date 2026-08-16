@@ -634,6 +634,15 @@ pub trait Source: Send {
     fn set_output_budget(&mut self, _budget: crate::memory::OutputBudget) {
         // Default: ignore
     }
+
+    /// The memory type the downstream link negotiated (#145), delivered at
+    /// start like `set_output_budget`. A source that can produce either
+    /// backing (V4l2Src with `dmabuf_export`) emits dmabuf ONLY when this
+    /// said `MemoryType::DmaBuf` — never delivered (no `prepare()`
+    /// negotiation) means CPU, the safe default. Default: ignore.
+    fn set_negotiated_memory(&mut self, _memory: crate::memory::MemoryType) {
+        // Default: ignore
+    }
 }
 
 /// An async source element that produces buffers asynchronously.
@@ -727,6 +736,15 @@ pub trait AsyncSource: Send {
     /// See [`Element::set_output_budget`] — same contract, same reason to
     /// override it: this source owns the arena its output buffers come from.
     fn set_output_budget(&mut self, _budget: crate::memory::OutputBudget) {
+        // Default: ignore
+    }
+
+    /// The memory type the downstream link negotiated (#145), delivered at
+    /// start like `set_output_budget`. A source that can produce either
+    /// backing (V4l2Src with `dmabuf_export`) emits dmabuf ONLY when this
+    /// said `MemoryType::DmaBuf` — never delivered (no `prepare()`
+    /// negotiation) means CPU, the safe default. Default: ignore.
+    fn set_negotiated_memory(&mut self, _memory: crate::memory::MemoryType) {
         // Default: ignore
     }
 }
@@ -1941,6 +1959,15 @@ pub trait AsyncElementDyn {
         // Default: do nothing
     }
 
+    /// The memory type this node's outgoing link negotiated (#145).
+    /// Delivered by the executor right after `set_output_budget`; the
+    /// source adapters forward it. Default: do nothing.
+    ///
+    /// ABI 9: adding this vtable slot is why the plugin ABI bumped.
+    fn set_negotiated_memory(&mut self, _memory: crate::memory::MemoryType) {
+        // Default: do nothing
+    }
+
     /// Get the inner element as `&dyn Any` for downcasting.
     ///
     /// This enables GStreamer-like element retrieval after pipeline creation:
@@ -2223,6 +2250,11 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
 
     fn set_output_budget(&mut self, budget: crate::memory::OutputBudget) {
         self.inner.set_output_budget(budget);
+    }
+
+    // #145: the negotiated memory type gates dmabuf emission at the source.
+    fn set_negotiated_memory(&mut self, memory: crate::memory::MemoryType) {
+        self.inner.set_negotiated_memory(memory);
     }
 
     fn name(&self) -> &str {
@@ -2978,6 +3010,11 @@ impl<S: AsyncSource> AsyncSourceAdapter<S> {
 impl<S: AsyncSource + Send + 'static> SendAsyncElementDyn for AsyncSourceAdapter<S> {
     fn set_output_budget(&mut self, budget: crate::memory::OutputBudget) {
         self.inner.set_output_budget(budget);
+    }
+
+    // #145: the negotiated memory type gates dmabuf emission at the source.
+    fn set_negotiated_memory(&mut self, memory: crate::memory::MemoryType) {
+        self.inner.set_negotiated_memory(memory);
     }
 
     fn name(&self) -> &str {

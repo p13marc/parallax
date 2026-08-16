@@ -2050,6 +2050,23 @@ impl Pipeline {
         self.negotiation.is_some()
     }
 
+    /// The negotiated memory type on `node`'s first outgoing link (#145).
+    ///
+    /// The executor delivers this to each source via
+    /// `set_negotiated_memory`, right after `set_output_budget` — finally a
+    /// consumer for [`link_memory_type`](Self::link_memory_type). Sources
+    /// have one output; for a multi-output node this reports the first
+    /// link, which is fine for the gate's purpose (a source emitting
+    /// dmabuf into mixed consumers needs `memorycopy` on the CPU branches
+    /// anyway).
+    pub fn node_output_memory_type(&self, id: NodeId) -> Option<MemoryType> {
+        self.graph
+            .children(id.0)
+            .iter(&self.graph)
+            .next()
+            .and_then(|(edge_idx, _)| self.link_memory_type(LinkId(edge_idx)))
+    }
+
     /// Get the full negotiation result (if negotiation has been run).
     pub fn negotiation_result(&self) -> Option<&NegotiationResult> {
         self.negotiation.as_ref()
