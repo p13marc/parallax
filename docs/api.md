@@ -57,6 +57,7 @@ brings in: `Buffer`, `Metadata`/`BufferFlags`/`RtpMeta`, clock types (`Clock`, `
 | `SharedArena`, `SharedSlotRef`, `SharedIpcSlotRef`, `SharedArenaCache`, `ArenaMetrics` | memfd arena with cross-process refcounting |
 | `BufferPool` (trait), `FixedBufferPool`, `PooledBuffer`, `PoolStats` | Pipeline buffer pools with backpressure |
 | `DmaBufSegment` | DMA-BUF fd wrapper (CPU-mapped) |
+| `ExternalSlot`, `ExternalReleaseHook` | Producer-owned memory pinned into the pipeline (#194) |
 | `MemoryType` | Memory vocabulary for caps negotiation |
 | `IpcChannel`, `IpcDescriptor`, `EventFd` | The IPC data plane (#179): shm descriptor/ack rings + doorbells |
 | `ipc::{send_fds, recv_fds, send_segment_handle, recv_segment_handle}` | SCM_RIGHTS fd passing |
@@ -64,7 +65,7 @@ brings in: `Buffer`, `Metadata`/`BufferFlags`/`RtpMeta`, clock types (`Clock`, `
 
 ### `parallax::buffer` / `parallax::metadata`
 
-`Buffer<T = ()>` (`new`, `as_bytes[_mut]`, `try_as_bytes_mut`, `copy_to_cpu`, `slice`, `metadata[_mut]`, `into_dynamic`), `MemoryHandle::{Cpu, DmaBuf}` (#145); `Metadata` (pts/dts/duration/sequence/stream_id/flags + typed custom map: `set`/`get`/`get_mut`/`remove`/`set_bytes`/`set_klv`/`set_sei`), `BufferFlags`, `RtpMeta`.
+`Buffer<T = ()>` (`new`, `as_bytes[_mut]`, `try_as_bytes_mut`, `copy_to_cpu`, `slice`, `metadata[_mut]`, `into_dynamic`), `MemoryHandle::{Cpu, DmaBuf, External}` (#145/#194); `Metadata` (pts/dts/duration/sequence/stream_id/flags + `planes: Option<PlaneLayout>` for strided video (#194: `set_video_planes`/`plane_layout`/`has_strided_planes`) + typed custom map: `set`/`get`/`get_mut`/`remove`/`set_bytes`/`set_klv`/`set_sei`), `BufferFlags`, `RtpMeta`.
 
 ### `parallax::format` / `parallax::negotiation`
 

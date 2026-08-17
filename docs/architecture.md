@@ -45,6 +45,7 @@ Everything above sits on the shared-memory foundation:
 - **`Metadata`** — PTS/DTS/duration (`ClockTime`), sequence, stream id, `BufferFlags`, optional RTP header info and negotiated format, plus a typed extensible map for custom data (KLV, SEI, captions, app data).
 - **`FixedBufferPool`** — pipeline-level pool on top of `SharedArena` with blocking `acquire()` (backpressure) and statistics.
 - **DMA-BUF** (`DmaBufSegment`/`DmaBufSlot`, `MemoryHandle::DmaBuf`) — device/GPU fds flow through the pipeline as first-class buffers (#145), release-hook recycled back to the producer.
+- **External memory** (`ExternalSlot`, `MemoryHandle::External`) — codec-owned frames (a dav1d picture) pinned into the pipeline without the de-stride copy (#194); strided plane layout rides `Metadata::plane_layout()`, and negotiation only delivers External to consumers that explicitly opt in.
 
 Details: [memory.md](memory.md).
 

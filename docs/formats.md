@@ -144,6 +144,18 @@ let camera = V4l2Src::with_config("/dev/video0", config)?;
 
 See `examples/45_dmabuf_negotiation.rs` and `examples/17_multi_format_caps.rs`.
 
+### External (strided) memory and plane layout (#194)
+
+`MemoryType::External` is producer-owned memory (a decoder's refcounted picture) pinned into the pipeline via `ExternalSlot`. Unlike Cpu/DmaBuf, its byte layout is producer-defined — strided planes, described per buffer:
+
+- `Metadata::set_video_planes(w, h, fmt, PlaneLayout)` declares a strided frame; `set_video_dims` clears the layout (packed).
+- `Metadata::plane_layout()` is the ONE read path: the explicit layout, else the packed one derived from `VideoRaw`. Consumers must never re-derive strides from width.
+- `PlaneLayout::packed(fmt, w, h)` / `required_len` / `repack_into` / `resolved()` are the geometry toolkit (`parallax::format`).
+
+Negotiation treats External as **opt-in** (`MemoryType::requires_explicit_optin`): the solver fixates it only when the sink's caps name it (`MemoryCaps::external_or_cpu()`); `Caps::any()` consumers get Cpu, an `[External, Cpu]` producer packs itself for a cpu-only sink (Direct link, no converter), and an External-ONLY producer gets a `memorycopy` repack inserted. Packed-assuming elements (`EncoderElement`, `VideoConvert`, `VideoScale`) error loudly on a strided layout rather than misreading it. Strided layouts never cross IPC.
+
+Producers/consumers today: `Dav1dDecoder` (emits External when negotiated — the GPU presentation path), `AutoVideoSink` with the wgpu backend (opts in, uploads with real `bytes_per_row`), `ExternalTestSrc` (`elements::testing`).
+
 ## Converters
 
 The real conversion engines live in `parallax::converters` (the pipeline elements `VideoConvertElement`/`AudioConvertElement`/`AudioResampleElement` wrap them):
