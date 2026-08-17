@@ -146,7 +146,7 @@ mod tests {
     fn owner_and_hook_release_exactly_once_on_last_drop() {
         let owner_drops = Arc::new(AtomicUsize::new(0));
         let hook_fires = Arc::new(AtomicUsize::new(0));
-        let data = vec![7u8; 64];
+        let data: Box<[u8]> = Box::new([7u8; 64]);
 
         let slot = {
             let hook_fires = hook_fires.clone();

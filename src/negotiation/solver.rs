@@ -239,13 +239,32 @@ impl NegotiationSolver {
             // Can negotiate directly - fixate the intersected format+memory
             // Use fixate_with_defaults() to handle Any/Any cases gracefully
             let format = intersected.format.fixate_with_defaults();
-            let memory_type = intersected.memory.fixate().unwrap_or(MemoryType::Cpu);
+            let mut memory_type = intersected.memory.fixate().unwrap_or(MemoryType::Cpu);
 
-            return Ok(LinkResult::Direct(LinkNegotiation {
-                link_id: link.id,
-                format,
-                memory_type,
-            }));
+            // Opt-in rule (#194): a memory type whose layout is
+            // producer-defined (External) only fixates when the SINK names
+            // it explicitly — `Caps::any()` consumers keep getting Cpu,
+            // because a byte-reading element would silently misinterpret a
+            // strided frame. When the intersection also permits Cpu the
+            // link downgrades in place; an opt-in-ONLY producer against a
+            // non-opting sink falls through to converter planning
+            // (memorycopy's repack direction).
+            let mut direct_ok = true;
+            if memory_type.requires_explicit_optin() && !sink_caps.lists_memory(memory_type) {
+                if intersected.memory.lists_memory(MemoryType::Cpu) {
+                    memory_type = MemoryType::Cpu;
+                } else {
+                    direct_ok = false;
+                }
+            }
+
+            if direct_ok {
+                return Ok(LinkResult::Direct(LinkNegotiation {
+                    link_id: link.id,
+                    format,
+                    memory_type,
+                }));
+            }
         }
 
         // No direct match: work out *which axes* disagree, then plan a chain of
@@ -258,8 +277,21 @@ impl NegotiationSolver {
                         continue; // Incompatible media kinds: no converter can help
                     };
 
-                    let source_memory = source_cap.memory.fixate().unwrap_or(MemoryType::Cpu);
+                    let mut source_memory = source_cap.memory.fixate().unwrap_or(MemoryType::Cpu);
                     let sink_memory = sink_cap.memory.fixate().unwrap_or(MemoryType::Cpu);
+
+                    // Opt-in rule, converter-path symmetry (#194): don't
+                    // ORIGINATE an opt-in memory type toward a sink cap
+                    // that doesn't list it — plan from Cpu instead when
+                    // the source can emit it (an [External, Cpu] producer
+                    // packs itself; only an External-only producer keeps
+                    // External here so the plan inserts the repack).
+                    if source_memory.requires_explicit_optin()
+                        && !sink_cap.memory.lists_memory(source_memory)
+                        && source_cap.memory.lists_memory(MemoryType::Cpu)
+                    {
+                        source_memory = MemoryType::Cpu;
+                    }
 
                     let Some(plan) = registry.plan(
                         FormatType::from(&source_cap.format),
@@ -534,6 +566,108 @@ mod tests {
         let result = solver.solve().unwrap();
         let link_caps = result.link_caps.get(&0).unwrap();
         assert_eq!(link_caps.memory_type, MemoryType::Cpu);
+    }
+
+    // ---- External opt-in matrix (#194) ----
+
+    fn external_link_solver(
+        source_memory: MemoryCaps,
+        sink_memory: MemoryCaps,
+    ) -> NegotiationSolver {
+        let mut solver =
+            NegotiationSolver::new().with_converters(crate::negotiation::builtin_registry());
+        let mut source_caps = ElementCaps::new("source");
+        source_caps.add_source_pad(
+            "src",
+            MediaCaps::new(FormatCaps::VideoRaw(VideoFormatCaps::any()), source_memory),
+        );
+        solver.add_element(source_caps);
+        let mut sink_caps = ElementCaps::new("sink");
+        sink_caps.add_sink_pad(
+            "sink",
+            MediaCaps::new(FormatCaps::VideoRaw(VideoFormatCaps::any()), sink_memory),
+        );
+        solver.add_element(sink_caps);
+        solver.add_link(LinkInfo {
+            id: 0,
+            source_element: "source".into(),
+            source_pad: "src".into(),
+            sink_element: "sink".into(),
+            sink_pad: "sink".into(),
+        });
+        solver
+    }
+
+    fn external_only() -> MemoryCaps {
+        MemoryCaps {
+            types: crate::format::CapsValue::Fixed(MemoryType::External),
+            can_import: vec![],
+            can_export: vec![MemoryType::External],
+        }
+    }
+
+    /// An `Any`-memory sink never sees External — the opt-in rule
+    /// downgrades the link to Cpu (a byte-reading consumer would silently
+    /// misinterpret a strided frame).
+    #[test]
+    fn external_downgrades_to_cpu_for_non_opting_sink() {
+        let solver = external_link_solver(MemoryCaps::external_preferred(), MemoryCaps::any());
+        let result = solver.solve().unwrap();
+        assert_eq!(
+            result.link_caps.get(&0).unwrap().memory_type,
+            MemoryType::Cpu
+        );
+        assert!(result.converters.is_empty());
+    }
+
+    /// A sink that names External in its caps gets it.
+    #[test]
+    fn external_fixates_for_opted_in_sink() {
+        let solver = external_link_solver(
+            MemoryCaps::external_preferred(),
+            MemoryCaps::external_or_cpu(),
+        );
+        let result = solver.solve().unwrap();
+        assert_eq!(
+            result.link_caps.get(&0).unwrap().memory_type,
+            MemoryType::External
+        );
+        assert!(result.converters.is_empty());
+    }
+
+    /// An [External, Cpu] producer against a cpu_only sink negotiates
+    /// DIRECT Cpu — the producer packs itself, no converter node.
+    #[test]
+    fn external_capable_source_packs_for_cpu_only_sink() {
+        let solver = external_link_solver(MemoryCaps::external_preferred(), MemoryCaps::cpu_only());
+        let result = solver.solve().unwrap();
+        assert_eq!(
+            result.link_caps.get(&0).unwrap().memory_type,
+            MemoryType::Cpu
+        );
+        assert!(result.converters.is_empty(), "{:?}", result.converters);
+    }
+
+    /// An External-ONLY producer against a non-opting sink needs the
+    /// memorycopy repack bridge.
+    #[test]
+    fn external_only_source_gets_memorycopy_repack() {
+        for sink in [MemoryCaps::cpu_only(), MemoryCaps::any()] {
+            let solver = external_link_solver(external_only(), sink);
+            let result = solver.solve().unwrap();
+            assert_eq!(
+                result.link_caps.get(&0).unwrap().memory_type,
+                MemoryType::External,
+                "source side of the link stays External"
+            );
+            assert_eq!(result.converters.len(), 1);
+            let chain: Vec<_> = result.converters[0]
+                .chain
+                .iter()
+                .map(|s| s.info.name)
+                .collect();
+            assert_eq!(chain, ["memorycopy"], "repack bridge inserted");
+        }
     }
 
     #[test]

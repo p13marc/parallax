@@ -375,14 +375,21 @@ impl AsyncSink for IpcSink {
         }
 
         let buffer = ctx.buffer();
-        // The descriptor ring speaks arena identity — a dmabuf-backed buffer
-        // has none (#145). Per-buffer SCM_RIGHTS fd passing is the honest
-        // follow-up; until then, negotiate Cpu or insert `memorycopy`.
+        // Packed is the IPC wire invariant (#194): strided layouts never
+        // cross; nothing in-tree produces a strided Cpu buffer.
+        debug_assert!(
+            !buffer.metadata().has_strided_planes(),
+            "ipcsink: strided plane layout on an IPC-bound buffer"
+        );
+        // The descriptor ring speaks arena identity — a dmabuf- or
+        // external-backed buffer has none (#145/#194). Per-buffer
+        // SCM_RIGHTS fd passing is the honest follow-up for dmabuf; until
+        // then, negotiate Cpu or insert `memorycopy`.
         let (Some(slot), Some(ipc_ref)) = (buffer.memory().slot(), buffer.memory().ipc_ref())
         else {
             return Err(Error::Element(
-                "ipcsink: dmabuf-backed buffer cannot cross the descriptor ring; \
-                 negotiate Cpu memory upstream or insert a memorycopy"
+                "ipcsink: dmabuf- or external-backed buffer cannot cross the descriptor \
+                 ring; negotiate Cpu memory upstream or insert a memorycopy"
                     .into(),
             ));
         };

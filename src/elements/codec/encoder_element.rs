@@ -168,6 +168,17 @@ impl<E: VideoEncoder> EncoderElement<E> {
     /// not `self`, so the caller can go on to `self.encoder.encode(frame)`
     /// while the view is live.
     fn buffer_to_frame<'a>(&mut self, buffer: &'a Buffer) -> Result<VideoFrameRef<'a>> {
+        // Loud guard (#194): the strides below derive from width — a
+        // strided frame sliced with them encodes garbage. Negotiation
+        // keeps External away from cpu-only elements; feeding strides
+        // straight from `Metadata::plane_layout` is the phase-2 upgrade.
+        if buffer.metadata().has_strided_planes() {
+            return Err(Error::Element(
+                "EncoderElement: strided plane layout not supported; negotiation should \
+                 have inserted a memorycopy repack"
+                    .into(),
+            ));
+        }
         match buffer.metadata().format {
             Some(MediaFormat::VideoRaw(vf)) => {
                 if self.format != Some(vf) {

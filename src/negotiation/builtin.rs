@@ -79,6 +79,12 @@ impl MemoryCopy {
     pub fn dmabuf_to_cpu() -> Self {
         Self::new(MemoryType::DmaBuf, MemoryType::Cpu)
     }
+
+    /// Create an External to CPU repacker (#194): strided producer-owned
+    /// frames land packed in CPU shm.
+    pub fn external_to_cpu() -> Self {
+        Self::new(MemoryType::External, MemoryType::Cpu)
+    }
 }
 
 impl Element for MemoryCopy {
@@ -87,10 +93,43 @@ impl Element for MemoryCopy {
     }
 
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
-        // The real direction (#145): land a dmabuf frame in CPU shm for
-        // consumers that negotiated Cpu. Already-CPU input passes through —
-        // the graph edge asked for Cpu and that is what it is.
-        if self.target_type == MemoryType::Cpu && buffer.memory_type() == MemoryType::DmaBuf {
+        // Non-CPU frames land in CPU shm for consumers that negotiated Cpu.
+        // Already-CPU input passes through — the graph edge asked for Cpu
+        // and that is what it is.
+        if self.target_type == MemoryType::Cpu && buffer.memory_type() != MemoryType::Cpu {
+            // A strided frame (#194) repacks — a flat copy would carry the
+            // row padding into memory every packed consumer misreads.
+            if buffer.metadata().has_strided_planes() {
+                let meta = buffer.metadata();
+                let (Some((w, h)), Some(fmt), Some(layout)) = (
+                    meta.video_dims(),
+                    meta.video_pixel_format(),
+                    meta.plane_layout(),
+                ) else {
+                    return Err(crate::error::Error::Element(
+                        "memorycopy: strided buffer without video geometry cannot be repacked"
+                            .into(),
+                    ));
+                };
+                let packed_len =
+                    crate::format::PlaneLayout::packed(fmt, w, h).required_len(fmt, w, h);
+                let mut slot = self.output.acquire(packed_len, "memorycopy")?;
+                layout
+                    .repack_into(
+                        buffer.as_bytes(),
+                        fmt,
+                        w,
+                        h,
+                        &mut slot.data_mut()[..packed_len],
+                    )
+                    .map_err(crate::error::Error::Element)?;
+                let handle = crate::buffer::MemoryHandle::with_len(slot, packed_len);
+                let mut metadata = buffer.metadata().clone();
+                // Output is packed: set_video_dims clears the layout.
+                metadata.set_video_dims(w, h, fmt);
+                return Ok(Some(Buffer::new(handle, metadata)));
+            }
+            // Packed non-CPU (dmabuf, packed External): flat copy (#145).
             let mut slot = self.output.acquire(buffer.len(), "memorycopy")?;
             let data = buffer.as_bytes();
             slot.data_mut()[..data.len()].copy_from_slice(data);
@@ -352,6 +391,20 @@ pub fn builtin_registry() -> ConverterRegistry {
         axes: ConvertAxes::MEMORY,
         cost: 20,
         factory: Arc::new(|_request: &ConversionRequest| Box::new(MemoryCopy::dmabuf_to_cpu())),
+    });
+
+    // External to CPU repack (#194): the bridge behind an External-only
+    // producer for consumers that did not opt in — the strided frame lands
+    // packed in CPU shm.
+    registry.register(ConverterSpec {
+        name: "memorycopy",
+        from_format: FormatType::Any,
+        to_format: FormatType::Any,
+        from_memory: MemoryType::External,
+        to_memory: MemoryType::Cpu,
+        axes: ConvertAxes::MEMORY,
+        cost: 20,
+        factory: Arc::new(|_request: &ConversionRequest| Box::new(MemoryCopy::external_to_cpu())),
     });
 
     registry

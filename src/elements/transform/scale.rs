@@ -446,6 +446,14 @@ impl Element for VideoScale {
     }
 
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
+        // Loud guard (#194): the scale engine assumes packed planes.
+        if buffer.metadata().has_strided_planes() {
+            return Err(Error::Element(
+                "videoscale: strided plane layout not supported; negotiation should have \
+                 inserted a memorycopy repack"
+                    .into(),
+            ));
+        }
         // What is this buffer? Ask it — do not infer.
         let (caps_format, src_w, src_h) = Self::resolve_input(buffer.metadata())?;
         // Caps-only formats (I444, 10-bit, …) fail here with a message naming them.

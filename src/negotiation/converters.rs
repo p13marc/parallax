@@ -170,6 +170,16 @@ pub fn diff_caps(source: &FormatMemoryCap, sink: &FormatMemoryCap) -> Option<Cap
 
     if source.memory.intersect(&sink.memory).is_none() {
         axes |= ConvertAxes::MEMORY;
+    } else if let Some(fixated) = source.memory.fixate()
+        && fixated.requires_explicit_optin()
+        && !sink.memory.lists_memory(fixated)
+        && !source.memory.lists_memory(MemoryType::Cpu)
+    {
+        // Opt-in rule (#194): the caps *intersect* (Fixed ∩ Any), but an
+        // opt-in memory type (External) may not be delivered to a sink
+        // that didn't name it, and this source cannot fall back to Cpu on
+        // its own — a converter (memorycopy repack) must bridge.
+        axes |= ConvertAxes::MEMORY;
     }
 
     match (&source.format, &sink.format) {

@@ -228,6 +228,18 @@ impl Element for VideoConvertElement {
     }
 
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
+        // Loud guard (#194): this converter walks planes with strides
+        // derived from width — a strided frame would convert into garbage.
+        // Negotiation keeps External away from cpu-only elements; anything
+        // that still lands here is a bug upstream, not a format to guess at.
+        if buffer.metadata().has_strided_planes() {
+            return Err(Error::Element(
+                "videoconvert: strided plane layout not supported; negotiation should have \
+                 inserted a memorycopy repack"
+                    .into(),
+            ));
+        }
+
         let input_data = buffer.as_bytes();
 
         tracing::debug!(

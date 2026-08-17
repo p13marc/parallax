@@ -1659,6 +1659,46 @@ impl MemoryCaps {
         }
     }
 
+    /// Prefer External (producer-owned, strided) but fall back to CPU.
+    ///
+    /// The producer side of #194: a decoder that can emit its codec's own
+    /// refcounted pictures declares this, and packs into its arena when
+    /// the link fixates `Cpu` instead.
+    pub fn external_preferred() -> Self {
+        Self {
+            types: CapsValue::List(vec![MemoryType::External, MemoryType::Cpu]),
+            can_import: vec![MemoryType::Cpu],
+            can_export: vec![MemoryType::External, MemoryType::Cpu],
+        }
+    }
+
+    /// Accept External or CPU memory — the consumer opt-in of #194.
+    ///
+    /// Listing `External` here is what lets the solver fixate it (see
+    /// [`MemoryType::requires_explicit_optin`]); a consumer that declares
+    /// this MUST read plane geometry via `Metadata::plane_layout` instead
+    /// of assuming packed bytes.
+    pub fn external_or_cpu() -> Self {
+        Self {
+            types: CapsValue::List(vec![MemoryType::External, MemoryType::Cpu]),
+            can_import: vec![MemoryType::External, MemoryType::Cpu],
+            can_export: vec![MemoryType::Cpu],
+        }
+    }
+
+    /// Whether this caps object explicitly names `memory` as a supported
+    /// type. `Any` does NOT count — that is the whole point for opt-in
+    /// types like [`MemoryType::External`], which a byte-reading `Any`
+    /// element would silently misinterpret.
+    pub fn lists_memory(&self, memory: MemoryType) -> bool {
+        match &self.types {
+            CapsValue::Fixed(t) => *t == memory,
+            CapsValue::List(ts) => ts.contains(&memory),
+            CapsValue::Any => false,
+            CapsValue::Range { .. } => false,
+        }
+    }
+
     /// Intersect with another memory caps.
     pub fn intersect(&self, other: &Self) -> Option<Self> {
         Some(Self {
@@ -1968,6 +2008,13 @@ impl ElementMediaCaps {
         Self {
             caps: smallvec::smallvec![FormatMemoryCap::any_cpu()],
         }
+    }
+
+    /// Whether any of this element's caps explicitly names `memory` as a
+    /// supported type (`Any` does not count) — the consumer opt-in check
+    /// for [`MemoryType::requires_explicit_optin`] types (#194).
+    pub fn lists_memory(&self, memory: MemoryType) -> bool {
+        self.caps.iter().any(|c| c.memory.lists_memory(memory))
     }
 
     /// Create caps for a single format+memory combination.
