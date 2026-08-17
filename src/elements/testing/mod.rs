@@ -7,12 +7,17 @@
 
 mod datasrc;
 mod dmabufsrc;
+mod externalsrc;
 mod null;
 mod testsrc;
 mod videotestsrc;
 
 pub use datasrc::DataSrc;
 pub use dmabufsrc::DmaBufTestSrc;
+pub use externalsrc::{
+    ExternalTestSrc, PAD_BYTE, TEST_HEIGHT, TEST_PADDING, TEST_WIDTH, packed_reference_frame,
+    strided_test_layout,
+};
 pub use null::{NullSink, NullSource};
 pub use testsrc::{TestPattern, TestSrc};
 pub use videotestsrc::{AsyncVideoTestSrc, PixelFormat, VideoPattern, VideoTestSrc};
