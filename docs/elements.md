@@ -54,7 +54,7 @@ Feature-gated:
 
 | Factory name | Feature | Properties |
 |---|---|---|
-| `autovideosink` | `display` | `title`, `width`+`height`, `sync`, `max-lateness-ms` |
+| `autovideosink` | `display` | `title`, `width`+`height`, `sync`, `max-lateness-ms`, `gpu` (bool, default true — GPU presentation when `display-gpu` is compiled and an adapter exists) |
 | `v4l2src` | `v4l2` | `device` (default /dev/video0), `width`+`height`, `format` (fourcc, default YUYV), `buffer-count`, `framerate`, `dmabuf-export` |
 | `alsasrc` / `alsasink` | `alsa` | `device` (default "default"), `rate` (48000), `channels` (2), `format` = s16\|s32\|f32\|u8, `buffer-frames`, `period-frames` |
 | `screencapsrc` | `screen-capture` | `source-type` = monitor\|window\|any, `cursor` (bool), `max-frames` |
@@ -106,7 +106,7 @@ Network and device constructors do their I/O (connect/bind/open) at parse time, 
 |---------|-------------|
 | `AppSrc` (+ `AppSrcHandle`) | Push buffers from application code into a pipeline |
 | `AppSink` (+ `AppSinkHandle`) | Pull buffers out of a pipeline into application code — add it with `add_async_sink`; a full queue back-pressures upstream by awaiting space (never parking a worker), or use `drop_on_full(true)` to shed instead. See [Reading the end of a stream](#reading-the-end-of-a-stream) |
-| `AutoVideoSink` `[display]` | Display video in a window (winit + softbuffer); frame dimensions from per-buffer metadata (`Metadata::video_dims`, both conventions) when present, else guessed from RGBA buffer size. `sync=true` paces presentation — see below. Async sink since #172: the pacing wait is an await, so a frozen clock pends the future instead of parking a worker |
+| `AutoVideoSink` `[display]` | Display video in a window (winit; render backends behind a trait since #190 — feature `display-gpu` adds a wgpu backend that takes **I420/NV12 directly**, converts colorspace + letterbox-scales bilinearly in a fragment shader, and presents via swapchain [Mailbox else Fifo]; softbuffer + the CPU blit remain the fallback, with an in-sink YUV→BGRA convert if the GPU was negotiated but init failed at runtime). Caps flip to `[I420, Nv12, Bgra, Rgba]` when the feature + a pre-window adapter probe (`PARALLAX_NO_GPU`/`PARALLAX_FORCE_GPU` override; llvmpipe rejected) + `with_gpu(true)` (default) agree — `parallax::elements::gpu_present_available()` is the same answer, which the player uses to skip `videoconvert` entirely. YUV frames require `Metadata::video_dims`; RGBA/BGRA keep the size-guess fallback. BT.709/601 chosen by height (≥720 → 709), limited range. `sync=true` paces presentation — see below. Async sink since #172: the pacing wait is an await, so a frozen clock pends the future instead of parking a worker |
 
 ### Reading the end of a stream
 

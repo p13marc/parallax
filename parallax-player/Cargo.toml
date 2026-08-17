@@ -16,6 +16,7 @@ parallax = { package = "parallax-pipeline", path = "..", features = [
     "opus",
     "h264",
     "display",
+    "display-gpu",
     "simd-colorspace",
     "audio-aac",
     "audio-vorbis",

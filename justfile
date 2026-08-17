@@ -66,6 +66,13 @@ check-media-full:
 bench-media:
     cargo bench --features h264,mkv-demux --bench media_path
 
+# Check + test + lint the display combo, GPU backend included (#190).
+# Compiles headless (wgpu loads drivers at runtime); the GPU path itself
+# needs a real session to exercise.
+check-display:
+    cargo nextest run --features display,display-gpu
+    cargo clippy --all-targets --features display,display-gpu -- -D warnings
+
 # Check + test + lint the V4L2 M2M hardware encoder (mirrors CI's test-v4l2-m2m job).
 # Needs libclang + kernel headers (on immutable Fedora: run inside a toolbox).
 # Live queue test: modprobe vicodec, then PARALLAX_VICODEC_TEST_DEVICE=auto just check-m2m

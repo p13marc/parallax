@@ -9,6 +9,8 @@ mod appsrc;
 
 #[cfg(feature = "display")]
 mod autovideosink;
+#[cfg(feature = "display")]
+mod present;
 
 /// Re-exported from [`crate::pipeline`], where the terminal outcome now lives —
 /// it is the pipeline's answer as much as a sink's.
@@ -18,3 +20,5 @@ pub use appsrc::{AppSrc, AppSrcHandle, AppSrcStats};
 
 #[cfg(feature = "display")]
 pub use autovideosink::{AutoVideoSink, AutoVideoSinkHandle, VideoKey, VideoWindowEvent};
+#[cfg(feature = "display")]
+pub use present::gpu_present_available;

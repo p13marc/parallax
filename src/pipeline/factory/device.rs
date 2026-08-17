@@ -72,6 +72,12 @@ fn create_autovideosink(props: &Props) -> Result<Box<DynAsyncElement<'static>>> 
     if let Some(t) = props.get_ms("max-lateness-ms")? {
         sink = sink.with_max_lateness(t);
     }
+    // GPU presentation (#190): on by default; inert without the
+    // `display-gpu` feature or a usable adapter. `gpu=false` restores the
+    // pure CPU shape (RGBA/BGRA caps, softbuffer blit).
+    if let Some(gpu) = props.get_bool("gpu")? {
+        sink = sink.with_gpu(gpu);
+    }
 
     Ok(DynAsyncElement::new_box(AsyncSinkAdapter::new(sink)))
 }

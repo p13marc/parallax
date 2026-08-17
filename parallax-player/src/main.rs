@@ -39,6 +39,11 @@ struct Args {
     #[arg(long)]
     no_audio: bool,
 
+    /// Disable GPU presentation: keep the CPU convert + softbuffer blit
+    /// path even when a usable adapter exists.
+    #[arg(long)]
+    no_gpu: bool,
+
     /// Loop playback when the stream ends.
     #[arg(long = "loop")]
     loop_playback: bool,
@@ -613,16 +618,26 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
         .unwrap_or((0, 0));
     let audio = audio_branch(args, summary.audio.as_ref());
 
-    // BGRA, not RGBA: same SIMD conversion cost, but BGRA bytes read as
-    // little-endian u32 are already softbuffer's presentation layout, so
-    // AutoVideoSink's blit is a copy instead of a per-pixel channel shuffle
-    // (the shuffle measured ~37% of the player's total CPU).
-    let mut convert = VideoConvertElement::new()
-        .with_input_format(PixelFormat::I420)
-        .with_output_format(PixelFormat::Bgra);
-    if width > 0 {
-        convert = convert.with_size(width, height);
-    }
+    // GPU presentation (#190): with a usable adapter the sink takes the
+    // decoder's I420 directly — colorspace conversion and scaling run in a
+    // fragment shader, and the whole convert stage (CPU + its BGRA arena)
+    // disappears from the pipeline.
+    let use_gpu = !args.no_gpu && parallax::elements::gpu_present_available();
+
+    // CPU fallback path: BGRA, not RGBA — same SIMD conversion cost, but
+    // BGRA bytes read as little-endian u32 are already softbuffer's
+    // presentation layout, so AutoVideoSink's blit is a copy instead of a
+    // per-pixel channel shuffle (the shuffle measured ~37% of the player's
+    // total CPU).
+    let convert = (!use_gpu).then(|| {
+        let mut convert = VideoConvertElement::new()
+            .with_input_format(PixelFormat::I420)
+            .with_output_format(PixelFormat::Bgra);
+        if width > 0 {
+            convert = convert.with_size(width, height);
+        }
+        convert
+    });
 
     let title = args
         .file
@@ -631,7 +646,10 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
         .unwrap_or_else(|| "parallax".into());
     // `sync` is what makes this a *player*: frames present at their PTS on
     // the pipeline clock instead of as fast as the decoder can go.
-    let mut sink = AutoVideoSink::new().with_title(title).with_sync(true);
+    let mut sink = AutoVideoSink::new()
+        .with_title(title)
+        .with_sync(true)
+        .with_gpu(use_gpu);
     let window = sink.handle();
 
     let mut pipeline = Pipeline::new();
@@ -672,17 +690,12 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
         VideoCodecKind::H264 => pipeline.add_filter("decode", H264Decoder::new()?),
         VideoCodecKind::Vp8 => pipeline.add_filter("decode", VpxDecoder::vp8()?),
         VideoCodecKind::Vp9 => pipeline.add_filter("decode", VpxDecoder::vp9()?),
-        // max_frame_delay=2 bounds dav1d's internal picture pool (auto
-        // delay on an 8-thread machine holds ~8 pictures ≈ tens of MB at
-        // 1080p and ~8 frames of latency) — a player wants the bound, a
-        // transcode wants the throughput default (#189).
         VideoCodecKind::Av1 => pipeline.add_filter(
             "decode",
             Dav1dDecoder::new()?.with_max_frame_delay(args.frame_delay)?,
         ),
         VideoCodecKind::Other(codec) => bail!("video track is {codec} — no decoder for it yet"),
     };
-    let cvt = pipeline.add_filter("convert", convert);
     let snk = pipeline.add_async_sink("display", sink);
     // Deep branch links decouple the two consumers: the demuxer emits in DTS
     // order, so if the video branch backpressures at its exact rate the audio
@@ -691,8 +704,18 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
     // demuxer's output arena is sized from these capacities (#84/#91), so
     // depth here is accounted memory, not a leak.
     pipeline.link_pads_full(src, "video", dec, "sink", LinkPolicy::Block, Some(24))?;
-    pipeline.link(dec, cvt)?;
-    pipeline.link(cvt, snk)?;
+    match convert {
+        // CPU path: decoder → I420→BGRA convert → softbuffer blit.
+        Some(convert) => {
+            let cvt = pipeline.add_filter("convert", convert);
+            pipeline.link(dec, cvt)?;
+            pipeline.link(cvt, snk)?;
+        }
+        // GPU path (#190): the sink takes I420 straight from the decoder.
+        None => {
+            pipeline.link(dec, snk)?;
+        }
+    }
 
     // Volume handle, taken before start(); None on a video-only run.
     let mut volume: Option<parallax::elements::GainControl> = None;

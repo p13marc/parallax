@@ -24,43 +24,17 @@
 //! This design mirrors GStreamer's xvimagesink which also runs its own
 //! X11 event thread.
 
-use crate::buffer::Buffer;
+use super::present::{self, DisplayFrame};
 use crate::clock::ClockTime;
 use crate::element::{AsyncSink, ConsumeContext};
 use crate::error::{Error, Result};
 use crate::format::{Caps, PixelFormat};
-use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use winit::event_loop::EventLoopProxy;
-
-/// Frame data sent to the display thread.
-///
-/// Carries the pipeline `Buffer` itself — a clone is three atomic
-/// increments and (since #138) an allocation-free metadata copy, so the
-/// display thread shares the arena slot instead of receiving a
-/// full-frame `Vec` copy (#141). The slot stays pinned until the frame
-/// is replaced, which is why the display channel is kept shallow.
-struct DisplayFrame {
-    /// Pixel data, arena-backed. BGRA or RGBA, per `bgra`.
-    data: Buffer,
-    /// Frame width in pixels
-    width: u32,
-    /// Frame height in pixels
-    height: u32,
-    /// Whether the payload is BGRA rather than RGBA.
-    ///
-    /// BGRA bytes read as little-endian `u32` are exactly softbuffer's
-    /// `0RGB` presentation format, so the blit degenerates to a row copy
-    /// (1:1) or an index-copy (scaled) with no per-pixel channel shuffle —
-    /// the shuffle was ~37% of the whole player's CPU on a real file. A
-    /// player that feeds this sink should convert to BGRA; RGBA remains
-    /// accepted for everything else.
-    bgra: bool,
-}
 
 /// The winit user event: "state changed, wake up and look".
 ///
@@ -301,6 +275,10 @@ pub struct AutoVideoSink {
     fullscreen: Arc<AtomicBool>,
     /// Doorbell into the display loop; see [`SharedProxy`].
     proxy: SharedProxy,
+    /// Prefer the GPU presentation backend (#190). Only effective when the
+    /// `display-gpu` feature is compiled and the process-wide probe finds a
+    /// real adapter; the caps flip to accept I420/NV12 exactly then.
+    gpu: bool,
 }
 
 /// A key press from the video window, winit-agnostic.
@@ -433,7 +411,22 @@ impl AutoVideoSink {
             events: None,
             fullscreen: Arc::new(AtomicBool::new(false)),
             proxy: Arc::new(Mutex::new(None)),
+            gpu: true,
         }
+    }
+
+    /// Prefer (or refuse) the GPU presentation backend (#190). Default on;
+    /// without the `display-gpu` feature or a usable adapter it is inert.
+    /// `with_gpu(false)` also drops I420/NV12 from the caps, restoring the
+    /// pure CPU pipeline shape (converter upstream, softbuffer blit).
+    pub fn with_gpu(mut self, gpu: bool) -> Self {
+        self.gpu = gpu;
+        self
+    }
+
+    /// Whether this sink will negotiate YUV input for GPU presentation.
+    fn gpu_effective(&self) -> bool {
+        self.gpu && present::gpu_present_available()
     }
 
     /// Runtime handle to the window: events + fullscreen control.
@@ -545,6 +538,7 @@ impl AutoVideoSink {
 
         running.store(true, Ordering::SeqCst);
 
+        let prefer_gpu = self.gpu;
         let handle = thread::spawn(move || {
             if let Err(e) = run_display_loop(
                 receiver,
@@ -555,6 +549,7 @@ impl AutoVideoSink {
                 events_tx,
                 fullscreen,
                 proxy.clone(),
+                prefer_gpu,
             ) {
                 eprintln!("Display error: {}", e);
             }
@@ -683,13 +678,38 @@ impl AsyncSink for AutoVideoSink {
 
         tracing::debug!("AutoVideoSink: received buffer with {} bytes", data.len());
 
-        // Dimensions: prefer per-buffer metadata (`MediaFormat::VideoRaw`,
-        // the single geometry representation since #160), fall back to
-        // guessing from the RGBA buffer size.
+        // Format: from per-buffer metadata; an undeclared payload is
+        // treated as RGBA (the legacy contract).
         let meta = ctx.metadata();
-        let (width, height) = match meta.video_dims() {
-            Some((w, h)) if w > 0 && h > 0 && (w as usize * h as usize * 4) == data.len() => (w, h),
-            _ => detect_dimensions(data.len()),
+        let format = meta.video_pixel_format().unwrap_or(PixelFormat::Rgba);
+
+        // Dimensions: prefer per-buffer metadata (`MediaFormat::VideoRaw`,
+        // the single geometry representation since #160); for RGBA/BGRA,
+        // fall back to guessing from the buffer size. YUV frames REQUIRE
+        // declared geometry — plane layout is unrecoverable without it.
+        let (width, height) = match format {
+            PixelFormat::I420 | PixelFormat::Nv12 => match meta.video_dims() {
+                Some((w, h)) if w > 0 && h > 0 && data.len() >= present::yuv420_len(w, h) => (w, h),
+                Some((w, h)) => {
+                    return Err(Error::Element(format!(
+                        "autovideosink: {format:?} buffer is {} bytes but {w}x{h} needs {}",
+                        data.len(),
+                        present::yuv420_len(w, h)
+                    )));
+                }
+                None => {
+                    return Err(Error::Element(format!(
+                        "autovideosink: {format:?} buffer carries no video dimensions \
+                         (decoders set them via Metadata::set_video_dims)"
+                    )));
+                }
+            },
+            _ => match meta.video_dims() {
+                Some((w, h)) if w > 0 && h > 0 && (w as usize * h as usize * 4) == data.len() => {
+                    (w, h)
+                }
+                _ => detect_dimensions(data.len()),
+            },
         };
 
         tracing::debug!("AutoVideoSink: detected dimensions {}x{}", width, height);
@@ -774,11 +794,11 @@ impl AsyncSink for AutoVideoSink {
 
         let frame = DisplayFrame {
             // Refcount bump, not a copy: the display thread maps the same
-            // arena slot the converter wrote (#141).
+            // arena slot the producer wrote (#141).
             data: ctx.buffer().clone(),
             width,
             height,
-            bgra: meta.video_pixel_format() == Some(PixelFormat::Bgra),
+            format,
         };
 
         // A full channel means the display cannot keep up. Shed this frame and
@@ -815,15 +835,28 @@ impl AsyncSink for AutoVideoSink {
             CapsValue, ElementMediaCaps, FormatCaps, FormatMemoryCap, MemoryCaps, MemoryLayout,
             VideoFormatCaps,
         };
-        // RGBA first: the converter matrix reaches Rgba from every source
-        // format, so auto-inserted converters keep working everywhere. BGRA
-        // is the fast path (blit without the per-pixel shuffle) for
-        // producers that can emit it — the player converts to it explicitly.
+        // With a usable GPU backend (#190) the sink takes the decoder's
+        // I420/NV12 directly — colorspace conversion and scaling move into
+        // the fragment shader, and no `videoconvert` is needed at all.
+        // Otherwise: RGBA first, because the converter matrix reaches Rgba
+        // from every source format, so auto-inserted converters keep
+        // working everywhere; BGRA is the CPU blit's fast path (its LE u32
+        // is softbuffer's 0RGB layout).
+        let formats = if self.gpu_effective() {
+            vec![
+                PixelFormat::I420,
+                PixelFormat::Nv12,
+                PixelFormat::Bgra,
+                PixelFormat::Rgba,
+            ]
+        } else {
+            vec![PixelFormat::Rgba, PixelFormat::Bgra]
+        };
         ElementMediaCaps::new([FormatMemoryCap::new(
             FormatCaps::VideoRaw(VideoFormatCaps {
                 width: CapsValue::Any,
                 height: CapsValue::Any,
-                pixel_format: CapsValue::List(vec![PixelFormat::Rgba, PixelFormat::Bgra]),
+                pixel_format: CapsValue::List(formats),
                 framerate: CapsValue::Any,
                 layout: MemoryLayout::NONE,
             }),
@@ -880,7 +913,9 @@ fn run_display_loop(
     events_tx: Option<crossbeam_channel::Sender<VideoWindowEvent>>,
     fullscreen: Arc<AtomicBool>,
     proxy_slot: SharedProxy,
+    prefer_gpu: bool,
 ) -> Result<()> {
+    use super::present::RenderBackend;
     use winit::application::ApplicationHandler;
     use winit::dpi::PhysicalSize;
     use winit::event::{ElementState, MouseButton, WindowEvent};
@@ -890,9 +925,10 @@ fn run_display_loop(
     use winit::window::{Fullscreen, Window, WindowAttributes, WindowId};
 
     struct VideoApp {
-        window: Option<std::rc::Rc<Window>>,
-        surface: Option<softbuffer::Surface<std::rc::Rc<Window>, std::rc::Rc<Window>>>,
-        context: Option<softbuffer::Context<std::rc::Rc<Window>>>,
+        // Declared before `window` so drop order tears the backend's
+        // surface down before the window it was created from.
+        backend: Option<Box<dyn RenderBackend>>,
+        window: Option<Arc<Window>>,
         receiver: mpsc::Receiver<DisplayFrame>,
         running: Arc<AtomicBool>,
         current_frame: Option<DisplayFrame>,
@@ -900,7 +936,7 @@ fn run_display_loop(
         initial_width: u32,
         initial_height: u32,
         events_tx: Option<crossbeam_channel::Sender<VideoWindowEvent>>,
-        blit_cache: BlitCache,
+        prefer_gpu: bool,
         /// Desired state, set by the handle; compared against `is_fullscreen`.
         fullscreen: Arc<AtomicBool>,
         is_fullscreen: bool,
@@ -949,24 +985,17 @@ fn run_display_loop(
 
             match event_loop.create_window(attrs) {
                 Ok(window) => {
-                    let window = std::rc::Rc::new(window);
-
-                    // Create softbuffer context and surface
-                    match softbuffer::Context::new(window.clone()) {
-                        Ok(context) => match softbuffer::Surface::new(&context, window.clone()) {
-                            Ok(surface) => {
-                                self.context = Some(context);
-                                self.surface = Some(surface);
-                                self.window = Some(window);
-                            }
-                            Err(e) => {
-                                eprintln!("Failed to create surface: {}", e);
-                                self.running.store(false, Ordering::SeqCst);
-                                event_loop.exit();
-                            }
-                        },
+                    let window = Arc::new(window);
+                    // GPU first (feature + preference + probe), softbuffer
+                    // as the fallback; see `present::create_backend`.
+                    match super::present::create_backend(window.clone(), self.prefer_gpu) {
+                        Ok(backend) => {
+                            tracing::debug!("autovideosink: {} backend ready", backend.name());
+                            self.backend = Some(backend);
+                            self.window = Some(window);
+                        }
                         Err(e) => {
-                            eprintln!("Failed to create softbuffer context: {}", e);
+                            eprintln!("Failed to create render backend: {}", e);
                             self.running.store(false, Ordering::SeqCst);
                             event_loop.exit();
                         }
@@ -1000,7 +1029,9 @@ fn run_display_loop(
                         width: size.width,
                         height: size.height,
                     });
-                    // Surface will be resized on next render
+                    if let Some(backend) = &mut self.backend {
+                        backend.resized(size.width, size.height);
+                    }
                     if let Some(window) = &self.window {
                         window.request_redraw();
                     }
@@ -1081,7 +1112,7 @@ fn run_display_loop(
             let Some(window) = &self.window else {
                 return;
             };
-            let Some(surface) = &mut self.surface else {
+            let Some(backend) = &mut self.backend else {
                 return;
             };
             let Some(frame) = &self.current_frame else {
@@ -1089,30 +1120,10 @@ fn run_display_loop(
             };
 
             let size = window.inner_size();
-            let width = size.width;
-            let height = size.height;
-
-            if width == 0 || height == 0 {
-                return;
-            }
-
-            // Resize surface if needed
-            if let (Some(w), Some(h)) = (NonZeroU32::new(width), NonZeroU32::new(height))
-                && surface.resize(w, h).is_err()
-            {
-                return;
-            }
-
-            // Get buffer and blit frame
-            if let Ok(mut buffer) = surface.buffer_mut() {
-                blit_frame(
-                    frame,
-                    &mut buffer,
-                    width as usize,
-                    height as usize,
-                    &mut self.blit_cache,
-                );
-                let _ = buffer.present();
+            if let Err(e) = backend.render(frame, (size.width, size.height)) {
+                // One frame failing to present is a glitch, not a teardown;
+                // persistent failure shows up as a black window plus logs.
+                tracing::warn!("autovideosink: {} render failed: {e}", backend.name());
             }
         }
     }
@@ -1128,17 +1139,16 @@ fn run_display_loop(
     *proxy_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(event_loop.create_proxy());
 
     let mut app = VideoApp {
+        backend: None,
         window: None,
-        surface: None,
-        context: None,
         receiver,
         running,
         current_frame: None,
-        blit_cache: BlitCache::default(),
         title: title.to_string(),
         initial_width,
         initial_height,
         events_tx,
+        prefer_gpu,
         fullscreen,
         is_fullscreen: false,
         cursor: (0.0, 0.0),
@@ -1149,214 +1159,9 @@ fn run_display_loop(
         .map_err(|e| Error::Element(format!("Event loop error: {}", e)))
 }
 
-/// Blit an RGBA frame to the softbuffer surface with scaling.
-/// Horizontal nearest-neighbour map, cached across frames — rebuilding it
-/// costs one small allocation only when the source or window geometry
-/// changes.
-#[derive(Default)]
-struct BlitCache {
-    key: (usize, usize),
-    x_map: Vec<u32>,
-}
-
-fn blit_frame(
-    frame: &DisplayFrame,
-    buffer: &mut [u32],
-    dst_width: usize,
-    dst_height: usize,
-    cache: &mut BlitCache,
-) {
-    let src_width = frame.width as usize;
-    let src_height = frame.height as usize;
-    let src = frame.data.as_bytes();
-
-    if src_width == 0
-        || src_height == 0
-        || dst_width == 0
-        || dst_height == 0
-        || src.len() < src_width * src_height * 4
-        || buffer.len() < dst_width * dst_height
-    {
-        return;
-    }
-
-    // Aspect-preserving letterbox: scale to fit, center, black bars around.
-    // Stretching to the window distorted anything whose aspect ratio did not
-    // match — obvious the moment a 16:9 stream met a fullscreen 16:10 panel.
-    let (out_width, out_height) = if src_width * dst_height >= src_height * dst_width {
-        // Width-bound: pillar-free, bars top/bottom.
-        (dst_width, (src_height * dst_width / src_width).max(1))
-    } else {
-        // Height-bound: bars left/right.
-        ((src_width * dst_height / src_height).max(1), dst_height)
-    };
-    let x0 = (dst_width - out_width) / 2;
-    let y0 = (dst_height - out_height) / 2;
-
-    if cache.key != (src_width, out_width) {
-        cache.key = (src_width, out_width);
-        cache.x_map.clear();
-        cache
-            .x_map
-            .extend((0..out_width).map(|x| ((x * src_width) / out_width) as u32));
-    }
-
-    // Row-wise: bars fill by slice, the image row converts RGBA → 0RGB with
-    // all bounds established once per row (#141) — the previous per-pixel
-    // loop paid a bounds check, two `contains`, and a mul+div per pixel.
-    for dst_y in 0..dst_height {
-        let row = &mut buffer[dst_y * dst_width..(dst_y + 1) * dst_width];
-        if dst_y < y0 || dst_y >= y0 + out_height {
-            row.fill(0); // letterbox bar
-            continue;
-        }
-        row[..x0].fill(0);
-        row[x0 + out_width..].fill(0);
-
-        let src_y = ((dst_y - y0) * src_height) / out_height;
-        let src_row = &src[src_y * src_width * 4..(src_y + 1) * src_width * 4];
-        let out_row = &mut row[x0..x0 + out_width];
-        match (frame.bgra, out_width == src_width) {
-            // BGRA is softbuffer's 0RGB layout already (the alpha byte lands
-            // in the ignored top bits), so no per-pixel channel shuffle —
-            // which used to be ~37% of the player's entire CPU (#161). The
-            // `try_into` on a 4-byte subslice compiles to a single 32-bit
-            // load; spelling out the four bytes kept four byte-loads plus
-            // shifts (measured).
-            (true, true) => {
-                // 1:1: a straight row copy at memcpy speed.
-                for (dst, px) in out_row.iter_mut().zip(src_row.chunks_exact(4)) {
-                    *dst = u32::from_le_bytes(px.try_into().unwrap());
-                }
-            }
-            (true, false) => {
-                for (dst, &sx) in out_row.iter_mut().zip(&cache.x_map[..out_width]) {
-                    let o = sx as usize * 4;
-                    *dst = u32::from_le_bytes(src_row[o..o + 4].try_into().unwrap());
-                }
-            }
-            // RGBA compat: shuffle each pixel into 0xRRGGBB.
-            (false, true) => {
-                // 1:1 horizontal: straight zip, no index math.
-                for (dst, px) in out_row.iter_mut().zip(src_row.chunks_exact(4)) {
-                    *dst = ((px[0] as u32) << 16) | ((px[1] as u32) << 8) | (px[2] as u32);
-                }
-            }
-            (false, false) => {
-                for (dst, &sx) in out_row.iter_mut().zip(&cache.x_map[..out_width]) {
-                    let o = sx as usize * 4;
-                    *dst = ((src_row[o] as u32) << 16)
-                        | ((src_row[o + 1] as u32) << 8)
-                        | (src_row[o + 2] as u32);
-                }
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// An arena-backed frame of `w`x`h` with every byte `fill`, for blits.
-    fn filled_frame(w: u32, h: u32, fill: u8, bgra: bool) -> DisplayFrame {
-        let len = (w * h * 4) as usize;
-        let arena = crate::memory::SharedArena::new(len, 2).unwrap();
-        let mut slot = arena.acquire().unwrap();
-        slot.data_mut()[..len].fill(fill);
-        DisplayFrame {
-            data: Buffer::new(
-                crate::buffer::MemoryHandle::with_len(slot, len),
-                crate::metadata::Metadata::new(),
-            ),
-            width: w,
-            height: h,
-            bgra,
-        }
-    }
-
-    /// An arena-backed white RGBA frame of `w`x`h` for blit tests.
-    fn white_frame(w: u32, h: u32) -> DisplayFrame {
-        filled_frame(w, h, 0xFF, false)
-    }
-
-    /// A single-pixel frame with explicit channel bytes, for format tests.
-    fn pixel_frame(bytes: [u8; 4], bgra: bool) -> DisplayFrame {
-        let arena = crate::memory::SharedArena::new(64, 2).unwrap();
-        let mut slot = arena.acquire().unwrap();
-        slot.data_mut()[..4].copy_from_slice(&bytes);
-        DisplayFrame {
-            data: Buffer::new(
-                crate::buffer::MemoryHandle::with_len(slot, 4),
-                crate::metadata::Metadata::new(),
-            ),
-            width: 1,
-            height: 1,
-            bgra,
-        }
-    }
-
-    /// Both formats land the same color in the presentation buffer: an
-    /// RGBA pixel goes through the shuffle, a BGRA pixel is copied verbatim
-    /// (its little-endian u32 IS softbuffer's 0RGB layout).
-    #[test]
-    fn bgra_and_rgba_blit_the_same_color() {
-        // R=0x11 G=0x22 B=0x33 → presentation 0x112233 (+ alpha in the
-        // ignored top byte on the BGRA path).
-        let rgba = pixel_frame([0x11, 0x22, 0x33, 0xFF], false);
-        let bgra = pixel_frame([0x33, 0x22, 0x11, 0xFF], true);
-
-        for (frame, mask) in [(&rgba, 0xFF_FFFFu32), (&bgra, 0x00FF_FFFF)] {
-            // 1:1 path.
-            let mut one = vec![0u32; 1];
-            blit_frame(frame, &mut one, 1, 1, &mut BlitCache::default());
-            assert_eq!(one[0] & mask, 0x112233);
-            // Scaled path (1x1 → 2x2).
-            let mut four = vec![0u32; 4];
-            blit_frame(frame, &mut four, 2, 2, &mut BlitCache::default());
-            for px in four {
-                assert_eq!(px & mask, 0x112233);
-            }
-        }
-    }
-
-    #[test]
-    fn letterbox_centers_and_paints_bars_black() {
-        // 2x2 white frame into a 4x2 window: 1:1 content in the middle two
-        // columns, black pillars on columns 0 and 3.
-        let frame = white_frame(2, 2);
-        let mut buffer = vec![0x123456u32; 4 * 2];
-        blit_frame(&frame, &mut buffer, 4, 2, &mut BlitCache::default());
-
-        for y in 0..2 {
-            assert_eq!(buffer[y * 4], 0, "left pillar is black");
-            assert_eq!(buffer[y * 4 + 3], 0, "right pillar is black");
-            assert_eq!(buffer[y * 4 + 1], 0xFFFFFF, "content");
-            assert_eq!(buffer[y * 4 + 2], 0xFFFFFF, "content");
-        }
-    }
-
-    #[test]
-    fn matching_aspect_fills_the_window() {
-        let frame = white_frame(2, 2);
-        let mut buffer = vec![0u32; 8 * 8];
-        blit_frame(&frame, &mut buffer, 8, 8, &mut BlitCache::default());
-        assert!(buffer.iter().all(|p| *p == 0xFFFFFF), "no bars");
-    }
-
-    /// The scaled path via the cached x-map produces the same result when
-    /// geometry changes between frames (cache rebuild).
-    #[test]
-    fn blit_cache_survives_geometry_changes() {
-        let mut cache = BlitCache::default();
-        let frame = white_frame(2, 2);
-        let mut a = vec![0u32; 8 * 8];
-        blit_frame(&frame, &mut a, 8, 8, &mut cache);
-        let mut b = vec![0u32; 6 * 6];
-        blit_frame(&frame, &mut b, 6, 6, &mut cache);
-        assert!(a.iter().all(|p| *p == 0xFFFFFF));
-        assert!(b.iter().all(|p| *p == 0xFFFFFF));
-    }
 
     #[test]
     fn handle_events_flow_and_fullscreen_toggles() {
