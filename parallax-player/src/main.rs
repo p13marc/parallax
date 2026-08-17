@@ -783,17 +783,11 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
         tokio::select! {
             reason = &mut ended => {
                 break match reason {
+                    // A window close now ends the run as a clean Eos
+                    // (Error::Shutdown, #191) — no string matching.
                     EndReason::Eos => Outcome::Eos,
                     EndReason::Aborted => Outcome::Stop,
-                    EndReason::Error(e) => {
-                        // The window closing mid-stream surfaces as a sink
-                        // error; that is the normal way to quit a player.
-                        if e.message().contains("window closed") {
-                            Outcome::Stop
-                        } else {
-                            bail!("playback failed: {e}");
-                        }
-                    }
+                    EndReason::Error(e) => bail!("playback failed: {e}"),
                 };
             }
             _ = tokio::signal::ctrl_c() => {
@@ -848,11 +842,18 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
                 let mut commands = Vec::new();
+                let mut quit = false;
                 while let Some(event) = window.try_event() {
-                    if let VideoWindowEvent::KeyPressed(key) = event
-                        && let Some(cmd) = command_for_key(&key)
-                    {
-                        commands.push(cmd);
+                    match event {
+                        VideoWindowEvent::KeyPressed(key) => {
+                            if let Some(cmd) = command_for_key(&key) {
+                                commands.push(cmd);
+                            }
+                        }
+                        // The deterministic close signal (#191) — don't
+                        // wait for the sink to notice on its next frame.
+                        VideoWindowEvent::CloseRequested => commands.push(Command::Quit),
+                        _ => {}
                     }
                 }
                 if let Some(cmd) = command_for_terminal() {
@@ -901,7 +902,13 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
                             }
                         }
                         Command::Fullscreen => window.set_fullscreen(!window.is_fullscreen()),
-                        Command::Quit => handle.stop(),
+                        Command::Quit => {
+                            // Break as well as stop (#191): waiting for the
+                            // pipeline to end used to be the only exit, and
+                            // when it didn't end, no quit path worked.
+                            handle.stop();
+                            quit = true;
+                        }
                     }
                 }
 
@@ -909,6 +916,10 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
                     window_seen = true;
                 } else if window_seen {
                     handle.stop();
+                    quit = true;
+                }
+                if quit {
+                    break Outcome::Stop;
                 }
             }
         }
@@ -916,6 +927,24 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
 
     drop(raw_mode);
     println!();
-    let _ = handle.wait().await;
+    // Bounded teardown (#191). The cooperative stop above normally drains
+    // within a moment; if anything wedges, a second Ctrl-C hard-exits (130,
+    // like parallax-launch) and a timeout aborts — this select is also what
+    // keeps SIGINT *listened to* here: `tokio::signal::ctrl_c` installed a
+    // process-global handler on first poll, so an unlistened SIGINT during a
+    // bare `wait().await` would be captured and discarded.
+    let ended = handle.ended();
+    tokio::select! {
+        _ = ended => { let _ = handle.wait().await; }
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!("interrupted during teardown — aborting");
+            handle.abort();
+            std::process::exit(130);
+        }
+        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+            eprintln!("teardown timed out — aborting pipeline");
+            handle.abort();
+        }
+    }
     Ok(outcome)
 }

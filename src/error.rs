@@ -13,6 +13,13 @@ pub enum Error {
     #[error("memory pool exhausted: no slots available")]
     PoolExhausted,
 
+    /// The element requests a cooperative pipeline shutdown (#191) — e.g.
+    /// the user closed a display window. Not a failure: the executor winds
+    /// the pipeline down and the run ends as `EndReason::Eos`, with no
+    /// error posted.
+    #[error("element requested shutdown")]
+    Shutdown,
+
     /// Buffer pool error (no pool configured or pool unavailable).
     #[error("buffer pool error: {0}")]
     BufferPool(String),

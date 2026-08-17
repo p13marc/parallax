@@ -79,7 +79,11 @@ impl std::error::Error for StreamError {}
 /// [`PipelineHandle::ended`]: crate::pipeline::PipelineHandle::ended
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EndReason {
-    /// Every upstream source ran to completion.
+    /// Every upstream source ran to completion — including runs an element
+    /// ended cooperatively via [`Error::Shutdown`](crate::error::Error::Shutdown)
+    /// (#191), e.g. the user closing a display window. Apps that must tell a
+    /// user-close from a natural end listen for
+    /// `VideoWindowEvent::CloseRequested` on the sink handle.
     Eos,
     /// An element failed. No more buffers are coming.
     Error(StreamError),

@@ -114,10 +114,10 @@ async fn main() -> Result<()> {
 
     let result = pipeline.run().await;
 
-    // Window close surfaces as a sink error — that's a normal way to quit.
+    // A window close is a cooperative shutdown (#191): the run ends cleanly,
+    // exactly like the stream finishing — no error to fish for.
     match result {
-        Ok(()) => println!("Stream finished."),
-        Err(e) if format!("{e}").contains("window closed") => println!("Window closed."),
+        Ok(()) => println!("Stream finished (or window closed)."),
         Err(e) => return Err(e),
     }
     Ok(())

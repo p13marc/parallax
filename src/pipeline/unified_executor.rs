@@ -309,6 +309,60 @@ fn determine_element_strategy(hints: &ExecutionHints) -> ElementStrategy {
 // Terminal outcome
 // ============================================================================
 
+/// Cooperative wind-down, shared by everything that can end the run (#191).
+///
+/// Raising the flag alone is not enough: a *paused* pipeline holds its
+/// producer and sink loops on the pause gate and its pacers against a frozen
+/// clock, so none of them would ever observe the flag. `begin()` therefore
+/// also resumes — the hooks are installed by `start()` once the pause
+/// plumbing exists.
+struct Shutdown {
+    /// Checked by producer loops between `produce()` calls. Kept as its own
+    /// `Arc` so the existing task plumbing that carries a bare
+    /// `Arc<AtomicBool>` keeps working unchanged.
+    stop: Arc<AtomicBool>,
+    unpause: std::sync::OnceLock<UnpauseHooks>,
+}
+
+struct UnpauseHooks {
+    pause_tx: watch::Sender<bool>,
+    pausable: Option<Arc<crate::clock::PausableClock>>,
+}
+
+impl Shutdown {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            stop: Arc::new(AtomicBool::new(false)),
+            unpause: std::sync::OnceLock::new(),
+        })
+    }
+
+    fn install_unpause(
+        &self,
+        pause_tx: watch::Sender<bool>,
+        pausable: Option<Arc<crate::clock::PausableClock>>,
+    ) {
+        let _ = self.unpause.set(UnpauseHooks { pause_tx, pausable });
+    }
+
+    /// Ask the whole pipeline to wind down: raise the cooperative stop flag
+    /// and, if the pipeline is paused, resume it so the gated loops and
+    /// frozen-clock pacers can actually reach their stop checks.
+    fn begin(&self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(hooks) = self.unpause.get()
+            && *hooks.pause_tx.borrow()
+        {
+            // Clock first, mirroring PipelineHandle::resume — a woken sink
+            // paces against running time immediately.
+            if let Some(clock) = &hooks.pausable {
+                clock.resume();
+            }
+            hooks.pause_tx.send_replace(false);
+        }
+    }
+}
+
 /// How the run ended, decided once and remembered.
 ///
 /// The outcome used to be reachable only through [`PipelineHandle::wait`], which
@@ -333,15 +387,20 @@ struct TerminalOutcome {
     tx: watch::Sender<Option<EndReason>>,
     live: AtomicUsize,
     bus: BusHandle,
+    /// Raised when an `Error` outcome wins (#191): one dead element must
+    /// wind the whole run down, not leave the siblings playing the rest of
+    /// the file into `wait()`.
+    shutdown: Arc<Shutdown>,
 }
 
 impl TerminalOutcome {
-    fn new(bus: BusHandle) -> Arc<Self> {
+    fn new(bus: BusHandle, shutdown: Arc<Shutdown>) -> Arc<Self> {
         let (tx, _) = watch::channel(None);
         Arc::new(Self {
             tx,
             live: AtomicUsize::new(0),
             bus,
+            shutdown,
         })
     }
 
@@ -349,13 +408,21 @@ impl TerminalOutcome {
     ///
     /// Returns whether this call is the one that decided it.
     fn record(&self, reason: EndReason) -> bool {
-        self.tx.send_if_modified(|slot| {
+        let is_error = matches!(reason, EndReason::Error(_));
+        let won = self.tx.send_if_modified(|slot| {
             if slot.is_some() {
                 return false;
             }
             *slot = Some(reason);
             true
-        })
+        });
+        // #191: a fatal error ends the run for everyone. First-writer-wins
+        // above keeps the recorded reason `Error` even though the wind-down
+        // ends the other tasks EOS-like.
+        if won && is_error {
+            self.shutdown.begin();
+        }
+        won
     }
 
     /// The pipeline failed. Reports it on the bus, attributed to the element.
@@ -420,6 +487,13 @@ impl TaskGuard {
 
     fn fail(&self, err: &Error) {
         self.outcome.fail(&self.node, err);
+    }
+
+    /// A read-only handle to the run's wind-down switch, for task bodies
+    /// that honor [`Error::Shutdown`] (#191). Taken before `reporting`
+    /// consumes the guard.
+    fn wind_down(&self) -> Arc<Shutdown> {
+        self.outcome.shutdown.clone()
     }
 }
 
@@ -499,15 +573,21 @@ impl std::fmt::Debug for Ended {
 /// [`PipelineHandle::wait`] takes the handle by value, so a caller that awaits
 /// it can no longer reach [`PipelineHandle::stop`]. Take one of these first and
 /// the two are independent.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Stopper {
-    stop: Arc<AtomicBool>,
+    shutdown: Arc<Shutdown>,
+}
+
+impl std::fmt::Debug for Stopper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Stopper").finish_non_exhaustive()
+    }
 }
 
 impl Stopper {
     /// Ask every source to stop producing. See [`PipelineHandle::stop`].
     pub fn stop(&self) {
-        self.stop.store(true, Ordering::Release);
+        self.shutdown.begin();
     }
 }
 
@@ -611,9 +691,10 @@ pub struct PipelineHandle {
     bus: Option<Bus>,
     /// Bus handle for posting pipeline-level messages.
     bus_handle: Option<BusHandle>,
-    /// Cooperative stop flag, checked by source tasks between `produce()`
-    /// calls (see [`PipelineHandle::stop`]).
-    stop: Arc<AtomicBool>,
+    /// Cooperative wind-down (#191): the stop flag inside is checked by
+    /// source tasks between `produce()` calls (see [`PipelineHandle::stop`]);
+    /// `begin()` also un-pauses a paused pipeline.
+    shutdown: Arc<Shutdown>,
     /// How the run ended, once it has (see [`PipelineHandle::ended`]).
     outcome: Arc<TerminalOutcome>,
     /// The seed share of the live count, retained only when RT threads are
@@ -790,7 +871,7 @@ impl PipelineHandle {
     /// awaiting it if you still need to stop the pipeline.
     pub fn stopper(&self) -> Stopper {
         Stopper {
-            stop: self.stop.clone(),
+            shutdown: self.shutdown.clone(),
         }
     }
 
@@ -806,7 +887,7 @@ impl PipelineHandle {
     /// (e.g. waiting on a hardware frame with no timeout) only observes the
     /// flag once that call returns.
     pub fn stop(&self) {
-        self.stop.store(true, Ordering::Release);
+        self.shutdown.begin();
     }
 
     /// Abort all pipeline tasks.
@@ -816,8 +897,9 @@ impl PipelineHandle {
     pub fn abort(mut self) {
         // Best effort for live sources: tasks blocked in a synchronous
         // produce() are never re-polled by abort(), so also raise the
-        // cooperative stop flag — they exit at the next loop iteration.
-        self.stop.store(true, Ordering::Release);
+        // cooperative stop flag (and un-pause, #191) — they exit at the next
+        // loop iteration.
+        self.shutdown.begin();
         // Before the aborts, not after. Cancellation is asynchronous: the tasks
         // drop their guards on a worker thread moments later, and whichever got
         // there first would otherwise report a clean EOS for a torn-down run.
@@ -1159,9 +1241,11 @@ impl Executor {
         // Create event sender
         let events = EventSender::new(256);
 
-        // Cooperative stop flag shared with every source task (see
-        // PipelineHandle::stop).
-        let stop = Arc::new(AtomicBool::new(false));
+        // Cooperative wind-down (#191): the stop flag inside is shared with
+        // every source task (see PipelineHandle::stop); `begin()` also
+        // un-pauses, and a fatal error triggers it via TerminalOutcome.
+        let shutdown = Shutdown::new();
+        let stop = shutdown.stop.clone();
 
         // Report what the element hints suggest. This is advisory only — see
         // the note on `effective_scheduling` below for why the suggestion is
@@ -1192,7 +1276,7 @@ impl Executor {
                 max: l.max,
             });
         }
-        let outcome = TerminalOutcome::new(bus_handle.clone());
+        let outcome = TerminalOutcome::new(bus_handle.clone(), shutdown.clone());
         // The seed share, held for the whole of `start()`. Without it, a source
         // that runs dry before its siblings are even spawned would take the live
         // count to zero and declare EOS for the whole graph.
@@ -1280,6 +1364,9 @@ impl Executor {
 
         // Runtime-control state, filled in as the tasks spawn.
         let (pause_tx, pause_rx) = watch::channel(false);
+        // #191: a wind-down must be able to un-pause, or gated loops and
+        // frozen-clock pacers never observe the stop flag.
+        shutdown.install_unpause(pause_tx.clone(), pausable.clone());
         let mut runtime = RuntimeControls {
             controls: Vec::new(),
             upstream_entries: Vec::new(),
@@ -1404,7 +1491,7 @@ impl Executor {
             rt_driver_task,
             bus,
             bus_handle,
-            stop,
+            shutdown,
             outcome,
             seed,
             controls: runtime.controls,
@@ -3680,6 +3767,15 @@ fn spawn_source_task(
                     }
                     break;
                 }
+                // #191: cooperative shutdown ends the stream cleanly.
+                Err(Error::Shutdown) => {
+                    tracing::info!("source '{name}': element requested shutdown");
+                    broadcast_eos(&outputs).await;
+                    for bridge in &output_bridges {
+                        bridge.signal_eos();
+                    }
+                    break;
+                }
                 Err(e) => {
                     tracing::error!("source '{}': error: {}", name, e);
                     events.send_error(e.to_string(), Some(name.clone()));
@@ -3776,6 +3872,7 @@ fn spawn_sink_task(
         let _ = element.handle_downstream_event(event);
     }
 
+    let wind_down = share.wind_down();
     tokio::spawn(reporting(share, async move {
         let inline_dispatch = element.dispatches_inline();
         tracing::debug!("sink '{}' started", name);
@@ -3968,6 +4065,15 @@ fn spawn_sink_task(
                             Err(Error::PoolExhausted) => {
                                 shed.record(&name, &tracers)?;
                             }
+                            // #191: a cooperative shutdown request (the user
+                            // closed the display window) is not a failure —
+                            // wind the whole run down and exit clean; the run
+                            // ends EndReason::Eos once the cascade drains.
+                            Err(Error::Shutdown) => {
+                                tracing::info!("sink '{name}': element requested shutdown");
+                                wind_down.begin();
+                                return Ok(());
+                            }
                             Err(e) => {
                                 events.send_error(e.to_string(), Some(name.clone()));
                                 return Err(e);
@@ -4057,6 +4163,12 @@ fn spawn_sink_task(
                         Err(Error::PoolExhausted) => {
                             shed.record(&name, &tracers)?;
                         }
+                        // #191: see the channel path.
+                        Err(Error::Shutdown) => {
+                            tracing::info!("sink '{name}': element requested shutdown");
+                            wind_down.begin();
+                            return Ok(());
+                        }
                         Err(e) => {
                             events.send_error(e.to_string(), Some(name.clone()));
                             return Err(e);
@@ -4125,22 +4237,27 @@ fn spawn_transform_task(
         let mut count: u64 = 0;
 
         /// Helper to send output buffer to all downstream channels and bridges.
+        /// Returns whether anything downstream is still listening (#191):
+        /// `false` means every channel receiver is gone (bridges count as
+        /// alive — RT segments do not die this way). The source task has
+        /// always stopped on this signal; transforms used to discard it and
+        /// keep processing into closed channels forever, holding their own
+        /// upstream open.
         async fn send_output(
             buffer: Buffer,
             epoch: u64,
             outputs: &[OutputBranch],
             output_bridges: &[Arc<AsyncRtBridge>],
             tracers: &TracerRegistry,
-        ) {
+        ) -> bool {
             // Move the buffer into the common single-consumer case instead
             // of cloning for it and dropping the original (#142) — the
             // clone was a metadata copy plus six refcount atomics per
             // buffer per element for nothing.
             if output_bridges.is_empty() {
-                broadcast(outputs, buffer, epoch, tracers).await;
-                return;
+                return broadcast(outputs, buffer, epoch, tracers).await;
             }
-            broadcast(outputs, buffer.clone(), epoch, tracers).await;
+            let connected = broadcast(outputs, buffer.clone(), epoch, tracers).await;
             let (last, rest) = output_bridges
                 .split_last()
                 .expect("output_bridges checked non-empty");
@@ -4148,6 +4265,7 @@ fn spawn_transform_task(
                 let _ = bridge.push_async(buffer.clone()).await;
             }
             let _ = last.push_async(buffer).await;
+            connected || !output_bridges.is_empty()
         }
 
         /// Helper to send EOS to all downstream channels and bridges.
@@ -4288,8 +4406,18 @@ fn spawn_transform_task(
                                     _ => {}
                                 }
                                 shed.reset();
-                                send_output(out, in_epoch, &outputs, &output_bridges, &tracers)
-                                    .await;
+                                if !send_output(out, in_epoch, &outputs, &output_bridges, &tracers)
+                                    .await
+                                {
+                                    // #191: nobody downstream is listening;
+                                    // exiting drops our input rx so the
+                                    // producer above stops too.
+                                    tracing::info!(
+                                        "transform '{name}': all downstream receivers \
+                                         gone, stopping"
+                                    );
+                                    return Ok(());
+                                }
                             }
                             Ok(None) => {
                                 tracing::debug!(
@@ -4305,6 +4433,15 @@ fn spawn_transform_task(
                             // and keep the pipeline alive.
                             Err(Error::PoolExhausted) => {
                                 shed.record(&name, &tracers)?;
+                            }
+                            // #191: cooperative shutdown, not a failure.
+                            Err(Error::Shutdown) => {
+                                tracing::info!("transform '{name}': element requested shutdown");
+                                broadcast_eos(&outputs).await;
+                                for bridge in &output_bridges {
+                                    bridge.signal_eos();
+                                }
+                                return Ok(());
                             }
                             Err(e) => {
                                 tracing::error!("transform '{}': error: {}", name, e);
@@ -4371,7 +4508,7 @@ fn spawn_transform_task(
                                     buffers.len()
                                 );
                                 for buffer in buffers {
-                                    send_output(
+                                    let _ = send_output(
                                         buffer,
                                         in_epoch,
                                         &outputs,
@@ -4432,12 +4569,28 @@ fn spawn_transform_task(
                             }
                             shed.reset();
                             let epoch = own_epoch.load(Ordering::Acquire);
-                            send_output(out, epoch, &outputs, &output_bridges, &tracers).await;
+                            if !send_output(out, epoch, &outputs, &output_bridges, &tracers).await {
+                                // #191: see the channel path.
+                                tracing::info!(
+                                    "transform '{name}': all downstream receivers gone, \
+                                     stopping"
+                                );
+                                return Ok(());
+                            }
                         }
                         Ok(None) => shed.reset(),
                         // Shed rather than die — see the channel path above.
                         Err(Error::PoolExhausted) => {
                             shed.record(&name, &tracers)?;
+                        }
+                        // #191: see the channel path.
+                        Err(Error::Shutdown) => {
+                            tracing::info!("transform '{name}': element requested shutdown");
+                            broadcast_eos(&outputs).await;
+                            for bridge in &output_bridges {
+                                bridge.signal_eos();
+                            }
+                            return Ok(());
                         }
                         Err(e) => {
                             events.send_error(e.to_string(), Some(name.clone()));
@@ -4460,8 +4613,9 @@ fn spawn_transform_task(
                             };
                             for buffer in buffers {
                                 let epoch = own_epoch.load(Ordering::Acquire);
-                                send_output(buffer, epoch, &outputs, &output_bridges, &tracers)
-                                    .await;
+                                let _ =
+                                    send_output(buffer, epoch, &outputs, &output_bridges, &tracers)
+                                        .await;
                             }
                         }
                         Err(e) => {
@@ -4508,8 +4662,12 @@ async fn route_demux_buffer(
     reanchor: Option<&PadReanchor>,
     src_pad: &crate::pipeline::probe::PadRef,
     probes: &ProbeRegistry,
-) -> Option<SegmentEvent> {
+) -> (Option<SegmentEvent>, bool) {
     let mut anchored = None;
+    // #191: whether the routed pad still has a live receiver. The source
+    // task has always stopped on all-receivers-gone; demuxer nodes used to
+    // discard this and read the whole file into closed channels.
+    let mut connected = true;
     match outputs_by_pad.get(pad) {
         Some(branches) => {
             // Per-pad lazy initial segment, anchored at this pad's first
@@ -4520,7 +4678,7 @@ async fn route_demux_buffer(
                 emit_event(branches, src_pad, probes, Event::Segment(seg.clone())).await;
                 anchored = Some(seg);
             }
-            broadcast(branches, buffer, epoch, tracers).await;
+            connected = broadcast(branches, buffer, epoch, tracers).await;
         }
         None if pad.is_empty() => {
             // Legacy broadcast pad: one shared segment for every branch.
@@ -4531,9 +4689,11 @@ async fn route_demux_buffer(
                 }
                 anchored = Some(seg);
             }
+            connected = false;
             for branches in outputs_by_pad.values() {
-                broadcast(branches, buffer.clone(), epoch, tracers).await;
+                connected |= broadcast(branches, buffer.clone(), epoch, tracers).await;
             }
+            connected |= outputs_by_pad.is_empty();
         }
         None => {
             tracers.notify_drop(name);
@@ -4546,7 +4706,7 @@ async fn route_demux_buffer(
             }
         }
     }
-    anchored
+    (anchored, connected)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4593,6 +4753,10 @@ fn spawn_demuxer_task(
             .await;
         }
         let mut segment_pads: HashSet<String> = HashSet::new();
+        // #191: pads whose every receiver is gone. When all linked pads are
+        // dead there is nobody left to feed — stop instead of reading the
+        // whole stream into closed channels.
+        let mut dead_pads: HashSet<String> = HashSet::new();
         // #165: source-style demuxers accumulate non-flushing-seek base like
         // sources. One tracker for the node (max PTS across pads -- the seek
         // segment is broadcast to all pads anyway); ~one frame of A/V skew
@@ -4734,7 +4898,7 @@ fn spawn_demuxer_task(
                                         _ => {}
                                     }
                                     let pts = out.metadata().pts;
-                                    let anchored = route_demux_buffer(
+                                    let (anchored, connected) = route_demux_buffer(
                                         &name,
                                         &pad,
                                         out,
@@ -4748,6 +4912,9 @@ fn spawn_demuxer_task(
                                         &probe_registry,
                                     )
                                     .await;
+                                    if !connected {
+                                        dead_pads.insert(pad.clone());
+                                    }
                                     // Same "one node, one base" rule as the
                                     // source-style branch: the first pad
                                     // anchoring after an un-anchor installs
@@ -4784,6 +4951,14 @@ fn spawn_demuxer_task(
                             // them as "nothing to emit" rather than inventing
                             // an early end of stream.
                             Ok(DemuxResult::WouldBlock | DemuxResult::Eos) => {}
+                            // #191: cooperative shutdown, not a failure.
+                            Err(Error::Shutdown) => {
+                                tracing::info!("demuxer '{name}': element requested shutdown");
+                                for branches in outputs_by_pad.values() {
+                                    broadcast_eos(branches).await;
+                                }
+                                return Ok(());
+                            }
                             Err(e) => {
                                 events.send_error(e.to_string(), Some(name.clone()));
                                 // Used to return without telling any of the
@@ -4794,6 +4969,17 @@ fn spawn_demuxer_task(
                                 }
                                 return Err(e);
                             }
+                        }
+                        // #191: every linked pad lost its receivers — stop
+                        // feeding closed channels. Exiting drops our input
+                        // rx, which is what lets the producer above stop.
+                        if !dead_pads.is_empty()
+                            && outputs_by_pad.keys().all(|p| dead_pads.contains(p))
+                        {
+                            tracing::info!(
+                                "demuxer '{name}': all downstream receivers gone, stopping"
+                            );
+                            return Ok(());
                         }
                     }
                     Some(Message::Event(event)) => {
@@ -4890,7 +5076,7 @@ fn spawn_demuxer_task(
                             {
                                 Ok(DemuxResult::Routed(routed)) if !routed.is_empty() => {
                                     for (pad, out) in routed {
-                                        route_demux_buffer(
+                                        let _ = route_demux_buffer(
                                             &name,
                                             &pad,
                                             out,
@@ -4919,7 +5105,7 @@ fn spawn_demuxer_task(
                         match guard(&name, element.flush_demux()).await {
                             Ok(routed) => {
                                 for (pad, out) in routed {
-                                    route_demux_buffer(
+                                    let _ = route_demux_buffer(
                                         &name,
                                         &pad,
                                         out,
@@ -5041,7 +5227,7 @@ fn spawn_demuxer_task(
                             }
                             tracers.notify_buffer(&name, &out);
                             let pts = out.metadata().pts;
-                            let anchored = route_demux_buffer(
+                            let (anchored, connected) = route_demux_buffer(
                                 &name,
                                 &pad,
                                 out,
@@ -5055,6 +5241,9 @@ fn spawn_demuxer_task(
                                 &probe_registry,
                             )
                             .await;
+                            if !connected {
+                                dead_pads.insert(pad.clone());
+                            }
                             // The first pad's lazy segment is the node's
                             // running-time anchor (#165); later pads anchor
                             // on the wire but not in the tracker -- one
@@ -5065,6 +5254,17 @@ fn spawn_demuxer_task(
                                 segment_tracker.installed(seg);
                             }
                             segment_tracker.observe(pts);
+                        }
+                        // #191: same rule as spawn_source_task — with every
+                        // linked pad's receivers gone there is nobody left
+                        // to produce for.
+                        if !dead_pads.is_empty()
+                            && outputs_by_pad.keys().all(|p| dead_pads.contains(p))
+                        {
+                            tracing::info!(
+                                "demuxer '{name}': all downstream receivers gone, stopping"
+                            );
+                            break;
                         }
                     }
                     Ok(DemuxResult::WouldBlock) => {
@@ -5099,6 +5299,14 @@ fn spawn_demuxer_task(
                             continue;
                         }
                         tracing::info!("demuxer '{}': EOS after {} buffers", name, count);
+                        for branches in outputs_by_pad.values() {
+                            broadcast_eos(branches).await;
+                        }
+                        break;
+                    }
+                    // #191: cooperative shutdown ends the stream cleanly.
+                    Err(Error::Shutdown) => {
+                        tracing::info!("demuxer '{name}': element requested shutdown");
                         for branches in outputs_by_pad.values() {
                             broadcast_eos(branches).await;
                         }

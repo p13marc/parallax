@@ -321,7 +321,10 @@ pub enum VideoWindowEvent {
         y: f64,
     },
     /// The user asked to close the window. The window *will* close and the
-    /// pipeline sees EOS via `is_open()`; this event lets the app react too.
+    /// sink requests a cooperative pipeline shutdown on its next frame
+    /// ([`Error::Shutdown`](crate::error::Error::Shutdown), #191 — the run
+    /// ends as `EndReason::Eos`); this event is the zero-latency signal for
+    /// apps that want to react before that.
     CloseRequested,
     /// The window was resized.
     Resized {
@@ -573,9 +576,24 @@ impl AutoVideoSink {
         // Drop sender to unblock receiver
         self.sender.take();
 
-        // Wait for thread to finish
+        // Wait for the display thread — but bounded (#191). This runs from
+        // the sink element's Drop, i.e. inside a tokio task; the sequence
+        // above makes the join normally instant, but a display thread
+        // wedged in driver teardown must degrade to a leaked thread, not an
+        // unkillable `PipelineHandle::wait()`. (winit's one-event-loop-per-
+        // process rule means no restart was ever possible anyway.)
         if let Some(handle) = self.display_thread.take() {
-            let _ = handle.join();
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !handle.is_finished() && std::time::Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            } else {
+                tracing::warn!(
+                    "autovideosink: display thread did not exit within 2s — detaching it"
+                );
+            }
         }
     }
 }
@@ -787,9 +805,12 @@ impl AsyncSink for AutoVideoSink {
             .as_ref()
             .ok_or_else(|| Error::Element("Display not started".into()))?;
 
-        // Check if display is still running
+        // The user closed the window: ask for a cooperative pipeline
+        // shutdown (#191). Not an error — the run ends as EndReason::Eos,
+        // and nothing has to string-match a message to tell a close from a
+        // failure any more.
         if !self.running.load(Ordering::SeqCst) {
-            return Err(Error::Element("Display window closed".into()));
+            return Err(Error::Shutdown);
         }
 
         let frame = DisplayFrame {
@@ -815,9 +836,12 @@ impl AsyncSink for AutoVideoSink {
                 self.drop_frame("display too slow");
                 Ok(())
             }
-            Err(mpsc::TrySendError::Disconnected(_)) => {
-                Err(Error::Element("Display closed".into()))
-            }
+            // Same close, seen from the channel side (the display thread
+            // already dropped the receiver) — same clean shutdown (#191).
+            // This arm used to return a *different* string ("Display
+            // closed") than the arm above, so apps matching one missed the
+            // other and reported a failed playback for a normal close.
+            Err(mpsc::TrySendError::Disconnected(_)) => Err(Error::Shutdown),
         }
     }
 
@@ -1074,6 +1098,21 @@ fn run_display_loop(
             // sink is shutting down. State checks happen in `about_to_wait`,
             // which winit runs right after this.
             self.drain_frames();
+        }
+
+        fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+            // Tear the render backend down HERE, while the event loop (and
+            // with it the display connection) is still alive (#191). The
+            // `app` local outlives `run_app`, so without this the wgpu
+            // Surface/Device would drop *after* winit destroyed the
+            // EventLoop — the classic swapchain-against-a-dead-connection
+            // driver hang. Also release every pinned arena slot promptly:
+            // a queued frame held by a dead thread pins a producer slot
+            // forever.
+            while self.receiver.try_recv().is_ok() {}
+            self.current_frame = None;
+            self.backend = None;
+            self.window = None;
         }
 
         fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
