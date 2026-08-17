@@ -1,8 +1,8 @@
 //! Element factory for creating elements from parsed descriptions.
 //!
-//! Registration is split per domain: [`basics`] (io/testing/util/flow),
-//! [`transform`] (transforms + timing), [`network`], [`ipc`], [`streaming`],
-//! [`codec`], [`device`], [`rtp`]. Feature-gated elements register under
+//! Registration is split per domain (private submodules): `basics`
+//! (io/testing/util/flow), `transform` (transforms + timing), `network`,
+//! `ipc`, `streaming`, `codec`, `device`, `rtp`. Feature-gated elements register under
 //! their `cfg`; names whose feature is off get a "requires cargo feature"
 //! error via [`GATED_ELEMENTS`] instead of "unknown element".
 //!
