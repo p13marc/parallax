@@ -1044,6 +1044,19 @@ pub trait Element: Send {
         // Default: ignore
     }
 
+    /// The memory type negotiation fixated for this element's output link
+    /// (#194). Delivered by the executor before start, like
+    /// [`set_output_budget`](Self::set_output_budget). An element that can
+    /// emit [`External`](crate::memory::MemoryType::External) buffers (a
+    /// decoder wrapping codec-owned pictures) gates on receiving
+    /// `MemoryType::External` here and packs into its arena otherwise —
+    /// the mid-graph mirror of `Source::set_negotiated_memory` (#145).
+    ///
+    /// Default: ignore.
+    fn set_negotiated_memory(&mut self, _memory: crate::memory::MemoryType) {
+        // Default: ignore
+    }
+
     /// Get the name of this element (for debugging/logging).
     fn name(&self) -> &str {
         std::any::type_name::<Self>()
@@ -2750,6 +2763,10 @@ impl<E: Element + Send + 'static> SendAsyncElementDyn for ElementAdapter<E> {
         self.inner.set_output_budget(budget);
     }
 
+    fn set_negotiated_memory(&mut self, memory: crate::memory::MemoryType) {
+        self.inner.set_negotiated_memory(memory);
+    }
+
     fn process_inline(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
         match input {
             Some(buffer) => self.inner.process(buffer),
@@ -2865,6 +2882,10 @@ impl SendAsyncElementDyn for BoxedElementAdapter {
 
     fn set_output_budget(&mut self, budget: crate::memory::OutputBudget) {
         self.inner.set_output_budget(budget);
+    }
+
+    fn set_negotiated_memory(&mut self, memory: crate::memory::MemoryType) {
+        self.inner.set_negotiated_memory(memory);
     }
 
     fn process_inline(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
