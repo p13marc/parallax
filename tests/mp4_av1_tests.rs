@@ -126,3 +126,34 @@ fn av1_track_decodes() {
         last = Some(pts);
     }
 }
+
+/// #195: `send_data` holds the input `Buffer` zero-copy (no `to_vec`),
+/// releasing it from dav1d's data-release callback. Dropping the decoder
+/// joins dav1d's threads synchronously, so afterwards every input slot's
+/// refcount must be back to exactly the clone this test kept.
+#[cfg(feature = "av1-decode")]
+#[test]
+fn dav1d_releases_zero_copy_input_buffers() {
+    use parallax::element::Element;
+    use parallax::elements::Dav1dDecoder;
+
+    let mut demux = open();
+    let video_id = demux.video_track_id().unwrap();
+    let mut dec = Dav1dDecoder::new().unwrap();
+
+    let mut held = Vec::new();
+    while let Some(sample) = demux.read_sample(video_id).unwrap() {
+        held.push(sample.buffer.clone());
+        let _ = dec.process(sample.buffer).unwrap();
+    }
+    while dec.flush().unwrap().is_some() {}
+    drop(dec);
+
+    for (i, buf) in held.iter().enumerate() {
+        assert_eq!(
+            buf.memory().refcount(),
+            1,
+            "input slot {i} still pinned after decoder drop"
+        );
+    }
+}

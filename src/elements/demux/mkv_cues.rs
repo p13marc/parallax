@@ -317,11 +317,30 @@ impl<R: Read> Read for SharedReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.lock().read(buf)
     }
+
+    fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+        self.lock().read_exact(buf)
+    }
 }
 
 impl<R: Seek> Seek for SharedReader<R> {
     fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
         self.lock().seek(from)
+    }
+
+    // The forwards below matter when the inner reader is a `BufReader`: the
+    // trait defaults would reach it as plain `seek` calls, and
+    // `BufReader::seek` discards its buffer. matroska-demuxer calls
+    // `stream_position()` on every frame (`remaining_len`) and seeks by small
+    // deltas between blocks, so without these the 1 MiB buffer is thrown away
+    // and refilled several times per frame (#195).
+
+    fn stream_position(&mut self) -> std::io::Result<u64> {
+        self.lock().stream_position()
+    }
+
+    fn seek_relative(&mut self, offset: i64) -> std::io::Result<()> {
+        self.lock().seek_relative(offset)
     }
 }
 
@@ -391,5 +410,59 @@ mod tests {
         b.seek(SeekFrom::Start(1)).unwrap();
         a.read_exact(&mut buf).unwrap();
         assert_eq!(buf, [2, 3], "seek through one handle moves both");
+    }
+
+    /// `stream_position()` must reach `BufReader`'s no-discard override.
+    /// Before the forward existed, the trait default turned it into
+    /// `seek(Current(0))`, which discards the BufReader buffer — the next
+    /// read then hit the inner reader again (#195).
+    #[test]
+    fn shared_reader_stream_position_keeps_bufreader_buffer() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingReader {
+            inner: Cursor<Vec<u8>>,
+            reads: Arc<AtomicUsize>,
+        }
+        impl Read for CountingReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.reads.fetch_add(1, Ordering::Relaxed);
+                self.inner.read(buf)
+            }
+        }
+        impl Seek for CountingReader {
+            fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+                self.inner.seek(from)
+            }
+        }
+
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counting = CountingReader {
+            inner: Cursor::new(vec![0u8; 4096]),
+            reads: reads.clone(),
+        };
+        let mut r = SharedReader::new(std::io::BufReader::with_capacity(1024, counting));
+
+        let mut buf = [0u8; 10];
+        r.read_exact(&mut buf).unwrap();
+        assert_eq!(reads.load(Ordering::Relaxed), 1, "one buffered fill");
+
+        for _ in 0..3 {
+            assert_eq!(r.stream_position().unwrap(), 10);
+        }
+        r.read_exact(&mut buf).unwrap();
+        assert_eq!(
+            reads.load(Ordering::Relaxed),
+            1,
+            "stream_position must not discard the BufReader buffer"
+        );
+
+        r.seek_relative(100).unwrap();
+        r.read_exact(&mut buf).unwrap();
+        assert_eq!(
+            reads.load(Ordering::Relaxed),
+            1,
+            "small forward seek_relative stays inside the buffer"
+        );
     }
 }

@@ -28,6 +28,22 @@ use crate::memory::{OutputArena, OutputBudget, defaults};
 
 use super::common::PixelFormat;
 
+/// Zero-copy input wrapper for `dav1d::Decoder::send_data` (#195).
+///
+/// dav1d boxes this and reads the payload through `AsRef<[u8]>`, calling the
+/// drop from its data-release callback — possibly on one of its worker
+/// threads (`Buffer` is `Send`). Until then the upstream arena slot stays
+/// pinned: two atomics per frame instead of a full compressed-TU heap copy.
+/// The pin is bounded by dav1d's small input queue, tiny next to the
+/// demuxers' 32-slot output arenas.
+struct InputData(Buffer);
+
+impl AsRef<[u8]> for InputData {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
 /// AV1 software decoder using dav1d.
 ///
 /// # Input
@@ -189,10 +205,10 @@ impl Dav1dDecoder {
     /// `Again` from `send_data` is not an error: the decoder wants its
     /// ready pictures consumed before accepting more input. Drain, then
     /// resubmit the retained data until it is accepted.
-    fn send_frame(&mut self, input: &[u8], pts_ns: i64) -> Result<()> {
+    fn send_frame(&mut self, input: Buffer, pts_ns: i64) -> Result<()> {
         let mut result = self
             .decoder
-            .send_data(input.to_vec(), None, Some(pts_ns), None);
+            .send_data(InputData(input), None, Some(pts_ns), None);
         // Bounded: each retry either lands the input or consumes output;
         // hitting the bound means dav1d is refusing input while claiming no
         // output exists, which is a decoder bug, not flow control.
@@ -337,7 +353,7 @@ impl Element for Dav1dDecoder {
         self.pending_meta.push_back(buffer.metadata().clone());
 
         let pts = buffer.metadata().pts.nanos() as i64;
-        self.send_frame(buffer.as_bytes(), pts)?;
+        self.send_frame(buffer, pts)?;
 
         // Harvest whatever dav1d has finished; `Again` while its frame
         // pipeline fills is the natural priming phase. (#192 measured the
