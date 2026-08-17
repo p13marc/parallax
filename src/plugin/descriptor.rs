@@ -17,6 +17,9 @@ use std::ffi::{CStr, c_char, c_int, c_void};
 /// bump is not a compatibility inconvenience — it is undefined behaviour.
 ///
 /// History:
+/// - **11**: `MemoryType::External` (#194) — a by-value enum crossing the
+///   `set_negotiated_memory` slot grew a variant (strided producer-owned
+///   buffers). No vtable change.
 /// - **10**: `AsyncElementDyn::retained_buffers` + `passthrough` (consumer
 ///   retention and zero-copy forwarding feed the producer's arena budget,
 ///   #189) — two new vtable slots.
@@ -39,7 +42,7 @@ use std::ffi::{CStr, c_char, c_int, c_void};
 /// - **3**: `AsyncElementDyn::process_demux` (demuxer routing).
 /// - **2**: `AsyncElementDyn::set_output_budget` (executor-sized output arenas).
 /// - **1**: initial hand-rolled `#[repr(C)]` descriptor ABI.
-pub const PARALLAX_ABI_VERSION: u32 = 10;
+pub const PARALLAX_ABI_VERSION: u32 = 11;
 
 /// Function pointer type for creating element instances.
 ///
@@ -412,7 +415,7 @@ mod tests {
     fn test_abi_version() {
         // Pinned so a vtable change to AsyncElementDyn has to be a decision.
         // 2: set_output_budget. 10: retained_buffers (#189).
-        assert_eq!(PARALLAX_ABI_VERSION, 10);
+        assert_eq!(PARALLAX_ABI_VERSION, 11);
     }
 
     #[test]

@@ -50,6 +50,7 @@ mod buffer_pool;
 pub mod defaults;
 mod dmabuf;
 mod eventfd;
+mod external;
 pub mod ipc;
 mod ipc_ring;
 mod segment;
@@ -59,6 +60,7 @@ pub use budget::{OutputArena, OutputBudget};
 pub use buffer_pool::{BufferPool, FixedBufferPool, PoolStats, PooledBuffer};
 pub use dmabuf::{DmaBufReleaseHook, DmaBufSegment, DmaBufSlot};
 pub use eventfd::EventFd;
+pub use external::{ExternalReleaseHook, ExternalSlot};
 pub use ipc_ring::{DEFAULT_IPC_RING_CAPACITY, IpcChannel, IpcChannelState, IpcDescriptor};
 pub use segment::MemoryType;
 pub use shared_refcount::{

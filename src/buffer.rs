@@ -1,6 +1,6 @@
 //! Buffer types for zero-copy data passing.
 
-use crate::memory::{DmaBufSlot, MemoryType, SharedIpcSlotRef, SharedSlotRef};
+use crate::memory::{DmaBufSlot, ExternalSlot, MemoryType, SharedIpcSlotRef, SharedSlotRef};
 use crate::metadata::Metadata;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -24,10 +24,18 @@ const VALIDATED_OK: u8 = 1;
 ///   as the slot, so [`as_slice`](Self::as_slice) is infallible for both
 ///   variants.
 ///
-/// Cloning is cheap for both: a shared-memory refcount increment (Cpu) or
-/// an `Arc` bump (DmaBuf). Arena-specific accessors ([`slot`](Self::slot),
-/// [`ipc_ref`](Self::ipc_ref), [`arena_id`](Self::arena_id), …) return
-/// `Option` — `None` on a DmaBuf handle.
+/// - [`External`](Self::External): producer-owned memory pinned by an
+///   [`ExternalSlot`] (#194) — e.g. a refcounted `dav1d::Picture` emitted
+///   without the de-stride copy. Read-only, non-IPC, and its byte layout
+///   is producer-defined: strided planes described by the buffer's
+///   `Metadata` plane layout, which is why negotiation only fixates
+///   `External` for consumers that explicitly opt in.
+///
+/// Cloning is cheap for all: a shared-memory refcount increment (Cpu) or
+/// an `Arc` bump (DmaBuf/External). Arena-specific accessors
+/// ([`slot`](Self::slot), [`ipc_ref`](Self::ipc_ref),
+/// [`arena_id`](Self::arena_id), …) return `Option` — `None` on DmaBuf
+/// and External handles.
 pub enum MemoryHandle {
     /// A `SharedArena` slot (refcount in shared memory).
     #[non_exhaustive]
@@ -45,6 +53,17 @@ pub enum MemoryHandle {
         /// The shared slot; last clone's drop fires the release hook.
         slot: Arc<DmaBufSlot>,
         /// Offset within the mapping (for sub-buffers).
+        offset: usize,
+        /// Length of this buffer's data.
+        len: usize,
+    },
+    /// Producer-owned memory pinned by an [`ExternalSlot`] (#194).
+    #[non_exhaustive]
+    External {
+        /// The shared slot; last clone's drop releases the producer's
+        /// allocation and fires the release hook.
+        slot: Arc<ExternalSlot>,
+        /// Offset within the external span (for sub-buffers).
         offset: usize,
         /// Length of this buffer's data.
         len: usize,
@@ -105,6 +124,30 @@ impl MemoryHandle {
         Self::DmaBuf { slot, offset, len }
     }
 
+    /// Create an External memory handle covering the slot's whole span.
+    pub fn from_external(slot: Arc<ExternalSlot>) -> Self {
+        let len = slot.len();
+        Self::External {
+            slot,
+            offset: 0,
+            len,
+        }
+    }
+
+    /// Create an External memory handle over `offset..offset + len` of
+    /// the span.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `offset + len` exceeds the span.
+    pub fn from_external_with_len(slot: Arc<ExternalSlot>, offset: usize, len: usize) -> Self {
+        assert!(
+            offset + len <= slot.len(),
+            "requested range exceeds external span"
+        );
+        Self::External { slot, offset, len }
+    }
+
     /// Get a pointer to the start of this handle's memory.
     pub fn as_ptr(&self) -> *const u8 {
         match self {
@@ -112,6 +155,7 @@ impl MemoryHandle {
             Self::DmaBuf { slot, offset, .. } => unsafe {
                 slot.segment().as_slice().as_ptr().add(*offset)
             },
+            Self::External { slot, offset, .. } => unsafe { slot.as_ptr().add(*offset) },
         }
     }
 
@@ -126,7 +170,7 @@ impl MemoryHandle {
     /// Get the length of this handle's data.
     pub fn len(&self) -> usize {
         match self {
-            Self::Cpu { len, .. } | Self::DmaBuf { len, .. } => *len,
+            Self::Cpu { len, .. } | Self::DmaBuf { len, .. } | Self::External { len, .. } => *len,
         }
     }
 
@@ -146,13 +190,14 @@ impl MemoryHandle {
     /// Get this handle's data as a mutable byte slice.
     ///
     /// `None` for a read-only DmaBuf mapping
-    /// ([`DmaBufSegment::from_fd_readonly`](crate::memory::DmaBufSegment::from_fd_readonly)) —
-    /// CPU slots are always writable.
+    /// ([`DmaBufSegment::from_fd_readonly`](crate::memory::DmaBufSegment::from_fd_readonly))
+    /// and always for External memory (the producer owns it) — CPU slots
+    /// are always writable.
     pub fn as_mut_slice(&mut self) -> Option<&mut [u8]> {
-        if let Self::DmaBuf { slot, .. } = self
-            && slot.segment().is_read_only()
-        {
-            return None;
+        match self {
+            Self::External { .. } => return None,
+            Self::DmaBuf { slot, .. } if slot.segment().is_read_only() => return None,
+            _ => {}
         }
         let len = self.len();
         Some(unsafe { std::slice::from_raw_parts_mut(self.as_mut_ptr(), len) })
@@ -163,29 +208,40 @@ impl MemoryHandle {
         match self {
             Self::Cpu { .. } => MemoryType::Cpu,
             Self::DmaBuf { .. } => MemoryType::DmaBuf,
+            Self::External { .. } => MemoryType::External,
         }
     }
 
     /// Get the offset within the backing slot/mapping.
     pub fn offset(&self) -> usize {
         match self {
-            Self::Cpu { offset, .. } | Self::DmaBuf { offset, .. } => *offset,
+            Self::Cpu { offset, .. }
+            | Self::DmaBuf { offset, .. }
+            | Self::External { offset, .. } => *offset,
         }
     }
 
-    /// The underlying arena slot; `None` for a DmaBuf handle.
+    /// The underlying arena slot; `None` for a DmaBuf or External handle.
     pub fn slot(&self) -> Option<&SharedSlotRef> {
         match self {
             Self::Cpu { slot, .. } => Some(slot),
-            Self::DmaBuf { .. } => None,
+            Self::DmaBuf { .. } | Self::External { .. } => None,
         }
     }
 
-    /// The underlying dmabuf slot; `None` for a Cpu handle.
+    /// The underlying dmabuf slot; `None` for other handles.
     pub fn dmabuf_slot(&self) -> Option<&Arc<DmaBufSlot>> {
         match self {
-            Self::Cpu { .. } => None,
             Self::DmaBuf { slot, .. } => Some(slot),
+            Self::Cpu { .. } | Self::External { .. } => None,
+        }
+    }
+
+    /// The underlying external slot; `None` for other handles.
+    pub fn external_slot(&self) -> Option<&Arc<ExternalSlot>> {
+        match self {
+            Self::External { slot, .. } => Some(slot),
+            Self::Cpu { .. } | Self::DmaBuf { .. } => None,
         }
     }
 
@@ -208,31 +264,33 @@ impl MemoryHandle {
                     len: *len,
                 })
             }
-            Self::DmaBuf { .. } => None,
+            Self::DmaBuf { .. } | Self::External { .. } => None,
         }
     }
 
-    /// The arena ID; `None` for a DmaBuf handle.
+    /// The arena ID; `None` for a DmaBuf or External handle.
     pub fn arena_id(&self) -> Option<u64> {
         self.slot().map(|s| s.arena_id())
     }
 
-    /// The arena's raw fd (for IPC); `None` for a DmaBuf handle.
+    /// The arena's raw fd (for IPC); `None` for a DmaBuf or External handle.
     pub fn arena_fd(&self) -> Option<i32> {
         self.slot().map(|s| s.arena_fd())
     }
 
-    /// The arena's total size (for IPC); `None` for a DmaBuf handle.
+    /// The arena's total size (for IPC); `None` for a DmaBuf or External
+    /// handle.
     pub fn arena_size(&self) -> Option<usize> {
         self.slot().map(|s| s.arena_size())
     }
 
     /// Get the current refcount (for debugging). Cpu: the shared-memory
-    /// slot refcount; DmaBuf: the `Arc`'s strong count.
+    /// slot refcount; DmaBuf/External: the `Arc`'s strong count.
     pub fn refcount(&self) -> u32 {
         match self {
             Self::Cpu { slot, .. } => slot.refcount(),
             Self::DmaBuf { slot, .. } => Arc::strong_count(slot) as u32,
+            Self::External { slot, .. } => Arc::strong_count(slot) as u32,
         }
     }
 
@@ -261,6 +319,13 @@ impl MemoryHandle {
                 offset: base + offset,
                 len,
             },
+            Self::External {
+                slot, offset: base, ..
+            } => Self::External {
+                slot: Arc::clone(slot),
+                offset: base + offset,
+                len,
+            },
         }
     }
 }
@@ -274,6 +339,11 @@ impl Clone for MemoryHandle {
                 len: *len,
             },
             Self::DmaBuf { slot, offset, len } => Self::DmaBuf {
+                slot: Arc::clone(slot),
+                offset: *offset,
+                len: *len,
+            },
+            Self::External { slot, offset, len } => Self::External {
                 slot: Arc::clone(slot),
                 offset: *offset,
                 len: *len,
@@ -294,6 +364,13 @@ impl std::fmt::Debug for MemoryHandle {
                 .finish(),
             Self::DmaBuf { slot, offset, len } => f
                 .debug_struct("MemoryHandle::DmaBuf")
+                .field("slot", slot)
+                .field("offset", offset)
+                .field("len", len)
+                .field("refs", &Arc::strong_count(slot))
+                .finish(),
+            Self::External { slot, offset, len } => f
+                .debug_struct("MemoryHandle::External")
                 .field("slot", slot)
                 .field("offset", offset)
                 .field("len", len)
@@ -402,19 +479,19 @@ impl<T> Buffer<T> {
     ///
     /// # Panics
     ///
-    /// Panics on a read-only DmaBuf mapping (#145) — nothing in-tree
-    /// produces one into a pipeline; the in-place-mutating elements are CPU
-    /// audio paths that never see dmabuf. Use
-    /// [`try_as_bytes_mut`](Self::try_as_bytes_mut) where the backing is
-    /// not statically known.
+    /// Panics on a read-only DmaBuf mapping (#145) or External memory
+    /// (#194) — nothing in-tree produces either into a pipeline whose
+    /// elements mutate in place; the in-place-mutating elements are CPU
+    /// audio paths. Use [`try_as_bytes_mut`](Self::try_as_bytes_mut)
+    /// where the backing is not statically known.
     pub fn as_bytes_mut(&mut self) -> &mut [u8] {
         self.memory
             .as_mut_slice()
-            .expect("buffer backed by a read-only dmabuf mapping cannot be mutated")
+            .expect("read-only buffer memory (dmabuf mapping or external) cannot be mutated")
     }
 
     /// Get the buffer data as a mutable byte slice, or `None` for a
-    /// read-only DmaBuf mapping (#145).
+    /// read-only DmaBuf mapping (#145) or External memory (#194).
     pub fn try_as_bytes_mut(&mut self) -> Option<&mut [u8]> {
         self.memory.as_mut_slice()
     }
@@ -800,5 +877,90 @@ mod dmabuf_handle_tests {
         assert_eq!(cpu.memory_type(), MemoryType::Cpu);
         assert_eq!(cpu.len(), 4, "len(), not the whole mapping");
         assert_eq!(cpu.as_bytes(), b"data");
+    }
+}
+
+#[cfg(test)]
+mod external_handle_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+
+    /// External buffer over a leaked-into-the-owner Vec — the producer
+    /// discipline in miniature: the owner IS what keeps the span alive.
+    fn external_buffer(data: Vec<u8>) -> Buffer {
+        let ptr = data.as_ptr();
+        let len = data.len();
+        // SAFETY: `data` moves into the owner box; the span lives as long
+        // as the slot.
+        let slot = unsafe { ExternalSlot::new(ptr, len, data, "buffer-test") };
+        Buffer::new(
+            MemoryHandle::from_external(Arc::new(slot)),
+            Metadata::from_sequence(0),
+        )
+    }
+
+    #[test]
+    fn external_handle_reports_its_type_and_no_arena() {
+        let buf = external_buffer(vec![0u8; 4096]);
+        assert_eq!(buf.memory_type(), MemoryType::External);
+        assert!(buf.memory().slot().is_none());
+        assert!(buf.memory().ipc_ref().is_none());
+        assert!(buf.memory().arena_id().is_none());
+        assert!(buf.memory().dmabuf_slot().is_none());
+        assert!(buf.memory().dmabuf_fd().is_none());
+        assert!(buf.memory().external_slot().is_some());
+    }
+
+    #[test]
+    fn external_memory_is_read_only() {
+        let mut buf = external_buffer(vec![9u8; 64]);
+        assert!(buf.try_as_bytes_mut().is_none());
+        assert_eq!(buf.as_bytes()[0], 9, "reads stay infallible");
+    }
+
+    #[test]
+    fn clone_shares_the_slot_and_drop_releases_once() {
+        let fired = Arc::new(AtomicU32::new(0));
+        let hook_fired = fired.clone();
+        let data = vec![1u8; 256];
+        let ptr = data.as_ptr();
+        // SAFETY: `data` moves into the owner box.
+        let slot = unsafe {
+            ExternalSlot::with_release(
+                ptr,
+                256,
+                data,
+                "buffer-test",
+                Box::new(move || {
+                    hook_fired.fetch_add(1, AtomicOrdering::SeqCst);
+                }),
+            )
+        };
+        let buf = Buffer::<()>::new(
+            MemoryHandle::from_external_with_len(Arc::new(slot), 0, 128),
+            Metadata::from_sequence(0),
+        );
+        assert_eq!(buf.len(), 128);
+        let clone = buf.clone();
+        assert_eq!(buf.memory().refcount(), 2);
+        drop(buf);
+        assert_eq!(fired.load(AtomicOrdering::SeqCst), 0);
+        drop(clone);
+        assert_eq!(fired.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn slice_offsets_into_the_span_and_copy_to_cpu_bridges() {
+        let mut data = vec![0u8; 1024];
+        data[100..105].copy_from_slice(b"world");
+        let buf = external_buffer(data);
+        let sub = buf.slice(100, 5);
+        assert_eq!(sub.as_bytes(), b"world");
+        assert_eq!(sub.memory_type(), MemoryType::External);
+
+        let arena = crate::memory::SharedArena::new(4096, 4).unwrap();
+        let cpu = sub.copy_to_cpu(&arena).unwrap();
+        assert_eq!(cpu.memory_type(), MemoryType::Cpu);
+        assert_eq!(cpu.as_bytes(), b"world");
     }
 }

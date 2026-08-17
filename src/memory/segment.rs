@@ -26,6 +26,14 @@ pub enum MemoryType {
     DmaBuf,
     /// RDMA-registered memory.
     RdmaRegistered,
+    /// Producer-owned memory pinned into the pipeline (#194): a codec's
+    /// own frame allocation (e.g. a refcounted `dav1d::Picture`) wrapped
+    /// in an `ExternalSlot` instead of being copied into an arena.
+    /// CPU-readable but read-only, never IPC-shareable, and — unlike every
+    /// other type — its byte layout is producer-defined (strided planes,
+    /// described by `Metadata` plane layout), so consumers must opt in
+    /// explicitly ([`MemoryType::requires_explicit_optin`]).
+    External,
 }
 
 impl MemoryType {
@@ -40,6 +48,7 @@ impl MemoryType {
             MemoryType::GpuDevice => false, // Must export to DmaBuf first
             MemoryType::DmaBuf => true,
             MemoryType::RdmaRegistered => true,
+            MemoryType::External => false, // producer-local pointer, no fd
         }
     }
 
@@ -54,6 +63,7 @@ impl MemoryType {
             MemoryType::GpuDevice => false, // Must download first
             MemoryType::DmaBuf => false,    // fd is local
             MemoryType::RdmaRegistered => true,
+            MemoryType::External => false, // producer-local pointer
         }
     }
 
@@ -61,5 +71,19 @@ impl MemoryType {
     #[inline]
     pub fn is_cpu_accessible(&self) -> bool {
         !matches!(self, MemoryType::GpuDevice)
+    }
+
+    /// Must a consumer name this type in its caps before negotiation may
+    /// fixate it?
+    ///
+    /// `Cpu` and `DmaBuf` are "transparent": their bytes are packed and
+    /// layout-free, so an element with `Caps::any()` genuinely handles
+    /// them by reading `as_bytes()`. `External` memory carries a
+    /// producer-defined plane layout — a byte-reading consumer would
+    /// silently misinterpret it — so the solver downgrades to `Cpu`
+    /// unless the sink's caps explicitly list `External` (#194).
+    #[inline]
+    pub fn requires_explicit_optin(&self) -> bool {
+        matches!(self, MemoryType::External)
     }
 }
