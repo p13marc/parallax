@@ -968,8 +968,12 @@ impl Source for ScreenCaptureSrc {
         // This used to invent a third one ("video/width", "video/height" and a
         // *stringified* "video/format"), which nothing downstream understood.
         metadata.set_video_dims(frame.width, frame.height, frame.format);
-        // Stride is not expressible in `VideoFormat`, so it stays a custom key.
-        metadata.set("video/stride", frame.stride);
+        // Stride became expressible with #194 (`Metadata::set_video_planes`),
+        // but strided layouts are negotiated (External opt-in) — declaring one
+        // on this Cpu buffer would trip packed-only consumers. A PipeWire
+        // frame whose stride exceeds width*4 keeps today's behavior (declared
+        // packed) until the capture path repacks or negotiates; the old
+        // "video/stride" custom key was read by nothing and is gone.
 
         // Increment frames produced counter
         self.frames_produced += 1;

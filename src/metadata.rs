@@ -488,6 +488,16 @@ pub struct Metadata {
     /// Media format (set on format changes or first buffer).
     pub format: Option<MediaFormat>,
 
+    /// Per-buffer plane layout for strided raw video (#194).
+    ///
+    /// `None` = packed (the overwhelmingly common case; derive it with
+    /// [`plane_layout`](Self::plane_layout)). Set by
+    /// [`set_video_planes`](Self::set_video_planes), cleared by
+    /// [`set_video_dims`](Self::set_video_dims) — an element that rewrites
+    /// geometry implicitly drops a stale layout. `Copy`, so the `Clone`
+    /// cost of `Metadata` is unchanged.
+    pub planes: Option<crate::format::PlaneLayout>,
+
     /// Byte offset in the original source (optional).
     pub offset: Option<u64>,
 
@@ -717,6 +727,50 @@ impl Metadata {
             pixel_format,
             framerate,
         )));
+        // Geometry rewrite ⇒ any explicit plane layout is stale. Packed
+        // producers (every arena-copying element) stay automatically
+        // correct by calling this and nothing else.
+        self.planes = None;
+    }
+
+    /// Declare a strided frame: geometry plus an explicit per-plane layout
+    /// (#194). Same format handling as
+    /// [`set_video_dims`](Self::set_video_dims); only External-emitting
+    /// producers (e.g. dav1d without the de-stride copy) need this.
+    pub fn set_video_planes(
+        &mut self,
+        width: u32,
+        height: u32,
+        pixel_format: crate::format::PixelFormat,
+        layout: crate::format::PlaneLayout,
+    ) {
+        self.set_video_dims(width, height, pixel_format);
+        self.planes = Some(layout);
+    }
+
+    /// The plane layout of this raw-video buffer: the explicit one if the
+    /// producer set it, else the packed layout derived from the `VideoRaw`
+    /// format. `None` if the buffer carries no usable video geometry.
+    ///
+    /// The ONE read path for plane geometry — consumers must not re-derive
+    /// strides from width.
+    pub fn plane_layout(&self) -> Option<crate::format::PlaneLayout> {
+        if let Some(layout) = self.planes {
+            return Some(layout);
+        }
+        let (w, h) = self.video_dims()?;
+        let fmt = self.video_pixel_format()?;
+        Some(crate::format::PlaneLayout::packed(fmt, w, h))
+    }
+
+    /// Whether this buffer declares a non-packed plane layout — the guard
+    /// packed-assuming consumers use to fail loudly instead of misreading.
+    pub fn has_strided_planes(&self) -> bool {
+        match (self.planes, self.video_dims(), self.video_pixel_format()) {
+            (Some(layout), Some((w, h)), Some(fmt)) => !layout.is_packed(fmt, w, h),
+            (Some(_), _, _) => true, // layout without geometry: treat as strided
+            (None, _, _) => false,
+        }
     }
 
     /// Declare the framerate of the raw video this buffer belongs to.
@@ -1000,6 +1054,59 @@ mod tests {
     #[test]
     fn video_dims_is_none_without_dimensions() {
         assert_eq!(Metadata::new().video_dims(), None);
+    }
+
+    #[test]
+    fn plane_layout_defaults_to_packed_and_dims_rewrite_clears_strided() {
+        use crate::format::{PlaneDesc, PlaneLayout};
+
+        let mut meta = Metadata::new();
+        assert_eq!(meta.plane_layout(), None, "no geometry, no layout");
+        assert!(!meta.has_strided_planes());
+
+        meta.set_video_dims(64, 48, PixelFormat::I420);
+        assert_eq!(
+            meta.plane_layout(),
+            Some(PlaneLayout::packed(PixelFormat::I420, 64, 48)),
+            "packed derived from VideoRaw"
+        );
+        assert!(!meta.has_strided_planes());
+
+        // Producer declares a strided frame (stride = width + 16).
+        let strided = PlaneLayout::from_planes(&[
+            PlaneDesc {
+                offset: 0,
+                stride: 80,
+            },
+            PlaneDesc {
+                offset: 80 * 48,
+                stride: 48,
+            },
+            PlaneDesc {
+                offset: 80 * 48 + 48 * 24,
+                stride: 48,
+            },
+        ]);
+        meta.set_video_planes(64, 48, PixelFormat::I420, strided);
+        assert_eq!(meta.plane_layout(), Some(strided));
+        assert!(meta.has_strided_planes());
+
+        // A geometry rewrite (converter, scaler) drops the stale layout.
+        meta.set_video_dims(32, 24, PixelFormat::I420);
+        assert!(!meta.has_strided_planes());
+        assert_eq!(
+            meta.plane_layout(),
+            Some(PlaneLayout::packed(PixelFormat::I420, 32, 24))
+        );
+
+        // A packed layout declared explicitly is not "strided".
+        meta.set_video_planes(
+            32,
+            24,
+            PixelFormat::I420,
+            PlaneLayout::packed(PixelFormat::I420, 32, 24),
+        );
+        assert!(!meta.has_strided_planes());
     }
 
     #[test]

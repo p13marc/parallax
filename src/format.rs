@@ -380,6 +380,235 @@ impl VideoFormat {
     }
 }
 
+/// Maximum number of planes a [`PlaneLayout`] can describe.
+pub const MAX_PLANES: usize = 4;
+
+/// One plane's position within a video buffer: byte offset of its first
+/// row and the byte distance between consecutive rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct PlaneDesc {
+    /// Byte offset of the plane's first row within the buffer.
+    pub offset: usize,
+    /// Byte stride between consecutive rows (≥ the row's used bytes).
+    pub stride: usize,
+}
+
+/// A plane resolved against a concrete format + geometry: everything a
+/// consumer needs to walk it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResolvedPlane {
+    /// Byte offset of the plane's first row within the buffer.
+    pub offset: usize,
+    /// Byte stride between consecutive rows.
+    pub stride: usize,
+    /// Number of rows.
+    pub rows: usize,
+    /// Used bytes per row (≤ stride).
+    pub row_bytes: usize,
+}
+
+/// Per-buffer plane layout for raw video (#194): where each plane starts
+/// and how far apart its rows are. The packed layout — offsets dense,
+/// stride == row bytes — is the degenerate case every consumer assumed
+/// before strided (External) buffers existed; [`PlaneLayout::packed`] is
+/// its single source of truth.
+///
+/// Travels on `Metadata` (`set_video_planes`/`plane_layout`), NOT inside
+/// [`VideoFormat`]: layout is per-buffer state, while `VideoFormat` is the
+/// stream format — `Copy + Eq + Hash`, compared for compatibility, and
+/// encoded onto the IPC wire. A stride difference must not make two hops
+/// "incompatible", and strided buffers never cross IPC anyway.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlaneLayout {
+    planes: [PlaneDesc; MAX_PLANES],
+    count: u8,
+}
+
+/// `(rows, row_bytes)` per plane for a format at `w`×`h` — the packed
+/// geometry both [`PlaneLayout::packed`] and [`PlaneLayout::resolved`]
+/// share. Subsumes the per-consumer stride derivations.
+fn plane_geometry(
+    format: PixelFormat,
+    width: u32,
+    height: u32,
+) -> ([(usize, usize); MAX_PLANES], usize) {
+    let w = width as usize;
+    let h = height as usize;
+    let cw = w.div_ceil(2);
+    let ch = h.div_ceil(2);
+    let mut planes = [(0usize, 0usize); MAX_PLANES];
+    let count;
+    match format {
+        PixelFormat::I420 => {
+            planes[0] = (h, w);
+            planes[1] = (ch, cw);
+            planes[2] = (ch, cw);
+            count = 3;
+        }
+        PixelFormat::Nv12 => {
+            planes[0] = (h, w);
+            planes[1] = (ch, cw * 2);
+            count = 2;
+        }
+        PixelFormat::I420_10Le => {
+            planes[0] = (h, w * 2);
+            planes[1] = (ch, cw * 2);
+            planes[2] = (ch, cw * 2);
+            count = 3;
+        }
+        PixelFormat::P010 => {
+            planes[0] = (h, w * 2);
+            planes[1] = (ch, cw * 4);
+            count = 2;
+        }
+        PixelFormat::I422 => {
+            planes[0] = (h, w);
+            planes[1] = (h, cw);
+            planes[2] = (h, cw);
+            count = 3;
+        }
+        PixelFormat::Yuyv | PixelFormat::Uyvy => {
+            planes[0] = (h, w * 2);
+            count = 1;
+        }
+        PixelFormat::I444 => {
+            planes[0] = (h, w);
+            planes[1] = (h, w);
+            planes[2] = (h, w);
+            count = 3;
+        }
+        PixelFormat::Rgb24 | PixelFormat::Bgr24 => {
+            planes[0] = (h, w * 3);
+            count = 1;
+        }
+        PixelFormat::Rgba | PixelFormat::Bgra | PixelFormat::Argb => {
+            planes[0] = (h, w * 4);
+            count = 1;
+        }
+        PixelFormat::Gray8 => {
+            planes[0] = (h, w);
+            count = 1;
+        }
+        PixelFormat::Gray16Le => {
+            planes[0] = (h, w * 2);
+            count = 1;
+        }
+    }
+    (planes, count)
+}
+
+impl PlaneLayout {
+    /// Build a layout from explicit plane descriptors (producer side).
+    ///
+    /// # Panics
+    ///
+    /// Panics on 0 planes or more than [`MAX_PLANES`].
+    pub fn from_planes(planes: &[PlaneDesc]) -> Self {
+        assert!(
+            !planes.is_empty() && planes.len() <= MAX_PLANES,
+            "1..={MAX_PLANES} planes required"
+        );
+        let mut arr = [PlaneDesc::default(); MAX_PLANES];
+        arr[..planes.len()].copy_from_slice(planes);
+        Self {
+            planes: arr,
+            count: planes.len() as u8,
+        }
+    }
+
+    /// The plane descriptors.
+    pub fn planes(&self) -> &[PlaneDesc] {
+        &self.planes[..self.count as usize]
+    }
+
+    /// The packed layout for a format at `w`×`h`: offsets dense, stride ==
+    /// used row bytes. What every arena-copying producer emits.
+    pub fn packed(format: PixelFormat, width: u32, height: u32) -> Self {
+        let (geom, count) = plane_geometry(format, width, height);
+        let mut planes = [PlaneDesc::default(); MAX_PLANES];
+        let mut offset = 0usize;
+        for (i, &(rows, row_bytes)) in geom[..count].iter().enumerate() {
+            planes[i] = PlaneDesc {
+                offset,
+                stride: row_bytes,
+            };
+            offset += rows * row_bytes;
+        }
+        Self {
+            planes,
+            count: count as u8,
+        }
+    }
+
+    /// Whether this layout IS the packed layout for the geometry.
+    pub fn is_packed(&self, format: PixelFormat, width: u32, height: u32) -> bool {
+        *self == Self::packed(format, width, height)
+    }
+
+    /// Minimum buffer length this layout requires: max over planes of
+    /// `offset + stride × (rows − 1) + row_bytes`.
+    pub fn required_len(&self, format: PixelFormat, width: u32, height: u32) -> usize {
+        self.resolved(format, width, height)
+            .map(|p| p.offset + p.stride * (p.rows.saturating_sub(1)) + p.row_bytes)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Each plane resolved with its packed row geometry: the one
+    /// consumer-facing walk. Plane count mismatches between the layout and
+    /// the format resolve to the smaller count.
+    pub fn resolved(
+        &self,
+        format: PixelFormat,
+        width: u32,
+        height: u32,
+    ) -> impl Iterator<Item = ResolvedPlane> + '_ {
+        let (geom, count) = plane_geometry(format, width, height);
+        let n = (self.count as usize).min(count);
+        (0..n).map(move |i| ResolvedPlane {
+            offset: self.planes[i].offset,
+            stride: self.planes[i].stride,
+            rows: geom[i].0,
+            row_bytes: geom[i].1,
+        })
+    }
+
+    /// Row-copy a frame in this layout into a packed destination. Returns
+    /// the packed length written.
+    pub fn repack_into(
+        &self,
+        src: &[u8],
+        format: PixelFormat,
+        width: u32,
+        height: u32,
+        dst: &mut [u8],
+    ) -> Result<usize, String> {
+        let need_src = self.required_len(format, width, height);
+        if src.len() < need_src {
+            return Err(format!(
+                "strided source too small: layout needs {need_src} bytes, got {}",
+                src.len()
+            ));
+        }
+        let mut out = 0usize;
+        for plane in self.resolved(format, width, height) {
+            let need_dst = out + plane.rows * plane.row_bytes;
+            if dst.len() < need_dst {
+                return Err(format!(
+                    "packed destination too small: need {need_dst} bytes, got {}",
+                    dst.len()
+                ));
+            }
+            for row in 0..plane.rows {
+                let s = plane.offset + row * plane.stride;
+                dst[out..out + plane.row_bytes].copy_from_slice(&src[s..s + plane.row_bytes]);
+                out += plane.row_bytes;
+            }
+        }
+        Ok(out)
+    }
+}
+
 /// Pixel formats (color space and memory layout).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
 #[repr(u8)]
@@ -2180,6 +2409,113 @@ mod tests {
         assert_eq!(Framerate::FPS_30.fps(), 30.0);
         assert!((Framerate::FPS_29_97.fps() - 29.97).abs() < 0.01);
         assert_eq!(Framerate::FPS_30.frame_duration_ns(), 33_333_333);
+    }
+
+    const ALL_PIXEL_FORMATS: [PixelFormat; 15] = [
+        PixelFormat::I420,
+        PixelFormat::Nv12,
+        PixelFormat::I420_10Le,
+        PixelFormat::P010,
+        PixelFormat::I422,
+        PixelFormat::Yuyv,
+        PixelFormat::Uyvy,
+        PixelFormat::I444,
+        PixelFormat::Rgb24,
+        PixelFormat::Rgba,
+        PixelFormat::Bgr24,
+        PixelFormat::Bgra,
+        PixelFormat::Argb,
+        PixelFormat::Gray8,
+        PixelFormat::Gray16Le,
+    ];
+
+    /// Packed layout must agree with `VideoFormat::frame_size` for every
+    /// format at even dimensions — one source of truth, cross-checked.
+    #[test]
+    fn packed_layout_matches_frame_size() {
+        for fmt in ALL_PIXEL_FORMATS {
+            let (w, h) = (64, 48);
+            let layout = PlaneLayout::packed(fmt, w, h);
+            let expected = VideoFormat::new(w, h, fmt, Framerate::default()).frame_size();
+            assert_eq!(
+                layout.required_len(fmt, w, h),
+                expected,
+                "{fmt:?}: packed required_len == frame_size"
+            );
+            assert!(layout.is_packed(fmt, w, h), "{fmt:?}");
+            // Offsets are dense: each plane starts where the previous ends.
+            let mut expect_offset = 0;
+            for p in layout.resolved(fmt, w, h) {
+                assert_eq!(p.offset, expect_offset, "{fmt:?}: dense offsets");
+                assert_eq!(p.stride, p.row_bytes, "{fmt:?}: packed stride");
+                expect_offset += p.rows * p.row_bytes;
+            }
+        }
+    }
+
+    /// Strided → packed repack round-trips byte-exactly against a frame
+    /// synthesized with stride = row_bytes + 16 and 0xEE padding.
+    #[test]
+    fn repack_round_trips_strided_frames() {
+        for fmt in [PixelFormat::I420, PixelFormat::Nv12, PixelFormat::I420_10Le] {
+            let (w, h) = (32, 16);
+            let packed_layout = PlaneLayout::packed(fmt, w, h);
+            let packed_len = packed_layout.required_len(fmt, w, h);
+
+            // Reference packed frame with a recognizable per-byte pattern.
+            let packed: Vec<u8> = (0..packed_len).map(|i| (i % 251) as u8).collect();
+
+            // Build the strided frame: each plane's rows spaced +16 bytes,
+            // planes laid out consecutively with their padding.
+            let mut descs = Vec::new();
+            let mut offset = 0;
+            for p in packed_layout.resolved(fmt, w, h) {
+                let stride = p.row_bytes + 16;
+                descs.push(PlaneDesc { offset, stride });
+                offset += stride * p.rows;
+            }
+            let strided_layout = PlaneLayout::from_planes(&descs);
+            assert!(!strided_layout.is_packed(fmt, w, h), "{fmt:?}");
+
+            let mut strided = vec![0xEEu8; strided_layout.required_len(fmt, w, h)];
+            let mut src_pos = 0;
+            for (d, p) in descs.iter().zip(packed_layout.resolved(fmt, w, h)) {
+                for row in 0..p.rows {
+                    let dst = d.offset + row * d.stride;
+                    strided[dst..dst + p.row_bytes]
+                        .copy_from_slice(&packed[src_pos..src_pos + p.row_bytes]);
+                    src_pos += p.row_bytes;
+                }
+            }
+
+            let mut out = vec![0u8; packed_len];
+            let written = strided_layout
+                .repack_into(&strided, fmt, w, h, &mut out)
+                .unwrap();
+            assert_eq!(written, packed_len, "{fmt:?}");
+            assert_eq!(out, packed, "{fmt:?}: byte-exact repack");
+        }
+    }
+
+    #[test]
+    fn repack_rejects_short_buffers() {
+        let fmt = PixelFormat::I420;
+        let layout = PlaneLayout::packed(fmt, 32, 16);
+        let need = layout.required_len(fmt, 32, 16);
+        let src = vec![0u8; need];
+        let mut short_dst = vec![0u8; need - 1];
+        assert!(
+            layout
+                .repack_into(&src, fmt, 32, 16, &mut short_dst)
+                .is_err()
+        );
+        let short_src = vec![0u8; need - 1];
+        let mut dst = vec![0u8; need];
+        assert!(
+            layout
+                .repack_into(&short_src, fmt, 32, 16, &mut dst)
+                .is_err()
+        );
     }
 
     #[test]
