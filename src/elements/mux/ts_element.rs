@@ -100,6 +100,8 @@ pub struct TsMuxElement {
     data_count: u32,
     /// Arena for output buffer allocation.
     output: OutputArena,
+    /// Buffers drained by `flush_all` awaiting handout, one per `flush` call.
+    flush_pending: std::collections::VecDeque<Buffer>,
 }
 
 impl TsMuxElement {
@@ -163,6 +165,7 @@ impl TsMuxElement {
             output: OutputArena::new(defaults::TS_MUX_SLOT_COUNT)
                 .with_min_slot_size(188 * 64)
                 .grow_to_fit(),
+            flush_pending: std::collections::VecDeque::new(),
         })
     }
 
@@ -386,9 +389,14 @@ impl Muxer for TsMuxElement {
     }
 
     fn flush(&mut self) -> Result<Option<Buffer>> {
-        // Return first flushed buffer; caller should call repeatedly
-        let outputs = self.flush_all()?;
-        Ok(outputs.into_iter().next())
+        // One buffer per call until drained (the Muxer::flush contract).
+        // `flush_all` empties the sync state, so its results must be stashed —
+        // returning only the first and re-draining next call loses the rest.
+        if self.flush_pending.is_empty() {
+            let drained = self.flush_all()?;
+            self.flush_pending.extend(drained);
+        }
+        Ok(self.flush_pending.pop_front())
     }
 }
 

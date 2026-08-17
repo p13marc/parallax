@@ -1246,3 +1246,71 @@ fn test_alignment_strategies() {
         AlignmentStrategy::Nearest(Duration::from_millis(50))
     );
 }
+
+/// EOS flush drains ALL held buffers, not just the first.
+///
+/// The `Element::flush` contract is "called repeatedly until `Ok(None)`", but
+/// the executor calls the dyn `flush()` once — the adapter owns the loop. This
+/// pins the fix: an element modeling a decoder's reorder/frame-delay pipeline
+/// (holds every input, emits one per flush call) must deliver its full tail.
+#[tokio::test]
+async fn test_eos_flush_drains_all_held_buffers() {
+    use parallax::buffer::Buffer;
+    use parallax::element::{ConsumeContext, Element, Sink};
+    use parallax::error::Result;
+
+    struct HoldAll {
+        held: std::collections::VecDeque<Buffer>,
+    }
+
+    impl Element for HoldAll {
+        fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
+            self.held.push_back(buffer);
+            Ok(None)
+        }
+
+        fn flush(&mut self) -> Result<Option<Buffer>> {
+            Ok(self.held.pop_front())
+        }
+    }
+
+    struct CountingSink {
+        count: Arc<AtomicU64>,
+    }
+
+    impl Sink for CountingSink {
+        fn consume(&mut self, _ctx: &ConsumeContext) -> Result<()> {
+            self.count.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    const N: u64 = 10;
+    let count = Arc::new(AtomicU64::new(0));
+
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_source("src", NullSource::new(N));
+    let hold = pipeline.add_filter(
+        "hold",
+        HoldAll {
+            held: std::collections::VecDeque::new(),
+        },
+    );
+    let sink = pipeline.add_sink(
+        "sink",
+        CountingSink {
+            count: Arc::clone(&count),
+        },
+    );
+    pipeline.link(src, hold).unwrap();
+    pipeline.link(hold, sink).unwrap();
+
+    let executor = Executor::new();
+    executor.run(&mut pipeline).await.unwrap();
+
+    assert_eq!(
+        count.load(Ordering::Relaxed),
+        N,
+        "every buffer held across EOS must be flushed through to the sink"
+    );
+}

@@ -1323,6 +1323,10 @@ impl<T: Element> Transform for T {
         self.process(buffer).map(Output::from)
     }
 
+    fn flush(&mut self) -> Result<Output> {
+        drain_flush(|| Element::flush(self))
+    }
+
     fn name(&self) -> &str {
         Element::name(self)
     }
@@ -2140,6 +2144,36 @@ impl<T: Element> SyncElement for T {
     }
 }
 
+/// Upper bound on one EOS drain, guarding against a flush that never
+/// returns `None`. Far above any real reorder depth (a video decoder holds
+/// at most tens of frames); hitting it is a bug in the element.
+const FLUSH_DRAIN_LIMIT: usize = 4096;
+
+/// Drain a one-buffer-per-call `flush` into a single [`Output`].
+///
+/// The `Element`/`SyncElement`/`Muxer` flush contract is "called repeatedly
+/// until `Ok(None)`", but the executor calls the dyn `flush()` exactly once
+/// at EOS — so the adapters own the loop. Without it, a decoder holding a
+/// reorder/frame-delay pipeline (dav1d, openh264) emitted only its first
+/// held frame at EOS and silently dropped the rest.
+fn drain_flush(mut flush_once: impl FnMut() -> Result<Option<Buffer>>) -> Result<Output> {
+    let mut drained = Vec::new();
+    loop {
+        match flush_once()? {
+            Some(buffer) => drained.push(buffer),
+            None => break,
+        }
+        if drained.len() >= FLUSH_DRAIN_LIMIT {
+            tracing::error!(
+                "flush drain hit the {FLUSH_DRAIN_LIMIT}-buffer limit; \
+                 element flush never returned None"
+            );
+            break;
+        }
+    }
+    Ok(Output::from(drained))
+}
+
 /// Adapter: [`SyncElement`] → [`AsyncElementDyn`].
 ///
 /// Wraps a `SyncElement` so it can be used in the pipeline graph
@@ -2204,7 +2238,7 @@ impl<T: SyncElement + 'static> SendAsyncElementDyn for SyncElementAdapter<T> {
     }
 
     async fn flush(&mut self) -> Result<Output> {
-        self.inner.flush_sync().map(Output::from)
+        drain_flush(|| self.inner.flush_sync())
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -2748,7 +2782,7 @@ impl<E: Element + Send + 'static> SendAsyncElementDyn for ElementAdapter<E> {
     }
 
     async fn flush(&mut self) -> Result<Output> {
-        self.inner.flush().map(Output::from)
+        drain_flush(|| self.inner.flush())
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -2857,7 +2891,7 @@ impl SendAsyncElementDyn for BoxedElementAdapter {
     }
 
     async fn flush(&mut self) -> Result<Output> {
-        self.inner.flush().map(Output::from)
+        drain_flush(|| self.inner.flush())
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -3696,6 +3730,10 @@ impl<M: Muxer + Send + 'static> SendAsyncElementDyn for MuxerAdapter<M> {
 
     async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
         SendAsyncElementDyn::process_inline(self, input)
+    }
+
+    async fn flush(&mut self) -> Result<Output> {
+        drain_flush(|| self.inner.flush())
     }
 
     fn input_caps(&self) -> Caps {

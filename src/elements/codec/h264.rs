@@ -1421,7 +1421,7 @@ impl Element for H264Decoder {
         }
 
         // Loop, not a single pop: a clipped frame must not end the drain —
-        // the executor stops calling flush() at the first None.
+        // the caller (the adapter's drain loop) stops at the first None.
         loop {
             match self.flushed.as_mut().and_then(VecDeque::pop_front) {
                 Some(frame) => {
