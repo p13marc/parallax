@@ -91,6 +91,12 @@ impl Default for DuplicateFilter {
 }
 
 impl Element for DuplicateFilter {
+    // #189: may forward the input buffer — the upstream producer's arena
+    // budget accumulates through this element.
+    fn passthrough(&self) -> bool {
+        true
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         let hash = Self::hash_buffer(buffer.as_bytes());
 
@@ -231,6 +237,12 @@ impl Default for RangeFilter {
 }
 
 impl Element for RangeFilter {
+    // #189: may forward the input buffer — the upstream producer's arena
+    // budget accumulates through this element.
+    fn passthrough(&self) -> bool {
+        true
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         let size = buffer.len();
         let seq = buffer.metadata().sequence;
@@ -341,6 +353,12 @@ impl RegexFilter {
 }
 
 impl Element for RegexFilter {
+    // #189: may forward the input buffer — the upstream producer's arena
+    // budget accumulates through this element.
+    fn passthrough(&self) -> bool {
+        true
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         let data = buffer.as_bytes();
 
@@ -438,6 +456,12 @@ impl MetadataExtract {
 }
 
 impl Element for MetadataExtract {
+    // #189: may forward the input buffer — the upstream producer's arena
+    // budget accumulates through this element.
+    fn passthrough(&self) -> bool {
+        true
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         let extracted = ExtractedMetadata {
             metadata: buffer.metadata().clone(),
@@ -587,6 +611,12 @@ impl BufferSplit {
 }
 
 impl Element for BufferSplit {
+    // #189: may forward the input buffer — the upstream producer's arena
+    // budget accumulates through this element.
+    fn passthrough(&self) -> bool {
+        true
+    }
+
     fn set_output_budget(&mut self, budget: OutputBudget) {
         self.output.set_budget(budget);
     }

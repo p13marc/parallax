@@ -73,6 +73,12 @@ impl Default for SequenceNumber {
 }
 
 impl Element for SequenceNumber {
+    // #189: may forward the input buffer — the upstream producer's arena
+    // budget accumulates through this element.
+    fn passthrough(&self) -> bool {
+        true
+    }
+
     fn process(&mut self, mut buffer: Buffer) -> Result<Option<Buffer>> {
         let seq = self.counter.fetch_add(self.increment, Ordering::SeqCst);
         buffer.metadata_mut().sequence = seq;
@@ -182,6 +188,12 @@ impl Timestamper {
 }
 
 impl Element for Timestamper {
+    // #189: may forward the input buffer — the upstream producer's arena
+    // budget accumulates through this element.
+    fn passthrough(&self) -> bool {
+        true
+    }
+
     fn process(&mut self, mut buffer: Buffer) -> Result<Option<Buffer>> {
         self.count.fetch_add(1, Ordering::Relaxed);
 
@@ -290,6 +302,12 @@ impl Default for MetadataInject {
 }
 
 impl Element for MetadataInject {
+    // #189: may forward the input buffer — the upstream producer's arena
+    // budget accumulates through this element.
+    fn passthrough(&self) -> bool {
+        true
+    }
+
     fn process(&mut self, mut buffer: Buffer) -> Result<Option<Buffer>> {
         self.count.fetch_add(1, Ordering::Relaxed);
 
@@ -615,6 +633,12 @@ impl Default for TimestampDebug {
 }
 
 impl Element for TimestampDebug {
+    // #189: may forward the input buffer — the upstream producer's arena
+    // budget accumulates through this element.
+    fn passthrough(&self) -> bool {
+        true
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         // Update stats and check for warnings
         let warning = self.update_stats(&buffer);

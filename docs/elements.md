@@ -66,7 +66,7 @@ Feature-gated:
 | `h264enc` | `h264` | `bitrate` (bps), `fps`, `qp`, `keyframe-interval`, `threads`, `scene-change` (bool), `max-slice-len`, `skip-frames` (bool), `profile` = baseline\|main\|high, `complexity` = low\|medium\|high, `usage` = camera\|screen\|camera-offline\|screen-offline |
 | `h264dec` | `h264` | — |
 | `av1enc` | `av1-encode` | `speed`, `quantizer`, `bitrate` |
-| `av1dec` | `av1-decode` | — |
+| `av1dec` | `av1-decode` | `threads` (0 = auto), `max-frame-delay` (0 = auto; small values bound dav1d's picture pool and latency but measurably raise decode CPU — constrained frame-threading keeps the workers busier), `apply-grain` (bool, default true) |
 | `vp8dec` / `vp9dec` | `vpx` | — |
 | `opusenc` | `opus` | `rate` (48000), `channels` (2), `bitrate` (128000), `application` = audio\|voip\|lowdelay (S16 input) |
 | `opusdec` | `opus` | `rate` (48000), `channels` (2) |

@@ -69,6 +69,12 @@ impl BufferTrim {
 }
 
 impl Element for BufferTrim {
+    // #189: may forward the input buffer — the upstream producer's arena
+    // budget accumulates through this element.
+    fn passthrough(&self) -> bool {
+        true
+    }
+
     fn set_output_budget(&mut self, budget: OutputBudget) {
         self.output.set_budget(budget);
     }
@@ -196,6 +202,12 @@ impl BufferSlice {
 }
 
 impl Element for BufferSlice {
+    // #189: may forward the input buffer — the upstream producer's arena
+    // budget accumulates through this element.
+    fn passthrough(&self) -> bool {
+        true
+    }
+
     fn set_output_budget(&mut self, budget: OutputBudget) {
         self.output.set_budget(budget);
     }
@@ -315,6 +327,12 @@ impl BufferPad {
 }
 
 impl Element for BufferPad {
+    // #189: may forward the input buffer — the upstream producer's arena
+    // budget accumulates through this element.
+    fn passthrough(&self) -> bool {
+        true
+    }
+
     fn set_output_budget(&mut self, budget: OutputBudget) {
         self.output.set_budget(budget);
     }

@@ -214,6 +214,15 @@ impl Default for VideoConvertElement {
 }
 
 impl Element for VideoConvertElement {
+    // #189: the no-op arm forwards the input buffer, so unless both formats
+    // are pinned unequal the upstream budget must accumulate through here.
+    fn passthrough(&self) -> bool {
+        match self.input_format {
+            Some(input) => input == self.output_format,
+            None => true,
+        }
+    }
+
     fn set_output_budget(&mut self, budget: OutputBudget) {
         self.output.set_budget(budget);
     }

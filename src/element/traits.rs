@@ -842,6 +842,15 @@ pub trait Sink: Send {
         None
     }
 
+    /// How many buffers this element holds on to *beyond* the one in its
+    /// hand (#189) — e.g. an internal display queue or an app-facing pull
+    /// queue. Each retained buffer pins a slot in the producing element's
+    /// output arena, so the executor adds this to the link capacity when
+    /// sizing that arena. Default: none.
+    fn retained_buffers(&self) -> usize {
+        0
+    }
+
     /// Get a clock provider if this sink can provide a clock.
     ///
     /// Audio sinks typically provide a hardware clock that can be used
@@ -929,6 +938,12 @@ pub trait AsyncSink: Send {
     /// [`Sink::latency`].
     fn latency(&self) -> Option<crate::pipeline::seek::LatencyRange> {
         None
+    }
+
+    /// Buffers held beyond the one in hand (#189); see
+    /// [`Sink::retained_buffers`].
+    fn retained_buffers(&self) -> usize {
+        0
     }
 
     /// Get a clock provider if this sink can provide a clock.
@@ -1087,6 +1102,27 @@ pub trait Element: Send {
     /// Default: none.
     fn latency(&self) -> Option<crate::pipeline::seek::LatencyRange> {
         None
+    }
+
+    /// Buffers held beyond the one in hand (#189); see
+    /// [`Sink::retained_buffers`]. A transform that clones inputs into an
+    /// internal queue (a timeshift window, an interleave stash) declares
+    /// the queue's depth here so the *upstream* arena is sized for it.
+    fn retained_buffers(&self) -> usize {
+        0
+    }
+
+    /// May this element forward its **input buffer** as its output (#189)?
+    ///
+    /// A zero-copy passthrough (`Ok(Some(buffer))` with the input, in-place
+    /// mutation included) keeps the *upstream producer's* arena slot live
+    /// through this element's own downstream links, so the executor
+    /// accumulates the producer's budget straight through every element
+    /// that answers `true`. Answer from configuration where it decides —
+    /// a pinned-format converter that always copies stays `false`.
+    /// Default: `false` (the element emits from its own memory).
+    fn passthrough(&self) -> bool {
+        false
     }
 }
 
@@ -1907,6 +1943,33 @@ pub trait AsyncElementDyn {
         None
     }
 
+    /// Buffers this element holds beyond the one in its hand (#189).
+    ///
+    /// Snapshotted at `Executor::start`: each link's contribution to the
+    /// producer's output-arena budget is `capacity + consumer.retained_buffers()`,
+    /// because a retained clone pins a slot exactly like a queued one.
+    /// Declare it for elements that keep buffers past the call that
+    /// delivered them — a display queue, an app-facing pull queue.
+    /// Default: none.
+    ///
+    /// ABI 10: adding this vtable slot is why the plugin ABI bumped.
+    fn retained_buffers(&self) -> usize {
+        0
+    }
+
+    /// May this element forward its input buffer as output (#189)?
+    ///
+    /// Snapshotted at `Executor::start` next to
+    /// [`retained_buffers`](Self::retained_buffers): the producer's arena
+    /// budget accumulates through every consumer answering `true`, because
+    /// a forwarded buffer keeps pinning the producer's slot across the
+    /// passthrough element's own downstream links. Default: `false`.
+    ///
+    /// ABI 10 (with `retained_buffers`): a new vtable slot.
+    fn passthrough(&self) -> bool {
+        false
+    }
+
     /// Flush a demuxer, keeping the pad routing.
     ///
     /// The flat [`flush`](Self::flush) cannot serve a demuxer: it returns
@@ -2538,6 +2601,11 @@ impl<S: Sink + Send + 'static> SendAsyncElementDyn for SinkAdapter<S> {
         self.inner.latency()
     }
 
+    // #189: retained buffers feed the upstream producer's arena budget.
+    fn retained_buffers(&self) -> usize {
+        self.inner.retained_buffers()
+    }
+
     fn process_inline(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
         if let Some(ref buffer) = input {
             let mut ctx = ConsumeContext::new(buffer);
@@ -2621,6 +2689,16 @@ impl<E: Element + Send + 'static> SendAsyncElementDyn for ElementAdapter<E> {
     // #184: declared latency feeds the start-time pipeline aggregate.
     fn latency(&self) -> Option<crate::pipeline::seek::LatencyRange> {
         self.inner.latency()
+    }
+
+    // #189: retained buffers and passthrough feed the upstream producer's
+    // arena budget.
+    fn retained_buffers(&self) -> usize {
+        self.inner.retained_buffers()
+    }
+
+    fn passthrough(&self) -> bool {
+        self.inner.passthrough()
     }
 
     // #164: without this override the dyn default swallowed the call, so a
@@ -2728,6 +2806,16 @@ impl SendAsyncElementDyn for BoxedElementAdapter {
     // #184: declared latency feeds the start-time pipeline aggregate.
     fn latency(&self) -> Option<crate::pipeline::seek::LatencyRange> {
         self.inner.latency()
+    }
+
+    // #189: retained buffers and passthrough feed the upstream producer's
+    // arena budget.
+    fn retained_buffers(&self) -> usize {
+        self.inner.retained_buffers()
+    }
+
+    fn passthrough(&self) -> bool {
+        self.inner.passthrough()
     }
 
     // #164: without this override the dyn default swallowed the call, so a
@@ -3173,6 +3261,11 @@ impl<S: AsyncSink + Send + 'static> SendAsyncElementDyn for AsyncSinkAdapter<S> 
 
     fn latency(&self) -> Option<crate::pipeline::seek::LatencyRange> {
         self.inner.latency()
+    }
+
+    // #189: retained buffers feed the upstream producer's arena budget.
+    fn retained_buffers(&self) -> usize {
+        self.inner.retained_buffers()
     }
 
     async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {

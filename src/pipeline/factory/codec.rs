@@ -145,11 +145,19 @@ fn create_av1enc(props: &Props) -> Result<Box<DynAsyncElement<'static>>> {
 }
 
 #[cfg(feature = "av1-decode")]
-fn create_av1dec(_props: &Props) -> Result<Box<DynAsyncElement<'static>>> {
+fn create_av1dec(props: &Props) -> Result<Box<DynAsyncElement<'static>>> {
     use crate::elements::codec::Dav1dDecoder;
-    Ok(DynAsyncElement::new_box(ElementAdapter::new(
-        Dav1dDecoder::new()?,
-    )))
+    let mut dec = Dav1dDecoder::new()?;
+    if let Some(n) = props.get_u32("threads")? {
+        dec = dec.with_threads(n)?;
+    }
+    if let Some(d) = props.get_u32("max-frame-delay")? {
+        dec = dec.with_max_frame_delay(d)?;
+    }
+    if let Some(g) = props.get_bool("apply-grain")? {
+        dec = dec.with_apply_grain(g)?;
+    }
+    Ok(DynAsyncElement::new_box(ElementAdapter::new(dec)))
 }
 
 #[cfg(feature = "vpx")]

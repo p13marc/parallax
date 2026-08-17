@@ -93,6 +93,12 @@ impl Default for Identity {
 }
 
 impl Element for Identity {
+    // #189: may forward the input buffer — the upstream producer's arena
+    // budget accumulates through this element.
+    fn passthrough(&self) -> bool {
+        true
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.bytes.fetch_add(buffer.len() as u64, Ordering::Relaxed);

@@ -93,6 +93,12 @@ impl Delay {
 }
 
 impl Element for Delay {
+    // #189: may forward the input buffer — the upstream producer's arena
+    // budget accumulates through this element.
+    fn passthrough(&self) -> bool {
+        true
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         if !self.delay.is_zero() {
             let start = Instant::now();

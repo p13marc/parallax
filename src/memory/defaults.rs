@@ -63,11 +63,13 @@ pub const METADATA_SLOT_SIZE: usize = 64 * 1024;
 /// Slot size for MPEG-TS muxer output (batched packets).
 pub const TS_MUX_SLOT_SIZE: usize = 1024 * 1024;
 
-/// Slot size for MPEG-TS demuxer output (PES packets can be large).
-pub const TS_DEMUX_SLOT_SIZE: usize = 2 * 1024 * 1024;
-
-/// Slot size for MP4 demuxer output (video frames can be large).
-pub const MP4_DEMUX_SLOT_SIZE: usize = 4 * 1024 * 1024;
+/// Minimum slot size for container demuxer output (MP4/MKV/TS).
+///
+/// Compressed frames are typically tens of KB; every demuxer arena is
+/// `grow_to_fit`, so a keyframe past this rebuilds once and stays (#189).
+/// The old 2-4 MiB minimums multiplied by pad-summed slot counts into
+/// half-gigabyte mappings for kilobyte payloads.
+pub const DEMUX_MIN_SLOT_SIZE: usize = 256 * 1024;
 
 // =============================================================================
 // Slot Counts

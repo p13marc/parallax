@@ -76,8 +76,12 @@ impl OutputBudget {
     ///
     /// Two adjustments to [`slots`](Self::slots):
     ///
-    /// - the `floor` wins when it is larger, so an element that knows it needs
-    ///   depth (a lookahead encoder) keeps it even in a shallow graph;
+    /// - the `floor` wins when it is larger. [`OutputArena`] passes a real
+    ///   floor only when **no executor budget arrived** (#189) — a budget
+    ///   already accounts for everything the graph can hold, including
+    ///   consumer retention, so a static floor on top of it is pure
+    ///   over-allocation. (An element that genuinely needs more depth than
+    ///   the graph — none is known — has `set_slots`.);
     /// - the total is clamped to [`defaults::MAX_OUTPUT_ARENA_BYTES`] slots' worth. A 4K
     ///   RGBA frame is 33 MB, so an unclamped `channel_capacity: 200` would ask
     ///   for 6.6 GB. Degrading to fewer slots sheds frames; allocating 6.6 GB
@@ -378,8 +382,18 @@ impl OutputArena {
 
         if self.arena.is_none() {
             let slot_size = len.max(self.min_slot_size).max(1);
-            let budget = self.budget.unwrap_or_default();
-            let slots = budget.resolve_with_override(self.explicit, self.floor, slot_size, element);
+            // #189: an executor budget is graph-derived truth — link
+            // capacities, consumer retention and the in-flight margin already
+            // cover every buffer the graph can hold, so the static floor
+            // would only over-allocate (it used to win, hiding both the
+            // waste and the unaccounted-retention bug it papered over). The
+            // floor applies only when no budget arrived: an element
+            // constructed and driven by hand, outside an executor.
+            let (budget, floor) = match self.budget {
+                Some(budget) => (budget, 1),
+                None => (OutputBudget::default(), self.floor),
+            };
+            let slots = budget.resolve_with_override(self.explicit, floor, slot_size, element);
 
             tracing::debug!(
                 "{element}: output arena {slots} slots x {slot_size} bytes \
@@ -421,8 +435,9 @@ mod tests {
     }
 
     #[test]
-    fn the_floor_wins_in_a_shallow_graph() {
-        // A one-deep link must not leave a lookahead encoder with 5 slots.
+    fn resolve_honours_a_larger_floor() {
+        // `resolve` itself keeps floor-wins semantics; `OutputArena` decides
+        // when a real floor applies (only without an executor budget, #189).
         let budget = OutputBudget::new(1, 4);
         assert_eq!(budget.resolve(64, 1024), 64);
     }
@@ -505,6 +520,16 @@ mod tests {
     #[test]
     fn without_a_budget_the_arena_falls_back_to_its_floor() {
         let mut out = OutputArena::new(8);
+        out.acquire(1024, "t").unwrap();
+        assert_eq!(out.arena().unwrap().slot_count(), 8);
+    }
+
+    #[test]
+    fn an_executor_budget_smaller_than_the_floor_wins() {
+        // #189: the budget covers everything the graph can hold (capacity +
+        // retention + margin); a static floor on top is over-allocation.
+        let mut out = OutputArena::new(64);
+        out.set_budget(OutputBudget::new(4, 4));
         out.acquire(1024, "t").unwrap();
         assert_eq!(out.arena().unwrap().slot_count(), 8);
     }

@@ -363,6 +363,12 @@ impl AppSink {
 }
 
 impl AsyncSink for AppSink {
+    /// The pull queue holds up to `max_buffers` arena-backed clones the
+    /// application hasn't collected yet (#189) — each pins a producer slot.
+    fn retained_buffers(&self) -> usize {
+        wait_ok(self.inner.state.lock()).max_buffers
+    }
+
     /// Queue the buffer, awaiting space when the queue is full.
     ///
     /// `AsyncSink` rather than `Sink` on purpose (#168). The old sync impl

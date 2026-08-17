@@ -225,6 +225,12 @@ impl SampleFilter {
 }
 
 impl Element for SampleFilter {
+    // #189: may forward the input buffer — the upstream producer's arena
+    // budget accumulates through this element.
+    fn passthrough(&self) -> bool {
+        true
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         let count = self.count.fetch_add(1, Ordering::Relaxed);
 
@@ -339,6 +345,12 @@ impl Default for MetadataFilter {
 }
 
 impl Element for MetadataFilter {
+    // #189: may forward the input buffer — the upstream producer's arena
+    // budget accumulates through this element.
+    fn passthrough(&self) -> bool {
+        true
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         let meta = buffer.metadata();
         let mut pass = true;

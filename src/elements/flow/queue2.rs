@@ -747,6 +747,12 @@ impl Queue2 {
 // ============================================================================
 
 impl Element for Queue2 {
+    // #189: may forward the input buffer — the upstream producer's arena
+    // budget accumulates through this element.
+    fn passthrough(&self) -> bool {
+        true
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         // Record-and-forward: the push updates stats/percent and posts
         // Buffering bus messages, but element mode never withholds data —

@@ -126,6 +126,12 @@ impl crate::control::Controllable for Valve {
 }
 
 impl Element for Valve {
+    // #189: may forward the input buffer — the upstream producer's arena
+    // budget accumulates through this element.
+    fn passthrough(&self) -> bool {
+        true
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         if self.inner.open.load(Ordering::SeqCst) {
             self.inner.passed.fetch_add(1, Ordering::SeqCst);

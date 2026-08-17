@@ -120,6 +120,12 @@ impl Timeout {
 }
 
 impl Element for Timeout {
+    // #189: may forward the input buffer — the upstream producer's arena
+    // budget accumulates through this element.
+    fn passthrough(&self) -> bool {
+        true
+    }
+
     fn set_output_budget(&mut self, budget: OutputBudget) {
         self.output.set_budget(budget);
     }
@@ -223,6 +229,12 @@ impl Debounce {
 }
 
 impl Element for Debounce {
+    // #189: may forward the input buffer — the upstream producer's arena
+    // budget accumulates through this element.
+    fn passthrough(&self) -> bool {
+        true
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         // If we have a held buffer, it gets suppressed
         if self.last_buffer.is_some() {
@@ -404,6 +416,12 @@ impl crate::control::Controllable for Throttle {
 }
 
 impl Element for Throttle {
+    // #189: may forward the input buffer — the upstream producer's arena
+    // budget accumulates through this element.
+    fn passthrough(&self) -> bool {
+        true
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         let now = Instant::now();
         // One relaxed load per buffer; the rate may have been changed by a

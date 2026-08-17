@@ -434,6 +434,13 @@ impl crate::control::Controllable for VideoScale {
 }
 
 impl Element for VideoScale {
+    // #189: the same-size arm forwards the input buffer, and whether it
+    // fires depends on the *stream's* geometry — unknowable at start, so
+    // answer conservatively.
+    fn passthrough(&self) -> bool {
+        true
+    }
+
     fn set_output_budget(&mut self, budget: OutputBudget) {
         self.output.set_budget(budget);
     }

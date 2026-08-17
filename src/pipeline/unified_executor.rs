@@ -548,6 +548,45 @@ struct RuntimeControls {
     /// every node as it spawns — a fed demuxer is not a source and so gets
     /// no `SourceControl` to hang this on.
     translations: Vec<crate::pipeline::seek::SeekTranslation>,
+    /// Per-node consumer holds (#189), snapshotted *before* any element is
+    /// taken for its task — `output_slot_budget` runs per node in spawn
+    /// order, so a consumer spawned before its producer would otherwise be
+    /// unqueryable.
+    holds: HoldSnapshot,
+}
+
+/// What each consumer does to buffers it receives (#189), snapshotted from
+/// every element at start for arena-budget accounting.
+#[derive(Default)]
+struct HoldSnapshot {
+    /// `retained_buffers()` per node — buffers kept past delivery (a display
+    /// queue, an app pull queue). Only nonzero entries are stored.
+    retained: HashMap<NodeId, usize>,
+    /// Nodes whose `passthrough()` answered true — they may forward the
+    /// input buffer, so the producer's slot stays live through *their*
+    /// downstream links too.
+    passthrough: std::collections::HashSet<NodeId>,
+}
+
+impl HoldSnapshot {
+    /// Read every element while it is still in its node.
+    fn capture(pipeline: &Pipeline) -> Self {
+        use crate::element::SendAsyncElementDyn;
+        let mut snapshot = Self::default();
+        for (id, node) in pipeline.nodes() {
+            let Some(element) = node.element() else {
+                continue;
+            };
+            let held = SendAsyncElementDyn::retained_buffers(element);
+            if held > 0 {
+                snapshot.retained.insert(id, held);
+            }
+            if SendAsyncElementDyn::passthrough(element) {
+                snapshot.passthrough.insert(id);
+            }
+        }
+        snapshot
+    }
 }
 
 /// Handle to a running pipeline.
@@ -1247,6 +1286,9 @@ impl Executor {
             pause_rx,
             position: Arc::new(AtomicU64::new(u64::MAX)),
             translations: Vec::new(),
+            // #189: consumer holds (retention + passthrough) pin producer
+            // arena slots; snapshot while every element is still in its node.
+            holds: HoldSnapshot::capture(pipeline),
         };
 
         // Execute based on scheduling mode
@@ -1482,7 +1524,12 @@ impl Executor {
                 });
                 (
                     node_id,
-                    self.output_slot_budget(pipeline, node_id, usize::from(bridged)),
+                    self.output_slot_budget(
+                        pipeline,
+                        node_id,
+                        usize::from(bridged),
+                        &runtime.holds,
+                    ),
                 )
             })
             .collect();
@@ -1599,22 +1646,53 @@ impl Executor {
         pipeline: &Pipeline,
         node_id: NodeId,
         output_bridges: usize,
+        holds: &HoldSnapshot,
     ) -> OutputBudget {
-        let mut per_pad: HashMap<String, usize> = HashMap::new();
-
-        for (_child_id, link) in pipeline.children(node_id) {
-            let capacity = link.capacity.unwrap_or(self.config.channel_capacity);
-            let deepest = per_pad.entry(link.src_pad.clone()).or_insert(0);
-            *deepest = (*deepest).max(capacity);
-        }
-
-        let mut downstream_capacity: usize = per_pad.values().sum();
+        let mut memo = HashMap::new();
+        let mut downstream_capacity = self.downstream_capacity(pipeline, node_id, holds, &mut memo);
         if output_bridges > 0 {
             downstream_capacity =
                 downstream_capacity.saturating_add(self.config.rt.bridge_capacity);
         }
 
         OutputBudget::new(downstream_capacity, defaults::IN_FLIGHT_MARGIN)
+    }
+
+    /// The per-link hold below `node_id`: channel capacity, plus what the
+    /// consumer retains (#189), plus — through every consumer that may
+    /// *forward* the buffer (`passthrough()`) — that consumer's own
+    /// downstream capacity, because a forwarded buffer keeps pinning this
+    /// node's slot across the passthrough element's links too. Memoized;
+    /// the pre-seeded 0 also terminates on a (never valid) cyclic graph.
+    fn downstream_capacity(
+        &self,
+        pipeline: &Pipeline,
+        node_id: NodeId,
+        holds: &HoldSnapshot,
+        memo: &mut HashMap<NodeId, usize>,
+    ) -> usize {
+        if let Some(&known) = memo.get(&node_id) {
+            return known;
+        }
+        memo.insert(node_id, 0);
+
+        let mut per_pad: HashMap<String, usize> = HashMap::new();
+        for (child_id, link) in pipeline.children(node_id) {
+            let mut hold = link
+                .capacity
+                .unwrap_or(self.config.channel_capacity)
+                .saturating_add(holds.retained.get(&child_id).copied().unwrap_or(0));
+            if holds.passthrough.contains(&child_id) {
+                hold =
+                    hold.saturating_add(self.downstream_capacity(pipeline, child_id, holds, memo));
+            }
+            let deepest = per_pad.entry(link.src_pad.clone()).or_insert(0);
+            *deepest = (*deepest).max(hold);
+        }
+
+        let total: usize = per_pad.values().sum();
+        memo.insert(node_id, total);
+        total
     }
 
     /// Build channel network recursively.
@@ -1890,7 +1968,8 @@ impl Executor {
     ) -> Result<JoinHandle<Result<()>>> {
         // Before `get_node_mut` borrows the pipeline mutably: `children()` needs
         // it shared.
-        let budget = self.output_slot_budget(pipeline, node_id, output_bridges.len());
+        let budget =
+            self.output_slot_budget(pipeline, node_id, output_bridges.len(), &runtime.holds);
 
         let node = pipeline
             .get_node_mut(node_id)
@@ -5667,7 +5746,7 @@ mod tests {
         let executor = Executor::new();
         let sink = pipeline.node_ids().into_iter().find(|&n| n != src).unwrap();
 
-        let budget = executor.output_slot_budget(&pipeline, sink, 0);
+        let budget = executor.output_slot_budget(&pipeline, sink, 0, &HoldSnapshot::default());
         assert_eq!(budget.downstream_capacity, 0);
         assert_eq!(budget.in_flight_margin, defaults::IN_FLIGHT_MARGIN);
     }
@@ -5678,7 +5757,9 @@ mod tests {
         let executor = Executor::with_config(ExecutorConfig::default().with_channel_capacity(64));
 
         assert_eq!(
-            executor.output_slot_budget(&pipeline, src, 0).slots(),
+            executor
+                .output_slot_budget(&pipeline, src, 0, &HoldSnapshot::default())
+                .slots(),
             64 + defaults::IN_FLIGHT_MARGIN
         );
     }
@@ -5689,7 +5770,9 @@ mod tests {
         let executor = Executor::new();
 
         assert_eq!(
-            executor.output_slot_budget(&pipeline, src, 0).slots(),
+            executor
+                .output_slot_budget(&pipeline, src, 0, &HoldSnapshot::default())
+                .slots(),
             128 + defaults::IN_FLIGHT_MARGIN
         );
     }
@@ -5702,7 +5785,7 @@ mod tests {
         let (pipeline, src) = fan_out(&[Some(8), Some(64), Some(16)]);
         let executor = Executor::new();
 
-        let budget = executor.output_slot_budget(&pipeline, src, 0);
+        let budget = executor.output_slot_budget(&pipeline, src, 0, &HoldSnapshot::default());
         assert_eq!(budget.downstream_capacity, 64);
         assert_eq!(budget.slots(), 64 + defaults::IN_FLIGHT_MARGIN);
     }
@@ -5713,8 +5796,115 @@ mod tests {
         let executor = Executor::new();
         let bridge_capacity = executor.config.rt.bridge_capacity;
 
-        let budget = executor.output_slot_budget(&pipeline, src, 1);
+        let budget = executor.output_slot_budget(&pipeline, src, 1, &HoldSnapshot::default());
         assert_eq!(budget.downstream_capacity, 8 + bridge_capacity);
+    }
+
+    #[test]
+    fn a_retaining_consumer_grows_the_budget_by_its_hold() {
+        // #189: a consumer that keeps buffers past delivery (display queue,
+        // app pull queue) pins that many producer slots on top of the
+        // channel. The snapshot in `Executor::start` fills the map from
+        // `retained_buffers()`; here we hand it in directly.
+        let (pipeline, src) = fan_out(&[Some(8)]);
+        let executor = Executor::new();
+        let sink = pipeline.node_ids().into_iter().find(|&n| n != src).unwrap();
+
+        let holds = HoldSnapshot {
+            retained: HashMap::from([(sink, 5)]),
+            ..Default::default()
+        };
+        let budget = executor.output_slot_budget(&pipeline, src, 0, &holds);
+        assert_eq!(budget.downstream_capacity, 8 + 5);
+    }
+
+    #[test]
+    fn hold_snapshot_reads_the_elements_before_start() {
+        // The end-to-end half: retention and passthrough declarations are
+        // picked up from the nodes, per the same path `Executor::start` uses.
+        struct HoldingSink;
+        impl crate::element::Sink for HoldingSink {
+            fn consume(&mut self, _ctx: &crate::element::ConsumeContext<'_>) -> Result<()> {
+                Ok(())
+            }
+            fn retained_buffers(&self) -> usize {
+                7
+            }
+        }
+        struct Forwarder;
+        impl crate::element::Element for Forwarder {
+            fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
+                Ok(Some(buffer))
+            }
+            fn passthrough(&self) -> bool {
+                true
+            }
+        }
+
+        let mut pipeline = Pipeline::new();
+        let src = pipeline.add_source("src", CountingSource { count: 0, max: 0 });
+        let fwd = pipeline.add_filter("fwd", Forwarder);
+        let sink = pipeline.add_sink("sink", HoldingSink);
+        pipeline
+            .link_pads_full(src, "src", fwd, "sink", LinkPolicy::Block, Some(4))
+            .unwrap();
+        pipeline
+            .link_pads_full(fwd, "src", sink, "sink", LinkPolicy::Block, Some(3))
+            .unwrap();
+
+        let holds = HoldSnapshot::capture(&pipeline);
+        assert_eq!(holds.retained.get(&sink), Some(&7));
+        assert!(holds.passthrough.contains(&fwd));
+
+        let executor = Executor::new();
+        // src's budget accumulates through the passthrough: its own link
+        // (4) plus fwd's downstream link (3) plus the sink's retention (7).
+        let budget = executor.output_slot_budget(&pipeline, src, 0, &holds);
+        assert_eq!(budget.downstream_capacity, 4 + 3 + 7);
+        // fwd itself (were it to allocate) only sees its own downstream.
+        let budget = executor.output_slot_budget(&pipeline, fwd, 0, &holds);
+        assert_eq!(budget.downstream_capacity, 3 + 7);
+    }
+
+    #[test]
+    fn a_passthrough_chain_accumulates_every_hop() {
+        // The audio-tail shape that shed in the field (#189): decoder →
+        // downmix → gain → sink, all passthrough, all default-capacity
+        // links. The decoder's arena must cover every channel in the chain.
+        struct Forwarder;
+        impl crate::element::Element for Forwarder {
+            fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
+                Ok(Some(buffer))
+            }
+            fn passthrough(&self) -> bool {
+                true
+            }
+        }
+
+        let mut pipeline = Pipeline::new();
+        let src = pipeline.add_source("src", CountingSource { count: 0, max: 0 });
+        let a = pipeline.add_filter("a", Forwarder);
+        let b = pipeline.add_filter("b", Forwarder);
+        let sink = pipeline.add_sink(
+            "sink",
+            CountingSink {
+                received: Arc::new(AtomicU64::new(0)),
+            },
+        );
+        pipeline
+            .link_pads_full(src, "src", a, "sink", LinkPolicy::Block, Some(4))
+            .unwrap();
+        pipeline
+            .link_pads_full(a, "src", b, "sink", LinkPolicy::Block, Some(4))
+            .unwrap();
+        pipeline
+            .link_pads_full(b, "src", sink, "sink", LinkPolicy::Block, Some(4))
+            .unwrap();
+
+        let holds = HoldSnapshot::capture(&pipeline);
+        let executor = Executor::new();
+        let budget = executor.output_slot_budget(&pipeline, src, 0, &holds);
+        assert_eq!(budget.downstream_capacity, 4 + 4 + 4);
     }
 
     #[test]
@@ -5725,7 +5915,7 @@ mod tests {
         let executor = Executor::with_config(ExecutorConfig::default().with_channel_capacity(256));
 
         let slots = executor
-            .output_slot_budget(&pipeline, src, 0)
+            .output_slot_budget(&pipeline, src, 0, &HoldSnapshot::default())
             .resolve(defaults::MIN_OUTPUT_SLOT_COUNT, 4096);
         assert!(
             slots > 256,

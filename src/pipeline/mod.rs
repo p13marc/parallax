@@ -84,7 +84,8 @@ pub use rt_scheduler::{
 pub use seek::{DurationQuery, LatencyRange, PositionQuery, SeekTranslation, SeekableQuery};
 pub use tags::{TagList, TagMergeMode, TagValue};
 pub use tracer::{
-    DropTracer, ElementStats, FramerateTracer, LatencyTracer, PipelineStats, Tracer, TracerRegistry,
+    DropTracer, ElementStats, FramerateTracer, LatencyTracer, PipelineStats, Tracer,
+    TracerInterests, TracerRegistry,
 };
 pub use typefind::{MediaType, TypeFindProbability, TypeFindRegistry, TypeFindResult};
 // Unified executor (primary API)

@@ -21,7 +21,7 @@ use parallax::elements::{
     VideoWindowEvent, VorbisDecoder, VpxDecoder,
 };
 use parallax::pipeline::typefind::{MediaType, TypeFindRegistry};
-use parallax::pipeline::{EndReason, Executor, LinkPolicy, Pipeline};
+use parallax::pipeline::{EndReason, Executor, ExecutorConfig, LinkPolicy, Pipeline};
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -42,6 +42,18 @@ struct Args {
     /// Loop playback when the stream ends.
     #[arg(long = "loop")]
     loop_playback: bool,
+
+    /// dav1d frame-delay bound (AV1 only): 0 = library auto. Small values
+    /// bound the picture pool (~3.5 MB each) but measurably raise decode
+    /// CPU — constrained frame-threading keeps the worker pool busier for
+    /// the same work — so the default stays auto.
+    #[arg(long, default_value_t = 0)]
+    frame_delay: u32,
+
+    /// Depth of the unlabelled tail links (decode→convert→display, audio
+    /// tail). Deeper = more read-ahead and pinned arena slots.
+    #[arg(long, default_value_t = 4)]
+    channel_capacity: usize,
 }
 
 /// Why one playback pass ended.
@@ -332,15 +344,18 @@ fn open_and_probe(args: &Args) -> anyhow::Result<Probed> {
 
     let (source, summary) = match media_type {
         MediaType::Mp4 => {
-            let demux = Mp4Demux::new(BufReader::new(file), size)
+            let demux = Mp4Demux::new(BufReader::with_capacity(1 << 20, file), size)
                 .with_context(|| format!("{} is not a readable MP4", args.file.display()))?;
             let summary = probe_mp4(args, &demux);
             (ProbedSource::Mp4(demux), summary)
         }
         MediaType::Matroska | MediaType::WebM => {
-            let demux = MkvDemux::new(BufReader::new(file)).with_context(|| {
-                format!("{} is not a readable Matroska/WebM", args.file.display())
-            })?;
+            // 1 MiB: the matroska parser issues many small reads through a
+            // mutex'd SharedReader, inline on a tokio worker.
+            let demux =
+                MkvDemux::new(BufReader::with_capacity(1 << 20, file)).with_context(|| {
+                    format!("{} is not a readable Matroska/WebM", args.file.display())
+                })?;
             let summary = probe_mkv(args, &demux);
             (ProbedSource::Mkv(demux), summary)
         }
@@ -430,6 +445,12 @@ fn command_for_terminal() -> Option<Command> {
 struct DropCounter(Arc<AtomicU64>);
 
 impl parallax::pipeline::tracer::Tracer for DropCounter {
+    // Drops only (#189): without this, registering the tracer puts a mutex +
+    // clock read on every buffer at every hop for two hooks it ignores.
+    fn interests(&self) -> parallax::pipeline::tracer::TracerInterests {
+        parallax::pipeline::tracer::TracerInterests::DROP
+    }
+
     fn on_drop(&self, _element_name: &str, _ts: std::time::Instant) {
         self.0.fetch_add(1, Ordering::Relaxed);
     }
@@ -651,7 +672,14 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
         VideoCodecKind::H264 => pipeline.add_filter("decode", H264Decoder::new()?),
         VideoCodecKind::Vp8 => pipeline.add_filter("decode", VpxDecoder::vp8()?),
         VideoCodecKind::Vp9 => pipeline.add_filter("decode", VpxDecoder::vp9()?),
-        VideoCodecKind::Av1 => pipeline.add_filter("decode", Dav1dDecoder::new()?),
+        // max_frame_delay=2 bounds dav1d's internal picture pool (auto
+        // delay on an 8-thread machine holds ~8 pictures ≈ tens of MB at
+        // 1080p and ~8 frames of latency) — a player wants the bound, a
+        // transcode wants the throughput default (#189).
+        VideoCodecKind::Av1 => pipeline.add_filter(
+            "decode",
+            Dav1dDecoder::new()?.with_max_frame_delay(args.frame_delay)?,
+        ),
         VideoCodecKind::Other(codec) => bail!("video track is {codec} — no decoder for it yet"),
     };
     let cvt = pipeline.add_filter("convert", convert);
@@ -693,7 +721,12 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
         pipeline.link(avolume, aout)?;
     }
 
-    let executor = Executor::new();
+    // Default-capacity (16) tail links ahead of a paced sink only add
+    // latency and pin arena slots — 4 is a 66 ms cushion at 60 fps (#189).
+    // The explicit pad links (video 24 / audio 96) keep their depths.
+    let executor = Executor::with_config(
+        ExecutorConfig::default().with_channel_capacity(args.channel_capacity),
+    );
     let mut handle = executor
         .start(&mut pipeline)
         .context("failed to start the pipeline")?;

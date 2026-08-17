@@ -108,6 +108,12 @@ impl Default for Inspect {
 }
 
 impl Element for Inspect {
+    // #189: may forward the input buffer — the upstream producer's arena
+    // budget accumulates through this element.
+    fn passthrough(&self) -> bool {
+        true
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         self.count += 1;
         self.bytes += buffer.len() as u64;

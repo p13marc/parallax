@@ -722,7 +722,7 @@ impl TsDemux {
         let stats = Arc::new(Mutex::new(TsDemuxStats::default()));
         let arena = Arc::new(Mutex::new(
             OutputArena::new(defaults::TS_DEMUX_SLOT_COUNT)
-                .with_min_slot_size(defaults::TS_DEMUX_SLOT_SIZE)
+                .with_min_slot_size(defaults::DEMUX_MIN_SLOT_SIZE)
                 .grow_to_fit(),
         ));
         let mut ctx = TsDemuxContext::new(output.clone(), stats.clone(), arena.clone());
@@ -746,7 +746,7 @@ impl TsDemux {
         let stats = Arc::new(Mutex::new(TsDemuxStats::default()));
         let arena = Arc::new(Mutex::new(
             OutputArena::new(defaults::TS_DEMUX_SLOT_COUNT)
-                .with_min_slot_size(defaults::TS_DEMUX_SLOT_SIZE)
+                .with_min_slot_size(defaults::DEMUX_MIN_SLOT_SIZE)
                 .grow_to_fit(),
         ));
         let mut ctx =

@@ -93,6 +93,11 @@ fn wake_display(proxy: &SharedProxy) {
 /// behind it, so showing it costs the *next* frame its slot too.
 const DEFAULT_MAX_LATENESS: Duration = Duration::from_millis(40);
 
+/// Depth of the consume-task → display-thread frame channel. Each queued
+/// frame is a zero-copy `Buffer` clone pinning a producer arena slot, so
+/// this plus the presented frame is what `retained_buffers()` reports.
+const DISPLAY_QUEUE_DEPTH: usize = 3;
+
 /// Longest single wait the pacer will ask for.
 ///
 /// A stream whose timestamps jump forward (a bad demuxer, a wrapped RTP clock)
@@ -526,11 +531,11 @@ impl AutoVideoSink {
         self.width.store(initial_width, Ordering::SeqCst);
         self.height.store(initial_height, Ordering::SeqCst);
 
-        // Bounded channel for backpressure (8 frames buffer)
         // Shallow on purpose: each queued frame pins an upstream arena slot
-        // (see DisplayFrame). 3 in flight + 1 presented stays well inside the
-        // producer's IN_FLIGHT_MARGIN.
-        let (sender, receiver) = mpsc::sync_channel::<DisplayFrame>(3);
+        // (see DisplayFrame). Declared to the executor via
+        // `retained_buffers()` (#189) so the producer's arena is sized for
+        // the queue plus the presented frame.
+        let (sender, receiver) = mpsc::sync_channel::<DisplayFrame>(DISPLAY_QUEUE_DEPTH);
 
         let running = Arc::clone(&self.running);
         let title = self.title.clone();
@@ -597,6 +602,13 @@ impl AsyncSink for AutoVideoSink {
     /// the aggregator stages at most ~one event per second of running time.
     fn take_upstream_event(&mut self) -> Option<crate::event::Event> {
         self.qos.take().map(crate::event::Event::Qos)
+    }
+
+    /// The display thread holds up to `DISPLAY_QUEUE_DEPTH` queued frames
+    /// plus the currently presented one, each a zero-copy `Buffer` clone
+    /// pinning a producer arena slot (#189).
+    fn retained_buffers(&self) -> usize {
+        DISPLAY_QUEUE_DEPTH + 1
     }
 
     /// Instant rate change (#165): `seek.rate` replaces the current

@@ -81,6 +81,12 @@ impl Default for AudioDownmix {
 }
 
 impl Element for AudioDownmix {
+    // #189: may forward the input buffer — the upstream producer's arena
+    // budget accumulates through this element.
+    fn passthrough(&self) -> bool {
+        true
+    }
+
     fn set_output_budget(&mut self, budget: OutputBudget) {
         self.output.set_budget(budget);
     }

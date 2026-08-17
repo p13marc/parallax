@@ -38,11 +38,53 @@ use crate::buffer::Buffer;
 // Tracer Trait
 // ============================================================================
 
+/// Which per-buffer hooks a tracer actually implements (#189).
+///
+/// The per-buffer hooks are called from inside element tasks — a registered
+/// tracer used to cost every buffer at every hop a mutex round-trip, an
+/// `Instant::now()` and a `catch_unwind` *per hook*, even for hooks it left
+/// as no-ops. Declaring interests lets the registry skip hooks nobody
+/// implements. The rare lifecycle hooks (`on_pipeline_start`/`stop`,
+/// `report`) are always delivered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TracerInterests(u8);
+
+impl TracerInterests {
+    /// `on_buffer`.
+    pub const BUFFER: Self = Self(1);
+    /// `on_buffer_processed`.
+    pub const BUFFER_PROCESSED: Self = Self(1 << 1);
+    /// `on_drop`.
+    pub const DROP: Self = Self(1 << 2);
+    /// Every hook — the safe default.
+    pub const ALL: Self = Self(0b111);
+
+    /// Combine two interest sets.
+    pub const fn and(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Does this set include every hook in `other`?
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+}
+
 /// Hook points where tracers observe pipeline behavior.
 ///
 /// All methods have default no-op implementations. Override only the
-/// hooks you need for your tracer.
+/// hooks you need for your tracer — and declare them in
+/// [`interests`](Tracer::interests) so unimplemented hot-path hooks cost
+/// nothing.
 pub trait Tracer: Send + Sync {
+    /// Which per-buffer hooks this tracer implements. Default: all of them,
+    /// so an undeclared tracer keeps working; a tracer that only counts
+    /// drops should return [`TracerInterests::DROP`] and take its two
+    /// no-op hooks off every buffer's hot path.
+    fn interests(&self) -> TracerInterests {
+        TracerInterests::ALL
+    }
+
     /// Called when a buffer passes through a source's output pad.
     fn on_buffer(&self, _element_name: &str, _buffer: &Buffer, _ts: Instant) {}
 
@@ -81,6 +123,37 @@ pub struct TracerRegistry {
     /// with no tracers, every buffer used to pay two mutex round-trips and
     /// two `Instant::now()` clock reads per element hop.
     count: Arc<std::sync::atomic::AtomicUsize>,
+    /// Per-hook interested-tracer counts (#189) — the same fast path, per
+    /// hook: a drops-only tracer must not put `on_buffer`/`on_buffer_processed`
+    /// back on every buffer's hot path.
+    hooks: Arc<HookCounts>,
+}
+
+#[derive(Default)]
+struct HookCounts {
+    buffer: std::sync::atomic::AtomicUsize,
+    buffer_processed: std::sync::atomic::AtomicUsize,
+    drop: std::sync::atomic::AtomicUsize,
+}
+
+impl HookCounts {
+    /// Recompute from the surviving tracers — runs under the registry lock,
+    /// on add and on panic-removal.
+    fn refresh(&self, tracers: &[Box<dyn Tracer>]) {
+        use std::sync::atomic::Ordering;
+        let mut buffer = 0;
+        let mut processed = 0;
+        let mut drop = 0;
+        for tracer in tracers {
+            let interests = tracer.interests();
+            buffer += usize::from(interests.contains(TracerInterests::BUFFER));
+            processed += usize::from(interests.contains(TracerInterests::BUFFER_PROCESSED));
+            drop += usize::from(interests.contains(TracerInterests::DROP));
+        }
+        self.buffer.store(buffer, Ordering::Release);
+        self.buffer_processed.store(processed, Ordering::Release);
+        self.drop.store(drop, Ordering::Release);
+    }
 }
 
 /// A tracer's name, or a stand-in if asking for it also panics.
@@ -120,6 +193,7 @@ impl TracerRegistry {
         tracers.push(tracer);
         self.count
             .store(tracers.len(), std::sync::atomic::Ordering::Release);
+        self.hooks.refresh(&tracers);
     }
 
     /// Check if any tracers are registered (lock-free).
@@ -165,12 +239,14 @@ impl TracerRegistry {
             }
             self.count
                 .store(tracers.len(), std::sync::atomic::Ordering::Release);
+            self.hooks.refresh(&tracers);
         }
     }
 
     /// Notify all tracers of a buffer.
     pub fn notify_buffer(&self, element_name: &str, buffer: &Buffer) {
-        if self.is_empty() {
+        use std::sync::atomic::Ordering;
+        if self.hooks.buffer.load(Ordering::Acquire) == 0 {
             return;
         }
         let ts = Instant::now();
@@ -179,7 +255,8 @@ impl TracerRegistry {
 
     /// Notify all tracers of a processed buffer.
     pub fn notify_buffer_processed(&self, element_name: &str) {
-        if self.is_empty() {
+        use std::sync::atomic::Ordering;
+        if self.hooks.buffer_processed.load(Ordering::Acquire) == 0 {
             return;
         }
         let ts = Instant::now();
@@ -190,7 +267,8 @@ impl TracerRegistry {
 
     /// Notify all tracers of a dropped buffer.
     pub fn notify_drop(&self, element_name: &str) {
-        if self.is_empty() {
+        use std::sync::atomic::Ordering;
+        if self.hooks.drop.load(Ordering::Acquire) == 0 {
             return;
         }
         let ts = Instant::now();
@@ -280,6 +358,10 @@ impl Default for LatencyTracer {
 }
 
 impl Tracer for LatencyTracer {
+    fn interests(&self) -> TracerInterests {
+        TracerInterests::BUFFER.and(TracerInterests::BUFFER_PROCESSED)
+    }
+
     fn on_buffer(&self, element_name: &str, _buffer: &Buffer, ts: Instant) {
         self.pending
             .lock()
@@ -365,6 +447,10 @@ impl Default for FramerateTracer {
 }
 
 impl Tracer for FramerateTracer {
+    fn interests(&self) -> TracerInterests {
+        TracerInterests::BUFFER
+    }
+
     fn on_buffer(&self, element_name: &str, _buffer: &Buffer, ts: Instant) {
         let mut stats = self.stats.lock().unwrap();
         let entry = stats
@@ -433,6 +519,10 @@ impl Default for DropTracer {
 }
 
 impl Tracer for DropTracer {
+    fn interests(&self) -> TracerInterests {
+        TracerInterests::DROP
+    }
+
     fn on_drop(&self, element_name: &str, _ts: Instant) {
         let mut drops = self.drops.lock().unwrap();
         *drops.entry(element_name.to_string()).or_insert(0) += 1;
@@ -615,6 +705,66 @@ mod tests {
         let registry = TracerRegistry::new();
         let reports = registry.reports();
         assert!(reports.is_empty());
+    }
+
+    #[test]
+    fn a_drops_only_tracer_keeps_buffer_hooks_off_the_hot_path() {
+        // #189: interests gate the per-hook fast path. The panicking
+        // `on_buffer` proves the point — if the registry called it, the
+        // tracer would be removed and the drop below would go uncounted.
+        struct DropsOnly(Arc<std::sync::atomic::AtomicUsize>);
+        impl Tracer for DropsOnly {
+            fn interests(&self) -> TracerInterests {
+                TracerInterests::DROP
+            }
+            fn on_buffer(&self, _e: &str, _b: &Buffer, _ts: Instant) {
+                panic!("on_buffer must not be dispatched to a drops-only tracer");
+            }
+            fn on_drop(&self, _e: &str, _ts: Instant) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            fn name(&self) -> &str {
+                "drops-only"
+            }
+        }
+
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let registry = TracerRegistry::new();
+        registry.add(Box::new(DropsOnly(drops.clone())));
+
+        let buffer = make_test_buffer();
+        registry.notify_buffer("source", &buffer);
+        registry.notify_buffer_processed("source");
+        registry.notify_drop("source");
+
+        assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(registry.len(), 1, "the tracer must not have been removed");
+    }
+
+    #[test]
+    fn interests_refresh_after_a_panicking_tracer_is_removed() {
+        // A BUFFER-interested tracer that panics is removed; the buffer hook
+        // count must drop back to zero with it.
+        struct Panics;
+        impl Tracer for Panics {
+            fn interests(&self) -> TracerInterests {
+                TracerInterests::BUFFER
+            }
+            fn on_buffer(&self, _e: &str, _b: &Buffer, _ts: Instant) {
+                panic!("boom");
+            }
+            fn name(&self) -> &str {
+                "panics"
+            }
+        }
+
+        let registry = TracerRegistry::new();
+        registry.add(Box::new(Panics));
+        let buffer = make_test_buffer();
+        registry.notify_buffer("source", &buffer);
+        assert_eq!(registry.len(), 0);
+        use std::sync::atomic::Ordering;
+        assert_eq!(registry.hooks.buffer.load(Ordering::Acquire), 0);
     }
 
     #[test]

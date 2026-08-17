@@ -162,6 +162,12 @@ impl crate::control::Controllable for Gain {
 }
 
 impl Element for Gain {
+    // #189: may forward the input buffer — the upstream producer's arena
+    // budget accumulates through this element.
+    fn passthrough(&self) -> bool {
+        true
+    }
+
     fn process(&mut self, mut buffer: Buffer) -> Result<Option<Buffer>> {
         // Metadata first, before any fast path: erroring only once the
         // factor moves off unity would let a mis-wired pipeline play fine

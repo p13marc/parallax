@@ -46,6 +46,10 @@ use super::common::{PixelFormat, VideoFrame};
 /// ```
 pub struct Dav1dDecoder {
     decoder: dav1d::Decoder,
+    /// The settings the decoder was built with, kept so the `with_*`
+    /// builders can rebuild it (#189). dav1d only takes settings at
+    /// construction.
+    settings: dav1d::Settings,
     frame_count: u64,
     /// Arena for output buffer allocation.
     output: OutputArena,
@@ -63,26 +67,34 @@ pub struct Dav1dDecoder {
 }
 
 impl Dav1dDecoder {
-    /// Create a new dav1d decoder with default settings.
+    /// Create a new dav1d decoder with default settings (auto threads, auto
+    /// frame delay, film-grain synthesis on).
     pub fn new() -> Result<Self> {
-        let settings = dav1d::Settings::new();
-        let decoder = dav1d::Decoder::with_settings(&settings)
-            .map_err(|e| Error::Config(format!("Failed to create dav1d decoder: {:?}", e)))?;
-
-        Ok(Self::from_decoder(decoder))
+        Self::build(dav1d::Settings::new())
     }
 
     /// Create a decoder with custom settings.
+    ///
+    /// Prefer the `with_*` builders for the common knobs — they keep the
+    /// caller off the `dav1d` crate.
     pub fn with_settings(settings: &dav1d::Settings) -> Result<Self> {
-        let decoder = dav1d::Decoder::with_settings(settings)
-            .map_err(|e| Error::Config(format!("Failed to create dav1d decoder: {:?}", e)))?;
-
-        Ok(Self::from_decoder(decoder))
+        // dav1d::Settings is not Clone; round-trip the values we expose.
+        let mut own = dav1d::Settings::new();
+        own.set_n_threads(settings.get_n_threads());
+        own.set_max_frame_delay(settings.get_max_frame_delay());
+        own.set_apply_grain(settings.get_apply_grain());
+        own.set_operating_point(settings.get_operating_point());
+        own.set_all_layers(settings.get_all_layers());
+        own.set_frame_size_limit(settings.get_frame_size_limit());
+        Self::build(own)
     }
 
-    fn from_decoder(decoder: dav1d::Decoder) -> Self {
-        Self {
+    fn build(settings: dav1d::Settings) -> Result<Self> {
+        let decoder = dav1d::Decoder::with_settings(&settings)
+            .map_err(|e| Error::Config(format!("Failed to create dav1d decoder: {:?}", e)))?;
+        Ok(Self {
             decoder,
+            settings,
             frame_count: 0,
             output: OutputArena::new(defaults::VIDEO_DECODER_SLOT_COUNT),
             ready: std::collections::VecDeque::new(),
@@ -90,7 +102,42 @@ impl Dav1dDecoder {
             last_dims: None,
             frames_out: 0,
             clip: Default::default(),
-        }
+        })
+    }
+
+    /// Rebuild the decoder from `self.settings`. Builders only — dav1d takes
+    /// settings at construction, and a rebuild discards decode state, so this
+    /// must run before any data is fed.
+    fn reconfigure(mut self) -> Result<Self> {
+        self.decoder = dav1d::Decoder::with_settings(&self.settings)
+            .map_err(|e| Error::Config(format!("Failed to create dav1d decoder: {:?}", e)))?;
+        Ok(self)
+    }
+
+    /// Decoder worker threads. `0` (the default) lets dav1d use every
+    /// logical core.
+    pub fn with_threads(mut self, n_threads: u32) -> Result<Self> {
+        self.settings.set_n_threads(n_threads);
+        self.reconfigure()
+    }
+
+    /// Cap dav1d's internal frame-delay pipeline (#189).
+    ///
+    /// `0` (the default) derives the delay from the thread count — on an
+    /// 8-thread machine that holds ~8 internal pictures (~25-50 MB at
+    /// 1080p) and adds ~8 frames of latency. A player wants a small bound
+    /// (2 is comfortable for 1080p60 on a desktop); a throughput transcode
+    /// wants the default.
+    pub fn with_max_frame_delay(mut self, max_frame_delay: u32) -> Result<Self> {
+        self.settings.set_max_frame_delay(max_frame_delay);
+        self.reconfigure()
+    }
+
+    /// Toggle film-grain synthesis (default on). Turning it off trades
+    /// fidelity on grainy streams for decode time.
+    pub fn with_apply_grain(mut self, apply_grain: bool) -> Result<Self> {
+        self.settings.set_apply_grain(apply_grain);
+        self.reconfigure()
     }
 
     /// Get the number of frames decoded.

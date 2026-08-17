@@ -444,7 +444,7 @@ impl<R: Read + Seek> MkvDemux<R> {
             stripped_prefix: Vec::new(),
             default_duration_ns: Vec::new(),
             output: OutputArena::new(defaults::MP4_DEMUX_SLOT_COUNT)
-                .with_min_slot_size(defaults::MP4_DEMUX_SLOT_SIZE)
+                .with_min_slot_size(defaults::DEMUX_MIN_SLOT_SIZE)
                 .grow_to_fit(),
             frame: Frame::default(),
             looping: false,

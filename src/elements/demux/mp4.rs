@@ -641,7 +641,7 @@ impl<R: Read + Seek> Mp4Demux<R> {
             sample_indices,
             avc_configs,
             output: OutputArena::new(defaults::MP4_DEMUX_SLOT_COUNT)
-                .with_min_slot_size(defaults::MP4_DEMUX_SLOT_SIZE)
+                .with_min_slot_size(defaults::DEMUX_MIN_SLOT_SIZE)
                 .grow_to_fit(),
             adts_aac: false,
         })
