@@ -69,7 +69,7 @@ parallax-macros = { package = "parallax-pipeline-macros", version = "0.1.2", pat
 ureq = { version = "3", optional = true }
 
 # WebSocket (optional)
-tungstenite = { version = "0.29", optional = true }
+tungstenite = { version = "0.30", optional = true }
 
 # Zenoh pub/sub (optional)
 zenoh = { version = "1.9", optional = true }
@@ -146,7 +146,7 @@ oxideav-ac3 = { version = "=0.0.10", optional = true }
 oxideav-core = { version = "0.1", optional = true }
 
 # AAC audio encoder (bindings to FDK-AAC - note license restrictions)
-fdk-aac = { version = "0.6", optional = true }
+fdk-aac = { version = "0.8", optional = true }
 
 # PipeWire (audio/video capture and playback)
 pipewire = { version = "0.10", optional = true }
@@ -160,16 +160,16 @@ v4l = { version = "0.14", optional = true }
 
 # V4L2 M2M stateful hardware codecs (pinned: 0.0.x API is unstable;
 # builds bindings from kernel headers, needs libclang at build time)
-v4l2r = { version = "=0.0.7", optional = true }
+v4l2r = { version = "=0.0.8", optional = true }
 
 # udev device monitoring (hotplug)
 udev = { version = "0.9", features = ["send"], optional = true }
 
 # ALSA (fallback audio capture/playback)
-alsa = { version = "0.9", optional = true }
+alsa = { version = "0.12", optional = true }
 
 # XDG Portal (for screen capture permissions on Wayland)
-ashpd = { version = "0.10", optional = true, default-features = false, features = ["tokio"] }
+ashpd = { version = "0.13", optional = true, default-features = false, features = ["tokio"] }
 
 # Regex (for RegexFilter)
 regex = "1"
