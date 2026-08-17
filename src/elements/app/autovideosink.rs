@@ -701,18 +701,35 @@ impl AsyncSink for AutoVideoSink {
         let meta = ctx.metadata();
         let format = meta.video_pixel_format().unwrap_or(PixelFormat::Rgba);
 
+        // A strided frame (#194: External zero-copy from a decoder)
+        // declares its real layout; the size gate must judge against THAT,
+        // not the packed size — a strided frame is larger.
+        let strided = meta
+            .has_strided_planes()
+            .then(|| meta.plane_layout())
+            .flatten();
+
         // Dimensions: prefer per-buffer metadata (`MediaFormat::VideoRaw`,
         // the single geometry representation since #160); for RGBA/BGRA,
         // fall back to guessing from the buffer size. YUV frames REQUIRE
         // declared geometry — plane layout is unrecoverable without it.
         let (width, height) = match format {
             PixelFormat::I420 | PixelFormat::Nv12 => match meta.video_dims() {
-                Some((w, h)) if w > 0 && h > 0 && data.len() >= present::yuv420_len(w, h) => (w, h),
+                Some((w, h)) if w > 0 && h > 0 => {
+                    let need = strided
+                        .map(|l| l.required_len(format, w, h))
+                        .unwrap_or_else(|| present::yuv420_len(w, h));
+                    if data.len() < need {
+                        return Err(Error::Element(format!(
+                            "autovideosink: {format:?} buffer is {} bytes but {w}x{h} needs {need}",
+                            data.len(),
+                        )));
+                    }
+                    (w, h)
+                }
                 Some((w, h)) => {
                     return Err(Error::Element(format!(
-                        "autovideosink: {format:?} buffer is {} bytes but {w}x{h} needs {}",
-                        data.len(),
-                        present::yuv420_len(w, h)
+                        "autovideosink: {format:?} buffer declares degenerate geometry {w}x{h}"
                     )));
                 }
                 None => {
@@ -815,11 +832,13 @@ impl AsyncSink for AutoVideoSink {
 
         let frame = DisplayFrame {
             // Refcount bump, not a copy: the display thread maps the same
-            // arena slot the producer wrote (#141).
+            // arena slot — or pins the same decoder picture (#194) — the
+            // producer wrote (#141).
             data: ctx.buffer().clone(),
             width,
             height,
             format,
+            layout: strided,
         };
 
         // A full channel means the display cannot keep up. Shed this frame and
@@ -866,15 +885,26 @@ impl AsyncSink for AutoVideoSink {
         // from every source format, so auto-inserted converters keep
         // working everywhere; BGRA is the CPU blit's fast path (its LE u32
         // is softbuffer's 0RGB layout).
-        let formats = if self.gpu_effective() {
-            vec![
-                PixelFormat::I420,
-                PixelFormat::Nv12,
-                PixelFormat::Bgra,
-                PixelFormat::Rgba,
-            ]
+        // With the GPU path the sink also opts into External memory
+        // (#194): wgpu uploads strided decoder-owned frames natively
+        // (bytes_per_row), so a dav1d picture reaches the texture with
+        // zero CPU copies; the CpuBackend runtime degradation repacks.
+        // Without a GPU the caps stay cpu_only — the packed contract.
+        let (formats, memory) = if self.gpu_effective() {
+            (
+                vec![
+                    PixelFormat::I420,
+                    PixelFormat::Nv12,
+                    PixelFormat::Bgra,
+                    PixelFormat::Rgba,
+                ],
+                MemoryCaps::external_or_cpu(),
+            )
         } else {
-            vec![PixelFormat::Rgba, PixelFormat::Bgra]
+            (
+                vec![PixelFormat::Rgba, PixelFormat::Bgra],
+                MemoryCaps::cpu_only(),
+            )
         };
         ElementMediaCaps::new([FormatMemoryCap::new(
             FormatCaps::VideoRaw(VideoFormatCaps {
@@ -884,7 +914,7 @@ impl AsyncSink for AutoVideoSink {
                 framerate: CapsValue::Any,
                 layout: MemoryLayout::NONE,
             }),
-            MemoryCaps::cpu_only(),
+            memory,
         )])
     }
 }

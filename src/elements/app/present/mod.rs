@@ -32,7 +32,7 @@ pub(crate) mod wgpu_backend;
 /// `Buffer` is also what keeps a future dmabuf frame (#62) a backend
 /// branch instead of a trait change.
 pub(crate) struct DisplayFrame {
-    /// Pixel data, arena-backed.
+    /// Pixel data, arena- or externally-backed (#194).
     pub(crate) data: Buffer,
     /// Frame width in pixels.
     pub(crate) width: u32,
@@ -41,6 +41,9 @@ pub(crate) struct DisplayFrame {
     /// Payload layout. Only `I420`, `Nv12`, `Rgba` and `Bgra` reach the
     /// display thread — the caps admit nothing else.
     pub(crate) format: PixelFormat,
+    /// Non-packed plane layout, when the producer declared one (#194):
+    /// External frames carry the decoder's real strides. `None` = packed.
+    pub(crate) layout: Option<crate::format::PlaneLayout>,
 }
 
 /// A display-thread-local presentation backend (deliberately not `Send`).
@@ -163,6 +166,9 @@ pub(crate) struct CpuBackend {
     /// fallback are converted here, then blitted as BGRA. Empty until the
     /// first YUV frame.
     scratch: Vec<u8>,
+    /// Strided (External) frames on the same degraded path are repacked
+    /// here first (#194) — one extra copy on a path that already warned.
+    repack_scratch: Vec<u8>,
     converter: Option<((PixelFormat, u32, u32), crate::converters::VideoConvert)>,
     warned_yuv: bool,
 }
@@ -178,12 +184,14 @@ impl CpuBackend {
             _context: context,
             blit_cache: BlitCache::default(),
             scratch: Vec::new(),
+            repack_scratch: Vec::new(),
             converter: None,
             warned_yuv: false,
         })
     }
 
-    /// Convert a YUV frame into `self.scratch` as BGRA.
+    /// Convert a YUV frame into `self.scratch` as BGRA, repacking a
+    /// strided frame through `repack_scratch` first (#194).
     fn convert_yuv(&mut self, frame: &DisplayFrame) -> Result<()> {
         use crate::converters::{PixelFormat as ConvFormat, VideoConvert};
         if !self.warned_yuv {
@@ -210,10 +218,24 @@ impl CpuBackend {
                 VideoConvert::new(conv_format, ConvFormat::Bgra, frame.width, frame.height)?,
             ));
         }
+        // Strided frame: row-copy into repack_scratch; packed frames read
+        // straight from the buffer. Field borrows below are disjoint
+        // (repack_scratch read, scratch written, converter read).
+        let packed: &[u8] = if let Some(layout) = frame.layout {
+            let (w, h, fmt) = (frame.width, frame.height, frame.format);
+            let packed_len = crate::format::PlaneLayout::packed(fmt, w, h).required_len(fmt, w, h);
+            self.repack_scratch.resize(packed_len, 0);
+            layout
+                .repack_into(frame.data.as_bytes(), fmt, w, h, &mut self.repack_scratch)
+                .map_err(Error::Element)?;
+            &self.repack_scratch
+        } else {
+            frame.data.as_bytes()
+        };
         let out_len = frame.width as usize * frame.height as usize * 4;
         self.scratch.resize(out_len, 0);
         let (_, converter) = self.converter.as_ref().expect("installed above");
-        converter.convert(frame.data.as_bytes(), &mut self.scratch)
+        converter.convert(packed, &mut self.scratch)
     }
 }
 
@@ -242,7 +264,10 @@ impl RenderBackend for CpuBackend {
             return Ok(());
         };
         let src: &[u8] = match frame.format {
-            PixelFormat::Bgra | PixelFormat::Rgba => frame.data.as_bytes(),
+            PixelFormat::Bgra | PixelFormat::Rgba => {
+                debug_assert!(frame.layout.is_none(), "no strided RGB producers exist");
+                frame.data.as_bytes()
+            }
             _ => &self.scratch,
         };
         blit_frame(
@@ -376,6 +401,7 @@ mod tests {
             width: w,
             height: h,
             format,
+            layout: None,
         }
     }
 
@@ -397,6 +423,7 @@ mod tests {
             width: 1,
             height: 1,
             format,
+            layout: None,
         }
     }
 
