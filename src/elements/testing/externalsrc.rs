@@ -76,11 +76,9 @@ fn strided_frame(seq: u64) -> Box<[u8]> {
 pub struct ExternalTestSrc {
     /// The "decoder-owned" frames; an in-flight slot pins its Arc clone.
     frames: Vec<Arc<Box<[u8]>>>,
-    /// Packed pattern seed per pool slot (rewritten on reuse).
-    /// Pool slots cycle: frame content for sequence `seq` lives in slot
-    /// `seq % pool`, so payloads are pre-built per slot from its first use
-    /// and reused as-is — tests compare against `seq`'s reference by
-    /// taking `seq % pool` into account via `slot_seed`.
+    /// Pool slots cycle: the frame for sequence `seq` is slot `seq % pool`,
+    /// whose payload was built once from that slot index — so consumers
+    /// verify against `packed_reference_frame(seq % pool)`.
     pool_size: u32,
     /// Indices currently free to hand out.
     available: VecDeque<u32>,

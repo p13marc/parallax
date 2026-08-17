@@ -127,6 +127,66 @@ fn av1_track_decodes() {
     }
 }
 
+/// #194: with External negotiated, the decoder emits its dav1d Pictures
+/// zero-copy — strided planes declared in metadata — and layout-directed
+/// reads reconstruct EXACTLY the frames the packed Cpu path copies out.
+#[cfg(feature = "av1-decode")]
+#[test]
+fn dav1d_external_emission_matches_packed_path() {
+    use parallax::element::Element;
+    use parallax::elements::Dav1dDecoder;
+    use parallax::memory::MemoryType;
+
+    let decode_all = |external: bool| -> Vec<parallax::buffer::Buffer> {
+        let mut demux = open();
+        let video_id = demux.video_track_id().unwrap();
+        let mut dec = Dav1dDecoder::new().unwrap();
+        if external {
+            dec.set_negotiated_memory(MemoryType::External);
+        }
+        let mut out = Vec::new();
+        while let Some(sample) = demux.read_sample(video_id).unwrap() {
+            if let Some(buf) = dec.process(sample.buffer).unwrap() {
+                out.push(buf);
+            }
+        }
+        while let Some(buf) = dec.flush().unwrap() {
+            out.push(buf);
+        }
+        out
+    };
+
+    let packed = decode_all(false);
+    let external = decode_all(true);
+    assert_eq!(packed.len(), 10);
+    assert_eq!(external.len(), 10);
+
+    for (p, e) in packed.iter().zip(&external) {
+        assert_eq!(e.memory_type(), MemoryType::External, "zero-copy emit");
+        assert_eq!(p.memory_type(), MemoryType::Cpu);
+        assert_eq!(p.metadata().pts, e.metadata().pts);
+
+        let meta = e.metadata();
+        let (w, h) = meta.video_dims().unwrap();
+        let fmt = meta.video_pixel_format().unwrap();
+        let layout = meta.plane_layout().expect("external frames declare planes");
+        let mut repacked = vec![0u8; layout.required_len(fmt, w, h)];
+        let n = layout
+            .repack_into(e.as_bytes(), fmt, w, h, &mut repacked)
+            .unwrap();
+        repacked.truncate(n);
+        assert_eq!(
+            repacked,
+            p.as_bytes(),
+            "layout-directed read matches the packed path byte-exactly"
+        );
+    }
+
+    // The Pictures outlive the decoder: `external` still readable here
+    // (decoder dropped inside decode_all).
+    assert!(external.iter().all(|b| !b.as_bytes().is_empty()));
+}
+
 /// #195: `send_data` holds the input `Buffer` zero-copy (no `to_vec`),
 /// releasing it from dav1d's data-release callback. Dropping the decoder
 /// joins dav1d's threads synchronously, so afterwards every input slot's

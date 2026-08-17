@@ -84,6 +84,20 @@ pub struct Dav1dDecoder {
     /// ACCURATE-seek clipping (#165): decoded frames below the current Time
     /// segment's start are dropped after decoding.
     clip: super::common::SegmentClip,
+    /// What the output link negotiated (#194). `Some(External)` switches
+    /// emit to zero-copy: the `dav1d::Picture` itself rides the pipeline
+    /// inside an `ExternalSlot`, strides declared via
+    /// `Metadata::set_video_planes` — no de-stride copy. Anything else
+    /// (or no negotiation) keeps the packed arena copy.
+    ///
+    /// Pinning bound: an in-flight External frame holds one Picture
+    /// (~frame-span bytes, malloc'd by dav1d's default allocator), bounded
+    /// by downstream retention (e.g. AutoVideoSink's display queue) plus
+    /// dav1d's own frame delay. Pictures are internally Arc'd with no
+    /// decoder back-reference, so buffers may outlive this element freely.
+    negotiated: Option<crate::memory::MemoryType>,
+    /// Warn-once latch for the plane-contiguity fallback.
+    warned_non_contiguous: bool,
 }
 
 impl Dav1dDecoder {
@@ -122,6 +136,8 @@ impl Dav1dDecoder {
             last_dims: None,
             frames_out: 0,
             clip: Default::default(),
+            negotiated: None,
+            warned_non_contiguous: false,
         })
     }
 
@@ -232,14 +248,117 @@ impl Dav1dDecoder {
         ))
     }
 
-    /// Build the output buffer for the oldest ready picture — the same
-    /// single de-stride copy as the steady-state path, just deferred to
-    /// emit time.
+    /// Build the output buffer for the oldest ready picture: zero-copy
+    /// External when the link negotiated it (#194), else the single
+    /// de-stride copy into an arena slot.
     fn emit_ready(&mut self) -> Result<Option<Buffer>> {
-        match self.ready.pop_front() {
-            Some(picture) => self.picture_to_slot(&picture).map(Some),
-            None => Ok(None),
+        let Some(picture) = self.ready.pop_front() else {
+            return Ok(None);
+        };
+        if self.negotiated == Some(crate::memory::MemoryType::External)
+            && let Some(buffer) = self.picture_to_external(&picture)?
+        {
+            return Ok(Some(buffer));
         }
+        self.picture_to_slot(&picture).map(Some)
+    }
+
+    /// Zero-copy emit (#194): wrap the `dav1d::Picture` (an internal Arc
+    /// clone) in an `ExternalSlot` and declare its real strides via
+    /// `Metadata::set_video_planes`. Returns `Ok(None)` when the picture's
+    /// planes are not one contiguous allocation — dav1d's default
+    /// allocator makes them so, but the API doesn't promise it — and the
+    /// caller falls back to the packed copy (legal on this link: every
+    /// External consumer also lists Cpu and reads layout from metadata).
+    fn picture_to_external(&mut self, picture: &dav1d::Picture) -> Result<Option<Buffer>> {
+        use dav1d::PlanarImageComponent as C;
+
+        let (format, h, ch, row_bytes_y, row_bytes_c, packed_total) =
+            Self::packed_geometry(picture)?;
+        let dims = (picture.width(), picture.height());
+
+        let y_ptr = picture.plane_data_ptr(C::Y) as *const u8 as usize;
+        let u_ptr = picture.plane_data_ptr(C::U) as *const u8 as usize;
+        let v_ptr = picture.plane_data_ptr(C::V) as *const u8 as usize;
+        let stride_y = picture.stride(C::Y) as usize;
+        let stride_c = picture.stride(C::U) as usize;
+
+        let planes = [
+            (y_ptr, stride_y, h, row_bytes_y),
+            (u_ptr, stride_c, ch, row_bytes_c),
+            (v_ptr, stride_c, ch, row_bytes_c),
+        ];
+        let base = planes.iter().map(|p| p.0).min().expect("3 planes");
+        let end = planes
+            .iter()
+            .map(|&(ptr, stride, rows, row_bytes)| {
+                ptr + stride * rows.saturating_sub(1) + row_bytes
+            })
+            .max()
+            .expect("3 planes");
+        let span = end - base;
+
+        // dav1d's internal allocator puts all three planes in ONE buffer
+        // (picture.c: y_sz + uv_sz*2 in a single aligned allocation), which
+        // is what makes the base..base+span slice sound. The bound below is
+        // a belt-and-braces guard against a hypothetical allocator with
+        // separate per-plane allocations: it must be generous, because the
+        // real allocator aligns strides to 128 bytes and plane heights to
+        // 128 rows — for a tiny frame the legitimate span is several times
+        // the packed size (observed 5.3x at 64x64).
+        if span > packed_total.saturating_mul(8).max(1 << 20) {
+            if !self.warned_non_contiguous {
+                self.warned_non_contiguous = true;
+                tracing::warn!(
+                    "dav1ddecoder: picture planes not contiguous (span {} vs packed {}); \
+                     falling back to packed copy-out",
+                    span,
+                    packed_total
+                );
+            }
+            return Ok(None);
+        }
+
+        let layout = crate::format::PlaneLayout::from_planes(&[
+            crate::format::PlaneDesc {
+                offset: y_ptr - base,
+                stride: stride_y,
+            },
+            crate::format::PlaneDesc {
+                offset: u_ptr - base,
+                stride: stride_c,
+            },
+            crate::format::PlaneDesc {
+                offset: v_ptr - base,
+                stride: stride_c,
+            },
+        ]);
+
+        // SAFETY: the cloned Picture (internally Arc'd, no decoder
+        // back-reference) keeps `base..base+span` alive and immutable for
+        // the slot's whole life; External buffers are never written.
+        let slot = unsafe {
+            crate::memory::ExternalSlot::new(
+                base as *const u8,
+                span,
+                picture.clone(),
+                "dav1d-picture",
+            )
+        };
+
+        self.frame_count += 1;
+        let pts = picture.timestamp().unwrap_or(0);
+        let mut metadata = self.claim_meta_for(pts);
+        metadata.pts = ClockTime::from_nanos(pts as u64);
+        metadata.sequence = self.frames_out;
+        self.frames_out += 1;
+        metadata.set_video_planes(dims.0, dims.1, format.into(), layout);
+        self.last_dims = Some(dims);
+
+        Ok(Some(Buffer::new(
+            MemoryHandle::from_external(std::sync::Arc::new(slot)),
+            metadata,
+        )))
     }
 
     /// Geometry of a picture in packed-output terms:
@@ -341,6 +460,35 @@ impl Dav1dDecoder {
 impl Element for Dav1dDecoder {
     fn set_output_budget(&mut self, budget: OutputBudget) {
         self.output.set_budget(budget);
+    }
+
+    fn set_negotiated_memory(&mut self, memory: crate::memory::MemoryType) {
+        self.negotiated = Some(memory);
+    }
+
+    fn output_media_caps(&self) -> crate::format::ElementMediaCaps {
+        use crate::format::{
+            CapsValue, ElementMediaCaps, FormatCaps, FormatMemoryCap, MemoryCaps, MemoryLayout,
+            VideoFormatCaps,
+        };
+        // External first (#194): an opted-in consumer (GPU present path)
+        // takes the dav1d Picture zero-copy; everyone else gets the packed
+        // Cpu copy the solver downgrades to.
+        ElementMediaCaps::new([FormatMemoryCap::new(
+            FormatCaps::VideoRaw(VideoFormatCaps {
+                width: CapsValue::Any,
+                height: CapsValue::Any,
+                pixel_format: CapsValue::List(vec![
+                    crate::format::PixelFormat::I420,
+                    crate::format::PixelFormat::I420_10Le,
+                    crate::format::PixelFormat::I422,
+                    crate::format::PixelFormat::I444,
+                ]),
+                framerate: CapsValue::Any,
+                layout: MemoryLayout::NONE,
+            }),
+            MemoryCaps::external_preferred(),
+        )])
     }
 
     // Decoders never skip an input: it would be a reference frame the
