@@ -147,3 +147,13 @@ bench-throughput:
 # python3-gobject + gstreamer1-rtsp-server)
 rtsp-server:
     ./scripts/rtsp_test_server.py
+
+# Decode-perf matrix (#192): build the player, run interleaved A/B/A
+# measurement passes over FILE. Extra configs via the script directly.
+decode-matrix FILE="~/Videos/boss_pokemon.webm":
+    cargo build -p parallax-player --release
+    ./scripts/decode_matrix.py --file {{FILE}} \
+        --config "baseline:" \
+        --config "t4:--dav1d-threads 4" \
+        --config "ahead16:--decode-ahead 16" \
+        --config "t4-ahead16:--dav1d-threads 4 --decode-ahead 16"

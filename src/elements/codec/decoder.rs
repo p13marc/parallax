@@ -26,7 +26,7 @@ use crate::element::{Element, ExecutionHints};
 use crate::error::{Error, Result};
 use crate::memory::{OutputArena, OutputBudget, defaults};
 
-use super::common::{PixelFormat, VideoFrame};
+use super::common::PixelFormat;
 
 /// AV1 software decoder using dav1d.
 ///
@@ -53,9 +53,13 @@ pub struct Dav1dDecoder {
     frame_count: u64,
     /// Arena for output buffer allocation.
     output: OutputArena,
-    /// Decoded frames waiting to be emitted (dav1d can release several
-    /// pictures after one send once its frame-delay pipeline fills).
-    ready: std::collections::VecDeque<VideoFrame>,
+    /// Decoded pictures waiting to be emitted (dav1d can release several
+    /// after one send once its frame-delay pipeline fills). Held as
+    /// `dav1d::Picture`s — refcounted views over dav1d-owned memory — so
+    /// queueing costs nothing and the single de-stride copy into an arena
+    /// slot happens at emit time (#195; the old owned-`VideoFrame` queue
+    /// paid a second full-frame copy on every queued picture).
+    ready: std::collections::VecDeque<dav1d::Picture>,
     /// Input metadata awaiting its decoded frame, matched by the pts that
     /// rides through dav1d as the packet timestamp.
     pending_meta: std::collections::VecDeque<crate::metadata::Metadata>,
@@ -116,6 +120,14 @@ impl Dav1dDecoder {
 
     /// Decoder worker threads. `0` (the default) lets dav1d use every
     /// logical core.
+    ///
+    /// At paced (realtime) rates, worker CPU scales with thread count
+    /// almost independently of the work (#192: 1080p60 on an 8-thread
+    /// machine measured ~0.45 cores at 2 threads vs ~2.3 at 8, identical
+    /// output) — idle workers churn on dav1d's task queues. A player
+    /// should size this to the stream (2 is ample for 1080p60, which
+    /// batch-decodes at ~3.7× realtime on 2 threads); a throughput
+    /// transcode wants the default.
     pub fn with_threads(mut self, n_threads: u32) -> Result<Self> {
         self.settings.set_n_threads(n_threads);
         self.reconfigure()
@@ -127,7 +139,10 @@ impl Dav1dDecoder {
     /// 8-thread machine that holds ~8 internal pictures (~25-50 MB at
     /// 1080p) and adds ~8 frames of latency. A player wants a small bound
     /// (2 is comfortable for 1080p60 on a desktop); a throughput transcode
-    /// wants the default.
+    /// wants the default. (#189 measured delay=2 raising decode CPU ~50%
+    /// at 8 threads; the #192 re-measure found it CPU-neutral — treat the
+    /// penalty as configuration-dependent and re-measure before relying
+    /// on either number.)
     pub fn with_max_frame_delay(mut self, max_frame_delay: u32) -> Result<Self> {
         self.settings.set_max_frame_delay(max_frame_delay);
         self.reconfigure()
@@ -145,24 +160,28 @@ impl Dav1dDecoder {
         self.frame_count
     }
 
+    /// Pull one picture off dav1d's output into `self.ready`.
+    ///
+    /// Returns whether a picture was obtained (`false` = `Again`, nothing
+    /// ready yet).
+    fn harvest_one(&mut self) -> Result<bool> {
+        match self.decoder.get_picture() {
+            Ok(picture) => {
+                self.ready.push_back(picture);
+                Ok(true)
+            }
+            Err(dav1d::Error::Again) => Ok(false),
+            Err(e) => Err(Error::InvalidSegment(format!(
+                "dav1d decode failed: {:?}",
+                e
+            ))),
+        }
+    }
+
     /// Drain every picture dav1d has ready into `self.ready`.
     fn drain_pictures(&mut self) -> Result<()> {
-        loop {
-            match self.decoder.get_picture() {
-                Ok(picture) => {
-                    let frame = self.picture_to_frame(&picture)?;
-                    self.frame_count += 1;
-                    self.ready.push_back(frame);
-                }
-                Err(dav1d::Error::Again) => return Ok(()), // nothing more yet
-                Err(e) => {
-                    return Err(Error::InvalidSegment(format!(
-                        "dav1d decode failed: {:?}",
-                        e
-                    )));
-                }
-            }
-        }
+        while self.harvest_one()? {}
+        Ok(())
     }
 
     /// Feed one temporal unit, honoring dav1d's flow control.
@@ -174,7 +193,10 @@ impl Dav1dDecoder {
         let mut result = self
             .decoder
             .send_data(input.to_vec(), None, Some(pts_ns), None);
-        loop {
+        // Bounded: each retry either lands the input or consumes output;
+        // hitting the bound means dav1d is refusing input while claiming no
+        // output exists, which is a decoder bug, not flow control.
+        for _ in 0..1024 {
             match result {
                 Ok(()) => return Ok(()),
                 Err(dav1d::Error::Again) => {
@@ -189,114 +211,18 @@ impl Dav1dDecoder {
                 }
             }
         }
+        Err(Error::InvalidSegment(
+            "dav1d refused input without releasing output".into(),
+        ))
     }
 
-    /// Build the output buffer for the oldest ready frame, claiming the
-    /// input metadata whose pts rode through dav1d as the timestamp.
+    /// Build the output buffer for the oldest ready picture — the same
+    /// single de-stride copy as the steady-state path, just deferred to
+    /// emit time.
     fn emit_ready(&mut self) -> Result<Option<Buffer>> {
-        let Some(frame) = self.ready.pop_front() else {
-            return Ok(None);
-        };
-
-        let dims = (frame.width, frame.height);
-        if self.last_dims.is_some_and(|last| last != dims) {
-            tracing::info!(
-                "dav1ddecoder: resolution changed to {}x{}, rebuilding the output arena",
-                dims.0,
-                dims.1
-            );
-            self.output.reset();
-        }
-        self.last_dims = Some(dims);
-
-        let mut slot = self.output.acquire(frame.data.len(), "dav1ddecoder")?;
-        slot.data_mut()[..frame.data.len()].copy_from_slice(&frame.data);
-
-        // The pts attached at send time comes back on the picture, so match
-        // the originating input's metadata by it.
-        let mut metadata = self.claim_meta_for(frame.pts);
-        metadata.pts = ClockTime::from_nanos(frame.pts as u64);
-        metadata.sequence = self.frames_out;
-        self.frames_out += 1;
-        metadata.set_video_dims(dims.0, dims.1, frame.format.into());
-
-        Ok(Some(Buffer::new(
-            MemoryHandle::with_len(slot, frame.data.len()),
-            metadata,
-        )))
-    }
-
-    /// Convert dav1d Picture to our VideoFrame.
-    fn picture_to_frame(&self, picture: &dav1d::Picture) -> Result<VideoFrame> {
-        let width = picture.width();
-        let height = picture.height();
-        let bit_depth = picture.bit_depth();
-
-        let format = match (picture.pixel_layout(), bit_depth) {
-            (dav1d::PixelLayout::I420, 8) => PixelFormat::I420,
-            (dav1d::PixelLayout::I420, 10) => PixelFormat::I420p10,
-            (dav1d::PixelLayout::I422, 8) => PixelFormat::I422,
-            (dav1d::PixelLayout::I444, 8) => PixelFormat::I444,
-            _ => {
-                return Err(Error::InvalidSegment(format!(
-                    "Unsupported pixel format: {:?} {}bit",
-                    picture.pixel_layout(),
-                    bit_depth
-                )));
-            }
-        };
-
-        // Downstream consumes packed planes (VideoConvert & friends assume
-        // tightly-packed I420), so strip dav1d's row padding while copying.
-        let bytes_per_sample = if bit_depth > 8 { 2 } else { 1 };
-        let (w, h) = (width as usize, height as usize);
-        let (cw, ch) = match format {
-            PixelFormat::I444 => (w, h),
-            PixelFormat::I422 => (w.div_ceil(2), h),
-            _ => (w.div_ceil(2), h.div_ceil(2)),
-        };
-
-        let stride_y = w * bytes_per_sample;
-        let stride_c = cw * bytes_per_sample;
-        let y_size = stride_y * h;
-        let c_size = stride_c * ch;
-
-        // Single allocation, no zero-fill: rows are appended in output
-        // order, so the Vec is exactly full when the copy finishes.
-        let mut data = Vec::with_capacity(y_size + 2 * c_size);
-        Self::append_packed_planes(picture, &mut data, h, ch, stride_y, stride_c);
-
-        Ok(VideoFrame {
-            width,
-            height,
-            format,
-            pts: picture.timestamp().unwrap_or(0),
-            data,
-            stride_y,
-            stride_u: stride_c,
-            stride_v: stride_c,
-        })
-    }
-
-    /// Append the picture's planes, de-strided, onto `out`.
-    fn append_packed_planes(
-        picture: &dav1d::Picture,
-        out: &mut Vec<u8>,
-        h: usize,
-        ch: usize,
-        stride_y: usize,
-        stride_c: usize,
-    ) {
-        for (component, rows, row_bytes) in [
-            (dav1d::PlanarImageComponent::Y, h, stride_y),
-            (dav1d::PlanarImageComponent::U, ch, stride_c),
-            (dav1d::PlanarImageComponent::V, ch, stride_c),
-        ] {
-            let plane = picture.plane(component);
-            let src_stride = picture.stride(component) as usize;
-            for row in 0..rows {
-                out.extend_from_slice(&plane[row * src_stride..row * src_stride + row_bytes]);
-            }
+        match self.ready.pop_front() {
+            Some(picture) => self.picture_to_slot(&picture).map(Some),
+            None => Ok(None),
         }
     }
 
@@ -413,33 +339,14 @@ impl Element for Dav1dDecoder {
         let pts = buffer.metadata().pts.nanos() as i64;
         self.send_frame(buffer.as_bytes(), pts)?;
 
-        // Steady state — nothing queued: the fresh picture de-strides
-        // straight into an arena slot, no intermediate frame (#139). Owned
-        // copies only happen when pictures burst faster than they're
-        // emitted (send_frame's Again drain, or >1 picture per send).
-        if self.ready.is_empty() {
-            match self.decoder.get_picture() {
-                Ok(picture) => {
-                    let out = self.picture_to_slot(&picture)?;
-                    self.drain_pictures()?; // surplus, if any → owned queue
-                    // ACCURATE clipping (#165): decoded, out-of-segment.
-                    if self.clip.clips(out.metadata().pts) {
-                        return Ok(None);
-                    }
-                    return Ok(Some(out));
-                }
-                Err(dav1d::Error::Again) => return Ok(None),
-                Err(e) => {
-                    return Err(Error::InvalidSegment(format!(
-                        "dav1d decode failed: {:?}",
-                        e
-                    )));
-                }
-            }
-        }
-        // Frames already queued: keep display order — append the fresh
-        // pictures, emit the oldest (skipping any that clip out-of-segment).
+        // Harvest whatever dav1d has finished; `Again` while its frame
+        // pipeline fills is the natural priming phase. (#192 measured the
+        // feeding pattern to be CPU-neutral — worker-thread count is the
+        // lever — so this stays the simple shape.)
         self.drain_pictures()?;
+
+        // Emit the oldest ready picture, skipping any that clip
+        // out-of-segment (#165). Empty while priming → None.
         loop {
             match self.emit_ready()? {
                 Some(b) if self.clip.clips(b.metadata().pts) => continue,
@@ -460,7 +367,7 @@ impl Element for Dav1dDecoder {
     /// EOS, one per call until empty.
     fn flush(&mut self) -> Result<Option<Buffer>> {
         // Loop, not a single step: a clipped frame must not end the drain —
-        // the executor stops calling flush() at the first None.
+        // the caller (the adapter's drain loop) stops at the first None.
         loop {
             if let Some(buf) = self.emit_ready()? {
                 if self.clip.clips(buf.metadata().pts) {
@@ -468,21 +375,9 @@ impl Element for Dav1dDecoder {
                 }
                 return Ok(Some(buf));
             }
-            match self.decoder.get_picture() {
-                Ok(picture) => {
-                    let out = self.picture_to_slot(&picture)?;
-                    if self.clip.clips(out.metadata().pts) {
-                        continue;
-                    }
-                    return Ok(Some(out));
-                }
-                Err(dav1d::Error::Again) => return Ok(None),
-                Err(e) => {
-                    return Err(Error::InvalidSegment(format!(
-                        "dav1d decode failed: {:?}",
-                        e
-                    )));
-                }
+            if !self.harvest_one()? {
+                // `Again` with no more input = the pipeline is empty.
+                return Ok(None);
             }
         }
     }

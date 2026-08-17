@@ -59,6 +59,31 @@ struct Args {
     /// tail). Deeper = more read-ahead and pinned arena slots.
     #[arg(long, default_value_t = 4)]
     channel_capacity: usize,
+
+    /// dav1d worker threads (AV1 only). 0 = pick from the stream: 2 up to
+    /// 1440p (measured #192: at paced 1080p60, 2 threads ≈ 0.45 cores vs
+    /// ≈ 2.3 with the full pool for identical output, and 2 threads still
+    /// batch-decode 1080p60 at 3.7× realtime), dav1d auto above.
+    #[arg(long, default_value_t = 0)]
+    dav1d_threads: u32,
+
+    /// Depth of the decode→display link: how many finished frames the
+    /// decoder may run ahead of the paced sink. Deeper lets the decoder
+    /// work in bursts with a full frame pipeline instead of one frame per
+    /// display interval (#192); each extra slot pins ~3.1 MB of arena at
+    /// 1080p (accounted, not leaked — the decoder arena is budget-sized).
+    #[arg(long, default_value_t = 4)]
+    decode_ahead: usize,
+
+    /// Present frames as fast as they decode instead of pacing to PTS —
+    /// the batch-decode-floor configuration for perf measurement.
+    #[arg(long)]
+    no_sync: bool,
+
+    /// Stop playback cleanly after this many seconds (0 = play to the
+    /// end). For scripted measurement runs.
+    #[arg(long, default_value_t = 0)]
+    exit_after: u64,
 }
 
 /// Why one playback pass ended.
@@ -648,7 +673,7 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
     // the pipeline clock instead of as fast as the decoder can go.
     let mut sink = AutoVideoSink::new()
         .with_title(title)
-        .with_sync(true)
+        .with_sync(!args.no_sync)
         .with_gpu(use_gpu);
     let window = sink.handle();
 
@@ -690,10 +715,24 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
         VideoCodecKind::H264 => pipeline.add_filter("decode", H264Decoder::new()?),
         VideoCodecKind::Vp8 => pipeline.add_filter("decode", VpxDecoder::vp8()?),
         VideoCodecKind::Vp9 => pipeline.add_filter("decode", VpxDecoder::vp9()?),
-        VideoCodecKind::Av1 => pipeline.add_filter(
-            "decode",
-            Dav1dDecoder::new()?.with_max_frame_delay(args.frame_delay)?,
-        ),
+        VideoCodecKind::Av1 => {
+            // Thread-count default is the #192 lever: at paced rates dav1d
+            // worker CPU scales with pool size (idle-worker task-queue
+            // churn), so size the pool to the stream instead of the
+            // machine. 2 threads hold 1080p60 with 3.7× batch headroom at
+            // ~1/5 the decode CPU of the full pool; above 1440p the full
+            // pool is needed for throughput.
+            let threads = match args.dav1d_threads {
+                0 if height > 0 && height <= 1440 => 2,
+                explicit_or_auto => explicit_or_auto,
+            };
+            pipeline.add_filter(
+                "decode",
+                Dav1dDecoder::new()?
+                    .with_threads(threads)?
+                    .with_max_frame_delay(args.frame_delay)?,
+            )
+        }
         VideoCodecKind::Other(codec) => bail!("video track is {codec} — no decoder for it yet"),
     };
     let snk = pipeline.add_async_sink("display", sink);
@@ -704,16 +743,21 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
     // demuxer's output arena is sized from these capacities (#84/#91), so
     // depth here is accounted memory, not a leak.
     pipeline.link_pads_full(src, "video", dec, "sink", LinkPolicy::Block, Some(24))?;
+    // The decode→display depth is the decode-ahead window (#192): the
+    // decoder task blocks in send_output once it is this many finished
+    // frames ahead of the paced sink. Applied to every hop of the video
+    // tail so the GPU and CPU paths stay comparable.
+    let ahead = Some(args.decode_ahead.max(1));
     match convert {
         // CPU path: decoder → I420→BGRA convert → softbuffer blit.
         Some(convert) => {
             let cvt = pipeline.add_filter("convert", convert);
-            pipeline.link(dec, cvt)?;
-            pipeline.link(cvt, snk)?;
+            pipeline.link_pads_full(dec, "src", cvt, "sink", LinkPolicy::Block, ahead)?;
+            pipeline.link_pads_full(cvt, "src", snk, "sink", LinkPolicy::Block, ahead)?;
         }
         // GPU path (#190): the sink takes I420 straight from the decoder.
         None => {
-            pipeline.link(dec, snk)?;
+            pipeline.link_pads_full(dec, "src", snk, "sink", LinkPolicy::Block, ahead)?;
         }
     }
 
@@ -755,6 +799,17 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
         .context("failed to start the pipeline")?;
     let mut bus = handle.take_bus();
     let mut ended = handle.ended();
+
+    // Scripted measurement runs end cleanly (sources stop, sinks drain,
+    // final stats print) instead of being killed mid-frame.
+    if args.exit_after > 0 {
+        let stopper = handle.stopper();
+        let secs = args.exit_after;
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+            stopper.stop();
+        });
+    }
 
     // Duration comes from the framework now — the demuxer reported it at
     // start and the handle serves it (#162). NONE means unknown (streamed
@@ -933,6 +988,13 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
     // keeps SIGINT *listened to* here: `tokio::signal::ctrl_c` installed a
     // process-global handler on first poll, so an unlistened SIGINT during a
     // bare `wait().await` would be captured and discarded.
+    // Machine-readable run summary (scripts/decode_matrix.py parses it),
+    // captured before `wait()` consumes the handle.
+    let final_position_ns = handle
+        .position()
+        .to_option()
+        .map(|p| p.nanos())
+        .unwrap_or(0);
     let ended = handle.ended();
     tokio::select! {
         _ = ended => { let _ = handle.wait().await; }
@@ -946,5 +1008,9 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
             handle.abort();
         }
     }
+    println!(
+        "stats: position_ns={final_position_ns} dropped={}",
+        dropped.load(Ordering::Relaxed)
+    );
     Ok(outcome)
 }
