@@ -89,6 +89,17 @@ check-feature-gates:
     cargo nextest run --features aac-encode,websocket,alsa,v4l2-m2m
     cargo clippy --all-targets --features aac-encode,websocket,alsa,v4l2-m2m -- -D warnings
 
+# Check + test + lint VA-API hardware decode (#193). Build needs libva-devel
+# + libclang (cros-libva runs bindgen); the tests green-skip when no VA driver
+# is present, so this is meaningful on any machine.
+#
+# NOTE what your driver actually decodes: Fedora's libva-intel-media-driver is
+# built WITHOUT H.264/HEVC (patent-encumbered) — the same hardware exposes them
+# under RPM Fusion's intel-media-driver-freeworld. `vainfo` is the ground truth.
+check-vaapi:
+    cargo nextest run --features vaapi
+    cargo clippy --all-targets --features vaapi -- -D warnings
+
 # Check + test + lint the V4L2 M2M hardware encoder (mirrors CI's test-v4l2-m2m job).
 # Needs libclang + kernel headers (on immutable Fedora: run inside a toolbox).
 # Live queue test: modprobe vicodec, then PARALLAX_VICODEC_TEST_DEVICE=auto just check-m2m

@@ -55,6 +55,12 @@ pub use traits::*;
 #[cfg(feature = "vulkan-video")]
 pub mod vulkan;
 
+#[cfg(feature = "vaapi")]
+pub mod vaapi;
+
+#[cfg(feature = "vaapi")]
+pub use vaapi::VaDisplay;
+
 #[cfg(feature = "vulkan-video")]
 pub use vulkan::{
     DecodeCommandRecorder, Dpb, DpbReference, DpbSlot, FrameDecodeInfo, H264ParameterSets,
@@ -193,6 +199,24 @@ impl GpuUsage {
 #[cfg(feature = "vulkan-video")]
 pub fn vulkan_video_available() -> bool {
     vulkan::VulkanContext::new().is_ok()
+}
+
+/// Whether VA-API hardware decode is available on this system.
+///
+/// A *display opens* — it says nothing about which codecs that display will
+/// decode, which varies with the driver package (see [`vaapi`]). Ask
+/// [`VaDisplay::supports_decode`] before choosing a hardware decoder.
+#[cfg(feature = "vaapi")]
+pub fn vaapi_available() -> bool {
+    vaapi::VaDisplay::open().is_some()
+}
+
+/// Whether VA-API hardware decode is available on this system.
+///
+/// Always `false` without the `vaapi` feature.
+#[cfg(not(feature = "vaapi"))]
+pub fn vaapi_available() -> bool {
+    false
 }
 
 #[cfg(not(feature = "vulkan-video"))]

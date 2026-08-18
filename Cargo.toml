@@ -107,6 +107,22 @@ ash = { version = "0.38", optional = true }
 # H.264 bitstream parsing (optional)
 h264-reader = { version = "0.8", optional = true }
 
+# VA-API hardware decode (optional).
+#
+# `cros-codecs-extended` rather than upstream `cros-codecs`: `cros-libva` runs
+# bindgen against the installed headers, and libva API >= 1.22 turned two
+# reserved bytes of `VAEncPictureParameterBufferVP9` into named fields. Its
+# struct literal is exhaustive, so *every* published `cros-libva` (0.0.12,
+# 0.0.13, and `main`) fails to compile on a modern libva — including on this
+# project's dev box (libva 1.23), while CI's ubuntu-24.04 (libva 1.20) would
+# build it fine. The fork's fix is one line (`..Default::default()`). The
+# crate has no cargo features, so the VP9 *encode* struct that breaks cannot
+# be excluded even though only decode is used here.
+#
+# Pinned exactly, like `v4l2r` and `oxideav-ac3`, and kept behind
+# `src/gpu/vaapi/` so switching back to upstream is a one-module change.
+cros-codecs = { package = "cros-codecs-extended", version = "=0.0.5-extended.2", optional = true, default-features = false, features = ["vaapi"] }
+
 # AV1 software codecs (optional)
 # rav1e: use default-features=false to skip asm (slower), or install nasm for optimized builds
 rav1e = { version = "0.8", optional = true, default-features = false, features = ["threading"] }
@@ -195,6 +211,9 @@ default = []
 cli = ["dep:clap"]  # parallax-launch binary (gst-launch equivalent)
 macros = ["parallax-macros"]  # Plugin authoring macros
 vulkan-video = ["dep:ash", "dep:h264-reader"]  # Vulkan Video codecs
+# VA-API hardware decode. Build needs libva-devel + libclang (cros-libva runs
+# bindgen); runtime needs a VA driver (intel-media-driver / mesa gallium).
+vaapi = ["dep:cros-codecs"]
 software-codecs = ["av1-encode", "av1-decode", "h264", "vpx"]  # All software video codecs
 av1-encode = ["dep:rav1e"]  # AV1 encoder (requires nasm on x86_64)
 av1-decode = ["dep:dav1d"]  # AV1 decoder (requires libdav1d system library)
