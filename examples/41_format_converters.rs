@@ -367,7 +367,11 @@ async fn main() -> Result<()> {
         ];
 
         let mut rgba_output = vec![0u8; (width * height * 4) as usize];
-        converter.convert(&yuyv_input, &mut rgba_output)?;
+        converter.convert(
+            &yuyv_input,
+            converter.packed_input_layout(),
+            &mut rgba_output,
+        )?;
 
         println!(
             "Converted {}x{} YUYV ({} bytes) to RGBA ({} bytes)",

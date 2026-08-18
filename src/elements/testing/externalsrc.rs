@@ -56,10 +56,17 @@ pub fn strided_test_layout() -> PlaneLayout {
 }
 
 /// Build the strided byte image of [`packed_reference_frame`]`(seq)`.
+///
+/// Sized to `full_span_len`, not `required_len`: a real strided producer
+/// allocates whole rows for every plane (dav1d aligns plane heights to 128
+/// rows, V4L2 hands out `bytesperline * height`), and consumers that walk
+/// planes in `stride`-sized chunks require it. A fixture that ended tight
+/// against its last row would push every consumer down its repack path and
+/// leave the zero-copy one untested.
 fn strided_frame(seq: u64) -> Box<[u8]> {
     let layout = strided_test_layout();
     let packed = packed_reference_frame(seq);
-    let mut out = vec![PAD_BYTE; layout.required_len(PixelFormat::I420, TEST_WIDTH, TEST_HEIGHT)]
+    let mut out = vec![PAD_BYTE; layout.full_span_len(PixelFormat::I420, TEST_WIDTH, TEST_HEIGHT)]
         .into_boxed_slice();
     let mut src = 0;
     for p in layout.resolved(PixelFormat::I420, TEST_WIDTH, TEST_HEIGHT) {

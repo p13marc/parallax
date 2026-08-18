@@ -144,17 +144,19 @@ let camera = V4l2Src::with_config("/dev/video0", config)?;
 
 See `examples/45_dmabuf_negotiation.rs` and `examples/17_multi_format_caps.rs`.
 
-### External (strided) memory and plane layout (#194)
+### External (strided) memory and plane layout (#194, #196)
 
 `MemoryType::External` is producer-owned memory (a decoder's refcounted picture) pinned into the pipeline via `ExternalSlot`. Unlike Cpu/DmaBuf, its byte layout is producer-defined — strided planes, described per buffer:
 
 - `Metadata::set_video_planes(w, h, fmt, PlaneLayout)` declares a strided frame; `set_video_dims` clears the layout (packed).
 - `Metadata::plane_layout()` is the ONE read path: the explicit layout, else the packed one derived from `VideoRaw`. Consumers must never re-derive strides from width.
-- `PlaneLayout::packed(fmt, w, h)` / `required_len` / `repack_into` / `resolved()` are the geometry toolkit (`parallax::format`).
+- `PlaneLayout::packed(fmt, w, h)` / `required_len` / `full_span_len` / `repack_into` / `resolved()` are the geometry toolkit (`parallax::format`).
 
-Negotiation treats External as **opt-in** (`MemoryType::requires_explicit_optin`): the solver fixates it only when the sink's caps name it (`MemoryCaps::external_or_cpu()`); `Caps::any()` consumers get Cpu, an `[External, Cpu]` producer packs itself for a cpu-only sink (Direct link, no converter), and an External-ONLY producer gets a `memorycopy` repack inserted. Packed-assuming elements (`EncoderElement`, `VideoConvert`, `VideoScale`) error loudly on a strided layout rather than misreading it. Strided layouts never cross IPC.
+`required_len` is the minimum a row-by-row reader needs (`offset + stride × (rows−1) + row_bytes`). **`full_span_len` is what a strided producer should actually allocate**: `offset + stride × rows`, i.e. whole rows for every plane. The SIMD colorspace backend walks planes with `chunks_exact(stride)` and silently drops a partial trailing chunk, so a frame ending tight against its last row would lose that row. Real producers already allocate this way — dav1d aligns plane heights to 128 rows, V4L2 hands out `bytesperline × height` — and a consumer that gets a short one repacks it (correct, just not zero-copy).
 
-Producers/consumers today: `Dav1dDecoder` (emits External when negotiated — the GPU presentation path), `AutoVideoSink` with the wgpu backend (opts in, uploads with real `bytes_per_row`), `ExternalTestSrc` (`elements::testing`).
+Negotiation treats External as **opt-in** (`MemoryType::requires_explicit_optin`): the solver fixates it only when the sink's caps name it (`MemoryCaps::external_or_cpu()`); `Caps::any()` consumers get Cpu, an `[External, Cpu]` producer packs itself for a cpu-only sink (Direct link, no converter), and an External-ONLY producer gets a `memorycopy` repack inserted. Since #196 the raw-video transforms and the software encoders **read** strided input instead of refusing it: `VideoConvertElement` and `VideoScale` declare `external_or_cpu()` on their input (packed `cpu_only()` on their output — they always write into an arena slot), and `EncoderElement` does too whenever its wrapped encoder answers `VideoEncoder::accepts_strided_input()`. Strided layouts never cross IPC.
+
+Producers today: `Dav1dDecoder` (emits External when negotiated), `ExternalTestSrc` (`elements::testing`). Consumers: `AutoVideoSink` with the wgpu backend (uploads with real `bytes_per_row`) and with the CPU backend (converts in place), `VideoConvertElement`, `VideoScale`, and `EncoderElement` around openh264/rav1e/v4l2-m2m.
 
 ## Converters
 

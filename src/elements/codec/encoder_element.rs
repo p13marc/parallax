@@ -168,17 +168,6 @@ impl<E: VideoEncoder> EncoderElement<E> {
     /// not `self`, so the caller can go on to `self.encoder.encode(frame)`
     /// while the view is live.
     fn buffer_to_frame<'a>(&mut self, buffer: &'a Buffer) -> Result<VideoFrameRef<'a>> {
-        // Loud guard (#194): the strides below derive from width — a
-        // strided frame sliced with them encodes garbage. Negotiation
-        // keeps External away from cpu-only elements; feeding strides
-        // straight from `Metadata::plane_layout` is the phase-2 upgrade.
-        if buffer.metadata().has_strided_planes() {
-            return Err(Error::Element(
-                "EncoderElement: strided plane layout not supported; negotiation should \
-                 have inserted a memorycopy repack"
-                    .into(),
-            ));
-        }
         match buffer.metadata().format {
             Some(MediaFormat::VideoRaw(vf)) => {
                 if self.format != Some(vf) {
@@ -218,26 +207,34 @@ impl<E: VideoEncoder> EncoderElement<E> {
 
         let declared = self.format.expect("set immediately above");
         let format = map_pixel_format(declared.pixel_format)?;
-        let width = declared.width;
-        let bpc = format.bytes_per_component();
-        let stride_y = width as usize * bpc;
-        let (stride_u, stride_v) = match format {
-            // Semi-planar: one interleaved UV plane at full row width.
-            super::common::PixelFormat::Nv12 => (stride_y, 0),
-            super::common::PixelFormat::I444 => (stride_y, stride_y),
-            // Planar 4:2:0 / 4:2:2: half-width chroma planes.
-            _ => (stride_y / 2, stride_y / 2),
-        };
+
+        // Plane geometry comes from the buffer (#196): packed for an ordinary
+        // arena frame, the producer's real strides for a codec-owned one.
+        // Deriving it from width here is what the strided guard used to be
+        // protecting against.
+        let layout = buffer
+            .metadata()
+            .plane_layout()
+            .expect("the VideoRaw arm above proved the buffer declares geometry");
+        let need = layout.full_span_len(declared.pixel_format, declared.width, declared.height);
+        if buffer.as_bytes().len() < need {
+            return Err(Error::Element(format!(
+                "EncoderElement: {}x{} {:?} needs {need} bytes for its declared plane \
+                 layout, buffer has {}",
+                declared.width,
+                declared.height,
+                declared.pixel_format,
+                buffer.as_bytes().len()
+            )));
+        }
 
         Ok(VideoFrameRef {
-            width,
+            width: declared.width,
             height: declared.height,
             format,
             pts: buffer.metadata().pts.nanos() as i64,
             data: buffer.as_bytes(),
-            stride_y,
-            stride_u,
-            stride_v,
+            layout,
         })
     }
 
@@ -480,10 +477,15 @@ impl<E: VideoEncoder + 'static> Transform for EncoderElement<E> {
             ]),
             ..VideoFormatCaps::any()
         };
-        ElementMediaCaps::new(vec![FormatMemoryCap::new(
-            caps.into(),
-            MemoryCaps::cpu_only(),
-        )])
+        // #196: an encoder that reads planes through `VideoFrameRef::plane`
+        // can take a codec-owned frame as it is; one that assumes packed
+        // bytes must not be offered one.
+        let memory = if self.encoder.accepts_strided_input() {
+            MemoryCaps::external_or_cpu()
+        } else {
+            MemoryCaps::cpu_only()
+        };
+        ElementMediaCaps::new(vec![FormatMemoryCap::new(caps.into(), memory)])
     }
 
     fn execution_hints(&self) -> ExecutionHints {
@@ -516,27 +518,26 @@ mod tests {
             u32,
             u32,
             super::super::common::PixelFormat,
-            usize,
-            usize,
-            usize,
+            Vec<(usize, usize)>,
         )>,
     }
 
     impl VideoEncoder for RecordingEncoder {
         type Packet = Vec<u8>;
         fn encode(&mut self, frame: VideoFrameRef<'_>) -> Result<Vec<Vec<u8>>> {
-            self.frames.push((
-                frame.width,
-                frame.height,
-                frame.format,
-                frame.stride_y,
-                frame.stride_u,
-                frame.stride_v,
-            ));
+            let planes = (0..4)
+                .filter_map(|i| frame.plane(i))
+                .map(|p| (p.offset, p.stride))
+                .collect();
+            self.frames
+                .push((frame.width, frame.height, frame.format, planes));
             Ok(vec![vec![0xAB]])
         }
         fn flush(&mut self) -> Result<Vec<Vec<u8>>> {
             Ok(Vec::new())
+        }
+        fn accepts_strided_input(&self) -> bool {
+            true
         }
     }
 
@@ -549,29 +550,51 @@ mod tests {
         }
     }
 
+    /// A buffer that really holds the frame it claims to.
+    ///
+    /// `buffer_to_frame` validates the declared layout against the byte
+    /// count (#196) — a 16-byte buffer claiming 640x480 is exactly the
+    /// silent-corruption case it now refuses.
     fn frame_buffer(format: Option<VideoFormat>) -> Buffer {
-        let arena = SharedArena::new(64, 8).unwrap();
+        let size =
+            format.map_or(16, |vf| {
+                crate::format::PlaneLayout::packed(vf.pixel_format, vf.width, vf.height)
+                    .required_len(vf.pixel_format, vf.width, vf.height)
+            });
+        let arena = SharedArena::new(size.max(16), 2).unwrap();
         let slot = arena.acquire().unwrap();
         let mut metadata = Metadata::from_sequence(0);
         metadata.format = format.map(MediaFormat::VideoRaw);
-        Buffer::new(MemoryHandle::with_len(slot, 16), metadata)
+        Buffer::new(MemoryHandle::with_len(slot, size), metadata)
     }
 
+    /// Plane offsets and strides for a packed buffer come out of
+    /// `PlaneLayout`, so NV12 is two planes with a full-width chroma plane —
+    /// not three with a phantom `stride_v = 0`.
     #[test]
-    fn strides_follow_pixel_format() {
+    fn planes_follow_pixel_format() {
         for (pf, expect) in [
-            (PixelFormat::I420, (640usize, 320usize, 320usize)),
-            (PixelFormat::Nv12, (640, 640, 0)),
-            (PixelFormat::I444, (640, 640, 640)),
-            (PixelFormat::I420_10Le, (1280, 640, 640)),
+            (
+                PixelFormat::I420,
+                vec![(0usize, 640usize), (307_200, 320), (384_000, 320)],
+            ),
+            (PixelFormat::Nv12, vec![(0, 640), (307_200, 640)]),
+            (
+                PixelFormat::I444,
+                vec![(0, 640), (307_200, 640), (614_400, 640)],
+            ),
+            (
+                PixelFormat::I420_10Le,
+                vec![(0, 1280), (614_400, 640), (768_000, 640)],
+            ),
         ] {
             let mut element = EncoderElement::new(RecordingEncoder { frames: vec![] });
             element
                 .transform(frame_buffer(Some(video_format(640, 480, pf))))
                 .unwrap();
-            let (w, h, _, sy, su, sv) = element.encoder().frames[0];
+            let (w, h, _, ref planes) = element.encoder().frames[0];
             assert_eq!((w, h), (640, 480));
-            assert_eq!((sy, su, sv), expect, "strides for {pf:?}");
+            assert_eq!(*planes, expect, "planes for {pf:?}");
         }
     }
 
@@ -597,6 +620,7 @@ mod tests {
         assert_eq!((frames[0].0, frames[0].1), (640, 480));
         assert_eq!((frames[1].0, frames[1].1), (1280, 720));
         assert_eq!(frames[1].2, super::super::common::PixelFormat::Nv12);
+        assert_eq!(frames[1].3.len(), 2, "NV12 is two planes");
         assert_eq!(
             element.format().unwrap().width,
             1280,
@@ -672,6 +696,84 @@ mod tests {
                 ))))
                 .is_err(),
             "packed YUV renegotiation must be rejected"
+        );
+    }
+    /// An encoder that reads planes gets a codec-owned frame as it is; one
+    /// that assumes packed bytes never sees one.
+    #[test]
+    fn input_memory_caps_follow_the_encoder() {
+        use crate::memory::MemoryType;
+
+        struct PackedOnly;
+        impl VideoEncoder for PackedOnly {
+            type Packet = Vec<u8>;
+            fn encode(&mut self, _frame: VideoFrameRef<'_>) -> Result<Vec<Vec<u8>>> {
+                Ok(Vec::new())
+            }
+            fn flush(&mut self) -> Result<Vec<Vec<u8>>> {
+                Ok(Vec::new())
+            }
+        }
+
+        let strided = EncoderElement::new(RecordingEncoder { frames: vec![] });
+        let caps = strided.input_media_caps();
+        assert!(
+            caps.iter()
+                .any(|c| c.memory.lists_memory(MemoryType::External)),
+            "a stride-reading encoder opts into External"
+        );
+
+        let packed = EncoderElement::new(PackedOnly);
+        assert!(
+            !packed
+                .input_media_caps()
+                .iter()
+                .any(|c| c.memory.lists_memory(MemoryType::External)),
+            "a packed-only encoder must never be offered a strided frame"
+        );
+    }
+
+    /// A strided frame reaches the encoder with real plane offsets and
+    /// strides — the layout it declared, not one derived from its width.
+    #[test]
+    fn a_strided_buffer_reaches_the_encoder_with_its_own_layout() {
+        use crate::format::{PixelFormat as Caps, PlaneDesc, PlaneLayout};
+        const W: u32 = 64;
+        const H: u32 = 48;
+        const PAD: usize = 16;
+
+        let packed = PlaneLayout::packed(Caps::I420, W, H);
+        let mut descs = Vec::new();
+        let mut offset = 0usize;
+        for p in packed.resolved(Caps::I420, W, H) {
+            descs.push(PlaneDesc {
+                offset,
+                stride: p.stride + PAD,
+            });
+            offset += (p.stride + PAD) * p.rows;
+        }
+        let layout = PlaneLayout::from_planes(&descs);
+        let len = layout.full_span_len(Caps::I420, W, H);
+
+        let arena = SharedArena::new(len, 2).unwrap();
+        let mut slot = arena.acquire().unwrap();
+        slot.data_mut()[..len].fill(0x40);
+        let mut metadata = Metadata::from_sequence(0);
+        metadata.set_video_planes(W, H, Caps::I420, layout);
+        let buffer = Buffer::new(MemoryHandle::with_len(slot, len), metadata);
+
+        let mut element = EncoderElement::new(RecordingEncoder { frames: vec![] });
+        element.transform(buffer).unwrap();
+
+        let (w, h, _, ref planes) = element.encoder().frames[0];
+        assert_eq!((w, h), (W, H));
+        assert_eq!(
+            *planes,
+            vec![
+                (0usize, 64 + PAD),
+                ((64 + PAD) * 48, 32 + PAD),
+                ((64 + PAD) * 48 + (32 + PAD) * 24, 32 + PAD),
+            ]
         );
     }
 }

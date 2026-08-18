@@ -166,8 +166,9 @@ pub(crate) struct CpuBackend {
     /// fallback are converted here, then blitted as BGRA. Empty until the
     /// first YUV frame.
     scratch: Vec<u8>,
-    /// Strided (External) frames on the same degraded path are repacked
-    /// here first (#194) — one extra copy on a path that already warned.
+    /// A frame whose buffer ends tight against its last row cannot be read
+    /// row-wise by the engine (#196), so it is repacked here first. Real
+    /// strided producers allocate whole rows, so this stays empty.
     repack_scratch: Vec<u8>,
     converter: Option<((PixelFormat, u32, u32), crate::converters::VideoConvert)>,
     warned_yuv: bool,
@@ -190,8 +191,12 @@ impl CpuBackend {
         })
     }
 
-    /// Convert a YUV frame into `self.scratch` as BGRA, repacking a
-    /// strided frame through `repack_scratch` first (#194).
+    /// Convert a YUV frame into `self.scratch` as BGRA.
+    ///
+    /// A strided frame is read in place through its declared plane layout
+    /// (#196) — I420 and NV12 are exactly the two formats this path takes,
+    /// and both engine families address planes by stride. The repack below
+    /// only catches a frame whose buffer ends tight against its last row.
     fn convert_yuv(&mut self, frame: &DisplayFrame) -> Result<()> {
         use crate::converters::{PixelFormat as ConvFormat, VideoConvert};
         if !self.warned_yuv {
@@ -218,24 +223,26 @@ impl CpuBackend {
                 VideoConvert::new(conv_format, ConvFormat::Bgra, frame.width, frame.height)?,
             ));
         }
-        // Strided frame: row-copy into repack_scratch; packed frames read
-        // straight from the buffer. Field borrows below are disjoint
-        // (repack_scratch read, scratch written, converter read).
-        let packed: &[u8] = if let Some(layout) = frame.layout {
-            let (w, h, fmt) = (frame.width, frame.height, frame.format);
-            let packed_len = crate::format::PlaneLayout::packed(fmt, w, h).required_len(fmt, w, h);
+        // Field borrows below are disjoint (repack_scratch read, scratch
+        // written, converter read).
+        let (w, h, fmt) = (frame.width, frame.height, frame.format);
+        let packed_layout = crate::format::PlaneLayout::packed(fmt, w, h);
+        let layout = frame.layout.unwrap_or(packed_layout);
+        let bytes = frame.data.as_bytes();
+        let (data, layout) = if bytes.len() >= layout.full_span_len(fmt, w, h) {
+            (bytes, layout)
+        } else {
+            let packed_len = packed_layout.required_len(fmt, w, h);
             self.repack_scratch.resize(packed_len, 0);
             layout
-                .repack_into(frame.data.as_bytes(), fmt, w, h, &mut self.repack_scratch)
+                .repack_into(bytes, fmt, w, h, &mut self.repack_scratch)
                 .map_err(Error::Element)?;
-            &self.repack_scratch
-        } else {
-            frame.data.as_bytes()
+            (&self.repack_scratch[..], packed_layout)
         };
-        let out_len = frame.width as usize * frame.height as usize * 4;
+        let out_len = w as usize * h as usize * 4;
         self.scratch.resize(out_len, 0);
         let (_, converter) = self.converter.as_ref().expect("installed above");
-        converter.convert(packed, &mut self.scratch)
+        converter.convert(data, layout, &mut self.scratch)
     }
 }
 

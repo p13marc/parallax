@@ -573,6 +573,24 @@ impl PlaneLayout {
         })
     }
 
+    /// Buffer length at which every plane is addressable for its full
+    /// `stride * rows`, not merely up to its last row's used bytes.
+    ///
+    /// [`required_len`](Self::required_len) is the minimum a row-by-row
+    /// reader needs. Some consumers need more: the SIMD colorspace backend
+    /// walks planes with `chunks_exact(stride)` and silently drops a final
+    /// partial chunk, so a plane whose buffer ends tight against its last
+    /// row loses that row. Producers of strided frames should allocate to
+    /// this length — real ones already do (dav1d aligns plane heights to
+    /// 128 rows, V4L2 gives `bytesperline * height`) — and consumers that
+    /// need it check against it and repack when it is not met.
+    pub fn full_span_len(&self, format: PixelFormat, width: u32, height: u32) -> usize {
+        self.resolved(format, width, height)
+            .map(|p| p.offset + p.stride * p.rows)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Row-copy a frame in this layout into a packed destination. Returns
     /// the packed length written.
     pub fn repack_into(

@@ -146,6 +146,27 @@ jobs:
           cache-targets: false
       - run: cargo clippy --all-targets --features display -- -D warnings
 
+  # The SIMD colorspace arms (the `yuv` crate) are a second implementation of
+  # every conversion, selected by a feature no other job enables — and the one
+  # parallax-player builds with. Untested, they rot silently (#196).
+  simd-check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@v7.0.1
+      - run: sudo apt-get update && sudo apt-get install -y libudev-dev g++ libclang-dev
+      - uses: https://github.com/dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: https://github.com/Swatinem/rust-cache@v2
+        with:
+          key: simd
+          cache-targets: false
+      - uses: https://github.com/taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - run: cargo nextest run --features simd-colorspace
+      - run: cargo clippy --all-targets --features simd-colorspace -- -D warnings
+
   docs:
     runs-on: ubuntu-24.04
     env:
