@@ -106,6 +106,19 @@ pub trait VideoEncoder: Send {
         false
     }
 
+    /// Whether this encoder reads planes through
+    /// [`VideoFrameRef::plane`](super::common::VideoFrameRef::plane) rather
+    /// than assuming packed bytes.
+    ///
+    /// Default `false`, and deliberately not a silent capability: an encoder
+    /// that ignores the layout would encode a strided frame's row padding as
+    /// picture data. [`EncoderElement`](super::EncoderElement) advertises
+    /// `MemoryCaps::external_or_cpu()` only when this answers `true`, so a
+    /// packed-only encoder simply never gets offered such a frame.
+    fn accepts_strided_input(&self) -> bool {
+        false
+    }
+
     /// Force the next encoded frame to be a keyframe (IDR).
     ///
     /// Default: no-op, for encoders without keyframe control. Encoders that

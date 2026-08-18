@@ -661,6 +661,12 @@ impl VideoEncoder for V4l2M2mH264Encoder {
         Ok(packets.into_iter().map(|(data, _)| data).collect())
     }
 
+    fn accepts_strided_input(&self) -> bool {
+        // `fill_output_plane` copies row by row through
+        // `VideoFrameRef::plane` into the driver's `bytesperline`.
+        true
+    }
+
     fn flush(&mut self) -> Result<Vec<Vec<u8>>> {
         // No streaming state means no frame was ever queued, so there is
         // nothing buffered in the hardware to drain.
@@ -841,54 +847,54 @@ fn fill_output_plane(dst: &mut [u8], format: &Format, frame: VideoFrameRef<'_>) 
     }
 
     let height = frame.height as usize;
-    let row_bytes = frame.stride_y.min(dst_stride);
-    copy_plane(
-        dst,
-        dst_stride,
-        frame.y_plane(),
-        frame.stride_y,
-        height,
-        row_bytes,
-    );
+    let luma = frame.y_plane();
+    let row_bytes = luma.row_bytes.min(dst_stride);
+    copy_plane(dst, dst_stride, luma.data, luma.stride, height, row_bytes);
     let y_size = dst_stride * height;
+
+    let chroma = |index: usize| {
+        frame.plane(index).ok_or_else(|| {
+            Error::Element(format!(
+                "V4L2 M2M: {:?} frame is missing plane {index}",
+                frame.format
+            ))
+        })
+    };
 
     match frame.format {
         PixelFormat::Nv12 => {
-            // One interleaved UV plane: full-width rows spaced like the luma
-            // plane. Addressed straight from the data layout — NV12 stride_u
-            // conventions differ between frame producers (EncoderElement uses
-            // the full row width, VideoFrame::new the planar half-width), but
-            // the bytes are laid out identically.
-            let src_uv = &frame.data[frame.stride_y * height..];
+            // One interleaved UV plane: full-width rows, found by its own
+            // offset rather than by assuming it follows the luma plane.
+            let uv = chroma(1)?;
             copy_plane(
                 &mut dst[y_size..],
                 dst_stride,
-                src_uv,
-                frame.stride_y,
-                height / 2,
-                row_bytes,
+                uv.data,
+                uv.stride,
+                uv.rows,
+                uv.row_bytes.min(dst_stride),
             );
         }
         PixelFormat::I420 => {
             // Chroma rows are half the luma stride (per the V4L2 YU12 spec).
             let dst_c_stride = dst_stride / 2;
-            let c_rows = height / 2;
-            let c_bytes = frame.stride_u.min(dst_c_stride);
+            let (u, v) = (chroma(1)?, chroma(2)?);
+            let c_bytes = u.row_bytes.min(dst_c_stride);
             copy_plane(
                 &mut dst[y_size..],
                 dst_c_stride,
-                frame.u_plane(),
-                frame.stride_u,
-                c_rows,
+                u.data,
+                u.stride,
+                u.rows,
                 c_bytes,
             );
-            let u_size = dst_c_stride * c_rows;
+            let u_size = dst_c_stride * u.rows;
             copy_plane(
                 &mut dst[y_size + u_size..],
                 dst_c_stride,
-                frame.v_plane(),
-                frame.stride_v,
-                c_rows,
+                v.data,
+                v.stride,
+                v.rows,
                 c_bytes,
             );
         }
@@ -1078,32 +1084,87 @@ mod tests {
         }
     }
 
-    /// NV12 stride_u conventions differ between frame producers
-    /// (EncoderElement: full row width; VideoFrame::new: planar half-width).
-    /// fill_output_plane must copy the same bytes under both.
+    /// NV12 is one interleaved chroma plane at full row width, and both
+    /// frame producers now say so.
+    ///
+    /// They used to disagree — `EncoderElement` set `stride_u = stride_y`
+    /// while `VideoFrame::new` set `stride_y / 2` — and this test existed to
+    /// prove `fill_output_plane` survived either. `PlaneLayout` is the single
+    /// source since #196, so there is no second convention left to reconcile;
+    /// what is worth pinning is that the packed frame copies verbatim.
     #[test]
-    fn nv12_fill_handles_both_stride_conventions() {
+    fn nv12_fill_copies_a_tight_frame_verbatim() {
         const W: usize = 16;
         const H: usize = 8;
         let format = driver_format(W as u32, H as u32, W as u32, (W * H * 3 / 2) as u32);
 
-        // VideoFrame::new convention: stride_u = stride_y / 2.
         let mut frame = VideoFrame::new(W as u32, H as u32, PixelFormat::Nv12);
         for (i, b) in frame.data.iter_mut().enumerate() {
             *b = i as u8;
         }
-        let mut dst_a = vec![0u8; W * H * 3 / 2];
-        let used = fill_output_plane(&mut dst_a, &format, frame.as_view()).unwrap();
+        assert_eq!(
+            frame.as_view().plane(1).map(|p| (p.offset, p.stride)),
+            Some((W * H, W)),
+            "one interleaved chroma plane at full row width"
+        );
+
+        let mut dst = vec![0u8; W * H * 3 / 2];
+        let used = fill_output_plane(&mut dst, &format, frame.as_view()).unwrap();
         assert_eq!(used, W * H * 3 / 2);
+        assert_eq!(&dst[..], &frame.data[..], "tight NV12 copies verbatim");
+    }
 
-        // EncoderElement convention: stride_u = stride_y, stride_v = 0.
-        frame.stride_u = frame.stride_y;
-        frame.stride_v = 0;
-        let mut dst_b = vec![0u8; W * H * 3 / 2];
-        fill_output_plane(&mut dst_b, &format, frame.as_view()).unwrap();
+    /// A strided source frame lands packed at the driver's stride: rows are
+    /// found through the layout, not by multiplying width.
+    #[test]
+    fn fill_reads_a_strided_source_frame() {
+        use crate::format::{PixelFormat as Caps, PlaneDesc, PlaneLayout};
+        const W: usize = 16;
+        const H: usize = 8;
+        const PAD: usize = 5;
+        let format = driver_format(W as u32, H as u32, W as u32, (W * H * 3 / 2) as u32);
 
-        assert_eq!(dst_a, dst_b, "same bytes regardless of stride convention");
-        assert_eq!(&dst_a[..], &frame.data[..], "tight NV12 copies verbatim");
+        // The packed reference, and the same picture with padded rows.
+        let packed = VideoFrame::new(W as u32, H as u32, PixelFormat::Nv12);
+        let mut packed = packed;
+        for (i, b) in packed.data.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+
+        let layout = PlaneLayout::from_planes(&[
+            PlaneDesc {
+                offset: 0,
+                stride: W + PAD,
+            },
+            PlaneDesc {
+                offset: (W + PAD) * H,
+                stride: W + PAD,
+            },
+        ]);
+        let mut strided = vec![0xEEu8; layout.full_span_len(Caps::Nv12, W as u32, H as u32)];
+        let mut src = 0usize;
+        for plane in layout.resolved(Caps::Nv12, W as u32, H as u32) {
+            for row in 0..plane.rows {
+                let d = plane.offset + row * plane.stride;
+                strided[d..d + plane.row_bytes]
+                    .copy_from_slice(&packed.data[src..src + plane.row_bytes]);
+                src += plane.row_bytes;
+            }
+        }
+        let view = VideoFrameRef {
+            width: W as u32,
+            height: H as u32,
+            format: PixelFormat::Nv12,
+            pts: 0,
+            data: &strided,
+            layout,
+        };
+
+        let mut from_strided = vec![0u8; W * H * 3 / 2];
+        fill_output_plane(&mut from_strided, &format, view).unwrap();
+        let mut from_packed = vec![0u8; W * H * 3 / 2];
+        fill_output_plane(&mut from_packed, &format, packed.as_view()).unwrap();
+        assert_eq!(from_strided, from_packed);
     }
 
     /// The driver stride can exceed the frame's: rows must land at
@@ -1140,9 +1201,10 @@ mod tests {
     fn test_frame(width: u32, height: u32, format: PixelFormat, seq: u64) -> VideoFrame {
         let mut frame = VideoFrame::new(width, height, format);
         frame.pts = (seq * 33_000_000) as i64;
+        let stride = frame.as_view().y_plane().stride;
         for y in 0..height as usize {
             for x in 0..width as usize {
-                frame.data[y * frame.stride_y + x] = ((x + y) as u8).wrapping_add(seq as u8 * 8);
+                frame.data[y * stride + x] = ((x + y) as u8).wrapping_add(seq as u8 * 8);
             }
         }
         frame

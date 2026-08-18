@@ -222,52 +222,34 @@ impl Rav1eEncoder {
     }
 
     /// Encode a frame from raw I420 data at the given geometry.
-    fn encode_frame(
-        &mut self,
-        input: &[u8],
-        width: usize,
-        height: usize,
-        _pts: u64,
-    ) -> Result<Option<Vec<u8>>> {
+    /// Copy one I420 frame into a rav1e frame and encode it.
+    ///
+    /// Rows are read through the source's declared plane layout (#196), so a
+    /// codec-owned strided frame needs no repack on the way in — rav1e's own
+    /// planes have their own padding anyway, which is why this was already a
+    /// row-by-row copy.
+    fn encode_frame(&mut self, source: VideoFrameRef<'_>, _pts: u64) -> Result<Option<Vec<u8>>> {
+        let (width, height) = (source.width as usize, source.height as usize);
         self.ensure_context(width, height)?;
 
         // Create rav1e frame
         let mut frame = self.context_mut()?.new_frame();
 
-        let y_size = width * height;
-        let uv_size = (width / 2) * (height / 2);
-
-        if input.len() < y_size + 2 * uv_size {
+        let planes: Vec<_> = (0..3).filter_map(|i| source.plane(i)).collect();
+        let [y_plane, u_plane, v_plane] = planes.as_slice() else {
             return Err(Error::InvalidSegment(format!(
-                "Input buffer too small: {} < {}",
-                input.len(),
-                y_size + 2 * uv_size
+                "Input buffer too small: {}x{} I420 does not fit in {} bytes",
+                width,
+                height,
+                source.data.len()
             )));
-        }
+        };
 
-        // Copy Y plane
-        for y in 0..height {
-            let src_offset = y * width;
-            let dst_row = &mut frame.planes[0].rows_iter_mut().nth(y).unwrap();
-            dst_row[..width].copy_from_slice(&input[src_offset..src_offset + width]);
-        }
-
-        // Copy U plane
-        let u_start = y_size;
-        let uv_width = width / 2;
-        let uv_height = height / 2;
-        for y in 0..uv_height {
-            let src_offset = u_start + y * uv_width;
-            let dst_row = &mut frame.planes[1].rows_iter_mut().nth(y).unwrap();
-            dst_row[..uv_width].copy_from_slice(&input[src_offset..src_offset + uv_width]);
-        }
-
-        // Copy V plane
-        let v_start = y_size + uv_size;
-        for y in 0..uv_height {
-            let src_offset = v_start + y * uv_width;
-            let dst_row = &mut frame.planes[2].rows_iter_mut().nth(y).unwrap();
-            dst_row[..uv_width].copy_from_slice(&input[src_offset..src_offset + uv_width]);
+        for (index, src) in [y_plane, u_plane, v_plane].into_iter().enumerate() {
+            for y in 0..src.rows {
+                let dst_row = &mut frame.planes[index].rows_iter_mut().nth(y).unwrap();
+                dst_row[..src.row_bytes].copy_from_slice(src.row(y));
+            }
         }
 
         // Send frame to encoder
@@ -347,7 +329,20 @@ impl Element for Rav1eEncoder {
             )
         })?;
 
-        match self.encode_frame(input, width as usize, height as usize, pts)? {
+        // Geometry and plane layout both come from the buffer.
+        let layout = buffer.metadata().plane_layout().ok_or_else(|| {
+            Error::Element("Rav1eEncoder: buffer declares no plane layout".into())
+        })?;
+        let source = VideoFrameRef {
+            width,
+            height,
+            format: crate::elements::codec::common::PixelFormat::I420,
+            pts: pts as i64,
+            data: input,
+            layout,
+        };
+
+        match self.encode_frame(source, pts)? {
             Some(packet) => {
                 let mut slot = self.output.acquire(packet.len(), "rav1eencoder")?;
                 slot.data_mut()[..packet.len()].copy_from_slice(&packet);
@@ -415,12 +410,7 @@ impl VideoEncoder for Rav1eEncoder {
         // and ensure_context rebuilds if it differs from the last one.
 
         // Encode the frame
-        match self.encode_frame(
-            frame.data,
-            frame.width as usize,
-            frame.height as usize,
-            frame.pts as u64,
-        )? {
+        match self.encode_frame(frame, frame.pts as u64)? {
             Some(packet) => Ok(vec![packet]),
             None => Ok(vec![]), // Encoder buffering
         }
@@ -428,6 +418,12 @@ impl VideoEncoder for Rav1eEncoder {
 
     fn flush(&mut self) -> Result<Vec<Self::Packet>> {
         self.flush_internal()
+    }
+
+    fn accepts_strided_input(&self) -> bool {
+        // The copy into rav1e's own planes is row-by-row through
+        // `VideoFrameRef::plane`.
+        true
     }
 
     fn has_pending(&self) -> bool {

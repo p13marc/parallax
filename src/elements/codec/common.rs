@@ -1,5 +1,7 @@
 //! Common types for video codec elements.
 
+use crate::format::PlaneLayout;
+
 /// Decode-but-drop threshold for video decoders (#165 ACCURATE clipping).
 ///
 /// Tracks the Time segment the decoder is playing under: a decoded frame
@@ -103,25 +105,17 @@ pub struct VideoFrame {
     pub format: PixelFormat,
     /// Presentation timestamp (in timebase units).
     pub pts: i64,
-    /// Frame data (planar layout).
+    /// Frame data.
     pub data: Vec<u8>,
-    /// Stride for Y plane.
-    pub stride_y: usize,
-    /// Stride for U plane.
-    pub stride_u: usize,
-    /// Stride for V plane.
-    pub stride_v: usize,
+    /// Where each plane starts and how far apart its rows sit. Always the
+    /// packed layout for an owned frame — it allocates its own buffer.
+    pub layout: PlaneLayout,
 }
 
 impl VideoFrame {
     /// Create a new video frame with allocated buffer.
     pub fn new(width: u32, height: u32, format: PixelFormat) -> Self {
         let size = format.frame_size(width as usize, height as usize);
-        let stride_y = width as usize * format.bytes_per_component();
-        let stride_uv = match format {
-            PixelFormat::I444 => stride_y,
-            _ => stride_y / 2,
-        };
 
         Self {
             width,
@@ -129,9 +123,7 @@ impl VideoFrame {
             format,
             pts: 0,
             data: vec![0u8; size],
-            stride_y,
-            stride_u: stride_uv,
-            stride_v: stride_uv,
+            layout: PlaneLayout::packed(format.into(), width, height),
         }
     }
 
@@ -143,25 +135,29 @@ impl VideoFrame {
             format: self.format,
             pts: self.pts,
             data: &self.data,
-            stride_y: self.stride_y,
-            stride_u: self.stride_u,
-            stride_v: self.stride_v,
+            layout: self.layout,
         }
     }
 
     /// Get Y plane data.
     pub fn y_plane(&self) -> &[u8] {
-        self.as_view().y_plane()
+        let p = self
+            .as_view()
+            .plane(0)
+            .expect("every format has a luma plane");
+        &self.data[p.offset..p.offset + p.stride * p.rows]
     }
 
     /// Get U plane data.
     pub fn u_plane(&self) -> &[u8] {
-        self.as_view().u_plane()
+        let p = self.as_view().plane(1).expect("no chroma plane");
+        &self.data[p.offset..p.offset + p.stride * p.rows]
     }
 
     /// Get V plane data.
     pub fn v_plane(&self) -> &[u8] {
-        self.as_view().v_plane()
+        let p = self.as_view().plane(2).expect("no second chroma plane");
+        &self.data[p.offset..p.offset + p.stride * p.rows]
     }
 }
 
@@ -180,45 +176,60 @@ pub struct VideoFrameRef<'a> {
     pub format: PixelFormat,
     /// Presentation timestamp (in timebase units).
     pub pts: i64,
-    /// Frame data (planar layout), borrowed from the producer.
+    /// Frame data, borrowed from the producer.
     pub data: &'a [u8],
-    /// Stride for Y plane.
-    pub stride_y: usize,
-    /// Stride for U plane.
-    pub stride_u: usize,
-    /// Stride for V plane.
-    pub stride_v: usize,
+    /// Where each plane starts and how far apart its rows sit (#196).
+    ///
+    /// Packed for an arena-backed frame, the producer's real strides for a
+    /// codec-owned one. Read planes through [`plane`](Self::plane) — never
+    /// by deriving an offset from width, which is what the three `stride_*`
+    /// fields this replaced invited.
+    pub layout: PlaneLayout,
+}
+
+/// One plane of a frame: its rows, and how to walk them.
+#[derive(Clone, Copy, Debug)]
+pub struct FramePlane<'a> {
+    /// The plane's `stride * rows` bytes.
+    pub data: &'a [u8],
+    /// Byte offset of the plane's first row within the whole frame.
+    pub offset: usize,
+    /// Byte distance between consecutive rows.
+    pub stride: usize,
+    /// Number of rows.
+    pub rows: usize,
+    /// Used bytes per row (<= stride).
+    pub row_bytes: usize,
+}
+
+impl<'a> FramePlane<'a> {
+    /// Row `y`'s used bytes.
+    pub fn row(&self, y: usize) -> &'a [u8] {
+        let start = y * self.stride;
+        &self.data[start..start + self.row_bytes]
+    }
 }
 
 impl<'a> VideoFrameRef<'a> {
-    /// Get Y plane data.
-    pub fn y_plane(&self) -> &'a [u8] {
-        let y_size = self.stride_y * self.height as usize;
-        &self.data[..y_size]
+    /// Plane `index`, or `None` when the format has fewer planes.
+    pub fn plane(&self, index: usize) -> Option<FramePlane<'a>> {
+        let p = self
+            .layout
+            .resolved(self.format.into(), self.width, self.height)
+            .nth(index)?;
+        let end = p.offset + p.stride * p.rows;
+        Some(FramePlane {
+            data: self.data.get(p.offset..end)?,
+            offset: p.offset,
+            stride: p.stride,
+            rows: p.rows,
+            row_bytes: p.row_bytes,
+        })
     }
 
-    /// Get U plane data.
-    pub fn u_plane(&self) -> &'a [u8] {
-        let y_size = self.stride_y * self.height as usize;
-        let uv_height = match self.format {
-            PixelFormat::I422 | PixelFormat::I444 => self.height as usize,
-            _ => self.height as usize / 2,
-        };
-        let u_size = self.stride_u * uv_height;
-        &self.data[y_size..y_size + u_size]
-    }
-
-    /// Get V plane data.
-    pub fn v_plane(&self) -> &'a [u8] {
-        let y_size = self.stride_y * self.height as usize;
-        let uv_height = match self.format {
-            PixelFormat::I422 | PixelFormat::I444 => self.height as usize,
-            _ => self.height as usize / 2,
-        };
-        let u_size = self.stride_u * uv_height;
-        let v_start = y_size + u_size;
-        let v_size = self.stride_v * uv_height;
-        &self.data[v_start..v_start + v_size]
+    /// The luma plane. Every format this type describes has one.
+    pub fn y_plane(&self) -> FramePlane<'a> {
+        self.plane(0).expect("every format has a luma plane")
     }
 }
 
@@ -250,8 +261,64 @@ mod tests {
             *b = (i % 251) as u8;
         }
         let view = frame.as_view();
-        assert_eq!(view.y_plane(), frame.y_plane());
-        assert_eq!(view.u_plane(), frame.u_plane());
-        assert_eq!(view.v_plane(), frame.v_plane());
+        assert_eq!(view.plane(0).unwrap().data, frame.y_plane());
+        assert_eq!(view.plane(1).unwrap().data, frame.u_plane());
+        assert_eq!(view.plane(2).unwrap().data, frame.v_plane());
+    }
+
+    /// The NV12 chroma plane is one interleaved plane at full row width,
+    /// and there is no third plane.
+    ///
+    /// Two producers used to disagree about this: `VideoFrame::new` set
+    /// `stride_u = stride_y / 2` while `EncoderElement` set
+    /// `stride_u = stride_y, stride_v = 0`, and `v4l2_m2m` carried a comment
+    /// and a test about reconciling them. `PlaneLayout` is now the single
+    /// source, so the disagreement cannot be expressed.
+    #[test]
+    fn nv12_has_one_full_width_chroma_plane() {
+        let frame = VideoFrame::new(16, 16, PixelFormat::Nv12);
+        let view = frame.as_view();
+        assert_eq!(view.y_plane().stride, 16);
+        let uv = view.plane(1).expect("interleaved chroma plane");
+        assert_eq!((uv.stride, uv.rows, uv.row_bytes), (16, 8, 16));
+        assert!(view.plane(2).is_none(), "NV12 has exactly two planes");
+    }
+
+    /// A strided frame's planes are found by offset, not by summing the
+    /// preceding planes' sizes.
+    #[test]
+    fn plane_views_follow_a_strided_layout() {
+        use crate::format::{PixelFormat as Caps, PlaneDesc, PlaneLayout};
+        // Y 16x16 at stride 24, then U and V 8x8 at stride 12.
+        let layout = PlaneLayout::from_planes(&[
+            PlaneDesc {
+                offset: 0,
+                stride: 24,
+            },
+            PlaneDesc {
+                offset: 24 * 16,
+                stride: 12,
+            },
+            PlaneDesc {
+                offset: 24 * 16 + 12 * 8,
+                stride: 12,
+            },
+        ]);
+        let len = layout.full_span_len(Caps::I420, 16, 16);
+        let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let view = VideoFrameRef {
+            width: 16,
+            height: 16,
+            format: PixelFormat::I420,
+            pts: 0,
+            data: &data,
+            layout,
+        };
+        let v = view.plane(2).unwrap();
+        assert_eq!(v.offset, 24 * 16 + 12 * 8);
+        assert_eq!((v.stride, v.rows, v.row_bytes), (12, 8, 8));
+        // Row 3 of V starts at its own offset plus three strides — nowhere
+        // near `stride * height` arithmetic over the whole buffer.
+        assert_eq!(v.row(3), &data[v.offset + 3 * 12..v.offset + 3 * 12 + 8]);
     }
 }

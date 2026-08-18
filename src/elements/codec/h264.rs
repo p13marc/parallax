@@ -30,6 +30,7 @@
 //! }
 //! ```
 
+use super::common::{FramePlane, VideoFrameRef};
 use crate::buffer::Buffer;
 use crate::control::{EncoderStatsHandle, RateControlMode};
 use crate::element::Element;
@@ -632,18 +633,35 @@ impl H264Encoder {
         width: u32,
         height: u32,
     ) -> Result<Vec<u8>> {
-        check_resolution(width, height)?;
-
-        let expected_size = width as usize * height as usize * 3 / 2;
-        if yuv_data.len() < expected_size {
-            return Err(Error::Config(format!(
-                "YUV data too small: expected {} bytes for {}x{}, got {}",
-                expected_size,
+        self.encode_i420(VideoFrameRef {
+            width,
+            height,
+            format: super::common::PixelFormat::I420,
+            pts: 0,
+            data: yuv_data,
+            layout: crate::format::PlaneLayout::packed(
+                crate::format::PixelFormat::I420,
                 width,
                 height,
-                yuv_data.len()
+            ),
+        })
+    }
+
+    /// Encode one I420 frame, reading its planes through the declared
+    /// layout — packed or strided alike (#196).
+    fn encode_i420(&mut self, frame: VideoFrameRef<'_>) -> Result<Vec<u8>> {
+        let (width, height) = (frame.width, frame.height);
+        check_resolution(width, height)?;
+
+        let planes: Vec<_> = (0..3).filter_map(|i| frame.plane(i)).collect();
+        let Ok(planes): std::result::Result<[_; 3], _> = planes.try_into() else {
+            return Err(Error::Config(format!(
+                "YUV data too small: {}x{} I420 does not fit in {} bytes",
+                width,
+                height,
+                frame.data.len()
             )));
-        }
+        };
 
         if let Some(previous) = self.dims
             && previous != (width, height)
@@ -665,7 +683,7 @@ impl H264Encoder {
         self.dims = Some((width, height));
 
         let yuv = YuvFrame {
-            data: yuv_data,
+            planes,
             width: width as usize,
             height: height as usize,
         };
@@ -953,13 +971,18 @@ impl super::traits::VideoEncoder for H264Encoder {
         // A frame of a different size is not an error: OpenH264 re-initialises
         // and emits a fresh IDR, which is exactly how a live resolution change
         // is supposed to look.
-        let encoded = self.encode_yuv420_at(frame.data, frame.width, frame.height)?;
+        let encoded = self.encode_i420(frame)?;
 
         if encoded.is_empty() {
             Ok(Vec::new())
         } else {
             Ok(vec![encoded])
         }
+    }
+
+    fn accepts_strided_input(&self) -> bool {
+        // `YuvFrame` hands openh264 each plane with its own stride.
+        true
     }
 
     fn flush(&mut self) -> Result<Vec<Self::Packet>> {
@@ -1548,8 +1571,10 @@ impl DecodedFrame {
 // ============================================================================
 
 /// Internal YUV frame wrapper for OpenH264.
+/// The `YUVSource` openh264 encodes from: three planes with their real
+/// strides, so a codec-owned frame needs no repack (#196).
 struct YuvFrame<'a> {
-    data: &'a [u8],
+    planes: [FramePlane<'a>; 3],
     width: usize,
     height: usize,
 }
@@ -1560,23 +1585,23 @@ impl<'a> YUVSource for YuvFrame<'a> {
     }
 
     fn strides(&self) -> (usize, usize, usize) {
-        (self.width, self.width / 2, self.width / 2)
+        (
+            self.planes[0].stride,
+            self.planes[1].stride,
+            self.planes[2].stride,
+        )
     }
 
     fn y(&self) -> &[u8] {
-        &self.data[..self.width * self.height]
+        self.planes[0].data
     }
 
     fn u(&self) -> &[u8] {
-        let y_size = self.width * self.height;
-        let u_size = (self.width / 2) * (self.height / 2);
-        &self.data[y_size..y_size + u_size]
+        self.planes[1].data
     }
 
     fn v(&self) -> &[u8] {
-        let y_size = self.width * self.height;
-        let u_size = (self.width / 2) * (self.height / 2);
-        &self.data[y_size + u_size..]
+        self.planes[2].data
     }
 }
 
@@ -2123,9 +2148,7 @@ mod tests {
             format: CodecPixelFormat::I420,
             pts: 0,
             data: detailed_frame(160, 120, 0),
-            stride_y: 160,
-            stride_u: 80,
-            stride_v: 80,
+            layout: crate::format::PlaneLayout::packed(crate::format::PixelFormat::I420, 160, 120),
         };
 
         let packets = encoder
