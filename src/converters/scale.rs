@@ -128,8 +128,9 @@ impl ScaleEngine {
     /// (#194). The **output is always packed**: every caller writes into a
     /// freshly sized arena slot.
     pub fn scale(&self, input: &[u8], input_layout: PlaneLayout, output: &mut [u8]) -> Result<()> {
+        // `full_span_len`, not `required_len` — see `plane`.
         let expected_input =
-            input_layout.required_len(self.format.into(), self.input_width, self.input_height);
+            input_layout.full_span_len(self.format.into(), self.input_width, self.input_height);
         let expected_output = self
             .format
             .buffer_size(self.output_width, self.output_height);
@@ -182,19 +183,19 @@ impl ScaleEngine {
         Ok(())
     }
 
-    /// One input plane resolved against the declared layout: its bytes from
-    /// the first row to the end of the buffer, plus the row pitch.
+    /// One input plane resolved against the declared layout: exactly its
+    /// `stride * rows` bytes, plus the row pitch.
     ///
-    /// The slice deliberately runs to the end of the buffer rather than to
-    /// `offset + stride * rows` — a tight strided layout's last row carries
-    /// no trailing padding, so the latter would overrun.
+    /// The full span keeps this in step with the colorspace engine, whose
+    /// SIMD backend cannot address a partial trailing row at all.
+    /// [`scale`](Self::scale) gates on [`PlaneLayout::full_span_len`].
     fn plane<'a>(&self, input: &'a [u8], layout: PlaneLayout, index: usize) -> PlaneIn<'a> {
         let p = layout
             .resolved(self.format.into(), self.input_width, self.input_height)
             .nth(index)
             .expect("plane index within the format's plane count");
         PlaneIn {
-            data: &input[p.offset..],
+            data: &input[p.offset..p.offset + p.stride * p.rows],
             stride: p.stride,
         }
     }

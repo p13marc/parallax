@@ -307,8 +307,9 @@ impl Element for VideoConvertElement {
         // Shrinking scaffold (#196): the arms for this input format may not
         // read strides yet, in which case the frame is repacked first. The
         // predicate — and this branch — go away as the families convert.
-        let (data, layout) = if VideoConvert::reads_strided_input(input_format)
-            || layout.is_packed(caps_format, width, height)
+        let (data, layout) = if layout.is_packed(caps_format, width, height)
+            || (VideoConvert::reads_strided_input(input_format)
+                && input_data.len() >= layout.full_span_len(caps_format, width, height))
         {
             (input_data, layout)
         } else {
@@ -450,6 +451,48 @@ mod tests {
         let mut metadata = Metadata::new();
         metadata.set_video_dims(w, h, format);
         Buffer::new(MemoryHandle::with_len(slot, size), metadata)
+    }
+
+    /// A strided frame whose buffer ends tight against its last row still
+    /// converts correctly: the engine refuses it (its arms address whole
+    /// rows), so the element repacks first.
+    ///
+    /// The engine's fast path is the common case — real strided producers
+    /// allocate whole rows — but "uncommon" must not mean "wrong".
+    #[test]
+    fn a_tight_trailing_row_falls_back_to_the_repack_and_stays_correct() {
+        use crate::converters::testutil::strided_twin;
+        use crate::format::PixelFormat as Caps;
+        const W: u32 = 32;
+        const H: u32 = 24;
+
+        let packed: Vec<u8> = (0..PixelFormat::I420.buffer_size(W, H))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let (strided, layout) = strided_twin(&packed, Caps::I420, W, H, 11);
+        let tight = layout.required_len(Caps::I420, W, H);
+        assert!(
+            tight < strided.len(),
+            "test premise: the twin has a padded tail"
+        );
+
+        // The same frame, minus that tail.
+        let arena = SharedArena::new(tight, 2).unwrap();
+        let mut slot = arena.acquire().unwrap();
+        slot.data_mut()[..tight].copy_from_slice(&strided[..tight]);
+        let mut metadata = Metadata::new();
+        metadata.set_video_planes(W, H, Caps::I420, layout);
+        let buffer = Buffer::new(MemoryHandle::with_len(slot, tight), metadata);
+
+        let mut element = VideoConvertElement::new().with_output_format(PixelFormat::Bgra);
+        let out = element.process(buffer).unwrap().expect("a converted frame");
+
+        let reference = VideoConvert::new(PixelFormat::I420, PixelFormat::Bgra, W, H).unwrap();
+        let mut want = vec![0u8; reference.output_size()];
+        reference
+            .convert(&packed, reference.packed_input_layout(), &mut want)
+            .unwrap();
+        assert_eq!(out.as_bytes(), want.as_slice());
     }
 
     fn rgb_to_i420() -> VideoConvertElement {

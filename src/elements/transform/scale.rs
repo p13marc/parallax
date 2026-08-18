@@ -517,8 +517,9 @@ impl Element for VideoScale {
 
         // Shrinking scaffold (#196): repack when the engine paths for this
         // format do not read strides yet. Goes away with the predicate.
-        let (data, layout) = if converters::ScaleEngine::reads_strided_input(format)
-            || layout.is_packed(caps_format, src_w, src_h)
+        let (data, layout) = if layout.is_packed(caps_format, src_w, src_h)
+            || (converters::ScaleEngine::reads_strided_input(format)
+                && buffer.as_bytes().len() >= layout.full_span_len(caps_format, src_w, src_h))
         {
             (buffer.as_bytes(), layout)
         } else {

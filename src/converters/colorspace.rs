@@ -288,26 +288,11 @@ pub struct VideoConvert {
 /// One input plane resolved against a buffer: its bytes from the first row
 /// to the end of the buffer, plus the geometry needed to walk it.
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code)] // fields used as the arm families are converted (#196)
 struct PlaneIn<'a> {
-    /// Plane bytes, starting at its first row.
+    /// The plane's `stride * rows` bytes.
     data: &'a [u8],
     /// Byte distance between consecutive rows.
     stride: usize,
-    /// Number of rows.
-    rows: usize,
-    /// Used bytes per row (<= stride).
-    row_bytes: usize,
-}
-
-impl<'a> PlaneIn<'a> {
-    /// Row `y`'s used bytes.
-    #[inline]
-    #[allow(dead_code)] // used as the arm families are converted (#196)
-    fn row(&self, y: usize) -> &'a [u8] {
-        let start = y * self.stride;
-        &self.data[start..start + self.row_bytes]
-    }
 }
 
 impl VideoConvert {
@@ -320,9 +305,9 @@ impl VideoConvert {
     /// buffers — once every family is converted.
     pub(crate) fn reads_strided_input(input_format: PixelFormat) -> bool {
         match input_format {
-            PixelFormat::I420
-            | PixelFormat::Nv12
-            | PixelFormat::Yuyv
+            // Planar/semi-planar YUV: planes resolved through `PlaneLayout`.
+            PixelFormat::I420 | PixelFormat::Nv12 => true,
+            PixelFormat::Yuyv
             | PixelFormat::Uyvy
             | PixelFormat::Rgb24
             | PixelFormat::Rgba
@@ -389,25 +374,33 @@ impl VideoConvert {
         PlaneLayout::packed(self.input_format.into(), self.width, self.height)
     }
 
-    /// One input plane, resolved against the buffer.
+    /// One input plane, resolved against the buffer: exactly its
+    /// `stride * rows` bytes.
     ///
-    /// The slice runs from the plane's first row to the *end of the buffer*,
-    /// not to `offset + stride * rows`: a tight strided layout's last row
-    /// has no trailing padding, so the latter would overrun. Every consumer
-    /// walks it row by row, and so does the `yuv` crate, whose own length
-    /// check is `stride * (rows - 1) + row_bytes`.
-    #[allow(dead_code)] // used as the arm families are converted (#196)
+    /// The full span, not `stride * (rows - 1) + row_bytes`, because the
+    /// SIMD backend walks planes with `chunks_exact(stride)` and drops a
+    /// final partial chunk — the last row would silently vanish.
+    /// [`convert`](Self::convert) gates on
+    /// [`PlaneLayout::full_span_len`] before any of this runs.
     fn input_plane<'a>(&self, input: &'a [u8], layout: PlaneLayout, index: usize) -> PlaneIn<'a> {
         let p = layout
             .resolved(self.input_format.into(), self.width, self.height)
             .nth(index)
             .expect("plane index within the format's plane count");
         PlaneIn {
-            data: &input[p.offset..],
+            data: &input[p.offset..p.offset + p.stride * p.rows],
             stride: p.stride,
-            rows: p.rows,
-            row_bytes: p.row_bytes,
         }
+    }
+
+    /// The three planes of an I420 input, in Y/U/V order.
+    fn i420_planes<'a>(&self, input: &'a [u8], layout: PlaneLayout) -> [PlaneIn<'a>; 3] {
+        [0, 1, 2].map(|i| self.input_plane(input, layout, i))
+    }
+
+    /// The two planes of an NV12 input: luma, then interleaved chroma.
+    fn nv12_planes<'a>(&self, input: &'a [u8], layout: PlaneLayout) -> [PlaneIn<'a>; 2] {
+        [0, 1].map(|i| self.input_plane(input, layout, i))
     }
 
     /// Convert a frame from input format to output format.
@@ -423,8 +416,12 @@ impl VideoConvert {
         input_layout: PlaneLayout,
         output: &mut [u8],
     ) -> Result<()> {
+        // `full_span_len`, not `required_len`: the arms address planes by
+        // whole rows (see `input_plane`). A caller holding a frame that ends
+        // tight against its last row must repack it first — the elements'
+        // scaffold does exactly that.
         let expected_input =
-            input_layout.required_len(self.input_format.into(), self.width, self.height);
+            input_layout.full_span_len(self.input_format.into(), self.width, self.height);
         let expected_output = self.output_format.buffer_size(self.width, self.height);
 
         if input.len() < expected_input {
@@ -445,36 +442,46 @@ impl VideoConvert {
 
         // Dispatch to specific conversion
         match (self.input_format, self.output_format) {
-            // Same format - just copy
+            // Same format: a row-copy through the layout, which degenerates
+            // to one `copy_from_slice` per plane when the input is packed.
+            // Not a flat slice copy — that would carry a strided frame's row
+            // padding into a packed output.
             (a, b) if a == b => {
-                let packed = self.input_format.buffer_size(self.width, self.height);
-                output[..packed].copy_from_slice(&input[..packed]);
+                input_layout
+                    .repack_into(
+                        input,
+                        self.input_format.into(),
+                        self.width,
+                        self.height,
+                        output,
+                    )
+                    .map_err(Error::Config)?;
             }
 
             // YUV to RGB conversions
             (PixelFormat::I420, PixelFormat::Rgb24) => {
-                self.i420_to_rgb24(input, output);
+                self.i420_to_rgb24(input, input_layout, output);
             }
             (PixelFormat::I420, PixelFormat::Rgba) => {
-                self.i420_to_rgba(input, output);
+                self.i420_to_rgba(input, input_layout, output);
             }
             (PixelFormat::I420, PixelFormat::Bgr24) => {
-                self.i420_to_bgr24(input, output);
+                self.i420_to_bgr24(input, input_layout, output);
             }
             (PixelFormat::I420, PixelFormat::Bgra) => {
-                self.i420_to_bgra(input, output);
+                self.i420_to_bgra(input, input_layout, output);
             }
             (PixelFormat::Nv12, PixelFormat::Rgb24) => {
-                self.nv12_to_rgb24(input, output);
+                self.nv12_to_rgb24(input, input_layout, output);
             }
             (PixelFormat::Nv12, PixelFormat::Rgba) => {
-                self.nv12_to_rgba(input, output);
+                self.nv12_to_rgba(input, input_layout, output);
             }
             (PixelFormat::Nv12, PixelFormat::Bgr24) => {
-                self.nv12_to_bgr24(input, output);
+                self.nv12_to_bgr24(input, input_layout, output);
             }
             (PixelFormat::Nv12, PixelFormat::Bgra) => {
-                self.nv12_to_bgra(input, output);
+                self.nv12_to_bgra(input, input_layout, output);
             }
 
             // YUYV (packed YUV 4:2:2) to RGB conversions
@@ -576,10 +583,10 @@ impl VideoConvert {
 
             // Planar <-> semi-planar YUV 4:2:0 (a chroma plane interleave).
             (PixelFormat::I420, PixelFormat::Nv12) => {
-                self.i420_to_nv12(input, output);
+                self.i420_to_nv12(input, input_layout, output);
             }
             (PixelFormat::Nv12, PixelFormat::I420) => {
-                self.nv12_to_i420(input, output);
+                self.nv12_to_i420(input, input_layout, output);
             }
 
             // Gray conversions
@@ -655,34 +662,44 @@ impl VideoConvert {
     }
 
     /// I420 -> NV12: interleave the two chroma planes.
-    fn i420_to_nv12(&self, input: &[u8], output: &mut [u8]) {
+    fn i420_to_nv12(&self, input: &[u8], layout: PlaneLayout, output: &mut [u8]) {
         let (w, h) = (self.width as usize, self.height as usize);
         let (cw, ch) = (w / 2, h / 2);
         let y_size = w * h;
-        let c_size = cw * ch;
 
-        output[..y_size].copy_from_slice(&input[..y_size]);
-
-        let u_plane = &input[y_size..y_size + c_size];
-        let v_plane = &input[y_size + c_size..y_size + 2 * c_size];
-        for i in 0..c_size {
-            output[y_size + i * 2] = u_plane[i];
-            output[y_size + i * 2 + 1] = v_plane[i];
+        let [yp, up, vp] = self.i420_planes(input, layout);
+        for row in 0..h {
+            let src = row * yp.stride;
+            output[row * w..row * w + w].copy_from_slice(&yp.data[src..src + w]);
+        }
+        for row in 0..ch {
+            let (u_row, v_row) = (row * up.stride, row * vp.stride);
+            let dst = y_size + row * cw * 2;
+            for col in 0..cw {
+                output[dst + col * 2] = up.data[u_row + col];
+                output[dst + col * 2 + 1] = vp.data[v_row + col];
+            }
         }
     }
 
     /// NV12 -> I420: de-interleave the chroma plane.
-    fn nv12_to_i420(&self, input: &[u8], output: &mut [u8]) {
+    fn nv12_to_i420(&self, input: &[u8], layout: PlaneLayout, output: &mut [u8]) {
         let (w, h) = (self.width as usize, self.height as usize);
         let (cw, ch) = (w / 2, h / 2);
         let y_size = w * h;
         let c_size = cw * ch;
 
-        output[..y_size].copy_from_slice(&input[..y_size]);
-
-        for i in 0..c_size {
-            output[y_size + i] = input[y_size + i * 2];
-            output[y_size + c_size + i] = input[y_size + i * 2 + 1];
+        let [yp, uvp] = self.nv12_planes(input, layout);
+        for row in 0..h {
+            let src = row * yp.stride;
+            output[row * w..row * w + w].copy_from_slice(&yp.data[src..src + w]);
+        }
+        for row in 0..ch {
+            let src = row * uvp.stride;
+            for col in 0..cw {
+                output[y_size + row * cw + col] = uvp.data[src + col * 2];
+                output[y_size + c_size + row * cw + col] = uvp.data[src + col * 2 + 1];
+            }
         }
     }
 
@@ -717,21 +734,18 @@ impl VideoConvert {
     // -------------------------------------------------------------------------
 
     #[cfg(feature = "simd-colorspace")]
-    fn i420_to_rgb24(&self, input: &[u8], output: &mut [u8]) {
+    fn i420_to_rgb24(&self, input: &[u8], layout: PlaneLayout, output: &mut [u8]) {
         let w = self.width as usize;
-        let h = self.height as usize;
 
-        let y_plane = &input[0..w * h];
-        let u_plane = &input[w * h..w * h + (w / 2) * (h / 2)];
-        let v_plane = &input[w * h + (w / 2) * (h / 2)..];
+        let [yp, up, vp] = self.i420_planes(input, layout);
 
         let planar = YuvPlanarImage {
-            y_plane,
-            y_stride: w as u32,
-            u_plane,
-            u_stride: (w / 2) as u32,
-            v_plane,
-            v_stride: (w / 2) as u32,
+            y_plane: yp.data,
+            y_stride: yp.stride as u32,
+            u_plane: up.data,
+            u_stride: up.stride as u32,
+            v_plane: vp.data,
+            v_stride: vp.stride as u32,
             width: self.width,
             height: self.height,
         };
@@ -747,19 +761,17 @@ impl VideoConvert {
     }
 
     #[cfg(not(feature = "simd-colorspace"))]
-    fn i420_to_rgb24(&self, input: &[u8], output: &mut [u8]) {
+    fn i420_to_rgb24(&self, input: &[u8], layout: PlaneLayout, output: &mut [u8]) {
         let w = self.width as usize;
         let h = self.height as usize;
 
-        let y_plane = &input[0..w * h];
-        let u_plane = &input[w * h..w * h + (w / 2) * (h / 2)];
-        let v_plane = &input[w * h + (w / 2) * (h / 2)..];
+        let [yp, up, vp] = self.i420_planes(input, layout);
 
         for row in 0..h {
             for col in 0..w {
-                let y = y_plane[row * w + col];
-                let u = u_plane[(row / 2) * (w / 2) + (col / 2)];
-                let v = v_plane[(row / 2) * (w / 2) + (col / 2)];
+                let y = yp.data[row * yp.stride + col];
+                let u = up.data[(row / 2) * up.stride + (col / 2)];
+                let v = vp.data[(row / 2) * vp.stride + (col / 2)];
 
                 let (r, g, b) = self.yuv_to_rgb(y, u, v);
 
@@ -772,21 +784,18 @@ impl VideoConvert {
     }
 
     #[cfg(feature = "simd-colorspace")]
-    fn i420_to_rgba(&self, input: &[u8], output: &mut [u8]) {
+    fn i420_to_rgba(&self, input: &[u8], layout: PlaneLayout, output: &mut [u8]) {
         let w = self.width as usize;
-        let h = self.height as usize;
 
-        let y_plane = &input[0..w * h];
-        let u_plane = &input[w * h..w * h + (w / 2) * (h / 2)];
-        let v_plane = &input[w * h + (w / 2) * (h / 2)..];
+        let [yp, up, vp] = self.i420_planes(input, layout);
 
         let planar = YuvPlanarImage {
-            y_plane,
-            y_stride: w as u32,
-            u_plane,
-            u_stride: (w / 2) as u32,
-            v_plane,
-            v_stride: (w / 2) as u32,
+            y_plane: yp.data,
+            y_stride: yp.stride as u32,
+            u_plane: up.data,
+            u_stride: up.stride as u32,
+            v_plane: vp.data,
+            v_stride: vp.stride as u32,
             width: self.width,
             height: self.height,
         };
@@ -802,19 +811,17 @@ impl VideoConvert {
     }
 
     #[cfg(not(feature = "simd-colorspace"))]
-    fn i420_to_rgba(&self, input: &[u8], output: &mut [u8]) {
+    fn i420_to_rgba(&self, input: &[u8], layout: PlaneLayout, output: &mut [u8]) {
         let w = self.width as usize;
         let h = self.height as usize;
 
-        let y_plane = &input[0..w * h];
-        let u_plane = &input[w * h..w * h + (w / 2) * (h / 2)];
-        let v_plane = &input[w * h + (w / 2) * (h / 2)..];
+        let [yp, up, vp] = self.i420_planes(input, layout);
 
         for row in 0..h {
             for col in 0..w {
-                let y = y_plane[row * w + col];
-                let u = u_plane[(row / 2) * (w / 2) + (col / 2)];
-                let v = v_plane[(row / 2) * (w / 2) + (col / 2)];
+                let y = yp.data[row * yp.stride + col];
+                let u = up.data[(row / 2) * up.stride + (col / 2)];
+                let v = vp.data[(row / 2) * vp.stride + (col / 2)];
 
                 let (r, g, b) = self.yuv_to_rgb(y, u, v);
 
@@ -828,21 +835,18 @@ impl VideoConvert {
     }
 
     #[cfg(feature = "simd-colorspace")]
-    fn i420_to_bgr24(&self, input: &[u8], output: &mut [u8]) {
+    fn i420_to_bgr24(&self, input: &[u8], layout: PlaneLayout, output: &mut [u8]) {
         let w = self.width as usize;
-        let h = self.height as usize;
 
-        let y_plane = &input[0..w * h];
-        let u_plane = &input[w * h..w * h + (w / 2) * (h / 2)];
-        let v_plane = &input[w * h + (w / 2) * (h / 2)..];
+        let [yp, up, vp] = self.i420_planes(input, layout);
 
         let planar = YuvPlanarImage {
-            y_plane,
-            y_stride: w as u32,
-            u_plane,
-            u_stride: (w / 2) as u32,
-            v_plane,
-            v_stride: (w / 2) as u32,
+            y_plane: yp.data,
+            y_stride: yp.stride as u32,
+            u_plane: up.data,
+            u_stride: up.stride as u32,
+            v_plane: vp.data,
+            v_stride: vp.stride as u32,
             width: self.width,
             height: self.height,
         };
@@ -858,19 +862,17 @@ impl VideoConvert {
     }
 
     #[cfg(not(feature = "simd-colorspace"))]
-    fn i420_to_bgr24(&self, input: &[u8], output: &mut [u8]) {
+    fn i420_to_bgr24(&self, input: &[u8], layout: PlaneLayout, output: &mut [u8]) {
         let w = self.width as usize;
         let h = self.height as usize;
 
-        let y_plane = &input[0..w * h];
-        let u_plane = &input[w * h..w * h + (w / 2) * (h / 2)];
-        let v_plane = &input[w * h + (w / 2) * (h / 2)..];
+        let [yp, up, vp] = self.i420_planes(input, layout);
 
         for row in 0..h {
             for col in 0..w {
-                let y = y_plane[row * w + col];
-                let u = u_plane[(row / 2) * (w / 2) + (col / 2)];
-                let v = v_plane[(row / 2) * (w / 2) + (col / 2)];
+                let y = yp.data[row * yp.stride + col];
+                let u = up.data[(row / 2) * up.stride + (col / 2)];
+                let v = vp.data[(row / 2) * vp.stride + (col / 2)];
 
                 let (r, g, b) = self.yuv_to_rgb(y, u, v);
 
@@ -883,21 +885,18 @@ impl VideoConvert {
     }
 
     #[cfg(feature = "simd-colorspace")]
-    fn i420_to_bgra(&self, input: &[u8], output: &mut [u8]) {
+    fn i420_to_bgra(&self, input: &[u8], layout: PlaneLayout, output: &mut [u8]) {
         let w = self.width as usize;
-        let h = self.height as usize;
 
-        let y_plane = &input[0..w * h];
-        let u_plane = &input[w * h..w * h + (w / 2) * (h / 2)];
-        let v_plane = &input[w * h + (w / 2) * (h / 2)..];
+        let [yp, up, vp] = self.i420_planes(input, layout);
 
         let planar = YuvPlanarImage {
-            y_plane,
-            y_stride: w as u32,
-            u_plane,
-            u_stride: (w / 2) as u32,
-            v_plane,
-            v_stride: (w / 2) as u32,
+            y_plane: yp.data,
+            y_stride: yp.stride as u32,
+            u_plane: up.data,
+            u_stride: up.stride as u32,
+            v_plane: vp.data,
+            v_stride: vp.stride as u32,
             width: self.width,
             height: self.height,
         };
@@ -913,19 +912,17 @@ impl VideoConvert {
     }
 
     #[cfg(not(feature = "simd-colorspace"))]
-    fn i420_to_bgra(&self, input: &[u8], output: &mut [u8]) {
+    fn i420_to_bgra(&self, input: &[u8], layout: PlaneLayout, output: &mut [u8]) {
         let w = self.width as usize;
         let h = self.height as usize;
 
-        let y_plane = &input[0..w * h];
-        let u_plane = &input[w * h..w * h + (w / 2) * (h / 2)];
-        let v_plane = &input[w * h + (w / 2) * (h / 2)..];
+        let [yp, up, vp] = self.i420_planes(input, layout);
 
         for row in 0..h {
             for col in 0..w {
-                let y = y_plane[row * w + col];
-                let u = u_plane[(row / 2) * (w / 2) + (col / 2)];
-                let v = v_plane[(row / 2) * (w / 2) + (col / 2)];
+                let y = yp.data[row * yp.stride + col];
+                let u = up.data[(row / 2) * up.stride + (col / 2)];
+                let v = vp.data[(row / 2) * vp.stride + (col / 2)];
 
                 let (r, g, b) = self.yuv_to_rgb(y, u, v);
 
@@ -943,18 +940,16 @@ impl VideoConvert {
     // -------------------------------------------------------------------------
 
     #[cfg(feature = "simd-colorspace")]
-    fn nv12_to_rgb24(&self, input: &[u8], output: &mut [u8]) {
+    fn nv12_to_rgb24(&self, input: &[u8], layout: PlaneLayout, output: &mut [u8]) {
         let w = self.width as usize;
-        let h = self.height as usize;
 
-        let y_plane = &input[0..w * h];
-        let uv_plane = &input[w * h..];
+        let [yp, uvp] = self.nv12_planes(input, layout);
 
         let bi_planar = YuvBiPlanarImage {
-            y_plane,
-            y_stride: w as u32,
-            uv_plane,
-            uv_stride: w as u32,
+            y_plane: yp.data,
+            y_stride: yp.stride as u32,
+            uv_plane: uvp.data,
+            uv_stride: uvp.stride as u32,
             width: self.width,
             height: self.height,
         };
@@ -971,19 +966,18 @@ impl VideoConvert {
     }
 
     #[cfg(not(feature = "simd-colorspace"))]
-    fn nv12_to_rgb24(&self, input: &[u8], output: &mut [u8]) {
+    fn nv12_to_rgb24(&self, input: &[u8], layout: PlaneLayout, output: &mut [u8]) {
         let w = self.width as usize;
         let h = self.height as usize;
 
-        let y_plane = &input[0..w * h];
-        let uv_plane = &input[w * h..];
+        let [yp, uvp] = self.nv12_planes(input, layout);
 
         for row in 0..h {
             for col in 0..w {
-                let y = y_plane[row * w + col];
-                let uv_idx = (row / 2) * w + (col / 2) * 2;
-                let u = uv_plane[uv_idx];
-                let v = uv_plane[uv_idx + 1];
+                let y = yp.data[row * yp.stride + col];
+                let uv_idx = (row / 2) * uvp.stride + (col / 2) * 2;
+                let u = uvp.data[uv_idx];
+                let v = uvp.data[uv_idx + 1];
 
                 let (r, g, b) = self.yuv_to_rgb(y, u, v);
 
@@ -996,18 +990,16 @@ impl VideoConvert {
     }
 
     #[cfg(feature = "simd-colorspace")]
-    fn nv12_to_rgba(&self, input: &[u8], output: &mut [u8]) {
+    fn nv12_to_rgba(&self, input: &[u8], layout: PlaneLayout, output: &mut [u8]) {
         let w = self.width as usize;
-        let h = self.height as usize;
 
-        let y_plane = &input[0..w * h];
-        let uv_plane = &input[w * h..];
+        let [yp, uvp] = self.nv12_planes(input, layout);
 
         let bi_planar = YuvBiPlanarImage {
-            y_plane,
-            y_stride: w as u32,
-            uv_plane,
-            uv_stride: w as u32,
+            y_plane: yp.data,
+            y_stride: yp.stride as u32,
+            uv_plane: uvp.data,
+            uv_stride: uvp.stride as u32,
             width: self.width,
             height: self.height,
         };
@@ -1024,19 +1016,18 @@ impl VideoConvert {
     }
 
     #[cfg(not(feature = "simd-colorspace"))]
-    fn nv12_to_rgba(&self, input: &[u8], output: &mut [u8]) {
+    fn nv12_to_rgba(&self, input: &[u8], layout: PlaneLayout, output: &mut [u8]) {
         let w = self.width as usize;
         let h = self.height as usize;
 
-        let y_plane = &input[0..w * h];
-        let uv_plane = &input[w * h..];
+        let [yp, uvp] = self.nv12_planes(input, layout);
 
         for row in 0..h {
             for col in 0..w {
-                let y = y_plane[row * w + col];
-                let uv_idx = (row / 2) * w + (col / 2) * 2;
-                let u = uv_plane[uv_idx];
-                let v = uv_plane[uv_idx + 1];
+                let y = yp.data[row * yp.stride + col];
+                let uv_idx = (row / 2) * uvp.stride + (col / 2) * 2;
+                let u = uvp.data[uv_idx];
+                let v = uvp.data[uv_idx + 1];
 
                 let (r, g, b) = self.yuv_to_rgb(y, u, v);
 
@@ -1051,18 +1042,16 @@ impl VideoConvert {
 
     /// Convert NV12 to BGR24 (SIMD-accelerated when available).
     #[cfg(feature = "simd-colorspace")]
-    fn nv12_to_bgr24(&self, input: &[u8], output: &mut [u8]) {
+    fn nv12_to_bgr24(&self, input: &[u8], layout: PlaneLayout, output: &mut [u8]) {
         let w = self.width as usize;
-        let h = self.height as usize;
 
-        let y_plane = &input[0..w * h];
-        let uv_plane = &input[w * h..];
+        let [yp, uvp] = self.nv12_planes(input, layout);
 
         let bi_planar = YuvBiPlanarImage {
-            y_plane,
-            y_stride: w as u32,
-            uv_plane,
-            uv_stride: w as u32,
+            y_plane: yp.data,
+            y_stride: yp.stride as u32,
+            uv_plane: uvp.data,
+            uv_stride: uvp.stride as u32,
             width: self.width,
             height: self.height,
         };
@@ -1079,19 +1068,18 @@ impl VideoConvert {
     }
 
     #[cfg(not(feature = "simd-colorspace"))]
-    fn nv12_to_bgr24(&self, input: &[u8], output: &mut [u8]) {
+    fn nv12_to_bgr24(&self, input: &[u8], layout: PlaneLayout, output: &mut [u8]) {
         let w = self.width as usize;
         let h = self.height as usize;
 
-        let y_plane = &input[0..w * h];
-        let uv_plane = &input[w * h..];
+        let [yp, uvp] = self.nv12_planes(input, layout);
 
         for row in 0..h {
             for col in 0..w {
-                let y = y_plane[row * w + col];
-                let uv_idx = (row / 2) * w + (col / 2) * 2;
-                let u = uv_plane[uv_idx];
-                let v = uv_plane[uv_idx + 1];
+                let y = yp.data[row * yp.stride + col];
+                let uv_idx = (row / 2) * uvp.stride + (col / 2) * 2;
+                let u = uvp.data[uv_idx];
+                let v = uvp.data[uv_idx + 1];
 
                 let (r, g, b) = self.yuv_to_rgb(y, u, v);
 
@@ -1105,18 +1093,16 @@ impl VideoConvert {
 
     /// Convert NV12 to BGRA (SIMD-accelerated when available).
     #[cfg(feature = "simd-colorspace")]
-    fn nv12_to_bgra(&self, input: &[u8], output: &mut [u8]) {
+    fn nv12_to_bgra(&self, input: &[u8], layout: PlaneLayout, output: &mut [u8]) {
         let w = self.width as usize;
-        let h = self.height as usize;
 
-        let y_plane = &input[0..w * h];
-        let uv_plane = &input[w * h..];
+        let [yp, uvp] = self.nv12_planes(input, layout);
 
         let bi_planar = YuvBiPlanarImage {
-            y_plane,
-            y_stride: w as u32,
-            uv_plane,
-            uv_stride: w as u32,
+            y_plane: yp.data,
+            y_stride: yp.stride as u32,
+            uv_plane: uvp.data,
+            uv_stride: uvp.stride as u32,
             width: self.width,
             height: self.height,
         };
@@ -1133,19 +1119,18 @@ impl VideoConvert {
     }
 
     #[cfg(not(feature = "simd-colorspace"))]
-    fn nv12_to_bgra(&self, input: &[u8], output: &mut [u8]) {
+    fn nv12_to_bgra(&self, input: &[u8], layout: PlaneLayout, output: &mut [u8]) {
         let w = self.width as usize;
         let h = self.height as usize;
 
-        let y_plane = &input[0..w * h];
-        let uv_plane = &input[w * h..];
+        let [yp, uvp] = self.nv12_planes(input, layout);
 
         for row in 0..h {
             for col in 0..w {
-                let y = y_plane[row * w + col];
-                let uv_idx = (row / 2) * w + (col / 2) * 2;
-                let u = uv_plane[uv_idx];
-                let v = uv_plane[uv_idx + 1];
+                let y = yp.data[row * yp.stride + col];
+                let uv_idx = (row / 2) * uvp.stride + (col / 2) * 2;
+                let u = uvp.data[uv_idx];
+                let v = uvp.data[uv_idx + 1];
 
                 let (r, g, b) = self.yuv_to_rgb(y, u, v);
 
@@ -2660,5 +2645,121 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Converting a strided frame must produce byte-identical output to
+    /// converting its packed twin, for every `(input, output)` pair the
+    /// engine supports.
+    ///
+    /// The two runs execute the same arithmetic over the same samples and
+    /// differ only in addressing, so equality is exact. The padding carries
+    /// a sentinel, so an arm that still derives a row start from width reads
+    /// it and the comparison fails.
+    ///
+    /// Input formats whose arms are not converted yet are skipped — the set
+    /// grows commit by commit as #196 lands them, and
+    /// `every_input_format_reads_strides` is what finally pins it closed.
+    #[test]
+    fn strided_input_converts_identically_to_its_packed_twin() {
+        use crate::converters::testutil::strided_twin;
+        const W: u32 = 32;
+        const H: u32 = 24;
+
+        let mut pairs = 0usize;
+        for input in PixelFormat::ALL {
+            if !VideoConvert::reads_strided_input(input) {
+                continue;
+            }
+            let caps: crate::format::PixelFormat = input.into();
+            let packed: Vec<u8> = (0..input.buffer_size(W, H))
+                .map(|i| (i % 251) as u8)
+                .collect();
+            let (strided, layout) = strided_twin(&packed, caps, W, H, 11);
+
+            for output in PixelFormat::ALL {
+                let Ok(conv) = VideoConvert::new(input, output, W, H) else {
+                    continue;
+                };
+                let mut from_packed = vec![0u8; conv.output_size()];
+                if conv
+                    .convert(&packed, conv.packed_input_layout(), &mut from_packed)
+                    .is_err()
+                {
+                    continue; // unsupported pair
+                }
+                let mut from_strided = vec![0u8; conv.output_size()];
+                conv.convert(&strided, layout, &mut from_strided).unwrap();
+                if from_packed != from_strided {
+                    // Report where, not just that: a whole-image mismatch
+                    // means a bad plane base, a trailing run means a
+                    // dropped last row.
+                    let first = from_packed
+                        .iter()
+                        .zip(&from_strided)
+                        .position(|(a, b)| a != b)
+                        .expect("differ");
+                    let count = from_packed
+                        .iter()
+                        .zip(&from_strided)
+                        .filter(|(a, b)| a != b)
+                        .count();
+                    panic!(
+                        "{input:?} -> {output:?}: {count} of {} bytes differ, first at {first}",
+                        from_packed.len()
+                    );
+                }
+                pairs += 1;
+            }
+        }
+        assert!(pairs > 0, "no converted input family to check");
+    }
+
+    /// A frame whose buffer ends tight against its last row is refused,
+    /// not silently short-converted.
+    ///
+    /// The SIMD backend walks planes in `stride`-sized chunks and drops a
+    /// partial trailing one, so the last row would vanish. Erroring is what
+    /// lets the element repack instead — see
+    /// [`PlaneLayout::full_span_len`](crate::format::PlaneLayout::full_span_len).
+    #[test]
+    fn a_tight_trailing_row_is_refused_by_the_engine() {
+        use crate::converters::testutil::strided_twin;
+        const W: u32 = 32;
+        const H: u32 = 24;
+        let caps: crate::format::PixelFormat = PixelFormat::I420.into();
+        let packed: Vec<u8> = (0..PixelFormat::I420.buffer_size(W, H))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let (strided, layout) = strided_twin(&packed, caps, W, H, 11);
+
+        let tight = layout.required_len(caps, W, H);
+        assert!(
+            tight < layout.full_span_len(caps, W, H),
+            "test premise: padding a stride leaves the last row short of a full chunk"
+        );
+
+        let conv = VideoConvert::new(PixelFormat::I420, PixelFormat::Rgba, W, H).unwrap();
+        let mut out = vec![0u8; conv.output_size()];
+        let err = conv
+            .convert(&strided[..tight], layout, &mut out)
+            .expect_err("a tight trailing row must not convert");
+        assert!(format!("{err}").contains("Input buffer too small"), "{err}");
+    }
+
+    /// The scaffold is gone: every input format the engine takes reads its
+    /// planes through the declared layout.
+    ///
+    /// Flipped on in the commit that converts the last family (#196); until
+    /// then it names exactly what is left.
+    #[test]
+    fn every_input_format_reads_strides() {
+        let pending: Vec<PixelFormat> = PixelFormat::ALL
+            .into_iter()
+            .filter(|f| !VideoConvert::reads_strided_input(*f))
+            .collect();
+        assert!(
+            pending.is_empty() || pending.len() < PixelFormat::ALL.len(),
+            "no input family reads strides yet: {pending:?}"
+        );
     }
 }

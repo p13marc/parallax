@@ -51,6 +51,11 @@ pub(crate) mod testutil {
     /// Build a strided twin of a packed frame: every plane's rows are moved
     /// `pad` bytes further apart, with the gaps filled by a sentinel that
     /// must never be read.
+    ///
+    /// Sized to [`PlaneLayout::full_span_len`], so the last plane's final
+    /// row keeps its trailing padding — the shape real strided producers
+    /// allocate (dav1d aligns plane heights to 128 rows, V4L2 hands out
+    /// `bytesperline * height`).
     pub(crate) fn strided_twin(
         packed: &[u8],
         format: crate::format::PixelFormat,
@@ -71,7 +76,7 @@ pub(crate) mod testutil {
         }
         let dst_layout = PlaneLayout::from_planes(&descs);
 
-        let mut out = vec![SENTINEL; dst_layout.required_len(format, width, height)];
+        let mut out = vec![SENTINEL; dst_layout.full_span_len(format, width, height)];
         for (src, dst) in src_layout
             .resolved(format, width, height)
             .zip(dst_layout.resolved(format, width, height))
