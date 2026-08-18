@@ -42,3 +42,46 @@ pub use audio::{AudioChannelMix, AudioConvert, ChannelLayout, SampleFormat};
 pub use colorspace::{ColorMatrix, PixelFormat, UnsupportedPixelFormat, VideoConvert};
 pub use resample::{AudioResample, ResampleQuality};
 pub use scale::{ScaleEngine, ScaleMode};
+
+/// Test-only helpers shared by the engine test modules.
+#[cfg(test)]
+pub(crate) mod testutil {
+    use crate::format::PlaneLayout;
+
+    /// Build a strided twin of a packed frame: every plane's rows are moved
+    /// `pad` bytes further apart, with the gaps filled by a sentinel that
+    /// must never be read.
+    pub(crate) fn strided_twin(
+        packed: &[u8],
+        format: crate::format::PixelFormat,
+        width: u32,
+        height: u32,
+        pad: usize,
+    ) -> (Vec<u8>, PlaneLayout) {
+        use crate::format::PlaneDesc;
+        const SENTINEL: u8 = 0x5A;
+
+        let src_layout = PlaneLayout::packed(format, width, height);
+        let mut descs = Vec::new();
+        let mut offset = 0usize;
+        for plane in src_layout.resolved(format, width, height) {
+            let stride = plane.stride + pad;
+            descs.push(PlaneDesc { offset, stride });
+            offset += stride * plane.rows;
+        }
+        let dst_layout = PlaneLayout::from_planes(&descs);
+
+        let mut out = vec![SENTINEL; dst_layout.required_len(format, width, height)];
+        for (src, dst) in src_layout
+            .resolved(format, width, height)
+            .zip(dst_layout.resolved(format, width, height))
+        {
+            for row in 0..src.rows {
+                let s = src.offset + row * src.stride;
+                let d = dst.offset + row * dst.stride;
+                out[d..d + dst.row_bytes].copy_from_slice(&packed[s..s + src.row_bytes]);
+            }
+        }
+        (out, dst_layout)
+    }
+}

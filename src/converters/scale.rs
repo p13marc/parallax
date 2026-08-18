@@ -26,6 +26,14 @@ pub enum ScaleMode {
     NearestNeighbor,
 }
 
+/// One input plane resolved against a buffer: its bytes from the first row
+/// onward, plus the byte distance between consecutive rows.
+#[derive(Clone, Copy, Debug)]
+struct PlaneIn<'a> {
+    data: &'a [u8],
+    stride: usize,
+}
+
 /// Video scaling engine.
 ///
 /// Scales video frames between different resolutions, operating on plain byte
@@ -99,6 +107,7 @@ impl ScaleEngine {
     /// [`VideoConvert::reads_strided_input`](super::VideoConvert::reads_strided_input).
     pub(crate) fn reads_strided_input(format: PixelFormat) -> bool {
         match format {
+            // Every path resolves its planes through `PlaneLayout`.
             PixelFormat::I420
             | PixelFormat::Nv12
             | PixelFormat::Yuyv
@@ -107,7 +116,7 @@ impl ScaleEngine {
             | PixelFormat::Rgba
             | PixelFormat::Bgr24
             | PixelFormat::Bgra
-            | PixelFormat::Gray8 => false,
+            | PixelFormat::Gray8 => true,
         }
     }
 
@@ -141,33 +150,63 @@ impl ScaleEngine {
             )));
         }
 
+        // Every path below reads the input through `plane`, which resolves
+        // one plane against the declared layout. The output is packed, so
+        // its own row pitch is always the plane's used row bytes.
         match self.format {
             PixelFormat::Rgb24 | PixelFormat::Bgr24 => {
-                self.scale_packed(input, output, 3);
+                let p = self.plane(input, input_layout, 0);
+                self.scale_packed(p.data, p.stride, output, 3);
             }
             PixelFormat::Rgba | PixelFormat::Bgra => {
-                self.scale_packed(input, output, 4);
+                let p = self.plane(input, input_layout, 0);
+                self.scale_packed(p.data, p.stride, output, 4);
             }
             PixelFormat::Gray8 => {
-                self.scale_packed(input, output, 1);
+                let p = self.plane(input, input_layout, 0);
+                self.scale_packed(p.data, p.stride, output, 1);
             }
             PixelFormat::Yuyv | PixelFormat::Uyvy => {
                 // YUYV/UYVY: 2 bytes per pixel average (4 bytes per 2 pixels)
-                self.scale_yuyv(input, output);
+                let p = self.plane(input, input_layout, 0);
+                self.scale_yuyv(p.data, p.stride, output);
             }
             PixelFormat::I420 => {
-                self.scale_i420(input, output);
+                self.scale_i420(input, input_layout, output);
             }
             PixelFormat::Nv12 => {
-                self.scale_nv12(input, output);
+                self.scale_nv12(input, input_layout, output);
             }
         }
 
         Ok(())
     }
 
+    /// One input plane resolved against the declared layout: its bytes from
+    /// the first row to the end of the buffer, plus the row pitch.
+    ///
+    /// The slice deliberately runs to the end of the buffer rather than to
+    /// `offset + stride * rows` — a tight strided layout's last row carries
+    /// no trailing padding, so the latter would overrun.
+    fn plane<'a>(&self, input: &'a [u8], layout: PlaneLayout, index: usize) -> PlaneIn<'a> {
+        let p = layout
+            .resolved(self.format.into(), self.input_width, self.input_height)
+            .nth(index)
+            .expect("plane index within the format's plane count");
+        PlaneIn {
+            data: &input[p.offset..],
+            stride: p.stride,
+        }
+    }
+
     /// Scale packed pixel formats (RGB, RGBA, Gray, etc.)
-    fn scale_packed(&self, input: &[u8], output: &mut [u8], bytes_per_pixel: usize) {
+    fn scale_packed(
+        &self,
+        input: &[u8],
+        in_stride: usize,
+        output: &mut [u8],
+        bytes_per_pixel: usize,
+    ) {
         let in_w = self.input_width as usize;
         let in_h = self.input_height as usize;
         let out_w = self.output_width as usize;
@@ -181,7 +220,7 @@ impl ScaleEngine {
                     for out_x in 0..out_w {
                         let in_x = (out_x * in_w / out_w).min(in_w - 1);
 
-                        let src_offset = (in_y * in_w + in_x) * bytes_per_pixel;
+                        let src_offset = in_y * in_stride + in_x * bytes_per_pixel;
                         let dst_offset = (out_y * out_w + out_x) * bytes_per_pixel;
 
                         output[dst_offset..dst_offset + bytes_per_pixel]
@@ -206,10 +245,10 @@ impl ScaleEngine {
                         let x_frac = src_x - x0 as f32;
 
                         for c in 0..bytes_per_pixel {
-                            let p00 = input[(y0 * in_w + x0) * bytes_per_pixel + c] as f32;
-                            let p10 = input[(y0 * in_w + x1) * bytes_per_pixel + c] as f32;
-                            let p01 = input[(y1 * in_w + x0) * bytes_per_pixel + c] as f32;
-                            let p11 = input[(y1 * in_w + x1) * bytes_per_pixel + c] as f32;
+                            let p00 = input[y0 * in_stride + x0 * bytes_per_pixel + c] as f32;
+                            let p10 = input[y0 * in_stride + x1 * bytes_per_pixel + c] as f32;
+                            let p01 = input[y1 * in_stride + x0 * bytes_per_pixel + c] as f32;
+                            let p11 = input[y1 * in_stride + x1 * bytes_per_pixel + c] as f32;
 
                             // Bilinear interpolation
                             let top = p00 + x_frac * (p10 - p00);
@@ -226,36 +265,55 @@ impl ScaleEngine {
     }
 
     /// Scale I420 format (planar YUV 4:2:0).
-    fn scale_i420(&self, input: &[u8], output: &mut [u8]) {
+    ///
+    /// Input planes come from `layout` — packed or strided; output planes are
+    /// packed, dense and in order. YUV geometry is even by construction
+    /// ([`ScaleEngine::new`] rejects odd dimensions), so the halves below are
+    /// exact.
+    fn scale_i420(&self, input: &[u8], layout: PlaneLayout, output: &mut [u8]) {
         let in_w = self.input_width as usize;
         let in_h = self.input_height as usize;
         let out_w = self.output_width as usize;
         let out_h = self.output_height as usize;
 
         // Y plane
-        let in_y = &input[0..in_w * in_h];
+        let src = self.plane(input, layout, 0);
         let out_y = &mut output[0..out_w * out_h];
-        self.scale_plane(in_y, in_w, in_h, out_y, out_w, out_h);
+        self.scale_plane(src.data, src.stride, in_w, in_h, out_y, out_w, out_h);
 
         // U plane (half resolution)
-        let in_u_offset = in_w * in_h;
         let out_u_offset = out_w * out_h;
-        let in_u = &input[in_u_offset..in_u_offset + (in_w / 2) * (in_h / 2)];
+        let src = self.plane(input, layout, 1);
         let out_u = &mut output[out_u_offset..out_u_offset + (out_w / 2) * (out_h / 2)];
-        self.scale_plane(in_u, in_w / 2, in_h / 2, out_u, out_w / 2, out_h / 2);
+        self.scale_plane(
+            src.data,
+            src.stride,
+            in_w / 2,
+            in_h / 2,
+            out_u,
+            out_w / 2,
+            out_h / 2,
+        );
 
         // V plane (half resolution)
-        let in_v_offset = in_u_offset + (in_w / 2) * (in_h / 2);
         let out_v_offset = out_u_offset + (out_w / 2) * (out_h / 2);
-        let in_v = &input[in_v_offset..in_v_offset + (in_w / 2) * (in_h / 2)];
+        let src = self.plane(input, layout, 2);
         let out_v = &mut output[out_v_offset..out_v_offset + (out_w / 2) * (out_h / 2)];
-        self.scale_plane(in_v, in_w / 2, in_h / 2, out_v, out_w / 2, out_h / 2);
+        self.scale_plane(
+            src.data,
+            src.stride,
+            in_w / 2,
+            in_h / 2,
+            out_v,
+            out_w / 2,
+            out_h / 2,
+        );
     }
 
     /// Scale YUYV/UYVY format (packed YUV 4:2:2).
     /// This is a simplified scaler that works in Y-only domain for speed.
     /// For better quality, convert to I420/NV12 first, scale, then convert back.
-    fn scale_yuyv(&self, input: &[u8], output: &mut [u8]) {
+    fn scale_yuyv(&self, input: &[u8], in_stride: usize, output: &mut [u8]) {
         let in_w = self.input_width as usize;
         let in_h = self.input_height as usize;
         let out_w = self.output_width as usize;
@@ -273,7 +331,7 @@ impl ScaleEngine {
                         // Map to input position (in macro-pixel units)
                         let in_x = ((out_x * in_w / out_w) / 2 * 2).min(in_w - 2);
 
-                        let src_idx = (in_y * in_w + in_x) * 2;
+                        let src_idx = in_y * in_stride + in_x * 2;
                         let dst_idx = (out_y * out_w + out_x) * 2;
 
                         // Copy the 4-byte macro-pixel
@@ -303,19 +361,19 @@ impl ScaleEngine {
                         let x_frac = (src_x_f - x0 as f32) / 2.0;
 
                         // Interpolate Y0
-                        let y0_00 = input[(y0 * in_w + x0) * 2] as f32;
-                        let y0_10 = input[(y0 * in_w + x1) * 2] as f32;
-                        let y0_01 = input[(y1 * in_w + x0) * 2] as f32;
-                        let y0_11 = input[(y1 * in_w + x1) * 2] as f32;
+                        let y0_00 = input[y0 * in_stride + x0 * 2] as f32;
+                        let y0_10 = input[y0 * in_stride + x1 * 2] as f32;
+                        let y0_01 = input[y1 * in_stride + x0 * 2] as f32;
+                        let y0_11 = input[y1 * in_stride + x1 * 2] as f32;
                         let y0_top = y0_00 + x_frac * (y0_10 - y0_00);
                         let y0_bot = y0_01 + x_frac * (y0_11 - y0_01);
                         let y0_val = (y0_top + y_frac * (y0_bot - y0_top)).round() as u8;
 
                         // Interpolate Y1
-                        let y1_00 = input[(y0 * in_w + x0) * 2 + 2] as f32;
-                        let y1_10 = input[(y0 * in_w + x1) * 2 + 2] as f32;
-                        let y1_01 = input[(y1 * in_w + x0) * 2 + 2] as f32;
-                        let y1_11 = input[(y1 * in_w + x1) * 2 + 2] as f32;
+                        let y1_00 = input[y0 * in_stride + x0 * 2 + 2] as f32;
+                        let y1_10 = input[y0 * in_stride + x1 * 2 + 2] as f32;
+                        let y1_01 = input[y1 * in_stride + x0 * 2 + 2] as f32;
+                        let y1_11 = input[y1 * in_stride + x1 * 2 + 2] as f32;
                         let y1_top = y1_00 + x_frac * (y1_10 - y1_00);
                         let y1_bot = y1_01 + x_frac * (y1_11 - y1_01);
                         let y1_val = (y1_top + y_frac * (y1_bot - y1_top)).round() as u8;
@@ -323,8 +381,8 @@ impl ScaleEngine {
                         // Nearest-neighbor for U/V
                         let in_x_nn = (src_x_f.round() as usize / 2 * 2).min(in_w - 2);
                         let in_y_nn = src_y_f.round() as usize;
-                        let u_val = input[(in_y_nn * in_w + in_x_nn) * 2 + 1];
-                        let v_val = input[(in_y_nn * in_w + in_x_nn) * 2 + 3];
+                        let u_val = input[in_y_nn * in_stride + in_x_nn * 2 + 1];
+                        let v_val = input[in_y_nn * in_stride + in_x_nn * 2 + 3];
 
                         let dst_idx = (out_y * out_w + out_x) * 2;
                         output[dst_idx] = y0_val;
@@ -338,31 +396,39 @@ impl ScaleEngine {
     }
 
     /// Scale NV12 format (semi-planar YUV 4:2:0).
-    fn scale_nv12(&self, input: &[u8], output: &mut [u8]) {
+    fn scale_nv12(&self, input: &[u8], layout: PlaneLayout, output: &mut [u8]) {
         let in_w = self.input_width as usize;
         let in_h = self.input_height as usize;
         let out_w = self.output_width as usize;
         let out_h = self.output_height as usize;
 
         // Y plane
-        let in_y = &input[0..in_w * in_h];
+        let src = self.plane(input, layout, 0);
         let out_y = &mut output[0..out_w * out_h];
-        self.scale_plane(in_y, in_w, in_h, out_y, out_w, out_h);
+        self.scale_plane(src.data, src.stride, in_w, in_h, out_y, out_w, out_h);
 
         // UV plane (interleaved, half resolution in each dimension)
-        let in_uv_offset = in_w * in_h;
         let out_uv_offset = out_w * out_h;
-        let in_uv = &input[in_uv_offset..in_uv_offset + in_w * (in_h / 2)];
+        let src = self.plane(input, layout, 1);
         let out_uv = &mut output[out_uv_offset..out_uv_offset + out_w * (out_h / 2)];
 
         // Scale UV as 2-channel interleaved data
-        self.scale_interleaved_uv(in_uv, in_w / 2, in_h / 2, out_uv, out_w / 2, out_h / 2);
+        self.scale_interleaved_uv(
+            src.data,
+            src.stride,
+            in_w / 2,
+            in_h / 2,
+            out_uv,
+            out_w / 2,
+            out_h / 2,
+        );
     }
 
     /// Scale a single plane (grayscale).
     fn scale_plane(
         &self,
         input: &[u8],
+        in_stride: usize,
         in_w: usize,
         in_h: usize,
         output: &mut [u8],
@@ -376,7 +442,7 @@ impl ScaleEngine {
 
                     for out_x in 0..out_w {
                         let in_x = (out_x * in_w / out_w).min(in_w - 1);
-                        output[out_y * out_w + out_x] = input[in_y * in_w + in_x];
+                        output[out_y * out_w + out_x] = input[in_y * in_stride + in_x];
                     }
                 }
             }
@@ -396,10 +462,10 @@ impl ScaleEngine {
                         let x1 = (x0 + 1).min(in_w - 1);
                         let x_frac = src_x - x0 as f32;
 
-                        let p00 = input[y0 * in_w + x0] as f32;
-                        let p10 = input[y0 * in_w + x1] as f32;
-                        let p01 = input[y1 * in_w + x0] as f32;
-                        let p11 = input[y1 * in_w + x1] as f32;
+                        let p00 = input[y0 * in_stride + x0] as f32;
+                        let p10 = input[y0 * in_stride + x1] as f32;
+                        let p01 = input[y1 * in_stride + x0] as f32;
+                        let p11 = input[y1 * in_stride + x1] as f32;
 
                         let top = p00 + x_frac * (p10 - p00);
                         let bottom = p01 + x_frac * (p11 - p01);
@@ -416,6 +482,7 @@ impl ScaleEngine {
     fn scale_interleaved_uv(
         &self,
         input: &[u8],
+        in_stride: usize,
         in_w: usize,
         in_h: usize,
         output: &mut [u8],
@@ -431,7 +498,7 @@ impl ScaleEngine {
                         let in_x = (out_x * in_w / out_w).min(in_w - 1);
 
                         // U and V are interleaved
-                        let src_idx = (in_y * in_w + in_x) * 2;
+                        let src_idx = in_y * in_stride + in_x * 2;
                         let dst_idx = (out_y * out_w + out_x) * 2;
 
                         output[dst_idx] = input[src_idx]; // U
@@ -456,19 +523,19 @@ impl ScaleEngine {
                         let x_frac = src_x - x0 as f32;
 
                         // Interpolate U
-                        let u00 = input[(y0 * in_w + x0) * 2] as f32;
-                        let u10 = input[(y0 * in_w + x1) * 2] as f32;
-                        let u01 = input[(y1 * in_w + x0) * 2] as f32;
-                        let u11 = input[(y1 * in_w + x1) * 2] as f32;
+                        let u00 = input[y0 * in_stride + x0 * 2] as f32;
+                        let u10 = input[y0 * in_stride + x1 * 2] as f32;
+                        let u01 = input[y1 * in_stride + x0 * 2] as f32;
+                        let u11 = input[y1 * in_stride + x1 * 2] as f32;
                         let u_top = u00 + x_frac * (u10 - u00);
                         let u_bottom = u01 + x_frac * (u11 - u01);
                         let u = u_top + y_frac * (u_bottom - u_top);
 
                         // Interpolate V
-                        let v00 = input[(y0 * in_w + x0) * 2 + 1] as f32;
-                        let v10 = input[(y0 * in_w + x1) * 2 + 1] as f32;
-                        let v01 = input[(y1 * in_w + x0) * 2 + 1] as f32;
-                        let v11 = input[(y1 * in_w + x1) * 2 + 1] as f32;
+                        let v00 = input[y0 * in_stride + x0 * 2 + 1] as f32;
+                        let v10 = input[y0 * in_stride + x1 * 2 + 1] as f32;
+                        let v01 = input[y1 * in_stride + x0 * 2 + 1] as f32;
+                        let v11 = input[y1 * in_stride + x1 * 2 + 1] as f32;
                         let v_top = v00 + x_frac * (v10 - v00);
                         let v_bottom = v01 + x_frac * (v11 - v01);
                         let v = v_top + y_frac * (v_bottom - v_top);
@@ -486,6 +553,7 @@ impl ScaleEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::converters::testutil::strided_twin;
 
     #[test]
     fn test_scale_nearest_2x() {
@@ -631,5 +699,43 @@ mod tests {
     fn test_error_on_odd_yuv_dimension() {
         let result = ScaleEngine::new(3, 4, 6, 8, PixelFormat::I420);
         assert!(result.is_err());
+    }
+
+    /// Scaling a strided frame must produce byte-identical output to
+    /// scaling its packed twin — for every format the engine takes and
+    /// both interpolation modes.
+    ///
+    /// The two runs execute the same arithmetic over the same samples; only
+    /// the addressing differs, so equality is exact, not approximate. The
+    /// padding is filled with a sentinel, so an index that still derives a
+    /// row start from width reads it and the comparison fails.
+    #[test]
+    fn strided_input_scales_identically_to_its_packed_twin() {
+        const SRC: (u32, u32) = (32, 24);
+        for format in PixelFormat::ALL {
+            let caps: crate::format::PixelFormat = format.into();
+            let packed: Vec<u8> = (0..format.buffer_size(SRC.0, SRC.1))
+                .map(|i| (i % 251) as u8)
+                .collect();
+            let (strided, layout) = strided_twin(&packed, caps, SRC.0, SRC.1, 13);
+
+            for dst in [(16u32, 12u32), (64, 48), (32, 24), (48, 16)] {
+                for mode in [ScaleMode::Bilinear, ScaleMode::NearestNeighbor] {
+                    let engine = ScaleEngine::new(SRC.0, SRC.1, dst.0, dst.1, format)
+                        .unwrap()
+                        .with_mode(mode);
+                    let mut from_packed = vec![0u8; engine.output_size()];
+                    let mut from_strided = vec![0u8; engine.output_size()];
+                    engine
+                        .scale(&packed, engine.packed_input_layout(), &mut from_packed)
+                        .unwrap();
+                    engine.scale(&strided, layout, &mut from_strided).unwrap();
+                    assert_eq!(
+                        from_packed, from_strided,
+                        "{format:?} {SRC:?}->{dst:?} {mode:?}"
+                    );
+                }
+            }
+        }
     }
 }
