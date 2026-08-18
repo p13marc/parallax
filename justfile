@@ -55,8 +55,9 @@ check-media:
     cargo clippy --all-targets --features {{media_features}} -- -D warnings
 
 # Media combo plus the system-library codecs (libvpx/libdav1d/libopus dev
-# packages + libclang required; not in CI)
-media_full_features := media_features + ",vpx,av1-decode,opus,h264"
+# packages + libclang required, and nasm for rav1e; not in CI). This is the
+# only recipe that clippies `av1-encode` — no CI job does.
+media_full_features := media_features + ",vpx,av1-decode,av1-encode,opus,h264"
 
 check-media-full:
     cargo nextest run --features {{media_full_features}}

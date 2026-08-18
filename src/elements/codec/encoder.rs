@@ -160,14 +160,15 @@ impl Rav1eEncoder {
     }
 
     fn build_config(config: &Rav1eConfig, width: usize, height: usize) -> Result<rav1e::Config> {
-        let mut enc = rav1e::EncoderConfig::default();
-
-        enc.width = width;
-        enc.height = height;
-        enc.speed_settings = rav1e::config::SpeedSettings::from_preset(config.speed as u8);
-        enc.quantizer = config.quantizer;
-        enc.bitrate = config.bitrate as i32;
-        enc.time_base = rav1e::data::Rational::new(config.timebase_num, config.timebase_den);
+        let enc = rav1e::EncoderConfig {
+            width,
+            height,
+            speed_settings: rav1e::config::SpeedSettings::from_preset(config.speed as u8),
+            quantizer: config.quantizer,
+            bitrate: config.bitrate as i32,
+            time_base: rav1e::data::Rational::new(config.timebase_num, config.timebase_den),
+            ..Default::default()
+        };
 
         let cfg = rav1e::Config::new()
             .with_encoder_config(enc)
