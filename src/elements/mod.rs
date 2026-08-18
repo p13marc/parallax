@@ -256,6 +256,10 @@ pub use codec::Dav1dDecoder;
 #[cfg(feature = "vpx")]
 pub use codec::{VpxCodec, VpxDecoder};
 
+// Video codecs - VA-API hardware decode (#193)
+#[cfg(feature = "vaapi")]
+pub use codec::VaapiDecoder;
+
 #[cfg(feature = "av1-encode")]
 pub use codec::{Rav1eConfig, Rav1eEncoder};
 

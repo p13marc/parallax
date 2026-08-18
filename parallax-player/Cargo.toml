@@ -22,6 +22,7 @@ parallax = { package = "parallax-pipeline", path = "..", features = [
     "audio-vorbis",
     "eac3",
     "alsa",
+    "vaapi",
 ] }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }

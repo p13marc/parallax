@@ -80,6 +80,15 @@ struct Args {
     #[arg(long)]
     no_sync: bool,
 
+    /// Use hardware video decode when the driver offers it (#193).
+    ///
+    /// `auto` tries the GPU's video engine and falls back to software with a
+    /// warning naming the reason; `off` never tries. Deliberately separate
+    /// from `--no-gpu`, which is about *presentation* — a machine can have
+    /// one without the other.
+    #[arg(long, default_value = "auto")]
+    hwdec: HwDec,
+
     /// Stop playback cleanly after this many seconds (0 = play to the
     /// end). For scripted measurement runs.
     #[arg(long, default_value_t = 0)]
@@ -107,6 +116,37 @@ async fn main() -> anyhow::Result<()> {
     // rebuilt to reopen the window.
     let _ = play(&args).await?;
     Ok(())
+}
+
+/// The hardware VP9 decoder, if this machine offers one.
+///
+/// Every failure is a reason to use software, not a reason to stop: no DRM
+/// node, no driver, or — commonly — a driver built without the codec the
+/// backend needs to initialise. The reason is logged once so a machine that
+/// *should* have hardware decode says why it does not.
+fn hw_vp9(mode: HwDec) -> Option<parallax::elements::VaapiDecoder> {
+    if mode == HwDec::Off {
+        return None;
+    }
+    match parallax::elements::VaapiDecoder::vp9() {
+        Ok(dec) => {
+            tracing::info!("VP9: decoding on the GPU video engine");
+            Some(dec)
+        }
+        Err(e) => {
+            tracing::warn!("VP9: software decode ({e})");
+            None
+        }
+    }
+}
+
+/// Whether to attempt hardware decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum HwDec {
+    /// Try hardware, fall back to software.
+    Auto,
+    /// Software only.
+    Off,
 }
 
 /// Video codec of the selected track, container-agnostic.
@@ -704,8 +744,10 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
             pipeline.add_demuxer("demux", s)
         }
     };
-    // The video decoder follows the probed codec; every decoder emits I420
-    // with in-band geometry, so the convert → display tail is codec-agnostic.
+    // The video decoder follows the probed codec. Geometry travels in-band
+    // either way, so the convert → display tail is codec-agnostic — but note
+    // the *format* is not uniform: software decoders emit I420 and the VA-API
+    // one emits NV12. Both the converter and the GPU sink take either.
     let video_codec = summary
         .video
         .as_ref()
@@ -714,7 +756,10 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
     let dec = match video_codec {
         VideoCodecKind::H264 => pipeline.add_filter("decode", H264Decoder::new()?),
         VideoCodecKind::Vp8 => pipeline.add_filter("decode", VpxDecoder::vp8()?),
-        VideoCodecKind::Vp9 => pipeline.add_filter("decode", VpxDecoder::vp9()?),
+        VideoCodecKind::Vp9 => match hw_vp9(args.hwdec) {
+            Some(hw) => pipeline.add_filter("decode", hw),
+            None => pipeline.add_filter("decode", VpxDecoder::vp9()?),
+        },
         VideoCodecKind::Av1 => {
             // Thread-count default is the #192 lever: at paced rates dav1d
             // worker CPU scales with pool size (idle-worker task-queue
