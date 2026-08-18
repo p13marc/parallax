@@ -65,7 +65,7 @@ brings in: `Buffer`, `Metadata`/`BufferFlags`/`RtpMeta`, clock types (`Clock`, `
 
 ### `parallax::buffer` / `parallax::metadata`
 
-`Buffer<T = ()>` (`new`, `as_bytes[_mut]`, `try_as_bytes_mut`, `copy_to_cpu`, `slice`, `metadata[_mut]`, `into_dynamic`), `MemoryHandle::{Cpu, DmaBuf, External}` (#145/#194); `Metadata` (pts/dts/duration/sequence/stream_id/flags + `planes: Option<PlaneLayout>` for strided video (#194: `set_video_planes`/`plane_layout`/`has_strided_planes`) + typed custom map: `set`/`get`/`get_mut`/`remove`/`set_bytes`/`set_klv`/`set_sei`), `BufferFlags`, `RtpMeta`.
+`Buffer<T = ()>` (`new`, `as_bytes[_mut]`, `try_as_bytes_mut`, `copy_to_cpu`, `slice`, `metadata[_mut]`, `into_dynamic`), `MemoryHandle::{Cpu, DmaBuf, External}` (#145/#194); `Metadata` (pts/dts/duration/sequence/stream_id/flags + `planes: Option<PlaneLayout>` for strided video (#194: `set_video_planes`/`plane_layout`/`has_strided_planes`; `PlaneLayout::{packed, resolved, required_len, full_span_len, repack_into}` is the geometry toolkit — #196 added `full_span_len`, the length at which every plane is addressable by whole rows) + typed custom map: `set`/`get`/`get_mut`/`remove`/`set_bytes`/`set_klv`/`set_sei`), `BufferFlags`, `RtpMeta`.
 
 ### `parallax::format` / `parallax::negotiation`
 
