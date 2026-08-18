@@ -101,25 +101,6 @@ impl ScaleEngine {
         PlaneLayout::packed(self.format.into(), self.input_width, self.input_height)
     }
 
-    /// Whether the paths reading `format` honor a non-packed input layout yet.
-    ///
-    /// Shrinking scaffold (#196) — see
-    /// [`VideoConvert::reads_strided_input`](super::VideoConvert::reads_strided_input).
-    pub(crate) fn reads_strided_input(format: PixelFormat) -> bool {
-        match format {
-            // Every path resolves its planes through `PlaneLayout`.
-            PixelFormat::I420
-            | PixelFormat::Nv12
-            | PixelFormat::Yuyv
-            | PixelFormat::Uyvy
-            | PixelFormat::Rgb24
-            | PixelFormat::Rgba
-            | PixelFormat::Bgr24
-            | PixelFormat::Bgra
-            | PixelFormat::Gray8 => true,
-        }
-    }
-
     /// Scale a frame.
     ///
     /// `input_layout` describes where the input's planes are and how far

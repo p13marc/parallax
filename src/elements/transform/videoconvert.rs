@@ -47,9 +47,9 @@ pub struct VideoConvertElement {
     converter_key: Option<(PixelFormat, PixelFormat, u32, u32)>,
     /// Element name
     name: String,
-    /// Staging for a strided input whose conversion arms do not read strides
-    /// yet (#196). Shrinking scaffold — deleted with
-    /// [`VideoConvert::reads_strided_input`].
+    /// Staging for a strided frame the engine cannot address by whole
+    /// rows (#196) — see [`PlaneLayout::full_span_len`]. Stays empty for
+    /// every producer that allocates whole rows, which is all of them.
     repack_scratch: Vec<u8>,
     /// Arena for output buffers
     output: OutputArena,
@@ -304,12 +304,13 @@ impl Element for VideoConvertElement {
         let output_size = self.output_format.buffer_size(width, height);
         let mut slot = self.output.acquire(output_size, "videoconvert")?;
 
-        // Shrinking scaffold (#196): the arms for this input format may not
-        // read strides yet, in which case the frame is repacked first. The
-        // predicate — and this branch — go away as the families convert.
+        // Every conversion arm addresses planes by stride, so a strided
+        // frame converts in place — provided each plane is addressable for
+        // its whole `stride * rows` (#196). One that ends tight against its
+        // last row is repacked first; real strided producers allocate past
+        // it, so this stays cold.
         let (data, layout) = if layout.is_packed(caps_format, width, height)
-            || (VideoConvert::reads_strided_input(input_format)
-                && input_data.len() >= layout.full_span_len(caps_format, width, height))
+            || input_data.len() >= layout.full_span_len(caps_format, width, height)
         {
             (input_data, layout)
         } else {

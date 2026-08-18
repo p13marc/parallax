@@ -252,9 +252,9 @@ pub struct VideoScale {
     last_target: Option<(u32, u32)>,
     /// Statistics.
     frames_processed: u64,
-    /// Staging for a strided input whose engine paths do not read strides
-    /// yet (#196). Shrinking scaffold — deleted with
-    /// [`ScaleEngine::reads_strided_input`](converters::ScaleEngine::reads_strided_input).
+    /// Staging for a strided frame the engine cannot address by whole
+    /// rows (#196) — see
+    /// [`PlaneLayout::full_span_len`](crate::format::PlaneLayout::full_span_len).
     repack_scratch: Vec<u8>,
     /// Arena for output buffers, sized by the executor at start.
     output: OutputArena,
@@ -515,11 +515,11 @@ impl Element for VideoScale {
         let output_size = format.buffer_size(dst_w, dst_h);
         let mut slot = self.output.acquire(output_size, "videoscale")?;
 
-        // Shrinking scaffold (#196): repack when the engine paths for this
-        // format do not read strides yet. Goes away with the predicate.
+        // The engine resamples strided planes in place, provided each is
+        // addressable for its whole `stride * rows` (#196). One that ends
+        // tight against its last row is repacked first.
         let (data, layout) = if layout.is_packed(caps_format, src_w, src_h)
-            || (converters::ScaleEngine::reads_strided_input(format)
-                && buffer.as_bytes().len() >= layout.full_span_len(caps_format, src_w, src_h))
+            || buffer.as_bytes().len() >= layout.full_span_len(caps_format, src_w, src_h)
         {
             (buffer.as_bytes(), layout)
         } else {
