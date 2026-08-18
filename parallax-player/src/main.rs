@@ -118,23 +118,27 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The hardware VP9 decoder, if this machine offers one.
+/// The hardware decoder for `codec`, if this machine offers one.
 ///
 /// Every failure is a reason to use software, not a reason to stop: no DRM
 /// node, no driver, or — commonly — a driver built without the codec the
-/// backend needs to initialise. The reason is logged once so a machine that
+/// backend needs to initialise. The reason is logged so a machine that
 /// *should* have hardware decode says why it does not.
-fn hw_vp9(mode: HwDec) -> Option<parallax::elements::VaapiDecoder> {
+fn hw_decoder(
+    mode: HwDec,
+    codec: parallax::gpu::Codec,
+    label: &str,
+) -> Option<parallax::elements::VaapiDecoder> {
     if mode == HwDec::Off {
         return None;
     }
-    match parallax::elements::VaapiDecoder::vp9() {
+    match parallax::elements::VaapiDecoder::open(codec) {
         Ok(dec) => {
-            tracing::info!("VP9: decoding on the GPU video engine");
+            tracing::info!("{label}: decoding on the GPU video engine");
             Some(dec)
         }
         Err(e) => {
-            tracing::warn!("VP9: software decode ({e})");
+            tracing::warn!("{label}: software decode ({e})");
             None
         }
     }
@@ -754,9 +758,12 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
         .map(|v| v.codec.clone())
         .expect("probe guarantees a video track");
     let dec = match video_codec {
-        VideoCodecKind::H264 => pipeline.add_filter("decode", H264Decoder::new()?),
+        VideoCodecKind::H264 => match hw_decoder(args.hwdec, parallax::gpu::Codec::H264, "H.264") {
+            Some(hw) => pipeline.add_filter("decode", hw),
+            None => pipeline.add_filter("decode", H264Decoder::new()?),
+        },
         VideoCodecKind::Vp8 => pipeline.add_filter("decode", VpxDecoder::vp8()?),
-        VideoCodecKind::Vp9 => match hw_vp9(args.hwdec) {
+        VideoCodecKind::Vp9 => match hw_decoder(args.hwdec, parallax::gpu::Codec::Vp9, "VP9") {
             Some(hw) => pipeline.add_filter("decode", hw),
             None => pipeline.add_filter("decode", VpxDecoder::vp9()?),
         },

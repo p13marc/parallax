@@ -24,7 +24,8 @@
 use std::collections::VecDeque;
 
 use cros_codecs::Resolution;
-use cros_codecs::backend::vaapi::decoder::VaapiBackend;
+use cros_codecs::backend::vaapi::decoder::VaapiDecodedHandle;
+use cros_codecs::decoder::stateless::h264::H264;
 use cros_codecs::decoder::stateless::vp9::Vp9;
 use cros_codecs::decoder::stateless::{DecodeError, StatelessDecoder, StatelessVideoDecoder};
 use cros_codecs::decoder::{BlockingMode, DecodedHandle, DecoderEvent};
@@ -57,16 +58,24 @@ const PIPELINE_FRAMES: usize = 6;
 /// stream that never produces output.
 const MAX_PENDING_METADATA: usize = 64;
 
-/// A VP9 decoder running on the GPU's video engine.
+/// The decoded-frame handle every codec's decoder produces.
+///
+/// All of them share one backend, so the handle type does not vary with the
+/// codec — which is what lets one element drive any of them through a
+/// trait object.
+type Handle = std::rc::Rc<std::cell::RefCell<VaapiDecodedHandle<VaFrame>>>;
+
+/// A hardware video decoder, whatever codec it was built for.
 pub struct VaapiDecoder {
-    decoder: StatelessDecoder<Vp9, VaapiBackend<VaFrame>>,
+    decoder: Box<dyn StatelessVideoDecoder<Handle = Handle>>,
+    codec: Codec,
     pool: VaFramePool,
     /// Output arena for the readback copy.
     output: OutputArena,
     /// Input metadata awaiting the frame it becomes, oldest first.
     pending_meta: VecDeque<Metadata>,
     /// Frames the decoder has finished but we have not emitted yet.
-    ready: VecDeque<<VaapiBackend<VaFrame> as DecoderBackendHandle>::Handle>,
+    ready: VecDeque<Handle>,
     /// An access unit the decoder could not take yet, and how far into it we
     /// got. Re-offered before anything new.
     stalled: Option<(Buffer, usize)>,
@@ -76,16 +85,6 @@ pub struct VaapiDecoder {
     frames_out: u64,
 }
 
-/// Names the handle type without spelling out `cros-codecs`' generics at
-/// every use site.
-trait DecoderBackendHandle {
-    type Handle: DecodedHandle<Frame = VaFrame>;
-}
-
-impl DecoderBackendHandle for VaapiBackend<VaFrame> {
-    type Handle = <StatelessDecoder<Vp9, VaapiBackend<VaFrame>> as StatelessVideoDecoder>::Handle;
-}
-
 // SAFETY: `cros-codecs` keeps `Rc<Context>` internally, so the decoder is
 // not `Send` by inference. It is owned entirely by one element task, never
 // shared, and never touched from another thread — the same justification
@@ -93,18 +92,37 @@ impl DecoderBackendHandle for VaapiBackend<VaFrame> {
 unsafe impl Send for VaapiDecoder {}
 
 impl VaapiDecoder {
-    /// Open the hardware decoder, or explain why it is unavailable.
+    /// A hardware VP9 decoder, or the reason there isn't one.
+    pub fn vp9() -> Result<Self> {
+        Self::open(Codec::Vp9)
+    }
+
+    /// A hardware H.264 decoder, or the reason there isn't one.
+    ///
+    /// Note that H.264 is absent from patent-free driver builds even on
+    /// hardware that has the engine — the error says so when that is why.
+    pub fn h264() -> Result<Self> {
+        Self::open(Codec::H264)
+    }
+
+    /// Open the hardware decoder for `codec`, or explain why it is
+    /// unavailable.
     ///
     /// Every failure here is a reason to use the software decoder instead,
     /// not a reason to stop: no DRM device, no driver, or a driver built
     /// without this codec.
-    pub fn vp9() -> Result<Self> {
+    ///
+    /// HEVC is deliberately absent: `cros-codecs`' H.265 constructor takes
+    /// an `Rc<Display>` where H.264 and VP9 take `Arc`, so it cannot be
+    /// driven from the same shared display at all. Adding it means fixing
+    /// that upstream first.
+    pub fn open(codec: Codec) -> Result<Self> {
         let display = VaDisplay::open().ok_or_else(|| {
             Error::Element(
                 "vaapi: no VA display (no DRM render node, or no driver installed)".into(),
             )
         })?;
-        Self::with_display(&display, Codec::Vp9)
+        Self::with_display(&display, codec)
     }
 
     /// Build a decoder on an already-open display.
@@ -135,12 +153,26 @@ impl VaapiDecoder {
             )));
         }
 
-        let decoder =
-            StatelessDecoder::<Vp9, _>::new_vaapi(display.handle(), BlockingMode::NonBlocking)
-                .map_err(|e| Error::Element(format!("vaapi: decoder init failed: {e:?}")))?;
+        let init = |e| Error::Element(format!("vaapi: {codec} decoder init failed: {e:?}"));
+        let decoder: Box<dyn StatelessVideoDecoder<Handle = Handle>> = match codec {
+            Codec::Vp9 => Box::new(
+                StatelessDecoder::<Vp9, _>::new_vaapi(display.handle(), BlockingMode::NonBlocking)
+                    .map_err(init)?,
+            ),
+            Codec::H264 => Box::new(
+                StatelessDecoder::<H264, _>::new_vaapi(display.handle(), BlockingMode::NonBlocking)
+                    .map_err(init)?,
+            ),
+            other => {
+                return Err(Error::Element(format!(
+                    "vaapi: no hardware decoder wired for {other} yet"
+                )));
+            }
+        };
 
         Ok(Self {
             decoder,
+            codec,
             pool: VaFramePool::new(Resolution::from((0, 0)), Resolution::from((0, 0))),
             output: OutputArena::new(defaults::VIDEO_DECODER_SLOT_COUNT),
             pending_meta: VecDeque::new(),
@@ -237,10 +269,7 @@ impl VaapiDecoder {
     /// is allocated at the *coded* size, so its rows are `coded.width` apart
     /// while the packed output wants `visible.width`. Cropping here is free;
     /// doing it downstream would cost another full-frame pass.
-    fn handle_to_buffer(
-        &mut self,
-        handle: &<VaapiBackend<VaFrame> as DecoderBackendHandle>::Handle,
-    ) -> Result<Buffer> {
+    fn handle_to_buffer(&mut self, handle: &Handle) -> Result<Buffer> {
         handle
             .sync()
             .map_err(|e| Error::Element(format!("vaapi: waiting for a frame failed: {e}")))?;
@@ -398,7 +427,12 @@ impl Element for VaapiDecoder {
     }
 
     fn name(&self) -> &str {
-        "vaapivp9dec"
+        match self.codec {
+            Codec::Vp9 => "vaapivp9dec",
+            Codec::H264 => "vaapih264dec",
+            Codec::H265 => "vaapih265dec",
+            Codec::Av1 => "vaapiav1dec",
+        }
     }
 
     fn execution_hints(&self) -> crate::element::ExecutionHints {
@@ -419,6 +453,7 @@ impl VaapiDecoder {
 impl std::fmt::Debug for VaapiDecoder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VaapiDecoder")
+            .field("codec", &self.codec)
             .field("pool", &self.pool.len())
             .field("ready", &self.ready.len())
             .field("frames_out", &self.frames_out)
@@ -433,12 +468,26 @@ mod tests {
     /// Construction answers rather than panicking, whatever the machine.
     ///
     /// `VaapiBackend::new` panics when config creation fails, so this is
-    /// really asserting that the capability probe runs first.
+    /// really asserting that the capability probe runs first — for every
+    /// codec, including ones this machine cannot decode.
     #[test]
     fn construction_answers_on_any_machine() {
-        match VaapiDecoder::vp9() {
-            Ok(d) => eprintln!("vaapi VP9 decoder: {d:?}"),
-            Err(e) => eprintln!("vaapi VP9 decoder unavailable (expected fallback): {e}"),
+        for codec in [Codec::Vp9, Codec::H264, Codec::H265, Codec::Av1] {
+            match VaapiDecoder::open(codec) {
+                Ok(d) => eprintln!("vaapi {codec}: {d:?}"),
+                Err(e) => eprintln!("vaapi {codec}: unavailable (expected fallback) — {e}"),
+            }
         }
+    }
+
+    /// Element names are per codec, so a pipeline graph names what it is
+    /// actually running.
+    #[test]
+    fn each_codec_has_its_own_element_name() {
+        let Ok(d) = VaapiDecoder::vp9() else {
+            eprintln!("skipping: no hardware VP9 decoder here");
+            return;
+        };
+        assert_eq!(d.name(), "vaapivp9dec");
     }
 }
