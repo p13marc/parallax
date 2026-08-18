@@ -27,7 +27,10 @@
 //! )?;
 //!
 //! let mut rgb_output = vec![0u8; 1920 * 1080 * 3];
-//! converter.convert(&yuv_input, &mut rgb_output)?;
+//! // Ordinary (packed) input; a codec-owned strided frame passes its
+//! // own `Metadata::plane_layout()` here instead (#194).
+//! let layout = converter.packed_input_layout();
+//! converter.convert(&yuv_input, layout, &mut rgb_output)?;
 //! ```
 
 mod audio;

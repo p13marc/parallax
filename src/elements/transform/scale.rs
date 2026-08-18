@@ -37,9 +37,10 @@ use crate::converters;
 use crate::element::Element;
 use crate::error::{Error, Result};
 use crate::format::{
-    CapsValue, ElementMediaCaps, FormatMemoryCap, MemoryCaps, PixelFormat, VideoFormatCaps,
+    CapsValue, ElementMediaCaps, FormatMemoryCap, MemoryCaps, PixelFormat, PlaneLayout,
+    VideoFormatCaps,
 };
-use crate::memory::{OutputArena, OutputBudget, defaults};
+use crate::memory::{MemoryType, OutputArena, OutputBudget, defaults};
 use crate::metadata::Metadata;
 
 // ============================================================================
@@ -251,6 +252,10 @@ pub struct VideoScale {
     last_target: Option<(u32, u32)>,
     /// Statistics.
     frames_processed: u64,
+    /// Staging for a strided input whose engine paths do not read strides
+    /// yet (#196). Shrinking scaffold — deleted with
+    /// [`ScaleEngine::reads_strided_input`](converters::ScaleEngine::reads_strided_input).
+    repack_scratch: Vec<u8>,
     /// Arena for output buffers, sized by the executor at start.
     output: OutputArena,
 }
@@ -282,6 +287,7 @@ impl VideoScale {
             last_source: None,
             last_target: None,
             frames_processed: 0,
+            repack_scratch: Vec::new(),
             // A retarget changes the output size, and grow_to_fit is what
             // rebuilds for it — the same thing the hand-rolled check did.
             output: OutputArena::new(defaults::TRANSFORM_SLOT_COUNT).grow_to_fit(),
@@ -405,7 +411,7 @@ impl Default for VideoScale {
 ///
 /// Width and height are `Any` — this element *is* the answer to a geometry
 /// mismatch, so it must not itself constrain geometry.
-fn scalable_caps() -> ElementMediaCaps {
+fn scalable_caps(memory: MemoryCaps) -> ElementMediaCaps {
     let format = VideoFormatCaps {
         width: CapsValue::Any,
         height: CapsValue::Any,
@@ -419,10 +425,7 @@ fn scalable_caps() -> ElementMediaCaps {
         ..VideoFormatCaps::any()
     };
 
-    ElementMediaCaps::new(vec![FormatMemoryCap::new(
-        format.into(),
-        MemoryCaps::cpu_only(),
-    )])
+    ElementMediaCaps::new(vec![FormatMemoryCap::new(format.into(), memory)])
 }
 
 impl crate::control::Controllable for VideoScale {
@@ -446,18 +449,19 @@ impl Element for VideoScale {
     }
 
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
-        // Loud guard (#194): the scale engine assumes packed planes.
-        if buffer.metadata().has_strided_planes() {
-            return Err(Error::Element(
-                "videoscale: strided plane layout not supported; negotiation should have \
-                 inserted a memorycopy repack"
-                    .into(),
-            ));
-        }
         // What is this buffer? Ask it — do not infer.
         let (caps_format, src_w, src_h) = Self::resolve_input(buffer.metadata())?;
         // Caps-only formats (I444, 10-bit, …) fail here with a message naming them.
         let format = converters::PixelFormat::try_from(caps_format)?;
+
+        // Plane geometry comes from the buffer and only from the buffer
+        // (#194): packed for an ordinary frame, the producer's real strides
+        // for a codec-owned one. `resolve_input` already proved the metadata
+        // declares geometry, so a layout is always there.
+        let layout = buffer
+            .metadata()
+            .plane_layout()
+            .expect("resolve_input proved the buffer declares video geometry");
 
         // Resolve the target against the *current* source, so an aspect-preserving
         // target survives a source resolution change.
@@ -469,12 +473,39 @@ impl Element for VideoScale {
 
         // Passthrough. The buffer already describes itself correctly, so forward
         // it untouched — no engine, no arena, no copy.
+        //
+        // Only when it is also what our *output* caps promise: since #196 the
+        // input side accepts External and strided frames while the output side
+        // stays packed CPU, so one of those has to be landed in the arena
+        // rather than forwarded across a link negotiated `Cpu`.
         if (dst_w, dst_h) == (src_w, src_h) {
-            return Ok(Some(buffer));
+            if buffer.memory_type() == MemoryType::Cpu && !buffer.metadata().has_strided_planes() {
+                return Ok(Some(buffer));
+            }
+            let packed_len = PlaneLayout::packed(caps_format, src_w, src_h).required_len(
+                caps_format,
+                src_w,
+                src_h,
+            );
+            let mut slot = self.output.acquire(packed_len, "videoscale")?;
+            layout
+                .repack_into(
+                    buffer.as_bytes(),
+                    caps_format,
+                    src_w,
+                    src_h,
+                    &mut slot.data_mut()[..packed_len],
+                )
+                .map_err(Error::Element)?;
+            let mut metadata = buffer.metadata().clone();
+            metadata.set_video_dims(src_w, src_h, caps_format);
+            return Ok(Some(Buffer::new(
+                MemoryHandle::with_len(slot, packed_len),
+                metadata,
+            )));
         }
 
         self.ensure_engine(format, src_w, src_h, dst_w, dst_h)?;
-        let engine = self.engine.as_ref().expect("ensure_engine just built one");
 
         // Scale straight into the arena slot — the engine writes into any
         // caller slice, so a scratch staging buffer only added a redundant
@@ -483,7 +514,31 @@ impl Element for VideoScale {
         // way, so failing before the work is strictly better.
         let output_size = format.buffer_size(dst_w, dst_h);
         let mut slot = self.output.acquire(output_size, "videoscale")?;
-        engine.scale(buffer.as_bytes(), &mut slot.data_mut()[..output_size])?;
+
+        // Shrinking scaffold (#196): repack when the engine paths for this
+        // format do not read strides yet. Goes away with the predicate.
+        let (data, layout) = if converters::ScaleEngine::reads_strided_input(format)
+            || layout.is_packed(caps_format, src_w, src_h)
+        {
+            (buffer.as_bytes(), layout)
+        } else {
+            let packed = PlaneLayout::packed(caps_format, src_w, src_h);
+            let packed_len = packed.required_len(caps_format, src_w, src_h);
+            self.repack_scratch.resize(packed_len, 0);
+            layout
+                .repack_into(
+                    buffer.as_bytes(),
+                    caps_format,
+                    src_w,
+                    src_h,
+                    &mut self.repack_scratch,
+                )
+                .map_err(Error::Element)?;
+            (&self.repack_scratch[..], packed)
+        };
+
+        let engine = self.engine.as_ref().expect("ensure_engine just built one");
+        engine.scale(data, layout, &mut slot.data_mut()[..output_size])?;
 
         let mut metadata = buffer.metadata().clone();
         // The INPUT format, not a hardcoded I420: scaling preserves the format.
@@ -498,11 +553,15 @@ impl Element for VideoScale {
     }
 
     fn input_media_caps(&self) -> ElementMediaCaps {
-        scalable_caps()
+        // #196: External (producer-owned, strided) input is read through
+        // `Metadata::plane_layout`, so a decoder's own frames come straight
+        // in — the contract `external_or_cpu` names.
+        scalable_caps(MemoryCaps::external_or_cpu())
     }
 
     fn output_media_caps(&self) -> ElementMediaCaps {
-        scalable_caps()
+        // Output is always a packed arena slot.
+        scalable_caps(MemoryCaps::cpu_only())
     }
 }
 

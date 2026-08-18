@@ -235,7 +235,7 @@ impl CpuBackend {
         let out_len = frame.width as usize * frame.height as usize * 4;
         self.scratch.resize(out_len, 0);
         let (_, converter) = self.converter.as_ref().expect("installed above");
-        converter.convert(packed, &mut self.scratch)
+        converter.convert(packed, converter.packed_input_layout(), &mut self.scratch)
     }
 }
 

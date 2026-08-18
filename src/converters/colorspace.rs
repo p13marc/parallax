@@ -7,6 +7,7 @@
 //! feature, a pure Rust implementation is used as fallback.
 
 use crate::error::{Error, Result};
+use crate::format::PlaneLayout;
 
 #[cfg(feature = "simd-colorspace")]
 use yuv::{
@@ -284,7 +285,53 @@ pub struct VideoConvert {
     color_matrix: ColorMatrix,
 }
 
+/// One input plane resolved against a buffer: its bytes from the first row
+/// to the end of the buffer, plus the geometry needed to walk it.
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)] // fields used as the arm families are converted (#196)
+struct PlaneIn<'a> {
+    /// Plane bytes, starting at its first row.
+    data: &'a [u8],
+    /// Byte distance between consecutive rows.
+    stride: usize,
+    /// Number of rows.
+    rows: usize,
+    /// Used bytes per row (<= stride).
+    row_bytes: usize,
+}
+
+impl<'a> PlaneIn<'a> {
+    /// Row `y`'s used bytes.
+    #[inline]
+    #[allow(dead_code)] // used as the arm families are converted (#196)
+    fn row(&self, y: usize) -> &'a [u8] {
+        let start = y * self.stride;
+        &self.data[start..start + self.row_bytes]
+    }
+}
+
 impl VideoConvert {
+    /// Whether the arms reading `input_format` honor a non-packed input
+    /// layout yet.
+    ///
+    /// Shrinking scaffold (#196): the stride rewrite lands one input-format
+    /// family per commit, and callers repack a strided buffer themselves
+    /// while this answers `false`. Deleted — along with those repack
+    /// buffers — once every family is converted.
+    pub(crate) fn reads_strided_input(input_format: PixelFormat) -> bool {
+        match input_format {
+            PixelFormat::I420
+            | PixelFormat::Nv12
+            | PixelFormat::Yuyv
+            | PixelFormat::Uyvy
+            | PixelFormat::Rgb24
+            | PixelFormat::Rgba
+            | PixelFormat::Bgr24
+            | PixelFormat::Bgra
+            | PixelFormat::Gray8 => false,
+        }
+    }
+
     /// Create a new video converter.
     pub fn new(
         input_format: PixelFormat,
@@ -335,9 +382,49 @@ impl VideoConvert {
         self.output_format.buffer_size(self.width, self.height)
     }
 
+    /// The packed input layout for this converter's format and geometry —
+    /// what a caller holding an ordinary arena buffer passes to
+    /// [`convert`](Self::convert).
+    pub fn packed_input_layout(&self) -> PlaneLayout {
+        PlaneLayout::packed(self.input_format.into(), self.width, self.height)
+    }
+
+    /// One input plane, resolved against the buffer.
+    ///
+    /// The slice runs from the plane's first row to the *end of the buffer*,
+    /// not to `offset + stride * rows`: a tight strided layout's last row
+    /// has no trailing padding, so the latter would overrun. Every consumer
+    /// walks it row by row, and so does the `yuv` crate, whose own length
+    /// check is `stride * (rows - 1) + row_bytes`.
+    #[allow(dead_code)] // used as the arm families are converted (#196)
+    fn input_plane<'a>(&self, input: &'a [u8], layout: PlaneLayout, index: usize) -> PlaneIn<'a> {
+        let p = layout
+            .resolved(self.input_format.into(), self.width, self.height)
+            .nth(index)
+            .expect("plane index within the format's plane count");
+        PlaneIn {
+            data: &input[p.offset..],
+            stride: p.stride,
+            rows: p.rows,
+            row_bytes: p.row_bytes,
+        }
+    }
+
     /// Convert a frame from input format to output format.
-    pub fn convert(&self, input: &[u8], output: &mut [u8]) -> Result<()> {
-        let expected_input = self.input_format.buffer_size(self.width, self.height);
+    ///
+    /// `input_layout` describes where the input's planes are and how far
+    /// apart their rows sit — [`packed_input_layout`](Self::packed_input_layout)
+    /// for an ordinary buffer, the producer's own layout for a strided one
+    /// (#194). The **output is always packed**: every caller writes into a
+    /// freshly sized arena slot, so there is no output layout to thread.
+    pub fn convert(
+        &self,
+        input: &[u8],
+        input_layout: PlaneLayout,
+        output: &mut [u8],
+    ) -> Result<()> {
+        let expected_input =
+            input_layout.required_len(self.input_format.into(), self.width, self.height);
         let expected_output = self.output_format.buffer_size(self.width, self.height);
 
         if input.len() < expected_input {
@@ -360,7 +447,8 @@ impl VideoConvert {
         match (self.input_format, self.output_format) {
             // Same format - just copy
             (a, b) if a == b => {
-                output[..expected_input].copy_from_slice(&input[..expected_input]);
+                let packed = self.input_format.buffer_size(self.width, self.height);
+                output[..packed].copy_from_slice(&input[..packed]);
             }
 
             // YUV to RGB conversions
@@ -2225,7 +2313,8 @@ mod tests {
         let src = yuyv_4x4();
         let conv = VideoConvert::new(PixelFormat::Yuyv, PixelFormat::I420, 4, 4).unwrap();
         let mut out = vec![0u8; conv.output_size()];
-        conv.convert(&src, &mut out).unwrap();
+        conv.convert(&src, conv.packed_input_layout(), &mut out)
+            .unwrap();
 
         // Luma passes through untouched, pixel for pixel.
         for row in 0..4usize {
@@ -2257,15 +2346,21 @@ mod tests {
 
         let direct = VideoConvert::new(PixelFormat::Yuyv, PixelFormat::Rgb24, 4, 4).unwrap();
         let mut rgb_direct = vec![0u8; direct.output_size()];
-        direct.convert(&src, &mut rgb_direct).unwrap();
+        direct
+            .convert(&src, direct.packed_input_layout(), &mut rgb_direct)
+            .unwrap();
 
         let to_i420 = VideoConvert::new(PixelFormat::Yuyv, PixelFormat::I420, 4, 4).unwrap();
         let mut i420 = vec![0u8; to_i420.output_size()];
-        to_i420.convert(&src, &mut i420).unwrap();
+        to_i420
+            .convert(&src, to_i420.packed_input_layout(), &mut i420)
+            .unwrap();
 
         let to_rgb = VideoConvert::new(PixelFormat::I420, PixelFormat::Rgb24, 4, 4).unwrap();
         let mut rgb_via_i420 = vec![0u8; to_rgb.output_size()];
-        to_rgb.convert(&i420, &mut rgb_via_i420).unwrap();
+        to_rgb
+            .convert(&i420, to_rgb.packed_input_layout(), &mut rgb_via_i420)
+            .unwrap();
 
         // Not identical: 4:2:0 loses vertical chroma resolution. But it must be
         // close — a wrong U/V assignment would swing colours wildly.
@@ -2296,8 +2391,12 @@ mod tests {
 
         let mut a = vec![0u8; from_yuyv.output_size()];
         let mut b = vec![0u8; from_uyvy.output_size()];
-        from_yuyv.convert(&yuyv, &mut a).unwrap();
-        from_uyvy.convert(&uyvy, &mut b).unwrap();
+        from_yuyv
+            .convert(&yuyv, from_yuyv.packed_input_layout(), &mut a)
+            .unwrap();
+        from_uyvy
+            .convert(&uyvy, from_uyvy.packed_input_layout(), &mut b)
+            .unwrap();
 
         assert_eq!(
             a, b,
@@ -2311,11 +2410,15 @@ mod tests {
 
         let to_i420 = VideoConvert::new(PixelFormat::Yuyv, PixelFormat::I420, 4, 4).unwrap();
         let mut i420 = vec![0u8; to_i420.output_size()];
-        to_i420.convert(&src, &mut i420).unwrap();
+        to_i420
+            .convert(&src, to_i420.packed_input_layout(), &mut i420)
+            .unwrap();
 
         let to_nv12 = VideoConvert::new(PixelFormat::Yuyv, PixelFormat::Nv12, 4, 4).unwrap();
         let mut nv12 = vec![0u8; to_nv12.output_size()];
-        to_nv12.convert(&src, &mut nv12).unwrap();
+        to_nv12
+            .convert(&src, to_nv12.packed_input_layout(), &mut nv12)
+            .unwrap();
 
         assert_eq!(&nv12[..16], &i420[..16], "same luma plane");
         for i in 0..4 {
@@ -2330,15 +2433,20 @@ mod tests {
         let src = yuyv_4x4();
         let to_i420 = VideoConvert::new(PixelFormat::Yuyv, PixelFormat::I420, 4, 4).unwrap();
         let mut i420 = vec![0u8; to_i420.output_size()];
-        to_i420.convert(&src, &mut i420).unwrap();
+        to_i420
+            .convert(&src, to_i420.packed_input_layout(), &mut i420)
+            .unwrap();
 
         let to_nv12 = VideoConvert::new(PixelFormat::I420, PixelFormat::Nv12, 4, 4).unwrap();
         let mut nv12 = vec![0u8; to_nv12.output_size()];
-        to_nv12.convert(&i420, &mut nv12).unwrap();
+        to_nv12
+            .convert(&i420, to_nv12.packed_input_layout(), &mut nv12)
+            .unwrap();
 
         let back = VideoConvert::new(PixelFormat::Nv12, PixelFormat::I420, 4, 4).unwrap();
         let mut i420_again = vec![0u8; back.output_size()];
-        back.convert(&nv12, &mut i420_again).unwrap();
+        back.convert(&nv12, back.packed_input_layout(), &mut i420_again)
+            .unwrap();
 
         assert_eq!(i420, i420_again);
     }
@@ -2411,8 +2519,12 @@ mod tests {
         let mut yuv = vec![0u8; PixelFormat::I420.buffer_size(4, 4)];
         let mut rgb_out = vec![0u8; 4 * 4 * 3];
 
-        conv_to_yuv.convert(&rgb_in, &mut yuv).unwrap();
-        conv_to_rgb.convert(&yuv, &mut rgb_out).unwrap();
+        conv_to_yuv
+            .convert(&rgb_in, conv_to_yuv.packed_input_layout(), &mut yuv)
+            .unwrap();
+        conv_to_rgb
+            .convert(&yuv, conv_to_rgb.packed_input_layout(), &mut rgb_out)
+            .unwrap();
 
         // Check that values are similar. With uniform 2x2 blocks, we should get
         // much closer values since no chroma information is lost to subsampling.
@@ -2435,7 +2547,8 @@ mod tests {
         let rgb = [255, 0, 0, 0, 255, 0, 0, 0, 255, 128, 128, 128]; // Red, Green, Blue, Gray
         let mut bgr = vec![0u8; 12];
 
-        conv.convert(&rgb, &mut bgr).unwrap();
+        conv.convert(&rgb, conv.packed_input_layout(), &mut bgr)
+            .unwrap();
 
         assert_eq!(bgr[0..3], [0, 0, 255]); // Red -> BGR
         assert_eq!(bgr[3..6], [0, 255, 0]); // Green stays
@@ -2452,7 +2565,9 @@ mod tests {
         let mut rgba = vec![0u8; 16];
         let mut rgb_out = vec![0u8; 12];
 
-        conv_add.convert(&rgb, &mut rgba).unwrap();
+        conv_add
+            .convert(&rgb, conv_add.packed_input_layout(), &mut rgba)
+            .unwrap();
 
         // Check alpha was added
         assert_eq!(rgba[3], 255);
@@ -2460,7 +2575,9 @@ mod tests {
         assert_eq!(rgba[11], 255);
         assert_eq!(rgba[15], 255);
 
-        conv_rem.convert(&rgba, &mut rgb_out).unwrap();
+        conv_rem
+            .convert(&rgba, conv_rem.packed_input_layout(), &mut rgb_out)
+            .unwrap();
 
         // Check roundtrip
         assert_eq!(rgb, rgb_out.as_slice());
@@ -2473,7 +2590,8 @@ mod tests {
         let gray = [0, 85, 170, 255];
         let mut rgb = vec![0u8; 12];
 
-        conv.convert(&gray, &mut rgb).unwrap();
+        conv.convert(&gray, conv.packed_input_layout(), &mut rgb)
+            .unwrap();
 
         assert_eq!(rgb[0..3], [0, 0, 0]);
         assert_eq!(rgb[3..6], [85, 85, 85]);
@@ -2494,7 +2612,53 @@ mod tests {
         let input = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
         let mut output = vec![0u8; 12];
 
-        conv.convert(&input, &mut output).unwrap();
+        conv.convert(&input, conv.packed_input_layout(), &mut output)
+            .unwrap();
         assert_eq!(input.as_slice(), output.as_slice());
+    }
+
+    /// Every engine format at every geometry the engine accepts: the packed
+    /// [`PlaneLayout`] and the engine's own `buffer_size` must agree.
+    ///
+    /// They are computed independently — `plane_geometry` rounds chroma up
+    /// with `div_ceil(2)`, `buffer_size` truncates with `/ 2` — and the
+    /// stride work makes the layout the input-side authority, so a
+    /// divergence would show up as a silent short-buffer read.
+    #[test]
+    fn packed_layout_len_agrees_with_engine_buffer_size() {
+        const FORMATS: [PixelFormat; 9] = [
+            PixelFormat::I420,
+            PixelFormat::Nv12,
+            PixelFormat::Yuyv,
+            PixelFormat::Uyvy,
+            PixelFormat::Rgb24,
+            PixelFormat::Rgba,
+            PixelFormat::Bgr24,
+            PixelFormat::Bgra,
+            PixelFormat::Gray8,
+        ];
+        for format in FORMATS {
+            for (w, h) in [(2u32, 2u32), (16, 16), (64, 48), (640, 480), (1920, 1080)] {
+                let caps: crate::format::PixelFormat = format.into();
+                assert_eq!(
+                    PlaneLayout::packed(caps, w, h).required_len(caps, w, h),
+                    format.buffer_size(w, h),
+                    "{format:?} at {w}x{h}"
+                );
+            }
+            // Odd geometry only reaches the engine for non-YUV formats:
+            // `VideoConvert::new` rejects odd dimensions whenever a YUV
+            // format is involved.
+            if !format.is_yuv() {
+                for (w, h) in [(1u32, 1u32), (65, 49), (639, 481)] {
+                    let caps: crate::format::PixelFormat = format.into();
+                    assert_eq!(
+                        PlaneLayout::packed(caps, w, h).required_len(caps, w, h),
+                        format.buffer_size(w, h),
+                        "{format:?} at {w}x{h}"
+                    );
+                }
+            }
+        }
     }
 }

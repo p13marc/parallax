@@ -6,7 +6,8 @@ use crate::buffer::{Buffer, MemoryHandle};
 use crate::converters::{PixelFormat, VideoConvert};
 use crate::element::Element;
 use crate::error::{Error, Result};
-use crate::format::Caps;
+use crate::format::{Caps, PlaneLayout};
+use crate::memory::MemoryType;
 use crate::memory::{OutputArena, OutputBudget, defaults};
 use crate::metadata::Metadata;
 
@@ -46,6 +47,10 @@ pub struct VideoConvertElement {
     converter_key: Option<(PixelFormat, PixelFormat, u32, u32)>,
     /// Element name
     name: String,
+    /// Staging for a strided input whose conversion arms do not read strides
+    /// yet (#196). Shrinking scaffold — deleted with
+    /// [`VideoConvert::reads_strided_input`].
+    repack_scratch: Vec<u8>,
     /// Arena for output buffers
     output: OutputArena,
 }
@@ -63,6 +68,7 @@ impl VideoConvertElement {
             converter: None,
             converter_key: None,
             name: "videoconvert".to_string(),
+            repack_scratch: Vec::new(),
             // `SharedArena::new` aligns every slot to a cache line, which is
             // stronger than the 32 bytes the AVX paths need — this used to ask
             // for `new_avx` and got *less* alignment than it does now.
@@ -228,18 +234,6 @@ impl Element for VideoConvertElement {
     }
 
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
-        // Loud guard (#194): this converter walks planes with strides
-        // derived from width — a strided frame would convert into garbage.
-        // Negotiation keeps External away from cpu-only elements; anything
-        // that still lands here is a bug upstream, not a format to guess at.
-        if buffer.metadata().has_strided_planes() {
-            return Err(Error::Element(
-                "videoconvert: strided plane layout not supported; negotiation should have \
-                 inserted a memorycopy repack"
-                    .into(),
-            ));
-        }
-
         let input_data = buffer.as_bytes();
 
         tracing::debug!(
@@ -252,16 +246,54 @@ impl Element for VideoConvertElement {
         // follow it rather than keep converting at the first frame's geometry.
         let (input_format, width, height) =
             self.resolve_input(buffer.metadata(), input_data.len())?;
+        let caps_format: crate::format::PixelFormat = input_format.into();
+
+        // Plane geometry comes from the buffer and only from the buffer
+        // (#194): `plane_layout()` answers the packed layout for an ordinary
+        // frame and the producer's real strides for a codec-owned one. The
+        // `unwrap_or_else` covers the auto-detected case, where `resolve_input`
+        // recovered geometry the metadata never declared.
+        let layout = buffer
+            .metadata()
+            .plane_layout()
+            .unwrap_or_else(|| PlaneLayout::packed(caps_format, width, height));
 
         // No-op conversion: forward the input untouched (the VideoScale /
         // AudioDownmix passthrough precedent) — zero copies, zero slots.
+        //
+        // Only when the input is already what our *output* caps promise,
+        // though. Since #196 the input side accepts External and strided
+        // frames, and the output side is still packed CPU: forwarding one
+        // across a link negotiated `Cpu` would hand the consumer a layout it
+        // never agreed to read.
         if input_format == self.output_format {
-            return Ok(Some(buffer));
+            if buffer.memory_type() == MemoryType::Cpu && !buffer.metadata().has_strided_planes() {
+                return Ok(Some(buffer));
+            }
+            let packed_len = PlaneLayout::packed(caps_format, width, height).required_len(
+                caps_format,
+                width,
+                height,
+            );
+            let mut slot = self.output.acquire(packed_len, "videoconvert")?;
+            layout
+                .repack_into(
+                    input_data,
+                    caps_format,
+                    width,
+                    height,
+                    &mut slot.data_mut()[..packed_len],
+                )
+                .map_err(Error::Element)?;
+            let mut metadata = buffer.metadata().clone();
+            metadata.set_video_dims(width, height, caps_format);
+            return Ok(Some(Buffer::new(
+                MemoryHandle::with_len(slot, packed_len),
+                metadata,
+            )));
         }
 
         self.ensure_converter(input_format, width, height)?;
-
-        let converter = self.converter.as_ref().unwrap();
 
         // Convert straight into the arena slot — every converter arm writes
         // into the caller's `&mut [u8]`, so a scratch staging buffer would
@@ -271,7 +303,32 @@ impl Element for VideoConvertElement {
         // skips the wasted work.
         let output_size = self.output_format.buffer_size(width, height);
         let mut slot = self.output.acquire(output_size, "videoconvert")?;
-        converter.convert(input_data, &mut slot.data_mut()[..output_size])?;
+
+        // Shrinking scaffold (#196): the arms for this input format may not
+        // read strides yet, in which case the frame is repacked first. The
+        // predicate — and this branch — go away as the families convert.
+        let (data, layout) = if VideoConvert::reads_strided_input(input_format)
+            || layout.is_packed(caps_format, width, height)
+        {
+            (input_data, layout)
+        } else {
+            let packed = PlaneLayout::packed(caps_format, width, height);
+            let packed_len = packed.required_len(caps_format, width, height);
+            self.repack_scratch.resize(packed_len, 0);
+            layout
+                .repack_into(
+                    input_data,
+                    caps_format,
+                    width,
+                    height,
+                    &mut self.repack_scratch,
+                )
+                .map_err(Error::Element)?;
+            (&self.repack_scratch[..], packed)
+        };
+
+        let converter = self.converter.as_ref().expect("installed above");
+        converter.convert(data, layout, &mut slot.data_mut()[..output_size])?;
 
         // Size the handle by the converted data, not by the arena slot: the
         // slot is reused across geometry changes and is only ever >= the frame.
@@ -307,8 +364,19 @@ impl Element for VideoConvertElement {
     }
 
     fn input_media_caps(&self) -> crate::format::ElementMediaCaps {
-        // Accept any raw video format - truly any dimensions and pixel format
-        // Request AVX-aligned memory for SIMD optimization
+        // Accept any raw video format - truly any dimensions and pixel format.
+        //
+        // #196: also accept External (producer-owned, strided) memory. The
+        // contract `external_or_cpu` carries is "reads geometry via
+        // Metadata::plane_layout", which `process` now does — so a decoder
+        // hands its own pictures straight over instead of de-striding them
+        // into an arena first.
+        //
+        // No `MemoryLayout::AVX` request on the input any more: alignment is
+        // something an arena can promise and a codec's own frame cannot. It
+        // was never enforced (caps intersection *merges* layouts rather than
+        // intersecting them), so this only stops advertising a guarantee we
+        // do not get; the output side still asks for it.
         use crate::format::{
             CapsValue, ElementMediaCaps, FormatCaps, FormatMemoryCap, MemoryCaps, MemoryLayout,
             VideoFormatCaps,
@@ -319,12 +387,12 @@ impl Element for VideoConvertElement {
             height: CapsValue::Any,
             pixel_format: CapsValue::Any,
             framerate: CapsValue::Any,
-            layout: MemoryLayout::AVX, // Request aligned memory for SIMD
+            layout: MemoryLayout::NONE,
         };
 
         ElementMediaCaps::new(vec![FormatMemoryCap::new(
             FormatCaps::VideoRaw(format),
-            MemoryCaps::cpu_only(),
+            MemoryCaps::external_or_cpu(),
         )])
     }
 

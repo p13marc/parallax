@@ -8,6 +8,7 @@
 //! from [`Metadata`](crate::metadata::Metadata) and drives the engine.
 
 use crate::error::{Error, Result};
+use crate::format::PlaneLayout;
 
 use super::PixelFormat;
 
@@ -85,9 +86,41 @@ impl ScaleEngine {
             .buffer_size(self.output_width, self.output_height)
     }
 
+    /// The packed input layout for this engine's format and source geometry
+    /// — what a caller holding an ordinary arena buffer passes to
+    /// [`scale`](Self::scale).
+    pub fn packed_input_layout(&self) -> PlaneLayout {
+        PlaneLayout::packed(self.format.into(), self.input_width, self.input_height)
+    }
+
+    /// Whether the paths reading `format` honor a non-packed input layout yet.
+    ///
+    /// Shrinking scaffold (#196) — see
+    /// [`VideoConvert::reads_strided_input`](super::VideoConvert::reads_strided_input).
+    pub(crate) fn reads_strided_input(format: PixelFormat) -> bool {
+        match format {
+            PixelFormat::I420
+            | PixelFormat::Nv12
+            | PixelFormat::Yuyv
+            | PixelFormat::Uyvy
+            | PixelFormat::Rgb24
+            | PixelFormat::Rgba
+            | PixelFormat::Bgr24
+            | PixelFormat::Bgra
+            | PixelFormat::Gray8 => false,
+        }
+    }
+
     /// Scale a frame.
-    pub fn scale(&self, input: &[u8], output: &mut [u8]) -> Result<()> {
-        let expected_input = self.format.buffer_size(self.input_width, self.input_height);
+    ///
+    /// `input_layout` describes where the input's planes are and how far
+    /// apart their rows sit — [`packed_input_layout`](Self::packed_input_layout)
+    /// for an ordinary buffer, the producer's own layout for a strided one
+    /// (#194). The **output is always packed**: every caller writes into a
+    /// freshly sized arena slot.
+    pub fn scale(&self, input: &[u8], input_layout: PlaneLayout, output: &mut [u8]) -> Result<()> {
+        let expected_input =
+            input_layout.required_len(self.format.into(), self.input_width, self.input_height);
         let expected_output = self
             .format
             .buffer_size(self.output_width, self.output_height);
@@ -463,7 +496,9 @@ mod tests {
         let input = [0, 255, 255, 0]; // 2x2 checkerboard
         let mut output = vec![0u8; 16];
 
-        scaler.scale(&input, &mut output).unwrap();
+        scaler
+            .scale(&input, scaler.packed_input_layout(), &mut output)
+            .unwrap();
 
         // Each pixel should be duplicated 2x2
         #[rustfmt::skip]
@@ -491,7 +526,9 @@ mod tests {
         ];
         let mut output = vec![0u8; 4];
 
-        scaler.scale(&input, &mut output).unwrap();
+        scaler
+            .scale(&input, scaler.packed_input_layout(), &mut output)
+            .unwrap();
 
         // Should pick top-left of each 2x2 block
         let expected = [0, 255, 255, 0];
@@ -507,7 +544,9 @@ mod tests {
         let input = [0, 100, 100, 200];
         let mut output = vec![0u8; 16];
 
-        scaler.scale(&input, &mut output).unwrap();
+        scaler
+            .scale(&input, scaler.packed_input_layout(), &mut output)
+            .unwrap();
 
         // Corners should be close to original values (bilinear can interpolate at edges)
         assert_eq!(output[0], 0); // top-left corner should be exact
@@ -542,7 +581,9 @@ mod tests {
         ];
         let mut output = vec![0u8; 4 * 4 * 3];
 
-        scaler.scale(&input, &mut output).unwrap();
+        scaler
+            .scale(&input, scaler.packed_input_layout(), &mut output)
+            .unwrap();
 
         // Top-left 2x2 should be red
         assert_eq!(&output[0..3], &[255, 0, 0]);
@@ -572,7 +613,9 @@ mod tests {
 
         let mut output = vec![0u8; 8 * 8 + 4 * 4 + 4 * 4]; // 96 bytes total
 
-        scaler.scale(&input, &mut output).unwrap();
+        scaler
+            .scale(&input, scaler.packed_input_layout(), &mut output)
+            .unwrap();
 
         // Output Y plane should be scaled
         assert_eq!(output.len(), PixelFormat::I420.buffer_size(8, 8));

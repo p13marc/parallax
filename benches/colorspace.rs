@@ -46,9 +46,10 @@ fn bench_i420_to_rgba(c: &mut Criterion) {
         let converter = VideoConvert::new(PixelFormat::I420, PixelFormat::Rgba, width, height)
             .expect("Failed to create converter");
 
+        let layout = converter.packed_input_layout();
         group.bench_with_input(BenchmarkId::new("convert", name), &input, |b, input| {
             b.iter(|| {
-                converter.convert(input, &mut output).unwrap();
+                converter.convert(input, layout, &mut output).unwrap();
                 std::hint::black_box(&output);
             });
         });
@@ -81,9 +82,10 @@ fn bench_rgba_to_i420(c: &mut Criterion) {
         let converter = VideoConvert::new(PixelFormat::Rgba, PixelFormat::I420, width, height)
             .expect("Failed to create converter");
 
+        let layout = converter.packed_input_layout();
         group.bench_with_input(BenchmarkId::new("convert", name), &input, |b, input| {
             b.iter(|| {
-                converter.convert(input, &mut output).unwrap();
+                converter.convert(input, layout, &mut output).unwrap();
                 std::hint::black_box(&output);
             });
         });
@@ -116,9 +118,10 @@ fn bench_yuyv_to_rgba(c: &mut Criterion) {
         let converter = VideoConvert::new(PixelFormat::Yuyv, PixelFormat::Rgba, width, height)
             .expect("Failed to create converter");
 
+        let layout = converter.packed_input_layout();
         group.bench_with_input(BenchmarkId::new("convert", name), &input, |b, input| {
             b.iter(|| {
-                converter.convert(input, &mut output).unwrap();
+                converter.convert(input, layout, &mut output).unwrap();
                 std::hint::black_box(&output);
             });
         });
@@ -153,9 +156,10 @@ fn bench_nv12_to_rgba(c: &mut Criterion) {
         let converter = VideoConvert::new(PixelFormat::Nv12, PixelFormat::Rgba, width, height)
             .expect("Failed to create converter");
 
+        let layout = converter.packed_input_layout();
         group.bench_with_input(BenchmarkId::new("convert", name), &input, |b, input| {
             b.iter(|| {
-                converter.convert(input, &mut output).unwrap();
+                converter.convert(input, layout, &mut output).unwrap();
                 std::hint::black_box(&output);
             });
         });
@@ -188,9 +192,10 @@ fn bench_rgba_to_nv12(c: &mut Criterion) {
         let converter = VideoConvert::new(PixelFormat::Rgba, PixelFormat::Nv12, width, height)
             .expect("Failed to create converter");
 
+        let layout = converter.packed_input_layout();
         group.bench_with_input(BenchmarkId::new("convert", name), &input, |b, input| {
             b.iter(|| {
-                converter.convert(input, &mut output).unwrap();
+                converter.convert(input, layout, &mut output).unwrap();
                 std::hint::black_box(&output);
             });
         });
