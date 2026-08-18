@@ -28,9 +28,9 @@ Dependencies are in `Cargo.toml`; these two are the ones the code alone would mi
 
 ## Build & Test Commands
 
-Recipes live in `justfile` (`just --list`); `just check-sensor` mirrors the CI sensor combo.
+Recipes live in `justfile` (`just --list`); `just check-sensor` mirrors the CI sensor combo, `just check-simd` the `simd-colorspace` one (the second implementation of every conversion arm, and the one `parallax-player` builds with — the default-feature scalar arms are its twin, so a conversion change needs both).
 
-Feature-gated code is NOT compiled by default — after touching gated modules (codecs, devices, rtp, vulkan…), check with the relevant features enabled. CI (`.github/workflows/ci.yml`) runs default tests plus the sensor combo; it deliberately does NOT run `--all-features` (dav1d/alsa/pipewire/libcamera need system libs, and vulkan-video carries lint debt tracked in #3).
+Feature-gated code is NOT compiled by default — after touching gated modules (codecs, devices, rtp, vulkan…), check with the relevant features enabled. CI (`.forgejo/workflows/ci.yml` — GitHub is a mirror) runs default tests plus the sensor, media, display and simd combos; it deliberately does NOT run `--all-features` (dav1d/alsa/pipewire/libcamera need system libs, and vulkan-video carries lint debt tracked in #3).
 
 ## Element System
 

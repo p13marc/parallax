@@ -73,6 +73,13 @@ check-display:
     cargo nextest run --features display,display-gpu
     cargo clippy --all-targets --features display,display-gpu -- -D warnings
 
+# Colorspace SIMD combo (the `yuv` crate) — what parallax-player actually
+# builds with. The scalar arms are the default-feature fallback, so both
+# families need running: a stride or format change touches two twins.
+check-simd:
+    cargo nextest run --features simd-colorspace
+    cargo clippy --all-targets --features simd-colorspace -- -D warnings
+
 # Check + test + lint the V4L2 M2M hardware encoder (mirrors CI's test-v4l2-m2m job).
 # Needs libclang + kernel headers (on immutable Fedora: run inside a toolbox).
 # Live queue test: modprobe vicodec, then PARALLAX_VICODEC_TEST_DEVICE=auto just check-m2m
