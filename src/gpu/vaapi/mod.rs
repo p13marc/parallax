@@ -32,6 +32,9 @@ use std::sync::Arc;
 
 use cros_codecs::libva;
 
+mod frame;
+pub use frame::{VaFrame, VaFrameDescriptor};
+
 use super::Codec;
 
 /// A VA-API display, plus what it can decode.
