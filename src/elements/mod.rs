@@ -63,7 +63,8 @@ pub mod app;
     feature = "eac3",
     feature = "aac-encode",
     feature = "image-jpeg",
-    feature = "image-png"
+    feature = "image-png",
+    feature = "vaapi"
 ))]
 pub mod codec;
 pub mod demux;

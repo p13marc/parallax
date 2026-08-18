@@ -10,13 +10,23 @@ use crate::format::PlaneLayout;
 /// keyframe, but an ACCURATE seek's segment starts at the requested time,
 /// and the executor makes that gap out-of-segment precisely so decoders
 /// drop it here and the first shown frame is the request itself.
-#[cfg(any(feature = "h264", feature = "av1-decode", feature = "vpx"))]
+#[cfg(any(
+    feature = "h264",
+    feature = "av1-decode",
+    feature = "vpx",
+    feature = "vaapi"
+))]
 #[derive(Default)]
 pub(crate) struct SegmentClip {
     below: Option<crate::clock::ClockTime>,
 }
 
-#[cfg(any(feature = "h264", feature = "av1-decode", feature = "vpx"))]
+#[cfg(any(
+    feature = "h264",
+    feature = "av1-decode",
+    feature = "vpx",
+    feature = "vaapi"
+))]
 impl SegmentClip {
     /// Track a downstream event; Time segments update the threshold.
     pub(crate) fn observe(&mut self, event: &crate::event::Event) {

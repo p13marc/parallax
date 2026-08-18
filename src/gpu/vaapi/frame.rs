@@ -97,6 +97,95 @@ impl Drop for FrameMemory {
     }
 }
 
+/// A fixed set of [`VaFrame`]s, reissued as the pipeline lets them go.
+///
+/// Allocating a frame costs a memfd, an ioctl and an mmap of several
+/// megabytes, so a decoder that allocated per picture would spend more on
+/// bookkeeping than on decoding. The pool holds one reference to each
+/// allocation and hands out a frame only when nothing else holds it —
+/// `Arc::strong_count == 1` means the decoder has released its handle *and*
+/// the pipeline has dropped the buffer that rode on it.
+///
+/// Sizing comes from the stream: `StreamInfo::min_num_frames` is what the
+/// codec needs for references alone, and anything the pipeline holds
+/// downstream is on top of that.
+#[derive(Debug)]
+pub struct VaFramePool {
+    slots: Vec<Arc<FrameMemory>>,
+    coded: Resolution,
+    visible: Resolution,
+}
+
+impl VaFramePool {
+    /// An empty pool for frames of this geometry.
+    pub fn new(coded: Resolution, visible: Resolution) -> Self {
+        Self {
+            slots: Vec::new(),
+            coded,
+            visible,
+        }
+    }
+
+    /// Grow to `count` frames, allocating any that are missing.
+    ///
+    /// Never shrinks: a slot may still be in flight, and dropping our
+    /// reference would only defer the free until the pipeline lets go
+    /// anyway. Geometry changes go through [`reset`](Self::reset).
+    pub fn reserve(&mut self, count: usize) -> Result<()> {
+        while self.slots.len() < count {
+            self.slots
+                .push(VaFrame::new(self.coded, self.visible)?.inner);
+        }
+        Ok(())
+    }
+
+    /// Drop every slot and re-target the pool at a new geometry.
+    ///
+    /// In-flight frames keep their own allocation alive, so this is safe
+    /// mid-stream — a resolution change simply stops reusing the old ones.
+    pub fn reset(&mut self, coded: Resolution, visible: Resolution) {
+        self.slots.clear();
+        self.coded = coded;
+        self.visible = visible;
+    }
+
+    /// A frame nothing else is holding, or `None` when all are in flight.
+    pub fn acquire(&mut self) -> Option<VaFrame> {
+        let free = self
+            .slots
+            .iter()
+            .find(|slot| Arc::strong_count(slot) == 1)?;
+        Some(VaFrame {
+            inner: Arc::clone(free),
+            visible: self.visible,
+        })
+    }
+
+    /// How many frames exist.
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Whether the pool holds no frames.
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    /// How many are free right now — diagnostics, and the signal that a
+    /// decoder is starved.
+    pub fn available(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|slot| Arc::strong_count(slot) == 1)
+            .count()
+    }
+
+    /// The geometry this pool allocates.
+    pub fn geometry(&self) -> (Resolution, Resolution) {
+        (self.coded, self.visible)
+    }
+}
+
 impl VaFrame {
     /// Allocate one NV12 frame at `coded` size, visible at `visible`.
     ///
@@ -436,6 +525,55 @@ mod tests {
 
         // Decode output is never written from our side.
         assert!(frame.map_mut().is_err());
+    }
+
+    /// The pool reissues a slot only once nothing else holds it, which is
+    /// what keeps a decoder from rendering over a frame the pipeline is
+    /// still reading.
+    #[test]
+    fn the_pool_reissues_only_released_slots() {
+        let mut pool = VaFramePool::new(res(64, 48), res(64, 48));
+        if pool.reserve(2).is_err() {
+            eprintln!("skipping: /dev/udmabuf unavailable");
+            return;
+        }
+        assert_eq!((pool.len(), pool.available()), (2, 2));
+
+        let a = pool.acquire().expect("a free slot");
+        let b = pool.acquire().expect("the other free slot");
+        assert_eq!(pool.available(), 0);
+        assert!(pool.acquire().is_none(), "both are in flight");
+
+        // Distinct allocations, not the same one handed out twice.
+        assert_ne!(a.as_bytes().as_ptr(), b.as_bytes().as_ptr());
+
+        drop(a);
+        assert_eq!(pool.available(), 1);
+        let c = pool.acquire().expect("the released slot comes back");
+        assert!(pool.acquire().is_none());
+        drop((b, c));
+        assert_eq!(pool.available(), 2);
+    }
+
+    /// A frame still in flight survives a pool reset — a resolution change
+    /// must not pull memory out from under a buffer the pipeline holds.
+    #[test]
+    fn a_reset_does_not_disturb_frames_in_flight() {
+        let mut pool = VaFramePool::new(res(64, 48), res(64, 48));
+        if pool.reserve(1).is_err() {
+            eprintln!("skipping: /dev/udmabuf unavailable");
+            return;
+        }
+        let held = pool.acquire().expect("a free slot");
+        // SAFETY: exclusive here; just marking the memory.
+        unsafe { std::slice::from_raw_parts_mut(held.inner.ptr, 4) }.copy_from_slice(b"live");
+
+        pool.reset(res(128, 96), res(128, 96));
+        assert_eq!(pool.len(), 0);
+        assert_eq!(pool.geometry().0, res(128, 96));
+
+        // The old frame still reads back.
+        assert_eq!(&held.as_bytes()[..4], b"live");
     }
 
     /// The driver really accepts one of these as a decode render target.

@@ -33,7 +33,7 @@ use std::sync::Arc;
 use cros_codecs::libva;
 
 mod frame;
-pub use frame::{VaFrame, VaFrameDescriptor};
+pub use frame::{VaFrame, VaFrameDescriptor, VaFramePool};
 
 use super::Codec;
 
@@ -105,6 +105,28 @@ impl VaDisplay {
             })
     }
 
+    /// Whether `cros-codecs` can initialise a decoder backend on this
+    /// display *at all*.
+    ///
+    /// `VaapiBackend::new` builds a throwaway 16x16 config from a hardcoded
+    /// `VAProfileH264Main` + `VAEntrypointVLD` — whatever codec the decoder
+    /// is actually for — and `.expect()`s the result. So on a driver without
+    /// H.264 it panics while decoding VP9, on hardware that decodes VP9
+    /// perfectly well.
+    ///
+    /// That is exactly the case on patent-free driver builds: Fedora's
+    /// `libva-intel-media-driver` omits H.264 and HEVC, and the same GPU
+    /// gains them under RPM Fusion's `intel-media-driver-freeworld`. Asking
+    /// the question here turns a panic deep in a dependency into an `Err`
+    /// and a software fallback.
+    pub fn supports_backend_init(&self) -> bool {
+        self.profiles.contains(&libva::VAProfile::VAProfileH264Main)
+            && self
+                .display
+                .query_config_entrypoints(libva::VAProfile::VAProfileH264Main)
+                .is_ok_and(|e| e.contains(&libva::VAEntrypoint::VAEntrypointVLD))
+    }
+
     /// Every codec this display can decode — for diagnostics and for the
     /// `--hwdec` report.
     pub fn decodable(&self) -> Vec<Codec> {
@@ -155,7 +177,12 @@ mod tests {
         match VaDisplay::open() {
             None => eprintln!("no VA display here — software fallback is the answer"),
             Some(d) => {
-                eprintln!("VA-API: {} decodes {:?}", d.vendor(), d.decodable());
+                eprintln!(
+                    "VA-API: {} decodes {:?} (backend init: {})",
+                    d.vendor(),
+                    d.decodable(),
+                    d.supports_backend_init()
+                );
                 // Whatever it reports, it must be self-consistent.
                 for codec in d.decodable() {
                     assert!(d.supports_decode(codec));

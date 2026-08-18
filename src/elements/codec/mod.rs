@@ -141,6 +141,13 @@ pub use audio_traits::{
 mod encoder_element;
 pub use encoder_element::EncoderElement;
 
+// VA-API hardware decode (#193). Unlike the Vulkan wrappers below this
+// implements `Element` directly, per the #160 codec-surface rule.
+#[cfg(feature = "vaapi")]
+mod vaapi;
+#[cfg(feature = "vaapi")]
+pub use vaapi::VaapiDecoder;
+
 // Hardware codec element wrappers (Vulkan Video)
 #[cfg(feature = "vulkan-video")]
 mod hw_decoder;
