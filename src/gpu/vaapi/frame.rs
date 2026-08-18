@@ -250,21 +250,33 @@ impl libva::ExternalBufferDescriptor for VaFrameDescriptor {
     type DescriptorAttribute = libva::VADRMPRIMESurfaceDescriptor;
 
     fn va_surface_attribute(&mut self) -> Self::DescriptorAttribute {
-        let mut desc: libva::VADRMPRIMESurfaceDescriptor = Default::default();
-        desc.fourcc = libva::VA_FOURCC_NV12;
-        desc.width = self.coded.width;
-        desc.height = self.coded.height;
-        desc.num_objects = 1;
-        desc.objects[0].fd = self.fd.as_raw_fd();
-        desc.objects[0].size = self.len as u32;
-        desc.objects[0].drm_format_modifier = DRM_FORMAT_MOD_LINEAR;
-        desc.num_layers = 1;
-        desc.layers[0].drm_format = DRM_FORMAT_NV12;
-        desc.layers[0].num_planes = 2;
-        desc.layers[0].object_index = [0; 4];
-        desc.layers[0].offset = [self.offsets[0] as u32, self.offsets[1] as u32, 0, 0];
-        desc.layers[0].pitch = [self.pitches[0] as u32, self.pitches[1] as u32, 0, 0];
-        desc
+        // One object (the whole allocation) carrying one layer of two
+        // planes — the NV12 shape, described to the driver in its own terms.
+        let mut objects: [libva::VADRMPRIMESurfaceDescriptorObject; 4] = Default::default();
+        objects[0] = libva::VADRMPRIMESurfaceDescriptorObject {
+            fd: self.fd.as_raw_fd(),
+            size: self.len as u32,
+            drm_format_modifier: DRM_FORMAT_MOD_LINEAR,
+        };
+
+        let mut layers: [libva::VADRMPRIMESurfaceDescriptorLayer; 4] = Default::default();
+        layers[0] = libva::VADRMPRIMESurfaceDescriptorLayer {
+            drm_format: DRM_FORMAT_NV12,
+            num_planes: 2,
+            object_index: [0; 4],
+            offset: [self.offsets[0] as u32, self.offsets[1] as u32, 0, 0],
+            pitch: [self.pitches[0] as u32, self.pitches[1] as u32, 0, 0],
+        };
+
+        libva::VADRMPRIMESurfaceDescriptor {
+            fourcc: libva::VA_FOURCC_NV12,
+            width: self.coded.width,
+            height: self.coded.height,
+            num_objects: 1,
+            objects,
+            num_layers: 1,
+            layers,
+        }
     }
 }
 
