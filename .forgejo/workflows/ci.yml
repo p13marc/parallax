@@ -50,7 +50,22 @@ jobs:
           components: rustfmt
       - run: cargo fmt --check
 
+  # The jobs below form a chain — `needs:` the previous one, `if: always()` so
+  # a red job never skips the rest. This is serialization, not a dependency:
+  # the runner has 1.7 GiB and no swap, and a single rustc on the parallax lib
+  # peaks near 1 GiB (#203), so two jobs sharing the box means the OOM killer
+  # picks one. That is what made CI unreadable — the same commit passing or
+  # failing depending on which pair happened to overlap, and an empty commit
+  # moving the red job from vaapi-check to vulkan-check.
+  #
+  # `CARGO_BUILD_JOBS=1` only caps parallelism *inside* a job; nothing in a
+  # workflow can cap the runner's own concurrency, so the chain does it.
+  # Costs wall-clock (roughly 25 min end to end) and buys a matrix whose
+  # result means something. Delete the `needs:`/`if:` pairs once the runner
+  # has the memory to run jobs side by side.
   clippy:
+    needs: fmt
+    if: always()
     runs-on: ubuntu-24.04
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v7.0.1
@@ -66,6 +81,8 @@ jobs:
       - run: cargo clippy --all-targets --features "$MEDIA_FEATURES" -- -D warnings
 
   test:
+    needs: clippy
+    if: always()
     runs-on: ubuntu-24.04
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v7.0.1
@@ -92,6 +109,8 @@ jobs:
       - run: cargo nextest run --features "$MEDIA_FEATURES"
 
   msrv:
+    needs: test
+    if: always()
     runs-on: ubuntu-24.04
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v7.0.1
@@ -110,6 +129,8 @@ jobs:
       - run: cargo check --all-targets --features "$SENSOR_FEATURES"
 
   libcamera:
+    needs: msrv
+    if: always()
     runs-on: ubuntu-24.04
     container:
       image: fedora:44
@@ -140,6 +161,8 @@ jobs:
   # un-compiled). image-jpeg is needed to compile elements::codec at all.
   # cargo check, not clippy: vulkan-video lint debt is tracked in #3.
   vulkan-check:
+    needs: libcamera
+    if: always()
     runs-on: ubuntu-24.04
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v7.0.1
@@ -153,6 +176,8 @@ jobs:
   # Feature gates no other job compiles. `display` builds here; `pipewire` and
   # `screen-capture` build in the libcamera fedora job (#170).
   display-check:
+    needs: vulkan-check
+    if: always()
     runs-on: ubuntu-24.04
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v7.0.1
@@ -179,6 +204,8 @@ jobs:
   #   alsa        libasound2-dev
   #   v4l2-m2m    v4l2r, bindgen against kernel headers, hence libclang-dev
   feature-gates:
+    needs: display-check
+    if: always()
     runs-on: ubuntu-24.04
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v7.0.1
@@ -194,6 +221,8 @@ jobs:
   # VA-API decode (#193). Runner has no GPU, so this proves the build and runs
   # the green-skip tests; real decode is validated on hardware locally.
   vaapi-check:
+    needs: feature-gates
+    if: always()
     runs-on: ubuntu-24.04
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v7.0.1
@@ -215,6 +244,8 @@ jobs:
   # every conversion, selected by a feature no other job enables — and the one
   # parallax-player builds with. Untested, they rot silently (#196).
   simd-check:
+    needs: vaapi-check
+    if: always()
     runs-on: ubuntu-24.04
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v7.0.1
@@ -233,6 +264,8 @@ jobs:
       - run: cargo clippy --all-targets --features simd-colorspace -- -D warnings
 
   docs:
+    needs: simd-check
+    if: always()
     runs-on: ubuntu-24.04
     env:
       RUSTDOCFLAGS: -D warnings
