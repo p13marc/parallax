@@ -37,10 +37,18 @@
 //! - **Arch**: `sudo pacman -S libfdk-aac`
 //! - **macOS**: `brew install fdk-aac`
 
-use super::audio_traits::{AudioEncoder, AudioSampleFormat, AudioSamples, AudioSamplesRef};
+use super::audio_traits::{AudioEncoder, AudioSampleFormat, AudioSamplesRef};
 use crate::error::{Error, Result};
 
-use fdk_aac::enc::{BitRate, ChannelMode, Encoder, EncoderParams};
+use fdk_aac::enc::{AudioObjectType, BitRate, ChannelMode, Encoder, EncoderParams};
+
+/// Maximum bytes one AAC-LC access unit can occupy, per channel.
+///
+/// ISO/IEC 14496-3 caps an AAC-LC frame at 6144 bits per channel, and
+/// `aacEncEncode` wants an output buffer it cannot overrun — it is handed a
+/// size, not a growable buffer. Sizing the scratch to the spec maximum means
+/// the encoder can never be short of room whatever the bitrate.
+const MAX_AU_BYTES_PER_CHANNEL: usize = 6144 / 8;
 
 /// AAC audio encoder.
 ///
@@ -62,6 +70,11 @@ pub struct AacEncoder {
     frame_size: usize,
     /// Internal buffer for accumulating samples.
     buffer: Vec<i16>,
+    /// Reusable output buffer handed to `aacEncEncode`.
+    ///
+    /// FDK writes into caller memory rather than allocating, so this is
+    /// allocated once at construction and reused for every frame.
+    scratch: Vec<u8>,
     /// Packets produced.
     packets_out: u64,
 }
@@ -97,6 +110,11 @@ impl AacEncoder {
             sample_rate,
             transport: fdk_aac::enc::Transport::Raw,
             channels: channel_mode,
+            // AAC-LC: what this encoder has always produced, and the only
+            // profile the rest of the tree (ADTS wrapping, esds
+            // AudioSpecificConfig) is written for. HE-AAC would change the
+            // frame length and the config blob alike.
+            audio_object_type: AudioObjectType::Mpeg4LowComplexity,
         };
 
         let encoder = Encoder::new(params)
@@ -112,8 +130,14 @@ impl AacEncoder {
             bitrate,
             frame_size,
             buffer: Vec::new(),
+            scratch: vec![0u8; MAX_AU_BYTES_PER_CHANNEL * channels as usize],
             packets_out: 0,
         })
+    }
+
+    /// The target bitrate this encoder was configured with, in bits/second.
+    pub fn bitrate(&self) -> u32 {
+        self.bitrate
     }
 
     /// Get the number of packets produced.
@@ -127,14 +151,22 @@ impl AacEncoder {
     }
 
     /// Encode a single frame (internal).
-    fn encode_frame(&mut self, frame: &[i16]) -> Result<Vec<u8>> {
-        let output = self
+    ///
+    /// Returns `None` when the encoder consumed the frame without emitting an
+    /// access unit — FDK primes its filter bank on the first call, and a
+    /// zero-length packet downstream is not the same thing as no packet.
+    fn encode_frame(&mut self, frame: &[i16]) -> Result<Option<Vec<u8>>> {
+        let info = self
             .encoder
-            .encode(frame)
+            .encode(frame, &mut self.scratch)
             .map_err(|e| Error::Element(format!("AAC encode error: {:?}", e)))?;
 
+        if info.output_size == 0 {
+            return Ok(None);
+        }
+
         self.packets_out += 1;
-        Ok(output)
+        Ok(Some(self.scratch[..info.output_size].to_vec()))
     }
 }
 
@@ -178,7 +210,9 @@ impl AudioEncoder for AacEncoder {
 
         while self.buffer.len() >= frame_samples {
             let frame: Vec<i16> = self.buffer.drain(..frame_samples).collect();
-            packets.push(self.encode_frame(&frame)?);
+            if let Some(packet) = self.encode_frame(&frame)? {
+                packets.push(packet);
+            }
         }
 
         Ok(packets)
@@ -193,10 +227,10 @@ impl AudioEncoder for AacEncoder {
         let frame_samples = self.frame_size * self.channels as usize;
         let padding_needed = frame_samples - self.buffer.len();
         self.buffer
-            .extend(std::iter::repeat(0i16).take(padding_needed));
+            .extend(std::iter::repeat_n(0i16, padding_needed));
 
         let frame: Vec<i16> = self.buffer.drain(..).collect();
-        Ok(vec![self.encode_frame(&frame)?])
+        Ok(self.encode_frame(&frame)?.into_iter().collect())
     }
 
     fn frame_size(&self) -> Option<usize> {
@@ -225,6 +259,7 @@ impl AudioEncoder for AacEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::elements::codec::audio_traits::AudioSamples;
 
     #[test]
     fn test_aac_encoder_creation() {
