@@ -25,8 +25,9 @@
 //!   is built without H.264 and HEVC (patent-encumbered); the same hardware
 //!   exposes them under RPM Fusion's `intel-media-driver-freeworld`. The
 //!   same GPU therefore has different capabilities depending on packaging.
-//! - `cros-codecs`' `VaapiBackend::new` **panics** rather than erroring when
-//!   config creation fails, so the caller has to have proven it works first.
+//! - A driver can advertise a profile it will not actually build a config
+//!   for, so the only honest probe is to build one — see
+//!   [`VaDisplay::decode_config_works`].
 
 use std::sync::Arc;
 
@@ -105,26 +106,32 @@ impl VaDisplay {
             })
     }
 
-    /// Whether `cros-codecs` can initialise a decoder backend on this
-    /// display *at all*.
+    /// Whether a decode config for `codec` can actually be *created*, not
+    /// merely advertised.
     ///
-    /// `VaapiBackend::new` builds a throwaway 16x16 config from a hardcoded
-    /// `VAProfileH264Main` + `VAEntrypointVLD` — whatever codec the decoder
-    /// is actually for — and `.expect()`s the result. So on a driver without
-    /// H.264 it panics while decoding VP9, on hardware that decodes VP9
-    /// perfectly well.
+    /// [`supports_decode`](Self::supports_decode) reads the driver's own
+    /// profile and entrypoint tables. This asks the driver to build the
+    /// thing, which is a strictly stronger question: a profile can be listed
+    /// with a VLD entrypoint and still refuse the config (an unsupported
+    /// `RT_FORMAT`, a disabled engine, a driver that reports optimistically).
+    /// Creating a config is cheap and destroying it is immediate, so asking
+    /// costs nothing next to discovering it at the first frame.
     ///
-    /// That is exactly the case on patent-free driver builds: Fedora's
-    /// `libva-intel-media-driver` omits H.264 and HEVC, and the same GPU
-    /// gains them under RPM Fusion's `intel-media-driver-freeworld`. Asking
-    /// the question here turns a panic deep in a dependency into an `Err`
-    /// and a software fallback.
-    pub fn supports_backend_init(&self) -> bool {
-        self.profiles.contains(&libva::VAProfile::VAProfileH264Main)
-            && self
-                .display
-                .query_config_entrypoints(libva::VAProfile::VAProfileH264Main)
-                .is_ok_and(|e| e.contains(&libva::VAEntrypoint::VAEntrypointVLD))
+    /// Returns true on the first profile that answers, so a driver offering
+    /// only the 10-bit profile of a codec still reads as capable.
+    pub fn decode_config_works(&self, codec: Codec) -> bool {
+        self.decode_profiles(codec).any(|profile| {
+            self.display
+                .create_config(
+                    vec![libva::VAConfigAttrib {
+                        type_: libva::VAConfigAttribType::VAConfigAttribRTFormat,
+                        value: libva::VA_RT_FORMAT_YUV420,
+                    }],
+                    profile,
+                    libva::VAEntrypoint::VAEntrypointVLD,
+                )
+                .is_ok()
+        })
     }
 
     /// Every codec this display can decode — for diagnostics and for the
@@ -177,15 +184,17 @@ mod tests {
         match VaDisplay::open() {
             None => eprintln!("no VA display here — software fallback is the answer"),
             Some(d) => {
-                eprintln!(
-                    "VA-API: {} decodes {:?} (backend init: {})",
-                    d.vendor(),
-                    d.decodable(),
-                    d.supports_backend_init()
-                );
-                // Whatever it reports, it must be self-consistent.
+                eprintln!("VA-API: {} decodes {:?}", d.vendor(), d.decodable());
+                // Whatever it reports, it must be self-consistent — and a
+                // codec it advertises must survive the stronger probe, or the
+                // decoder would construct and then fail at the first frame.
                 for codec in d.decodable() {
                     assert!(d.supports_decode(codec));
+                    assert!(
+                        d.decode_config_works(codec),
+                        "{} advertises {codec} but refuses a decode config for it",
+                        d.vendor()
+                    );
                 }
             }
         }

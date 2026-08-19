@@ -137,18 +137,15 @@ impl VaapiDecoder {
             )));
         }
 
-        // `VaapiBackend::new` builds its initial config from a hardcoded
-        // `VAProfileH264Main` regardless of the codec asked for, and
-        // `.expect()`s it — so a driver without H.264 panics here while
-        // decoding VP9 it fully supports. Refusing first turns that into a
-        // software fallback. (Filed against the crate; remove this once the
-        // backend uses the decoder's own profile.)
-        if !display.supports_backend_init() {
+        // Advertising a profile and building a config for it are different
+        // questions, and only the second one is the one the decoder needs
+        // answered. Asking it here keeps a driver that reports optimistically
+        // from failing at the first frame instead of at construction, where a
+        // caller can still choose software.
+        if !display.decode_config_works(codec) {
             return Err(Error::Element(format!(
-                "vaapi: {} cannot decode H.264, which cros-codecs' backend requires for \
-                 its initial config even when decoding {codec} — falling back to software. \
-                 A patent-free driver build (Fedora's libva-intel-media-driver) omits \
-                 H.264/HEVC; RPM Fusion's intel-media-driver-freeworld has them",
+                "vaapi: {} advertises {codec} decode but will not create a config for it \
+                 — falling back to software",
                 display.vendor(),
             )));
         }
@@ -265,10 +262,11 @@ impl VaapiDecoder {
 
     /// Copy one decoded frame out of GPU-written memory into an arena slot.
     ///
-    /// The readback is per-row rather than one `copy_from_slice`: the frame
-    /// is allocated at the *coded* size, so its rows are `coded.width` apart
-    /// while the packed output wants `visible.width`. Cropping here is free;
-    /// doing it downstream would cost another full-frame pass.
+    /// The copy goes through [`VaFrame::read_plane`] because the driver
+    /// renders **Y-tiled** frames whatever modifier it is asked for, so the
+    /// bytes are not rows. De-tiling moves the same volume of data as a
+    /// straight copy would and crops coded-to-visible on the way, which is
+    /// why it is still worth doing here rather than downstream.
     fn handle_to_buffer(&mut self, handle: &Handle) -> Result<Buffer> {
         handle
             .sync()
@@ -287,17 +285,15 @@ impl VaapiDecoder {
         let total = packed.required_len(PixelFormat::Nv12, w, h);
         let mut slot = self.output.acquire(total, "vaapidecoder")?;
 
-        let src = frame.as_bytes();
-        let src_offsets = frame.offsets();
-        let src_pitches = frame.pitches();
         let dst = &mut slot.data_mut()[..total];
-
         for (plane, out) in packed.resolved(PixelFormat::Nv12, w, h).enumerate() {
-            for row in 0..out.rows {
-                let s = src_offsets[plane] + row * src_pitches[plane];
-                let d = out.offset + row * out.stride;
-                dst[d..d + out.row_bytes].copy_from_slice(&src[s..s + out.row_bytes]);
-            }
+            frame.read_plane(
+                plane,
+                &mut dst[out.offset..],
+                out.stride,
+                out.rows,
+                out.row_bytes,
+            );
         }
 
         let mut metadata = self.claim_meta_for(handle.timestamp());
@@ -354,11 +350,12 @@ impl Element for VaapiDecoder {
     }
 
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
-        // The pool cannot be sized before the first access unit tells the
-        // decoder what the stream is.
-        if self.pool.is_empty() {
-            self.pool.reserve(PIPELINE_FRAMES)?;
-        }
+        // No pool is reserved here on purpose. Frame geometry is not known
+        // until the decoder has read a sequence header, and reserving before
+        // that would allocate zero-sized frames. The decoder asks for one
+        // only after it reports `FormatChanged`, which `drain_events` turns
+        // into a correctly-sized `resize_pool`; until then an allocation
+        // request answers `None`, which is the ordinary back-pressure stall.
 
         // Anything stalled goes first, or the stream reorders itself.
         if let Some((pending, offset)) = self.stalled.take() {

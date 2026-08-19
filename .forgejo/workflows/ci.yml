@@ -175,7 +175,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v7.0.1
-      - run: sudo apt-get update && sudo apt-get install -y libva-dev libclang-dev g++
+      - run: sudo apt-get update && sudo apt-get install -y libva-dev libclang-dev libvpx-dev pkg-config g++
       - uses: https://github.com/dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -186,8 +186,8 @@ jobs:
       - uses: https://github.com/taiki-e/install-action@v2.86.1
         with:
           tool: cargo-nextest
-      - run: cargo nextest run --features vaapi
-      - run: cargo clippy --all-targets --features vaapi -- -D warnings
+      - run: cargo nextest run --features vaapi,mkv-demux,vpx
+      - run: cargo clippy --all-targets --features vaapi,mkv-demux,vpx -- -D warnings
 
   # The SIMD colorspace arms (the `yuv` crate) are a second implementation of
   # every conversion, selected by a feature no other job enables — and the one

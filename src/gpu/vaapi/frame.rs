@@ -18,15 +18,39 @@
 //!
 //! A udmabuf wraps an ordinary memfd as a dma-buf. That gives us:
 //!
-//! - **linear** memory, so a CPU read is a plain row copy;
 //! - memory the pipeline owns, so [`map`](VideoFrame::map) is our own mmap
 //!   rather than a driver round-trip;
 //! - a dma-buf fd, which is what `VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2`
 //!   wants — and which is already a first-class buffer backing in this
 //!   pipeline ([`crate::memory::DmaBufSlot`], #145).
 //!
-//! Verified against the reference device: iHD accepts a linear
-//! udmabuf-backed NV12 surface as a decode render target.
+//! # The frames are Y-tiled, and that is not negotiable
+//!
+//! The first version of this module asked for `DRM_FORMAT_MOD_LINEAR` and
+//! believed the answer: the import succeeds, and `vaExportSurfaceHandle`
+//! even echoes `drm_format_modifier = 0` back. The pixels say otherwise.
+//! Measured against a software decode of the same stream, the decoded
+//! frames are laid out in **Intel Y-tiles** — 128-byte by 32-row tiles,
+//! each tile stored as eight 16-byte columns of 32 rows — bit-exactly, at
+//! every resolution tested (128x128, 256x128, 640x480, 1920x1088). No
+//! usage hint (decoder, display, export, VPP-write, none) and no layer
+//! shape (one NV12 layer or two single-plane layers) changes it: on this
+//! driver the decode render target is tiled whatever it is told.
+//!
+//! Two consequences, both load-bearing:
+//!
+//! - The **allocation must be tile-shaped**, or the driver writes past it.
+//!   The pitch is rounded up to [`TILE_WIDTH`] and each plane's row count
+//!   to [`TILE_HEIGHT`]; a 460-wide frame is really 512 bytes per row and
+//!   the declared 460 was simply ignored — the driver overran a buffer
+//!   sized from it.
+//! - A CPU reader cannot address the bytes directly. [`VaFrame::read_plane`]
+//!   is the only correct way out, and it de-tiles as it copies. The eventual
+//!   zero-copy path does not de-tile at all: it hands the dma-buf and its
+//!   modifier to the GPU, which is what a tiled frame is *for*.
+//!
+//! So the modifier this module declares is the truth — `I915_FORMAT_MOD_Y_TILED`
+//! — rather than a linear request the driver ignores.
 //!
 //! `cros-codecs`' own `GenericDmaVideoFrame` is deliberately not used even
 //! where it would fit: its `map()` runs `_mm_clflush` **per byte** on drop
@@ -45,8 +69,19 @@ use crate::error::{Error, Result};
 
 /// `DRM_FORMAT_NV12`, as a fourcc.
 const DRM_FORMAT_NV12: u32 = u32::from_le_bytes(*b"NV12");
-/// `DRM_FORMAT_MOD_LINEAR`.
-const DRM_FORMAT_MOD_LINEAR: u64 = 0;
+/// `I915_FORMAT_MOD_Y_TILED` — `fourcc_mod_code(INTEL, 2)`.
+///
+/// What the driver actually renders into, whatever modifier it is asked
+/// for (see the module docs), so it is what we declare.
+const I915_FORMAT_MOD_Y_TILED: u64 = (1u64 << 56) | 2;
+
+/// An Intel Y-tile is 128 bytes wide...
+const TILE_WIDTH: usize = 128;
+/// ...and 32 rows tall, so 4 KiB in all.
+const TILE_HEIGHT: usize = 32;
+/// Within a tile the bytes are stored as 16-byte columns, each column
+/// holding all [`TILE_HEIGHT`] of its rows before the next one starts.
+const TILE_COLUMN: usize = 16;
 
 /// A linear NV12 frame in memory this process owns, exposed to VA-API as a
 /// dma-buf.
@@ -78,6 +113,9 @@ struct FrameMemory {
     /// Byte offset and row pitch of the luma and chroma planes.
     offsets: [usize; 2],
     pitches: [usize; 2],
+    /// Rows actually allocated per plane — the visible/coded row count
+    /// rounded up to a whole tile, which is what the driver writes.
+    rows: [usize; 2],
 }
 
 // SAFETY: `ptr` is a private MAP_SHARED mapping owned by this struct and
@@ -193,9 +231,23 @@ impl VaFrame {
     /// the visible size is what the stream actually shows. Keeping both is
     /// what lets the readback crop without a second copy.
     pub fn new(coded: Resolution, visible: Resolution) -> Result<Self> {
-        let pitch = coded.width as usize;
-        let luma = pitch * coded.height as usize;
-        let chroma = pitch * coded.height.div_ceil(2) as usize;
+        if coded.width == 0 || coded.height == 0 {
+            return Err(Error::Element(format!(
+                "vaapi: refusing to allocate a {}x{} frame — the pool is sized from the \
+                 stream's geometry, so it must not be reserved before that is known",
+                coded.width, coded.height
+            )));
+        }
+        // Tile-shaped, not frame-shaped: the driver renders Y-tiles and
+        // rounds the pitch up to a whole tile regardless of what we declare,
+        // so a buffer sized from the frame's own width is one the driver
+        // writes past. Rows are rounded per plane too — a partial bottom tile
+        // is still a whole tile in memory.
+        let pitch = (coded.width as usize).next_multiple_of(TILE_WIDTH);
+        let luma_rows = (coded.height as usize).next_multiple_of(TILE_HEIGHT);
+        let chroma_rows = coded.height.div_ceil(2).next_multiple_of(TILE_HEIGHT as u32) as usize;
+        let luma = pitch * luma_rows;
+        let chroma = pitch * chroma_rows;
         // udmabuf requires a page-multiple size.
         let len = (luma + chroma).next_multiple_of(page_size());
 
@@ -227,12 +279,60 @@ impl VaFrame {
                 coded,
                 offsets: [0, luma],
                 pitches: [pitch, pitch],
+                rows: [luma_rows, chroma_rows],
             }),
             visible,
         })
     }
 
-    /// The frame's bytes.
+    /// Copy `rows` rows of `plane` into `dst`, de-tiling on the way.
+    ///
+    /// `dst` is packed at `dst_stride` bytes per row and `row_bytes` of each
+    /// row are meaningful — which is how the coded-to-visible crop happens
+    /// for free, since the tiled source is addressed per 16-byte column
+    /// anyway and the columns past the visible width are simply never read.
+    ///
+    /// This is the only correct way to read a decoded frame on the CPU: the
+    /// bytes behind [`as_bytes`](Self::as_bytes) are Y-tiled, so reading
+    /// them as rows yields a coherent but scrambled picture (the failure
+    /// looks like a diagonal shear, which is what made it visible at all).
+    pub fn read_plane(
+        &self,
+        plane: usize,
+        dst: &mut [u8],
+        dst_stride: usize,
+        rows: usize,
+        row_bytes: usize,
+    ) {
+        let src = self.as_bytes();
+        let base = self.inner.offsets[plane];
+        let pitch = self.inner.pitches[plane];
+        let tiles_across = pitch / TILE_WIDTH;
+        const TILE_BYTES: usize = TILE_WIDTH * TILE_HEIGHT;
+        const COLUMN_BYTES: usize = TILE_COLUMN * TILE_HEIGHT;
+
+        for row in 0..rows {
+            let (tile_y, row_in_tile) = (row / TILE_HEIGHT, row % TILE_HEIGHT);
+            let mut col = 0;
+            while col < row_bytes {
+                let (tile_x, col_in_tile) = (col / TILE_WIDTH, col % TILE_WIDTH);
+                let tile = tile_y * tiles_across + tile_x;
+                let src_off = base
+                    + tile * TILE_BYTES
+                    + (col_in_tile / TILE_COLUMN) * COLUMN_BYTES
+                    + row_in_tile * TILE_COLUMN;
+                let n = TILE_COLUMN.min(row_bytes - col);
+                let dst_off = row * dst_stride + col;
+                dst[dst_off..dst_off + n].copy_from_slice(&src[src_off..src_off + n]);
+                col += TILE_COLUMN;
+            }
+        }
+    }
+
+    /// The frame's bytes, **as the driver tiled them**.
+    ///
+    /// Useful as raw memory — its length, its identity as one allocation —
+    /// but not as a picture. Read pixels with [`read_plane`](Self::read_plane).
     pub fn as_bytes(&self) -> &[u8] {
         // SAFETY: the mapping is live for as long as `inner` is, and this
         // borrow cannot outlive `&self`.
@@ -345,7 +445,7 @@ impl libva::ExternalBufferDescriptor for VaFrameDescriptor {
         objects[0] = libva::VADRMPRIMESurfaceDescriptorObject {
             fd: self.fd.as_raw_fd(),
             size: self.len as u32,
-            drm_format_modifier: DRM_FORMAT_MOD_LINEAR,
+            drm_format_modifier: I915_FORMAT_MOD_Y_TILED,
         };
 
         let mut layers: [libva::VADRMPRIMESurfaceDescriptorLayer; 4] = Default::default();
@@ -393,10 +493,9 @@ impl VideoFrame for VaFrame {
     }
 
     fn get_plane_size(&self) -> Vec<usize> {
-        let h = self.inner.coded.height as usize;
         vec![
-            self.inner.pitches[0] * h,
-            self.inner.pitches[1] * h.div_ceil(2),
+            self.inner.pitches[0] * self.inner.rows[0],
+            self.inner.pitches[1] * self.inner.rows[1],
         ]
     }
 
@@ -483,6 +582,8 @@ mod tests {
 
         assert_eq!(frame.resolution(), res(1920, 1080), "visible size");
         assert_eq!(frame.coded(), res(1920, 1088), "coded size");
+        // 1920 is already a whole number of 128-byte tiles and both 1088 and
+        // 544 are multiples of 32, so this geometry needs no rounding at all.
         assert_eq!(frame.pitches(), [1920, 1920]);
         assert_eq!(frame.offsets(), [0, 1920 * 1088]);
         assert_eq!(frame.get_plane_size(), vec![1920 * 1088, 1920 * 544]);
@@ -519,8 +620,10 @@ mod tests {
             assert_eq!(planes.len(), 2);
             assert_eq!(planes[0][0], 0xA1, "luma plane starts at offset 0");
             assert_eq!(planes[1][0], 0xB2, "chroma plane starts after luma");
-            assert_eq!(planes[0].len(), 64 * 48);
-            assert_eq!(planes[1].len(), 64 * 24);
+            // Tile-aligned: 64 bytes of pitch become 128, and 48 luma rows
+            // and 24 chroma rows each become 64 and 32.
+            assert_eq!(planes[0].len(), 128 * 64);
+            assert_eq!(planes[1].len(), 128 * 32);
         }
 
         // Decode output is never written from our side.
@@ -606,14 +709,86 @@ mod tests {
             .expect("a frame can be imported more than once");
     }
 
-    /// Odd heights round the chroma plane up rather than truncating it —
-    /// a half-row short would have the driver writing past the allocation.
+    /// Geometry that fits no tile boundary anywhere still allocates whole
+    /// tiles. Anything less and the driver writes past the allocation — it
+    /// renders Y-tiles regardless of the pitch and height it was given.
     #[test]
-    fn odd_coded_height_rounds_chroma_up() {
+    fn awkward_geometry_allocates_whole_tiles() {
         let Ok(frame) = VaFrame::new(res(16, 18), res(16, 17)) else {
             eprintln!("skipping: /dev/udmabuf unavailable");
             return;
         };
-        assert_eq!(frame.get_plane_size(), vec![16 * 18, 16 * 9]);
+        assert_eq!(frame.pitches(), [128, 128], "16 bytes is a 128-byte tile");
+        // 18 luma rows and 9 chroma rows are both one 32-row tile.
+        assert_eq!(frame.get_plane_size(), vec![128 * 32, 128 * 32]);
+        assert_eq!(frame.offsets(), [0, 128 * 32]);
+    }
+
+    /// A frame whose width is not a whole number of tiles: 460 bytes of
+    /// picture live in a 512-byte pitch. Getting this wrong is not a
+    /// cosmetic error — the driver wrote 512-byte rows into a buffer sized
+    /// for 460 of them.
+    #[test]
+    fn a_non_tile_width_rounds_the_pitch_up() {
+        let Ok(frame) = VaFrame::new(res(460, 320), res(460, 308)) else {
+            eprintln!("skipping: /dev/udmabuf unavailable");
+            return;
+        };
+        assert_eq!(frame.pitches(), [512, 512]);
+        assert_eq!(frame.get_plane_size(), vec![512 * 320, 512 * 160]);
+    }
+
+    /// The de-tiler is the inverse of the driver's layout: writing a Y-tiled
+    /// pattern through the raw mapping and reading it back must give the
+    /// picture the tiling encoded. Pure arithmetic — no GPU involved.
+    #[test]
+    fn read_plane_inverts_the_tiling() {
+        const W: usize = 256;
+        const H: usize = 64;
+        let Ok(frame) = VaFrame::new(res(W as u32, H as u32), res(W as u32, H as u32)) else {
+            eprintln!("skipping: /dev/udmabuf unavailable");
+            return;
+        };
+        // The picture we want back: byte (x, y) is a function of both, so a
+        // transposed or shifted read cannot pass by accident.
+        let pixel = |x: usize, y: usize| ((x * 7 + y * 31) % 251) as u8;
+
+        // Write it into the mapping in Y-tile order.
+        {
+            // SAFETY: the mapping is live and exclusively borrowed here.
+            let bytes = unsafe { std::slice::from_raw_parts_mut(frame.inner.ptr, frame.inner.len) };
+            let pitch = frame.pitches()[0];
+            for y in 0..H {
+                for x in 0..W {
+                    let tile = (y / TILE_HEIGHT) * (pitch / TILE_WIDTH) + x / TILE_WIDTH;
+                    let off = tile * TILE_WIDTH * TILE_HEIGHT
+                        + ((x % TILE_WIDTH) / TILE_COLUMN) * TILE_COLUMN * TILE_HEIGHT
+                        + (y % TILE_HEIGHT) * TILE_COLUMN
+                        + x % TILE_COLUMN;
+                    bytes[off] = pixel(x, y);
+                }
+            }
+        }
+
+        let mut out = vec![0u8; W * H];
+        frame.read_plane(0, &mut out, W, H, W);
+        for y in 0..H {
+            for x in 0..W {
+                assert_eq!(out[y * W + x], pixel(x, y), "de-tiled byte at ({x},{y})");
+            }
+        }
+    }
+
+    /// The crop is free: a visible width narrower than the coded one simply
+    /// stops the de-tiler early, and never reads the columns past it.
+    #[test]
+    fn read_plane_crops_to_the_visible_width() {
+        let Ok(frame) = VaFrame::new(res(256, 64), res(200, 50)) else {
+            eprintln!("skipping: /dev/udmabuf unavailable");
+            return;
+        };
+        let mut out = vec![0xCDu8; 200 * 50];
+        frame.read_plane(0, &mut out, 200, 50, 200);
+        assert_eq!(out.len(), 200 * 50);
     }
 }
