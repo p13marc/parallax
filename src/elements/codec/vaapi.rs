@@ -23,6 +23,7 @@
 
 use std::collections::VecDeque;
 
+use cros_codecs::DecodedFormat;
 use cros_codecs::Resolution;
 use cros_codecs::backend::vaapi::decoder::VaapiDecodedHandle;
 use cros_codecs::decoder::stateless::h264::H264;
@@ -340,6 +341,19 @@ impl VaapiDecoder {
         let Some(info) = self.decoder.stream_info() else {
             return Ok(());
         };
+        // `VaFrame` allocates NV12 and nothing else, so a stream the decoder
+        // wants to render in another format must stop here rather than have
+        // the driver write P010 into buffers sized for 8-bit. The driver now
+        // advertises VP9 Profile2 and HEVC Main10, so this is reachable, not
+        // defensive.
+        if info.format != DecodedFormat::NV12 {
+            return Err(Error::Element(format!(
+                "vaapi: the stream decodes to {:?}, and this element only allocates NV12 \
+                 frames — 10-bit hardware decode is not implemented (falls back to software \
+                 where one exists)",
+                info.format
+            )));
+        }
         let coded = info.coded_resolution;
         let visible = info.display_resolution;
         if self.pool.geometry() != (coded, visible) {
@@ -375,6 +389,22 @@ impl VaapiDecoder {
         Ok(())
     }
 
+    /// Add the one cause a bare driver error will not name itself.
+    ///
+    /// This element allocates 8-bit NV12 frames and nothing else, so a 10-bit
+    /// stream (VP9 Profile2, HEVC Main10 — both of which this driver
+    /// advertises) fails inside `decode` with the driver's bare "invalid
+    /// parameter": it was handed surfaces of the wrong format. The decoder's
+    /// own `stream_info` is no help — it reports `NV12` regardless — so the
+    /// bit depth cannot be *detected* here, only offered as the likely cause
+    /// it is.
+    fn explain(&self, e: Error) -> Error {
+        Error::Element(format!(
+            "{e}. If the stream is 10-bit (VP9 Profile2, HEVC Main10), that is why: \
+             this element allocates 8-bit NV12 frames only"
+        ))
+    }
+
     /// Push queued access units into the decoder until it stops taking them.
     ///
     /// Draining events between attempts is not bookkeeping — it is what
@@ -395,7 +425,8 @@ impl VaapiDecoder {
             let outcome = drive_input(&mut self.pending_input, &mut self.refusals, |data, pts| {
                 let mut alloc = || pool.acquire();
                 decoder.decode(pts, data, &mut alloc)
-            })?;
+            })
+            .map_err(|e| self.explain(e))?;
             self.drain_events()?;
 
             if outcome == DriveOutcome::Drained {
