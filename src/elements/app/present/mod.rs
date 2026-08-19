@@ -20,6 +20,7 @@ use winit::window::Window;
 
 pub(crate) mod color;
 #[cfg(feature = "display-gpu")]
+pub(crate) mod dmabuf_import;
 pub(crate) mod wgpu_backend;
 
 /// Frame data sent to the display thread.
@@ -100,6 +101,24 @@ pub fn gpu_present_available() -> bool {
     #[cfg(feature = "display-gpu")]
     {
         wgpu_backend::gpu_available()
+    }
+    #[cfg(not(feature = "display-gpu"))]
+    {
+        false
+    }
+}
+
+/// Whether the GPU path can *import* a dma-buf rather than uploading it.
+///
+/// Strictly narrower than [`gpu_present_available`]: presentation works on
+/// any adapter, importing needs Vulkan with the external-memory extensions.
+/// The sink must not advertise `MemoryType::DmaBuf` on the strength of the
+/// former, or a producer that owns GPU memory hands over frames the sink
+/// cannot read.
+pub fn gpu_dmabuf_import_available() -> bool {
+    #[cfg(feature = "display-gpu")]
+    {
+        wgpu_backend::dmabuf_import_available()
     }
     #[cfg(not(feature = "display-gpu"))]
     {

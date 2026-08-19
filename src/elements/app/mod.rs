@@ -21,4 +21,4 @@ pub use appsrc::{AppSrc, AppSrcHandle, AppSrcStats};
 #[cfg(feature = "display")]
 pub use autovideosink::{AutoVideoSink, AutoVideoSinkHandle, VideoKey, VideoWindowEvent};
 #[cfg(feature = "display")]
-pub use present::gpu_present_available;
+pub use present::{gpu_dmabuf_import_available, gpu_present_available};

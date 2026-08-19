@@ -14,7 +14,7 @@ Usage:
         --config "ahead16:--decode-ahead 16" \
         --duration 60 --warmup 10 --repeat 2 --out /tmp/matrix
 
-Config syntax: "name:extra player flags". The player must support
+Config syntax: "name:[ENV=VALUE ...] [extra player flags]". The player must support
 --exit-after and print the final "stats: position_ns=… dropped=…" line.
 Stdlib only; Linux only (reads /proc).
 """
@@ -98,13 +98,17 @@ def classify(comm: str) -> str:
     return "other"
 
 
-def run_once(player, file, extra_flags, duration, warmup, quiet):
+def run_once(player, file, extra_flags, duration, warmup, quiet, env_overrides=None):
     cmd = [player, str(file), f"--exit-after={duration}", *extra_flags]
+    env = None
+    if env_overrides:
+        env = {**os.environ, **env_overrides}
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL if quiet else None,
         text=True,
+        env=env,
     )
     pid = proc.pid
     window = max(duration - warmup - 2, 5)
@@ -167,17 +171,36 @@ def main():
 
     configs = []
     for spec in args.config:
-        name, _, flags = spec.partition(":")
-        configs.append((name.strip(), flags.split()))
+        name, _, rest = spec.partition(":")
+        # Tokens of the form NAME=VALUE before any flag are environment
+        # overrides. Some choices are not expressible as flags — a probe
+        # answered once per process, say — and comparing them across
+        # separate script runs is worthless: the interleaving is the only
+        # thing that cancels thermal and frequency drift.
+        flags, env = [], {}
+        for token in rest.split():
+            if not token.startswith("-") and "=" in token and not flags:
+                key, _, value = token.partition("=")
+                env[key] = value
+            else:
+                flags.append(token)
+        configs.append((name.strip(), flags, env))
 
     rows = []
     # Interleaved order: A B C A B C … so drift hits every config equally.
     for rep in range(args.repeat):
-        for name, flags in configs:
+        for name, flags, env in configs:
             label = f"{name}#{rep + 1}"
-            print(f"[{label}] {' '.join(flags) or '(defaults)'} …", flush=True)
+            shown = " ".join([*(f"{k}={v}" for k, v in env.items()), *flags])
+            print(f"[{label}] {shown or '(defaults)'} …", flush=True)
             r = run_once(
-                args.player, args.file, flags, args.duration, args.warmup, not args.loud
+                args.player,
+                args.file,
+                flags,
+                args.duration,
+                args.warmup,
+                not args.loud,
+                env,
             )
             r = {"config": name, "rep": rep + 1, **r}
             rows.append(r)

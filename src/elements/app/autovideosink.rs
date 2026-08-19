@@ -621,7 +621,17 @@ impl AsyncSink for AutoVideoSink {
     /// plus the currently presented one, each a zero-copy `Buffer` clone
     /// pinning a producer arena slot (#189).
     fn retained_buffers(&self) -> usize {
-        DISPLAY_QUEUE_DEPTH + 1
+        // Plus the submissions the GPU may still be reading from when the
+        // frames are imported rather than uploaded: an imported frame's
+        // memory belongs to the producer until its draw retires, so the
+        // backend holds it that much longer (see `GPU_IN_FLIGHT`).
+        DISPLAY_QUEUE_DEPTH
+            + 1
+            + if present::gpu_dmabuf_import_available() {
+                2
+            } else {
+                0
+            }
     }
 
     /// Instant rate change (#165): `seek.rate` replaces the current
@@ -898,7 +908,15 @@ impl AsyncSink for AutoVideoSink {
                     PixelFormat::Bgra,
                     PixelFormat::Rgba,
                 ],
-                MemoryCaps::external_or_cpu(),
+                // Importing a dma-buf costs nothing at all where it is
+                // available, so it goes first — but only where it really is:
+                // advertising it on a GL adapter would strand a producer
+                // that owns GPU memory with frames the sink cannot read.
+                if present::gpu_dmabuf_import_available() {
+                    MemoryCaps::gpu_import_or_cpu()
+                } else {
+                    MemoryCaps::external_or_cpu()
+                },
             )
         } else {
             (

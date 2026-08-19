@@ -20,12 +20,39 @@ use winit::window::Window;
 /// element can flip its caps at negotiation time. llvmpipe is rejected —
 /// a software Vulkan raster is slower than the softbuffer blit — unless
 /// `PARALLAX_FORCE_GPU=1` (testing). `PARALLAX_NO_GPU=1` vetoes outright.
+/// What the one-shot adapter probe learned.
+#[derive(Clone, Copy)]
+struct GpuProbe {
+    /// A real (non-software) adapter exists.
+    usable: bool,
+    /// ...and it can import dma-bufs, so the sink may advertise `DmaBuf`.
+    dmabuf_import: bool,
+}
+
 pub(crate) fn gpu_available() -> bool {
-    static PROBE: OnceLock<bool> = OnceLock::new();
+    probe().usable
+}
+
+/// Whether a dma-buf frame can be imported rather than uploaded.
+///
+/// Strictly narrower than [`gpu_available`]: a GL or software-Vulkan
+/// adapter presents fine and cannot import anything, and advertising
+/// `DmaBuf` on that basis would strand a producer with frames the sink
+/// cannot read. `PARALLAX_NO_DMABUF_IMPORT=1` forces the upload path so the
+/// two can be compared on one machine without rebuilding.
+pub(crate) fn dmabuf_import_available() -> bool {
+    probe().dmabuf_import
+}
+
+fn probe() -> GpuProbe {
+    static PROBE: OnceLock<GpuProbe> = OnceLock::new();
     *PROBE.get_or_init(|| {
         if std::env::var_os("PARALLAX_NO_GPU").is_some_and(|v| v != "0") {
             tracing::info!("autovideosink: GPU presentation disabled (PARALLAX_NO_GPU)");
-            return false;
+            return GpuProbe {
+                usable: false,
+                dmabuf_import: false,
+            };
         }
         let force = std::env::var_os("PARALLAX_FORCE_GPU").is_some_and(|v| v != "0");
         let instance =
@@ -40,8 +67,12 @@ pub(crate) fn gpu_available() -> bool {
             Ok(adapter) => {
                 let info = adapter.get_info();
                 let usable = force || info.device_type != wgpu::DeviceType::Cpu;
+                let no_import =
+                    std::env::var_os("PARALLAX_NO_DMABUF_IMPORT").is_some_and(|v| v != "0");
+                let dmabuf_import =
+                    usable && !no_import && super::dmabuf_import::import_supported(&adapter);
                 tracing::info!(
-                    "autovideosink: GPU probe found {:?} ({:?}, {:?}) — {}",
+                    "autovideosink: GPU probe found {:?} ({:?}, {:?}) — {}{}",
                     info.name,
                     info.device_type,
                     info.backend,
@@ -49,13 +80,24 @@ pub(crate) fn gpu_available() -> bool {
                         "using it"
                     } else {
                         "software rasterizer, keeping softbuffer"
+                    },
+                    if dmabuf_import {
+                        ", dma-buf import available"
+                    } else {
+                        ""
                     }
                 );
-                usable
+                GpuProbe {
+                    usable,
+                    dmabuf_import,
+                }
             }
             Err(e) => {
                 tracing::info!("autovideosink: no GPU adapter ({e}); keeping softbuffer");
-                false
+                GpuProbe {
+                    usable: false,
+                    dmabuf_import: false,
+                }
             }
         }
     })
@@ -85,7 +127,53 @@ pub(crate) struct WgpuBackend {
     textures: Option<PlaneTextures>,
     /// Set by `resized`; applied (reconfigure) on the next render.
     pending_size: Option<(u32, u32)>,
+    /// Whether this device can import dma-bufs (feature requested and got).
+    dmabuf_import: bool,
+    /// Imported frames, keyed by the producer allocation they alias.
+    ///
+    /// A pooled producer hands out a fresh slot per frame over a *stable*
+    /// segment, so importing per frame would mean a `dup`, a
+    /// `vkAllocateMemory` and a `vkCreateImage` every frame — most of the
+    /// syscall cost zero-copy exists to remove. The segment is the identity
+    /// of the underlying allocation, and holding an `Arc` of it is what
+    /// stops that identity being reused under the key.
+    imported: Vec<ImportedFrame>,
+    /// Frames whose submission may still be reading their memory.
+    ///
+    /// With an upload the bytes are copied at `write_texture` time and the
+    /// producer's buffer can go immediately. With an import the GPU samples
+    /// the producer's memory during the pass, so releasing the buffer — and
+    /// with it the pool slot the decoder would refill — before the
+    /// submission retires would let the next frame be decoded over the one
+    /// being drawn.
+    in_flight: std::collections::VecDeque<(wgpu::SubmissionIndex, crate::buffer::Buffer)>,
+    /// Monotonic tick for the import cache's LRU order.
+    clock: u64,
 }
+
+/// How many submissions may be outstanding before the oldest frame's memory
+/// is released. Two is enough to never stall at vsync pacing while keeping
+/// the wait exact rather than hopeful.
+const GPU_IN_FLIGHT: usize = 2;
+
+/// Textures aliasing one producer allocation, plus its ready bind group.
+struct ImportedFrame {
+    /// Identity of the aliased allocation.
+    key: usize,
+    /// Geometry, since a resize reuses the allocation for a different shape.
+    geometry: (PixelFormat, u32, u32),
+    /// Keeps the allocation's identity alive so `key` cannot be recycled.
+    _segment: std::sync::Arc<crate::memory::DmaBufSegment>,
+    /// Kept alive for as long as the bind group refers to them.
+    _planes: Vec<wgpu::Texture>,
+    bind_group: wgpu::BindGroup,
+    mode: u32,
+    /// Bumped on use; the least recently used entry is evicted first.
+    used: u64,
+}
+
+/// Imported allocations kept at once. A producer pool is 4-8 frames.
+const IMPORT_CACHE: usize = 8;
 
 impl WgpuBackend {
     pub(crate) fn new(window: Arc<Window>) -> Result<Self> {
@@ -102,9 +190,34 @@ impl WgpuBackend {
             apply_limit_buckets: false,
         }))
         .map_err(|e| Error::Element(format!("wgpu adapter: {e}")))?;
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
-                .map_err(|e| Error::Element(format!("wgpu device: {e}")))?;
+        // Re-ask the adapter rather than trusting the probe: the probe's
+        // adapter is surfaceless and on a multi-GPU box need not be this one.
+        let want_import =
+            dmabuf_import_available() && super::dmabuf_import::import_supported(&adapter);
+        let descriptor = wgpu::DeviceDescriptor {
+            required_features: if want_import {
+                wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF
+            } else {
+                wgpu::Features::empty()
+            },
+            ..Default::default()
+        };
+        let (device, queue, dmabuf_import) =
+            match pollster::block_on(adapter.request_device(&descriptor)) {
+                Ok((d, q)) => (d, q, want_import),
+                // A feature bit must never cost us the whole GPU backend.
+                Err(e) if want_import => {
+                    tracing::warn!(
+                        "autovideosink: device without dma-buf import ({e}); uploading instead"
+                    );
+                    let (d, q) = pollster::block_on(
+                        adapter.request_device(&wgpu::DeviceDescriptor::default()),
+                    )
+                    .map_err(|e| Error::Element(format!("wgpu device: {e}")))?;
+                    (d, q, false)
+                }
+                Err(e) => return Err(Error::Element(format!("wgpu device: {e}"))),
+            };
 
         let caps = surface.get_capabilities(&adapter);
         let format = caps
@@ -231,7 +344,195 @@ impl WgpuBackend {
             params,
             textures: None,
             pending_size: None,
+            dmabuf_import,
+            imported: Vec::new(),
+            in_flight: std::collections::VecDeque::new(),
+            clock: 0,
         })
+    }
+
+    /// The shader mode for a frame's format and height.
+    fn shader_mode(format: PixelFormat, height: u32) -> Result<u32> {
+        let matrix = color::matrix_for_height(height);
+        Ok(match (format, matrix) {
+            (PixelFormat::I420, color::ColorMatrix::Bt709) => 0,
+            (PixelFormat::I420, color::ColorMatrix::Bt601) => 1,
+            (PixelFormat::Nv12, color::ColorMatrix::Bt709) => 2,
+            (PixelFormat::Nv12, color::ColorMatrix::Bt601) => 3,
+            (PixelFormat::Rgba | PixelFormat::Bgra, _) => 4,
+            (other, _) => {
+                return Err(Error::Element(format!(
+                    "autovideosink/wgpu: unsupported display format {other:?}"
+                )));
+            }
+        })
+    }
+
+    /// Import this frame's dma-buf as textures, or reuse an earlier import
+    /// of the same allocation.
+    ///
+    /// Returns `Ok(false)` when the frame is not importable at all — no
+    /// dma-buf, no declared plane layout, import unavailable — and the
+    /// caller uploads instead. An import that *fails* is different: it is
+    /// reported, import is switched off for this backend, and the upload
+    /// path takes over permanently rather than failing every frame.
+    fn prepare_imported(&mut self, frame: &DisplayFrame) -> Result<bool> {
+        if !self.dmabuf_import {
+            return Ok(false);
+        }
+        let Some(slot) = frame.data.memory().dmabuf_slot() else {
+            return Ok(false);
+        };
+        // Without a layout there is nothing to import *by*: the offsets and
+        // pitches are the whole content of the import.
+        let Some(layout) = frame.layout.as_ref() else {
+            return Ok(false);
+        };
+
+        let key = std::sync::Arc::as_ptr(slot.shared_segment()) as usize;
+        let geometry = (frame.format, frame.width, frame.height);
+        self.clock += 1;
+        if let Some(entry) = self
+            .imported
+            .iter_mut()
+            .find(|e| e.key == key && e.geometry == geometry)
+        {
+            entry.used = self.clock;
+            let mode = entry.mode;
+            self.queue.write_buffer(
+                &self.params,
+                0,
+                &[mode as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            );
+            return Ok(true);
+        }
+
+        let planes = match super::dmabuf_import::plane_imports(
+            frame.format,
+            frame.width,
+            frame.height,
+            layout,
+            frame.data.memory().offset(),
+        ) {
+            Ok(p) => p,
+            Err(e) => return self.disable_import(e),
+        };
+
+        let mut textures = Vec::with_capacity(planes.len());
+        for plane in &planes {
+            // SAFETY: the layout and modifier come from the producer that
+            // allocated this dma-buf, which is the only thing that knows them.
+            let imported = unsafe {
+                super::dmabuf_import::import_plane(
+                    &self.device,
+                    slot.fd(),
+                    plane,
+                    slot.modifier(),
+                    // Sampled only: the producer owns these bytes.
+                    wgpu::TextureUsages::TEXTURE_BINDING,
+                    "autovideosink-imported-plane",
+                )
+            };
+            match imported {
+                Ok(t) => textures.push(t),
+                Err(e) => return self.disable_import(e),
+            }
+        }
+
+        // The shader always binds three textures; pad with 1x1 dummies.
+        let dummy = |label: &str| {
+            self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            })
+        };
+        while textures.len() < 3 {
+            textures.push(dummy("import-dummy"));
+        }
+
+        let mode = Self::shader_mode(frame.format, frame.height)?;
+        let view = |t: &wgpu::Texture| t.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("autovideosink-imported-bind"),
+            layout: &self.bind_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&view(&textures[0])),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&view(&textures[1])),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&view(&textures[2])),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.params.as_entire_binding(),
+                },
+            ],
+        });
+        self.queue.write_buffer(
+            &self.params,
+            0,
+            &[mode as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        );
+
+        if self.imported.len() >= IMPORT_CACHE
+            && let Some(oldest) = self
+                .imported
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, e)| e.used)
+                .map(|(i, _)| i)
+        {
+            self.imported.swap_remove(oldest);
+        }
+        if self.imported.is_empty() {
+            tracing::info!(
+                "autovideosink: importing {:?} frames from the producer's dma-buf \
+                 (modifier {:#x}) — no upload",
+                frame.format,
+                slot.modifier()
+            );
+        }
+        self.imported.push(ImportedFrame {
+            key,
+            geometry,
+            _segment: std::sync::Arc::clone(slot.shared_segment()),
+            _planes: textures,
+            bind_group,
+            mode,
+            used: self.clock,
+        });
+        // The upload path's textures are now stale for this frame; drop them
+        // so a later CPU frame rebuilds rather than showing old pixels.
+        self.textures = None;
+        Ok(true)
+    }
+
+    /// Give up on importing and say why, once.
+    fn disable_import(&mut self, e: Error) -> Result<bool> {
+        tracing::warn!("autovideosink: dma-buf import failed ({e}); uploading instead");
+        self.dmabuf_import = false;
+        self.imported.clear();
+        Ok(false)
     }
 
     /// (Re)build the texture set for this frame's format + geometry.
@@ -509,8 +810,13 @@ impl RenderBackend for WgpuBackend {
             self.surface.configure(&self.device, &self.config);
         }
 
-        self.ensure_textures(frame)?;
-        self.upload(frame)?;
+        // Zero-copy first: an imported frame needs no textures of ours and
+        // no upload at all.
+        let imported = self.prepare_imported(frame)?;
+        if !imported {
+            self.ensure_textures(frame)?;
+            self.upload(frame)?;
+        }
 
         use wgpu::CurrentSurfaceTexture;
         let target = match self.surface.get_current_texture() {
@@ -572,12 +878,38 @@ impl RenderBackend for WgpuBackend {
             );
             pass.set_pipeline(&self.pipeline);
             pass.set_viewport(x0 as f32, y0 as f32, out_w as f32, out_h as f32, 0.0, 1.0);
-            let textures = self.textures.as_ref().expect("ensured above");
-            pass.set_bind_group(0, &textures.bind_group, &[]);
+            let bind_group = if imported {
+                &self
+                    .imported
+                    .iter()
+                    .max_by_key(|e| e.used)
+                    .expect("just imported")
+                    .bind_group
+            } else {
+                &self.textures.as_ref().expect("ensured above").bind_group
+            };
+            pass.set_bind_group(0, bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
-        self.queue.submit(Some(encoder.finish()));
+        let submission = self.queue.submit(Some(encoder.finish()));
         self.queue.present(target);
+
+        if imported {
+            // The pass samples the producer's memory, so its buffer — and
+            // through it the pool slot the producer would refill — must
+            // outlive the submission. Waiting on the *specific* submission
+            // is exact; at this depth and vsync pacing it has already
+            // retired by the time we ask.
+            self.in_flight.push_back((submission, frame.data.clone()));
+            while self.in_flight.len() > GPU_IN_FLIGHT {
+                let (index, buffer) = self.in_flight.pop_front().expect("checked len");
+                let _ = self.device.poll(wgpu::PollType::Wait {
+                    submission_index: Some(index),
+                    timeout: Some(std::time::Duration::from_millis(100)),
+                });
+                drop(buffer);
+            }
+        }
         Ok(())
     }
 

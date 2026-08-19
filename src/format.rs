@@ -1704,6 +1704,24 @@ impl MemoryCaps {
         }
     }
 
+    /// A consumer that can import a dma-buf on the GPU, or read CPU memory.
+    ///
+    /// The order is the point: `DmaBuf` first means a producer that owns
+    /// GPU memory hands it over untouched, and only a consumer that really
+    /// can import it advertises this. `External` sits between them because
+    /// a producer-owned CPU pointer still beats a copy.
+    pub fn gpu_import_or_cpu() -> Self {
+        Self {
+            types: CapsValue::List(vec![
+                MemoryType::DmaBuf,
+                MemoryType::External,
+                MemoryType::Cpu,
+            ]),
+            can_import: vec![MemoryType::DmaBuf, MemoryType::External, MemoryType::Cpu],
+            can_export: vec![MemoryType::Cpu],
+        }
+    }
+
     /// Whether this caps object explicitly names `memory` as a supported
     /// type. `Any` does NOT count — that is the whole point for opt-in
     /// types like [`MemoryType::External`], which a byte-reading `Any`

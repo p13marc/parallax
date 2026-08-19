@@ -66,14 +66,10 @@ use cros_codecs::video_frame::{ReadMapping, VideoFrame, WriteMapping};
 use cros_codecs::{Fourcc, Resolution};
 
 use crate::error::{Error, Result};
+use crate::memory::I915_FORMAT_MOD_Y_TILED;
 
 /// `DRM_FORMAT_NV12`, as a fourcc.
 const DRM_FORMAT_NV12: u32 = u32::from_le_bytes(*b"NV12");
-/// `I915_FORMAT_MOD_Y_TILED` — `fourcc_mod_code(INTEL, 2)`.
-///
-/// What the driver actually renders into, whatever modifier it is asked
-/// for (see the module docs), so it is what we declare.
-const I915_FORMAT_MOD_Y_TILED: u64 = (1u64 << 56) | 2;
 
 /// An Intel Y-tile is 128 bytes wide...
 const TILE_WIDTH: usize = 128;
@@ -332,6 +328,16 @@ impl VaFrame {
         }
     }
 
+    /// Raw mutable access to the mapping, for tests that place a known
+    /// pattern where the driver would have written one.
+    #[cfg(test)]
+    #[cfg_attr(not(feature = "display-gpu"), allow(dead_code))]
+    pub(crate) fn as_bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: the mapping is PROT_WRITE and lives as long as `inner`;
+        // `&mut self` is what makes this the only live reference to it.
+        unsafe { std::slice::from_raw_parts_mut(self.inner.ptr, self.inner.len) }
+    }
+
     /// The frame's bytes, **as the driver tiled them**.
     ///
     /// Useful as raw memory — its length, its identity as one allocation —
@@ -355,6 +361,15 @@ impl VaFrame {
     /// Coded (allocated) geometry.
     pub fn coded(&self) -> Resolution {
         self.inner.coded
+    }
+
+    /// The allocation's DRM format modifier.
+    ///
+    /// Always [`I915_FORMAT_MOD_Y_TILED`]: whatever this module asks for,
+    /// that is what the driver renders. An importer needs it; a CPU reader
+    /// needs [`read_plane`](Self::read_plane) instead.
+    pub fn modifier(&self) -> u64 {
+        I915_FORMAT_MOD_Y_TILED
     }
 
     /// Borrow the dma-buf, e.g. to hand the pipeline a

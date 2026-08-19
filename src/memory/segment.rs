@@ -76,12 +76,24 @@ impl MemoryType {
     /// Must a consumer name this type in its caps before negotiation may
     /// fixate it?
     ///
-    /// `Cpu` and `DmaBuf` are "transparent": their bytes are packed and
-    /// layout-free, so an element with `Caps::any()` genuinely handles
-    /// them by reading `as_bytes()`. `External` memory carries a
-    /// producer-defined plane layout — a byte-reading consumer would
+    /// `Cpu` and `DmaBuf` are "transparent": their bytes are CPU-readable
+    /// and their plane geometry travels in `Metadata` like everyone
+    /// else's, so an element with `Caps::any()` genuinely handles them by
+    /// reading `as_bytes()`. `External` memory is a raw producer pointer
+    /// with no fd and no IPC identity — a byte-reading consumer would
     /// silently misinterpret it — so the solver downgrades to `Cpu`
     /// unless the sink's caps explicitly list `External` (#194).
+    ///
+    /// The exception is a **non-linear modifier**: a tiled allocation is
+    /// readable but is not a picture, so `as_bytes()` on it is garbage to
+    /// anything that has not been told the layout. That is not handled by
+    /// making `DmaBuf` opt-in — it would regress every working
+    /// CPU-readable producer — but by the producer: a tiled frame is
+    /// emitted only onto a link that negotiated `DmaBuf` deliberately (the
+    /// `set_negotiated_memory` discipline), and `memorycopy` refuses to
+    /// copy one to CPU rather than copying nonsense.
+    /// [`DmaBufSlot::is_linear`](crate::memory::DmaBufSlot::is_linear) is
+    /// the question to ask.
     #[inline]
     pub fn requires_explicit_optin(&self) -> bool {
         matches!(self, MemoryType::External)

@@ -97,6 +97,21 @@ impl Element for MemoryCopy {
         // Already-CPU input passes through — the graph edge asked for Cpu
         // and that is what it is.
         if self.target_type == MemoryType::Cpu && buffer.memory_type() != MemoryType::Cpu {
+            // A tiled dmabuf is readable but is not a picture, and this
+            // element has no way to know the tiling — that is codec- and
+            // driver-specific knowledge belonging to whoever allocated it.
+            // Copying the bytes would produce a plausible-looking, scrambled
+            // frame, which is worse than refusing.
+            if let Some(slot) = buffer.memory().dmabuf_slot()
+                && !slot.is_linear()
+            {
+                return Err(crate::error::Error::Element(format!(
+                    "memorycopy: cannot copy a dmabuf with modifier {:#x} to CPU memory — \
+                     it is not laid out as rows, and only its producer knows how to read it. \
+                     A consumer of tiled frames must negotiate DmaBuf and import them",
+                    slot.modifier()
+                )));
+            }
             // A strided frame (#194) repacks — a flat copy would carry the
             // row padding into memory every packed consumer misreads.
             if buffer.metadata().has_strided_planes() {

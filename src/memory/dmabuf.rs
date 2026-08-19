@@ -239,6 +239,14 @@ impl DmaBufSegment {
 /// buffer to the driver (QBUF); tests use it to observe recycling.
 pub type DmaBufReleaseHook = Box<dyn Fn(u32) + Send + Sync>;
 
+/// `DRM_FORMAT_MOD_LINEAR` — rows end to end at the declared stride.
+pub const DRM_FORMAT_MOD_LINEAR: u64 = 0;
+
+/// `I915_FORMAT_MOD_Y_TILED` — Intel Y-tiles, 128 bytes by 32 rows, each
+/// tile stored as eight 16-byte columns. What Intel's VA driver renders
+/// decode output into (see `crate::gpu::vaapi`).
+pub const I915_FORMAT_MOD_Y_TILED: u64 = (1u64 << 56) | 2;
+
 /// A refcounted dmabuf-backed slot (#145) — the DmaBuf counterpart of
 /// [`SharedSlotRef`](crate::memory::SharedSlotRef)'s discipline: cloning a
 /// buffer clones an `Arc<DmaBufSlot>`, and the LAST drop fires the release
@@ -255,6 +263,13 @@ pub struct DmaBufSlot {
     /// Fired exactly once, from `Drop` — i.e. when the last
     /// `Arc<DmaBufSlot>` clone goes away.
     release: Option<DmaBufReleaseHook>,
+    /// How the bytes are arranged in memory, as a DRM format modifier.
+    ///
+    /// A property of the *allocation*, not of the frame, which is why it
+    /// lives here and not in `Metadata`: a transform that copies a dmabuf
+    /// into CPU memory must not carry it along, and geometry is already
+    /// `Metadata`'s job.
+    modifier: u64,
 }
 
 impl DmaBufSlot {
@@ -264,6 +279,7 @@ impl DmaBufSlot {
             segment: std::sync::Arc::new(segment),
             index: 0,
             release: None,
+            modifier: DRM_FORMAT_MOD_LINEAR,
         }
     }
 
@@ -278,7 +294,45 @@ impl DmaBufSlot {
             segment,
             index,
             release: Some(hook),
+            modifier: DRM_FORMAT_MOD_LINEAR,
         }
+    }
+
+    /// Declare the allocation's DRM format modifier.
+    ///
+    /// The default is [`DRM_FORMAT_MOD_LINEAR`], which is what every
+    /// CPU-readable producer has: rows laid end to end at the declared
+    /// stride. A producer whose memory is *not* linear — a GPU decode
+    /// target, say — must say so, because the bytes are then meaningless
+    /// to anything but an importer that knows the layout.
+    pub fn with_modifier(mut self, modifier: u64) -> Self {
+        self.modifier = modifier;
+        self
+    }
+
+    /// The allocation's DRM format modifier.
+    pub fn modifier(&self) -> u64 {
+        self.modifier
+    }
+
+    /// Whether the bytes can be read as rows at the declared stride.
+    ///
+    /// `false` means [`crate::buffer::Buffer::as_bytes`] on this slot is a
+    /// live mapping of memory laid out in some tiled or compressed order:
+    /// readable, but not a picture. Only an importer told the modifier can
+    /// make sense of it.
+    pub fn is_linear(&self) -> bool {
+        self.modifier == DRM_FORMAT_MOD_LINEAR
+    }
+
+    /// The mapped segment, shared.
+    ///
+    /// A GPU importer keys its cache on this pointer: a pooled producer
+    /// hands out a fresh `DmaBufSlot` per frame over a *stable* segment, so
+    /// the segment is the identity of the underlying allocation and holding
+    /// an `Arc` of it keeps that identity from being reused underneath.
+    pub fn shared_segment(&self) -> &std::sync::Arc<DmaBufSegment> {
+        &self.segment
     }
 
     /// The mapped segment.

@@ -210,6 +210,8 @@ pub struct VaapiDecoder {
     eos_drained: bool,
     /// Geometry of the last emitted frame; a change resets the arena.
     last_dims: Option<(u32, u32)>,
+    /// What the downstream link negotiated, once the executor has said.
+    negotiated: Option<crate::memory::MemoryType>,
     clip: SegmentClip,
     frames_out: u64,
 }
@@ -326,6 +328,7 @@ impl VaapiDecoder {
             refusals: 0,
             eos_drained: false,
             last_dims: None,
+            negotiated: None,
             clip: SegmentClip::default(),
             frames_out: 0,
         })
@@ -456,6 +459,73 @@ impl VaapiDecoder {
         Ok(Buffer::new(MemoryHandle::with_len(slot, total), metadata))
     }
 
+    /// Hand the decoded frame onward as a dma-buf, no copy at all.
+    ///
+    /// The frame is Y-tiled (see [`crate::gpu::vaapi`]), so this is only
+    /// legal onto a link that negotiated `DmaBuf` and can *import* it — the
+    /// bytes are not rows and nothing downstream may read them as such. What
+    /// travels is the fd, the modifier, and the plane offsets and pitches;
+    /// the GPU does the rest.
+    ///
+    /// Lifetime: the release hook holds the `VaFrame` clone, so the pool
+    /// cannot reissue the slot until the last `Buffer` referencing it drops.
+    /// That is the same `Arc::strong_count == 1` rule the readback path
+    /// relies on, expressed through the hook because a `DmaBufSlot` has
+    /// nowhere else to keep an owner.
+    fn handle_to_dmabuf(&mut self, handle: &Handle) -> Result<Buffer> {
+        handle
+            .sync()
+            .map_err(|e| Error::Element(format!("vaapi: waiting for a frame failed: {e}")))?;
+
+        let frame = handle.video_frame();
+        let visible = handle.display_resolution();
+        let (w, h) = (visible.width, visible.height);
+
+        let fd = frame
+            .dmabuf()
+            .try_clone_to_owned()
+            .map_err(|e| Error::Element(format!("vaapi: duplicating the frame fd failed: {e}")))?;
+        let len = frame.as_bytes().len();
+        let segment = crate::memory::DmaBufSegment::from_fd_readonly(fd, len)?;
+
+        // The hook fires on the last `Arc<DmaBufSlot>` drop, and its only job
+        // is to hold this clone alive until then.
+        let pinned = std::sync::Arc::clone(&frame);
+        let slot = crate::memory::DmaBufSlot::with_release(
+            std::sync::Arc::new(segment),
+            0,
+            Box::new(move |_| {
+                // The capture is the whole point: `pinned` is dropped along
+                // with this closure, which happens on the last slot
+                // reference — exactly when the pool may reissue the frame.
+                let _held_until_now = &pinned;
+            }),
+        )
+        .with_modifier(frame.modifier());
+
+        let layout = PlaneLayout::from_planes(&[
+            crate::format::PlaneDesc {
+                offset: frame.offsets()[0],
+                stride: frame.pitches()[0],
+            },
+            crate::format::PlaneDesc {
+                offset: frame.offsets()[1],
+                stride: frame.pitches()[1],
+            },
+        ]);
+
+        let mut metadata = self.claim_meta_for(handle.timestamp());
+        metadata.pts = ClockTime::from_nanos(handle.timestamp());
+        metadata.sequence = self.frames_out;
+        metadata.set_video_planes(w, h, PixelFormat::Nv12, layout);
+        self.frames_out += 1;
+
+        Ok(Buffer::new(
+            MemoryHandle::from_dmabuf(std::sync::Arc::new(slot)),
+            metadata,
+        ))
+    }
+
     /// The input metadata belonging to `pts`.
     ///
     /// VP9 has no reorder, so this is normally the front of the queue; the
@@ -480,7 +550,11 @@ impl VaapiDecoder {
     /// Emit the oldest decoded frame that the current segment wants.
     fn next_output(&mut self) -> Result<Option<Buffer>> {
         while let Some(handle) = self.ready.pop_front() {
-            let buffer = self.handle_to_buffer(&handle)?;
+            let buffer = if self.negotiated == Some(crate::memory::MemoryType::DmaBuf) {
+                self.handle_to_dmabuf(&handle)?
+            } else {
+                self.handle_to_buffer(&handle)?
+            };
             if self.clip.clips(buffer.metadata().pts) {
                 continue;
             }
@@ -498,6 +572,10 @@ impl VaapiDecoder {
 impl Element for VaapiDecoder {
     fn set_output_budget(&mut self, budget: OutputBudget) {
         self.output.set_budget(budget);
+    }
+
+    fn set_negotiated_memory(&mut self, memory: crate::memory::MemoryType) {
+        self.negotiated = Some(memory);
     }
 
     /// Access units are queued rather than dropped when the decoder stalls,
@@ -587,7 +665,11 @@ impl Element for VaapiDecoder {
                 framerate: CapsValue::Any,
                 layout: MemoryLayout::NONE,
             }),
-            MemoryCaps::cpu_only(),
+            // DmaBuf first: the frames already *are* dma-bufs, so a sink
+            // that can import one costs nothing at all, while Cpu costs a
+            // de-tiling copy. A consumer that cannot import simply does not
+            // list DmaBuf and gets the copy.
+            MemoryCaps::dmabuf_preferred(),
         )])
     }
 

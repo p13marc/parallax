@@ -185,9 +185,9 @@ pub use app::{
 };
 
 #[cfg(feature = "display")]
-pub use app::gpu_present_available;
-#[cfg(feature = "display")]
 pub use app::{AutoVideoSink, AutoVideoSinkHandle, VideoKey, VideoWindowEvent};
+#[cfg(feature = "display")]
+pub use app::{gpu_dmabuf_import_available, gpu_present_available};
 
 // IPC
 pub use ipc::{IpcSink, IpcSrc};
