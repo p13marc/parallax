@@ -18,20 +18,24 @@ env:
   RUSTC_WRAPPER: /srv/cache/bin/sccache
   CARGO_INCREMENTAL: "0"
   # The runner has 1.7 GiB of RAM and no swap (#203). rustc compiling the
-  # parallax lib with the sensor feature set was being SIGKILLed by the OOM
-  # killer — "sccache: Compile terminated by signal 9" — which is why jobs
-  # failed scattered and unreproducibly, depending on what was co-running.
-  # Two levers, both free here:
+  # parallax lib is SIGKILLed by the OOM killer — "sccache: Compile
+  # terminated by signal 9" — which is why jobs fail scattered and
+  # unreproducibly: ~2 share the box, and which one dies depends on what it
+  # is co-running with. Two levers, both free here:
   #
-  #   debuginfo   dominates rustc's peak RSS and is worth nothing to a CI job
+  #   debuginfo   dominates rustc's peak RSS and is worth nothing to a job
   #               that only checks, lints or runs tests. Note cargo applies
   #               the *dev* profile's debug setting to the test profile too,
   #               but set both so a future profile split cannot regress it.
-  #   jobs=1      one rustc at a time. Slower, but two large crates in
-  #               parallel do not fit in 1.7 GiB whatever else is done.
+  #   jobs=1      one rustc at a time. Two large crates in parallel do not
+  #               fit in 1.7 GiB whatever else is done.
   #
-  # The durable fix is more memory (or any swap at all) on the runner; until
-  # then these keep the matrix green.
+  # These reduce the pressure; they do NOT fix it, and saying otherwise would
+  # be wrong. Measured with both applied, one rustc on the lib peaks at
+  # 861 MiB, and 1000 MiB with --all-targets, against the 466-704 MiB the
+  # runner reported free. The fix is capacity: ~4 GiB, or 2 GiB plus a
+  # swapfile, and capping runner concurrency at one job. Until then a red run
+  # here says nothing about the code.
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
   CARGO_BUILD_JOBS: "1"
@@ -57,35 +61,9 @@ jobs:
       - uses: https://github.com/Swatinem/rust-cache@v2.9.2
         with:
           cache-targets: false
-      - run: set -o pipefail; cargo clippy --all-targets -- -D warnings 2>&1 | tee -a /tmp/ci-step.log
-      - run: set -o pipefail; cargo clippy --all-targets --features "$SENSOR_FEATURES,image-codecs,zenoh-unstable" -- -D warnings 2>&1 | tee -a /tmp/ci-step.log
-      - run: set -o pipefail; cargo clippy --all-targets --features "$MEDIA_FEATURES" -- -D warnings 2>&1 | tee -a /tmp/ci-step.log
-      # TEMPORARY (#203). This Forgejo's API exposes no endpoint for Actions
-      # logs, so a red job is invisible to anything but a browser session.
-      # Post the disk state and the tail of the failing command to the
-      # tracking issue instead. Delete this step, and the `tee` above, once
-      # the cause is known. Internal URL for the same reason release.yml uses
-      # one: the runner zone cannot hairpin to the public vhost.
-      - name: report failure to #203
-        if: failure()
-        env:
-          JOB: ${{ github.job }}
-        run: |
-          {
-            echo "### \`$JOB\` — $(echo "$GITHUB_SHA" | cut -c1-8) — run $GITHUB_RUN_NUMBER"
-            echo
-            echo '```'
-            echo "== df -h =="; df -h / /tmp "$GITHUB_WORKSPACE" 2>&1 | sort -u
-            echo "== target =="; du -sh "$GITHUB_WORKSPACE/target" 2>&1 || true
-            echo "== free =="; free -h 2>&1 | head -3
-            echo "== tail of the failing command =="
-            tail -100 /tmp/ci-step.log 2>&1 || echo "(nothing captured — failed before the build step)"
-            echo '```'
-          } > /tmp/ci-report.md
-          python3 -c "import json; print(json.dumps({'body': open('/tmp/ci-report.md').read()[:60000]}))" > /tmp/ci-report.json
-          curl -sS -X POST -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            -H 'Content-Type: application/json' --data @/tmp/ci-report.json \
-            "http://10.10.0.30:3000/api/v1/repos/$GITHUB_REPOSITORY/issues/203/comments" >/dev/null
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --features "$SENSOR_FEATURES,image-codecs,zenoh-unstable" -- -D warnings
+      - run: cargo clippy --all-targets --features "$MEDIA_FEATURES" -- -D warnings
 
   test:
     runs-on: ubuntu-24.04
@@ -99,8 +77,8 @@ jobs:
       - uses: https://github.com/taiki-e/install-action@v2.86.1
         with:
           tool: cargo-nextest
-      - run: set -o pipefail; cargo nextest run 2>&1 | tee -a /tmp/ci-step.log
-      - run: set -o pipefail; cargo test --doc 2>&1 | tee -a /tmp/ci-step.log
+      - run: cargo nextest run
+      - run: cargo test --doc
       # #176: the job's three feature combos build into one container
       # overlay on the runner's 50G root disk, and their combined target/
       # no longer fits — the third build died with ENOSPC (and an ld Bus
@@ -108,36 +86,10 @@ jobs:
       # target/ between combos caps the peak at one combo's worth; the
       # recompile is cheap because sccache serves it from garage S3.
       - run: rm -rf target
-      - run: set -o pipefail; cargo check --all-targets --features "$SENSOR_FEATURES" 2>&1 | tee -a /tmp/ci-step.log
-      - run: set -o pipefail; cargo nextest run --features "$SENSOR_FEATURES" 2>&1 | tee -a /tmp/ci-step.log
+      - run: cargo check --all-targets --features "$SENSOR_FEATURES"
+      - run: cargo nextest run --features "$SENSOR_FEATURES"
       - run: rm -rf target
-      - run: set -o pipefail; cargo nextest run --features "$MEDIA_FEATURES" 2>&1 | tee -a /tmp/ci-step.log
-      # TEMPORARY (#203). This Forgejo's API exposes no endpoint for Actions
-      # logs, so a red job is invisible to anything but a browser session.
-      # Post the disk state and the tail of the failing command to the
-      # tracking issue instead. Delete this step, and the `tee` above, once
-      # the cause is known. Internal URL for the same reason release.yml uses
-      # one: the runner zone cannot hairpin to the public vhost.
-      - name: report failure to #203
-        if: failure()
-        env:
-          JOB: ${{ github.job }}
-        run: |
-          {
-            echo "### \`$JOB\` — $(echo "$GITHUB_SHA" | cut -c1-8) — run $GITHUB_RUN_NUMBER"
-            echo
-            echo '```'
-            echo "== df -h =="; df -h / /tmp "$GITHUB_WORKSPACE" 2>&1 | sort -u
-            echo "== target =="; du -sh "$GITHUB_WORKSPACE/target" 2>&1 || true
-            echo "== free =="; free -h 2>&1 | head -3
-            echo "== tail of the failing command =="
-            tail -100 /tmp/ci-step.log 2>&1 || echo "(nothing captured — failed before the build step)"
-            echo '```'
-          } > /tmp/ci-report.md
-          python3 -c "import json; print(json.dumps({'body': open('/tmp/ci-report.md').read()[:60000]}))" > /tmp/ci-report.json
-          curl -sS -X POST -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            -H 'Content-Type: application/json' --data @/tmp/ci-report.json \
-            "http://10.10.0.30:3000/api/v1/repos/$GITHUB_REPOSITORY/issues/203/comments" >/dev/null
+      - run: cargo nextest run --features "$MEDIA_FEATURES"
 
   msrv:
     runs-on: ubuntu-24.04
@@ -151,37 +103,11 @@ jobs:
         with:
           key: msrv
           cache-targets: false
-      - run: set -o pipefail; cargo check --all-targets 2>&1 | tee -a /tmp/ci-step.log
+      - run: cargo check --all-targets
       # Same disk discipline as the test job (#176) — msrv shares the root
       # disk with whatever else the runner is executing.
       - run: rm -rf target
-      - run: set -o pipefail; cargo check --all-targets --features "$SENSOR_FEATURES" 2>&1 | tee -a /tmp/ci-step.log
-      # TEMPORARY (#203). This Forgejo's API exposes no endpoint for Actions
-      # logs, so a red job is invisible to anything but a browser session.
-      # Post the disk state and the tail of the failing command to the
-      # tracking issue instead. Delete this step, and the `tee` above, once
-      # the cause is known. Internal URL for the same reason release.yml uses
-      # one: the runner zone cannot hairpin to the public vhost.
-      - name: report failure to #203
-        if: failure()
-        env:
-          JOB: ${{ github.job }}
-        run: |
-          {
-            echo "### \`$JOB\` — $(echo "$GITHUB_SHA" | cut -c1-8) — run $GITHUB_RUN_NUMBER"
-            echo
-            echo '```'
-            echo "== df -h =="; df -h / /tmp "$GITHUB_WORKSPACE" 2>&1 | sort -u
-            echo "== target =="; du -sh "$GITHUB_WORKSPACE/target" 2>&1 || true
-            echo "== free =="; free -h 2>&1 | head -3
-            echo "== tail of the failing command =="
-            tail -100 /tmp/ci-step.log 2>&1 || echo "(nothing captured — failed before the build step)"
-            echo '```'
-          } > /tmp/ci-report.md
-          python3 -c "import json; print(json.dumps({'body': open('/tmp/ci-report.md').read()[:60000]}))" > /tmp/ci-report.json
-          curl -sS -X POST -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            -H 'Content-Type: application/json' --data @/tmp/ci-report.json \
-            "http://10.10.0.30:3000/api/v1/repos/$GITHUB_REPOSITORY/issues/203/comments" >/dev/null
+      - run: cargo check --all-targets --features "$SENSOR_FEATURES"
 
   libcamera:
     runs-on: ubuntu-24.04
@@ -222,33 +148,7 @@ jobs:
         with:
           key: vulkan
           cache-targets: false
-      - run: set -o pipefail; cargo check --all-targets --features image-jpeg,vulkan-video 2>&1 | tee -a /tmp/ci-step.log
-      # TEMPORARY (#203). This Forgejo's API exposes no endpoint for Actions
-      # logs, so a red job is invisible to anything but a browser session.
-      # Post the disk state and the tail of the failing command to the
-      # tracking issue instead. Delete this step, and the `tee` above, once
-      # the cause is known. Internal URL for the same reason release.yml uses
-      # one: the runner zone cannot hairpin to the public vhost.
-      - name: report failure to #203
-        if: failure()
-        env:
-          JOB: ${{ github.job }}
-        run: |
-          {
-            echo "### \`$JOB\` — $(echo "$GITHUB_SHA" | cut -c1-8) — run $GITHUB_RUN_NUMBER"
-            echo
-            echo '```'
-            echo "== df -h =="; df -h / /tmp "$GITHUB_WORKSPACE" 2>&1 | sort -u
-            echo "== target =="; du -sh "$GITHUB_WORKSPACE/target" 2>&1 || true
-            echo "== free =="; free -h 2>&1 | head -3
-            echo "== tail of the failing command =="
-            tail -100 /tmp/ci-step.log 2>&1 || echo "(nothing captured — failed before the build step)"
-            echo '```'
-          } > /tmp/ci-report.md
-          python3 -c "import json; print(json.dumps({'body': open('/tmp/ci-report.md').read()[:60000]}))" > /tmp/ci-report.json
-          curl -sS -X POST -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            -H 'Content-Type: application/json' --data @/tmp/ci-report.json \
-            "http://10.10.0.30:3000/api/v1/repos/$GITHUB_REPOSITORY/issues/203/comments" >/dev/null
+      - run: cargo check --all-targets --features image-jpeg,vulkan-video
 
   # Feature gates no other job compiles. `display` builds here; `pipewire` and
   # `screen-capture` build in the libcamera fedora job (#170).
@@ -308,34 +208,8 @@ jobs:
       - uses: https://github.com/taiki-e/install-action@v2.86.1
         with:
           tool: cargo-nextest
-      - run: set -o pipefail; cargo nextest run --features vaapi,mkv-demux,mp4-demux,vpx,h264 2>&1 | tee -a /tmp/ci-step.log
-      - run: set -o pipefail; cargo clippy --all-targets --features vaapi,mkv-demux,mp4-demux,vpx,h264 -- -D warnings 2>&1 | tee -a /tmp/ci-step.log
-      # TEMPORARY (#203). This Forgejo's API exposes no endpoint for Actions
-      # logs, so a red job is invisible to anything but a browser session.
-      # Post the disk state and the tail of the failing command to the
-      # tracking issue instead. Delete this step, and the `tee` above, once
-      # the cause is known. Internal URL for the same reason release.yml uses
-      # one: the runner zone cannot hairpin to the public vhost.
-      - name: report failure to #203
-        if: failure()
-        env:
-          JOB: ${{ github.job }}
-        run: |
-          {
-            echo "### \`$JOB\` — $(echo "$GITHUB_SHA" | cut -c1-8) — run $GITHUB_RUN_NUMBER"
-            echo
-            echo '```'
-            echo "== df -h =="; df -h / /tmp "$GITHUB_WORKSPACE" 2>&1 | sort -u
-            echo "== target =="; du -sh "$GITHUB_WORKSPACE/target" 2>&1 || true
-            echo "== free =="; free -h 2>&1 | head -3
-            echo "== tail of the failing command =="
-            tail -100 /tmp/ci-step.log 2>&1 || echo "(nothing captured — failed before the build step)"
-            echo '```'
-          } > /tmp/ci-report.md
-          python3 -c "import json; print(json.dumps({'body': open('/tmp/ci-report.md').read()[:60000]}))" > /tmp/ci-report.json
-          curl -sS -X POST -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            -H 'Content-Type: application/json' --data @/tmp/ci-report.json \
-            "http://10.10.0.30:3000/api/v1/repos/$GITHUB_REPOSITORY/issues/203/comments" >/dev/null
+      - run: cargo nextest run --features vaapi,mkv-demux,mp4-demux,vpx,h264
+      - run: cargo clippy --all-targets --features vaapi,mkv-demux,mp4-demux,vpx,h264 -- -D warnings
 
   # The SIMD colorspace arms (the `yuv` crate) are a second implementation of
   # every conversion, selected by a feature no other job enables — and the one
@@ -355,34 +229,8 @@ jobs:
       - uses: https://github.com/taiki-e/install-action@v2
         with:
           tool: cargo-nextest
-      - run: set -o pipefail; cargo nextest run --features simd-colorspace 2>&1 | tee -a /tmp/ci-step.log
-      - run: set -o pipefail; cargo clippy --all-targets --features simd-colorspace -- -D warnings 2>&1 | tee -a /tmp/ci-step.log
-      # TEMPORARY (#203). This Forgejo's API exposes no endpoint for Actions
-      # logs, so a red job is invisible to anything but a browser session.
-      # Post the disk state and the tail of the failing command to the
-      # tracking issue instead. Delete this step, and the `tee` above, once
-      # the cause is known. Internal URL for the same reason release.yml uses
-      # one: the runner zone cannot hairpin to the public vhost.
-      - name: report failure to #203
-        if: failure()
-        env:
-          JOB: ${{ github.job }}
-        run: |
-          {
-            echo "### \`$JOB\` — $(echo "$GITHUB_SHA" | cut -c1-8) — run $GITHUB_RUN_NUMBER"
-            echo
-            echo '```'
-            echo "== df -h =="; df -h / /tmp "$GITHUB_WORKSPACE" 2>&1 | sort -u
-            echo "== target =="; du -sh "$GITHUB_WORKSPACE/target" 2>&1 || true
-            echo "== free =="; free -h 2>&1 | head -3
-            echo "== tail of the failing command =="
-            tail -100 /tmp/ci-step.log 2>&1 || echo "(nothing captured — failed before the build step)"
-            echo '```'
-          } > /tmp/ci-report.md
-          python3 -c "import json; print(json.dumps({'body': open('/tmp/ci-report.md').read()[:60000]}))" > /tmp/ci-report.json
-          curl -sS -X POST -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            -H 'Content-Type: application/json' --data @/tmp/ci-report.json \
-            "http://10.10.0.30:3000/api/v1/repos/$GITHUB_REPOSITORY/issues/203/comments" >/dev/null
+      - run: cargo nextest run --features simd-colorspace
+      - run: cargo clippy --all-targets --features simd-colorspace -- -D warnings
 
   docs:
     runs-on: ubuntu-24.04
