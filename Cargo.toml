@@ -447,6 +447,10 @@ name = "60_ipc"
 # `cros-codecs-extended` with the fixes from #200 applied (fork branch
 # `fix-init-profile`, three commits, each ready to send upstream).
 #
+# Hosted on this project's own forge rather than a third-party one: a `git`
+# dependency is fetched on every clean build, including CI's, and that is a
+# host the build then depends on.
+#
 # The load-bearing one: `VaapiBackend::new` builds its throwaway 16x16 init
 # config from a hardcoded `VAProfileH264Main` *whatever codec the decoder is
 # for*, and `.expect()`s it — so it panics while decoding VP9 on a driver
@@ -464,4 +468,4 @@ name = "60_ipc"
 # `parallax-pipeline`, so a crates.io build with `--features vaapi` still
 # resolves the unpatched dependency. See the `vaapi` feature's own comment.
 [patch.crates-io]
-cros-codecs-extended = { git = "https://github.com/p13marc/cros-codecs-extended", rev = "f75c09bc0c65755c236e75de4bcfedb398c56d95" }
+cros-codecs-extended = { git = "https://git.marcpardo.eu/marcpardo/cros-codecs-extended.git", rev = "f75c09bc0c65755c236e75de4bcfedb398c56d95" }
