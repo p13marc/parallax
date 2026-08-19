@@ -26,6 +26,7 @@ use std::collections::VecDeque;
 use cros_codecs::Resolution;
 use cros_codecs::backend::vaapi::decoder::VaapiDecodedHandle;
 use cros_codecs::decoder::stateless::h264::H264;
+use cros_codecs::decoder::stateless::h265::H265;
 use cros_codecs::decoder::stateless::vp8::Vp8;
 use cros_codecs::decoder::stateless::vp9::Vp9;
 use cros_codecs::decoder::stateless::{DecodeError, StatelessDecoder, StatelessVideoDecoder};
@@ -230,6 +231,15 @@ impl VaapiDecoder {
         Self::open(Codec::Vp8)
     }
 
+    /// A hardware HEVC decoder, or the reason there isn't one.
+    ///
+    /// There is no software HEVC decoder in this tree, so unlike the others
+    /// this one has no fallback behind it: a driver without HEVC means the
+    /// stream cannot be played at all.
+    pub fn h265() -> Result<Self> {
+        Self::open(Codec::H265)
+    }
+
     /// A hardware H.264 decoder, or the reason there isn't one.
     ///
     /// Note that H.264 is absent from patent-free driver builds even on
@@ -245,10 +255,6 @@ impl VaapiDecoder {
     /// not a reason to stop: no DRM device, no driver, or a driver built
     /// without this codec.
     ///
-    /// HEVC is deliberately absent: `cros-codecs`' H.265 constructor takes
-    /// an `Rc<Display>` where H.264 and VP9 take `Arc`, so it cannot be
-    /// driven from the same shared display at all. Adding it means fixing
-    /// that upstream first.
     pub fn open(codec: Codec) -> Result<Self> {
         let display = VaDisplay::open().ok_or_else(|| {
             Error::Element(
@@ -296,6 +302,10 @@ impl VaapiDecoder {
             ),
             Codec::Vp8 => Box::new(
                 StatelessDecoder::<Vp8, _>::new_vaapi(display.handle(), BlockingMode::NonBlocking)
+                    .map_err(init)?,
+            ),
+            Codec::H265 => Box::new(
+                StatelessDecoder::<H265, _>::new_vaapi(display.handle(), BlockingMode::NonBlocking)
                     .map_err(init)?,
             ),
             other => {
@@ -664,7 +674,11 @@ mod tests {
 
         assert_eq!(outcome, DriveOutcome::Stalled);
         assert_eq!(pending.len(), 1, "the unit is kept, not dropped");
-        assert_eq!(pending.front().unwrap().offset, 40, "progress is remembered");
+        assert_eq!(
+            pending.front().unwrap().offset,
+            40,
+            "progress is remembered"
+        );
 
         // Resuming must offer only the remaining 60 bytes.
         let mut seen = 0;
@@ -723,7 +737,10 @@ mod tests {
 
         let outcome = drive_input(&mut pending, &mut refusals, |_, _| Ok(0)).unwrap();
         assert_eq!(outcome, DriveOutcome::Drained);
-        assert!(pending.is_empty(), "the unit is dropped, not retried forever");
+        assert!(
+            pending.is_empty(),
+            "the unit is dropped, not retried forever"
+        );
     }
 
     /// An unparseable unit is skipped like a lost reference, and only a long
@@ -753,7 +770,10 @@ mod tests {
         let err = drive_input(&mut pending, &mut refusals, |_, _| {
             Err(DecodeError::ParseFrameError("bad NAL".to_string()))
         });
-        assert!(err.is_err(), "a stream that never parses must not loop forever");
+        assert!(
+            err.is_err(),
+            "a stream that never parses must not loop forever"
+        );
     }
 
     /// Construction answers rather than panicking, whatever the machine.

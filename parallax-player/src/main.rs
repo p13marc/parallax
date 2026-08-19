@@ -157,6 +157,7 @@ enum HwDec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum VideoCodecKind {
     H264,
+    H265,
     Vp8,
     Vp9,
     Av1,
@@ -167,6 +168,7 @@ impl std::fmt::Display for VideoCodecKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             VideoCodecKind::H264 => write!(f, "H.264"),
+            VideoCodecKind::H265 => write!(f, "H.265"),
             VideoCodecKind::Vp8 => write!(f, "VP8"),
             VideoCodecKind::Vp9 => write!(f, "VP9"),
             VideoCodecKind::Av1 => write!(f, "AV1"),
@@ -201,6 +203,7 @@ impl From<Mp4Codec> for VideoCodecKind {
     fn from(c: Mp4Codec) -> Self {
         match c {
             Mp4Codec::H264 => VideoCodecKind::H264,
+            Mp4Codec::H265 => VideoCodecKind::H265,
             Mp4Codec::Vp9 => VideoCodecKind::Vp9,
             Mp4Codec::Av1 => VideoCodecKind::Av1,
             other => VideoCodecKind::Other(other.to_string()),
@@ -212,6 +215,7 @@ impl From<&MkvCodec> for VideoCodecKind {
     fn from(c: &MkvCodec) -> Self {
         match c {
             MkvCodec::H264 => VideoCodecKind::H264,
+            MkvCodec::H265 => VideoCodecKind::H265,
             MkvCodec::Vp8 => VideoCodecKind::Vp8,
             MkvCodec::Vp9 => VideoCodecKind::Vp9,
             MkvCodec::Av1 => VideoCodecKind::Av1,
@@ -761,6 +765,18 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
         VideoCodecKind::H264 => match hw_decoder(args.hwdec, parallax::gpu::Codec::H264, "H.264") {
             Some(hw) => pipeline.add_filter("decode", hw),
             None => pipeline.add_filter("decode", H264Decoder::new()?),
+        },
+        // HEVC is the one codec with no software decoder behind it, so the
+        // fallback is an error rather than a slower path — and it says which
+        // of the two reasons applies, because "install a different driver
+        // package" and "this GPU cannot do it" need different answers.
+        VideoCodecKind::H265 => match hw_decoder(args.hwdec, parallax::gpu::Codec::H265, "H.265") {
+            Some(hw) => pipeline.add_filter("decode", hw),
+            None => bail!(
+                "H.265 needs hardware decode — parallax has no software HEVC decoder. \
+                 Check `vainfo`: patent-free driver builds omit HEVC on hardware that \
+                 has the engine (on Fedora, RPM Fusion's intel-media-driver has it)"
+            ),
         },
         VideoCodecKind::Vp8 => match hw_decoder(args.hwdec, parallax::gpu::Codec::Vp8, "VP8") {
             Some(hw) => pipeline.add_filter("decode", hw),

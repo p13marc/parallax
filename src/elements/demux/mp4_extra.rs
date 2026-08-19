@@ -22,6 +22,8 @@ pub(crate) struct StsdExtra {
     pub dops: Option<DopsInfo>,
     /// AV1 configuration record (`av1C` payload), when present.
     pub av1c: Option<Vec<u8>>,
+    /// HEVC configuration record (`hvcC` payload), when present.
+    pub hvcc: Option<Vec<u8>>,
 }
 
 /// Parsed `dOps` (OpusSpecificBox) fields.
@@ -171,6 +173,16 @@ fn scan_trak<R: Read + Seek>(
             let children = entry_payload + 6 + 2 + 70;
             if let Some((av1c, av1c_end)) = find_child(r, b"av1C", children, entry_end)? {
                 extra.av1c = Some(read_bytes(r, av1c, (av1c_end - av1c) as usize)?);
+            }
+        }
+        // HEVC, under either sample-entry name: `hvc1` keeps the parameter
+        // sets out of band, `hev1` permits them in band as well. Both carry
+        // an `hvcC`, and the mp4 crate models neither in a way that exposes
+        // it, so the record is recovered here like `av1C` is.
+        b"hvc1" | b"hev1" => {
+            let children = entry_payload + 6 + 2 + 70;
+            if let Some((hvcc, hvcc_end)) = find_child(r, b"hvcC", children, entry_end)? {
+                extra.hvcc = Some(read_bytes(r, hvcc, (hvcc_end - hvcc) as usize)?);
             }
         }
         // AudioSampleEntry: 6 reserved + 2 dref + 20 bytes of fixed

@@ -266,6 +266,104 @@ fn walk_avcc(
     Ok(())
 }
 
+/// A track's length-prefixed NAL configuration.
+///
+/// H.264 and HEVC store their bitstream the same way in a container — NAL
+/// units behind a fixed-width length prefix, with the parameter sets kept out
+/// of band — and want the same treatment on the way out: start codes, with
+/// the parameter sets prepended to every keyframe so a decoder joining
+/// mid-stream or after a seek can start. Only the record that carries them
+/// differs, so only its parser is per-codec.
+pub struct NalConfig {
+    /// NAL length prefix size in bytes (1, 2 or 4).
+    pub length_size: u8,
+    /// Parameter-set NALs to prepend to a keyframe, in the order the record
+    /// listed them: SPS then PPS for H.264, VPS then SPS then PPS for HEVC.
+    pub params: Vec<Vec<u8>>,
+}
+
+/// Parse an AVCDecoderConfigurationRecord (ISO 14496-15 §5.3.3.1).
+pub fn parse_avcc(data: &[u8]) -> crate::error::Result<NalConfig> {
+    let err = || crate::error::Error::Config("truncated avcC record in CodecPrivate".into());
+    if data.len() < 7 || data[0] != 1 {
+        return Err(crate::error::Error::Config(format!(
+            "CodecPrivate is not an avcC record (len {}, version {})",
+            data.len(),
+            data.first().copied().unwrap_or(0)
+        )));
+    }
+    let length_size = (data[4] & 0x03) + 1;
+    let mut pos = 5usize;
+    let read_sets = |pos: &mut usize, count: usize| -> crate::error::Result<Vec<Vec<u8>>> {
+        let mut sets = Vec::with_capacity(count);
+        for _ in 0..count {
+            let len = data
+                .get(*pos..*pos + 2)
+                .map(|b| u16::from_be_bytes([b[0], b[1]]) as usize)
+                .ok_or_else(err)?;
+            *pos += 2;
+            sets.push(data.get(*pos..*pos + len).ok_or_else(err)?.to_vec());
+            *pos += len;
+        }
+        Ok(sets)
+    };
+    let num_sps = (*data.get(pos).ok_or_else(err)? & 0x1f) as usize;
+    pos += 1;
+    let sps = read_sets(&mut pos, num_sps)?;
+    let num_pps = *data.get(pos).ok_or_else(err)? as usize;
+    pos += 1;
+    let pps = read_sets(&mut pos, num_pps)?;
+    Ok(NalConfig {
+        length_size,
+        params: sps.into_iter().chain(pps).collect(),
+    })
+}
+
+/// Parse an HEVCDecoderConfigurationRecord (ISO 14496-15 §8.3.3.1).
+///
+/// Only two of its 22 fixed header bytes matter here — the version and the
+/// length-prefix width — because everything else (profile, tier, chroma
+/// format, bit depth) is repeated in the SPS the decoder is about to be
+/// handed anyway. The arrays that follow hold the VPS, SPS and PPS, and are
+/// taken in file order: a decoder needs them in dependency order, and every
+/// muxer writes them that way because the spec's own array order is.
+pub fn parse_hvcc(data: &[u8]) -> crate::error::Result<NalConfig> {
+    let err = || crate::error::Error::Config("truncated hvcC record in CodecPrivate".into());
+    if data.len() < 23 || data[0] != 1 {
+        return Err(crate::error::Error::Config(format!(
+            "CodecPrivate is not an hvcC record (len {}, version {})",
+            data.len(),
+            data.first().copied().unwrap_or(0)
+        )));
+    }
+    let length_size = (data[21] & 0x03) + 1;
+    let num_arrays = data[22] as usize;
+    let mut pos = 23usize;
+    let mut params = Vec::new();
+    for _ in 0..num_arrays {
+        // array_completeness(1) | reserved(1) | NAL_unit_type(6)
+        pos += 1;
+        let count = data
+            .get(pos..pos + 2)
+            .map(|b| u16::from_be_bytes([b[0], b[1]]) as usize)
+            .ok_or_else(err)?;
+        pos += 2;
+        for _ in 0..count {
+            let len = data
+                .get(pos..pos + 2)
+                .map(|b| u16::from_be_bytes([b[0], b[1]]) as usize)
+                .ok_or_else(err)?;
+            pos += 2;
+            params.push(data.get(pos..pos + len).ok_or_else(err)?.to_vec());
+            pos += len;
+        }
+    }
+    Ok(NalConfig {
+        length_size,
+        params,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

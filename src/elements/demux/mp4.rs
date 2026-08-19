@@ -455,7 +455,7 @@ pub struct Mp4Demux<R: Read + Seek> {
     sample_indices: std::collections::HashMap<u32, u32>,
     /// H.264 decoder configuration per track, lifted from the avcC box.
     /// Tracks in the map get their samples converted to Annex-B.
-    avc_configs: std::collections::HashMap<u32, AvcDecoderConfig>,
+    nal_configs: std::collections::HashMap<u32, crate::codec::annexb::NalConfig>,
     /// Per-instance output arena for demuxed samples.
     ///
     /// This used to be a process-wide `static`, so two demuxers in one process
@@ -466,21 +466,6 @@ pub struct Mp4Demux<R: Read + Seek> {
     output: OutputArena,
     /// Prepend an ADTS header to every AAC sample (see [`with_adts_aac`](Self::with_adts_aac)).
     adts_aac: bool,
-}
-
-/// Per-track H.264 decoder configuration from the avcC box.
-///
-/// MP4 stores H.264 as AVCC: length-prefixed NALs with the parameter sets
-/// out-of-band in the sample entry. Decoders consume Annex-B, so the demuxer
-/// needs both the prefix size and the parameter sets to emit self-contained
-/// access units.
-struct AvcDecoderConfig {
-    /// NAL length prefix size in bytes (1, 2 or 4).
-    length_size: u8,
-    /// Raw SPS NALs (no start codes).
-    sps: Vec<Vec<u8>>,
-    /// Raw PPS NALs (no start codes).
-    pps: Vec<Vec<u8>>,
 }
 
 impl<R: Read + Seek> Mp4Demux<R> {
@@ -506,7 +491,7 @@ impl<R: Read + Seek> Mp4Demux<R> {
 
         let mut tracks = Vec::new();
         let mut sample_indices = std::collections::HashMap::new();
-        let mut avc_configs = std::collections::HashMap::new();
+        let mut nal_configs = std::collections::HashMap::new();
 
         for track in mp4_reader.tracks().values() {
             let track_type = track
@@ -535,22 +520,35 @@ impl<R: Read + Seek> Mp4Demux<R> {
             // H.264 tracks: lift the avcC record so samples can be converted
             // to Annex-B with in-band parameter sets. A track without one
             // passes through unconverted (and undecodable — say so).
+            if codec == Mp4Codec::H265 {
+                // HEVC is stored exactly like H.264 — length-prefixed NALs
+                // with the parameter sets out of band — so it wants the same
+                // Annex-B conversion. Only the record differs, and the mp4
+                // crate does not expose it, so the raw scan recovers it.
+                match extra.and_then(|e| e.hvcc.as_ref()) {
+                    Some(hvcc) => {
+                        nal_configs
+                            .insert(track.track_id(), crate::codec::annexb::parse_hvcc(hvcc)?);
+                    }
+                    None => tracing::warn!(
+                        "HEVC track {} has no hvcC record; samples pass through \
+                         length-prefixed and will not decode",
+                        track.track_id()
+                    ),
+                }
+            }
             if codec == Mp4Codec::H264 {
                 match &track.trak.mdia.minf.stbl.stsd.avc1 {
                     Some(avc1) => {
                         let avcc = &avc1.avcc;
-                        avc_configs.insert(
+                        nal_configs.insert(
                             track.track_id(),
-                            AvcDecoderConfig {
+                            crate::codec::annexb::NalConfig {
                                 length_size: avcc.length_size_minus_one + 1,
-                                sps: avcc
+                                params: avcc
                                     .sequence_parameter_sets
                                     .iter()
-                                    .map(|n| n.bytes.clone())
-                                    .collect(),
-                                pps: avcc
-                                    .picture_parameter_sets
-                                    .iter()
+                                    .chain(avcc.picture_parameter_sets.iter())
                                     .map(|n| n.bytes.clone())
                                     .collect(),
                             },
@@ -639,7 +637,7 @@ impl<R: Read + Seek> Mp4Demux<R> {
             tracks,
             stats: Mp4DemuxStats::default(),
             sample_indices,
-            avc_configs,
+            nal_configs,
             output: OutputArena::new(defaults::MP4_DEMUX_SLOT_COUNT)
                 .with_min_slot_size(defaults::DEMUX_MIN_SLOT_SIZE)
                 .grow_to_fit(),
@@ -675,13 +673,13 @@ impl<R: Read + Seek> Mp4Demux<R> {
     /// Annex-B consumers expect them in-band).
     #[cfg(test)] // production converts straight into the slot (#144)
     fn avcc_sample_to_annex_b(
-        cfg: &AvcDecoderConfig,
+        cfg: &crate::codec::annexb::NalConfig,
         data: &[u8],
         is_sync: bool,
     ) -> Result<Vec<u8>> {
         let mut out = Vec::with_capacity(data.len() + 64);
         if is_sync {
-            for nal in cfg.sps.iter().chain(cfg.pps.iter()) {
+            for nal in &cfg.params {
                 out.extend_from_slice(&[0, 0, 0, 1]);
                 out.extend_from_slice(nal);
             }
@@ -947,13 +945,9 @@ impl<R: Read + Seek> Mp4Demux<R> {
         // via a length-prefix pre-pass), ADTS-wrapped AAC gets its 7-byte
         // header prepended, everything else copies through once.
         use crate::codec::annexb;
-        let handle = if let Some(cfg) = self.avc_configs.get(&track_id) {
+        let handle = if let Some(cfg) = self.nal_configs.get(&track_id) {
             let params_len: usize = if sample.is_sync {
-                cfg.sps
-                    .iter()
-                    .chain(cfg.pps.iter())
-                    .map(|n| 4 + n.len())
-                    .sum()
+                cfg.params.iter().map(|n| 4 + n.len()).sum()
             } else {
                 0
             };
@@ -963,7 +957,7 @@ impl<R: Read + Seek> Mp4Demux<R> {
                 let out = &mut slot.data_mut()[..total];
                 let mut pos = 0usize;
                 if sample.is_sync {
-                    for nal in cfg.sps.iter().chain(cfg.pps.iter()) {
+                    for nal in &cfg.params {
                         out[pos..pos + 4].copy_from_slice(&[0, 0, 0, 1]);
                         out[pos + 4..pos + 4 + nal.len()].copy_from_slice(nal);
                         pos += 4 + nal.len();
@@ -1548,11 +1542,10 @@ mod tests {
 
     type TestDemux = Mp4Demux<std::io::Cursor<Vec<u8>>>;
 
-    fn test_avc_config() -> AvcDecoderConfig {
-        AvcDecoderConfig {
+    fn test_avc_config() -> crate::codec::annexb::NalConfig {
+        crate::codec::annexb::NalConfig {
             length_size: 4,
-            sps: vec![vec![0x67, 0x42, 0x00, 0x1F]],
-            pps: vec![vec![0x68, 0xCE, 0x3C, 0x80]],
+            params: vec![vec![0x67, 0x42, 0x00, 0x1F], vec![0x68, 0xCE, 0x3C, 0x80]],
         }
     }
 

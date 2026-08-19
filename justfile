@@ -101,8 +101,8 @@ check-feature-gates:
 # test there is a bit-exact comparison against the software decoder, and video
 # decoding is normative enough that "close enough" is not a thing.
 check-vaapi:
-    cargo nextest run --features vaapi,mkv-demux,vpx,h264
-    cargo clippy --all-targets --features vaapi,mkv-demux,vpx,h264 -- -D warnings
+    cargo nextest run --features vaapi,mkv-demux,mp4-demux,vpx,h264
+    cargo clippy --all-targets --features vaapi,mkv-demux,mp4-demux,vpx,h264 -- -D warnings
 
 # Check + test + lint the V4L2 M2M hardware encoder (mirrors CI's test-v4l2-m2m job).
 # Needs libclang + kernel headers (on immutable Fedora: run inside a toolbox).

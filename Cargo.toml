@@ -121,7 +121,7 @@ h264-reader = { version = "0.8", optional = true }
 #
 # Pinned exactly, like `v4l2r` and `oxideav-ac3`, and kept behind
 # `src/gpu/vaapi/` so switching back to upstream is a one-module change.
-cros-codecs = { package = "cros-codecs-extended", version = "=0.0.5-extended.2", optional = true, default-features = false, features = ["vaapi"] }
+cros-codecs = { package = "cros-codecs-extended", version = "=0.0.5-extended.2", optional = true, default-features = false, features = ["vaapi", "h265"] }
 
 # AV1 software codecs (optional)
 # rav1e: use default-features=false to skip asm (slower), or install nasm for optimized builds

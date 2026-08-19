@@ -9,8 +9,8 @@
 #![cfg(all(feature = "vaapi", feature = "mkv-demux"))]
 
 use parallax::element::{Demuxer, DemuxerProduce, Element};
-use parallax::elements::demux::MkvDemux;
 use parallax::elements::VaapiDecoder;
+use parallax::elements::demux::MkvDemux;
 use std::io::Cursor;
 
 const VP9_OPUS_WEBM: &[u8] = include_bytes!("fixtures/tiny_vp9_opus.webm");
@@ -18,6 +18,9 @@ const VP9_OPUS_WEBM: &[u8] = include_bytes!("fixtures/tiny_vp9_opus.webm");
 const H264_AAC_MKV: &[u8] = include_bytes!("fixtures/tiny_h264_aac.mkv");
 #[cfg(feature = "vpx")]
 const VP8_VORBIS_WEBM: &[u8] = include_bytes!("fixtures/tiny_vp8_vorbis.webm");
+const HEVC_MKV: &[u8] = include_bytes!("fixtures/tiny_hevc.mkv");
+#[cfg(feature = "mp4-demux")]
+const HEVC_MP4: &[u8] = include_bytes!("fixtures/tiny_hevc.mp4");
 
 /// One decoded frame, as the pipeline would see it.
 struct Frame {
@@ -87,7 +90,10 @@ fn vp9_decodes_the_whole_fixture_on_hardware() {
         assert_eq!(f.bytes.len(), 64 * 64 * 3 / 2, "packed NV12 payload");
     }
     let pts: Vec<u64> = frames.iter().map(|f| f.pts_ms).collect();
-    assert!(pts.windows(2).all(|w| w[0] < w[1]), "monotonic PTS: {pts:?}");
+    assert!(
+        pts.windows(2).all(|w| w[0] < w[1]),
+        "monotonic PTS: {pts:?}"
+    );
     assert_eq!(pts[0], 0);
 }
 
@@ -190,4 +196,68 @@ fn h264_hardware_decode_is_bit_exact_with_software() {
         H264_AAC_MKV,
     );
     assert_bit_exact(&hw, &sw);
+}
+
+/// HEVC has no software decoder in this tree, so there is nothing to compare
+/// it against byte for byte. What there *is* is two independent container
+/// paths to the same elementary stream — Matroska's `hvcC` in CodecPrivate
+/// and MP4's in the sample entry — and they must produce identical pictures.
+/// A mistake in either parameter-set path shows up as one side failing to
+/// decode or the two disagreeing.
+#[cfg(feature = "mp4-demux")]
+#[test]
+fn hevc_decodes_identically_from_both_containers() {
+    let hw = |data| match VaapiDecoder::h265() {
+        Ok(dec) => Some(drive(dec, data)),
+        Err(e) => {
+            eprintln!("skipping: no VA-API HEVC decoder here — {e}");
+            None
+        }
+    };
+    let Some(from_mkv) = hw(HEVC_MKV) else { return };
+    let from_mp4 = {
+        use parallax::element::{Demuxer, DemuxerProduce};
+        use parallax::elements::demux::{Mp4Demux, Mp4DemuxSource};
+        let mut demux = Mp4DemuxSource::new(
+            Mp4Demux::new(
+                std::io::Cursor::new(HEVC_MP4.to_vec()),
+                HEVC_MP4.len() as u64,
+            )
+            .expect("fixture parses"),
+        );
+        let mut dec = VaapiDecoder::h265().expect("checked above");
+        let mut frames = Vec::new();
+        loop {
+            match demux.produce().expect("demux") {
+                DemuxerProduce::Routed(routed) => {
+                    for (_, buf) in routed {
+                        if let Some(out) = dec.process(buf).expect("decode") {
+                            frames.push(out);
+                        }
+                    }
+                }
+                DemuxerProduce::Eos => break,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        while let Some(out) = dec.flush().expect("flush") {
+            frames.push(out);
+        }
+        frames
+    };
+
+    assert_eq!(
+        from_mkv.len(),
+        10,
+        "all fixture frames decoded from Matroska"
+    );
+    assert_eq!(from_mp4.len(), from_mkv.len(), "same frame count from MP4");
+    for (i, (m, p)) in from_mkv.iter().zip(&from_mp4).enumerate() {
+        assert_eq!(m.dims, (320, 240));
+        assert_eq!(
+            m.bytes,
+            p.as_bytes(),
+            "frame {i} differs between the Matroska and MP4 paths"
+        );
+    }
 }

@@ -37,6 +37,7 @@
 
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::clock::ClockTime;
+use crate::codec::annexb::{NalConfig, parse_avcc, parse_hvcc};
 use crate::error::{Error, Result};
 use crate::memory::{OutputArena, OutputBudget, defaults};
 use crate::metadata::{BufferFlags, Metadata};
@@ -209,58 +210,6 @@ pub struct MkvTrack {
     pub audio_info: Option<MkvAudioInfo>,
 }
 
-// ============================================================================
-// avcC parsing (Matroska keeps H.264 parameter sets in CodecPrivate)
-// ============================================================================
-
-/// Parsed avcC decoder configuration from a track's CodecPrivate.
-struct AvcConfig {
-    /// NAL length prefix size in bytes (1, 2 or 4).
-    length_size: u8,
-    /// Raw SPS NALs (no start codes).
-    sps: Vec<Vec<u8>>,
-    /// Raw PPS NALs (no start codes).
-    pps: Vec<Vec<u8>>,
-}
-
-/// Parse an AVCDecoderConfigurationRecord (ISO 14496-15 §5.3.3.1).
-fn parse_avcc(data: &[u8]) -> Result<AvcConfig> {
-    let err = || Error::Config("truncated avcC record in CodecPrivate".into());
-    if data.len() < 7 || data[0] != 1 {
-        return Err(Error::Config(format!(
-            "CodecPrivate is not an avcC record (len {}, version {})",
-            data.len(),
-            data.first().copied().unwrap_or(0)
-        )));
-    }
-    let length_size = (data[4] & 0x03) + 1;
-    let mut pos = 5usize;
-    let read_sets = |pos: &mut usize, count: usize| -> Result<Vec<Vec<u8>>> {
-        let mut sets = Vec::with_capacity(count);
-        for _ in 0..count {
-            let len = data
-                .get(*pos..*pos + 2)
-                .map(|b| u16::from_be_bytes([b[0], b[1]]) as usize)
-                .ok_or_else(err)?;
-            *pos += 2;
-            sets.push(data.get(*pos..*pos + len).ok_or_else(err)?.to_vec());
-            *pos += len;
-        }
-        Ok(sets)
-    };
-    let num_sps = (*data.get(pos).ok_or_else(err)? & 0x1f) as usize;
-    pos += 1;
-    let sps = read_sets(&mut pos, num_sps)?;
-    let num_pps = *data.get(pos).ok_or_else(err)? as usize;
-    pos += 1;
-    let pps = read_sets(&mut pos, num_pps)?;
-    Ok(AvcConfig {
-        length_size,
-        sps,
-        pps,
-    })
-}
-
 /// VP9 uncompressed-header keyframe probe (profiles 0–3).
 ///
 /// Used only when the container stores the frame in a BlockGroup without a
@@ -313,7 +262,7 @@ pub struct MkvDemux<R: Read + Seek> {
     /// `(track_number, pad)` for each routed track.
     routed: Vec<(u64, crate::element::PadId)>,
     /// avcC config of the routed H.264 video track, if any.
-    avc_config: Option<AvcConfig>,
+    nal_config: Option<NalConfig>,
     /// Bytes to prepend per frame for tracks using header-stripping
     /// compression, keyed like `routed`.
     stripped_prefix: Vec<(u64, Vec<u8>)>,
@@ -440,7 +389,7 @@ impl<R: Read + Seek> MkvDemux<R> {
             timestamp_scale,
             outputs: Vec::new(),
             routed: Vec::new(),
-            avc_config: None,
+            nal_config: None,
             stripped_prefix: Vec::new(),
             default_duration_ns: Vec::new(),
             output: OutputArena::new(defaults::MP4_DEMUX_SLOT_COUNT)
@@ -524,12 +473,18 @@ impl<R: Read + Seek> MkvDemux<R> {
             .iter()
             .find(|t| t.id == id)
             .expect("routed track exists in track table");
-        if track.codec == MkvCodec::H264 {
+        let record = match track.codec {
+            MkvCodec::H264 => Some(("avcC", parse_avcc as fn(&[u8]) -> Result<NalConfig>)),
+            MkvCodec::H265 => Some(("hvcC", parse_hvcc as fn(&[u8]) -> Result<NalConfig>)),
+            _ => None,
+        };
+        if let Some((name, parse)) = record {
             match entry.codec_private() {
-                Some(private) => self.avc_config = Some(parse_avcc(private)?),
+                Some(private) => self.nal_config = Some(parse(private)?),
                 None => tracing::warn!(
-                    "H.264 MKV track {id} has no avcC CodecPrivate; frames pass \
-                     through length-prefixed and will not decode"
+                    "{} MKV track {id} has no {name} CodecPrivate; frames pass \
+                     through length-prefixed and will not decode",
+                    track.codec
                 ),
             }
         }
@@ -624,20 +579,16 @@ impl<R: Read + Seek> MkvDemux<R> {
             .map(|(_, p)| p.as_slice())
             .unwrap_or(&[]);
 
-        let is_h264_video = self.avc_config.is_some()
+        let is_length_prefixed_video = self.nal_config.is_some()
             && self
                 .routed
                 .first()
                 .is_some_and(|(id, pad)| *id == track && pad.0 == 0);
 
-        let handle = if is_h264_video && prefix.is_empty() {
-            let cfg = self.avc_config.as_ref().expect("checked above");
+        let handle = if is_length_prefixed_video && prefix.is_empty() {
+            let cfg = self.nal_config.as_ref().expect("checked above");
             let params_len: usize = if is_keyframe {
-                cfg.sps
-                    .iter()
-                    .chain(cfg.pps.iter())
-                    .map(|n| 4 + n.len())
-                    .sum()
+                cfg.params.iter().map(|n| 4 + n.len()).sum()
             } else {
                 0
             };
@@ -647,7 +598,7 @@ impl<R: Read + Seek> MkvDemux<R> {
                 let out = &mut slot.data_mut()[..total];
                 let mut pos = 0usize;
                 if is_keyframe {
-                    for nal in cfg.sps.iter().chain(cfg.pps.iter()) {
+                    for nal in &cfg.params {
                         out[pos..pos + 4].copy_from_slice(&[0, 0, 0, 1]);
                         out[pos + 4..pos + 4 + nal.len()].copy_from_slice(nal);
                         pos += 4 + nal.len();
@@ -657,19 +608,15 @@ impl<R: Read + Seek> MkvDemux<R> {
                 debug_assert_eq!(pos, total);
             }
             MemoryHandle::with_len(slot, total)
-        } else if is_h264_video {
-            // Header-stripped H.264 (rare): the length prefixes span the
+        } else if is_length_prefixed_video {
+            // Header-stripped (rare): the length prefixes span the
             // prefix/data boundary, so materialize once, then convert.
             let mut joined = Vec::with_capacity(prefix.len() + data.len());
             joined.extend_from_slice(prefix);
             joined.extend_from_slice(data);
-            let cfg = self.avc_config.as_ref().expect("checked above");
+            let cfg = self.nal_config.as_ref().expect("checked above");
             let params_len: usize = if is_keyframe {
-                cfg.sps
-                    .iter()
-                    .chain(cfg.pps.iter())
-                    .map(|n| 4 + n.len())
-                    .sum()
+                cfg.params.iter().map(|n| 4 + n.len()).sum()
             } else {
                 0
             };
@@ -679,7 +626,7 @@ impl<R: Read + Seek> MkvDemux<R> {
                 let out = &mut slot.data_mut()[..total];
                 let mut pos = 0usize;
                 if is_keyframe {
-                    for nal in cfg.sps.iter().chain(cfg.pps.iter()) {
+                    for nal in &cfg.params {
                         out[pos..pos + 4].copy_from_slice(&[0, 0, 0, 1]);
                         out[pos + 4..pos + 4 + nal.len()].copy_from_slice(nal);
                         pos += 4 + nal.len();
@@ -732,13 +679,24 @@ impl<R: Read + Seek> MkvDemux<R> {
             return k;
         }
         match codec {
-            MkvCodec::H264 => {
+            MkvCodec::H264 | MkvCodec::H265 => {
                 // Length-prefixed at this point; walk NALs by prefix.
                 let len_size = self
-                    .avc_config
+                    .nal_config
                     .as_ref()
                     .map(|c| c.length_size as usize)
                     .unwrap_or(4);
+                let is_irap = |first: u8, second: u8| match codec {
+                    // H.264: nal_unit_type 5 is an IDR slice.
+                    MkvCodec::H264 => first & 0x1f == 5,
+                    // HEVC: types 16..=23 are the IRAP set (BLA, IDR, CRA),
+                    // and the type lives in the first byte's bits 1..6 of a
+                    // two-byte header.
+                    _ => {
+                        let _ = second;
+                        matches!((first >> 1) & 0x3f, 16..=23)
+                    }
+                };
                 let mut pos = 0usize;
                 while pos + len_size <= data.len() {
                     let mut len = 0usize;
@@ -747,7 +705,7 @@ impl<R: Read + Seek> MkvDemux<R> {
                     }
                     pos += len_size;
                     if let Some(&first) = data.get(pos)
-                        && first & 0x1f == 5
+                        && is_irap(first, data.get(pos + 1).copied().unwrap_or(0))
                     {
                         return true;
                     }
@@ -1312,8 +1270,44 @@ mod tests {
 
         let cfg = parse_avcc(&avcc).unwrap();
         assert_eq!(cfg.length_size, 4);
-        assert_eq!(cfg.sps, vec![sps.to_vec()]);
-        assert_eq!(cfg.pps, vec![pps.to_vec()]);
+        assert_eq!(cfg.params, vec![sps.to_vec(), pps.to_vec()], "SPS then PPS");
+    }
+
+    /// hvcC keeps its parameter sets in typed arrays rather than two counted
+    /// lists, and puts the length-prefix width 17 bytes further along.
+    #[test]
+    fn hvcc_parse_extracts_vps_sps_pps_in_order() {
+        let vps = [0x40u8, 0x01, 0x0c];
+        let sps = [0x42u8, 0x01, 0x01];
+        let pps = [0x44u8, 0x01, 0xc1];
+        let mut hvcc = vec![1u8];
+        hvcc.extend_from_slice(&[0; 20]); // profile/tier/level and friends
+        hvcc.push(0xf3); // reserved(6) | lengthSizeMinusOne(2) = 3 -> 4 bytes
+        hvcc.push(3); // three arrays
+        for (nal_type, nal) in [(32u8, &vps[..]), (33, &sps[..]), (34, &pps[..])] {
+            hvcc.push(nal_type);
+            hvcc.extend_from_slice(&1u16.to_be_bytes());
+            hvcc.extend_from_slice(&(nal.len() as u16).to_be_bytes());
+            hvcc.extend_from_slice(nal);
+        }
+
+        let cfg = parse_hvcc(&hvcc).unwrap();
+        assert_eq!(cfg.length_size, 4);
+        assert_eq!(
+            cfg.params,
+            vec![vps.to_vec(), sps.to_vec(), pps.to_vec()],
+            "VPS, SPS, PPS in the order the record listed them"
+        );
+    }
+
+    #[test]
+    fn hvcc_parse_rejects_garbage() {
+        assert!(parse_hvcc(&[]).is_err());
+        assert!(parse_hvcc(&[2; 32]).is_err(), "wrong version");
+        let mut truncated = vec![1u8];
+        truncated.extend_from_slice(&[0; 21]);
+        truncated.push(1); // claims one array, then stops
+        assert!(parse_hvcc(&truncated).is_err());
     }
 
     #[test]

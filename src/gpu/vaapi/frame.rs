@@ -245,7 +245,10 @@ impl VaFrame {
         // is still a whole tile in memory.
         let pitch = (coded.width as usize).next_multiple_of(TILE_WIDTH);
         let luma_rows = (coded.height as usize).next_multiple_of(TILE_HEIGHT);
-        let chroma_rows = coded.height.div_ceil(2).next_multiple_of(TILE_HEIGHT as u32) as usize;
+        let chroma_rows = coded
+            .height
+            .div_ceil(2)
+            .next_multiple_of(TILE_HEIGHT as u32) as usize;
         let luma = pitch * luma_rows;
         let chroma = pitch * chroma_rows;
         // udmabuf requires a page-multiple size.
