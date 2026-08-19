@@ -413,8 +413,7 @@ mod hardware_tests {
             width: w,
             height: h,
         };
-        let Ok(mut frame) = VaFrame::new(res(W as u32, H as u32), res(W as u32, H as u32))
-        else {
+        let Ok(mut frame) = VaFrame::new(res(W as u32, H as u32), res(W as u32, H as u32)) else {
             eprintln!("skipping: /dev/udmabuf unavailable");
             return;
         };
