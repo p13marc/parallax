@@ -17,6 +17,24 @@ env:
   # on vm-runner-01; S3 endpoint+credentials come from the runner's env_file
   RUSTC_WRAPPER: /srv/cache/bin/sccache
   CARGO_INCREMENTAL: "0"
+  # The runner has 1.7 GiB of RAM and no swap (#203). rustc compiling the
+  # parallax lib with the sensor feature set was being SIGKILLed by the OOM
+  # killer — "sccache: Compile terminated by signal 9" — which is why jobs
+  # failed scattered and unreproducibly, depending on what was co-running.
+  # Two levers, both free here:
+  #
+  #   debuginfo   dominates rustc's peak RSS and is worth nothing to a CI job
+  #               that only checks, lints or runs tests. Note cargo applies
+  #               the *dev* profile's debug setting to the test profile too,
+  #               but set both so a future profile split cannot regress it.
+  #   jobs=1      one rustc at a time. Slower, but two large crates in
+  #               parallel do not fit in 1.7 GiB whatever else is done.
+  #
+  # The durable fix is more memory (or any swap at all) on the runner; until
+  # then these keep the matrix green.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_BUILD_JOBS: "1"
 
 jobs:
   fmt:
