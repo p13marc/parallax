@@ -1,11 +1,16 @@
-//! GPU acceleration module for hardware video encoding/decoding.
+//! Hardware video decode.
 //!
-//! This module provides hardware-accelerated video decode using Vulkan Video.
-//! Implemented today: H.264 decode (progressive 8-bit 4:2:0,
-//! Baseline/Main/High) with real command submission, POC/DPB reference
-//! management, and RAII GPU memory. H.265/AV1 exist only as enum arms and
-//! encode only as an unimplemented trait (`HwVideoEncoder`) — see #3 for
-//! the hardware-validation status.
+//! Two backends, complementary rather than rival, and only the *software*
+//! decoders are a fallback for either:
+//!
+//! - `vaapi` — the path that runs on commodity Intel and AMD graphics
+//!   today, and the one validated on this project's reference device
+//!   (Comet Lake Gen9.5). H.264, HEVC, VP8 and VP9 decode, each checked
+//!   bit-exact against its software counterpart where one exists.
+//! - `vulkan` — Vulkan Video, targeting newer hardware (Gen12+ / RADV).
+//!   H.264 decode is fully wired (real command submission, POC/DPB
+//!   reference management, RAII GPU memory) but **unvalidated on silicon**;
+//!   H.265/AV1 are enum arms and encode is an unimplemented trait. See #3.
 //!
 //! # Architecture
 //!

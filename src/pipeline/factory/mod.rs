@@ -18,7 +18,8 @@ mod basics;
     feature = "vpx",
     feature = "opus",
     feature = "image-jpeg",
-    feature = "image-png"
+    feature = "image-png",
+    feature = "vaapi"
 ))]
 mod codec;
 mod device;
@@ -46,6 +47,10 @@ pub type ElementConstructor = fn(&Props) -> Result<Box<DynAsyncElement<'static>>
 /// Kept unconditional so a build without the feature can say *why* a name is
 /// unavailable. `--list-elements` in parallax-launch prints these too.
 pub const GATED_ELEMENTS: &[(&str, &str)] = &[
+    ("vaapih264dec", "vaapi"),
+    ("vaapih265dec", "vaapi"),
+    ("vaapivp8dec", "vaapi"),
+    ("vaapivp9dec", "vaapi"),
     ("autovideosink", "display"),
     ("v4l2src", "v4l2"),
     ("alsasrc", "alsa"),
@@ -119,7 +124,8 @@ impl ElementFactory {
             feature = "vpx",
             feature = "opus",
             feature = "image-jpeg",
-            feature = "image-png"
+            feature = "image-png",
+            feature = "vaapi"
         ))]
         codec::register(&mut factory);
         device::register(&mut factory);

@@ -501,7 +501,7 @@ impl Element for VaapiDecoder {
     }
 
     /// Access units are queued rather than dropped when the decoder stalls,
-    /// so up to [`MAX_PENDING_INPUT`] upstream buffers can be pinned here.
+    /// so up to `MAX_PENDING_INPUT` upstream buffers can be pinned here.
     /// Declaring it is what sizes the *producer's* arena to survive it (#189).
     fn retained_buffers(&self) -> usize {
         MAX_PENDING_INPUT

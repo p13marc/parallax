@@ -1,7 +1,7 @@
 //! VA-API hardware video decode (#193).
 //!
 //! The hardware-decode backend that is actually validatable on commodity
-//! Intel and AMD graphics, unlike Vulkan Video ([`crate::gpu::vulkan`], #3,
+//! Intel and AMD graphics, unlike Vulkan Video (`crate::gpu::vulkan`, #3,
 //! which needs Gen12+ / RADV). Decode work runs on the GPU's fixed-function
 //! video engine; the CPU cost of a decoded frame collapses to the readback.
 //!

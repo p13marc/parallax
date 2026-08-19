@@ -12,7 +12,8 @@ use crate::element::DynAsyncElement;
     feature = "av1-decode",
     feature = "vpx",
     feature = "image-jpeg",
-    feature = "image-png"
+    feature = "image-png",
+    feature = "vaapi"
 ))]
 use crate::element::ElementAdapter;
 #[cfg(feature = "opus")]
@@ -33,6 +34,17 @@ pub(super) fn register(f: &mut ElementFactory) {
     {
         f.register("vp8dec", create_vp8dec);
         f.register("vp9dec", create_vp9dec);
+    }
+    // Naming a hardware decoder explicitly means "I want the video engine":
+    // unlike the player's probe-and-fall-back dispatch, construction failing
+    // here is an error, because the caller asked for this element and not
+    // "whatever can decode H.264".
+    #[cfg(feature = "vaapi")]
+    {
+        f.register("vaapih264dec", create_vaapih264dec);
+        f.register("vaapih265dec", create_vaapih265dec);
+        f.register("vaapivp8dec", create_vaapivp8dec);
+        f.register("vaapivp9dec", create_vaapivp9dec);
     }
     #[cfg(feature = "opus")]
     {
@@ -173,6 +185,38 @@ fn create_vp9dec(_props: &Props) -> Result<Box<DynAsyncElement<'static>>> {
     use crate::elements::codec::VpxDecoder;
     Ok(DynAsyncElement::new_box(ElementAdapter::new(
         VpxDecoder::vp9()?,
+    )))
+}
+
+#[cfg(feature = "vaapi")]
+fn create_vaapih264dec(_props: &Props) -> Result<Box<DynAsyncElement<'static>>> {
+    use crate::elements::VaapiDecoder;
+    Ok(DynAsyncElement::new_box(ElementAdapter::new(
+        VaapiDecoder::h264()?,
+    )))
+}
+
+#[cfg(feature = "vaapi")]
+fn create_vaapih265dec(_props: &Props) -> Result<Box<DynAsyncElement<'static>>> {
+    use crate::elements::VaapiDecoder;
+    Ok(DynAsyncElement::new_box(ElementAdapter::new(
+        VaapiDecoder::h265()?,
+    )))
+}
+
+#[cfg(feature = "vaapi")]
+fn create_vaapivp8dec(_props: &Props) -> Result<Box<DynAsyncElement<'static>>> {
+    use crate::elements::VaapiDecoder;
+    Ok(DynAsyncElement::new_box(ElementAdapter::new(
+        VaapiDecoder::vp8()?,
+    )))
+}
+
+#[cfg(feature = "vaapi")]
+fn create_vaapivp9dec(_props: &Props) -> Result<Box<DynAsyncElement<'static>>> {
+    use crate::elements::VaapiDecoder;
+    Ok(DynAsyncElement::new_box(ElementAdapter::new(
+        VaapiDecoder::vp9()?,
     )))
 }
 
