@@ -121,7 +121,25 @@ h264-reader = { version = "0.8", optional = true }
 #
 # Pinned exactly, like `v4l2r` and `oxideav-ac3`, and kept behind
 # `src/gpu/vaapi/` so switching back to upstream is a one-module change.
-cros-codecs = { package = "cros-codecs-extended", version = "=0.0.5-extended.2", optional = true, default-features = false, features = ["vaapi", "h265"] }
+#
+# This is the plain crates.io release, deliberately: a `[patch.crates-io]`
+# pointing at a fork used to live at the bottom of this file, and it was
+# removed for 0.7.0 because `[patch]` is workspace-local — cargo strips it
+# from the published manifest, so it never reached a crates.io consumer and
+# our build was the only one it fixed (#202). What the fork fixed is that
+# `VaapiBackend::new` builds its throwaway init config from a hardcoded
+# `VAProfileH264Main` whatever codec the decoder is for, and `.expect()`s
+# it; `VaDisplay::supports_backend_init` now asks that question before any
+# decoder is constructed, so the panic became a fallback `Err` for everyone
+# instead of for us alone. Upstreaming is #200.
+#
+# No `h265` feature, and that is the same story one step further along. The
+# published release does not *compile* with it: `h265/vaapi.rs` hands
+# `VaapiBackend::new` an `Rc<Display>` where every other codec hands an `Arc`
+# (#200 again). A capability probe cannot rescue a type error, so HEVC
+# hardware decode waits for the upstream fix rather than shipping a feature
+# that fails to build for everyone who is not us (#202).
+cros-codecs = { package = "cros-codecs-extended", version = "=0.0.5-extended.2", optional = true, default-features = false, features = ["vaapi"] }
 
 # AV1 software codecs (optional)
 # rav1e: use default-features=false to skip asm (slower), or install nasm for optimized builds
@@ -443,29 +461,3 @@ name = "56_typefind"
 
 [[example]]
 name = "60_ipc"
-
-# `cros-codecs-extended` with the fixes from #200 applied (fork branch
-# `fix-init-profile`, three commits, each ready to send upstream).
-#
-# Hosted on this project's own forge rather than a third-party one: a `git`
-# dependency is fetched on every clean build, including CI's, and that is a
-# host the build then depends on.
-#
-# The load-bearing one: `VaapiBackend::new` builds its throwaway 16x16 init
-# config from a hardcoded `VAProfileH264Main` *whatever codec the decoder is
-# for*, and `.expect()`s it — so it panics while decoding VP9 on a driver
-# built without H.264, which is exactly what a patent-free driver package is
-# (Fedora's `libva-intel-media-driver`). `new_sequence` replaces that config
-# with the stream's real profile immediately, so the hardcoded one is pure
-# placeholder; the fork takes the profile from the caller and returns `Err`
-# instead of aborting the process. Without it hardware decode cannot run at
-# all on this project's reference device.
-#
-# Pinned by `rev`, not `branch`: a branch resolves into `Cargo.lock` once and
-# then silently moves under `cargo update`.
-#
-# `[patch]` is workspace-local and is not honoured for crates.io consumers of
-# `parallax-pipeline`, so a crates.io build with `--features vaapi` still
-# resolves the unpatched dependency. See the `vaapi` feature's own comment.
-[patch.crates-io]
-cros-codecs-extended = { git = "https://git.marcpardo.eu/marcpardo/cros-codecs-extended.git", rev = "f75c09bc0c65755c236e75de4bcfedb398c56d95" }

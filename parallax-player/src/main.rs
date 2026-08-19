@@ -766,18 +766,15 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
             Some(hw) => pipeline.add_filter("decode", hw),
             None => pipeline.add_filter("decode", H264Decoder::new()?),
         },
-        // HEVC is the one codec with no software decoder behind it, so the
-        // fallback is an error rather than a slower path — and it says which
-        // of the two reasons applies, because "install a different driver
-        // package" and "this GPU cannot do it" need different answers.
-        VideoCodecKind::H265 => match hw_decoder(args.hwdec, parallax::gpu::Codec::H265, "H.265") {
-            Some(hw) => pipeline.add_filter("decode", hw),
-            None => bail!(
-                "H.265 needs hardware decode — parallax has no software HEVC decoder. \
-                 Check `vainfo`: patent-free driver builds omit HEVC on hardware that \
-                 has the engine (on Fedora, RPM Fusion's intel-media-driver has it)"
-            ),
-        },
+        // HEVC has neither a software decoder in this tree nor, for now, a
+        // hardware one: `cros-codecs`' `h265` feature does not compile against
+        // its published release (#200), so it is not built. The container side
+        // still reads the track, which is why this is a clean message rather
+        // than a demux failure.
+        VideoCodecKind::H265 => bail!(
+            "H.265 is not supported: parallax has no software HEVC decoder, and \
+             hardware HEVC is disabled pending an upstream cros-codecs fix (#200)"
+        ),
         VideoCodecKind::Vp8 => match hw_decoder(args.hwdec, parallax::gpu::Codec::Vp8, "VP8") {
             Some(hw) => pipeline.add_filter("decode", hw),
             None => pipeline.add_filter("decode", VpxDecoder::vp8()?),

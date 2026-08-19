@@ -68,7 +68,7 @@ Feature-gated:
 | `av1enc` | `av1-encode` | `speed`, `quantizer`, `bitrate` |
 | `av1dec` | `av1-decode` | `threads` (0 = auto), `max-frame-delay` (0 = auto; small values bound dav1d's picture pool and latency but measurably raise decode CPU — constrained frame-threading keeps the workers busier), `apply-grain` (bool, default true) |
 | `vp8dec` / `vp9dec` | `vpx` | — |
-| `vaapih264dec` / `vaapih265dec` / `vaapivp8dec` / `vaapivp9dec` | `vaapi` | — (naming one asks for the video engine: construction failing is an error, not a fallback) |
+| `vaapih264dec` / `vaapivp8dec` / `vaapivp9dec` | `vaapi` | — (naming one asks for the video engine: construction failing is an error, not a fallback) |
 | `opusenc` | `opus` | `rate` (48000), `channels` (2), `bitrate` (128000), `application` = audio\|voip\|lowdelay (S16 input) |
 | `opusdec` | `opus` | `rate` (48000), `channels` (2) |
 | `jpegenc` / `jpegdec` | `image-jpeg` | enc: `quality` |
@@ -303,7 +303,7 @@ Codec surface rule (#160): video decoders implement `Element` directly; audio co
 | AAC encode | `AacEncoder` (impl `AudioEncoder`) | `aac-encode` | FDK-AAC — **license restrictions for commercial use** |
 | JPEG | `JpegEncoder` / `JpegDecoder` | `image-jpeg` | zune-jpeg + jpeg-encoder, pure Rust |
 | PNG | `PngEncoder` / `PngDecoder` | `image-png` | png crate, pure Rust |
-| **Hardware decode (VA-API)** | `VaapiDecoder::{h264,h265,vp8,vp9}()` / `open(Codec)` (impl `Element`) | `vaapi` | Intel/AMD video engine, one element for any codec. Packed NV12 out. Construction returns `Err` with the reason so the caller can fall back to software — except HEVC, which has no software decoder here. Needs libva-devel + libclang to build, a VA driver and `/dev/udmabuf` at runtime. Measured −77% player CPU at 1080p H.264, −47% at 1440p VP9 on Comet Lake Gen9.5 |
+| **Hardware decode (VA-API)** | `VaapiDecoder::{h264,vp8,vp9}()` / `open(Codec)` (impl `Element`) | `vaapi` | Intel/AMD video engine, one element for any codec. Packed NV12 out. Construction returns `Err` with the reason so the caller can fall back to software. HEVC is **not** built — see below. Needs libva-devel + libclang to build, a VA driver and `/dev/udmabuf` at runtime. Measured −77% player CPU at 1080p H.264, −47% at 1440p VP9 on Comet Lake Gen9.5 |
 | GPU H.264 decode (Vulkan Video) | `HwDecoderElement` | `vulkan-video` | Fully wired but **unvalidated on hardware** (#3); needs Gen12+/RADV. Prefer `vaapi` where it is available |
 
 ### Hardware decode: what your driver decodes is a packaging question
@@ -317,9 +317,21 @@ string from a failed construction says which codecs the driver admitted to.
 
 The player treats that as a fallback: `--hwdec auto` (the default) tries
 hardware, logs the reason if there isn't any, and uses the software decoder.
-`--hwdec off` never mentions VA-API at all. HEVC is the exception — there is
-no software HEVC decoder in this tree, so a driver without it means the
-stream cannot be played, and the error says so rather than pretending.
+`--hwdec off` never mentions VA-API at all.
+
+Two limitations are dependency-shaped rather than hardware-shaped, both
+tracked in #200:
+
+- **HEVC is not built.** `cros-codecs`' `h265` feature does not compile
+  against its published release, so `VaapiDecoder::open(Codec::H265)` errors
+  and there is no software HEVC decoder behind it. The demuxers still parse
+  the track (`hvcC` from both Matroska and MP4), so this is a clean "not
+  supported" rather than a demux failure.
+- **A driver with no H.264 gets no VA-API at all.** `cros-codecs` initialises
+  every decoder backend with a hardcoded H.264 config and panics when the
+  driver has none, whatever codec was requested, so `VaDisplay::
+  supports_backend_init()` is checked first and VP8/VP9 fall back to software
+  on such a driver. RPM Fusion's `intel-media-driver` avoids it entirely.
 
 Decode output is **Y-tiled** on this driver regardless of the modifier
 requested, so the readback de-tiles as it copies (see the root `CLAUDE.md`

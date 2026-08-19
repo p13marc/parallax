@@ -28,6 +28,11 @@
 //! - A driver can advertise a profile it will not actually build a config
 //!   for, so the only honest probe is to build one — see
 //!   [`VaDisplay::decode_config_works`].
+//! - The decoder library itself asks a question of its own before it asks
+//!   ours: `cros-codecs` initialises every backend with a hardcoded H.264
+//!   config and panics if the driver has none, whatever codec was requested.
+//!   [`VaDisplay::supports_backend_init`] asks it first so the answer is a
+//!   fallback `Err` rather than a dead process (#200, #202).
 
 use std::sync::Arc;
 
@@ -134,6 +139,31 @@ impl VaDisplay {
         })
     }
 
+    /// Whether `cros-codecs` can initialise a decoder backend on this display
+    /// *at all*, whatever codec the caller actually wants.
+    ///
+    /// `VaapiBackend::new` builds a throwaway 16x16 init config from a
+    /// hardcoded `VAProfileH264Main` + `VAEntrypointVLD` — regardless of the
+    /// decoder's codec — and `.expect()`s the result. So on a driver without
+    /// H.264 it takes the process down while decoding VP9, on hardware that
+    /// decodes VP9 perfectly well. Patent-free driver packages are exactly
+    /// that case: Fedora's `libva-intel-media-driver` omits H.264 and HEVC,
+    /// and the same GPU gains them under RPM Fusion's
+    /// `intel-media-driver-freeworld`.
+    ///
+    /// This asks [`decode_config_works`](Self::decode_config_works) rather
+    /// than reading the profile table, because creating the config is the
+    /// same question the backend is about to ask — a driver that advertises
+    /// H.264/VLD and then refuses the config would panic just the same.
+    ///
+    /// The fix belongs upstream (#200), and until it lands this is the only
+    /// thing standing between a crates.io consumer and an aborted process:
+    /// `[patch.crates-io]` was workspace-local and never reached them (#202).
+    /// Delete this once a released `cros-codecs` returns `Err`.
+    pub fn supports_backend_init(&self) -> bool {
+        self.decode_config_works(Codec::H264)
+    }
+
     /// Every codec this display can decode — for diagnostics and for the
     /// `--hwdec` report.
     pub fn decodable(&self) -> Vec<Codec> {
@@ -185,7 +215,12 @@ mod tests {
         match VaDisplay::open() {
             None => eprintln!("no VA display here — software fallback is the answer"),
             Some(d) => {
-                eprintln!("VA-API: {} decodes {:?}", d.vendor(), d.decodable());
+                eprintln!(
+                    "VA-API: {} decodes {:?} (backend init: {})",
+                    d.vendor(),
+                    d.decodable(),
+                    d.supports_backend_init()
+                );
                 // Whatever it reports, it must be self-consistent — and a
                 // codec it advertises must survive the stronger probe, or the
                 // decoder would construct and then fail at the first frame.

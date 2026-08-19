@@ -42,7 +42,6 @@ pub(super) fn register(f: &mut ElementFactory) {
     #[cfg(feature = "vaapi")]
     {
         f.register("vaapih264dec", create_vaapih264dec);
-        f.register("vaapih265dec", create_vaapih265dec);
         f.register("vaapivp8dec", create_vaapivp8dec);
         f.register("vaapivp9dec", create_vaapivp9dec);
     }
@@ -193,14 +192,6 @@ fn create_vaapih264dec(_props: &Props) -> Result<Box<DynAsyncElement<'static>>> 
     use crate::elements::VaapiDecoder;
     Ok(DynAsyncElement::new_box(ElementAdapter::new(
         VaapiDecoder::h264()?,
-    )))
-}
-
-#[cfg(feature = "vaapi")]
-fn create_vaapih265dec(_props: &Props) -> Result<Box<DynAsyncElement<'static>>> {
-    use crate::elements::VaapiDecoder;
-    Ok(DynAsyncElement::new_box(ElementAdapter::new(
-        VaapiDecoder::h265()?,
     )))
 }
 

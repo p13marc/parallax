@@ -27,7 +27,6 @@ use cros_codecs::DecodedFormat;
 use cros_codecs::Resolution;
 use cros_codecs::backend::vaapi::decoder::VaapiDecodedHandle;
 use cros_codecs::decoder::stateless::h264::H264;
-use cros_codecs::decoder::stateless::h265::H265;
 use cros_codecs::decoder::stateless::vp8::Vp8;
 use cros_codecs::decoder::stateless::vp9::Vp9;
 use cros_codecs::decoder::stateless::{DecodeError, StatelessDecoder, StatelessVideoDecoder};
@@ -234,15 +233,6 @@ impl VaapiDecoder {
         Self::open(Codec::Vp8)
     }
 
-    /// A hardware HEVC decoder, or the reason there isn't one.
-    ///
-    /// There is no software HEVC decoder in this tree, so unlike the others
-    /// this one has no fallback behind it: a driver without HEVC means the
-    /// stream cannot be played at all.
-    pub fn h265() -> Result<Self> {
-        Self::open(Codec::H265)
-    }
-
     /// A hardware H.264 decoder, or the reason there isn't one.
     ///
     /// Note that H.264 is absent from patent-free driver builds even on
@@ -293,6 +283,21 @@ impl VaapiDecoder {
             )));
         }
 
+        // Not a question about `codec`: whatever we ask for, `VaapiBackend::new`
+        // builds its init config from a hardcoded H.264 profile and panics if
+        // the driver has none. A library must not abort its caller's process,
+        // so ask first and hand back the fallback Err every caller here already
+        // knows how to handle. Remove when #200 lands upstream.
+        if codec != Codec::H264 && !display.supports_backend_init() {
+            return Err(Error::Element(format!(
+                "vaapi: {} decodes {codec}, but has no H.264 decode config and \
+                 cros-codecs initialises every backend with one (#200) — falling back \
+                 to software. RPM Fusion's intel-media-driver-freeworld carries the \
+                 codecs a patent-free driver build omits",
+                display.vendor(),
+            )));
+        }
+
         let init = |e| Error::Element(format!("vaapi: {codec} decoder init failed: {e:?}"));
         let decoder: Box<dyn StatelessVideoDecoder<Handle = Handle>> = match codec {
             Codec::Vp9 => Box::new(
@@ -307,10 +312,19 @@ impl VaapiDecoder {
                 StatelessDecoder::<Vp8, _>::new_vaapi(display.handle(), BlockingMode::NonBlocking)
                     .map_err(init)?,
             ),
-            Codec::H265 => Box::new(
-                StatelessDecoder::<H265, _>::new_vaapi(display.handle(), BlockingMode::NonBlocking)
-                    .map_err(init)?,
-            ),
+            // HEVC is absent on purpose, not unfinished: `cros-codecs`'
+            // `h265` feature does not compile against its published release
+            // (its constructor takes `Rc<Display>` where the backend wants
+            // `Arc`, #200), and a type error is not something a runtime probe
+            // can fall back from. Enabling it would break the build for every
+            // consumer rather than only degrade it (#202).
+            Codec::H265 => {
+                return Err(Error::Element(
+                    "vaapi: HEVC hardware decode is not built — cros-codecs' h265 \
+                     feature does not compile against its published release (#200)"
+                        .into(),
+                ));
+            }
             other => {
                 return Err(Error::Element(format!(
                     "vaapi: no hardware decoder wired for {other} yet"
@@ -709,8 +723,12 @@ impl Element for VaapiDecoder {
             Codec::Vp9 => "vaapivp9dec",
             Codec::H264 => "vaapih264dec",
             Codec::Vp8 => "vaapivp8dec",
-            Codec::H265 => "vaapih265dec",
             Codec::Av1 => "vaapiav1dec",
+            // Unreachable: `with_display` refuses H.265 before a decoder
+            // exists to be named. Spelled out rather than swept into a
+            // catch-all so that wiring HEVC back up is a compile error here
+            // instead of an element that names itself wrongly at runtime.
+            Codec::H265 => "vaapih265dec",
         }
     }
 

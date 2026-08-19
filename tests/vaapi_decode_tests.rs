@@ -198,66 +198,77 @@ fn h264_hardware_decode_is_bit_exact_with_software() {
     assert_bit_exact(&hw, &sw);
 }
 
-/// HEVC has no software decoder in this tree, so there is nothing to compare
-/// it against byte for byte. What there *is* is two independent container
-/// paths to the same elementary stream — Matroska's `hvcC` in CodecPrivate
-/// and MP4's in the sample entry — and they must produce identical pictures.
-/// A mistake in either parameter-set path shows up as one side failing to
-/// decode or the two disagreeing.
+/// HEVC hardware decode is not built (see `VaapiDecoder::with_display`), but
+/// the container work #193 added for it is, and it is worth keeping honest:
+/// Matroska carries `hvcC` in CodecPrivate and MP4 in the sample entry, both
+/// parsed by the same `annexb::parse_hvcc`, and both must reconstruct the
+/// same elementary stream.
+///
+/// Comparing the two demuxers against each other is the whole point — with no
+/// decoder to check against, agreement between two independent parameter-set
+/// paths is the strongest available statement that either is right. This
+/// needs no GPU, so unlike its neighbours it never skips.
 #[cfg(feature = "mp4-demux")]
 #[test]
-fn hevc_decodes_identically_from_both_containers() {
-    let hw = |data| match VaapiDecoder::h265() {
-        Ok(dec) => Some(drive(dec, data)),
-        Err(e) => {
-            eprintln!("skipping: no VA-API HEVC decoder here — {e}");
-            None
-        }
-    };
-    let Some(from_mkv) = hw(HEVC_MKV) else { return };
-    let from_mp4 = {
-        use parallax::element::{Demuxer, DemuxerProduce};
-        use parallax::elements::demux::{Mp4Demux, Mp4DemuxSource};
-        let mut demux = Mp4DemuxSource::new(
-            Mp4Demux::new(
-                std::io::Cursor::new(HEVC_MP4.to_vec()),
-                HEVC_MP4.len() as u64,
-            )
-            .expect("fixture parses"),
-        );
-        let mut dec = VaapiDecoder::h265().expect("checked above");
-        let mut frames = Vec::new();
+fn hevc_reaches_the_same_elementary_stream_from_both_containers() {
+    fn from_mkv(data: &[u8]) -> Vec<Vec<u8>> {
+        let mut demux = MkvDemux::new(Cursor::new(data.to_vec()))
+            .expect("fixture parses")
+            .video_only();
+        let mut aus = Vec::new();
         loop {
             match demux.produce().expect("demux") {
                 DemuxerProduce::Routed(routed) => {
-                    for (_, buf) in routed {
-                        if let Some(out) = dec.process(buf).expect("decode") {
-                            frames.push(out);
-                        }
-                    }
+                    aus.extend(routed.into_iter().map(|(_, b)| b.as_bytes().to_vec()));
                 }
                 DemuxerProduce::Eos => break,
                 other => panic!("unexpected {other:?}"),
             }
         }
-        while let Some(out) = dec.flush().expect("flush") {
-            frames.push(out);
+        aus
+    }
+
+    fn from_mp4(data: &[u8]) -> Vec<Vec<u8>> {
+        use parallax::elements::demux::{Mp4Demux, Mp4DemuxSource};
+        let mut demux = Mp4DemuxSource::new(
+            Mp4Demux::new(Cursor::new(data.to_vec()), data.len() as u64).expect("fixture parses"),
+        );
+        let mut aus = Vec::new();
+        loop {
+            match demux.produce().expect("demux") {
+                DemuxerProduce::Routed(routed) => {
+                    aus.extend(routed.into_iter().map(|(_, b)| b.as_bytes().to_vec()));
+                }
+                DemuxerProduce::Eos => break,
+                other => panic!("unexpected {other:?}"),
+            }
         }
-        frames
-    };
+        aus
+    }
+
+    let mkv = from_mkv(HEVC_MKV);
+    let mp4: Vec<Vec<u8>> = from_mp4(HEVC_MP4)
+        .into_iter()
+        .filter(|au| !au.is_empty())
+        .collect();
 
     assert_eq!(
-        from_mkv.len(),
+        mkv.len(),
         10,
-        "all fixture frames decoded from Matroska"
+        "all fixture access units came out of Matroska"
     );
-    assert_eq!(from_mp4.len(), from_mkv.len(), "same frame count from MP4");
-    for (i, (m, p)) in from_mkv.iter().zip(&from_mp4).enumerate() {
-        assert_eq!(m.dims, (320, 240));
+    assert_eq!(mp4.len(), mkv.len(), "same access-unit count from MP4");
+
+    // The first access unit carries the parameter sets both containers store
+    // out of band, so if either `hvcC` path is wrong this is where it shows.
+    assert!(
+        mkv[0].windows(4).any(|w| w == [0, 0, 0, 1]),
+        "Matroska path emits Annex-B start codes"
+    );
+    for (i, (m, p)) in mkv.iter().zip(&mp4).enumerate() {
         assert_eq!(
-            m.bytes,
-            p.as_bytes(),
-            "frame {i} differs between the Matroska and MP4 paths"
+            m, p,
+            "access unit {i} differs between the Matroska and MP4 paths"
         );
     }
 }
