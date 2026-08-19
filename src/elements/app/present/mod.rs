@@ -21,6 +21,7 @@ use winit::window::Window;
 pub(crate) mod color;
 #[cfg(feature = "display-gpu")]
 pub(crate) mod dmabuf_import;
+#[cfg(feature = "display-gpu")]
 pub(crate) mod wgpu_backend;
 
 /// Frame data sent to the display thread.

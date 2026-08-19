@@ -70,9 +70,23 @@ bench-media:
 # Check + test + lint the display combo, GPU backend included (#190).
 # Compiles headless (wgpu loads drivers at runtime); the GPU path itself
 # needs a real session to exercise.
+#
+# `display` ALONE is linted too, and not for completeness: everything under
+# `present/` behind `display-gpu` is invisible to the combined build, so a
+# module that loses its cfg gate compiles here and breaks CI's display-check.
+# That has happened.
 check-display:
     cargo nextest run --features display,display-gpu
     cargo clippy --all-targets --features display,display-gpu -- -D warnings
+    cargo clippy --all-targets --features display -- -D warnings
+
+# Vulkan Video (#3). Mirrors CI's vulkan-check, and exists because of root
+# CLAUDE.md gotcha 11b: `elements::codec::hw_encoder`/`hw_decoder` need
+# `vulkan-video` AND a codec feature, so this combination is the only one
+# that compiles them. They had rotted before; a `gpu::Codec` variant added
+# for VA-API broke them again.
+check-vulkan:
+    cargo check --all-targets --features image-jpeg,vulkan-video
 
 # Colorspace SIMD combo (the `yuv` crate) — what parallax-player actually
 # builds with. The scalar arms are the default-feature fallback, so both

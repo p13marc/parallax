@@ -396,5 +396,6 @@ fn codec_name(codec: crate::gpu::Codec) -> &'static str {
         crate::gpu::Codec::H265 => "H.265",
         crate::gpu::Codec::Av1 => "AV1",
         crate::gpu::Codec::Vp9 => "VP9",
+        crate::gpu::Codec::Vp8 => "VP8",
     }
 }

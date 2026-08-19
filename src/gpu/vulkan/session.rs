@@ -237,8 +237,11 @@ impl VideoSession {
             Codec::H264 => vk::VideoCodecOperationFlagsKHR::DECODE_H264,
             Codec::H265 => vk::VideoCodecOperationFlagsKHR::DECODE_H265,
             Codec::Av1 => vk::VideoCodecOperationFlagsKHR::DECODE_AV1,
-            Codec::Vp9 => {
-                return Err(VulkanError::CodecNotSupported(Codec::Vp9).into());
+            // Vulkan Video has no VP9 or VP8 decode operation at all — they
+            // are not in the spec, so this is a permanent absence rather than
+            // something unimplemented here. VA-API decodes both.
+            codec @ (Codec::Vp9 | Codec::Vp8) => {
+                return Err(VulkanError::CodecNotSupported(codec).into());
             }
         };
 
@@ -354,8 +357,11 @@ impl VideoSession {
             Codec::H264 => vk::VideoCodecOperationFlagsKHR::DECODE_H264,
             Codec::H265 => vk::VideoCodecOperationFlagsKHR::DECODE_H265,
             Codec::Av1 => vk::VideoCodecOperationFlagsKHR::DECODE_AV1,
-            Codec::Vp9 => {
-                return Err(VulkanError::CodecNotSupported(Codec::Vp9).into());
+            // Vulkan Video has no VP9 or VP8 decode operation at all — they
+            // are not in the spec, so this is a permanent absence rather than
+            // something unimplemented here. VA-API decodes both.
+            codec @ (Codec::Vp9 | Codec::Vp8) => {
+                return Err(VulkanError::CodecNotSupported(codec).into());
             }
         };
 
