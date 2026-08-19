@@ -35,8 +35,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::thread;
 
-use ashpd::desktop::PersistMode;
-use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
+use ashpd::desktop::screencast::{
+    CursorMode, OpenPipeWireRemoteOptions, Screencast, SelectSourcesOptions, SourceType,
+    StartCastOptions,
+};
+use ashpd::desktop::{CreateSessionOptions, PersistMode};
 use ashpd::enumflags2::BitFlags;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded};
 use pipewire as pw;
@@ -321,7 +324,7 @@ impl ScreenCaptureSrc {
 
         // Create a session
         let session = screencast
-            .create_session()
+            .create_session(CreateSessionOptions::default())
             .await
             .map_err(|e| Error::Device(DeviceError::PipeWire(format!("Session error: {}", e))))?;
 
@@ -344,11 +347,12 @@ impl ScreenCaptureSrc {
         screencast
             .select_sources(
                 &session,
-                cursor_mode,
-                self.config.source_type.to_source_type(),
-                false, // multiple sources
-                restore_token.as_deref(),
-                persist_mode,
+                SelectSourcesOptions::default()
+                    .set_cursor_mode(cursor_mode)
+                    .set_sources(self.config.source_type.to_source_type())
+                    .set_multiple(false)
+                    .set_restore_token(restore_token.as_deref())
+                    .set_persist_mode(persist_mode),
             )
             .await
             .map_err(|e| {
@@ -360,7 +364,7 @@ impl ScreenCaptureSrc {
 
         // Start the screencast
         let response = screencast
-            .start(&session, None)
+            .start(&session, None, StartCastOptions::default())
             .await
             .map_err(|e| Error::Device(DeviceError::PipeWire(format!("Start error: {}", e))))?
             .response()
@@ -388,7 +392,7 @@ impl ScreenCaptureSrc {
 
         // Get the PipeWire remote fd
         let pw_fd = screencast
-            .open_pipe_wire_remote(&session)
+            .open_pipe_wire_remote(&session, OpenPipeWireRemoteOptions::default())
             .await
             .map_err(|e| {
                 Error::Device(DeviceError::PipeWire(format!(

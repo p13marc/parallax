@@ -233,32 +233,34 @@ impl PipeWireSrc {
     #[cfg(feature = "screen-capture")]
     pub async fn screen_capture() -> Result<Self> {
         // Use ashpd to request screen capture permission
-        use ashpd::desktop::PersistMode;
-        use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
+        use ashpd::desktop::screencast::{
+            CursorMode, Screencast, SelectSourcesOptions, SourceType, StartCastOptions,
+        };
+        use ashpd::desktop::{CreateSessionOptions, PersistMode};
 
         let proxy = Screencast::new()
             .await
             .map_err(|e| DeviceError::PipeWire(e.to_string()))?;
 
         let session = proxy
-            .create_session()
+            .create_session(CreateSessionOptions::default())
             .await
             .map_err(|e| DeviceError::PipeWire(e.to_string()))?;
 
         proxy
             .select_sources(
                 &session,
-                CursorMode::Embedded,
-                SourceType::Monitor | SourceType::Window,
-                true, // multiple
-                None, // restore_token
-                PersistMode::DoNot,
+                SelectSourcesOptions::default()
+                    .set_cursor_mode(CursorMode::Embedded)
+                    .set_sources(SourceType::Monitor | SourceType::Window)
+                    .set_multiple(true)
+                    .set_persist_mode(PersistMode::DoNot),
             )
             .await
             .map_err(|e| DeviceError::PipeWire(e.to_string()))?;
 
         let response = proxy
-            .start(&session, None)
+            .start(&session, None, StartCastOptions::default())
             .await
             .map_err(|e| DeviceError::PipeWire(e.to_string()))?
             .response()

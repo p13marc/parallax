@@ -169,7 +169,7 @@ udev = { version = "0.9", features = ["send"], optional = true }
 alsa = { version = "0.12", optional = true }
 
 # XDG Portal (for screen capture permissions on Wayland)
-ashpd = { version = "0.13", optional = true, default-features = false, features = ["tokio"] }
+ashpd = { version = "0.13", optional = true, default-features = false, features = ["tokio", "screencast"] }
 
 # Regex (for RegexFilter)
 regex = "1"
