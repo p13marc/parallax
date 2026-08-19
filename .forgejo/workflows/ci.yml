@@ -146,6 +146,30 @@ jobs:
           cache-targets: false
       - run: cargo clippy --all-targets --features display -- -D warnings
 
+  # The last feature gates nothing else compiles. Not a theoretical gap:
+  # `aac-encode` had been broken since before the version master locked —
+  # `AacEncoder` called an `fdk-aac` signature no published release has — and
+  # no job or recipe ever asked, so nothing reported it. Cheap to hold: all
+  # four are pure-Rust or vendored-source deps that build in seconds.
+  #
+  #   aac-encode  fdk-aac (compiles FDK from source, hence g++)
+  #   websocket   tungstenite
+  #   alsa        libasound2-dev
+  #   v4l2-m2m    v4l2r, bindgen against kernel headers, hence libclang-dev
+  feature-gates:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@v7.0.1
+      - run: sudo apt-get update && sudo apt-get install -y g++ libclang-dev libasound2-dev
+      - uses: https://github.com/dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: https://github.com/Swatinem/rust-cache@v2.9.2
+        with:
+          key: feature-gates
+          cache-targets: false
+      - run: cargo clippy --all-targets --features aac-encode,websocket,alsa,v4l2-m2m -- -D warnings
+
   # The SIMD colorspace arms (the `yuv` crate) are a second implementation of
   # every conversion, selected by a feature no other job enables — and the one
   # parallax-player builds with. Untested, they rot silently (#196).

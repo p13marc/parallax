@@ -81,6 +81,14 @@ check-simd:
     cargo nextest run --features simd-colorspace
     cargo clippy --all-targets --features simd-colorspace -- -D warnings
 
+# Feature gates no other recipe or CI job compiled before this existed.
+# `aac-encode` had rotted un-compiled against an fdk-aac signature that never
+# shipped; mirrors CI's feature-gates job. Needs g++ (fdk-aac builds FDK from
+# source), libclang + kernel headers (v4l2r bindgen) and libasound2/alsa-lib.
+check-feature-gates:
+    cargo nextest run --features aac-encode,websocket,alsa,v4l2-m2m
+    cargo clippy --all-targets --features aac-encode,websocket,alsa,v4l2-m2m -- -D warnings
+
 # Check + test + lint the V4L2 M2M hardware encoder (mirrors CI's test-v4l2-m2m job).
 # Needs libclang + kernel headers (on immutable Fedora: run inside a toolbox).
 # Live queue test: modprobe vicodec, then PARALLAX_VICODEC_TEST_DEVICE=auto just check-m2m
