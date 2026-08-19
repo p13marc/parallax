@@ -59,12 +59,130 @@ const PIPELINE_FRAMES: usize = 6;
 /// stream that never produces output.
 const MAX_PENDING_METADATA: usize = 64;
 
+/// Cap on access units the decoder has not been able to swallow yet.
+///
+/// A stall is normally one `NotEnoughOutputBuffers` cleared by the next
+/// `drain_events`, so this is never approached in a healthy pipeline. It is
+/// a bound rather than an unbounded queue because the alternative to failing
+/// is silently growing, and it is deliberately *not* handled by dropping:
+/// a skipped access unit is a reference frame the decoder never sees, and
+/// everything after it decodes wrong until the next keyframe.
+const MAX_PENDING_INPUT: usize = 8;
+
+/// How many times an access unit may make no progress before its tail is
+/// abandoned.
+///
+/// `decode` returning `Ok(0)` without an error is not something the wired
+/// codecs do — VP9 reports the whole bitstream consumed, H.264 at least one
+/// NAL unit — so this is a spin guard, not a code path with a purpose.
+const MAX_ZERO_PROGRESS: u32 = 2;
+
+/// Consecutive undecodable access units tolerated before giving up.
+///
+/// Matches `H264Decoder`'s policy for `dsRefLost`: after a seek into an
+/// open GOP the leading pictures reference frames that were never decoded,
+/// and refusing them is correct behaviour, not failure. Erring only after a
+/// long run of them keeps a corrupt stream from looping forever.
+const MAX_CONSECUTIVE_REFUSALS: u32 = 300;
+
 /// The decoded-frame handle every codec's decoder produces.
 ///
 /// All of them share one backend, so the handle type does not vary with the
 /// codec — which is what lets one element drive any of them through a
 /// trait object.
 type Handle = std::rc::Rc<std::cell::RefCell<VaapiDecodedHandle<VaFrame>>>;
+
+/// One access unit and how far into it the decoder has got.
+struct PendingAu {
+    buffer: Buffer,
+    offset: usize,
+    /// How many times in a row `decode` reported no progress on it.
+    zero_progress: u32,
+}
+
+/// What [`drive_input`] managed to do with the queue.
+#[derive(Debug, PartialEq, Eq)]
+enum DriveOutcome {
+    /// Every queued access unit was consumed.
+    Drained,
+    /// The decoder could take no more for now; the queue front is where to
+    /// resume. Not an error: the caller drains events and tries again.
+    Stalled,
+}
+
+/// Feed queued access units to `decode`, front first, until one stalls.
+///
+/// Split out from the element so the offset and queue bookkeeping — which is
+/// where all three of the data-loss bugs lived — can be tested without a GPU.
+/// `decode` is the raw call: bytes and PTS in, bytes-consumed out.
+fn drive_input<F>(
+    pending: &mut VecDeque<PendingAu>,
+    refusals: &mut u32,
+    mut decode: F,
+) -> Result<DriveOutcome>
+where
+    F: FnMut(&[u8], u64) -> std::result::Result<usize, DecodeError>,
+{
+    while let Some(au) = pending.front_mut() {
+        let pts = au.buffer.metadata().pts.nanos();
+        let data = au.buffer.as_bytes();
+        if au.offset >= data.len() {
+            pending.pop_front();
+            continue;
+        }
+
+        match decode(&data[au.offset..], pts) {
+            Ok(0) => {
+                au.zero_progress += 1;
+                if au.zero_progress < MAX_ZERO_PROGRESS {
+                    // Give it one more chance after the caller drains events;
+                    // treating it as a stall keeps the unit queued.
+                    return Ok(DriveOutcome::Stalled);
+                }
+                let left = data.len() - au.offset;
+                tracing::warn!(
+                    "vaapi: decoder made no progress on {left} bytes of an access unit;                      abandoning its tail"
+                );
+                pending.pop_front();
+            }
+            Ok(consumed) => {
+                // Advance *before* anything can return: the whole first bug
+                // was reporting a stall while forgetting how far we had got,
+                // so the already-consumed prefix was submitted again.
+                au.offset += consumed;
+                au.zero_progress = 0;
+                *refusals = 0;
+                if au.offset >= data.len() {
+                    pending.pop_front();
+                }
+            }
+            Err(DecodeError::CheckEvents) | Err(DecodeError::NotEnoughOutputBuffers(_)) => {
+                // Back-pressure, not failure. The failing call consumed
+                // nothing, so resuming at `offset` re-offers exactly the unit
+                // that was refused — which is what the trait asks for.
+                return Ok(DriveOutcome::Stalled);
+            }
+            Err(e @ DecodeError::ParseFrameError(_)) => {
+                // An access unit the parser cannot make sense of. After a
+                // seek into an open GOP that is expected, not broken, so it
+                // is skipped like `H264Decoder` skips a lost reference —
+                // fatal only if it never stops.
+                *refusals += 1;
+                if *refusals >= MAX_CONSECUTIVE_REFUSALS {
+                    return Err(Error::Element(format!(
+                        "vaapi: {MAX_CONSECUTIVE_REFUSALS} consecutive access units                          could not be parsed; last error: {e}"
+                    )));
+                }
+                if refusals.is_power_of_two() {
+                    tracing::warn!("vaapi: skipping an unparseable access unit ({e})");
+                }
+                pending.pop_front();
+            }
+            Err(e) => return Err(Error::Element(format!("vaapi: decode failed: {e}"))),
+        }
+    }
+    Ok(DriveOutcome::Drained)
+}
 
 /// A hardware video decoder, whatever codec it was built for.
 pub struct VaapiDecoder {
@@ -77,9 +195,18 @@ pub struct VaapiDecoder {
     pending_meta: VecDeque<Metadata>,
     /// Frames the decoder has finished but we have not emitted yet.
     ready: VecDeque<Handle>,
-    /// An access unit the decoder could not take yet, and how far into it we
-    /// got. Re-offered before anything new.
-    stalled: Option<(Buffer, usize)>,
+    /// Access units the decoder has not finished swallowing, oldest first.
+    ///
+    /// A single slot is not enough: while one unit is stalled the executor
+    /// keeps delivering, and there is nowhere to hand a buffer back to — the
+    /// only recoverable error the executor knows, `PoolExhausted`, makes it
+    /// *shed* the buffer, which for a decoder is the one thing that must
+    /// never happen.
+    pending_input: VecDeque<PendingAu>,
+    /// Consecutive access units the decoder refused to parse.
+    refusals: u32,
+    /// Whether the end-of-stream drain has already been asked for this cycle.
+    eos_drained: bool,
     /// Geometry of the last emitted frame; a change resets the arena.
     last_dims: Option<(u32, u32)>,
     clip: SegmentClip,
@@ -185,7 +312,9 @@ impl VaapiDecoder {
             output: OutputArena::new(defaults::VIDEO_DECODER_SLOT_COUNT),
             pending_meta: VecDeque::new(),
             ready: VecDeque::new(),
-            stalled: None,
+            pending_input: VecDeque::new(),
+            refusals: 0,
+            eos_drained: false,
             last_dims: None,
             clip: SegmentClip::default(),
             frames_out: 0,
@@ -233,42 +362,43 @@ impl VaapiDecoder {
         Ok(())
     }
 
-    /// Feed one access unit, from `offset`, returning how far we got.
+    /// Push queued access units into the decoder until it stops taking them.
     ///
-    /// Returns `Ok(None)` when the decoder could not take it all — the
-    /// caller stashes the remainder rather than dropping it. A decoder must
-    /// never skip an input: it would be a reference frame the decoder never
-    /// sees, and everything after it decodes wrong.
-    fn feed(&mut self, data: &[u8], mut offset: usize, pts: u64) -> Result<Option<usize>> {
-        while offset < data.len() {
-            // Borrow-splitting: the closure needs the pool while `decoder`
-            // is mutably borrowed, so they must be distinct fields here.
-            let pool = &mut self.pool;
-            let mut alloc = || pool.acquire();
+    /// Draining events between attempts is not bookkeeping — it is what
+    /// releases the decoded frame the decoder is waiting for, so a stall that
+    /// looks terminal often clears on the next pass. The loop stops as soon
+    /// as a pass changes nothing, which is the only honest definition of "it
+    /// really cannot take more right now".
+    fn pump(&mut self) -> Result<()> {
+        loop {
+            let progress_marker = self
+                .pending_input
+                .front()
+                .map(|au| (self.pending_input.len(), au.offset));
 
-            match self.decoder.decode(pts, &data[offset..], &mut alloc) {
-                Ok(0) => {
-                    // No progress and no error: nothing more to take from
-                    // this unit.
-                    break;
-                }
-                Ok(consumed) => offset += consumed,
-                Err(DecodeError::CheckEvents) => {
-                    self.drain_events()?;
-                    return Ok(None);
-                }
-                Err(DecodeError::NotEnoughOutputBuffers(_)) => {
-                    // Every frame is in flight downstream. Not an error and
-                    // not a drop — the unit is re-offered once one returns.
-                    self.drain_events()?;
-                    return Ok(None);
-                }
-                Err(e) => {
-                    return Err(Error::Element(format!("vaapi: decode failed: {e}")));
-                }
+            // Borrow-splitting: the allocation closure needs the pool while
+            // `decoder` is mutably borrowed, so they must be distinct fields.
+            let (decoder, pool) = (&mut self.decoder, &mut self.pool);
+            let outcome = drive_input(&mut self.pending_input, &mut self.refusals, |data, pts| {
+                let mut alloc = || pool.acquire();
+                decoder.decode(pts, data, &mut alloc)
+            })?;
+            self.drain_events()?;
+
+            if outcome == DriveOutcome::Drained {
+                return Ok(());
+            }
+            let after = self
+                .pending_input
+                .front()
+                .map(|au| (self.pending_input.len(), au.offset));
+            if after == progress_marker {
+                // The pass moved nothing, so another one would not either.
+                // The queue keeps what it holds; the next `process` or
+                // `flush` will try again once downstream has released a frame.
+                return Ok(());
             }
         }
-        Ok(Some(offset))
     }
 
     /// Copy one decoded frame out of GPU-written memory into an arena slot.
@@ -360,42 +490,57 @@ impl Element for VaapiDecoder {
         self.output.set_budget(budget);
     }
 
+    /// Access units are queued rather than dropped when the decoder stalls,
+    /// so up to [`MAX_PENDING_INPUT`] upstream buffers can be pinned here.
+    /// Declaring it is what sizes the *producer's* arena to survive it (#189).
+    fn retained_buffers(&self) -> usize {
+        MAX_PENDING_INPUT
+    }
+
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
         // No pool is reserved here on purpose. Frame geometry is not known
         // until the decoder has read a sequence header, and reserving before
-        // that would allocate zero-sized frames. The decoder asks for one
-        // only after it reports `FormatChanged`, which `drain_events` turns
-        // into a correctly-sized `resize_pool`; until then an allocation
-        // request answers `None`, which is the ordinary back-pressure stall.
+        // that would ask for zero-sized frames. The decoder requests one only
+        // after it reports `FormatChanged`, which `drain_events` turns into a
+        // correctly-sized `resize_pool`; until then an allocation request
+        // answers `None`, which is the ordinary back-pressure stall.
 
-        // Anything stalled goes first, or the stream reorders itself.
-        if let Some((pending, offset)) = self.stalled.take() {
-            let pts = pending.metadata().pts.nanos();
-            match self.feed(pending.as_bytes(), offset, pts)? {
-                Some(_) => {}
-                None => {
-                    self.stalled = Some((pending, offset));
-                    // Hold the new unit too — but only after the stalled one
-                    // drains, so it is queued rather than dropped.
-                    self.push_meta(buffer.metadata().clone());
-                    return self.next_output();
-                }
-            }
+        if self.pending_input.len() >= MAX_PENDING_INPUT {
+            return Err(Error::Element(format!(
+                "vaapi: {MAX_PENDING_INPUT} access units are queued and the decoder has \
+                 taken none of them — the frame pool ({} frames, {} free) is too small \
+                 for what this graph holds downstream",
+                self.pool.len(),
+                self.pool.available(),
+            )));
         }
 
         self.push_meta(buffer.metadata().clone());
-        let pts = buffer.metadata().pts.nanos();
-        if self.feed(buffer.as_bytes(), 0, pts)?.is_none() {
-            self.stalled = Some((buffer, 0));
-        }
-        self.drain_events()?;
+        self.pending_input.push_back(PendingAu {
+            buffer,
+            offset: 0,
+            zero_progress: 0,
+        });
+        self.eos_drained = false;
+        self.pump()?;
         self.next_output()
     }
 
     fn flush(&mut self) -> Result<Option<Buffer>> {
-        if self.stalled.is_none() && self.ready.is_empty() {
-            // One drain per cycle: `flush` is called repeatedly until it
-            // answers `None`, and asking the decoder twice would restart it.
+        // Whatever is still queued has to reach the decoder before the drain,
+        // or the tail of the stream is simply lost.
+        self.pump()?;
+
+        if !self.eos_drained && self.pending_input.is_empty() && self.ready.is_empty() {
+            // Once per cycle: `flush` is called repeatedly until it answers
+            // `None`, and asking the decoder to drain twice restarts it.
+            self.eos_drained = true;
+            if !self.pending_input.is_empty() {
+                tracing::warn!(
+                    "vaapi: {} access units never reached the decoder before the drain",
+                    self.pending_input.len()
+                );
+            }
             let _ = self.decoder.flush();
             self.drain_events()?;
         }
@@ -412,7 +557,9 @@ impl Element for VaapiDecoder {
             while self.decoder.next_event().is_some() {}
             self.ready.clear();
             self.pending_meta.clear();
-            self.stalled = None;
+            self.pending_input.clear();
+            self.refusals = 0;
+            self.eos_drained = false;
         }
         Some(event)
     }
@@ -474,6 +621,141 @@ impl std::fmt::Debug for VaapiDecoder {
 mod tests {
     use super::*;
 
+    /// An access unit of `len` bytes, PTS `pts`.
+    fn au(arena: &crate::memory::SharedArena, len: usize, pts: u64) -> PendingAu {
+        let slot = arena.acquire().expect("arena not exhausted");
+        let mut metadata = Metadata::default();
+        metadata.pts = ClockTime::from_nanos(pts);
+        PendingAu {
+            buffer: Buffer::new(MemoryHandle::with_len(slot, len), metadata),
+            offset: 0,
+            zero_progress: 0,
+        }
+    }
+
+    fn queue(arena: &crate::memory::SharedArena, lens: &[usize]) -> VecDeque<PendingAu> {
+        lens.iter()
+            .enumerate()
+            .map(|(i, len)| au(arena, *len, i as u64))
+            .collect()
+    }
+
+    /// A stall must not forget how far the decoder got.
+    ///
+    /// The original bug reported the stall without the offset, so the caller
+    /// re-stashed the pre-call one and the already-consumed prefix was
+    /// submitted again. For H.264 that means re-sending an SPS, which can
+    /// itself provoke the next stall — a livelock, not just waste.
+    #[test]
+    fn a_stall_resumes_where_it_stopped() {
+        let arena = crate::memory::SharedArena::new(4096, 4).unwrap();
+        let mut pending = queue(&arena, &[100]);
+        let mut refusals = 0;
+        let mut calls = 0;
+
+        let outcome = drive_input(&mut pending, &mut refusals, |_data, _pts| {
+            calls += 1;
+            match calls {
+                1 => Ok(40),
+                _ => Err(DecodeError::CheckEvents),
+            }
+        })
+        .unwrap();
+
+        assert_eq!(outcome, DriveOutcome::Stalled);
+        assert_eq!(pending.len(), 1, "the unit is kept, not dropped");
+        assert_eq!(pending.front().unwrap().offset, 40, "progress is remembered");
+
+        // Resuming must offer only the remaining 60 bytes.
+        let mut seen = 0;
+        drive_input(&mut pending, &mut refusals, |data, _pts| {
+            seen = data.len();
+            Ok(data.len())
+        })
+        .unwrap();
+        assert_eq!(seen, 60, "resumed at the offset, not from the start");
+        assert!(pending.is_empty());
+    }
+
+    /// A unit arriving while another is stalled is queued behind it, in
+    /// order, and neither is lost.
+    ///
+    /// This is the bug that could not be fixed by returning an error: the
+    /// executor's only recoverable error, `PoolExhausted`, makes it *shed*
+    /// the buffer.
+    #[test]
+    fn a_second_access_unit_waits_its_turn() {
+        let arena = crate::memory::SharedArena::new(4096, 4).unwrap();
+        let mut pending = queue(&arena, &[10, 20]);
+        let mut refusals = 0;
+
+        // Everything stalls at first.
+        let outcome = drive_input(&mut pending, &mut refusals, |_, _| {
+            Err(DecodeError::NotEnoughOutputBuffers(1))
+        })
+        .unwrap();
+        assert_eq!(outcome, DriveOutcome::Stalled);
+        assert_eq!(pending.len(), 2, "both units still queued");
+
+        // Then everything drains, oldest first.
+        let mut order = Vec::new();
+        let outcome = drive_input(&mut pending, &mut refusals, |data, pts| {
+            order.push((pts, data.len()));
+            Ok(data.len())
+        })
+        .unwrap();
+        assert_eq!(outcome, DriveOutcome::Drained);
+        assert_eq!(order, vec![(0, 10), (1, 20)], "decode order preserved");
+        assert!(pending.is_empty());
+    }
+
+    /// `Ok(0)` neither spins forever nor silently abandons the unit on the
+    /// first try: it gets one more pass, then gives up loudly.
+    #[test]
+    fn no_progress_gives_up_rather_than_spinning() {
+        let arena = crate::memory::SharedArena::new(4096, 4).unwrap();
+        let mut pending = queue(&arena, &[64]);
+        let mut refusals = 0;
+
+        let outcome = drive_input(&mut pending, &mut refusals, |_, _| Ok(0)).unwrap();
+        assert_eq!(outcome, DriveOutcome::Stalled, "first zero is a stall");
+        assert_eq!(pending.len(), 1);
+
+        let outcome = drive_input(&mut pending, &mut refusals, |_, _| Ok(0)).unwrap();
+        assert_eq!(outcome, DriveOutcome::Drained);
+        assert!(pending.is_empty(), "the unit is dropped, not retried forever");
+    }
+
+    /// An unparseable unit is skipped like a lost reference, and only a long
+    /// run of them is fatal.
+    #[test]
+    fn unparseable_units_are_skipped_then_eventually_fatal() {
+        let arena = crate::memory::SharedArena::new(4096, 64).unwrap();
+        let mut refusals = 0;
+
+        let mut pending = queue(&arena, &[8]);
+        let outcome = drive_input(&mut pending, &mut refusals, |_, _| {
+            Err(DecodeError::ParseFrameError("bad NAL".to_string()))
+        })
+        .unwrap();
+        assert_eq!(outcome, DriveOutcome::Drained);
+        assert!(pending.is_empty());
+        assert_eq!(refusals, 1);
+
+        // A successful decode clears the count.
+        let mut pending = queue(&arena, &[8]);
+        drive_input(&mut pending, &mut refusals, |d, _| Ok(d.len())).unwrap();
+        assert_eq!(refusals, 0, "one good unit resets the run");
+
+        // A long enough run is fatal.
+        refusals = MAX_CONSECUTIVE_REFUSALS - 1;
+        let mut pending = queue(&arena, &[8]);
+        let err = drive_input(&mut pending, &mut refusals, |_, _| {
+            Err(DecodeError::ParseFrameError("bad NAL".to_string()))
+        });
+        assert!(err.is_err(), "a stream that never parses must not loop forever");
+    }
+
     /// Construction answers rather than panicking, whatever the machine.
     ///
     /// `VaapiBackend::new` panics when config creation fails, so this is
@@ -481,7 +763,7 @@ mod tests {
     /// codec, including ones this machine cannot decode.
     #[test]
     fn construction_answers_on_any_machine() {
-        for codec in [Codec::Vp9, Codec::H264, Codec::H265, Codec::Av1] {
+        for codec in [Codec::Vp9, Codec::Vp8, Codec::H264, Codec::H265, Codec::Av1] {
             match VaapiDecoder::open(codec) {
                 Ok(d) => eprintln!("vaapi {codec}: {d:?}"),
                 Err(e) => eprintln!("vaapi {codec}: unavailable (expected fallback) — {e}"),

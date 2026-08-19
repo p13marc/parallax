@@ -574,7 +574,7 @@ mod tests {
     /// Allocation, geometry and mapping, with no GPU involved — udmabuf is
     /// a kernel facility, not a driver one.
     #[test]
-    fn a_frame_is_linear_nv12_of_the_coded_size() {
+    fn a_frame_is_nv12_of_the_coded_size() {
         let Ok(frame) = VaFrame::new(res(1920, 1088), res(1920, 1080)) else {
             eprintln!("skipping: /dev/udmabuf unavailable");
             return;
