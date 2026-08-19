@@ -26,6 +26,7 @@ use std::collections::VecDeque;
 use cros_codecs::Resolution;
 use cros_codecs::backend::vaapi::decoder::VaapiDecodedHandle;
 use cros_codecs::decoder::stateless::h264::H264;
+use cros_codecs::decoder::stateless::vp8::Vp8;
 use cros_codecs::decoder::stateless::vp9::Vp9;
 use cros_codecs::decoder::stateless::{DecodeError, StatelessDecoder, StatelessVideoDecoder};
 use cros_codecs::decoder::{BlockingMode, DecodedHandle, DecoderEvent};
@@ -97,6 +98,11 @@ impl VaapiDecoder {
         Self::open(Codec::Vp9)
     }
 
+    /// A hardware VP8 decoder, or the reason there isn't one.
+    pub fn vp8() -> Result<Self> {
+        Self::open(Codec::Vp8)
+    }
+
     /// A hardware H.264 decoder, or the reason there isn't one.
     ///
     /// Note that H.264 is absent from patent-free driver builds even on
@@ -129,9 +135,10 @@ impl VaapiDecoder {
     fn with_display(display: &VaDisplay, codec: Codec) -> Result<Self> {
         if !display.supports_decode(codec) {
             return Err(Error::Element(format!(
-                "vaapi: {} decodes {:?}, not {codec} — falling back to software \
-                 (H.264 and HEVC are absent from patent-free driver builds; \
-                 check `vainfo`)",
+                "vaapi: {} decodes {:?}, not {codec} — falling back to software. \
+                 Which codecs a driver offers is a packaging decision as much as a \
+                 hardware one: patent-free builds omit H.264 and HEVC on silicon that \
+                 has the engines. `vainfo` is the ground truth",
                 display.vendor(),
                 display.decodable(),
             )));
@@ -158,6 +165,10 @@ impl VaapiDecoder {
             ),
             Codec::H264 => Box::new(
                 StatelessDecoder::<H264, _>::new_vaapi(display.handle(), BlockingMode::NonBlocking)
+                    .map_err(init)?,
+            ),
+            Codec::Vp8 => Box::new(
+                StatelessDecoder::<Vp8, _>::new_vaapi(display.handle(), BlockingMode::NonBlocking)
                     .map_err(init)?,
             ),
             other => {
@@ -427,6 +438,7 @@ impl Element for VaapiDecoder {
         match self.codec {
             Codec::Vp9 => "vaapivp9dec",
             Codec::H264 => "vaapih264dec",
+            Codec::Vp8 => "vaapivp8dec",
             Codec::H265 => "vaapih265dec",
             Codec::Av1 => "vaapiav1dec",
         }

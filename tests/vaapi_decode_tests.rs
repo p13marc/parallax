@@ -14,6 +14,10 @@ use parallax::elements::VaapiDecoder;
 use std::io::Cursor;
 
 const VP9_OPUS_WEBM: &[u8] = include_bytes!("fixtures/tiny_vp9_opus.webm");
+#[cfg(feature = "h264")]
+const H264_AAC_MKV: &[u8] = include_bytes!("fixtures/tiny_h264_aac.mkv");
+#[cfg(feature = "vpx")]
+const VP8_VORBIS_WEBM: &[u8] = include_bytes!("fixtures/tiny_vp8_vorbis.webm");
 
 /// One decoded frame, as the pipeline would see it.
 struct Frame {
@@ -95,17 +99,13 @@ fn vp9_decodes_the_whole_fixture_on_hardware() {
 /// is also the only test that distinguishes the three ways this can go
 /// wrong: a stride mistake shears the image, a plane-offset mistake shifts
 /// the chroma, and a modifier mistake checkerboards everything.
-#[cfg(feature = "vpx")]
-#[test]
-fn hardware_decode_is_bit_exact_with_software() {
-    use parallax::elements::VpxDecoder;
-
-    let Some(hw_dec) = vp9_hw() else { return };
-    let hw = drive(hw_dec, VP9_OPUS_WEBM);
-    let sw = drive(VpxDecoder::vp9().expect("software VP9"), VP9_OPUS_WEBM);
+/// Compare hardware NV12 against software I420, frame by frame.
+#[cfg(any(feature = "vpx", feature = "h264"))]
+fn assert_bit_exact(hw: &[Frame], sw: &[Frame]) {
+    assert!(!hw.is_empty(), "hardware decoded nothing");
     assert_eq!(hw.len(), sw.len(), "same frame count");
 
-    for (i, (h, s)) in hw.iter().zip(&sw).enumerate() {
+    for (i, (h, s)) in hw.iter().zip(sw).enumerate() {
         let (w, ht) = h.dims;
         let (w, ht) = (w as usize, ht as usize);
         let (cw, ch) = (w.div_ceil(2), ht.div_ceil(2));
@@ -136,4 +136,58 @@ fn hardware_decode_is_bit_exact_with_software() {
             }
         }
     }
+}
+
+#[cfg(feature = "vpx")]
+#[test]
+fn hardware_decode_is_bit_exact_with_software() {
+    let Some(hw_dec) = vp9_hw() else { return };
+    let hw = drive(hw_dec, VP9_OPUS_WEBM);
+    let sw = drive(
+        parallax::elements::VpxDecoder::vp9().expect("software VP9"),
+        VP9_OPUS_WEBM,
+    );
+    assert_bit_exact(&hw, &sw);
+}
+
+/// VP8, the third codec this driver decodes.
+#[cfg(feature = "vpx")]
+#[test]
+fn vp8_hardware_decode_is_bit_exact_with_software() {
+    let hw_dec = match VaapiDecoder::vp8() {
+        Ok(dec) => dec,
+        Err(e) => {
+            eprintln!("skipping: no VA-API VP8 decoder here — {e}");
+            return;
+        }
+    };
+    let hw = drive(hw_dec, VP8_VORBIS_WEBM);
+    let sw = drive(
+        parallax::elements::VpxDecoder::vp8().expect("software VP8"),
+        VP8_VORBIS_WEBM,
+    );
+    assert_bit_exact(&hw, &sw);
+}
+
+/// The same proof for H.264, which is where the corpus really lives.
+///
+/// H.264 is absent from patent-free driver builds even on hardware that has
+/// the engine, so this green-skips more often than the VP9 one — but where
+/// it runs, it runs against `openh264` and must agree byte for byte.
+#[cfg(feature = "h264")]
+#[test]
+fn h264_hardware_decode_is_bit_exact_with_software() {
+    let hw_dec = match VaapiDecoder::h264() {
+        Ok(dec) => dec,
+        Err(e) => {
+            eprintln!("skipping: no VA-API H.264 decoder here — {e}");
+            return;
+        }
+    };
+    let hw = drive(hw_dec, H264_AAC_MKV);
+    let sw = drive(
+        parallax::elements::H264Decoder::new().expect("software H.264"),
+        H264_AAC_MKV,
+    );
+    assert_bit_exact(&hw, &sw);
 }

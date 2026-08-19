@@ -186,8 +186,8 @@ jobs:
       - uses: https://github.com/taiki-e/install-action@v2.86.1
         with:
           tool: cargo-nextest
-      - run: cargo nextest run --features vaapi,mkv-demux,vpx
-      - run: cargo clippy --all-targets --features vaapi,mkv-demux,vpx -- -D warnings
+      - run: cargo nextest run --features vaapi,mkv-demux,vpx,h264
+      - run: cargo clippy --all-targets --features vaapi,mkv-demux,vpx,h264 -- -D warnings
 
   # The SIMD colorspace arms (the `yuv` crate) are a second implementation of
   # every conversion, selected by a feature no other job enables — and the one

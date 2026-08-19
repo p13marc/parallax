@@ -762,7 +762,10 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
             Some(hw) => pipeline.add_filter("decode", hw),
             None => pipeline.add_filter("decode", H264Decoder::new()?),
         },
-        VideoCodecKind::Vp8 => pipeline.add_filter("decode", VpxDecoder::vp8()?),
+        VideoCodecKind::Vp8 => match hw_decoder(args.hwdec, parallax::gpu::Codec::Vp8, "VP8") {
+            Some(hw) => pipeline.add_filter("decode", hw),
+            None => pipeline.add_filter("decode", VpxDecoder::vp8()?),
+        },
         VideoCodecKind::Vp9 => match hw_decoder(args.hwdec, parallax::gpu::Codec::Vp9, "VP9") {
             Some(hw) => pipeline.add_filter("decode", hw),
             None => pipeline.add_filter("decode", VpxDecoder::vp9()?),

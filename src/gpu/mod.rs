@@ -80,6 +80,8 @@ pub enum Codec {
     Av1,
     /// VP9
     Vp9,
+    /// VP8
+    Vp8,
 }
 
 impl std::fmt::Display for Codec {
@@ -89,6 +91,7 @@ impl std::fmt::Display for Codec {
             Codec::H265 => write!(f, "H.265"),
             Codec::Av1 => write!(f, "AV1"),
             Codec::Vp9 => write!(f, "VP9"),
+            Codec::Vp8 => write!(f, "VP8"),
         }
     }
 }

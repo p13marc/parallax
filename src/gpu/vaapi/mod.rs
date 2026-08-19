@@ -137,7 +137,7 @@ impl VaDisplay {
     /// Every codec this display can decode — for diagnostics and for the
     /// `--hwdec` report.
     pub fn decodable(&self) -> Vec<Codec> {
-        [Codec::H264, Codec::H265, Codec::Vp9, Codec::Av1]
+        [Codec::H264, Codec::H265, Codec::Vp9, Codec::Vp8, Codec::Av1]
             .into_iter()
             .filter(|c| self.supports_decode(*c))
             .collect()
@@ -167,6 +167,7 @@ fn profiles_for(codec: Codec) -> &'static [libva::VAProfile::Type] {
         Codec::H265 => &[VAProfileHEVCMain, VAProfileHEVCMain10],
         Codec::Vp9 => &[VAProfileVP9Profile0, VAProfileVP9Profile2],
         Codec::Av1 => &[VAProfileAV1Profile0],
+        Codec::Vp8 => &[VAProfileVP8Version0_3],
     }
 }
 
@@ -204,7 +205,7 @@ mod tests {
     /// never be vacuously false because the table forgot an arm.
     #[test]
     fn every_codec_has_profiles() {
-        for codec in [Codec::H264, Codec::H265, Codec::Vp9, Codec::Av1] {
+        for codec in [Codec::H264, Codec::H265, Codec::Vp9, Codec::Vp8, Codec::Av1] {
             assert!(!profiles_for(codec).is_empty(), "{codec} has no profiles");
         }
     }
