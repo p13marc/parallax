@@ -11,7 +11,7 @@ This guide takes you from an empty project to a running pipeline with custom ele
 
 ```toml
 [dependencies]
-parallax-pipeline = "0.1"   # lib name is `parallax`: code writes `use parallax::...`
+parallax-pipeline = "0.7"   # lib name is `parallax`: code writes `use parallax::...`
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 

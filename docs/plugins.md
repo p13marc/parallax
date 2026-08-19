@@ -27,7 +27,7 @@ edition = "2024"
 crate-type = ["cdylib"]  # Important: creates a .so file
 
 [dependencies]
-parallax-pipeline = "0.1"   # lib name is `parallax`: code still writes `use parallax::...`
+parallax-pipeline = "0.7"   # lib name is `parallax`: code still writes `use parallax::...`
 ```
 
 ### 3. Implement Elements

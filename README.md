@@ -10,9 +10,9 @@ A Rust-native streaming pipeline engine with zero-copy, multi-process shared mem
 
 Parallax lets you build media and data pipelines the way GStreamer does — sources, transforms, sinks, connected into a graph — but with a design that is Rust-first throughout: memfd-backed buffers that are always ready for cross-process sharing, reference counts stored *in* shared memory so they work across processes, a hybrid Tokio + real-time-thread executor inspired by PipeWire, and a typed pipeline API with compile-time type checking.
 
-> **Status:** Parallax is a young project (v0.1, pre-release). The core engine — memory, pipelines, executor, elements, caps negotiation, plugins — is implemented and covered by 1100+ tests. Some subsystems are still scaffolding (see [Project status](#project-status)). Expect API churn before 1.0.
+> **Status:** Parallax is a young project (v0.7, pre-1.0). The core engine — memory, pipelines, executor, elements, caps negotiation, plugins — is implemented and covered by 1700+ tests. Some subsystems are still scaffolding (see [Project status](#project-status)). Expect API churn before 1.0.
 
-**Requirements:** Linux only (memfd_create, SCM_RIGHTS, eventfd) · Rust **1.95+** (edition 2024)
+**Requirements:** Linux only (memfd_create, SCM_RIGHTS, eventfd) · Rust **1.97+** (edition 2024)
 
 ## Highlights
 
@@ -22,6 +22,7 @@ Parallax lets you build media and data pipelines the way GStreamer does — sour
 - **Progressive typing** — build pipelines dynamically from strings (`Pipeline::parse`) or programmatically, or use the typed API (`pipeline(src) >> map(..) >> filter(..)`) with compile-time type checking.
 - **Caps negotiation** — elements declare multiple format+memory capabilities in preference order; the pipeline negotiates per link, including DMA-BUF vs CPU memory selection, and can auto-insert converters (opt-in).
 - **Batteries included** — 100+ built-in elements: file/TCP/UDP/Unix/HTTP/WebSocket/Zenoh I/O, RTP/RTCP/RTSP, MPEG-TS and MP4 mux/demux, HLS/DASH output, V4L2/libcamera/PipeWire/ALSA/screen capture, codecs (H.264, AV1, Opus, AAC, FLAC/MP3/Vorbis, JPEG/PNG), KLV/STANAG metadata, and a rich set of flow/timing/transform utilities.
+- **Hardware decode that stays zero-copy** — VA-API decodes H.264/VP8/VP9 on the GPU's video engine and the decoded dma-buf goes straight to the display without a copy. Measured against the software path at 1080p H.264: 0.54 → 0.12 CPU cores, 88 MB → 34 MB of arena.
 - **Pure Rust where possible** — rav1e, Symphonia, zune-jpeg, png, mp4, mpeg2ts-reader; C libraries only where unavoidable (OpenH264, dav1d, libopus, FDK-AAC).
 - **Observability** — pipeline bus (GStreamer-style messages), pad probes, latency/framerate/drop tracers, `metrics`/`tracing` integration, DOT graph export.
 
@@ -29,7 +30,7 @@ Parallax lets you build media and data pipelines the way GStreamer does — sour
 
 ```toml
 [dependencies]
-parallax-pipeline = "0.1"   # lib name is `parallax`: code writes `use parallax::...`
+parallax-pipeline = "0.7"   # lib name is `parallax`: code writes `use parallax::...`
 ```
 
 ### Parse a pipeline from a string
@@ -316,11 +317,14 @@ Default features are **empty** — everything below is opt-in.
 | **Containers** | | |
 | `mpeg-ts` | MPEG-TS demuxer + muxer (pure Rust) | — |
 | `mp4-demux` | MP4/MOV demuxer + muxer (pure Rust) | — |
+| `mkv-demux` | Matroska/WebM demuxer (pure Rust) | — |
 | **Video codecs** | | |
 | `h264` | H.264 encode/decode (OpenH264) | C++ compiler |
 | `av1-encode` | AV1 encoder (rav1e, pure Rust) | nasm recommended |
 | `av1-decode` | AV1 decoder (dav1d) | libdav1d |
+| `vpx` | VP8/VP9 decode | libvpx |
 | `software-codecs` | All of the above | |
+| `vaapi` | VA-API hardware decode — H.264, VP8, VP9, with zero-copy dma-buf display | libva + libclang; VA driver at runtime |
 | `vulkan-video` | Vulkan Video H.264 GPU decode (**hardware-unvalidated**, see status) | Vulkan 1.3 |
 | **Audio codecs** | | |
 | `audio-codecs` | FLAC+MP3+AAC+Vorbis decoders (Symphonia, pure Rust) | — |
@@ -382,6 +386,7 @@ Honest accounting of where things stand:
 
 - **Solid:** memory subsystem, pipeline graph + executor (async & hybrid RT), element library, caps negotiation, bus/probes/tracers/seek, plugin loading, typed pipelines. The full test suite runs in CI (`just check`).
 - **Functional but young:** RTSP client, HLS/DASH sinks, MP4/TS muxing, device capture (V4L2/PipeWire/ALSA/libcamera/screen).
+- **Validated on hardware:** `vaapi` — H.264, VP8 and VP9 decode on the video engine, each compared bit-exactly against its software counterpart, with the decoded dma-buf imported by the display rather than copied. HEVC is *not* built: the dependency's `h265` feature does not compile against its published release (#200), and there is no software HEVC decoder here either. A driver without H.264 gets no VA-API at all, for the same upstream reason.
 - **Hardware-unvalidated:** `vulkan-video` — H.264 decode really submits work (session, DPB, POC/reference management, per-frame command submission, RAII memory) and decodes a fixture in tests, but no capable GPU has validated it yet (RADV is the target; ANV needs Gen12+); no GPU encode, no H.265/AV1. See #3.
 - **Removed:** process isolation/sandboxing for untrusted elements was prototyped and backed out (fork-safety concerns); it may return in a different form. See [docs/security.md](docs/security.md).
 - **Not started:** RDMA, CUDA interop.
