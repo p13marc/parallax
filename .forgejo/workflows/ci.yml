@@ -19,28 +19,21 @@ env:
   # on vm-runner-01; S3 endpoint+credentials come from the runner's env_file
   RUSTC_WRAPPER: /srv/cache/bin/sccache
   CARGO_INCREMENTAL: "0"
-  # The runner has 1.7 GiB of RAM and no swap (#203). rustc compiling the
-  # parallax lib is SIGKILLed by the OOM killer — "sccache: Compile
-  # terminated by signal 9" — which is why jobs fail scattered and
-  # unreproducibly: ~2 share the box, and which one dies depends on what it
-  # is co-running with. Two levers, both free here:
+  # Resolved 2026-08-20 (#203): the runner was not short of memory, it was
+  # ballooned. pvestatd had pinned vm-runner-01 at a 2 GiB floor while the
+  # host was full, so the guest saw 1.7 GiB of its nominal 10 GiB and the OOM
+  # killer took whichever rustc happened to be largest. The balloon is gone;
+  # the runner now has 9.9 GiB plus 4 GiB of zram.
   #
-  #   debuginfo   dominates rustc's peak RSS and is worth nothing to a job
-  #               that only checks, lints or runs tests. Note cargo applies
-  #               the *dev* profile's debug setting to the test profile too,
-  #               but set both so a future profile split cannot regress it.
-  #   jobs=1      one rustc at a time. Two large crates in parallel do not
-  #               fit in 1.7 GiB whatever else is done.
-  #
-  # These reduce the pressure; they do NOT fix it, and saying otherwise would
-  # be wrong. Measured with both applied, one rustc on the lib peaks at
-  # 861 MiB, and 1000 MiB with --all-targets, against the 466-704 MiB the
-  # runner reported free. The fix is capacity: ~4 GiB, or 2 GiB plus a
-  # swapfile, and capping runner concurrency at one job. Until then a red run
-  # here says nothing about the code.
+  # debuginfo is still off: it dominates rustc's peak RSS and is worth nothing
+  # to a job that only checks, lints or runs tests. Cargo applies the *dev*
+  # profile's debug setting to the test profile too, but both are set so a
+  # future profile split cannot regress it.
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
-  CARGO_BUILD_JOBS: "1"
+  # Cap build parallelism: cargo otherwise defaults to nproc (6 on
+  # vm-runner-01) per job, against a lane capacity of 2.
+  CARGO_BUILD_JOBS: "2"
 
 jobs:
   fmt:
@@ -52,22 +45,7 @@ jobs:
           components: rustfmt
       - run: cargo fmt --check
 
-  # The jobs below form a chain — `needs:` the previous one, `if: always()` so
-  # a red job never skips the rest. This is serialization, not a dependency:
-  # the runner has 1.7 GiB and no swap, and a single rustc on the parallax lib
-  # peaks near 1 GiB (#203), so two jobs sharing the box means the OOM killer
-  # picks one. That is what made CI unreadable — the same commit passing or
-  # failing depending on which pair happened to overlap, and an empty commit
-  # moving the red job from vaapi-check to vulkan-check.
-  #
-  # `CARGO_BUILD_JOBS=1` only caps parallelism *inside* a job; nothing in a
-  # workflow can cap the runner's own concurrency, so the chain does it.
-  # Costs wall-clock (roughly 25 min end to end) and buys a matrix whose
-  # result means something. Delete the `needs:`/`if:` pairs once the runner
-  # has the memory to run jobs side by side.
   clippy:
-    needs: fmt
-    if: always()
     runs-on: ubuntu-24.04
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v7.0.1
@@ -83,8 +61,6 @@ jobs:
       - run: cargo clippy --all-targets --features "$MEDIA_FEATURES" -- -D warnings
 
   test:
-    needs: clippy
-    if: always()
     runs-on: ubuntu-24.04
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v7.0.1
@@ -111,8 +87,6 @@ jobs:
       - run: cargo nextest run --features "$MEDIA_FEATURES"
 
   msrv:
-    needs: test
-    if: always()
     runs-on: ubuntu-24.04
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v7.0.1
@@ -131,8 +105,6 @@ jobs:
       - run: cargo check --all-targets --features "$SENSOR_FEATURES"
 
   libcamera:
-    needs: msrv
-    if: always()
     runs-on: ubuntu-24.04
     container:
       image: fedora:44
@@ -163,8 +135,6 @@ jobs:
   # un-compiled). image-jpeg is needed to compile elements::codec at all.
   # cargo check, not clippy: vulkan-video lint debt is tracked in #3.
   vulkan-check:
-    needs: libcamera
-    if: always()
     runs-on: ubuntu-24.04
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v7.0.1
@@ -178,8 +148,6 @@ jobs:
   # Feature gates no other job compiles. `display` builds here; `pipewire` and
   # `screen-capture` build in the libcamera fedora job (#170).
   display-check:
-    needs: vulkan-check
-    if: always()
     runs-on: ubuntu-24.04
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v7.0.1
@@ -206,8 +174,6 @@ jobs:
   #   alsa        libasound2-dev
   #   v4l2-m2m    v4l2r, bindgen against kernel headers, hence libclang-dev
   feature-gates:
-    needs: display-check
-    if: always()
     runs-on: ubuntu-24.04
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v7.0.1
@@ -223,8 +189,6 @@ jobs:
   # VA-API decode (#193). Runner has no GPU, so this proves the build and runs
   # the green-skip tests; real decode is validated on hardware locally.
   vaapi-check:
-    needs: feature-gates
-    if: always()
     runs-on: ubuntu-24.04
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v7.0.1
@@ -246,8 +210,6 @@ jobs:
   # every conversion, selected by a feature no other job enables — and the one
   # parallax-player builds with. Untested, they rot silently (#196).
   simd-check:
-    needs: vaapi-check
-    if: always()
     runs-on: ubuntu-24.04
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v7.0.1
@@ -266,8 +228,6 @@ jobs:
       - run: cargo clippy --all-targets --features simd-colorspace -- -D warnings
 
   docs:
-    needs: simd-check
-    if: always()
     runs-on: ubuntu-24.04
     env:
       RUSTDOCFLAGS: -D warnings
