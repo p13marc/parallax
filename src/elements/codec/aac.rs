@@ -229,7 +229,10 @@ impl AudioEncoder for AacEncoder {
         self.buffer
             .extend(std::iter::repeat_n(0i16, padding_needed));
 
-        let frame: Vec<i16> = self.buffer.drain(..).collect();
+        // `mem::take`, not `drain(..).collect()`: same result, one fewer
+        // allocation. This is the flush path — the buffer is not reused after
+        // it, so surrendering its capacity costs nothing.
+        let frame: Vec<i16> = std::mem::take(&mut self.buffer);
         Ok(self.encode_frame(&frame)?.into_iter().collect())
     }
 
