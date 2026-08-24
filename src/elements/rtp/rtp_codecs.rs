@@ -53,6 +53,40 @@ const DEFAULT_MTU: usize = 1400;
 // H.264 Depayloader
 // ============================================================================
 
+/// Whether a length-prefixed (AVC/HVCC) buffer contains a decoder entry point.
+///
+/// `annexb::is_entry_point` scans for start codes, so it cannot read the
+/// `avc_format()` output — 4-byte big-endian lengths instead. Same NAL-type
+/// rules, different framing.
+fn length_prefixed_has_entry_point(data: &[u8], codec: crate::codec::annexb::NalCodec) -> bool {
+    use crate::codec::annexb::NalCodec;
+
+    let mut i = 0usize;
+    while i + 4 <= data.len() {
+        let len = u32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as usize;
+        let start = i + 4;
+        let end = match start.checked_add(len) {
+            Some(e) if e <= data.len() => e,
+            _ => break,
+        };
+        if start < end {
+            let nal_type = match codec {
+                NalCodec::H264 => data[start] & 0x1F,
+                NalCodec::H265 => (data[start] >> 1) & 0x3F,
+            };
+            let entry = match codec {
+                NalCodec::H264 => nal_type == 5,
+                NalCodec::H265 => (16..=23).contains(&nal_type),
+            };
+            if entry {
+                return true;
+            }
+        }
+        i = end;
+    }
+    false
+}
+
 /// H.264/AVC RTP depacketizer.
 ///
 /// Converts RTP packets containing H.264 payload into NAL units.
@@ -74,6 +108,9 @@ const DEFAULT_MTU: usize = 1400;
 /// ```
 pub struct RtpH264Depay {
     name: String,
+    /// Mirrors `depacketizer.is_avc`: the keyframe scan needs to know which
+    /// framing it is reading.
+    is_avc: bool,
     depacketizer: H264Packet,
     stats: DepayStats,
     output: OutputArena,
@@ -84,6 +121,7 @@ impl RtpH264Depay {
     pub fn new() -> Self {
         Self {
             name: "rtp-h264-depay".into(),
+            is_avc: false,
             depacketizer: H264Packet::default(),
             stats: DepayStats::default(),
             output: OutputArena::new(defaults::TRANSFORM_SLOT_COUNT)
@@ -95,6 +133,7 @@ impl RtpH264Depay {
     /// Set AVC output format (4-byte length prefix instead of Annex B start codes).
     pub fn avc_format(mut self) -> Self {
         self.depacketizer.is_avc = true;
+        self.is_avc = true;
         self
     }
 
@@ -144,14 +183,28 @@ impl Element for RtpH264Depay {
                 let mut metadata = buffer.metadata().clone();
                 metadata.format = Some(MediaFormat::Video(VideoCodec::H264));
 
-                // Check if this is a keyframe (IDR NAL unit)
-                if output.len() > 4 {
-                    let nal_type = output[4] & 0x1F;
-                    if nal_type == 5 {
-                        // IDR
-                        metadata.flags = metadata.flags.insert(BufferFlags::SYNC_POINT);
-                    }
-                }
+                // Scan every NAL, not just the first (#239). The canonical
+                // keyframe an encoder or RTSP server ships is a STAP-A of
+                // `SPS | PPS | IDR`, so reading only `output[4]` saw the SPS
+                // (type 7), decided "not a keyframe", and left the one access
+                // unit that carries the parameter sets unflagged.
+                let entry_point = if self.is_avc {
+                    length_prefixed_has_entry_point(&output, crate::codec::annexb::NalCodec::H264)
+                } else {
+                    crate::codec::annexb::is_entry_point(
+                        &output,
+                        crate::codec::annexb::NalCodec::H264,
+                    )
+                };
+                metadata.flags = if entry_point {
+                    metadata.flags.insert(BufferFlags::SYNC_POINT)
+                } else {
+                    // The inherited flag came from RtpSrc, which sets
+                    // SYNC_POINT from the RTP *marker* bit — "last packet of an
+                    // access unit", not "keyframe". Carrying it through would
+                    // be worse than saying nothing.
+                    metadata.flags.remove(BufferFlags::SYNC_POINT)
+                };
 
                 Ok(Some(Buffer::new(handle, metadata)))
             }
@@ -351,6 +404,18 @@ impl Element for RtpH265Depay {
 
                 let mut metadata = buffer.metadata().clone();
                 metadata.format = Some(MediaFormat::Video(VideoCodec::H265));
+
+                // H.265 had no keyframe detection at all (#239), and inherited
+                // a SYNC_POINT that RtpSrc set from the RTP marker bit — which
+                // means "end of access unit", not "keyframe".
+                metadata.flags = if crate::codec::annexb::is_entry_point(
+                    &output,
+                    crate::codec::annexb::NalCodec::H265,
+                ) {
+                    metadata.flags.insert(BufferFlags::SYNC_POINT)
+                } else {
+                    metadata.flags.remove(BufferFlags::SYNC_POINT)
+                };
 
                 Ok(Some(Buffer::new(handle, metadata)))
             }
@@ -1185,6 +1250,72 @@ mod tests {
         slot.data_mut()[..data.len()].copy_from_slice(data);
         let handle = crate::buffer::MemoryHandle::with_len(slot, data.len());
         Buffer::new(handle, Metadata::default())
+    }
+
+    #[test]
+    fn a_stap_a_keyframe_is_recognised() {
+        // #239: the canonical keyframe is SPS|PPS|IDR, so a scan that looked
+        // only at the first NAL saw type 7 and called it a delta frame.
+        use crate::codec::annexb::{NalCodec, is_entry_point};
+
+        let stap_a = [
+            0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1E, // SPS
+            0, 0, 0, 1, 0x68, 0xCE, 0x38, 0x80, // PPS
+            0, 0, 0, 1, 0x65, 0xAA, 0xBB, // IDR
+        ];
+        assert!(is_entry_point(&stap_a, NalCodec::H264));
+        // The old first-NAL-only reading:
+        assert_ne!(stap_a[4] & 0x1F, 5, "first NAL is the SPS, not the IDR");
+
+        let delta = [0, 0, 0, 1, 0x41, 0x9A, 0x02];
+        assert!(!is_entry_point(&delta, NalCodec::H264));
+    }
+
+    #[test]
+    fn length_prefixed_keyframes_are_recognised_too() {
+        use crate::codec::annexb::NalCodec;
+
+        // avcC framing: 4-byte big-endian length, then the NAL.
+        let mut avcc = Vec::new();
+        for nal in [
+            vec![0x67u8, 0x42, 0x00, 0x1E],
+            vec![0x68, 0xCE, 0x38, 0x80],
+            vec![0x65, 0xAA, 0xBB],
+        ] {
+            avcc.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+            avcc.extend_from_slice(&nal);
+        }
+        assert!(super::length_prefixed_has_entry_point(
+            &avcc,
+            NalCodec::H264
+        ));
+
+        let mut delta = Vec::new();
+        let nal = [0x41u8, 0x9A, 0x02];
+        delta.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+        delta.extend_from_slice(&nal);
+        assert!(!super::length_prefixed_has_entry_point(
+            &delta,
+            NalCodec::H264
+        ));
+
+        // A truncated length must not panic or over-read.
+        assert!(!super::length_prefixed_has_entry_point(
+            &[0, 0, 0, 99, 0x65],
+            NalCodec::H264
+        ));
+    }
+
+    #[test]
+    fn hevc_irap_types_are_recognised() {
+        use crate::codec::annexb::{NalCodec, is_entry_point};
+
+        // IDR_W_RADL is type 19; the two-byte header puts it in bits 1..6.
+        let irap = [0, 0, 0, 1, 19u8 << 1, 0x01, 0xAA];
+        assert!(is_entry_point(&irap, NalCodec::H265));
+        // TRAIL_R (type 1) is not an entry point.
+        let trail = [0, 0, 0, 1, 1u8 << 1, 0x01, 0xAA];
+        assert!(!is_entry_point(&trail, NalCodec::H265));
     }
 
     #[test]
