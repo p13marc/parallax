@@ -23,9 +23,7 @@
 //! comes back through the ack ring. In-flight is bounded at the ring
 //! capacity, which is what makes both rings never-full by construction.
 
-use super::protocol::{
-    ControlMessage, KNOWN_CUSTOM_KEYS, MAX_CONTROL_MESSAGE_SIZE, frame_message, unframe_message,
-};
+use super::protocol::{ControlMessage, MAX_CONTROL_MESSAGE_SIZE, frame_message, unframe_message};
 use crate::buffer::{Buffer, MemoryHandle};
 use crate::element::{AsyncSink, AsyncSource, ConsumeContext, ProduceContext, ProduceResult};
 use crate::error::{Error, Result};
@@ -89,16 +87,17 @@ fn connect_nonfatal(path: &Path) -> Result<Option<UnixStream>> {
 const STALL_WARN_AFTER: Duration = Duration::from_secs(5);
 
 /// Extract the custom-map entries that can cross the IPC boundary.
+///
+/// **Every** byte-valued entry, since #220 — it used to be a two-entry
+/// hardcoded list in the core crate, so an application's own key vanished at
+/// the first hop. The type-erased half of the map still cannot travel: a
+/// `Box<dyn Any>` has no wire form.
 fn overflow_entries(meta: &crate::metadata::Metadata) -> Vec<(String, Vec<u8>)> {
     if meta.custom_is_empty() {
         return Vec::new();
     }
-    KNOWN_CUSTOM_KEYS
-        .iter()
-        .filter_map(|key| {
-            meta.get_bytes(key)
-                .map(|b| ((*key).to_string(), b.to_vec()))
-        })
+    meta.byte_entries()
+        .map(|(key, bytes)| (key.to_string(), bytes.to_vec()))
         .collect()
 }
 
@@ -737,12 +736,20 @@ impl IpcSrc {
 
         let (slot_ref, mut meta) = desc.decode()?;
         if let Some(entries) = self.meta_overflow.remove(&desc.seq) {
+            let mut spilled: Vec<(String, Vec<u8>)> = Vec::new();
             for (key, bytes) in entries {
-                // Keys must intern to the compile-time list; unknown ones
-                // were never supposed to be sent.
-                if let Some(known) = KNOWN_CUSTOM_KEYS.iter().find(|k| **k == key) {
-                    meta.set_bytes(known, bytes);
+                // #220: re-attach under the real key. Past the intern cap, or
+                // on a key that is not `"domain/type"`, it lands in the
+                // aggregate bucket rather than being dropped — the same
+                // policy the zenoh wire uses, where the two used to disagree
+                // (IPC discarded, zenoh aggregated).
+                match crate::metadata::Metadata::intern(&key) {
+                    Some(interned) => meta.set_bytes(interned, bytes),
+                    None => spilled.push((key, bytes)),
                 }
+            }
+            if !spilled.is_empty() {
+                meta.set(crate::wire::CUSTOM_META, spilled);
             }
         }
 

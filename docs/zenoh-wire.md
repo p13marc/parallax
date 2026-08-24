@@ -53,6 +53,26 @@ Each buffer becomes exactly one zenoh sample:
 | encoding | derived from `Metadata.format` (`video/h264`, `image/jpeg`-style MIME hints; `zenoh/bytes` when unknown), overridable via `ZenohSink::with_encoding` |
 | attachment | `[0x50 'P', 0x58 'X', 0x04] ++ rkyv(WireMetadata)` |
 
+### Custom metadata
+
+**Every byte-valued custom entry travels** (#220), and the receiver re-attaches
+each under its real key. There used to be a two-entry hardcoded allowlist in
+the core crate, so an application's own `"myapp/telemetry"` vanished at the
+first hop; `with_forward_custom_keys` is now an optional *filter* for sending
+less than everything.
+
+The mechanism is `Metadata::intern`, which leaks a runtime key once and hands
+back the `&'static str` on every later sighting — bounded at 256 distinct keys
+per process and 64 bytes each, with a `"domain/type"` syntax check. Those
+bounds are what make leaking sound: without a cap, a hostile peer streaming
+distinct keys would grow the process without limit. Past them the entry is
+**not dropped**; it spills into the `"wire/overflow"` aggregate bucket, and the
+IPC wire does the same (the two used to disagree — IPC discarded, zenoh
+aggregated).
+
+The type-erased half of the map still cannot travel and never will: a
+`Box<dyn Any>` has no wire form. **Store it as bytes if you want it to cross.**
+
 `WireMetadata` (`src/wire/metadata.rs`) carries pts/dts/duration
 (ns, `u64::MAX` = unset), sequence, stream_id, `BufferFlags` bits, source byte
 offset, the media format (stable u8 codec / pixel-format codes), the coded

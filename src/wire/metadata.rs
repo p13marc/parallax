@@ -34,14 +34,15 @@ use crate::metadata::{BufferFlags, Metadata, RtpMeta};
 
 use super::codes;
 
-/// Metadata key under which custom wire entries with unknown keys are
-/// aggregated as a `Vec<(String, Vec<u8>)>` (keys cannot be interned into the
-/// `&'static str`-keyed metadata map without leaking).
-pub const CUSTOM_META: &str = "zenoh/custom";
-
-/// Custom byte-entry keys a receiver re-inserts under their own metadata key
-/// via [`Metadata::set_bytes`]. One list for every wire.
-use crate::elements::ipc::protocol::KNOWN_CUSTOM_KEYS;
+/// Metadata key under which custom wire entries that could **not** be
+/// interned are aggregated as a `Vec<(String, Vec<u8>)>`.
+///
+/// Since #220 this is the overflow bucket, not the normal path: a key is
+/// re-attached under its real name unless it fails
+/// [`Metadata::intern`](crate::metadata::Metadata::intern) — past the
+/// per-process cap, or not shaped like `"domain/type"`. Nothing is discarded
+/// either way.
+pub const CUSTOM_META: &str = "wire/overflow";
 
 /// Buffer metadata as serialized on a parallax wire.
 ///
@@ -320,17 +321,20 @@ impl WirePlanes {
 impl WireMetadata {
     /// Capture a buffer's [`Metadata`] for the wire.
     ///
-    /// `forward_custom_keys` selects which byte-valued custom entries
-    /// ([`Metadata::get_bytes`]) are serialized; everything else in the
-    /// custom map is type-erased and cannot cross the wire.
+    /// **Every** byte-valued custom entry travels (#220). `forward_custom_keys`
+    /// is an optional *filter*, not an allowlist: empty means "all of them".
+    /// It used to be the other way round, with a two-entry hardcoded list in
+    /// the core crate deciding what a downstream application was allowed to
+    /// send.
+    ///
+    /// What still cannot cross is the type-erased half of the map — a
+    /// `Box<dyn Any>` has no wire form. **Store it as bytes if you want it to
+    /// travel.**
     pub fn from_metadata(metadata: &Metadata, forward_custom_keys: &[&'static str]) -> Self {
-        let custom = forward_custom_keys
-            .iter()
-            .filter_map(|key| {
-                metadata
-                    .get_bytes(key)
-                    .map(|bytes| (key.to_string(), bytes.to_vec()))
-            })
+        let custom = metadata
+            .byte_entries()
+            .filter(|(key, _)| forward_custom_keys.is_empty() || forward_custom_keys.contains(key))
+            .map(|(key, bytes)| (key.to_string(), bytes.to_vec()))
             .collect();
 
         Self {
@@ -417,15 +421,22 @@ impl WireMetadata {
         });
         metadata.planes = self.planes.as_ref().map(WirePlanes::to_layout);
 
-        let mut unknown: Vec<(String, Vec<u8>)> = Vec::new();
+        // Re-attach under the real key (#220). `intern` leaks the key once,
+        // bounded, so a receiver is no longer limited to a hardcoded list —
+        // an application's own `myapp/telemetry` survives the hop.
+        let mut overflow: Vec<(String, Vec<u8>)> = Vec::new();
         for (key, bytes) in &self.custom {
-            match KNOWN_CUSTOM_KEYS.iter().find(|known| *known == key) {
-                Some(known) => metadata.set_bytes(known, bytes.clone()),
-                None => unknown.push((key.clone(), bytes.clone())),
+            match Metadata::intern(key) {
+                Some(interned) => metadata.set_bytes(interned, bytes.clone()),
+                // Past the intern cap, or not a `"domain/type"` key. The
+                // entry is not dropped — it lands in the aggregate bucket,
+                // where an application that knows what it is looking for can
+                // still find it.
+                None => overflow.push((key.clone(), bytes.clone())),
             }
         }
-        if !unknown.is_empty() {
-            metadata.set(CUSTOM_META, unknown);
+        if !overflow.is_empty() {
+            metadata.set(CUSTOM_META, overflow);
         }
 
         metadata
@@ -538,6 +549,40 @@ mod tests {
         assert_eq!(restored.format, metadata.format);
     }
 
+    /// #220's headline: a key this build has never heard of arrives under its
+    /// own name. It used to reach a two-entry hardcoded allowlist and, failing
+    /// that, an aggregate bucket the application had to know to look in.
+    #[test]
+    fn a_key_a_receiver_never_heard_of_arrives_under_its_own_name() {
+        let wire = WireMetadata {
+            pts_nanos: u64::MAX,
+            dts_nanos: u64::MAX,
+            duration_nanos: u64::MAX,
+            sequence: 0,
+            stream_id: 0,
+            flags: 0,
+            offset: None,
+            format: None,
+            coded: None,
+            rtp: None,
+            planes: None,
+            custom: vec![("myapp/telemetry".to_string(), vec![1, 2, 3])],
+            terminal: None,
+        };
+        let restored = wire.to_metadata();
+        let key = Metadata::intern("myapp/telemetry").expect("interns");
+        assert_eq!(restored.get_bytes(key), Some(&[1u8, 2, 3][..]));
+        assert!(
+            restored
+                .get::<Vec<(String, Vec<u8>)>>(CUSTOM_META)
+                .is_none(),
+            "an interned key must not also land in the overflow bucket"
+        );
+    }
+
+    /// A key that is not shaped like one is not dropped either — it spills
+    /// into the bucket, where an application that knows what it is looking for
+    /// can still find it.
     #[test]
     fn unknown_custom_keys_are_aggregated() {
         let wire = WireMetadata {
@@ -552,14 +597,14 @@ mod tests {
             coded: None,
             rtp: None,
             planes: None,
-            custom: vec![("future/thing".to_string(), vec![1, 2, 3])],
+            custom: vec![("no slash here".to_string(), vec![1, 2, 3])],
             terminal: None,
         };
         let restored = wire.to_metadata();
         let aggregated = restored
             .get::<Vec<(String, Vec<u8>)>>(CUSTOM_META)
             .expect("unknown keys aggregated");
-        assert_eq!(aggregated[0].0, "future/thing");
+        assert_eq!(aggregated[0].0, "no slash here");
         assert_eq!(aggregated[0].1, vec![1, 2, 3]);
     }
 

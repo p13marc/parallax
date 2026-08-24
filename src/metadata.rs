@@ -335,6 +335,18 @@ impl MetaBox {
     }
 }
 
+/// The cap on distinct interned custom keys per process (#220).
+///
+/// The number that makes [`Metadata::intern`] non-weaponizable: a peer that
+/// streams distinct keys stops growing this process at 256 of them. Real
+/// deployments use a handful.
+pub const MAX_INTERNED_KEYS: usize = 256;
+
+/// The longest key [`Metadata::intern`] will leak.
+///
+/// A key is a `"domain/type"` label, not a payload.
+pub const MAX_INTERNED_KEY_LEN: usize = 64;
+
 /// A custom-metadata value with the common scalar types stored inline.
 ///
 /// `Metadata` is cloned per buffer per element, so the representation of the
@@ -934,6 +946,92 @@ impl Metadata {
         self.custom.iter().map(|(k, _)| *k)
     }
 
+    /// Turn a runtime key into the `&'static str` the custom map needs (#220).
+    ///
+    /// # Why this exists
+    ///
+    /// Custom keys are `&'static str`, which is right for producers — they are
+    /// string literals, the map is an association list, and comparison is a
+    /// pointer-or-bytes check with no allocation. It is wrong for *receivers*:
+    /// a key arriving off a wire is a `String`, and there is no way to turn one
+    /// into a `&'static str` without leaking it.
+    ///
+    /// The old answer was a two-entry hardcoded allowlist in the core crate
+    /// (`["stanag/klv", "h264/sei"]`), so a downstream crate could invent
+    /// `myapp/telemetry` and watch it vanish at the first hop. This is the
+    /// answer instead: leak the key, once, and hand back the leaked `'static`
+    /// reference on every subsequent sighting.
+    ///
+    /// # Why it is not a memory leak, and not a weapon
+    ///
+    /// Two bounds, both load-bearing:
+    ///
+    /// - **At most [`MAX_INTERNED_KEYS`] distinct keys per process.** Past
+    ///   that this returns `None` and the caller falls back to the aggregate
+    ///   bucket. Without the cap a hostile or buggy peer could stream distinct
+    ///   keys and grow the process without limit — a wire-driven allocation
+    ///   that is never freed is exactly the shape worth refusing.
+    /// - **A `"domain/type"` syntax check**, the convention the map has always
+    ///   documented. It also keeps the leaked set to things that look like
+    ///   keys rather than to arbitrary bytes.
+    ///
+    /// Within those bounds the total is at most 256 short strings leaked once
+    /// for the life of the process, which is not a leak in any sense that
+    /// matters.
+    ///
+    /// A key already interned costs a lock and a set lookup, no allocation.
+    pub fn intern(key: &str) -> Option<&'static str> {
+        use std::collections::HashSet;
+        use std::sync::{Mutex, OnceLock};
+
+        // `"domain/type"`: exactly one slash, neither side empty, no
+        // whitespace or control characters.
+        let mut parts = key.split('/');
+        let ok = match (parts.next(), parts.next(), parts.next()) {
+            (Some(domain), Some(ty), None) => {
+                !domain.is_empty()
+                    && !ty.is_empty()
+                    && !key.chars().any(|c| c.is_whitespace() || c.is_control())
+            }
+            _ => false,
+        };
+        if !ok || key.len() > MAX_INTERNED_KEY_LEN {
+            return None;
+        }
+
+        static KEYS: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+        let mut set = KEYS
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            // A poisoned lock here means a panic *while holding it*, which
+            // this function cannot cause: it does nothing that can panic
+            // between the lock and the unlock. Recover rather than turning
+            // someone else's panic into a second failure.
+            .unwrap_or_else(|e| e.into_inner());
+
+        if let Some(existing) = set.get(key) {
+            return Some(existing);
+        }
+        if set.len() >= MAX_INTERNED_KEYS {
+            return None;
+        }
+        let leaked: &'static str = Box::leak(key.to_owned().into_boxed_str());
+        set.insert(leaked);
+        Some(leaked)
+    }
+
+    /// Every byte-valued custom entry, in insertion order (#220).
+    ///
+    /// This is what a transport forwards. Byte entries are the ones that can
+    /// cross a boundary at all — everything else in the map is a type-erased
+    /// `Box<dyn Any>`, and a `Box<dyn Any>` has no wire form. **If you want a
+    /// custom value to survive a hop, store it as bytes.**
+    pub fn byte_entries(&self) -> impl Iterator<Item = (&'static str, &[u8])> + '_ {
+        self.custom
+            .iter()
+            .filter_map(|(k, v)| v.downcast_ref::<Vec<u8>>().map(|b| (*k, b.as_slice())))
+    }
+
     /// Get the number of custom metadata entries.
     #[inline]
     pub fn custom_len(&self) -> usize {
@@ -1192,6 +1290,64 @@ mod tests {
     #[test]
     fn video_dims_is_none_without_dimensions() {
         assert_eq!(Metadata::new().video_dims(), None);
+    }
+
+    #[test]
+    fn interning_is_idempotent_and_gives_back_the_same_pointer() {
+        let a = Metadata::intern("myapp/telemetry").expect("a well-shaped key interns");
+        let b = Metadata::intern("myapp/telemetry").expect("and again");
+        assert_eq!(a, b);
+        assert!(
+            std::ptr::eq(a.as_ptr(), b.as_ptr()),
+            "the second sighting must hand back the leaked reference, not leak again"
+        );
+
+        // …and the interned key really works as a map key.
+        let mut meta = Metadata::new();
+        meta.set_bytes(a, vec![7, 8]);
+        assert_eq!(meta.get_bytes(b), Some(&[7u8, 8][..]));
+    }
+
+    /// The bounds are what make leaking sound. Neither of these consumes a
+    /// registry slot, which matters: the registry is process-global, so a test
+    /// that filled it would poison every sibling test in the same binary.
+    /// The count cap is asserted as a constant rather than exercised for that
+    /// reason.
+    #[test]
+    fn interning_refuses_what_it_must_not_leak() {
+        for bad in [
+            "nodomain",         // no slash
+            "too/many/slashes", // more than one
+            "/empty",           // empty domain
+            "empty/",           // empty type
+            "has space/here",   // whitespace
+            "ctrl\u{7}/char",   // control character
+            "",
+        ] {
+            assert_eq!(Metadata::intern(bad), None, "key {bad:?} must be refused");
+        }
+
+        let too_long = format!("app/{}", "x".repeat(MAX_INTERNED_KEY_LEN));
+        assert_eq!(Metadata::intern(&too_long), None);
+
+        assert_eq!(
+            MAX_INTERNED_KEYS, 256,
+            "the cap is what stops a hostile peer streaming distinct keys from \
+             growing this process without bound"
+        );
+    }
+
+    /// A `Box<dyn Any>` has no wire form, and `byte_entries` is where that
+    /// line is drawn: it is what a transport forwards.
+    #[test]
+    fn only_byte_entries_can_cross_a_boundary() {
+        let mut meta = Metadata::new();
+        meta.set_bytes("stanag/klv", vec![1, 2, 3]);
+        meta.set("app/counter", 42u64);
+        meta.set("app/name", "not bytes".to_string());
+
+        let entries: Vec<_> = meta.byte_entries().collect();
+        assert_eq!(entries, vec![("stanag/klv", &[1u8, 2, 3][..])]);
     }
 
     #[test]

@@ -1507,8 +1507,19 @@ impl ZenohSink {
         self
     }
 
-    /// Select byte-valued custom metadata entries (see
-    /// [`Metadata::set_bytes`]) to forward on the wire, e.g. `"stanag/klv"`.
+    /// Restrict which byte-valued custom entries travel (#220).
+    ///
+    /// A **filter**, not an allowlist: by default *every* byte entry
+    /// ([`Metadata::set_bytes`](crate::metadata::Metadata::set_bytes)) is
+    /// forwarded and the receiver re-attaches it under its real key. Call this
+    /// only to send less than that — a stream whose metadata is large or
+    /// sensitive, where the peer needs `"stanag/klv"` and nothing else.
+    ///
+    /// It used to be the other way round, gated by a two-entry hardcoded list
+    /// in the core crate, so an application's own `"myapp/telemetry"` vanished
+    /// at the first hop no matter what it asked for.
+    ///
+    /// Refused on `@media`: that plane carries pixels and nothing else.
     pub fn with_forward_custom_keys(mut self, keys: &[&'static str]) -> Result<Self> {
         if self.profile == WireProfile::Media {
             return Err(Error::Element(
