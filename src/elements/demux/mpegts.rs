@@ -29,7 +29,7 @@ use crate::event::{
     Event, EventResult, SeekEvent, SeekFlags, SeekPosition, SeekType, SegmentFormat,
 };
 use crate::memory::{OutputArena, OutputBudget, defaults};
-use crate::metadata::Metadata;
+use crate::metadata::{BufferFlags, Metadata};
 
 use mpeg2ts_reader::StreamType;
 use mpeg2ts_reader::demultiplex::{
@@ -280,6 +280,33 @@ pub enum TsStreamType {
     Unknown(u8),
 }
 
+impl TsStreamType {
+    /// The pipeline's video codec for this stream type, if it is video (#238).
+    ///
+    /// MPEG-2 video has no `VideoCodec` variant, so it stays undeclared rather
+    /// than being labelled as something it is not.
+    fn video_codec(&self) -> Option<crate::format::VideoCodec> {
+        use crate::format::VideoCodec;
+        Some(match self {
+            Self::H264 => VideoCodec::H264,
+            Self::H265 => VideoCodec::H265,
+            _ => return None,
+        })
+    }
+
+    /// The pipeline's audio codec for this stream type, if it is audio (#238).
+    fn audio_codec(&self) -> Option<crate::format::AudioCodec> {
+        use crate::format::AudioCodec;
+        Some(match self {
+            Self::AacAdts | Self::AacLatm => AudioCodec::Aac,
+            Self::MpegAudio => AudioCodec::Mp3,
+            // `Ac3` proper has no variant; `Eac3` is a different codec and
+            // claiming it would be worse than saying nothing.
+            _ => return None,
+        })
+    }
+}
+
 impl From<StreamType> for TsStreamType {
     fn from(st: StreamType) -> Self {
         match st {
@@ -493,6 +520,28 @@ impl FrameCollector {
         }
         if let Some(dts) = self.current_dts {
             metadata.dts = ClockTime::from_nanos((dts as u128 * 1_000_000_000 / 90_000) as u64);
+        }
+
+        // Declare the codec (#238). Unlike MKV and MP4 there is no geometry to
+        // stamp: MPEG-TS carries no sequence header this demuxer parses, so a
+        // consumer that needs dimensions must read the bitstream. The codec
+        // alone is still what makes `encoding_for_format` produce `video/h264`
+        // instead of `zenoh/bytes`.
+        if let Some(codec) = self.stream_type.video_codec() {
+            metadata.format = Some(crate::format::MediaFormat::Video(codec));
+            // The elementary stream is Annex-B here, so the keyframe verdict
+            // can be read from the bytes — this demuxer set no SYNC_POINT at
+            // all before, so every consumer gating on one saw a stream with no
+            // entry points.
+            let nal_codec = match codec {
+                crate::format::VideoCodec::H265 => crate::codec::annexb::NalCodec::H265,
+                _ => crate::codec::annexb::NalCodec::H264,
+            };
+            if crate::codec::annexb::is_entry_point(data, nal_codec) {
+                metadata.flags |= BufferFlags::SYNC_POINT;
+            }
+        } else if let Some(codec) = self.stream_type.audio_codec() {
+            metadata.format = Some(crate::format::MediaFormat::Audio(codec));
         }
 
         Ok(Buffer::new(handle, metadata))

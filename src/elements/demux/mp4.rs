@@ -74,6 +74,31 @@ pub enum Mp4Codec {
 }
 
 impl Mp4Codec {
+    /// The pipeline's video codec for this track, if it is video (#238).
+    ///
+    /// `None` for audio, subtitles, and codecs parallax has no variant for —
+    /// an undeclared format beats a mislabelled one.
+    fn video_codec(&self) -> Option<crate::format::VideoCodec> {
+        use crate::format::VideoCodec;
+        Some(match self {
+            Self::H264 => VideoCodec::H264,
+            Self::H265 => VideoCodec::H265,
+            Self::Vp9 => VideoCodec::Vp9,
+            Self::Av1 => VideoCodec::Av1,
+            _ => return None,
+        })
+    }
+
+    /// The pipeline's audio codec for this track, if it is audio (#238).
+    fn audio_codec(&self) -> Option<crate::format::AudioCodec> {
+        use crate::format::AudioCodec;
+        Some(match self {
+            Self::Aac => AudioCodec::Aac,
+            Self::Opus => AudioCodec::Opus,
+            _ => return None,
+        })
+    }
+
     /// Returns true if this is a video codec.
     pub fn is_video(&self) -> bool {
         matches!(
@@ -1068,6 +1093,22 @@ impl<R: Read + Seek> Mp4Demux<R> {
 
         if sample.is_sync {
             metadata.flags |= BufferFlags::SYNC_POINT;
+        }
+
+        // Say what this is (#238) — the codec and the geometry were both
+        // parsed out of the track header and then discarded, so a
+        // `mp4demux ! zenohsink` published H.264 as `zenoh/bytes`.
+        if let Some(track) = self.tracks.iter().find(|t| t.id == track_id) {
+            if let Some(codec) = track.codec.video_codec() {
+                match &track.video_info {
+                    Some(v) if v.width > 0 && v.height > 0 => {
+                        metadata.set_coded_video_dims(codec, v.width, v.height)
+                    }
+                    _ => metadata.format = Some(crate::format::MediaFormat::Video(codec)),
+                }
+            } else if let Some(codec) = track.codec.audio_codec() {
+                metadata.format = Some(crate::format::MediaFormat::Audio(codec));
+            }
         }
 
         Buffer::new(handle, metadata)
