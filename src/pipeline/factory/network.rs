@@ -222,15 +222,19 @@ fn create_wssink(props: &Props) -> Result<Box<DynAsyncElement<'static>>> {
 // ============================================================================
 
 /// `zenohsrc key=<key-expr> [profile=media] [resync-on-discont=<bool>]
-///          [timeout-ms=<n>]`
+///          [timeout-ms=<n>] [stream-timeout-ms=<n>]
+///          [on-publisher-loss=wait|eos]`
 ///
 /// `profile=media` subscribes to the `@media` plane: the codec comes from the
 /// key expression (so caps are known before the first sample), the attachment
 /// is a CBOR `FrameMeta`, and samples are dropped until the first keyframe.
+///
+/// The two timeouts mean different things (#224): `timeout-ms` is a heartbeat
+/// that keeps the stream open, `stream-timeout-ms` ends it.
 #[cfg(feature = "zenoh")]
 async fn create_zenohsrc(props: Props) -> Result<Box<DynAsyncElement<'static>>> {
     use crate::elements::network::shared_session;
-    use crate::elements::{ZenohSrc, network::WireProfile};
+    use crate::elements::{PublisherLoss, ZenohSrc, network::WireProfile};
 
     let key = props.req_str("key")?;
     let profile = props
@@ -253,6 +257,15 @@ async fn create_zenohsrc(props: Props) -> Result<Box<DynAsyncElement<'static>>> 
     }
     if let Some(timeout) = props.get_ms("timeout-ms")? {
         src = src.with_timeout(timeout);
+    }
+    if let Some(timeout) = props.get_ms("stream-timeout-ms")? {
+        src = src.with_stream_timeout(timeout);
+    }
+    if let Some(policy) = props.get_enum(
+        "on-publisher-loss",
+        &[("wait", PublisherLoss::Wait), ("eos", PublisherLoss::Eos)],
+    )? {
+        src = src.on_publisher_loss(policy);
     }
     Ok(DynAsyncElement::new_box(AsyncSourceAdapter::new(src)))
 }

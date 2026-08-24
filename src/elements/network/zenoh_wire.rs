@@ -6,12 +6,20 @@
 //! while parallax subscribers ([`ZenohSrc`](super::ZenohSrc)) reconstruct
 //! full metadata (PTS/DTS/duration/sequence/flags/format).
 //!
-//! # Wire contract (version 2)
+//! # Wire contract (version 3)
 //!
 //! ```text
 //! payload    = raw buffer bytes, unmodified
-//! attachment = [ 0x50 'P', 0x58 'X', 0x02 version ] ++ rkyv(WireMetadata)
+//! attachment = [ 0x50 'P', 0x58 'X', 0x03 version ] ++ rkyv(WireMetadata)
 //! ```
+//!
+//! A **terminal sample** (#224) is a zero-length payload whose attachment
+//! carries `terminal: Some(..)`. It rides the *media key expression*, not a
+//! sibling `@event` key, and that is the load-bearing part: zenoh orders
+//! within a flow (publisher x priority x reliability), and two key expressions
+//! route, batch and deliver independently — so a terminal on a sibling key
+//! could overtake or lag the last media sample arbitrarily, which is precisely
+//! the bug an end-of-stream marker exists to fix.
 //!
 //! - A missing attachment, unknown magic, or unknown version means "foreign
 //!   or legacy publisher": receivers fall back to fabricated metadata and
@@ -38,7 +46,9 @@ use crate::metadata::{BufferFlags, Metadata};
 pub const WIRE_MAGIC: [u8; 2] = [0x50, 0x58];
 
 /// Attachment wire-format version.
-pub const WIRE_VERSION: u8 = 2;
+///
+/// 3: `WireMetadata::terminal` (#224). 2: `coded` (#236).
+pub const WIRE_VERSION: u8 = 3;
 
 /// Metadata key under which [`ZenohSrc`](super::ZenohSrc) stores the concrete
 /// key expression a sample arrived on (a `String`; useful with wildcard
@@ -85,6 +95,13 @@ pub struct WireMetadata {
     pub coded: Option<(u32, u32, u32, u32)>,
     /// Whitelisted custom byte entries (e.g. KLV, SEI), as (key, bytes).
     pub custom: Vec<(String, Vec<u8>)>,
+    /// Set on a terminal sample (#224); `None` on every media sample.
+    ///
+    /// It is a field rather than a separate attachment kind so a terminal
+    /// carries the same `sequence` accounting as the frames before it: a
+    /// receiver's gap detection keeps working right up to the last sample,
+    /// and a zero-length *media* buffer stays distinguishable from a goodbye.
+    pub terminal: Option<WireTerminal>,
 }
 
 mod wire_format {
@@ -137,8 +154,26 @@ mod wire_format {
         /// Raw bytes.
         Bytes,
     }
+
+    /// Why a published stream ended (#224).
+    ///
+    /// Parallax-private plane only. The `@media` plane forbids anything but
+    /// pixels on the media key (RFC 07 §1), and learns the same fact from the
+    /// publisher's liveliness token disappearing instead — which also covers
+    /// `kill -9` and network partition, where no graceful sample is ever sent.
+    #[derive(Debug, Clone, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    #[rkyv(derive(Debug))]
+    pub enum WireTerminal {
+        /// The stream ended normally.
+        Eos,
+        /// The publishing pipeline failed.
+        Error {
+            /// What went wrong, for the receiver's bus and logs.
+            message: String,
+        },
+    }
 }
-pub use wire_format::WireFormat;
+pub use wire_format::{WireFormat, WireTerminal};
 
 /// Stable wire code for a [`VideoCodec`].
 pub fn video_codec_to_code(codec: VideoCodec) -> u8 {
@@ -356,6 +391,28 @@ impl WireMetadata {
                 .coded
                 .map(|c| (c.width, c.height, c.framerate.num, c.framerate.den)),
             custom,
+            terminal: None,
+        }
+    }
+
+    /// A terminal marker carrying `sequence` (#224).
+    ///
+    /// The sequence is the publisher's, one past the last frame, so a
+    /// receiver's gap detection covers the goodbye too — a terminal that
+    /// arrives after samples were lost still says so.
+    pub fn terminal(reason: WireTerminal, sequence: u64) -> Self {
+        Self {
+            pts_nanos: ClockTime::NONE.nanos(),
+            dts_nanos: ClockTime::NONE.nanos(),
+            duration_nanos: ClockTime::NONE.nanos(),
+            sequence,
+            stream_id: 0,
+            flags: 0,
+            offset: None,
+            format: None,
+            coded: None,
+            custom: Vec::new(),
+            terminal: Some(reason),
         }
     }
 
@@ -535,6 +592,7 @@ mod tests {
             format: None,
             coded: None,
             custom: vec![("future/thing".to_string(), vec![1, 2, 3])],
+            terminal: None,
         };
         let restored = wire.to_metadata();
         let aggregated = restored
@@ -542,6 +600,27 @@ mod tests {
             .expect("unknown keys aggregated");
         assert_eq!(aggregated[0].0, "future/thing");
         assert_eq!(aggregated[0].1, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn a_terminal_round_trips_and_is_distinguishable_from_an_empty_frame() {
+        for reason in [
+            WireTerminal::Eos,
+            WireTerminal::Error {
+                message: "the camera went away".to_string(),
+            },
+        ] {
+            let wire = WireMetadata::terminal(reason.clone(), 41);
+            let decoded = WireMetadata::decode(&wire.encode()).expect("our own attachment");
+            assert_eq!(decoded.terminal, Some(reason));
+            // The sequence rides along, so a receiver's gap detection covers
+            // the goodbye too.
+            assert_eq!(decoded.sequence, 41);
+        }
+
+        // A zero-length *media* sample is not a goodbye.
+        let ordinary = WireMetadata::from_metadata(&Metadata::new(), &[]);
+        assert_eq!(ordinary.terminal, None);
     }
 
     #[test]

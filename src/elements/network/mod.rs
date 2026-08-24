@@ -59,8 +59,9 @@ pub use media_key::MediaKeyShape;
 pub use zenoh::ZenohReliability;
 #[cfg(feature = "zenoh")]
 pub use zenoh::{
-    WireProfile, ZenohCongestionControl, ZenohDemandEvent, ZenohPriority, ZenohQuerier, ZenohQuery,
-    ZenohQueryable, ZenohSink, ZenohSinkHandle, ZenohSrc, ZenohSrcHandle, ZenohStats,
+    PublisherLoss, WireProfile, ZenohCongestionControl, ZenohDemandEvent, ZenohPriority,
+    ZenohQuerier, ZenohQuery, ZenohQueryable, ZenohSink, ZenohSinkHandle, ZenohSrc, ZenohSrcHandle,
+    ZenohStats,
 };
 #[cfg(feature = "zenoh")]
 pub use zenoh::{ZENOH_CONFIG_ENV, shared_session};

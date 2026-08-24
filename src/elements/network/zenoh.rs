@@ -34,7 +34,7 @@ use std::time::Duration;
 use zenoh::Session;
 use zenoh::key_expr::KeyExpr;
 
-use super::zenoh_wire::{KEY_EXPR_META, WireMetadata, encoding_for_format};
+use super::zenoh_wire::{KEY_EXPR_META, WireMetadata, WireTerminal, encoding_for_format};
 
 /// Congestion control mode for Zenoh publishing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -192,6 +192,21 @@ enum SampleOutcome {
     Dropped,
     /// No output arena slot was free; the sample is lost.
     NoSlot,
+    /// The publisher said goodbye (#224). `Some(message)` is a failure.
+    Terminal(Option<String>),
+}
+
+/// What woke [`ZenohSrc::produce`] (#224).
+#[allow(clippy::large_enum_variant)]
+enum WireEvent {
+    /// A sample arrived.
+    Sample(zenoh::sample::Sample),
+    /// Every sender is gone: the subscription is over.
+    Closed,
+    /// The publisher's liveliness token disappeared.
+    PublisherLost,
+    /// The application called [`ZenohSrcHandle::end_stream`].
+    EndRequested,
 }
 
 /// Receive-queue depth, in samples (#225).
@@ -202,6 +217,29 @@ enum SampleOutcome {
 /// `with_queue` called afterwards could not resize it, and a knob that
 /// silently does nothing is worse than none.
 const DEFAULT_RECV_QUEUE: usize = 8;
+
+/// What a [`ZenohSrc`] does when the publisher's liveliness token vanishes
+/// (#224).
+///
+/// The token disappears on a clean shutdown, on `kill -9`, and on a network
+/// partition alike — it is a *liveness* signal, not an end-of-stream one. Only
+/// a terminal sample distinguishes "the stream ended" from "the publisher went
+/// away", which is why the default here is to keep waiting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PublisherLoss {
+    /// Warn and keep the subscription open (default).
+    ///
+    /// Right for live video: a camera pipeline restarting is normal
+    /// operation, and ending the receiving pipeline on every sender restart
+    /// would turn a two-second gap into a dead viewer.
+    #[default]
+    Wait,
+    /// End the stream — `produce` returns [`ProduceResult::Eos`].
+    ///
+    /// Right for a bounded transfer, where the publisher vanishing means the
+    /// data is not coming.
+    Eos,
+}
 
 /// Counters behind [`ZenohSrcHandle`], shared with the subscriber callback.
 #[derive(Debug, Default)]
@@ -218,6 +256,19 @@ struct ZenohSrcCounters {
     lost_wire: AtomicU64,
     /// Samples dropped because the keyframe gate had not opened yet.
     dropped_pre_keyframe: AtomicU64,
+    /// The application asked this source to end (#224).
+    end_requested: AtomicBool,
+    /// Woken by `end_stream()` so a source parked on the wire notices.
+    ///
+    /// `notify_one`, not `notify_waiters`: it leaves a permit, so a request
+    /// landing in the window between the flag check and the await is not lost
+    /// — the same lazily-registered-waiter hazard `AppSink` had to design
+    /// around (gotcha 15).
+    end_signal: tokio::sync::Notify,
+    /// How many times the publisher's liveliness token has disappeared.
+    publisher_losses: AtomicU64,
+    /// `Media` only: receive-timeout expiries, which produce no buffer.
+    heartbeats: AtomicU64,
 }
 
 /// Read-only runtime view of a [`ZenohSrc`] (#225).
@@ -260,6 +311,31 @@ impl ZenohSrcHandle {
     /// Samples dropped while waiting for the first keyframe.
     pub fn dropped_pre_keyframe(&self) -> u64 {
         self.counters.dropped_pre_keyframe.load(Ordering::Relaxed)
+    }
+
+    /// How many times the publisher's liveliness token has disappeared (#224).
+    ///
+    /// Counts under either [`PublisherLoss`] policy — an operator watching a
+    /// flapping link wants the number whether or not it ends the stream.
+    pub fn publisher_losses(&self) -> u64 {
+        self.counters.publisher_losses.load(Ordering::Relaxed)
+    }
+
+    /// End this source's stream now (#224).
+    ///
+    /// The lever parallax exposes so an application can apply a policy
+    /// parallax has no business knowing — the `@media` plane's `state`
+    /// catalogue doc, for one: consuming it needs the zenkey key grammar, the
+    /// origin, the producer chunk and the `StreamStatus` schema, none of which
+    /// parallax has or should acquire. The application watches the doc; this
+    /// is how it acts on it. `produce` returns
+    /// [`ProduceResult::Eos`](crate::element::ProduceResult::Eos) at the next
+    /// opportunity, even if it is parked waiting for a sample.
+    ///
+    /// Idempotent, and takes effect exactly once.
+    pub fn end_stream(&self) {
+        self.counters.end_requested.store(true, Ordering::Release);
+        self.counters.end_signal.notify_one();
     }
 }
 
@@ -330,6 +406,16 @@ pub struct ZenohSrc {
     waiting_for_keyframe: bool,
     /// `Media` only: whether the keyframe gate re-arms after a wire gap.
     resync_on_discont: bool,
+    /// End the stream after this long with no sample at all (#224). Distinct
+    /// from `timeout`, which is a heartbeat and keeps the stream open.
+    stream_timeout: Option<Duration>,
+    /// What to do when the publisher's liveliness token disappears.
+    on_publisher_loss: PublisherLoss,
+    /// Fires once per liveliness `Delete`. Bounded: a flapping publisher must
+    /// not grow memory, and every event past the first says the same thing.
+    liveliness_rx: tokio::sync::mpsc::Receiver<()>,
+    /// Held to keep the liveliness subscription alive.
+    _liveliness: Option<zenoh::pubsub::Subscriber<()>>,
 }
 
 impl ZenohSrc {
@@ -376,6 +462,37 @@ impl ZenohSrc {
             .await
             .map_err(|e| Error::Element(format!("Zenoh subscribe error: {}", e)))?;
 
+        // #224: watch the publisher's liveliness on the same key expression.
+        // Always declared, whatever the policy — the warning is worth having
+        // even when the stream is meant to survive a restart — and stable in
+        // zenoh 1.10, so no `zenoh-unstable` is involved.
+        let (live_tx, liveliness_rx) = tokio::sync::mpsc::channel(1);
+        let live_counters = Arc::clone(&counters);
+        let live_name = name.clone();
+        let liveliness = session
+            .liveliness()
+            .declare_subscriber(&key_expr)
+            .callback(move |sample| {
+                // Put is the publisher appearing; only Delete is a loss.
+                if sample.kind() != zenoh::sample::SampleKind::Delete {
+                    return;
+                }
+                let n = live_counters
+                    .publisher_losses
+                    .fetch_add(1, Ordering::Relaxed)
+                    + 1;
+                tracing::warn!("{live_name}: publisher liveliness lost ({n} total)");
+                // A full channel already carries the same news; this runs on a
+                // zenoh runtime thread and must never block.
+                let _ = live_tx.try_send(());
+            })
+            .await
+            .map_err(|e| {
+                tracing::warn!("{name}: liveliness subscribe failed: {e}");
+                e
+            })
+            .ok();
+
         Ok(Self {
             name,
             key_expr,
@@ -392,6 +509,10 @@ impl ZenohSrc {
             shape: super::media_key::MediaKeyShape::Opaque,
             waiting_for_keyframe: false,
             resync_on_discont: false,
+            stream_timeout: None,
+            on_publisher_loss: PublisherLoss::Wait,
+            liveliness_rx,
+            _liveliness: liveliness,
         })
     }
 
@@ -462,10 +583,43 @@ impl ZenohSrc {
         self
     }
 
-    /// Set a receive timeout. On timeout an empty buffer flagged
-    /// [`BufferFlags::TIMEOUT`] is produced instead of waiting forever.
+    /// Set a receive heartbeat. On expiry an empty buffer flagged
+    /// [`BufferFlags::TIMEOUT`] is produced instead of waiting forever, and
+    /// the subscription stays open.
+    ///
+    /// **Not on `@media`.** There, an expiry posts a rate-limited bus warning
+    /// and nothing else: the plane's samples are whole access units, and
+    /// handing a decoder a zero-length one labelled as a frame is a defect,
+    /// not a heartbeat. Use [`with_stream_timeout`](Self::with_stream_timeout)
+    /// to actually end a silent stream.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
+        self
+    }
+
+    /// End the stream after `timeout` with no sample at all (#224).
+    ///
+    /// Off by default, and deliberately distinct from
+    /// [`with_timeout`](Self::with_timeout): that one is a heartbeat that
+    /// keeps the stream open, this one is a verdict. `produce` returns
+    /// [`ProduceResult::Eos`](crate::element::ProduceResult::Eos), so the
+    /// receiving pipeline ends cleanly rather than hanging on a publisher
+    /// that stopped without saying so — the case neither a terminal sample
+    /// nor a liveliness token covers, because a wedged publisher is still
+    /// alive and never sent a goodbye.
+    ///
+    /// The two compose: a heartbeat can fire many times inside one stream
+    /// timeout, and only the stream timeout ends anything.
+    pub fn with_stream_timeout(mut self, timeout: Duration) -> Self {
+        self.stream_timeout = Some(timeout);
+        self
+    }
+
+    /// What to do when the publisher's liveliness token disappears (#224).
+    ///
+    /// Default [`PublisherLoss::Wait`].
+    pub fn on_publisher_loss(mut self, policy: PublisherLoss) -> Self {
+        self.on_publisher_loss = policy;
         self
     }
 
@@ -502,12 +656,27 @@ impl ZenohSrc {
         self.output.try_acquire(len, "zenohsrc")
     }
 
-    /// Await the next sample. `None` once every sender is gone.
+    /// Await the next thing that can happen to this source (#224).
+    ///
+    /// Three races, all cancel-safe: `poll_recv` is a bare poll,
+    /// `mpsc::Receiver::recv` is documented cancel-safe, and `Notified` only
+    /// consumes its permit on completion. Nothing is lost when a sibling
+    /// branch wins.
     ///
     /// `LeakyReceiver::recv` is test-only by design — production drives it
     /// through `poll_recv` — so poll it directly rather than widening that.
-    async fn next_sample(&mut self) -> Option<zenoh::sample::Sample> {
-        std::future::poll_fn(|cx| self.receiver.poll_recv(cx)).await
+    async fn next_wire_event(&mut self) -> WireEvent {
+        tokio::select! {
+            biased;
+            // An explicit end wins over anything queued behind it: the
+            // application asked, and there is no point delivering more.
+            () = self.counters.end_signal.notified() => WireEvent::EndRequested,
+            sample = std::future::poll_fn(|cx| self.receiver.poll_recv(cx)) => match sample {
+                Some(sample) => WireEvent::Sample(sample),
+                None => WireEvent::Closed,
+            },
+            Some(()) = self.liveliness_rx.recv() => WireEvent::PublisherLost,
+        }
     }
 
     /// Build a buffer from a received sample.
@@ -532,6 +701,15 @@ impl ZenohSrc {
             WireMetadata::decode(&bytes)
         }) {
             Some(wire) => {
+                // #224: a zero-payload sample whose attachment says goodbye.
+                // Checked before the sequence bookkeeping so the terminal's
+                // own sequence does not read as a gap.
+                if let Some(terminal) = &wire.terminal {
+                    return Ok(SampleOutcome::Terminal(match terminal {
+                        super::zenoh_wire::WireTerminal::Eos => None,
+                        super::zenoh_wire::WireTerminal::Error { message } => Some(message.clone()),
+                    }));
+                }
                 let mut metadata = wire.to_metadata();
                 // A gap in the published sequence means samples were lost on
                 // the wire (congestion drop, late join).
@@ -672,6 +850,35 @@ impl ZenohSrc {
         )))
     }
 
+    /// What a `with_timeout` expiry produces.
+    ///
+    /// On `@media` it produces *nothing*: the plane's samples are whole access
+    /// units, so a zero-length one flagged TIMEOUT is a malformed frame, and
+    /// the decoders downstream have no way to tell it apart from one. Warn
+    /// (rate-limited, on the ladder the drop counters use) and keep waiting;
+    /// `with_stream_timeout` is the knob that actually ends a silent stream.
+    fn heartbeat(&mut self, ctx: &mut ProduceContext<'_>) -> Result<ProduceResult> {
+        if self.profile == WireProfile::Media {
+            let n = self.counters.heartbeats.fetch_add(1, Ordering::Relaxed) + 1;
+            if is_power_of_ten(n) {
+                let warning = format!(
+                    "{}: no @media sample within the receive timeout ({n} total)",
+                    self.name
+                );
+                tracing::warn!("{warning}");
+                ctx.post_message(crate::pipeline::bus::MessageKind::Warning {
+                    warning,
+                    debug: Some(self.key_expr.clone()),
+                });
+            }
+            return Ok(ProduceResult::WouldBlock);
+        }
+        Ok(match self.timeout_buffer()? {
+            Some(b) => ProduceResult::OwnBuffer(b),
+            None => ProduceResult::WouldBlock,
+        })
+    }
+
     fn timeout_buffer(&mut self) -> Result<Option<Buffer>> {
         let Some(slot) = self.acquire(0)? else {
             return Ok(None);
@@ -708,21 +915,64 @@ impl AsyncSource for ZenohSrc {
         // for the one case that genuinely means "ask me again later": no
         // output slot was free.
         loop {
-            let sample = if let Some(timeout) = self.timeout {
-                match tokio::time::timeout(timeout, self.next_sample()).await {
-                    Ok(Some(sample)) => sample,
-                    Ok(None) => return Ok(ProduceResult::Eos),
+            // #224: an end asked for while this task was elsewhere.
+            if self.counters.end_requested.load(Ordering::Acquire) {
+                tracing::info!("{}: ending on request", self.name);
+                return Ok(ProduceResult::Eos);
+            }
+
+            // Two independent clocks (#224). The heartbeat keeps the stream
+            // open; only the stream timeout ends it. Whichever is shorter
+            // fires first, and the loop re-arms the other.
+            let deadline = match (self.timeout, self.stream_timeout) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+
+            let event = match deadline {
+                Some(d) => match tokio::time::timeout(d, self.next_wire_event()).await {
+                    Ok(event) => event,
                     Err(_) => {
-                        return Ok(match self.timeout_buffer()? {
-                            Some(b) => ProduceResult::OwnBuffer(b),
-                            None => ProduceResult::WouldBlock,
-                        });
+                        // The stream timeout is the verdict; the heartbeat is
+                        // not. When both are set, whichever the elapsed
+                        // deadline belonged to decides.
+                        if self.stream_timeout == Some(d) {
+                            tracing::warn!("{}: no sample for {d:?}, ending the stream", self.name);
+                            return Ok(ProduceResult::Eos);
+                        }
+                        return self.heartbeat(ctx);
                     }
+                },
+                None => self.next_wire_event().await,
+            };
+
+            let sample = match event {
+                WireEvent::Sample(sample) => sample,
+                WireEvent::Closed => return Ok(ProduceResult::Eos),
+                WireEvent::EndRequested => {
+                    tracing::info!("{}: ending on request", self.name);
+                    return Ok(ProduceResult::Eos);
                 }
-            } else {
-                match self.next_sample().await {
-                    Some(sample) => sample,
-                    None => return Ok(ProduceResult::Eos),
+                WireEvent::PublisherLost => {
+                    let n = self.counters.publisher_losses.load(Ordering::Relaxed);
+                    ctx.post_message(crate::pipeline::bus::MessageKind::Warning {
+                        warning: format!("{}: publisher liveliness lost ({n} total)", self.name),
+                        debug: Some(self.key_expr.clone()),
+                    });
+                    match self.on_publisher_loss {
+                        PublisherLoss::Eos => return Ok(ProduceResult::Eos),
+                        // A restarting camera is normal operation; the
+                        // subscription survives it and picks the stream back
+                        // up when the publisher returns.
+                        PublisherLoss::Wait => {
+                            if self.profile == WireProfile::Media {
+                                // Whatever comes back starts a new GOP as far
+                                // as this decoder is concerned.
+                                self.waiting_for_keyframe = true;
+                            }
+                            continue;
+                        }
+                    }
                 }
             };
 
@@ -753,6 +1003,20 @@ impl AsyncSource for ZenohSrc {
                 }
                 // Swallowed on purpose — go straight back for the next one.
                 SampleOutcome::Dropped => continue,
+                // #224: the publisher said goodbye. An error crosses the
+                // machine boundary as an error, extending #85's rule: a
+                // receiving pipeline must not report a clean EOS for a
+                // stream that failed at the other end.
+                SampleOutcome::Terminal(None) => {
+                    tracing::info!("{}: publisher signalled end of stream", self.name);
+                    return Ok(ProduceResult::Eos);
+                }
+                SampleOutcome::Terminal(Some(message)) => {
+                    return Err(Error::Element(format!(
+                        "{}: publisher failed: {message}",
+                        self.name
+                    )));
+                }
             }
         }
     }
@@ -993,6 +1257,13 @@ pub struct ZenohSink {
     #[cfg(feature = "zenoh-unstable")]
     demand_tx: Option<tokio::sync::mpsc::Sender<ZenohDemandEvent>>,
     demand_rx: Option<tokio::sync::mpsc::Receiver<ZenohDemandEvent>>,
+    /// Declared alongside the publisher (#224). Its disappearance is what
+    /// tells a subscriber the publisher is gone in the cases no goodbye can
+    /// cover — `kill -9`, a partition, a crashed host. Held here so it lives
+    /// exactly as long as the element does; `finish` undeclares it explicitly
+    /// so a graceful end is prompt rather than whenever the drop happens to
+    /// propagate.
+    liveliness: Option<zenoh::liveliness::LivelinessToken>,
 }
 
 impl ZenohSink {
@@ -1048,6 +1319,7 @@ impl ZenohSink {
             #[cfg(feature = "zenoh-unstable")]
             demand_tx: Some(demand_tx),
             demand_rx: Some(demand_rx),
+            liveliness: None,
         })
     }
 
@@ -1354,7 +1626,45 @@ impl ZenohSink {
         #[cfg(feature = "zenoh-unstable")]
         self.arm_matching_listener().await?;
 
+        // #224: liveliness on the media key itself. A token is a separate
+        // zenoh primitive with no payload, so it is not a sample on the plane
+        // and does not offend RFC 07 §1 — which is why both profiles get it.
+        // Stable API in zenoh 1.10: no `unstable` feature involved.
+        match self
+            .session
+            .liveliness()
+            .declare_token(self.key_expr.clone())
+            .await
+        {
+            Ok(token) => self.liveliness = Some(token),
+            // Not fatal. A publisher that cannot declare a token still
+            // publishes; its subscribers simply lose the ungraceful-death
+            // signal, which is exactly the situation before #224.
+            Err(e) => tracing::warn!("{}: could not declare a liveliness token: {e}", self.name),
+        }
+
         Ok(())
+    }
+
+    /// Publish the terminal sample, on the media key, in order (#224).
+    ///
+    /// `@media` gets none: the plane carries pixels and nothing else, and a
+    /// consumer there learns the same fact from the liveliness token.
+    async fn publish_terminal(&mut self, reason: WireTerminal) -> Result<()> {
+        if self.profile == WireProfile::Media || !self.attach_metadata {
+            return Ok(());
+        }
+        // Nothing was ever published, so there is no stream to end.
+        let Some(publisher) = self.publisher.as_ref() else {
+            return Ok(());
+        };
+
+        let attachment = WireMetadata::terminal(reason, self.wire_sequence).encode();
+        publisher
+            .put(Vec::new())
+            .attachment(attachment)
+            .await
+            .map_err(|e| Error::Element(format!("Zenoh terminal put error: {e}")))
     }
 }
 
@@ -1423,6 +1733,39 @@ impl AsyncSink for ZenohSink {
 
     fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Publish the goodbye, then withdraw the liveliness token (#224).
+    ///
+    /// In that order, deliberately: a subscriber whose loss policy is `Eos`
+    /// would otherwise end on the token and never see the terminal's reason,
+    /// turning a reported failure into a silent clean end.
+    ///
+    /// The reason arrives as a parameter, so this does not need to snoop
+    /// `handle_downstream_event` for it — #221 hands the sink task's own
+    /// verdict straight to the hook. `Aborted` publishes `Eos`: a deliberate
+    /// stop is not a failure, and the receiver's stream really did end.
+    async fn finish(&mut self, reason: crate::pipeline::EndReason) -> Result<()> {
+        use crate::pipeline::EndReason;
+
+        let terminal = match reason {
+            EndReason::Error(err) => WireTerminal::Error {
+                message: match err.node() {
+                    Some(node) => format!("{node}: {}", err.message()),
+                    None => err.message().to_string(),
+                },
+            },
+            EndReason::Eos | EndReason::Aborted => WireTerminal::Eos,
+        };
+        let published = self.publish_terminal(terminal).await;
+
+        if let Some(token) = self.liveliness.take()
+            && let Err(e) = token.undeclare().await
+        {
+            tracing::warn!("{}: liveliness undeclare failed: {e}", self.name);
+        }
+
+        published
     }
 
     /// Hand a queued keyframe request to the executor's upstream path.

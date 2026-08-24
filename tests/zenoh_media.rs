@@ -1,13 +1,18 @@
-//! The `@media` plane, over two real zenoh sessions (#231, #223).
+//! Two real zenoh sessions: the `@media` plane (#231, #223) and the
+//! cross-machine end-of-stream path (#224).
 //!
 //! `tests/zenoh_roundtrip.rs` shares one session for the whole binary, so
 //! everything it exercises is intra-session loopback. That cannot catch what
 //! this file is for: a publisher and a subscriber that only know each other
 //! through the network, which is the shape the plane is actually deployed in.
 //!
-//! Two sessions, scouting fully off, explicit `127.0.0.1` endpoints — hermetic
-//! on a shared runner, where multicast discovery would find whatever else
-//! happens to be running.
+//! Two sessions, scouting fully off, explicit unix-socket endpoints —
+//! hermetic on a shared runner, where multicast discovery would find whatever
+//! else happens to be running.
+//!
+//! The #224 tests live here rather than in a file of their own because this is
+//! where the two-session harness is, and a terminal that only ever crossed a
+//! loopback session would prove nothing about ordering.
 
 #![cfg(feature = "zenoh")]
 
@@ -644,4 +649,251 @@ fn frame_meta_matches_the_checked_in_corpus() {
         seen += 1;
     }
     assert!(seen >= 2, "expected a corpus, found {seen} vectors");
+}
+
+// ===========================================================================
+// #224 — end of stream across the wire
+// ===========================================================================
+
+use parallax::elements::{PublisherLoss, ZenohSrcHandle};
+use parallax::pipeline::EndReason;
+
+/// A parallax-plane pair, with one buffer already published so the sink's
+/// publisher (and its liveliness token) exist.
+async fn parallax_pair(tag: &str) -> (ZenohSrc, ZenohSink, String) {
+    let (pub_session, sub_session) = session_pair().await;
+    let key = unique_key(tag);
+    let src = ZenohSrc::with_session(sub_session, &key)
+        .await
+        .expect("source");
+    let sink = ZenohSink::with_session(pub_session, &key)
+        .await
+        .expect("sink");
+    settle().await;
+    (src, sink, key)
+}
+
+/// `produce` once, expecting neither a buffer nor an error within `patience`.
+async fn expect_no_buffer(src: &mut ZenohSrc, patience: Duration) {
+    let mut ctx = ProduceContext::without_buffer();
+    match tokio::time::timeout(patience, src.produce(&mut ctx)).await {
+        // Parked on the wire — nothing arrived, which is the point.
+        Err(_) => {}
+        Ok(Ok(ProduceResult::WouldBlock)) => {}
+        Ok(other) => panic!("expected nothing, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_eos_crosses_the_wire_and_ends_the_receiver() {
+    let (mut src, mut sink, _key) = parallax_pair("terminal-eos").await;
+
+    let mut meta = Metadata::new();
+    meta.sequence = 1;
+    sink.consume(&ConsumeContext::new(&buffer(b"frame", meta)))
+        .await
+        .expect("publish");
+    assert_eq!(next_buffer(&mut src).await.as_bytes(), b"frame");
+
+    sink.finish(EndReason::Eos).await.expect("goodbye");
+
+    let mut ctx = ProduceContext::without_buffer();
+    let result = tokio::time::timeout(Duration::from_secs(10), src.produce(&mut ctx))
+        .await
+        .expect("the terminal must arrive")
+        .expect("a clean end is not an error");
+    assert!(
+        matches!(result, ProduceResult::Eos),
+        "got {result:?}, expected Eos"
+    );
+}
+
+/// #85's rule, extended across the machine boundary: a receiving pipeline must
+/// not report a clean end for a stream that failed at the other end.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_publisher_failure_crosses_the_wire_as_a_failure() {
+    let (mut src, mut sink, _key) = parallax_pair("terminal-error").await;
+
+    sink.consume(&ConsumeContext::new(&buffer(b"x", Metadata::new())))
+        .await
+        .expect("publish");
+    let _ = next_buffer(&mut src).await;
+
+    sink.finish(EndReason::Error(parallax::pipeline::StreamError::new(
+        "v4l2src",
+        "device disappeared",
+    )))
+    .await
+    .expect("goodbye");
+
+    let mut ctx = ProduceContext::without_buffer();
+    let err = tokio::time::timeout(Duration::from_secs(10), src.produce(&mut ctx))
+        .await
+        .expect("the terminal must arrive")
+        .expect_err("a failed publisher must not read as a clean EOS");
+    let message = err.to_string();
+    assert!(
+        message.contains("device disappeared") && message.contains("v4l2src"),
+        "the reason must survive the crossing, got {message}"
+    );
+}
+
+/// RFC 07 §1: `@media` carries pixels and nothing else. A terminal sample there
+/// would reach a decoder as a zero-length access unit.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_media_plane_gets_no_terminal_sample() {
+    let (pub_session, sub_session) = session_pair().await;
+    let key = unique_key("video/h264/high");
+    let mut src = ZenohSrc::media_with_session(sub_session, &key)
+        .await
+        .expect("media source");
+    let mut sink = ZenohSink::media_with_session(pub_session, &key)
+        .await
+        .expect("media sink");
+    settle().await;
+
+    let mut meta = Metadata::new();
+    meta.flags |= BufferFlags::SYNC_POINT;
+    sink.consume(&ConsumeContext::new(&buffer(&keyframe_au(), meta)))
+        .await
+        .expect("publish");
+    let _ = next_buffer(&mut src).await;
+
+    sink.finish(EndReason::Eos).await.expect("goodbye");
+
+    // Nothing at all — not a frame, and not an EOS either: the default loss
+    // policy keeps a media subscription open across a publisher restart.
+    expect_no_buffer(&mut src, Duration::from_millis(600)).await;
+}
+
+/// The ungraceful case no goodbye covers: the publisher's process is gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_vanished_publisher_ends_the_stream_under_the_eos_policy() {
+    let (pub_session, sub_session) = session_pair().await;
+    let key = unique_key("video/h264/high");
+    let mut src = ZenohSrc::media_with_session(sub_session, &key)
+        .await
+        .expect("media source")
+        .on_publisher_loss(PublisherLoss::Eos);
+    let mut sink = ZenohSink::media_with_session(pub_session, &key)
+        .await
+        .expect("media sink");
+    settle().await;
+
+    let mut meta = Metadata::new();
+    meta.flags |= BufferFlags::SYNC_POINT;
+    sink.consume(&ConsumeContext::new(&buffer(&keyframe_au(), meta)))
+        .await
+        .expect("publish");
+    let _ = next_buffer(&mut src).await;
+
+    // No `finish`, no goodbye — just gone, the way a killed process is.
+    drop(sink);
+
+    let mut ctx = ProduceContext::without_buffer();
+    let result = tokio::time::timeout(Duration::from_secs(10), src.produce(&mut ctx))
+        .await
+        .expect("the liveliness delete must arrive")
+        .expect("a vanished publisher is not this pipeline's error");
+    assert!(
+        matches!(result, ProduceResult::Eos),
+        "got {result:?}, expected Eos"
+    );
+    assert_eq!(src.control().publisher_losses(), 1);
+}
+
+/// The default, and why: a camera pipeline restarting is normal operation.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_vanished_publisher_only_warns_by_default() {
+    let (pub_session, sub_session) = session_pair().await;
+    let key = unique_key("video/h264/high");
+    let mut src = ZenohSrc::media_with_session(sub_session, &key)
+        .await
+        .expect("media source");
+    let handle: ZenohSrcHandle = src.control();
+    let mut sink = ZenohSink::media_with_session(pub_session, &key)
+        .await
+        .expect("media sink");
+    settle().await;
+
+    let mut meta = Metadata::new();
+    meta.flags |= BufferFlags::SYNC_POINT;
+    sink.consume(&ConsumeContext::new(&buffer(&keyframe_au(), meta)))
+        .await
+        .expect("publish");
+    let _ = next_buffer(&mut src).await;
+
+    drop(sink);
+
+    expect_no_buffer(&mut src, Duration::from_millis(800)).await;
+    assert_eq!(
+        handle.publisher_losses(),
+        1,
+        "the loss is counted even when it is not acted on"
+    );
+}
+
+/// The lever an application uses to apply a policy parallax has no business
+/// knowing — the `@media` `state` catalogue doc, for one.
+#[tokio::test(flavor = "multi_thread")]
+async fn end_stream_ends_a_source_parked_on_the_wire() {
+    let (mut src, _sink, _key) = parallax_pair("end-stream").await;
+    let handle = src.control();
+
+    // Ask from another task while `produce` is parked with nothing to read.
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        handle.end_stream();
+    });
+
+    let mut ctx = ProduceContext::without_buffer();
+    let result = tokio::time::timeout(Duration::from_secs(5), src.produce(&mut ctx))
+        .await
+        .expect("end_stream must wake a parked produce")
+        .expect("ending on request is not an error");
+    assert!(matches!(result, ProduceResult::Eos), "got {result:?}");
+}
+
+/// The case neither a terminal nor a liveliness token covers: the publisher is
+/// alive, has said nothing, and never will.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stream_timeout_ends_a_silent_stream() {
+    let (_pub_session, sub_session) = session_pair().await;
+    let mut src = ZenohSrc::with_session(sub_session, unique_key("stream-timeout"))
+        .await
+        .expect("source")
+        .with_stream_timeout(Duration::from_millis(200));
+
+    let mut ctx = ProduceContext::without_buffer();
+    let result = tokio::time::timeout(Duration::from_secs(5), src.produce(&mut ctx))
+        .await
+        .expect("the stream timeout must fire")
+        .expect("a timeout is a clean end, not an error");
+    assert!(matches!(result, ProduceResult::Eos), "got {result:?}");
+}
+
+/// The heartbeat's empty TIMEOUT buffer is a defect on `@media`: the plane's
+/// samples are whole access units, and a decoder cannot tell a zero-length
+/// "heartbeat" apart from a malformed frame.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_at_media_heartbeat_never_produces_a_frame() {
+    let (_pub_session, sub_session) = session_pair().await;
+    let key = unique_key("video/h264/high");
+    let mut src = ZenohSrc::media_with_session(sub_session, &key)
+        .await
+        .expect("media source")
+        .with_timeout(Duration::from_millis(100));
+
+    // Several expiries, none of which may yield a buffer.
+    for _ in 0..3 {
+        let mut ctx = ProduceContext::without_buffer();
+        let result = tokio::time::timeout(Duration::from_secs(5), src.produce(&mut ctx))
+            .await
+            .expect("the heartbeat must fire")
+            .expect("a heartbeat is not an error");
+        assert!(
+            matches!(result, ProduceResult::WouldBlock),
+            "@media must never emit a zero-length frame, got {result:?}"
+        );
+    }
 }

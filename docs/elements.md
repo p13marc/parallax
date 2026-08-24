@@ -84,7 +84,7 @@ Feature-gated:
 | Factory name | Feature | Properties |
 |---|---|---|
 | `rtspsrc` | `rtsp` | `location` (req), `transport` = tcp\|udp, `timeout-ms`, `video-only`, `audio-only`, `skip-until-keyframe` |
-| `zenohsrc` | `zenoh` | `key` (req), `profile` = parallax\|media, `resync-on-discont`, `timeout-ms` |
+| `zenohsrc` | `zenoh` | `key` (req), `profile` = parallax\|media, `resync-on-discont`, `timeout-ms` (heartbeat, keeps the stream open), `stream-timeout-ms` (ends it), `on-publisher-loss` = wait\|eos |
 | `zenohsink` | `zenoh` | `key` (req), `profile` = parallax\|media, `congestion` = block\|drop, `priority`, `express` |
 
 `profile=media` selects the `@media` plane: the codec comes from the key expression (so caps are known before the first sample), the attachment is a CBOR `FrameMeta`, the QoS profile is fixed, and wildcards are refused. Both zenoh elements share one process-wide session, opened on first use and configurable with `PARALLAX_ZENOH_CONFIG`.
