@@ -468,3 +468,11 @@ name = "56_typefind"
 
 [[example]]
 name = "60_ipc"
+
+[[example]]
+name = "62_zenoh"
+required-features = ["zenoh"]
+
+[[example]]
+name = "63_media_consume"
+required-features = ["zenoh", "h264"]

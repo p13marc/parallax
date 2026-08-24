@@ -47,6 +47,28 @@ one sees zeros, so both directions degrade to "geometry unknown".
 `with_forward_custom_keys()` are meaningless on `@media` and now say so
 instead of silently doing nothing.
 
+**Plugin ABI 11 → 12** (#221). `AsyncElementDyn` gains `finish`, a terminal
+hook the sink task awaits after the last buffer and before dropping the
+element. New vtable slot, so every out-of-tree plugin must be rebuilt.
+
+**Zenoh attachment v2 → v3** (#224). `WireMetadata` gains `terminal`. A
+zero-payload sample carrying it is the parallax plane's end-of-stream marker;
+it rides the media key expression, because zenoh orders only within a flow and
+a terminal on a sibling key could overtake the last frame.
+
+**The RTP payloaders are `Transform`s** (#218). All six emit one buffer per RTP
+packet via `Output::Multiple` instead of concatenating an access unit's packets
+into one buffer for `RtpSink` to wrap in a single header — which produced a
+malformed, oversized packet for every frame that fragmented.
+
+**Demuxers stamp `Metadata.format`** (#238). MKV and MP4 also stamp `coded`
+from the track header. Nothing was declared before, so `mp4demux ! zenohsink`
+published H.264 as `zenoh/bytes`.
+
+**`RtpH265Depay` emits NAL units** (#240). It used to hand back the RTP payload
+verbatim — payload header attached, no start codes, fragmentation units never
+reassembled. Anything consuming its output was consuming garbage.
+
 **Element factory** (#222). `ElementConstructor` is an enum (`Sync`/`Async`)
 rather than a bare fn-pointer alias, and `Props` is owning and cloneable
 instead of borrowing, with its consumption set shared between clones. Both are
@@ -95,6 +117,24 @@ the plugin ABI does not use either — so no ABI bump. `register` is unchanged;
   the encoders, originated by `ZenohSink::request_keyframe`.
 - **RTSP buffers describe themselves** (#205): codec from the SDP rtpmap name,
   geometry from `sprop-parameter-sets` / `a=framesize` / the first in-band SPS.
+- **A terminal hook for sinks** (#221). `finish(EndReason)` on `Sink`,
+  `AsyncSink`, `SimpleSink` and `AsyncElementDyn`, awaited from **all seven**
+  exits the sink task has and bounded by `ExecutorConfig::finish_timeout`
+  (default 2 s). `Mp4FileSink`, `HlsSink`, `DashSink` and `WebSocketSink` move
+  their finalization out of `Drop`, where the error went nowhere.
+- **End of stream across the wire** (#224). A terminal sample on the parallax
+  plane — `Eos`, or `Error` with a message, so a stream that failed at the far
+  end does not read as a clean end at this one — plus a **liveliness token on
+  both planes**, which covers `kill -9` and network partition. `PublisherLoss`
+  is `Wait` by default, because a camera pipeline restarting is normal
+  operation. Also `ZenohSrcHandle::end_stream()` and `with_stream_timeout`.
+- **`ExecutorConfig::live_video()`** (#237) and a "Stopping a live pipeline"
+  section in `docs/pipeline.md`: `stopper()` outlives the handle `wait()`
+  consumes, and no source wrapper is needed.
+- **`codec::vpx`** (#239): `vp8_is_keyframe` / `vp9_is_keyframe`, the VPx half
+  of `annexb::is_entry_point`.
+- **`docs/multi-machine.md`** (#229), the deployment guide, and
+  `examples/62_zenoh.rs` / `examples/63_media_consume.rs` (#228).
 
 ### Fixed
 
@@ -114,6 +154,24 @@ the plugin ABI does not use either — so no ABI bump. `register` is unchanged;
   dropped the `Session`; dropping the last clone closes the session and makes
   `produce` report EOS on its first poll. Invisible until a test stopped
   sharing one process-wide session.
+- **RTP keyframe detection** (#239). H.264 read only the first NAL, so the
+  canonical `SPS | PPS | IDR` keyframe was delivered *unflagged*; H.265 and VP9
+  had no detection at all and inherited a `SYNC_POINT` that `RtpSrc` sets from
+  the RTP **marker** bit — "end of access unit", not "keyframe" — so roughly
+  every frame claimed to be an entry point. Every verdict now sets *and clears*
+  from the bitstream.
+- **Three payload copies per zenoh buffer, down to one** (#226). Publishing
+  hands zenoh the arena's own bytes; receiving walks `ZBytes::slices()` straight
+  into a slot. In-flight publishes therefore pin producer slots, which
+  `ZenohSink::retained_buffers()` declares — on the parallax plane that turns
+  unbounded heap growth under `CongestionControl::Block` into real backpressure.
+- **`@media` no longer emits a zero-length "heartbeat" frame** (#224).
+  `with_timeout` on that plane produced an empty `TIMEOUT`-flagged buffer, which
+  a decoder cannot tell apart from a malformed access unit.
+- **A load-dependent test flake** (#241). `monitored_link_reports_busy_then_ready`
+  bounded its wait with 200 000 `yield_now()` calls — a CPU budget, not a
+  timeout, and one that shrinks on a faster box while the thing it waits for
+  gets slower under load.
 
 ## [0.7.0] — 2026-08-19
 
