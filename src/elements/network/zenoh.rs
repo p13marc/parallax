@@ -684,16 +684,18 @@ impl ZenohSrc {
     /// wire, so it is lost — the same as any other zenoh congestion drop, and
     /// the receiver's DISCONT tracking already reports it.
     fn sample_to_buffer(&mut self, sample: zenoh::sample::Sample) -> Result<SampleOutcome> {
-        let data = sample.payload().to_bytes().into_owned();
+        // No `into_owned()` (#226): the payload is copied once, straight into
+        // the arena slot, the same as every other source in this tree. It used
+        // to be materialised as a `Vec` first and then copied again.
         self.counters
             .bytes_received
-            .fetch_add(data.len() as u64, Ordering::Relaxed);
+            .fetch_add(sample.payload().len() as u64, Ordering::Relaxed);
         self.counters
             .samples_received
             .fetch_add(1, Ordering::Relaxed);
 
         if self.profile == WireProfile::Media {
-            return self.media_sample_to_buffer(sample, data);
+            return self.media_sample_to_buffer(sample);
         }
 
         let mut metadata = match sample.attachment().and_then(|a| {
@@ -745,7 +747,7 @@ impl ZenohSrc {
             metadata.set(KEY_EXPR_META, key.to_string());
         }
 
-        self.buffer_from(data, metadata)
+        self.buffer_from(sample.payload(), metadata)
     }
 
     /// An empty TIMEOUT-flagged buffer (produced when `with_timeout` fires).
@@ -754,11 +756,7 @@ impl ZenohSrc {
     /// The plane's contract, read back: the payload is one whole access unit,
     /// the codec is on the `Encoding` (never sniffed), and per-frame metadata
     /// is a CBOR `FrameMeta` on the attachment.
-    fn media_sample_to_buffer(
-        &mut self,
-        sample: zenoh::sample::Sample,
-        data: Vec<u8>,
-    ) -> Result<SampleOutcome> {
+    fn media_sample_to_buffer(&mut self, sample: zenoh::sample::Sample) -> Result<SampleOutcome> {
         let frame = sample
             .attachment()
             .and_then(|a| crate::wire::FrameMeta::from_cbor(&a.to_bytes()));
@@ -777,7 +775,7 @@ impl ZenohSrc {
             }
             let metadata = Metadata::from_sequence(self.sequence);
             self.sequence += 1;
-            return self.buffer_from(data, metadata);
+            return self.buffer_from(sample.payload(), metadata);
         };
 
         let mut metadata = frame.to_metadata();
@@ -835,17 +833,27 @@ impl ZenohSrc {
             metadata.format = Some(crate::format::MediaFormat::Video(codec));
         }
 
-        self.buffer_from(data, metadata)
+        self.buffer_from(sample.payload(), metadata)
     }
 
-    /// Copy `data` into an arena slot and pair it with `metadata`.
-    fn buffer_from(&mut self, data: Vec<u8>, metadata: Metadata) -> Result<SampleOutcome> {
-        let Some(mut slot) = self.acquire(data.len())? else {
+    /// Copy a sample's payload into an arena slot and pair it with `metadata`.
+    ///
+    /// Walks `ZBytes::slices()` rather than asking for a contiguous view
+    /// (#226): a payload that arrived in several transport fragments would
+    /// otherwise be flattened into a `Vec` first and copied again. This is one
+    /// copy either way.
+    fn buffer_from(
+        &mut self,
+        payload: &zenoh::bytes::ZBytes,
+        metadata: Metadata,
+    ) -> Result<SampleOutcome> {
+        let len = payload.len();
+        let Some(mut slot) = self.acquire(len)? else {
             return Ok(SampleOutcome::NoSlot);
         };
-        slot.data_mut()[..data.len()].copy_from_slice(&data);
+        copy_zbytes_into(payload, slot.data_mut());
         Ok(SampleOutcome::Buffer(Buffer::new(
-            MemoryHandle::with_len(slot, data.len()),
+            MemoryHandle::with_len(slot, len),
             metadata,
         )))
     }
@@ -1052,6 +1060,59 @@ impl AsyncSource for ZenohSrc {
         ElementMediaCaps::new(vec![FormatMemoryCap::new(format, MemoryCaps::cpu_only())])
     }
 }
+
+/// Copy a zenoh payload into `dst`, whatever shape it arrived in (#226).
+///
+/// A `ZBytes` can be several non-contiguous regions — that is the whole point
+/// of its zero-copy transport — and `to_bytes()` flattens those into a fresh
+/// allocation before anyone can look at them. Walking the slices copies once,
+/// straight into the arena slot, in every case.
+///
+/// `dst` must be at least `payload.len()` long.
+fn copy_zbytes_into(payload: &zenoh::bytes::ZBytes, dst: &mut [u8]) {
+    let mut offset = 0;
+    for chunk in payload.slices() {
+        dst[offset..offset + chunk.len()].copy_from_slice(chunk);
+        offset += chunk.len();
+    }
+    debug_assert_eq!(offset, payload.len(), "slices() must cover the payload");
+}
+
+/// A payload published straight out of the producer's arena (#226).
+///
+/// `bytes::Bytes::from_owner` keeps this alive for exactly as long as zenoh
+/// holds the slice, and a parallax `Buffer` clone is two atomic increments and
+/// no syscall — so a frame reaches the wire with **no** payload copy at all.
+/// Before this the sink did `ctx.input().to_vec()` and zenoh copied that into
+/// its own `ZBuf`: two copies per frame.
+struct ArenaPayload(Buffer);
+
+impl AsRef<[u8]> for ArenaPayload {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+/// Wrap a buffer as a zero-copy zenoh payload.
+fn from_arena(buffer: &Buffer) -> zenoh::bytes::ZBytes {
+    zenoh::bytes::ZBytes::from(bytes::Bytes::from_owner(ArenaPayload(buffer.clone())))
+}
+
+/// How many published payloads zenoh may still be holding (#226).
+///
+/// Declared through `retained_buffers` (ABI 10) because those payloads now pin
+/// slots in the *producer's* output arena — without this the upstream source
+/// starves as soon as the transport batches. There is no zenoh API for the
+/// real depth; this is a deliberate small over-estimate of what a `put` that
+/// has already returned can still reference.
+///
+/// The knock-on effect is worth stating, and it applies to the **parallax
+/// plane only**: under `CongestionControl::Block` this turns what used to be
+/// unbounded heap growth into visible backpressure — the source runs out of
+/// slots and answers `WouldBlock`. `@media` is `Drop` by contract (a stale
+/// frame is worthless and the encoder must never block), so nothing there
+/// blocks and nobody should "fix" it into blocking.
+const PUBLISH_IN_FLIGHT: usize = 4;
 
 /// How many viewer-arrival/departure events the handle buffers (#234).
 ///
@@ -1685,15 +1746,15 @@ impl AsyncSink for ZenohSink {
                 let attachment = self.attach_metadata.then(|| {
                     WireMetadata::from_metadata(metadata, &self.forward_custom_keys).encode()
                 });
-                (ctx.input().to_vec(), attachment)
+                (from_arena(ctx.buffer()), attachment)
             }
             WireProfile::Media => {
                 // Keep the keyframe promise at the byte level: repair a
                 // keyframe that arrived without its parameter sets, then judge
                 // the flag on the bytes we are actually about to send.
                 let prepared = match &mut self.param_sets {
-                    Some(cache) => cache.prepare(ctx.input()).into_owned(),
-                    None => ctx.input().to_vec(),
+                    Some(cache) => cache.prepare(ctx.input()),
+                    None => std::borrow::Cow::Borrowed(ctx.input()),
                 };
 
                 let keyframe = match self.param_sets.as_ref().map(|c| c.codec()) {
@@ -1709,7 +1770,15 @@ impl AsyncSink for ZenohSink {
                 frame.sequence = self.wire_sequence;
                 self.wire_sequence = self.wire_sequence.wrapping_add(1);
 
-                (prepared, Some(frame.to_cbor()))
+                // Borrowed is the overwhelmingly common case — every delta
+                // frame and every well-formed keyframe — and it goes out
+                // straight from the arena. Only a repaired keyframe, which
+                // genuinely is new bytes, allocates.
+                let payload = match prepared {
+                    std::borrow::Cow::Borrowed(_) => from_arena(ctx.buffer()),
+                    std::borrow::Cow::Owned(v) => zenoh::bytes::ZBytes::from(v),
+                };
+                (payload, Some(frame.to_cbor()))
             }
         };
 
@@ -1766,6 +1835,13 @@ impl AsyncSink for ZenohSink {
         }
 
         published
+    }
+
+    /// Arena slots this sink can still be pinning (#226).
+    ///
+    /// See [`PUBLISH_IN_FLIGHT`].
+    fn retained_buffers(&self) -> usize {
+        PUBLISH_IN_FLIGHT
     }
 
     /// Hand a queued keyframe request to the executor's upstream path.
@@ -2084,6 +2160,45 @@ pub struct ZenohStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #226: a payload that arrived in several transport fragments must land
+    /// in the arena slot intact, without being flattened into a `Vec` first.
+    #[test]
+    fn a_non_contiguous_payload_is_copied_once_and_in_order() {
+        use zenoh::bytes::ZBytes;
+
+        let mut writer = ZBytes::writer();
+        writer.append(ZBytes::from(vec![1u8, 2, 3]));
+        writer.append(ZBytes::from(vec![4u8, 5]));
+        writer.append(ZBytes::from(vec![6u8]));
+        let payload: ZBytes = writer.finish();
+
+        assert!(
+            payload.slices().count() > 1,
+            "the fixture must actually be non-contiguous"
+        );
+        assert_eq!(payload.len(), 6);
+
+        let mut dst = vec![0u8; 8];
+        copy_zbytes_into(&payload, &mut dst);
+        assert_eq!(&dst[..6], &[1, 2, 3, 4, 5, 6]);
+        assert_eq!(&dst[6..], &[0, 0], "nothing past the payload is touched");
+    }
+
+    /// The publish path hands zenoh the arena's own bytes.
+    #[test]
+    fn an_arena_payload_exposes_the_buffer_without_copying() {
+        let arena = crate::memory::SharedArena::new(64, 4).unwrap();
+        let mut slot = arena.acquire().unwrap();
+        slot.data_mut()[..4].copy_from_slice(b"data");
+        let buffer = Buffer::new(MemoryHandle::with_len(slot, 4), Metadata::new());
+
+        let payload = from_arena(&buffer);
+        assert_eq!(payload.to_bytes().as_ref(), b"data");
+        // The clone pins the slot for as long as zenoh holds the payload,
+        // which is what makes handing over the pointer sound.
+        assert_eq!(buffer.as_bytes(), b"data");
+    }
 
     #[test]
     fn test_zenoh_priority_conversion() {
