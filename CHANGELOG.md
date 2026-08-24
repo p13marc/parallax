@@ -8,6 +8,71 @@ ride minor bumps.
 Earlier releases predate this file — their notes live in the `Bump to X.Y.Z`
 commit messages and the Forgejo releases.
 
+## [Unreleased]
+
+Work on the `@media` plane (milestone *Multi-machine video: RTSP → @media →
+browser*, epic #204). Several wire-format breaks land together on purpose, so
+no intermediate build advertises a half-migrated format.
+
+### Breaking
+
+**`MediaFormat` and encoded geometry** (#236). `VideoCodec` gains `Mjpeg`,
+appended last so the discriminants `ipc_ring`'s `descriptor_enum_discriminants_locked`
+pins do not move. `Metadata` gains a `coded` field carrying encoded video's
+geometry, written by `set_coded_video_dims` and read by `coded_video_dims`.
+`MediaFormat::Video(VideoCodec)` is unchanged: most of its uses are caps
+declarations or producers that know the codec and nothing else, and
+`MediaFormat::compatible` compares the whole payload, so a struct variant
+would have made two H.264 caps at different resolutions incompatible.
+
+`video_dims()` deliberately still answers only for raw video. Several readers
+treat a `Some` from it as proof that a buffer has addressable planes.
+
+Every video encoder now stamps what it produced instead of cloning its input's
+`VideoRaw` — including `EncoderElement`'s flush path, which used to emit
+`format: None` so the tail of a stream disagreed with its head. `VideoEncoder`
+gains `codec()`; it is not part of the plugin ABI, so the ABI version is
+unchanged.
+
+**Zenoh attachment v1 → v2** (#236). `WireMetadata` carries the coded
+geometry. Peers of different versions fall back to foreign-publisher handling,
+as they always have.
+
+**IPC descriptor semantics** (#236). `FMT_VIDEO` now uses the four payload
+words `FMT_VIDEO_RAW` already spent, so the descriptor stays 128 bytes and
+`IPC_RING_VERSION` does not move: an older peer never reads them and a newer
+one sees zeros, so both directions degrade to "geometry unknown".
+
+**`ZenohSink` builders return `Result`** (#231). `without_metadata()` and
+`with_forward_custom_keys()` are meaningless on `@media` and now say so
+instead of silently doing nothing.
+
+### Added
+
+- **The `@media` plane** (#231, #223). `ZenohSink::media` / `ZenohSrc::media`
+  speak the ratified contract: one access unit per sample, codec on the
+  `Encoding`, CBOR `FrameMeta` on the attachment, the `frame` QoS profile,
+  exact keys only. The publisher owns the wire sequence and decides the
+  keyframe flag from the bytes it is sending; the subscriber gates on the
+  first keyframe and derives its caps from the key expression, so
+  `prepare()` is deterministic.
+- **`wire::FrameMeta`** (#232), with a CBOR conformance corpus under
+  `tests/fixtures/framemeta/`.
+- **`codec::annexb`**: `NalCodec`, `is_entry_point`, `has_param_sets`,
+  `param_set_blob`, `ParamSetCache` (#233) and `h264_profile_level_id` +
+  `h264_browser_compatible` (#215).
+- **`Event::ForceKeyUnit`** (#213), the third upstream family. Consumed by
+  the encoders, originated by `ZenohSink::request_keyframe`.
+- **RTSP buffers describe themselves** (#205): codec from the SDP rtpmap name,
+  geometry from `sprop-parameter-sets` / `a=framesize` / the first in-band SPS.
+
+### Fixed
+
+- **`ZenohSrc` did not hold its session alive**. It declared a subscriber and
+  dropped the `Session`; dropping the last clone closes the session and makes
+  `produce` report EOS on its first poll. Invisible until a test stopped
+  sharing one process-wide session.
+
 ## [0.7.0] — 2026-08-19
 
 175 commits since 0.6.0. Every out-of-tree plugin must be rebuilt: the plugin
