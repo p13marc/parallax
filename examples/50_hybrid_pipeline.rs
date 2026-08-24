@@ -85,8 +85,8 @@ struct RtGain {
 impl Element for RtGain {
     fn process(&mut self, mut buffer: Buffer) -> Result<Option<Buffer>> {
         let data = buffer.as_bytes_mut();
-        for sample in data.chunks_exact_mut(4) {
-            let val = f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]);
+        for sample in data.as_chunks_mut::<4>().0 {
+            let val = f32::from_le_bytes(*sample);
             let out = val * self.factor;
             sample.copy_from_slice(&out.to_le_bytes());
         }

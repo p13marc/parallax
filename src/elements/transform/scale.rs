@@ -633,9 +633,9 @@ mod tests {
         );
 
         assert_eq!(out.len(), 3 * 2 * 2, "output must be RGB24-sized, not I420");
-        for px in out.as_bytes().chunks_exact(3) {
+        for px in out.as_bytes().as_chunks::<3>().0 {
             assert!(
-                [RED, GREEN, BLUE, WHITE].contains(&[px[0], px[1], px[2]]),
+                [RED, GREEN, BLUE, WHITE].contains(px),
                 "output pixel {px:?} is not one of the input primaries — the bytes \
                  were resampled as something other than RGB"
             );
