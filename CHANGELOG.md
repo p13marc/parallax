@@ -47,8 +47,27 @@ one sees zeros, so both directions degrade to "geometry unknown".
 `with_forward_custom_keys()` are meaningless on `@media` and now say so
 instead of silently doing nothing.
 
+**Element factory** (#222). `ElementConstructor` is an enum (`Sync`/`Async`)
+rather than a bare fn-pointer alias, and `Props` is owning and cloneable
+instead of borrowing, with its consumption set shared between clones. Both are
+`pub`, though neither is referenced anywhere outside the factory module and
+the plugin ABI does not use either — so no ABI bump. `register` is unchanged;
+`register_async` is new.
+
 ### Added
 
+- **`rtspsrc`, `zenohsrc` and `zenohsink` from a pipeline string** (#222).
+  `Pipeline::parse_async` / `parse_with_factory_async` await constructors that
+  perform real I/O; `Pipeline::parse` stays and, on such an element, points at
+  the async entry point rather than claiming a missing cargo feature.
+  `parallax-launch` uses the async path, so
+
+  ```
+  parallax-launch "zenohsrc key=…/@media/parallax/cam0/video/h264/high profile=media ! h264dec ! autovideosink"
+  ```
+
+  works. Both zenoh elements share one process-wide session, opened on first
+  use and configurable with `PARALLAX_ZENOH_CONFIG`.
 - **The `@media` plane** (#231, #223). `ZenohSink::media` / `ZenohSrc::media`
   speak the ratified contract: one access unit per sample, codec on the
   `Encoding`, CBOR `FrameMeta` on the attachment, the `frame` QoS profile,

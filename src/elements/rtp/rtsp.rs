@@ -91,7 +91,7 @@ use url::Url;
 // ============================================================================
 
 /// RTSP transport mode.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RtspTransport {
     /// TCP interleaved (RTP over RTSP connection).
     /// Most reliable, works through firewalls/NAT.

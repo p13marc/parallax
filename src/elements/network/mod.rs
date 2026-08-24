@@ -63,4 +63,6 @@ pub use zenoh::{
     ZenohSink, ZenohSrc, ZenohStats,
 };
 #[cfg(feature = "zenoh")]
+pub use zenoh::{ZENOH_CONFIG_ENV, shared_session};
+#[cfg(feature = "zenoh")]
 pub use zenoh_wire::{WireFormat, WireMetadata};

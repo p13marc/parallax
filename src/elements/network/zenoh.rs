@@ -137,6 +137,39 @@ pub enum WireProfile {
     Media,
 }
 
+/// The process-wide zenoh session the pipeline-string factory uses (#222).
+///
+/// `zenoh::open` builds a whole transport stack and starts scouting, so a
+/// pipeline like `zenohsrc key=a ! … ! zenohsink key=b` must not open two.
+/// Library callers keep using `with_session` to supply their own.
+///
+/// `tokio::sync::OnceCell` rather than `std::sync::OnceLock` because opening
+/// is async and `OnceLock::get_or_init` is not.
+static SHARED_SESSION: tokio::sync::OnceCell<Session> = tokio::sync::OnceCell::const_new();
+
+/// Environment variable naming a zenoh JSON5 config file for [`shared_session`].
+pub const ZENOH_CONFIG_ENV: &str = "PARALLAX_ZENOH_CONFIG";
+
+/// The process-wide zenoh session, opening it on first use.
+///
+/// Configured from the file named by `PARALLAX_ZENOH_CONFIG`, or zenoh's
+/// defaults when that is unset.
+pub async fn shared_session() -> Result<Session> {
+    SHARED_SESSION
+        .get_or_try_init(|| async {
+            let config = match std::env::var(ZENOH_CONFIG_ENV) {
+                Ok(path) => zenoh::Config::from_file(&path)
+                    .map_err(|e| Error::Element(format!("{ZENOH_CONFIG_ENV}={path}: {e}")))?,
+                Err(_) => zenoh::Config::default(),
+            };
+            zenoh::open(config)
+                .await
+                .map_err(|e| Error::Element(format!("Zenoh open error: {e}")))
+        })
+        .await
+        .cloned()
+}
+
 const DEFAULT_ARENA_SLOT: usize = 64 * 1024;
 /// Slots for a querier, which holds every reply to one query at once.
 const QUERIER_SLOT_COUNT: usize = 64;

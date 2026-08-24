@@ -79,7 +79,17 @@ Feature-gated:
 | `rtp{h264,h265,vp8,vp9,opus,av1}pay` | `rtp` | `mtu` |
 | `rtp{h264,h265,vp8,vp9,opus}depay` | `rtp` | — |
 
-Not registered (use the programmatic API): mux/demux elements (the linear grammar cannot name pads), zenoh (async constructors), `rtspsrc`, closure-taking transforms, `AppSrc`/`AppSink`, v4l2-m2m and Vulkan hardware codecs.
+`rtspsrc`, `zenohsrc` and `zenohsink` build by **awaiting** real I/O, so they need `Pipeline::parse_async` (which is what `parallax-launch` uses); the synchronous `Pipeline::parse` meets one and says so rather than pretending the feature is missing.
+
+| Factory name | Feature | Properties |
+|---|---|---|
+| `rtspsrc` | `rtsp` | `location` (req), `transport` = tcp\|udp, `timeout-ms`, `video-only`, `audio-only`, `skip-until-keyframe` |
+| `zenohsrc` | `zenoh` | `key` (req), `profile` = parallax\|media, `resync-on-discont`, `timeout-ms` |
+| `zenohsink` | `zenoh` | `key` (req), `profile` = parallax\|media, `congestion` = block\|drop, `priority`, `express` |
+
+`profile=media` selects the `@media` plane: the codec comes from the key expression (so caps are known before the first sample), the attachment is a CBOR `FrameMeta`, the QoS profile is fixed, and wildcards are refused. Both zenoh elements share one process-wide session, opened on first use and configurable with `PARALLAX_ZENOH_CONFIG`.
+
+Not registered (use the programmatic API): mux/demux elements (the linear grammar cannot name pads), closure-taking transforms, `AppSrc`/`AppSink`, v4l2-m2m and Vulkan hardware codecs.
 
 Network and device constructors do their I/O (connect/bind/open) at parse time, so a bad address fails the parse rather than the run.
 

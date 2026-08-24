@@ -11,6 +11,8 @@ use crate::error::Result;
 pub(super) fn register(f: &mut ElementFactory) {
     #[cfg(feature = "rtp")]
     {
+        #[cfg(feature = "rtsp")]
+        f.register_async("rtspsrc", |p| Box::pin(create_rtspsrc(p)));
         f.register("rtpsrc", create_rtpsrc);
         f.register("rtpsink", create_rtpsink);
         f.register("rtpjitterbuffer", create_rtpjitterbuffer);
@@ -145,4 +147,52 @@ fn create_rtpjitterbuffer(props: &Props) -> Result<Box<DynAsyncElement<'static>>
         jb = jb.with_drop_late(drop);
     }
     Ok(DynAsyncElement::new_box(ElementAdapter::new(jb)))
+}
+
+// ============================================================================
+// RTSP (async constructor — DESCRIBE/SETUP/PLAY happen here)
+// ============================================================================
+
+/// `rtspsrc location=<url> [transport=tcp|udp] [timeout-ms=<n>]
+///         [video-only=<bool>] [audio-only=<bool>] [skip-until-keyframe=<bool>]`
+///
+/// Credentials embedded in the URL (`rtsp://user:pass@host/...`) are lifted
+/// into RTSP auth automatically. The connection is made here, so a bad URL or
+/// an unreachable camera fails the parse rather than the run.
+#[cfg(feature = "rtsp")]
+async fn create_rtspsrc(
+    props: super::Props,
+) -> crate::error::Result<Box<crate::element::DynAsyncElement<'static>>> {
+    use crate::element::AsyncSourceAdapter;
+    use crate::elements::{RtspSrc, RtspTransport};
+
+    let location = props.req_str("location")?;
+    let mut src = RtspSrc::new(location);
+
+    if let Some(transport) = props.get_enum(
+        "transport",
+        &[
+            ("tcp", RtspTransport::TcpInterleaved),
+            ("udp", RtspTransport::Udp),
+        ],
+    )? {
+        src = src.with_transport(transport);
+    }
+    if let Some(timeout) = props.get_ms("timeout-ms")? {
+        src = src.with_timeout(timeout);
+    }
+    if props.get_bool("video-only")?.unwrap_or(false) {
+        src = src.video_only();
+    }
+    if props.get_bool("audio-only")?.unwrap_or(false) {
+        src = src.audio_only();
+    }
+    if let Some(skip) = props.get_bool("skip-until-keyframe")? {
+        src = src.skip_until_keyframe(skip);
+    }
+
+    let session = src.connect().await?;
+    Ok(crate::element::DynAsyncElement::new_box(
+        AsyncSourceAdapter::new(session),
+    ))
 }
