@@ -146,7 +146,20 @@ fmt-check:
     cargo fmt --check
 
 # Run all checks (format, lint, test)
-check: fmt-check lint test
+# Rustdoc with warnings denied — mirrors CI's `docs` job, which is the only
+# thing that was checking this and therefore the only thing that caught it.
+#
+# Three combos, not one: an intra-doc link into a feature-gated module resolves
+# in a build that has the feature and breaks in one that does not, so a single
+# combo cannot tell you the doc set is sound. CI runs the sensor one; the other
+# two are what a reader actually types (`cargo doc` with no features) and what
+# the media path uses.
+check-docs:
+    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features {{sensor_features}},image-codecs
+    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features {{media_features}}
+
+check: fmt-check lint test check-docs
 
 # Run benchmarks
 bench:

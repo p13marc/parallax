@@ -50,7 +50,7 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
 
 /// A seekable HTTP source with a sparse on-disk cache (#188).
 ///
-/// See the [module docs](self) for the serve-from-disk contract.
+/// See this module's docs for the serve-from-disk contract.
 pub struct HttpCacheSrc {
     name: String,
     url: String,

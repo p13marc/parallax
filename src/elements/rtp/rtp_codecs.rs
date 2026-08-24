@@ -448,7 +448,7 @@ impl Transform for RtpH264Pay {
 /// packets are split on their length prefixes, and fragmentation units are
 /// reassembled across packets with the original NAL header rebuilt.
 ///
-/// The reassembly is parallax's own ([`h265_depacket`](super::h265_depacket)),
+/// The reassembly is parallax's own (`rtp::h265_depacket`),
 /// because the `rtp` crate's `H265Packet::depacketize` returns the payload
 /// verbatim on every branch (#240) — this element used to advertise
 /// `MediaFormat::Video(H265)` on fragment-shaped bytes that nothing could

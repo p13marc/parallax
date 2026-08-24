@@ -7,9 +7,9 @@
 //!
 //! # Two planes, two schemas — on purpose
 //!
-//! - The **parallax plane** ([`elements::network::zenoh_wire`]) carries an
-//!   rkyv `WireMetadata`: everything a `Metadata` holds, for parallax↔parallax
-//!   links.
+//! - The **parallax plane** (`elements::network::zenoh_wire`, feature-gated on
+//!   `zenoh`, hence not linked) carries an rkyv `WireMetadata`: everything a
+//!   `Metadata` holds, for parallax↔parallax links.
 //! - The **`@media` plane** carries a CBOR [`FrameMeta`]: seven fields, for
 //!   consumers that are not parallax — the zensight GUI, a browser.
 //!
@@ -19,8 +19,6 @@
 //! by parallax. Widening it to carry parallax's internals would break that
 //! contract; narrowing `WireMetadata` to match would lose metadata on
 //! parallax's own links.
-//!
-//! [`elements::network::zenoh_wire`]: crate::elements::network::zenoh_wire
 
 pub mod codes;
 pub mod descriptor;

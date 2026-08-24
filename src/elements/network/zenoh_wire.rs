@@ -1,8 +1,8 @@
 //! The zenoh side of parallax's wire: how the shared schema reaches a sample.
 //!
 //! [`ZenohSink`](super::ZenohSink) publishes each buffer's payload bytes
-//! unmodified and serializes the buffer [`Metadata`] into the sample's
-//! **attachment**, so non-parallax subscribers still see plain media bytes
+//! unmodified and serializes the buffer [`Metadata`](crate::metadata::Metadata)
+//! into the sample's **attachment**, so non-parallax subscribers still see plain media bytes
 //! while parallax subscribers ([`ZenohSrc`](super::ZenohSrc)) reconstruct full
 //! metadata.
 //!
