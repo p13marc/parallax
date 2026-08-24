@@ -325,6 +325,11 @@ impl ParamSetCache {
         }
     }
 
+    /// Which codec this cache reads NAL headers for.
+    pub fn codec(&self) -> NalCodec {
+        self.codec
+    }
+
     /// The cached parameter sets, if any have been seen.
     pub fn param_sets(&self) -> Option<&[u8]> {
         self.sets.as_deref()

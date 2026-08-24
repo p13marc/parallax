@@ -109,6 +109,34 @@ impl From<ZenohReliability> for zenoh::qos::Reliability {
 }
 
 /// Default arena slot size for received samples (grows on demand).
+/// Which wire contract an element speaks (#231, #223).
+///
+/// Not merely a choice of attachment codec: a profile fixes five coupled
+/// decisions at once, and the combinations that cross them are nonsense.
+///
+/// | | `Parallax` | `Media` |
+/// |---|---|---|
+/// | attachment | rkyv [`WireMetadata`] | CBOR [`FrameMeta`](crate::wire::FrameMeta) |
+/// | QoS default | Block / Data | best-effort · drop · interactive-high · express |
+/// | sequence | forwarded from the buffer | owned by the publisher |
+/// | wildcards | legal | refused |
+/// | keyframe flag | `SYNC_POINT` passthrough | derived from the bytes |
+///
+/// `Media` implements the `@media` plane, a contract parallax does not own —
+/// it is a conformant implementer, not the author. It never *builds* an
+/// `@media` key (it has no origin and no producer chunk), never publishes a
+/// catalogue, and never touches the control plane: it takes the key it is
+/// given and carries pixels on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WireProfile {
+    /// parallax↔parallax links: full metadata, parallax's own conventions.
+    #[default]
+    Parallax,
+    /// The `@media` plane: one access unit per sample, codec on the
+    /// `Encoding`, CBOR `FrameMeta` on the attachment.
+    Media,
+}
+
 const DEFAULT_ARENA_SLOT: usize = 64 * 1024;
 /// Slots for a querier, which holds every reply to one query at once.
 const QUERIER_SLOT_COUNT: usize = 64;
@@ -138,6 +166,12 @@ const QUERIER_SLOT_COUNT: usize = 64;
 pub struct ZenohSrc {
     name: String,
     key_expr: String,
+    /// Held so the session outlives the subscriber declared on it. Dropping
+    /// the last `Session` clone closes the session, which silently kills the
+    /// subscription and makes `produce` report EOS on its first poll — a
+    /// failure mode invisible whenever the caller happens to keep a clone of
+    /// its own alive, as a process-wide test session does.
+    _session: Session,
     // Held to keep the subscription alive.
     _subscriber: zenoh::pubsub::Subscriber<()>,
     receiver: tokio::sync::mpsc::UnboundedReceiver<zenoh::sample::Sample>,
@@ -150,6 +184,18 @@ pub struct ZenohSrc {
     warned_foreign: bool,
     timeout: Option<Duration>,
     output: OutputArena,
+    profile: WireProfile,
+    /// `Media` only: what the key expression says the payload is, resolved at
+    /// construction so `output_media_caps()` can answer before `prepare()`.
+    shape: super::media_key::MediaKeyShape,
+    /// `Media` only: drop samples until the first keyframe. A decoder fed a
+    /// mid-GOP access unit produces nothing useful and complains for a whole
+    /// GOP about it.
+    waiting_for_keyframe: bool,
+    /// `Media` only: whether the keyframe gate re-arms after a wire gap.
+    resync_on_discont: bool,
+    /// Samples dropped because the gate had not opened yet.
+    dropped_pre_keyframe: u64,
 }
 
 impl ZenohSrc {
@@ -183,6 +229,7 @@ impl ZenohSrc {
         Ok(Self {
             name,
             key_expr,
+            _session: session,
             _subscriber: subscriber,
             receiver: rx,
             bytes_received: 0,
@@ -192,7 +239,66 @@ impl ZenohSrc {
             warned_foreign: false,
             timeout: None,
             output: OutputArena::new(defaults::SOURCE_SLOT_COUNT).grow_to_fit(),
+            profile: WireProfile::Parallax,
+            shape: super::media_key::MediaKeyShape::Opaque,
+            waiting_for_keyframe: false,
+            resync_on_discont: false,
+            dropped_pre_keyframe: 0,
         })
+    }
+
+    /// Subscribe to an `@media` tier key.
+    ///
+    /// The key must be concrete: the plane revoked the tier wildcard, because
+    /// `…/video/h264/*` delivers every tier of a stream interleaved on one
+    /// subscriber, unseparable except by re-parsing the key per sample.
+    /// Exact-tier subscription *is* the quality choice.
+    ///
+    /// Because the codec is a literal chunk of the key, `output_media_caps()`
+    /// is honest before a single sample arrives — which is what lets a graph
+    /// under `ConverterPolicy::Deny` prepare deterministically.
+    pub async fn media(key_expr: impl Into<String>) -> Result<Self> {
+        let session = zenoh::open(zenoh::Config::default())
+            .await
+            .map_err(|e| Error::Element(format!("Zenoh open error: {}", e)))?;
+        Self::media_with_session(session, key_expr).await
+    }
+
+    /// Subscribe to an `@media` tier key using an existing session.
+    pub async fn media_with_session(session: Session, key_expr: impl Into<String>) -> Result<Self> {
+        let key_expr = key_expr.into();
+        if super::media_key::has_wildcard(&key_expr) {
+            return Err(Error::Element(format!(
+                "@media subscriptions must name one exact tier, got a wildcard: {key_expr}"
+            )));
+        }
+
+        let shape = super::media_key::MediaKeyShape::parse(&key_expr);
+        let mut src = Self::with_session(session, key_expr).await?;
+        src.profile = WireProfile::Media;
+        src.waiting_for_keyframe = true;
+        src.shape = shape;
+        Ok(src)
+    }
+
+    /// Whether to re-arm the keyframe gate after a wire discontinuity.
+    ///
+    /// Default `false`. Re-arming throws away a whole GOP for one lost
+    /// packet, and the decoders already degrade gracefully with a rate-limited
+    /// warning — opt in when you would rather freeze than smear.
+    pub fn with_resync_on_discont(mut self, resync: bool) -> Self {
+        self.resync_on_discont = resync;
+        self
+    }
+
+    /// Which wire contract this source speaks.
+    pub fn profile(&self) -> WireProfile {
+        self.profile
+    }
+
+    /// Samples dropped because the keyframe gate had not opened yet.
+    pub fn dropped_pre_keyframe(&self) -> u64 {
+        self.dropped_pre_keyframe
     }
 
     /// Set a custom name.
@@ -250,6 +356,10 @@ impl ZenohSrc {
         self.bytes_received += data.len() as u64;
         self.samples_received += 1;
 
+        if self.profile == WireProfile::Media {
+            return self.media_sample_to_buffer(sample, data);
+        }
+
         let mut metadata = match sample.attachment().and_then(|a| {
             let bytes = a.to_bytes();
             WireMetadata::decode(&bytes)
@@ -298,6 +408,92 @@ impl ZenohSrc {
     }
 
     /// An empty TIMEOUT-flagged buffer (produced when `with_timeout` fires).
+    /// Build a buffer from an `@media` sample (#223).
+    ///
+    /// The plane's contract, read back: the payload is one whole access unit,
+    /// the codec is on the `Encoding` (never sniffed), and per-frame metadata
+    /// is a CBOR `FrameMeta` on the attachment.
+    fn media_sample_to_buffer(
+        &mut self,
+        sample: zenoh::sample::Sample,
+        data: Vec<u8>,
+    ) -> Result<Option<Buffer>> {
+        let frame = sample
+            .attachment()
+            .and_then(|a| crate::wire::FrameMeta::from_cbor(&a.to_bytes()));
+
+        let Some(frame) = frame else {
+            // A publisher on this plane that sends no FrameMeta is not
+            // conformant; say so once and pass the bytes on rather than
+            // dropping a stream that might still decode.
+            if !self.warned_foreign {
+                self.warned_foreign = true;
+                tracing::warn!(
+                    "zenohsrc '{}': @media sample without a FrameMeta attachment; \
+                     delivering with synthesised metadata",
+                    self.name
+                );
+            }
+            let metadata = Metadata::from_sequence(self.sequence);
+            self.sequence += 1;
+            return self.buffer_from(data, metadata);
+        };
+
+        let mut metadata = frame.to_metadata();
+
+        // A gap means the publisher's samples did not all arrive. So does the
+        // very first sample of a subscription: joining a live stream partway
+        // *is* a discontinuity, and it never used to be flagged because the
+        // "previous sequence" started empty.
+        let discont = match self.last_wire_sequence {
+            Some(prev) => frame.sequence != prev.wrapping_add(1),
+            None => true,
+        };
+        if discont {
+            metadata.flags |= BufferFlags::DISCONT;
+            if self.resync_on_discont {
+                self.waiting_for_keyframe = true;
+            }
+        }
+        self.last_wire_sequence = Some(frame.sequence);
+
+        // Never hand a decoder a mid-GOP access unit.
+        if self.waiting_for_keyframe {
+            if !frame.keyframe {
+                self.dropped_pre_keyframe += 1;
+                if self.dropped_pre_keyframe == 1 {
+                    tracing::debug!(
+                        "zenohsrc '{}': waiting for a keyframe before delivering",
+                        self.name
+                    );
+                }
+                return Ok(None);
+            }
+            self.waiting_for_keyframe = false;
+        }
+
+        // Coded geometry, when the publisher knew it.
+        if let (Some(codec), true) = (self.shape.codec(), frame.width > 0 && frame.height > 0) {
+            metadata.set_coded_video_dims(codec, frame.width, frame.height);
+        } else if let Some(codec) = self.shape.codec() {
+            metadata.format = Some(crate::format::MediaFormat::Video(codec));
+        }
+
+        self.buffer_from(data, metadata)
+    }
+
+    /// Copy `data` into an arena slot and pair it with `metadata`.
+    fn buffer_from(&mut self, data: Vec<u8>, metadata: Metadata) -> Result<Option<Buffer>> {
+        let Some(mut slot) = self.acquire(data.len())? else {
+            return Ok(None);
+        };
+        slot.data_mut()[..data.len()].copy_from_slice(&data);
+        Ok(Some(Buffer::new(
+            MemoryHandle::with_len(slot, data.len()),
+            metadata,
+        )))
+    }
+
     fn timeout_buffer(&mut self) -> Result<Option<Buffer>> {
         let Some(slot) = self.acquire(0)? else {
             return Ok(None);
@@ -342,6 +538,33 @@ impl AsyncSource for ZenohSrc {
     fn name(&self) -> &str {
         &self.name
     }
+
+    /// Caps derived from the key expression, not from received data (#223).
+    ///
+    /// On `@media` the codec is a literal chunk of the key, so this is honest
+    /// at `prepare()` time — before a single sample has arrived. That matters:
+    /// `prepare()` is synchronous and runs first, so caps derived from the
+    /// wire would be `Video(H264)` on one run and `Any` on the next depending
+    /// on network timing, and the same pipeline string would pass under
+    /// `ConverterPolicy::Deny` once and fail the next time.
+    ///
+    /// A key naming no codec parallax knows reports `Bytes` rather than `Any`:
+    /// `Bytes` intersects with anything, so `Deny` still never fails on it,
+    /// and it says "opaque bytes", which is true, where `Any` says "anything",
+    /// which is not.
+    fn output_media_caps(&self) -> crate::format::ElementMediaCaps {
+        use crate::format::{ElementMediaCaps, FormatCaps, FormatMemoryCap, MemoryCaps};
+
+        if self.profile != WireProfile::Media {
+            return ElementMediaCaps::from(crate::format::Caps::any());
+        }
+
+        let format = match self.shape.codec() {
+            Some(codec) => FormatCaps::Video(codec),
+            None => FormatCaps::Bytes,
+        };
+        ElementMediaCaps::new(vec![FormatMemoryCap::new(format, MemoryCaps::cpu_only())])
+    }
 }
 
 /// A Zenoh sink that publishes to a key expression.
@@ -379,6 +602,15 @@ pub struct ZenohSink {
     encoding: Option<zenoh::bytes::Encoding>,
     forward_custom_keys: Vec<&'static str>,
     attach_metadata: bool,
+    profile: WireProfile,
+    /// `Media` only: the publisher owns the wire sequence. `metadata.sequence`
+    /// is per-element and gets rewritten mid-graph (an encoder sets it to its
+    /// own frame count), so only the publisher knows what actually went out —
+    /// which is what makes a subscriber's gap detection mean anything.
+    wire_sequence: u64,
+    /// `Media` only: keeps every published keyframe a self-contained decoder
+    /// entry point.
+    param_sets: Option<crate::codec::annexb::ParamSetCache>,
     bytes_sent: u64,
     samples_sent: u64,
 }
@@ -415,9 +647,69 @@ impl ZenohSink {
             encoding: None,
             forward_custom_keys: Vec::new(),
             attach_metadata: true,
+            profile: WireProfile::Parallax,
+            wire_sequence: 0,
+            param_sets: None,
             bytes_sent: 0,
             samples_sent: 0,
         })
+    }
+
+    /// Publish on the `@media` plane.
+    ///
+    /// Applies the plane's `frame` QoS profile — best-effort, drop,
+    /// interactive-high, express — because a stale frame is worthless and the
+    /// encoder must never block. A plain declared publisher, never an
+    /// AdvancedPublisher: recovering a superseded frame is anti-useful.
+    ///
+    /// The key must be a concrete tier key. Wildcards are refused rather than
+    /// warned about: publishing under one is a lie about identity, and
+    /// subscribing under one would interleave every tier of a stream on a
+    /// single subscriber.
+    pub async fn media(key_expr: impl Into<String>) -> Result<Self> {
+        let session = zenoh::open(zenoh::Config::default())
+            .await
+            .map_err(|e| Error::Element(format!("Zenoh open error: {}", e)))?;
+        Self::media_with_session(session, key_expr).await
+    }
+
+    /// Publish on the `@media` plane using an existing session.
+    pub async fn media_with_session(session: Session, key_expr: impl Into<String>) -> Result<Self> {
+        let key_expr = key_expr.into();
+        if super::media_key::has_wildcard(&key_expr) {
+            return Err(Error::Element(format!(
+                "@media keys must be concrete, got a wildcard: {key_expr}"
+            )));
+        }
+
+        let codec = super::media_key::MediaKeyShape::parse(&key_expr).codec();
+        let mut sink = Self::with_session(session, key_expr).await?;
+        sink.profile = WireProfile::Media;
+        // The plane's `frame` QoS profile.
+        sink.congestion_control = ZenohCongestionControl::Drop;
+        sink.priority = ZenohPriority::InteractiveHigh;
+        sink.express = true;
+        #[cfg(feature = "zenoh-unstable")]
+        {
+            sink.reliability = Some(ZenohReliability::BestEffort);
+        }
+        sink.param_sets = match codec {
+            Some(crate::format::VideoCodec::H264) => Some(
+                crate::codec::annexb::ParamSetCache::new(crate::codec::annexb::NalCodec::H264),
+            ),
+            Some(crate::format::VideoCodec::H265) => Some(
+                crate::codec::annexb::ParamSetCache::new(crate::codec::annexb::NalCodec::H265),
+            ),
+            // Every JPEG is self-contained; other codecs carry their headers
+            // in band and have no Annex-B parameter-set concept.
+            _ => None,
+        };
+        Ok(sink)
+    }
+
+    /// Which wire contract this sink speaks.
+    pub fn profile(&self) -> WireProfile {
+        self.profile
     }
 
     /// Set a custom name.
@@ -464,17 +756,29 @@ impl ZenohSink {
 
     /// Select byte-valued custom metadata entries (see
     /// [`Metadata::set_bytes`]) to forward on the wire, e.g. `"stanag/klv"`.
-    pub fn with_forward_custom_keys(mut self, keys: &[&'static str]) -> Self {
+    pub fn with_forward_custom_keys(mut self, keys: &[&'static str]) -> Result<Self> {
+        if self.profile == WireProfile::Media {
+            return Err(Error::Element(
+                "@media carries pixels and nothing else; side-band data belongs                  on the telemetry plane, not in the media attachment"
+                    .to_string(),
+            ));
+        }
         self.forward_custom_keys = keys.to_vec();
-        self
+        Ok(self)
     }
 
     /// Publish raw payloads only, without the metadata attachment
     /// (interop mode for consumers that must not see attachments).
     /// PTS and all other metadata are lost on the wire in this mode.
-    pub fn without_metadata(mut self) -> Self {
+    pub fn without_metadata(mut self) -> Result<Self> {
+        if self.profile == WireProfile::Media {
+            return Err(Error::Element(
+                "@media samples must carry a FrameMeta attachment;                  without_metadata() is not meaningful on that plane"
+                    .to_string(),
+            ));
+        }
         self.attach_metadata = false;
-        self
+        Ok(self)
     }
 
     /// Get the key expression.
@@ -550,20 +854,50 @@ impl AsyncSink for ZenohSink {
         let publisher = self.publisher.as_ref().expect("publisher just ensured");
 
         let metadata = ctx.metadata();
-        let data = ctx.input().to_vec();
-        let len = data.len();
 
         let encoding = self
             .encoding
             .clone()
             .unwrap_or_else(|| encoding_for_format(metadata.format.as_ref()));
 
+        let (data, attachment) = match self.profile {
+            WireProfile::Parallax => {
+                let attachment = self.attach_metadata.then(|| {
+                    WireMetadata::from_metadata(metadata, &self.forward_custom_keys).encode()
+                });
+                (ctx.input().to_vec(), attachment)
+            }
+            WireProfile::Media => {
+                // Keep the keyframe promise at the byte level: repair a
+                // keyframe that arrived without its parameter sets, then judge
+                // the flag on the bytes we are actually about to send.
+                let prepared = match &mut self.param_sets {
+                    Some(cache) => cache.prepare(ctx.input()).into_owned(),
+                    None => ctx.input().to_vec(),
+                };
+
+                let keyframe = match self.param_sets.as_ref().map(|c| c.codec()) {
+                    Some(codec) => crate::codec::annexb::is_entry_point(&prepared, codec),
+                    // No Annex-B notion of an entry point (JPEG, VP8/9, AV1):
+                    // trust what the pipeline flagged.
+                    None => metadata.flags.is_keyframe(),
+                };
+
+                let (width, height) = metadata.coded_video_dims().unwrap_or((0, 0));
+                let mut frame = crate::wire::FrameMeta::from_metadata(metadata, width, height);
+                frame.keyframe = keyframe;
+                frame.sequence = self.wire_sequence;
+                self.wire_sequence = self.wire_sequence.wrapping_add(1);
+
+                (prepared, Some(frame.to_cbor()))
+            }
+        };
+
+        let len = data.len();
         let put = publisher.put(data).encoding(encoding);
-        let put = if self.attach_metadata {
-            let wire = WireMetadata::from_metadata(metadata, &self.forward_custom_keys);
-            put.attachment(wire.encode())
-        } else {
-            put
+        let put = match attachment {
+            Some(bytes) => put.attachment(bytes),
+            None => put,
         };
 
         put.await

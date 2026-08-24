@@ -22,6 +22,9 @@ mod http_cache;
 mod websocket;
 
 #[cfg(feature = "zenoh")]
+pub mod media_key;
+
+#[cfg(feature = "zenoh")]
 mod zenoh;
 
 #[cfg(feature = "zenoh")]
@@ -50,12 +53,14 @@ pub use http_cache::HttpCacheSrc;
 pub use websocket::{WebSocketSink, WebSocketSrc, WebSocketStats, WsMessageType};
 
 // Zenoh (feature-gated)
+#[cfg(feature = "zenoh")]
+pub use media_key::MediaKeyShape;
 #[cfg(feature = "zenoh-unstable")]
 pub use zenoh::ZenohReliability;
 #[cfg(feature = "zenoh")]
 pub use zenoh::{
-    ZenohCongestionControl, ZenohPriority, ZenohQuerier, ZenohQuery, ZenohQueryable, ZenohSink,
-    ZenohSrc, ZenohStats,
+    WireProfile, ZenohCongestionControl, ZenohPriority, ZenohQuerier, ZenohQuery, ZenohQueryable,
+    ZenohSink, ZenohSrc, ZenohStats,
 };
 #[cfg(feature = "zenoh")]
 pub use zenoh_wire::{WireFormat, WireMetadata};
