@@ -1215,8 +1215,14 @@ impl crate::element::AsyncSource for RtspSession {
     /// the retries run out — the error is returned and the run ends, which is
     /// what batch work wants.
     ///
-    /// End of stream is *not* retried. A server that says goodbye said
-    /// goodbye; only a failure is a candidate for a retry.
+    /// **A stream that simply ends is retried too, when a policy is set.**
+    /// That is not an oversight: RTSP has no in-band end-of-stream for a live
+    /// stream, so a server whose process dies looks to the client exactly like
+    /// one that finished — retina yields `None` for a clean FIN either way.
+    /// Configuring a reconnect policy *is* the statement "this source is
+    /// live", and a live source running out is abnormal. A finite stream — a
+    /// recording served over RTSP — wants `without_reconnect()`, which makes
+    /// the end an end.
     async fn produce(
         &mut self,
         ctx: &mut crate::element::ProduceContext<'_>,
@@ -1231,10 +1237,17 @@ impl crate::element::AsyncSource for RtspSession {
                     }
                     return Ok(ProduceResult::OwnBuffer(buffer));
                 }
-                Ok(None) => return Ok(ProduceResult::Eos),
-                Err(e) => {
-                    let Some(policy) = self.config.reconnect else {
-                        return Err(e);
+                Ok(None) if self.config.reconnect.is_none() => {
+                    return Ok(ProduceResult::Eos);
+                }
+                outcome => {
+                    let policy = self
+                        .config
+                        .reconnect
+                        .expect("the None-without-policy arm returned above");
+                    let e = match outcome {
+                        Err(e) => e,
+                        _ => Error::Element("stream ended".into()),
                     };
                     if !policy.may_retry(attempts) {
                         return Err(Error::Element(format!(
