@@ -45,6 +45,14 @@ check-sensor:
     cargo nextest run --features {{sensor_features}}
     cargo clippy --all-targets --features {{sensor_features}},image-codecs -- -D warnings
 
+# The degraded zenoh build: `zenoh` WITHOUT `zenoh-unstable` (#230). Every
+# other recipe enables both, so this is the only one that asks whether the
+# no-matching-listener path still compiles and passes — `has_viewers()` failing
+# open, the always-empty demand-event stream.
+check-zenoh-degraded:
+    cargo nextest run --features zenoh
+    cargo clippy --all-targets --features zenoh -- -D warnings
+
 # Pure-Rust media/container feature combo (mirrors CI's media checks)
 media_features := "mp4-demux,mkv-demux,mpeg-ts,audio-aac,audio-vorbis,http"
 

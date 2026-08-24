@@ -189,6 +189,36 @@ jobs:
           key: feature-gates
           cache-targets: false
       - run: cargo clippy --all-targets --features aac-encode,websocket,alsa,v4l2-m2m -- -D warnings
+
+  # The *degraded* zenoh build (#230): `zenoh` without `zenoh-unstable`.
+  #
+  # Every other job that touches zenoh enables both, so nothing asked whether
+  # the code still compiles — let alone behaves — when the matching listener
+  # is unavailable. It is supposed to degrade: `ZenohSinkHandle` still exists,
+  # its event stream is simply always empty, and `has_viewers()` fails **open**
+  # so an idle reaper never kills a live stream because the build cannot tell.
+  # That is exactly the kind of claim that rots un-compiled (gotcha 11b).
+  #
+  # A job of its own rather than a line in `feature-gates`: zenoh is a large
+  # dependency tree, and the matrix has been retuned for OOM twice (#203).
+  zenoh-degraded:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@v7.0.1
+      - run: sudo apt-get update && sudo apt-get install -y g++
+      - uses: https://github.com/dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: https://github.com/Swatinem/rust-cache@v2.9.2
+        with:
+          key: zenoh-degraded
+          cache-targets: false
+      - uses: https://github.com/taiki-e/install-action@v2.86.1
+        with:
+          tool: cargo-nextest
+      - run: cargo nextest run --features zenoh
+      - run: cargo clippy --all-targets --features zenoh -- -D warnings
+
   # VA-API decode (#193). Runner has no GPU, so this proves the build and runs
   # the green-skip tests; real decode is validated on hardware locally.
   vaapi-check:
