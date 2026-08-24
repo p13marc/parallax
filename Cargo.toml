@@ -74,6 +74,13 @@ tungstenite = { version = "0.30", optional = true }
 # Zenoh pub/sub (optional)
 zenoh = { version = "1.9", optional = true }
 
+# CBOR, for the `@media` plane's FrameMeta attachment (#232). A real CBOR
+# reader rather than a hand-rolled one because the decode side must accept
+# whatever a *foreign* encoder produced — zensight's ciborium today, a
+# browser's JS CBOR library tomorrow — and those differ on integer width,
+# map key ordering and definite-vs-indefinite lengths.
+ciborium = { version = "0.2", optional = true }
+
 # Sync MPMC channels for the display/capture threads. Optional on purpose: it
 # is NOT in the default tree (it reaches Cargo.lock only through zenoh), so
 # only the features that need a sync multi-consumer channel pull it in.
@@ -254,7 +261,7 @@ image-png = ["dep:png"]
 simd-colorspace = ["dep:yuv"]
 http = ["ureq"]       # HTTP source/sink elements
 websocket = ["tungstenite"]  # WebSocket source/sink elements
-zenoh = ["dep:zenoh"] # Zenoh pub/sub elements
+zenoh = ["dep:zenoh", "dep:ciborium"] # Zenoh pub/sub elements
 zenoh-unstable = ["zenoh", "zenoh/unstable"] # reliability control + matching listeners
 rtp = ["dep:rtp", "dep:rtcp", "dep:webrtc-util"]  # RTP/RTCP elements
 rtsp = ["rtp", "dep:retina", "dep:url"]  # RTSP client (includes RTP support)
