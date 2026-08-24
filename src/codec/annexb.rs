@@ -337,6 +337,74 @@ impl ParamSetCache {
     }
 }
 
+/// The `profile-level-id` of the first SPS in an H.264 access unit (#215).
+///
+/// The three bytes after the SPS NAL header *are* the profile-level-id:
+/// `profile_idc`, the constraint-set flags, and `level_idc`, in that order and
+/// at fixed positions — they precede every exp-Golomb field, so no bit reader
+/// and no `h264-reader` dependency is needed. Returned packed as
+/// `profile_idc << 16 | constraint_flags << 8 | level_idc`.
+///
+/// The same six hex digits are what a WebCodecs client needs
+/// (`VideoDecoder.configure({ codec: "avc1.<6 hex>" })`) and what an SDP
+/// answer's `fmtp` line carries. Nothing on the `@media` wire transports it —
+/// `FrameMeta` deliberately does not — so a consumer derives it from the first
+/// keyframe, which is only possible because of the parameter-set promise
+/// [`ParamSetCache`] keeps.
+///
+/// ```
+/// use parallax::codec::annexb;
+///
+/// // SPS: profile_idc 0x64 (High), constraints 0x0c, level_idc 0x14 (2.0)
+/// let au = [0, 0, 0, 1, 0x67, 0x64, 0x0c, 0x14, 0xAC];
+/// assert_eq!(annexb::h264_profile_level_id(&au), Some(0x640C14));
+/// ```
+pub fn h264_profile_level_id(data: &[u8]) -> Option<u32> {
+    let sps = nal_units(data).find(|nal| nal.nal_type() == NAL_SPS)?;
+    // [0] is the NAL header; [1..4] is the profile-level-id.
+    if sps.data.len() < 4 {
+        return None;
+    }
+    Some((u32::from(sps.data[1]) << 16) | (u32::from(sps.data[2]) << 8) | u32::from(sps.data[3]))
+}
+
+/// Why a stream's H.264 profile is unusable in a browser (#215).
+///
+/// There is no re-encode on a passthrough path, so a camera's profile is the
+/// consumer's problem. A profile that lands here will negotiate and then fail
+/// to decode, which is worth saying out loud rather than rendering black.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum H264Incompatibility {
+    /// A high-bit-depth or non-4:2:0 profile: High 10 (110), High 4:2:2 (122),
+    /// High 4:4:4 predictive (244). No browser decodes these.
+    UnsupportedProfile(u8),
+}
+
+impl std::fmt::Display for H264Incompatibility {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedProfile(idc) => write!(
+                f,
+                "H.264 profile_idc {idc} (high-bit-depth or non-4:2:0) is not decodable \
+                 in any browser; Baseline (66), Main (77) and High (100) are"
+            ),
+        }
+    }
+}
+
+/// Judge an H.264 profile-level-id for browser playback.
+///
+/// `Ok(())` means the profile is universally safe. This is deliberately narrow:
+/// it reads only the profile byte, which is the part that is categorically
+/// undecodable rather than merely uncommon.
+pub fn h264_browser_compatible(profile_level_id: u32) -> Result<(), H264Incompatibility> {
+    let profile_idc = ((profile_level_id >> 16) & 0xFF) as u8;
+    match profile_idc {
+        110 | 122 | 244 => Err(H264Incompatibility::UnsupportedProfile(profile_idc)),
+        _ => Ok(()),
+    }
+}
+
 /// Prepend `sps` and `pps` (raw, no start codes) to an Annex-B access unit.
 ///
 /// Use this to make a keyframe self-contained for a late joiner when the encoder
@@ -638,6 +706,45 @@ mod tests {
             v.push(payload);
         }
         v
+    }
+
+    #[test]
+    fn profile_level_id_reads_the_real_fixture() {
+        // The one raw H.264 fixture in the tree. Its SPS is
+        // `67 64 0c 14 ...` => High profile, constraints 0x0c, level 2.0.
+        let stream = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/tiny_64x64.h264"
+        ))
+        .expect("fixture");
+
+        assert_eq!(h264_profile_level_id(&stream), Some(0x640C14));
+        // High profile is fine everywhere.
+        assert!(h264_browser_compatible(0x640C14).is_ok());
+    }
+
+    #[test]
+    fn profile_level_id_needs_an_sps() {
+        assert_eq!(h264_profile_level_id(&delta_frame()), None);
+        assert_eq!(h264_profile_level_id(&[]), None);
+        // A truncated SPS must not panic or read past the end.
+        assert_eq!(h264_profile_level_id(&[0, 0, 0, 1, 0x67, 0x64]), None);
+    }
+
+    #[test]
+    fn the_undecodable_profiles_are_named() {
+        for idc in [110u32, 122, 244] {
+            let plid = idc << 16;
+            assert_eq!(
+                h264_browser_compatible(plid),
+                Err(H264Incompatibility::UnsupportedProfile(idc as u8)),
+                "profile_idc {idc} must be rejected"
+            );
+        }
+        // Baseline, Main, High.
+        for idc in [66u32, 77, 100] {
+            assert!(h264_browser_compatible(idc << 16).is_ok());
+        }
     }
 
     #[test]
