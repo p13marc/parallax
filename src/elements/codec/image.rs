@@ -457,8 +457,21 @@ mod jpeg_codec {
             metadata.flags |= crate::metadata::BufferFlags::SYNC_POINT;
             // These bytes are a JPEG, not raw video. Carrying the input's
             // VideoRaw format forward would tell downstream elements they can
-            // index into planes that are no longer there.
-            metadata.format = None;
+            // index into planes that are no longer there — but dropping the
+            // format entirely lost the geometry too, and left the zenoh
+            // `Encoding` as `zenoh/bytes` (#236). Say what it is: MJPEG, at
+            // the coded size.
+            match buffer.metadata().video_dims() {
+                Some((w, h)) => {
+                    metadata.set_coded_video_dims(crate::format::VideoCodec::Mjpeg, w, h)
+                }
+                None => {
+                    metadata.format = Some(crate::format::MediaFormat::Video(
+                        crate::format::VideoCodec::Mjpeg,
+                    ));
+                    metadata.planes = None;
+                }
+            }
             Ok(Some(Buffer::new(
                 MemoryHandle::with_len(slot, output.len()),
                 metadata,
@@ -728,8 +741,13 @@ mod png_codec {
             self.frame_count += 1;
 
             let mut metadata = buffer.metadata().clone();
-            // These bytes are a PNG, not raw video.
+            // These bytes are a PNG, not raw video. There is no `VideoCodec`
+            // variant for PNG (it is not a video codec), so `format` stays
+            // `None` — but the plane layout must still go, or a consumer
+            // would try to walk rows that are no longer there (#236).
             metadata.format = None;
+            metadata.planes = None;
+            metadata.coded = None;
             Ok(Some(Buffer::new(
                 MemoryHandle::with_len(slot, output.len()),
                 metadata,

@@ -276,6 +276,7 @@ fn video_codec_from(v: u32) -> Result<VideoCodec> {
         x if x == Vp8 as u32 => Vp8,
         x if x == Vp9 as u32 => Vp9,
         x if x == Av1 as u32 => Av1,
+        x if x == Mjpeg as u32 => Mjpeg,
         other => return Err(bad_wire(format!("VideoCodec {other}"))),
     })
 }
@@ -368,6 +369,18 @@ impl IpcDescriptor {
             Some(MediaFormat::Video(c)) => {
                 d.fmt_tag = FMT_VIDEO;
                 d.fmt_a = *c as u32;
+                // Coded geometry (#236) rides the same four words
+                // FMT_VIDEO_RAW already uses, so the descriptor does not
+                // grow. Zero means "the producer did not know" — a peer
+                // that predates this fills them with zeros and a reader
+                // that predates it never looks, so both directions
+                // degrade to `coded: None` rather than to garbage.
+                if let Some(cf) = &meta.coded {
+                    d.fmt_b = cf.width;
+                    d.fmt_c = cf.height;
+                    d.fmt_d = cf.framerate.num;
+                    d.fmt_e = cf.framerate.den;
+                }
             }
             Some(MediaFormat::AudioRaw(a)) => {
                 d.fmt_tag = FMT_AUDIO_RAW;
@@ -440,7 +453,18 @@ impl IpcDescriptor {
                 pixel_format: pixel_format_from(self.fmt_c)?,
                 framerate: Framerate::new(self.fmt_d, self.fmt_e),
             })),
-            FMT_VIDEO => Some(MediaFormat::Video(video_codec_from(self.fmt_a)?)),
+            FMT_VIDEO => {
+                let codec = video_codec_from(self.fmt_a)?;
+                if self.fmt_b > 0 && self.fmt_c > 0 {
+                    meta.coded = Some(crate::format::CodedVideoFormat::new(
+                        codec,
+                        self.fmt_b,
+                        self.fmt_c,
+                        Framerate::new(self.fmt_d, self.fmt_e),
+                    ));
+                }
+                Some(MediaFormat::Video(codec))
+            }
             FMT_AUDIO_RAW => Some(MediaFormat::AudioRaw(AudioFormat {
                 sample_rate: self.fmt_a,
                 channels: self.fmt_b as u16,
@@ -1116,6 +1140,43 @@ mod tests {
     }
 
     #[test]
+    fn coded_geometry_rides_the_descriptor() {
+        let slot = SharedIpcSlotRef {
+            arena_id: 1,
+            slot_index: 0,
+            data_offset: 0,
+            len: 1,
+        };
+        let mut meta = Metadata::new();
+        meta.set_coded_video_dims(VideoCodec::H264, 1920, 1080);
+
+        let (_slot, back) = IpcDescriptor::encode(0, &slot, &meta).decode().unwrap();
+        assert_eq!(back.format, Some(MediaFormat::Video(VideoCodec::H264)));
+        assert_eq!(back.coded_video_dims(), Some((1920, 1080)));
+        // Encoded video has no plane layout to inherit.
+        assert_eq!(back.video_dims(), None);
+    }
+
+    #[test]
+    fn a_codec_without_geometry_decodes_as_unknown_geometry() {
+        // The RTP depayloaders know the codec and nothing else; that must not
+        // come back as a 0x0 picture.
+        let slot = SharedIpcSlotRef {
+            arena_id: 1,
+            slot_index: 0,
+            data_offset: 0,
+            len: 1,
+        };
+        let mut meta = Metadata::new();
+        meta.format = Some(MediaFormat::Video(VideoCodec::H265));
+
+        let (_slot, back) = IpcDescriptor::encode(0, &slot, &meta).decode().unwrap();
+        assert_eq!(back.format, Some(MediaFormat::Video(VideoCodec::H265)));
+        assert_eq!(back.coded_video_dims(), None);
+        assert!(back.coded.is_none());
+    }
+
+    #[test]
     fn descriptor_round_trip_all_media_formats() {
         let slot = SharedIpcSlotRef {
             arena_id: 1,
@@ -1131,6 +1192,7 @@ mod tests {
                 framerate: Framerate::new(25, 1),
             }),
             MediaFormat::Video(VideoCodec::Av1),
+            MediaFormat::Video(VideoCodec::Mjpeg),
             MediaFormat::AudioRaw(AudioFormat {
                 sample_rate: 48_000,
                 channels: 2,

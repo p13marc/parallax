@@ -498,6 +498,19 @@ pub struct Metadata {
     /// cost of `Metadata` is unchanged.
     pub planes: Option<crate::format::PlaneLayout>,
 
+    /// Geometry of an *encoded* video buffer (#236).
+    ///
+    /// `format` says H.264; this says what size the pictures are. They are
+    /// separate because [`MediaFormat::Video`] must stay constructible from a
+    /// codec alone — caps declarations and the RTP depayloaders have no
+    /// geometry to give it.
+    ///
+    /// Deliberately **not** reported by [`video_dims`](Self::video_dims),
+    /// which stays raw-only: several readers treat a `Some` answer there as
+    /// "this buffer has addressable planes", and an encoded bitstream does
+    /// not. Read it with [`coded_video_dims`](Self::coded_video_dims).
+    pub coded: Option<crate::format::CodedVideoFormat>,
+
     /// Byte offset in the original source (optional).
     pub offset: Option<u64>,
 
@@ -802,6 +815,63 @@ impl Metadata {
         }
     }
 
+    /// Declare an encoded video buffer: its codec and the geometry of the
+    /// pictures it carries (#236).
+    ///
+    /// Sets [`format`](Self::format) to [`MediaFormat::Video`] and records the
+    /// geometry in [`coded`](Self::coded). This is what an encoder calls
+    /// instead of cloning its input's metadata — carrying a `VideoRaw` format
+    /// onto a bitstream tells downstream elements they can index into planes
+    /// that are no longer there.
+    ///
+    /// A framerate already negotiated upstream is preserved, exactly as
+    /// [`set_video_dims`](Self::set_video_dims) does.
+    ///
+    /// ```
+    /// use parallax::metadata::Metadata;
+    /// use parallax::format::VideoCodec;
+    ///
+    /// let mut meta = Metadata::new();
+    /// meta.set_coded_video_dims(VideoCodec::H264, 1920, 1080);
+    ///
+    /// assert_eq!(meta.coded_video_dims(), Some((1920, 1080)));
+    /// // Raw geometry stays absent — these bytes have no planes.
+    /// assert_eq!(meta.video_dims(), None);
+    /// ```
+    pub fn set_coded_video_dims(
+        &mut self,
+        codec: crate::format::VideoCodec,
+        width: u32,
+        height: u32,
+    ) {
+        let framerate = match (&self.format, self.coded) {
+            (_, Some(cf)) => cf.framerate,
+            (Some(MediaFormat::VideoRaw(vf)), _) => vf.framerate,
+            _ => crate::format::Framerate::default(),
+        };
+
+        self.format = Some(MediaFormat::Video(codec));
+        self.coded = Some(crate::format::CodedVideoFormat::new(
+            codec, width, height, framerate,
+        ));
+        // These bytes are a bitstream, not a frame: any plane layout inherited
+        // from the encoder's input is meaningless here.
+        self.planes = None;
+    }
+
+    /// Coded picture dimensions, if this buffer carries encoded video whose
+    /// geometry the producer knew.
+    ///
+    /// The counterpart of
+    /// [`set_coded_video_dims`](Self::set_coded_video_dims). Returns `None`
+    /// for raw video — use [`video_dims`](Self::video_dims) for that.
+    pub fn coded_video_dims(&self) -> Option<(u32, u32)> {
+        match self.coded {
+            Some(cf) if cf.width > 0 && cf.height > 0 => Some((cf.width, cf.height)),
+            _ => None,
+        }
+    }
+
     /// The raw video pixel format, if [`format`](Self::format) carries one.
     pub fn video_pixel_format(&self) -> Option<crate::format::PixelFormat> {
         match self.format {
@@ -1049,6 +1119,74 @@ mod tests {
 
         assert_eq!(meta.video_dims(), None);
         assert_eq!(meta.video_pixel_format(), None);
+    }
+
+    #[test]
+    fn set_coded_video_dims_says_encoded_and_keeps_the_geometry() {
+        let mut meta = Metadata::new();
+        meta.set_coded_video_dims(crate::format::VideoCodec::H264, 1920, 1080);
+
+        assert_eq!(
+            meta.format,
+            Some(MediaFormat::Video(crate::format::VideoCodec::H264))
+        );
+        assert_eq!(meta.coded_video_dims(), Some((1920, 1080)));
+        // Raw geometry stays absent: these bytes have no addressable planes,
+        // and several readers treat a `Some` from video_dims() as proof that
+        // they do.
+        assert_eq!(meta.video_dims(), None);
+        assert_eq!(meta.video_pixel_format(), None);
+    }
+
+    #[test]
+    fn stamping_an_encoded_format_drops_a_stale_plane_layout() {
+        use crate::format::{PixelFormat, PlaneDesc, PlaneLayout};
+
+        let mut meta = Metadata::new();
+        meta.set_video_planes(
+            64,
+            64,
+            PixelFormat::I420,
+            PlaneLayout::from_planes(&[
+                PlaneDesc {
+                    offset: 0,
+                    stride: 128,
+                },
+                PlaneDesc {
+                    offset: 8192,
+                    stride: 64,
+                },
+                PlaneDesc {
+                    offset: 10240,
+                    stride: 64,
+                },
+            ]),
+        );
+        assert!(meta.planes.is_some());
+
+        // An encoder stamping its output must not leave the input frame's
+        // plane layout attached to a bitstream.
+        meta.set_coded_video_dims(crate::format::VideoCodec::H264, 64, 64);
+        assert!(meta.planes.is_none());
+    }
+
+    #[test]
+    fn coded_geometry_preserves_a_negotiated_framerate() {
+        use crate::format::{Framerate, PixelFormat, VideoFormat};
+
+        let mut meta = Metadata::new();
+        meta.format = Some(MediaFormat::VideoRaw(VideoFormat::new(
+            1920,
+            1080,
+            PixelFormat::I420,
+            Framerate::new(30000, 1001),
+        )));
+
+        meta.set_coded_video_dims(crate::format::VideoCodec::H264, 1920, 1080);
+        assert_eq!(
+            meta.coded.map(|c| c.framerate),
+            Some(Framerate::new(30000, 1001))
+        );
     }
 
     #[test]

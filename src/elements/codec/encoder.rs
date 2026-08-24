@@ -396,6 +396,10 @@ impl Drop for Rav1eEncoder {
 }
 
 impl VideoEncoder for Rav1eEncoder {
+    fn codec(&self) -> crate::format::VideoCodec {
+        crate::format::VideoCodec::Av1
+    }
+
     type Packet = Vec<u8>;
 
     fn encode(&mut self, frame: VideoFrameRef<'_>) -> Result<Vec<Self::Packet>> {

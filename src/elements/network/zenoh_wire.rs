@@ -6,11 +6,11 @@
 //! while parallax subscribers ([`ZenohSrc`](super::ZenohSrc)) reconstruct
 //! full metadata (PTS/DTS/duration/sequence/flags/format).
 //!
-//! # Wire contract (version 1)
+//! # Wire contract (version 2)
 //!
 //! ```text
 //! payload    = raw buffer bytes, unmodified
-//! attachment = [ 0x50 'P', 0x58 'X', 0x01 version ] ++ rkyv(WireMetadata)
+//! attachment = [ 0x50 'P', 0x58 'X', 0x02 version ] ++ rkyv(WireMetadata)
 //! ```
 //!
 //! - A missing attachment, unknown magic, or unknown version means "foreign
@@ -38,7 +38,7 @@ use crate::metadata::{BufferFlags, Metadata};
 pub const WIRE_MAGIC: [u8; 2] = [0x50, 0x58];
 
 /// Attachment wire-format version.
-pub const WIRE_VERSION: u8 = 1;
+pub const WIRE_VERSION: u8 = 2;
 
 /// Metadata key under which [`ZenohSrc`](super::ZenohSrc) stores the concrete
 /// key expression a sample arrived on (a `String`; useful with wildcard
@@ -56,7 +56,7 @@ pub const CUSTOM_META: &str = "zenoh/custom";
 /// extend it there as new well-known keys appear.
 use crate::elements::ipc::protocol::KNOWN_CUSTOM_KEYS;
 
-/// Buffer metadata as serialized on the zenoh wire (version 1).
+/// Buffer metadata as serialized on the zenoh wire (version 2).
 ///
 /// Timestamps are nanoseconds with `u64::MAX` as the
 /// [`ClockTime::NONE`] sentinel, matching `ClockTime`'s own representation.
@@ -79,6 +79,10 @@ pub struct WireMetadata {
     pub offset: Option<u64>,
     /// Media format of the payload.
     pub format: Option<WireFormat>,
+    /// Coded picture geometry for encoded video (#236): `(width, height,
+    /// fps_num, fps_den)`. `None` when the producer did not know it — the
+    /// RTP depayloaders, for instance, know the codec and nothing else.
+    pub coded: Option<(u32, u32, u32, u32)>,
     /// Whitelisted custom byte entries (e.g. KLV, SEI), as (key, bytes).
     pub custom: Vec<(String, Vec<u8>)>,
 }
@@ -144,6 +148,7 @@ pub fn video_codec_to_code(codec: VideoCodec) -> u8 {
         VideoCodec::Vp8 => 2,
         VideoCodec::Vp9 => 3,
         VideoCodec::Av1 => 4,
+        VideoCodec::Mjpeg => 5,
     }
 }
 
@@ -155,6 +160,7 @@ pub fn video_codec_from_code(code: u8) -> Option<VideoCodec> {
         2 => VideoCodec::Vp8,
         3 => VideoCodec::Vp9,
         4 => VideoCodec::Av1,
+        5 => VideoCodec::Mjpeg,
         _ => return None,
     })
 }
@@ -346,6 +352,9 @@ impl WireMetadata {
                 .format
                 .as_ref()
                 .and_then(WireFormat::from_media_format),
+            coded: metadata
+                .coded
+                .map(|c| (c.width, c.height, c.framerate.num, c.framerate.den)),
             custom,
         }
     }
@@ -361,6 +370,16 @@ impl WireMetadata {
         metadata.flags = BufferFlags::from_bits(self.flags);
         metadata.offset = self.offset;
         metadata.format = self.format.as_ref().and_then(WireFormat::to_media_format);
+        if let (Some(MediaFormat::Video(codec)), Some((w, h, num, den))) =
+            (&metadata.format, self.coded)
+        {
+            metadata.coded = Some(crate::format::CodedVideoFormat::new(
+                *codec,
+                w,
+                h,
+                Framerate::new(num, den),
+            ));
+        }
 
         let mut unknown: Vec<(String, Vec<u8>)> = Vec::new();
         for (key, bytes) in &self.custom {
@@ -413,6 +432,7 @@ pub fn encoding_for_format(format: Option<&MediaFormat>) -> zenoh::bytes::Encodi
         Some(MediaFormat::Video(VideoCodec::Vp8)) => Encoding::VIDEO_VP8,
         Some(MediaFormat::Video(VideoCodec::Vp9)) => Encoding::VIDEO_VP9,
         Some(MediaFormat::Video(VideoCodec::Av1)) => Encoding::from("video/AV1"),
+        Some(MediaFormat::Video(VideoCodec::Mjpeg)) => Encoding::IMAGE_JPEG,
         Some(MediaFormat::VideoRaw(vf)) => Encoding::VIDEO_RAW
             .with_schema(format!("{:?};{}x{}", vf.pixel_format, vf.width, vf.height)),
         Some(MediaFormat::Audio(AudioCodec::Opus)) => Encoding::from("audio/opus"),
@@ -513,6 +533,7 @@ mod tests {
             flags: 0,
             offset: None,
             format: None,
+            coded: None,
             custom: vec![("future/thing".to_string(), vec![1, 2, 3])],
         };
         let restored = wire.to_metadata();
@@ -549,6 +570,42 @@ mod tests {
     }
 
     #[test]
+    fn coded_geometry_survives_the_attachment() {
+        let mut metadata = Metadata::new();
+        metadata.set_coded_video_dims(VideoCodec::H264, 1920, 1080);
+
+        let wire = WireMetadata::from_metadata(&metadata, &[]);
+        let restored = WireMetadata::decode(&wire.encode()).unwrap().to_metadata();
+
+        assert_eq!(restored.format, Some(MediaFormat::Video(VideoCodec::H264)));
+        assert_eq!(restored.coded_video_dims(), Some((1920, 1080)));
+        assert_eq!(restored.video_dims(), None);
+    }
+
+    #[test]
+    fn a_codec_without_geometry_stays_without_geometry() {
+        // The RTP depayloaders stamp a codec and nothing else.
+        let mut metadata = Metadata::new();
+        metadata.format = Some(MediaFormat::Video(VideoCodec::Vp9));
+
+        let wire = WireMetadata::from_metadata(&metadata, &[]);
+        let restored = WireMetadata::decode(&wire.encode()).unwrap().to_metadata();
+
+        assert_eq!(restored.format, Some(MediaFormat::Video(VideoCodec::Vp9)));
+        assert!(restored.coded.is_none());
+    }
+
+    #[test]
+    fn mjpeg_derives_the_jpeg_encoding() {
+        // A preview stream must announce itself as image/jpeg, not
+        // zenoh/bytes — the whole point of declaring the codec (#236).
+        assert_eq!(
+            encoding_for_format(Some(&MediaFormat::Video(VideoCodec::Mjpeg))).to_string(),
+            "image/jpeg"
+        );
+    }
+
+    #[test]
     fn all_codes_roundtrip() {
         for codec in [
             VideoCodec::H264,
@@ -556,6 +613,7 @@ mod tests {
             VideoCodec::Vp8,
             VideoCodec::Vp9,
             VideoCodec::Av1,
+            VideoCodec::Mjpeg,
         ] {
             assert_eq!(
                 video_codec_from_code(video_codec_to_code(codec)),

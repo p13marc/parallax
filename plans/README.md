@@ -12,6 +12,7 @@ Completed plans have been removed (see git history). Only plans with an existing
 |---|------|----------|--------|----------|
 | 11 | [GPU Codec Framework](11_GPU_CODEC_FRAMEWORK.md) | Medium-High | Large | 🟡 ~80% — H.264 decode fully wired (submission, POC/DPB refs, RAII memory) and fixture-tested; hardware validation pending (#3); no encode, no H.265/AV1 |
 | 16 | [Process Isolation](16_PROCESS_ISOLATION.md) | Low | Large | ⬜ Not started — **note:** the earlier scaffolding (`src/execution/`) was removed in `da6df59`; any implementation starts from scratch with a spawn-based design |
+| 29 | [Multi-machine video: RTSP → @media → browser](29_multi_machine_browser.md) | High | Large | ⬜ Not started — epic [#204](https://git.marcpardo.eu/marcpardo/parallax/issues/204). Make `ZenohSink`/`ZenohSrc` speak the ratified zenkey `@media` plane (CBOR `FrameMeta`, exact tier keys, `frame` QoS, byte-level keyframe promise), fix the encoders that never stamp `MediaFormat`, and harden RTSP ingest. WHEP egress deferred to its own milestone; the browser frontend is zenoh-ts + WebCodecs, tracked in zensight |
 
 ## Proposed Plans (no plan file yet)
 
@@ -21,7 +22,7 @@ Completed plans have been removed (see git history). Only plans with an existing
 | 25 | Audio processing filters | Medium | AudioMixer, ChannelMix, Equalizer, Compressor/Limiter, AudioLevel |
 | 26 | Video codec expansion | Medium-High | H.265 + VP8/VP9; consider rav1d for pure-Rust AV1 decode |
 | 27 | Container format expansion | Medium | MKV/WebM, FLV, WAV, Ogg (pure Rust crates exist); FLV is prerequisite for RTMP |
-| 28 | Streaming protocol expansion | Medium-High | WHIP (RFC 9725) sink, MoQ sink (Rust stacks exist), SRT, RTMP |
+| 28 | Streaming protocol expansion | Medium | MoQ sink (Rust stacks exist), SRT, RTMP. **WHIP/WHEP moved to plan 29** (str0m, ICE-lite, frame-level API) |
 | — | Wayland `ext-image-copy-capture-v1` source | Low | Lower-latency screen capture without the portal/PipeWire path |
 
 **Legend:** ⬜ Not Started | 🟡 In Progress | ✅ Complete

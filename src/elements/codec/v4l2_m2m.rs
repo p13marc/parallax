@@ -587,6 +587,10 @@ fn raw_fourcc_for(format: PixelFormat) -> Result<&'static [u8; 4]> {
 }
 
 impl VideoEncoder for V4l2M2mH264Encoder {
+    fn codec(&self) -> crate::format::VideoCodec {
+        crate::format::VideoCodec::H264
+    }
+
     type Packet = Vec<u8>;
 
     fn encode(&mut self, frame: VideoFrameRef<'_>) -> Result<Vec<Vec<u8>>> {
