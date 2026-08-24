@@ -40,7 +40,7 @@ use crate::metadata::{BufferFlags, RtpMeta};
 use bytes::Bytes;
 use rtp::codecs::av1::Av1Payloader;
 use rtp::codecs::h264::{H264Packet, H264Payloader};
-use rtp::codecs::h265::{H265Packet, HevcPayloader};
+use rtp::codecs::h265::HevcPayloader;
 use rtp::codecs::opus::{OpusPacket, OpusPayloader};
 use rtp::codecs::vp8::{Vp8Packet, Vp8Payloader};
 use rtp::codecs::vp9::{Vp9Packet, Vp9Payloader};
@@ -223,6 +223,18 @@ impl Element for RtpH264Depay {
 // ============================================================================
 // Packetization (#218)
 // ============================================================================
+
+/// `1, 10, 100, …` — the rate-limit ladder for drop warnings, matching the
+/// executor's shed reporting. A per-packet warning would bury everything else.
+fn is_power_of_ten(mut n: u64) -> bool {
+    if n == 0 {
+        return false;
+    }
+    while n.is_multiple_of(10) {
+        n /= 10;
+    }
+    n == 1
+}
 
 /// The RTP clock for video, in Hz. Every video payload type in RFC 3551 and
 /// its successors uses 90 kHz.
@@ -430,14 +442,30 @@ impl Transform for RtpH264Pay {
 // H.265 Depayloader
 // ============================================================================
 
-/// H.265/HEVC RTP depacketizer.
+/// H.265/HEVC RTP depacketizer (RFC 7798).
 ///
-/// Converts RTP packets containing H.265 payload into NAL units.
+/// Emits Annex-B NAL units: single-NAL packets gain a start code, aggregation
+/// packets are split on their length prefixes, and fragmentation units are
+/// reassembled across packets with the original NAL header rebuilt.
+///
+/// The reassembly is parallax's own ([`h265_depacket`](super::h265_depacket)),
+/// because the `rtp` crate's `H265Packet::depacketize` returns the payload
+/// verbatim on every branch (#240) — this element used to advertise
+/// `MediaFormat::Video(H265)` on fragment-shaped bytes that nothing could
+/// decode.
+///
+/// A packet it cannot decode is **dropped**, with a rate-limited warning and a
+/// bump to [`DepayStats::errors`] — losing one NAL unit beats ending a live
+/// stream over one corrupt datagram.
 pub struct RtpH265Depay {
     name: String,
-    depacketizer: H265Packet,
+    /// parallax's own (#240) — the `rtp` crate's returns the payload verbatim.
+    depacketizer: super::h265_depacket::H265Depacketizer,
     stats: DepayStats,
     output: OutputArena,
+    /// Rate-limits the drop warning, on the ladder the executor's shed
+    /// reporting uses.
+    dropped: u64,
 }
 
 impl RtpH265Depay {
@@ -445,12 +473,24 @@ impl RtpH265Depay {
     pub fn new() -> Self {
         Self {
             name: "rtp-h265-depay".into(),
-            depacketizer: H265Packet::default(),
+            depacketizer: super::h265_depacket::H265Depacketizer::new(),
             stats: DepayStats::default(),
             output: OutputArena::new(defaults::TRANSFORM_SLOT_COUNT)
                 .with_min_slot_size(defaults::VIDEO_ENCODED_SLOT_SIZE)
                 .grow_to_fit(),
+            dropped: 0,
         }
+    }
+
+    /// Expect DONL/DOND fields, i.e. the sender's SDP has
+    /// `sprop-max-don-diff > 0` (RFC 7798 §7.1).
+    ///
+    /// Off by default and deliberately not sniffed: reading a DONL that is not
+    /// there shifts every length prefix in an aggregation packet, and a
+    /// wrong guess produces plausible-looking garbage rather than an error.
+    pub fn with_donl(mut self, donl: bool) -> Self {
+        self.depacketizer = self.depacketizer.with_donl(donl);
+        self
     }
 
     /// Set a custom name.
@@ -477,45 +517,64 @@ impl Element for RtpH265Depay {
     }
 
     fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
-        let payload = Bytes::copy_from_slice(buffer.as_bytes());
         self.stats.packets_in += 1;
 
-        match self.depacketizer.depacketize(&payload) {
-            Ok(output) => {
-                if output.is_empty() {
-                    return Ok(None);
-                }
-
-                self.stats.frames_out += 1;
-                self.stats.bytes_out += output.len() as u64;
-
-                let mut slot = self.output.acquire(output.len(), "rtph265depay")?;
-                slot.data_mut()[..output.len()].copy_from_slice(output.as_ref());
-
-                let handle = crate::buffer::MemoryHandle::with_len(slot, output.len());
-
-                let mut metadata = buffer.metadata().clone();
-                metadata.format = Some(MediaFormat::Video(VideoCodec::H265));
-
-                // H.265 had no keyframe detection at all (#239), and inherited
-                // a SYNC_POINT that RtpSrc set from the RTP marker bit — which
-                // means "end of access unit", not "keyframe".
-                metadata.flags = if crate::codec::annexb::is_entry_point(
-                    &output,
-                    crate::codec::annexb::NalCodec::H265,
-                ) {
-                    metadata.flags.insert(BufferFlags::SYNC_POINT)
-                } else {
-                    metadata.flags.remove(BufferFlags::SYNC_POINT)
-                };
-
-                Ok(Some(Buffer::new(handle, metadata)))
-            }
-            Err(e) => {
+        // A fragment that is not the last one produces nothing; a packet this
+        // cannot decode is *dropped*, never returned as an error. An `Err` out
+        // of a transform kills the element task and winds the run down (#191),
+        // so one corrupt datagram would end a live stream.
+        let output = match self.depacketizer.push(buffer.as_bytes()) {
+            Ok(Some(output)) => output,
+            Ok(None) => return Ok(None),
+            Err(reason) => {
                 self.stats.errors += 1;
-                Err(Error::Element(format!("H.265 depacketize error: {}", e)))
+                self.dropped += 1;
+                if is_power_of_ten(self.dropped) {
+                    tracing::warn!(
+                        "{}: dropping an undecodable H.265 packet ({reason:?}, {} total)",
+                        self.name,
+                        self.dropped
+                    );
+                }
+                return Ok(None);
             }
+        };
+
+        self.stats.frames_out += 1;
+        self.stats.bytes_out += output.len() as u64;
+
+        let mut slot = self.output.acquire(output.len(), "rtph265depay")?;
+        slot.data_mut()[..output.len()].copy_from_slice(&output);
+
+        let handle = crate::buffer::MemoryHandle::with_len(slot, output.len());
+
+        let mut metadata = buffer.metadata().clone();
+        metadata.format = Some(MediaFormat::Video(VideoCodec::H265));
+
+        // H.265 had no keyframe detection at all (#239), and inherited
+        // a SYNC_POINT that RtpSrc set from the RTP marker bit — which
+        // means "end of access unit", not "keyframe".
+        metadata.flags = if crate::codec::annexb::is_entry_point(
+            &output,
+            crate::codec::annexb::NalCodec::H265,
+        ) {
+            metadata.flags.insert(BufferFlags::SYNC_POINT)
+        } else {
+            metadata.flags.remove(BufferFlags::SYNC_POINT)
+        };
+
+        Ok(Some(Buffer::new(handle, metadata)))
+    }
+
+    /// A flush or a seek abandons any half-reassembled NAL unit.
+    fn handle_downstream_event(
+        &mut self,
+        event: crate::event::Event,
+    ) -> Option<crate::event::Event> {
+        if matches!(event, crate::event::Event::FlushStart) {
+            self.depacketizer.reset();
         }
+        Some(event)
     }
 
     fn name(&self) -> &str {

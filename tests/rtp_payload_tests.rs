@@ -17,7 +17,7 @@
 use parallax::buffer::{Buffer, MemoryHandle};
 use parallax::clock::ClockTime;
 use parallax::element::{Element, Output, Transform};
-use parallax::elements::{RtpH264Depay, RtpH264Pay, RtpOpusPay};
+use parallax::elements::{RtpH264Depay, RtpH264Pay, RtpH265Depay, RtpH265Pay, RtpOpusPay};
 use parallax::memory::SharedArena;
 use parallax::metadata::Metadata;
 use std::sync::OnceLock;
@@ -164,4 +164,43 @@ fn an_audio_frame_that_fits_is_one_packet_with_the_marker_set() {
 
     assert_eq!(out.len(), 1);
     assert!(out[0].metadata().rtp.expect("RtpMeta").marker);
+}
+
+/// #240: the H.265 depayloader used to hand back the RTP payload verbatim —
+/// payload header attached, no start codes, fragments never joined. This is
+/// the same round-trip proof as the H.264 one, on the path that had none.
+#[test]
+fn the_h265_depayloader_reassembles_a_fragmented_access_unit() {
+    // An IRAP slice (type 19) far past the MTU, plus a VPS/SPS/PPS ahead of
+    // it — the shape a real keyframe takes.
+    let mut au = Vec::new();
+    for (nal_type, len) in [(32u8, 8usize), (33, 24), (34, 6)] {
+        au.extend_from_slice(&[0, 0, 0, 1, nal_type << 1, 0x01]);
+        au.extend((0..len).map(|i| (i % 251) as u8));
+    }
+    au.extend_from_slice(&[0, 0, 0, 1, 19 << 1, 0x01]);
+    au.extend((0..6000u32).map(|i| (i % 251) as u8));
+
+    let mut pay = RtpH265Pay::new().with_mtu(MTU);
+    let out = packets(pay.transform(buffer(&au, 0)).unwrap());
+    assert!(out.len() > 1, "the fixture must fragment");
+
+    let mut depay = RtpH265Depay::new();
+    let mut reassembled = Vec::new();
+    let mut saw_keyframe = false;
+    for packet in &out {
+        if let Some(frame) = depay.process(packet.clone()).unwrap() {
+            saw_keyframe |= frame.metadata().flags.is_keyframe();
+            reassembled.extend_from_slice(frame.as_bytes());
+        }
+    }
+
+    assert_eq!(
+        reassembled, au,
+        "the reassembled access unit must be byte-identical"
+    );
+    assert!(
+        saw_keyframe,
+        "the IRAP slice must be flagged as a decoder entry point"
+    );
 }

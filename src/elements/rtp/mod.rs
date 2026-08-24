@@ -32,6 +32,9 @@ mod rtp;
 mod rtcp;
 
 #[cfg(feature = "rtp")]
+mod h265_depacket;
+
+#[cfg(feature = "rtp")]
 mod rtp_codecs;
 
 #[cfg(feature = "rtp")]

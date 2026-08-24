@@ -77,7 +77,7 @@ Feature-gated:
 | `rtpsink` | `rtp` | `address` (req, dest), `payload-type`, `ssrc`, `clock-rate` |
 | `rtpjitterbuffer` | `rtp` | `latency-ms`, `max-packets`, `clock-rate`, `drop-late` (bool) |
 | `rtp{h264,h265,vp8,vp9,opus,av1}pay` | `rtp` | `mtu` |
-| `rtp{h264,h265,vp8,vp9,opus}depay` | `rtp` | — |
+| `rtp{h264,h265,vp8,vp9,opus}depay` | `rtp` | `donl` (bool, `rtph265depay` only — the sender's `sprop-max-don-diff > 0`) |
 
 `rtspsrc`, `zenohsrc` and `zenohsink` build by **awaiting** real I/O, so they need `Pipeline::parse_async` (which is what `parallax-launch` uses); the synchronous `Pipeline::parse` meets one and says so rather than pretending the feature is missing.
 

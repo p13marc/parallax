@@ -81,15 +81,25 @@ fn pay(props: &Props, kind: Pay) -> Result<Box<DynAsyncElement<'static>>> {
     })
 }
 
+/// `rtph265depay [donl=<bool>]` — see [`RtpH265Depay::with_donl`]; the other
+/// depayloaders take no properties.
+///
+/// [`RtpH265Depay::with_donl`]: crate::elements::rtp::RtpH265Depay::with_donl
 #[cfg(feature = "rtp")]
-fn depay(_props: &Props, kind: Depay) -> Result<Box<DynAsyncElement<'static>>> {
+fn depay(props: &Props, kind: Depay) -> Result<Box<DynAsyncElement<'static>>> {
     use crate::elements::rtp::{
         RtpH264Depay, RtpH265Depay, RtpOpusDepay, RtpVp8Depay, RtpVp9Depay,
     };
 
     Ok(match kind {
         Depay::H264 => DynAsyncElement::new_box(ElementAdapter::new(RtpH264Depay::new())),
-        Depay::H265 => DynAsyncElement::new_box(ElementAdapter::new(RtpH265Depay::new())),
+        Depay::H265 => {
+            let mut d = RtpH265Depay::new();
+            if let Some(donl) = props.get_bool("donl")? {
+                d = d.with_donl(donl);
+            }
+            DynAsyncElement::new_box(ElementAdapter::new(d))
+        }
         Depay::Vp8 => DynAsyncElement::new_box(ElementAdapter::new(RtpVp8Depay::new())),
         Depay::Vp9 => DynAsyncElement::new_box(ElementAdapter::new(RtpVp9Depay::new())),
         Depay::Opus => DynAsyncElement::new_box(ElementAdapter::new(RtpOpusDepay::new())),
