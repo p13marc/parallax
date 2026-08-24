@@ -1850,7 +1850,10 @@ impl AsyncSink for ZenohSink {
 
     /// Arena slots this sink can still be pinning (#226).
     ///
-    /// See [`PUBLISH_IN_FLIGHT`].
+    /// A small over-estimate of what a `put` that has already returned can
+    /// still reference: zenoh exposes no API for the real depth, and without
+    /// declaring *some* hold the upstream source starves as soon as the
+    /// transport batches.
     fn retained_buffers(&self) -> usize {
         PUBLISH_IN_FLIGHT
     }

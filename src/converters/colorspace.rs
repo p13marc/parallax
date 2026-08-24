@@ -2141,7 +2141,7 @@ impl VideoConvert {
         for row in 0..h {
             let src = &input[row * in_stride..row * in_stride + w];
             let dst = &mut output[row * w * 3..(row + 1) * w * 3];
-            for (gray, dst_chunk) in src.iter().zip(dst.chunks_exact_mut(3)) {
+            for (gray, dst_chunk) in src.iter().zip(dst.as_chunks_mut::<3>().0) {
                 dst_chunk[0] = *gray;
                 dst_chunk[1] = *gray;
                 dst_chunk[2] = *gray;
@@ -2155,7 +2155,7 @@ impl VideoConvert {
         for row in 0..h {
             let src = &input[row * in_stride..row * in_stride + w];
             let dst = &mut output[row * w * 4..(row + 1) * w * 4];
-            for (gray, dst_chunk) in src.iter().zip(dst.chunks_exact_mut(4)) {
+            for (gray, dst_chunk) in src.iter().zip(dst.as_chunks_mut::<4>().0) {
                 dst_chunk[0] = *gray;
                 dst_chunk[1] = *gray;
                 dst_chunk[2] = *gray;

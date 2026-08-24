@@ -437,63 +437,62 @@ fn plane_geometry(
     let cw = w.div_ceil(2);
     let ch = h.div_ceil(2);
     let mut planes = [(0usize, 0usize); MAX_PLANES];
-    let count;
-    match format {
+    let count = match format {
         PixelFormat::I420 => {
             planes[0] = (h, w);
             planes[1] = (ch, cw);
             planes[2] = (ch, cw);
-            count = 3;
+            3
         }
         PixelFormat::Nv12 => {
             planes[0] = (h, w);
             planes[1] = (ch, cw * 2);
-            count = 2;
+            2
         }
         PixelFormat::I420_10Le => {
             planes[0] = (h, w * 2);
             planes[1] = (ch, cw * 2);
             planes[2] = (ch, cw * 2);
-            count = 3;
+            3
         }
         PixelFormat::P010 => {
             planes[0] = (h, w * 2);
             planes[1] = (ch, cw * 4);
-            count = 2;
+            2
         }
         PixelFormat::I422 => {
             planes[0] = (h, w);
             planes[1] = (h, cw);
             planes[2] = (h, cw);
-            count = 3;
+            3
         }
         PixelFormat::Yuyv | PixelFormat::Uyvy => {
             planes[0] = (h, w * 2);
-            count = 1;
+            1
         }
         PixelFormat::I444 => {
             planes[0] = (h, w);
             planes[1] = (h, w);
             planes[2] = (h, w);
-            count = 3;
+            3
         }
         PixelFormat::Rgb24 | PixelFormat::Bgr24 => {
             planes[0] = (h, w * 3);
-            count = 1;
+            1
         }
         PixelFormat::Rgba | PixelFormat::Bgra | PixelFormat::Argb => {
             planes[0] = (h, w * 4);
-            count = 1;
+            1
         }
         PixelFormat::Gray8 => {
             planes[0] = (h, w);
-            count = 1;
+            1
         }
         PixelFormat::Gray16Le => {
             planes[0] = (h, w * 2);
-            count = 1;
+            1
         }
-    }
+    };
     (planes, count)
 }
 

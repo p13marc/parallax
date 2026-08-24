@@ -381,8 +381,8 @@ fn blit_frame(
             // shifts (measured).
             (true, true) => {
                 // 1:1: a straight row copy at memcpy speed.
-                for (dst, px) in out_row.iter_mut().zip(src_row.chunks_exact(4)) {
-                    *dst = u32::from_le_bytes(px.try_into().unwrap());
+                for (dst, px) in out_row.iter_mut().zip(src_row.as_chunks::<4>().0) {
+                    *dst = u32::from_le_bytes(*px);
                 }
             }
             (true, false) => {
@@ -394,7 +394,7 @@ fn blit_frame(
             // RGBA compat: shuffle each pixel into 0xRRGGBB.
             (false, true) => {
                 // 1:1 horizontal: straight zip, no index math.
-                for (dst, px) in out_row.iter_mut().zip(src_row.chunks_exact(4)) {
+                for (dst, px) in out_row.iter_mut().zip(src_row.as_chunks::<4>().0) {
                     *dst = ((px[0] as u32) << 16) | ((px[1] as u32) << 8) | (px[2] as u32);
                 }
             }

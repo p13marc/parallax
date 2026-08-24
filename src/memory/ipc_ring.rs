@@ -70,7 +70,7 @@ const IPC_RING_MAGIC: u64 = 0x504C585F49504352;
 ///
 /// 2: the descriptor grew 128 → 192 bytes to carry a `PlaneLayout` inline
 /// (#219). 1: initial.
-const IPC_RING_VERSION: u32 = 2;
+pub const IPC_RING_VERSION: u32 = 2;
 
 /// Default entries per ring.
 pub const DEFAULT_IPC_RING_CAPACITY: u32 = 64;

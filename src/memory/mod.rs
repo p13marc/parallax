@@ -63,7 +63,9 @@ pub use dmabuf::{
 };
 pub use eventfd::EventFd;
 pub use external::{ExternalReleaseHook, ExternalSlot};
-pub use ipc_ring::{DEFAULT_IPC_RING_CAPACITY, IpcChannel, IpcChannelState, IpcDescriptor};
+pub use ipc_ring::{
+    DEFAULT_IPC_RING_CAPACITY, IPC_RING_VERSION, IpcChannel, IpcChannelState, IpcDescriptor,
+};
 pub use segment::MemoryType;
 pub use shared_refcount::{
     ArenaMetrics, SharedArena, SharedArenaCache, SharedIpcSlotRef, SharedSlotRef,

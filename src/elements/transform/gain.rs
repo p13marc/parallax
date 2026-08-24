@@ -203,22 +203,22 @@ impl Element for Gain {
         let data = buffer.as_bytes_mut();
         match fmt.sample_format {
             SampleFormat::F32 => {
-                for sample in data.chunks_exact_mut(4) {
-                    let val = f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]);
-                    sample.copy_from_slice(&(val * factor).to_le_bytes());
+                for sample in data.as_chunks_mut::<4>().0 {
+                    let val = f32::from_le_bytes(*sample);
+                    *sample = (val * factor).to_le_bytes();
                 }
             }
             SampleFormat::S16 => {
-                for sample in data.chunks_exact_mut(2) {
-                    let val = i16::from_le_bytes([sample[0], sample[1]]);
+                for sample in data.as_chunks_mut::<2>().0 {
+                    let val = i16::from_le_bytes(*sample);
                     let out = (f32::from(val) * factor).clamp(-32768.0, 32767.0) as i16;
-                    sample.copy_from_slice(&out.to_le_bytes());
+                    *sample = out.to_le_bytes();
                 }
             }
             SampleFormat::S32 => {
                 // f64: f32's 24-bit mantissa cannot represent i32 exactly.
-                for sample in data.chunks_exact_mut(4) {
-                    let val = i32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]);
+                for sample in data.as_chunks_mut::<4>().0 {
+                    let val = i32::from_le_bytes(*sample);
                     let out = (f64::from(val) * f64::from(factor))
                         .clamp(f64::from(i32::MIN), f64::from(i32::MAX))
                         as i32;
@@ -300,16 +300,20 @@ mod tests {
     fn read_s16_samples(buffer: &Buffer) -> Vec<i16> {
         buffer
             .as_bytes()
-            .chunks_exact(2)
-            .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|chunk| i16::from_le_bytes(*chunk))
             .collect()
     }
 
     fn read_f32_samples(buffer: &Buffer) -> Vec<f32> {
         buffer
             .as_bytes()
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
             .collect()
     }
 

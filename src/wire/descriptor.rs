@@ -1,5 +1,5 @@
-//! `IpcDescriptor` — the fixed-size POD **projection** of [`WireMetadata`]
-//! (#219).
+//! `IpcDescriptor` — the fixed-size POD **projection** of
+//! [`WireMetadata`](super::WireMetadata) (#219).
 //!
 //! # Projection, not a second schema
 //!
@@ -15,7 +15,7 @@
 //! encodings and asserts they restore an identical `Metadata`. When they
 //! disagree, one of them is wrong.
 //!
-//! Both encodings read the same [`codes`](super::codes) table, so neither is
+//! Both encodings read the same [`codes`] table, so neither is
 //! sensitive to the order of the enums it describes.
 //!
 //! # What a projection cannot carry
