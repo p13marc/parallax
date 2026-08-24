@@ -109,8 +109,8 @@ pub use network::{WebSocketSink, WebSocketSrc, WebSocketStats, WsMessageType};
 
 #[cfg(feature = "zenoh")]
 pub use network::{
-    WireProfile, ZenohCongestionControl, ZenohPriority, ZenohQuerier, ZenohQuery, ZenohQueryable,
-    ZenohSink, ZenohSrc, ZenohSrcHandle, ZenohStats,
+    WireProfile, ZenohCongestionControl, ZenohDemandEvent, ZenohPriority, ZenohQuerier, ZenohQuery,
+    ZenohQueryable, ZenohSink, ZenohSinkHandle, ZenohSrc, ZenohSrcHandle, ZenohStats,
 };
 
 // RTP/RTCP/RTSP

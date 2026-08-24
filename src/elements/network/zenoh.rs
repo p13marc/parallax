@@ -29,7 +29,7 @@ use crate::error::{Error, Result};
 use crate::memory::{OutputArena, OutputBudget, defaults};
 use crate::metadata::{BufferFlags, Metadata};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use zenoh::Session;
 use zenoh::key_expr::KeyExpr;
@@ -789,6 +789,154 @@ impl AsyncSource for ZenohSrc {
     }
 }
 
+/// How many viewer-arrival/departure events the handle buffers (#234).
+///
+/// Bounded and lossy: the matching callback runs on a zenoh runtime thread and
+/// must never block on an application that stopped polling.
+const DEMAND_EVENT_QUEUE: usize = 16;
+
+/// A change in who is listening (#234).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZenohDemandEvent {
+    /// The publisher went from no matching subscribers to some.
+    ViewersArrived,
+    /// The publisher went from some matching subscribers to none.
+    ViewersGone,
+}
+
+/// Counters and flags behind [`ZenohSinkHandle`], shared with the matching
+/// listener's callback.
+#[derive(Debug, Default)]
+struct ZenohSinkCounters {
+    bytes_sent: AtomicU64,
+    samples_sent: AtomicU64,
+    keyframes_sent: AtomicU64,
+    publish_errors: AtomicU64,
+    /// Whether anyone is currently subscribed.
+    has_viewers: AtomicBool,
+    rising_edges: AtomicU64,
+    falling_edges: AtomicU64,
+    /// A keyframe request is queued for the executor's upstream path.
+    keyframe_pending: AtomicBool,
+    keyframe_requests: AtomicU64,
+}
+
+impl ZenohSinkCounters {
+    /// Queue a keyframe request, coalescing with one already waiting.
+    ///
+    /// A viewer under packet loss will ask far faster than a GOP; the executor
+    /// collects at most one per poll either way, so counting each ask as a
+    /// separate event would be noise.
+    fn request_keyframe(&self) -> bool {
+        if self.keyframe_pending.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        self.keyframe_requests.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+}
+
+/// Runtime handle to a [`ZenohSink`] (#234).
+///
+/// Clone it *before* `Executor::start()` — the element is moved into its task
+/// there.
+///
+/// # There is no viewer count
+///
+/// zenoh's `MatchingStatus` is a single boolean: "someone is listening" or
+/// "nobody is". A count is not available and cannot be synthesised, so this
+/// reports [`has_viewers`](Self::has_viewers) plus monotonic edge counters.
+/// Anything claiming a number would be inventing one.
+///
+/// # The matching listener only sees the 0↔N edge
+///
+/// A second viewer joining beside a first produces **no** event. That is why
+/// [`request_keyframe`](Self::request_keyframe) exists: an application that
+/// knows a new viewer arrived — because it owns the control plane — asks
+/// explicitly rather than waiting out a GOP.
+#[derive(Clone, Debug)]
+pub struct ZenohSinkHandle {
+    counters: Arc<ZenohSinkCounters>,
+    /// A `Receiver` cannot be cloned and the handle can, so the two share one
+    /// behind a lock. `tokio::sync::Mutex`, not `std`'s: `event_timeout` holds
+    /// it across an await, and blocking an executor thread there would be a
+    /// real hazard rather than a lint.
+    events: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<ZenohDemandEvent>>>,
+}
+
+impl ZenohSinkHandle {
+    /// Whether the publisher currently has matching subscribers.
+    ///
+    /// `true` on a build without `zenoh-unstable`, where matching status is
+    /// unavailable — failing open, so an idle reaper built on this never kills
+    /// a stream someone is watching.
+    pub fn has_viewers(&self) -> bool {
+        self.counters.has_viewers.load(Ordering::Relaxed)
+    }
+
+    /// How many times viewers have arrived (the 0→N edge).
+    pub fn rising_edges(&self) -> u64 {
+        self.counters.rising_edges.load(Ordering::Relaxed)
+    }
+
+    /// How many times the last viewer has left (the N→0 edge).
+    pub fn falling_edges(&self) -> u64 {
+        self.counters.falling_edges.load(Ordering::Relaxed)
+    }
+
+    /// The next demand change, if one is waiting. Non-blocking.
+    /// `None` if another clone of this handle is mid-poll, which is
+    /// indistinguishable from "nothing waiting" for a caller that is polling.
+    pub fn try_event(&self) -> Option<ZenohDemandEvent> {
+        self.events.try_lock().ok()?.try_recv().ok()
+    }
+
+    /// Wait for the next demand change, giving up after `timeout`.
+    pub async fn event_timeout(&self, timeout: Duration) -> Option<ZenohDemandEvent> {
+        tokio::time::timeout(timeout, async {
+            let mut rx = self.events.lock().await;
+            rx.recv().await
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// Ask upstream for a decoder entry point.
+    ///
+    /// Queues an [`Event::ForceKeyUnit`](crate::event::Event::ForceKeyUnit) for
+    /// the executor to carry toward the sources, where the first encoder
+    /// consumes it. Repeated calls before collection coalesce.
+    pub fn request_keyframe(&self) {
+        self.counters.request_keyframe();
+    }
+
+    /// Keyframe requests raised, from every origin.
+    pub fn keyframe_requests(&self) -> u64 {
+        self.counters.keyframe_requests.load(Ordering::Relaxed)
+    }
+
+    /// Samples published.
+    pub fn samples_sent(&self) -> u64 {
+        self.counters.samples_sent.load(Ordering::Relaxed)
+    }
+
+    /// Payload bytes published.
+    pub fn bytes_sent(&self) -> u64 {
+        self.counters.bytes_sent.load(Ordering::Relaxed)
+    }
+
+    /// Samples published carrying a decoder entry point.
+    pub fn keyframes_sent(&self) -> u64 {
+        self.counters.keyframes_sent.load(Ordering::Relaxed)
+    }
+
+    /// Publishes that failed.
+    pub fn publish_errors(&self) -> u64 {
+        self.counters.publish_errors.load(Ordering::Relaxed)
+    }
+}
+
 /// A Zenoh sink that publishes to a key expression.
 ///
 /// Implements [`AsyncSink`]; add to a pipeline with
@@ -833,12 +981,18 @@ pub struct ZenohSink {
     /// `Media` only: keeps every published keyframe a self-contained decoder
     /// entry point.
     param_sets: Option<crate::codec::annexb::ParamSetCache>,
-    /// A keyframe request waiting to be handed to the executor's upstream
-    /// path, and the monotonic counter that stamps it.
-    pending_keyframe: Option<crate::event::ForceKeyUnitEvent>,
-    keyframe_requests: u64,
-    bytes_sent: u64,
-    samples_sent: u64,
+    counters: Arc<ZenohSinkCounters>,
+    /// Kept alive so the matching listener keeps firing; dropping it
+    /// undeclares the subscription to matching status.
+    #[cfg(feature = "zenoh-unstable")]
+    _matching: Option<zenoh::matching::MatchingListener<()>>,
+    /// Only the matching listener pushes demand events, so without
+    /// `zenoh-unstable` there is nothing to send and the sender would be dead
+    /// weight. The receiver still exists: a handle taken on such a build is
+    /// usable, its event stream is simply always empty.
+    #[cfg(feature = "zenoh-unstable")]
+    demand_tx: Option<tokio::sync::mpsc::Sender<ZenohDemandEvent>>,
+    demand_rx: Option<tokio::sync::mpsc::Receiver<ZenohDemandEvent>>,
 }
 
 impl ZenohSink {
@@ -858,6 +1012,10 @@ impl ZenohSink {
     pub async fn with_session(session: Session, key_expr: impl Into<String>) -> Result<Self> {
         let key_expr = key_expr.into();
         let name = format!("zenohsink-{}", &key_expr[..key_expr.len().min(30)]);
+        #[cfg(feature = "zenoh-unstable")]
+        let (demand_tx, demand_rx) = tokio::sync::mpsc::channel(DEMAND_EVENT_QUEUE);
+        #[cfg(not(feature = "zenoh-unstable"))]
+        let (_demand_tx, demand_rx) = tokio::sync::mpsc::channel(DEMAND_EVENT_QUEUE);
 
         // The publisher is created lazily so QoS builder methods can run first.
         Ok(Self {
@@ -876,10 +1034,20 @@ impl ZenohSink {
             profile: WireProfile::Parallax,
             wire_sequence: 0,
             param_sets: None,
-            pending_keyframe: None,
-            keyframe_requests: 0,
-            bytes_sent: 0,
-            samples_sent: 0,
+            counters: {
+                let c = Arc::new(ZenohSinkCounters::default());
+                // Fail open where matching status is unavailable: an idle
+                // reaper built on `has_viewers()` must not kill a live stream
+                // just because the build cannot tell.
+                #[cfg(not(feature = "zenoh-unstable"))]
+                c.has_viewers.store(true, Ordering::Relaxed);
+                c
+            },
+            #[cfg(feature = "zenoh-unstable")]
+            _matching: None,
+            #[cfg(feature = "zenoh-unstable")]
+            demand_tx: Some(demand_tx),
+            demand_rx: Some(demand_rx),
         })
     }
 
@@ -951,17 +1119,17 @@ impl ZenohSink {
     /// Repeated calls before the executor collects coalesce into one request.
     /// A viewer under packet loss will ask far faster than a GOP.
     pub fn request_keyframe(&mut self) {
-        if self.pending_keyframe.is_none() {
-            self.keyframe_requests += 1;
-            self.pending_keyframe = Some(crate::event::ForceKeyUnitEvent::new(
-                self.keyframe_requests as u32,
-            ));
-        }
+        self.counters.request_keyframe();
     }
 
     /// How many keyframe requests this sink has raised.
     pub fn keyframe_requests(&self) -> u64 {
-        self.keyframe_requests
+        self.counters.keyframe_requests.load(Ordering::Relaxed)
+    }
+
+    /// Whether the publisher currently has matching subscribers.
+    pub fn has_viewers(&self) -> bool {
+        self.counters.has_viewers.load(Ordering::Relaxed)
     }
 
     /// Set a custom name.
@@ -1040,19 +1208,19 @@ impl ZenohSink {
 
     /// Get the number of bytes sent.
     pub fn bytes_sent(&self) -> u64 {
-        self.bytes_sent
+        self.counters.bytes_sent.load(Ordering::Relaxed)
     }
 
     /// Get the number of samples sent.
     pub fn samples_sent(&self) -> u64 {
-        self.samples_sent
+        self.counters.samples_sent.load(Ordering::Relaxed)
     }
 
     /// Get statistics.
     pub fn stats(&self) -> ZenohStats {
         ZenohStats {
-            bytes_transferred: self.bytes_sent,
-            samples: self.samples_sent,
+            bytes_transferred: self.bytes_sent(),
+            samples: self.samples_sent(),
         }
     }
 
@@ -1065,6 +1233,90 @@ impl ZenohSink {
         &self,
     ) -> Option<zenoh::matching::MatchingListenerBuilder<'_, zenoh::handlers::DefaultHandler>> {
         self.publisher.as_ref().map(|p| p.matching_listener())
+    }
+
+    /// A runtime handle: demand signal, keyframe requests, publish counters.
+    ///
+    /// Clone it **before** `Executor::start()` — the element is moved into its
+    /// task there. Taking it also arms the demand-event channel; a sink whose
+    /// handle was never taken buffers no events.
+    pub fn control(&mut self) -> ZenohSinkHandle {
+        let rx = self
+            .demand_rx
+            .take()
+            .map(|rx| Arc::new(tokio::sync::Mutex::new(rx)))
+            .unwrap_or_else(|| {
+                // Already taken: hand out a live-but-empty receiver rather
+                // than panicking on a second call.
+                let (_tx, rx) = tokio::sync::mpsc::channel(1);
+                Arc::new(tokio::sync::Mutex::new(rx))
+            });
+        ZenohSinkHandle {
+            counters: Arc::clone(&self.counters),
+            events: rx,
+        }
+    }
+
+    /// Watch subscriber matching, so the publisher learns when viewers arrive.
+    ///
+    /// The `@media` plane asks a publisher to force a keyframe when a viewer
+    /// appears, so a late joiner does not wait out a GOP. The rising edge does
+    /// three things: flips `has_viewers`, notifies the handle, and queues an
+    /// `Event::ForceKeyUnit` for the executor to carry upstream.
+    ///
+    /// Only the 0↔N edge is observable — zenoh reports a boolean, not a count
+    /// — so an Nth viewer produces nothing here and must ask through
+    /// [`ZenohSinkHandle::request_keyframe`].
+    #[cfg(feature = "zenoh-unstable")]
+    async fn arm_matching_listener(&mut self) -> Result<()> {
+        let Some(publisher) = self.publisher.as_ref() else {
+            return Ok(());
+        };
+
+        let counters = Arc::clone(&self.counters);
+        let tx = self.demand_tx.clone();
+        let name = self.name.clone();
+
+        let listener = publisher
+            .matching_listener()
+            .callback(move |status| {
+                let matching = status.matching();
+                let was = counters.has_viewers.swap(matching, Ordering::AcqRel);
+                if was == matching {
+                    return;
+                }
+                let event = if matching {
+                    counters.rising_edges.fetch_add(1, Ordering::Relaxed);
+                    // A viewer just arrived with no decoder state at all.
+                    counters.request_keyframe();
+                    tracing::debug!("{name}: viewers arrived, requesting a keyframe");
+                    ZenohDemandEvent::ViewersArrived
+                } else {
+                    counters.falling_edges.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!("{name}: last viewer left");
+                    ZenohDemandEvent::ViewersGone
+                };
+                if let Some(tx) = &tx {
+                    // Lossy on purpose: this runs on a zenoh runtime thread.
+                    let _ = tx.try_send(event);
+                }
+            })
+            .await
+            .map_err(|e| Error::Element(format!("Zenoh matching listener error: {e}")))?;
+
+        // Seed from the current status: a subscriber that appeared between the
+        // publisher and listener declarations would otherwise never produce an
+        // edge, and the stream would sit there unwatched-looking.
+        if let Ok(status) = publisher.matching_status().await
+            && status.matching()
+            && !self.counters.has_viewers.swap(true, Ordering::AcqRel)
+        {
+            self.counters.rising_edges.fetch_add(1, Ordering::Relaxed);
+            self.counters.request_keyframe();
+        }
+
+        self._matching = Some(listener);
+        Ok(())
     }
 
     /// Declare the publisher now (it is otherwise declared lazily on the
@@ -1096,6 +1348,12 @@ impl ZenohSink {
             .map_err(|e| Error::Element(format!("Zenoh publisher error: {}", e)))?;
 
         self.publisher = Some(publisher);
+
+        // The listener can only be declared on an existing publisher, and the
+        // publisher is lazy, so this is the one place both are true.
+        #[cfg(feature = "zenoh-unstable")]
+        self.arm_matching_listener().await?;
+
         Ok(())
     }
 }
@@ -1155,8 +1413,10 @@ impl AsyncSink for ZenohSink {
         put.await
             .map_err(|e| Error::Element(format!("Zenoh put error: {}", e)))?;
 
-        self.bytes_sent += len as u64;
-        self.samples_sent += 1;
+        self.counters
+            .bytes_sent
+            .fetch_add(len as u64, Ordering::Relaxed);
+        self.counters.samples_sent.fetch_add(1, Ordering::Relaxed);
 
         Ok(())
     }
@@ -1170,9 +1430,13 @@ impl AsyncSink for ZenohSink {
     /// Polled after every `consume`, so a request raised between samples goes
     /// out on the next one.
     fn take_upstream_event(&mut self) -> Option<crate::event::Event> {
-        self.pending_keyframe
-            .take()
-            .map(crate::event::Event::ForceKeyUnit)
+        if !self.counters.keyframe_pending.swap(false, Ordering::AcqRel) {
+            return None;
+        }
+        let count = self.counters.keyframe_requests.load(Ordering::Relaxed) as u32;
+        Some(crate::event::Event::ForceKeyUnit(
+            crate::event::ForceKeyUnitEvent::new(count),
+        ))
     }
 }
 

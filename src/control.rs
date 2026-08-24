@@ -483,7 +483,7 @@ pub use crate::pipeline::flow::FlowStateHandle;
 pub use crate::elements::codec::JpegQualityControl;
 
 #[cfg(feature = "zenoh")]
-pub use crate::elements::network::ZenohSrcHandle;
+pub use crate::elements::network::{ZenohDemandEvent, ZenohSinkHandle, ZenohSrcHandle};
 
 #[cfg(test)]
 mod tests {

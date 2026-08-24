@@ -68,6 +68,17 @@ the plugin ABI does not use either — so no ABI bump. `register` is unchanged;
 
   works. Both zenoh elements share one process-wide session, opened on first
   use and configurable with `PARALLAX_ZENOH_CONFIG`.
+- **Demand signalling on `ZenohSink`** (#234). `ZenohSinkHandle` (via
+  `control()`, cloned before `start()`) reports `has_viewers()` plus monotonic
+  rise/fall edge counters, delivers `ZenohDemandEvent` on a bounded lossy
+  channel, exposes the publish counters, and carries `request_keyframe()`.
+  A viewer arriving raises `Event::ForceKeyUnit` upstream automatically, so a
+  late joiner does not wait out a GOP.
+
+  There is deliberately **no viewer count**: zenoh's `MatchingStatus` is a
+  boolean, and a count cannot be synthesised. On a build without
+  `zenoh-unstable`, `has_viewers()` fails **open** so an idle reaper never
+  kills a live stream because the build cannot tell.
 - **The `@media` plane** (#231, #223). `ZenohSink::media` / `ZenohSrc::media`
   speak the ratified contract: one access unit per sample, codec on the
   `Encoding`, CBOR `FrameMeta` on the attachment, the `frame` QoS profile,

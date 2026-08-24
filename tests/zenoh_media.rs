@@ -402,6 +402,111 @@ async fn a_foreign_publisher_does_not_break_the_subscriber() {
     assert_eq!(received.as_bytes(), b"not an access unit");
 }
 
+/// #234: the publisher learns when someone starts watching.
+///
+/// This test only means anything on a build with `zenoh-unstable` — matching
+/// status lives behind it — which is why that feature is now in the CI test
+/// job's sensor combo rather than only in clippy and doc.
+#[cfg(feature = "zenoh-unstable")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_viewer_arriving_raises_the_demand_signal_and_asks_for_a_keyframe() {
+    use parallax::elements::ZenohDemandEvent;
+
+    let (pub_session, sub_session) = session_pair().await;
+    let key = unique_key("video/h264/high");
+
+    let mut sink = ZenohSink::media_with_session(pub_session, &key)
+        .await
+        .expect("media sink");
+    let demand = sink.control();
+
+    // The publisher is lazy, so declare it (and the listener) up front.
+    sink.ensure_publisher().await.expect("publisher");
+    settle().await;
+
+    assert!(!demand.has_viewers(), "nobody is watching yet");
+    assert_eq!(demand.rising_edges(), 0);
+
+    // A viewer appears.
+    let _src = ZenohSrc::media_with_session(sub_session, &key)
+        .await
+        .expect("media source");
+
+    let event = demand
+        .event_timeout(Duration::from_secs(10))
+        .await
+        .expect("a demand event");
+    assert_eq!(event, ZenohDemandEvent::ViewersArrived);
+    assert!(demand.has_viewers());
+    assert_eq!(demand.rising_edges(), 1);
+
+    // The arrival asks upstream for an entry point on the viewer's behalf —
+    // that is the whole point, so a late joiner does not wait out a GOP.
+    assert_eq!(demand.keyframe_requests(), 1);
+    match sink.take_upstream_event() {
+        Some(parallax::event::Event::ForceKeyUnit(e)) => {
+            assert!(e.all_headers, "a joining viewer needs the parameter sets");
+        }
+        other => panic!("expected a ForceKeyUnit, got {other:?}"),
+    }
+}
+
+/// The falling edge, which is what an idle reaper runs on.
+#[cfg(feature = "zenoh-unstable")]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_last_viewer_leaving_is_observable() {
+    use parallax::elements::ZenohDemandEvent;
+
+    let (pub_session, sub_session) = session_pair().await;
+    let key = unique_key("video/h264/low");
+
+    let mut sink = ZenohSink::media_with_session(pub_session, &key)
+        .await
+        .expect("media sink");
+    let demand = sink.control();
+    sink.ensure_publisher().await.expect("publisher");
+    settle().await;
+
+    let src = ZenohSrc::media_with_session(sub_session, &key)
+        .await
+        .expect("media source");
+    assert_eq!(
+        demand.event_timeout(Duration::from_secs(10)).await,
+        Some(ZenohDemandEvent::ViewersArrived)
+    );
+
+    drop(src);
+    assert_eq!(
+        demand.event_timeout(Duration::from_secs(10)).await,
+        Some(ZenohDemandEvent::ViewersGone),
+        "the last viewer leaving must be observable"
+    );
+    assert!(!demand.has_viewers());
+    assert_eq!(demand.falling_edges(), 1);
+}
+
+/// Publish counters live on the handle, which outlives `start()`.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_handle_counts_what_was_published() {
+    let (pub_session, _sub) = session_pair().await;
+    let key = unique_key("video/h264/high");
+
+    let mut sink = ZenohSink::media_with_session(pub_session, &key)
+        .await
+        .expect("media sink");
+    let stats = sink.control();
+
+    let mut meta = Metadata::new();
+    meta.flags |= BufferFlags::SYNC_POINT;
+    sink.consume(&ConsumeContext::new(&buffer(&keyframe_au(), meta)))
+        .await
+        .expect("publish");
+
+    assert_eq!(stats.samples_sent(), 1);
+    assert!(stats.bytes_sent() > 0);
+    assert_eq!(stats.publish_errors(), 0);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_keyframe_request_is_raised_upstream_and_coalesced() {
     let (pub_session, _sub) = session_pair().await;

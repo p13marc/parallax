@@ -12,7 +12,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  SENSOR_FEATURES: zenoh,h264,v4l2,rtp,rtsp,image-jpeg,hotplug
+  # `zenoh-unstable` is in here rather than appended per-job because the
+  # matching-listener demand signal (#234) lives behind it: with it only on the
+  # clippy and doc jobs, a test covering that code compiled and never ran.
+  SENSOR_FEATURES: zenoh,h264,v4l2,rtp,rtsp,image-jpeg,hotplug,zenoh-unstable
   # Pure-Rust media/container combo (no system libs needed; http = ureq/rustls)
   MEDIA_FEATURES: mp4-demux,mkv-demux,mpeg-ts,audio-aac,audio-vorbis,http
   # shared compiler cache: sccache (mounted from the runner VM) -> garage S3
@@ -57,7 +60,7 @@ jobs:
         with:
           cache-targets: false
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo clippy --all-targets --features "$SENSOR_FEATURES,image-codecs,zenoh-unstable" -- -D warnings
+      - run: cargo clippy --all-targets --features "$SENSOR_FEATURES,image-codecs" -- -D warnings
       - run: cargo clippy --all-targets --features "$MEDIA_FEATURES" -- -D warnings
 
   test:
@@ -238,4 +241,4 @@ jobs:
       - uses: https://github.com/Swatinem/rust-cache@v2.9.2
         with:
           cache-targets: false
-      - run: cargo doc --no-deps --features "$SENSOR_FEATURES,image-codecs,zenoh-unstable"
+      - run: cargo doc --no-deps --features "$SENSOR_FEATURES,image-codecs"
