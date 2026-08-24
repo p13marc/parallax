@@ -64,6 +64,12 @@ pub struct Behaviour {
     /// Pause this long between RTP packets, so a test can observe the stream
     /// rather than race it to EOF.
     pub packet_interval: Duration,
+    /// Send an RTCP Sender Report on interleaved channel 1 before the media,
+    /// anchoring RTP timestamp 0 to this Unix time in seconds (#207).
+    ///
+    /// `None` is the cheap-camera case: many never send one, and that must
+    /// keep working.
+    pub sender_report_at_unix_secs: Option<u64>,
 }
 
 impl Behaviour {
@@ -260,6 +266,18 @@ fn serve(
 /// Write the fixture as interleaved RTP until it runs out — or until
 /// `drop_after` packets, whichever comes first.
 fn pump(stream: &mut TcpStream, behaviour: &Behaviour, connection: u64) -> std::io::Result<()> {
+    // The SR first: it is the anchor, and a consumer that has not seen one
+    // cannot place the frames that follow.
+    if let Some(unix_secs) = behaviour.sender_report_at_unix_secs {
+        let sr = sender_report(unix_secs, 0);
+        let mut framed = Vec::with_capacity(4 + sr.len());
+        framed.push(b'$');
+        framed.push(1); // interleaved channel 1 = RTCP
+        framed.extend_from_slice(&(sr.len() as u16).to_be_bytes());
+        framed.extend_from_slice(&sr);
+        stream.write_all(&framed)?;
+    }
+
     let packets = rtp_packets();
     let die_at = if connection == 1 {
         behaviour.drop_after
@@ -473,6 +491,28 @@ fn rtp_packets() -> Vec<Vec<u8>> {
         }
     }
     out
+}
+
+/// A minimal RTCP Sender Report: header + sender info, no report blocks.
+///
+/// 28 bytes, which is exactly what retina's validator requires for `RC=0`.
+/// `unix_secs` is converted to the NTP epoch; the RTP timestamp it anchors is
+/// `rtp_timestamp`.
+fn sender_report(unix_secs: u64, rtp_timestamp: u32) -> Vec<u8> {
+    const NTP_TO_UNIX_SECS: u64 = 2_208_988_800;
+    let ntp = (unix_secs + NTP_TO_UNIX_SECS) << 32;
+
+    let mut packet = Vec::with_capacity(28);
+    packet.push(0x80); // V=2, P=0, RC=0
+    packet.push(200); // PT = SR
+    packet.extend_from_slice(&6u16.to_be_bytes()); // length in words - 1
+    packet.extend_from_slice(&0xDEAD_BEEFu32.to_be_bytes()); // SSRC, same as RTP
+    packet.extend_from_slice(&ntp.to_be_bytes());
+    packet.extend_from_slice(&rtp_timestamp.to_be_bytes());
+    packet.extend_from_slice(&0u32.to_be_bytes()); // packet count
+    packet.extend_from_slice(&0u32.to_be_bytes()); // octet count
+    debug_assert_eq!(packet.len(), 28);
+    packet
 }
 
 /// A 12-byte RTP header plus payload. Payload type 96, SSRC 0xDEADBEEF.

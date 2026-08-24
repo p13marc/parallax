@@ -252,3 +252,74 @@ async fn without_reconnect_the_stream_simply_ends() {
     );
     assert_eq!(session.stats().reconnects, 0);
 }
+
+/// #207: an RTP timestamp is a counter with an arbitrary origin. The Sender
+/// Report is the only thing that turns it into a time two machines can agree
+/// on — which is what an end-to-end latency measurement across this epic's
+/// topology needs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sender_report_anchors_timestamps_to_a_wallclock() {
+    // 2024-01-01T00:00:00Z, anchoring RTP timestamp 0.
+    const ANCHOR_SECS: u64 = 1_704_067_200;
+
+    let server = rtsp_server::start(Behaviour {
+        sender_report_at_unix_secs: Some(ANCHOR_SECS),
+        packet_interval: Duration::from_millis(5),
+        ..Behaviour::good()
+    });
+
+    let mut session = RtspSrc::new(server.url())
+        .video_only()
+        .without_reconnect()
+        .connect()
+        .await
+        .expect("connect");
+    let handle = session.stream_info_handle();
+
+    let buffers = drain(&mut session, 2).await;
+    assert!(!buffers.is_empty());
+
+    let sr = handle
+        .stream(0)
+        .and_then(|s| s.sender_report)
+        .expect("the SR must have been recorded");
+    assert_eq!(sr.ntp_unix_nanos, ANCHOR_SECS * 1_000_000_000);
+    assert_eq!(sr.rtp_timestamp, 0);
+
+    // The PTS is now a wallclock, not a per-session relative number: it must
+    // land within a second of the anchor for a stream that starts at RTP 0.
+    let pts = buffers[0].metadata().pts.nanos();
+    let anchor = ANCHOR_SECS * 1_000_000_000;
+    assert!(
+        pts >= anchor && pts < anchor + 5_000_000_000,
+        "pts {pts} is not anchored near {anchor}"
+    );
+}
+
+/// The camera that never sends one. Timestamps stay relative, and that is a
+/// supported configuration rather than a fault.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_sender_report_falls_back_to_relative_timing() {
+    let server = rtsp_server::start(Behaviour {
+        sender_report_at_unix_secs: None,
+        ..Behaviour::good()
+    });
+
+    let mut session = RtspSrc::new(server.url())
+        .video_only()
+        .without_reconnect()
+        .connect()
+        .await
+        .expect("connect");
+    let handle = session.stream_info_handle();
+
+    let buffers = drain(&mut session, 1).await;
+    assert!(!buffers.is_empty());
+    assert!(handle.stream(0).unwrap().sender_report.is_none());
+
+    // Relative to the RTP origin: small, not a 2024 wallclock.
+    assert!(
+        buffers[0].metadata().pts.nanos() < 60_000_000_000,
+        "an unanchored stream must not claim a wallclock"
+    );
+}

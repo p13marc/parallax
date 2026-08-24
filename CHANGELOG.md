@@ -135,6 +135,19 @@ the plugin ABI does not use either — so no ABI bump. `register` is unchanged;
   of `annexb::is_entry_point`.
 - **`docs/multi-machine.md`** (#229), the deployment guide, and
   `examples/62_zenoh.rs` / `examples/63_media_consume.rs` (#228).
+- **RTSP reconnection** (#206), on by default with exponential backoff and
+  full jitter, `DISCONT` on the resumed stream and a re-armed keyframe gate.
+  `without_reconnect()` restores fail-the-run for batch work.
+- **RTCP Sender Reports** (#207): `StreamInfo::sender_report` and a PTS that
+  is a wallclock rather than a per-session relative number, so two machines
+  can agree on when a frame was captured. Plus `RtspUnknownRtcpSsrc`, because
+  retina's default drops RTCP from an unexpected SSRC — and the anchor with it.
+- **An RTSP test server** (#209) in `tests/support/`, hand rolled, whose
+  failure modes are the point: a mid-stream disconnect, a stalled DESCRIBE, an
+  SDP missing its parameter sets.
+- **One interned custom-key registry** (#220) and **one wire schema** (#219),
+  with `tests/wire_projection.rs` proving the IPC descriptor and the zenoh
+  attachment agree.
 
 ### Fixed
 

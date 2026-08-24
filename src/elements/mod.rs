@@ -136,8 +136,9 @@ pub use rtp::{
 
 #[cfg(feature = "rtsp")]
 pub use rtp::{
-    MediaType, RtspConfig, RtspCredentials, RtspFrame, RtspFrameFormat, RtspReconnect, RtspSession,
-    RtspSrc, RtspStats, RtspStreamInfoHandle, RtspTransport, StreamInfo, StreamSelection,
+    MediaType, RtspConfig, RtspCredentials, RtspFrame, RtspFrameFormat, RtspReconnect,
+    RtspSenderReport, RtspSession, RtspSrc, RtspStats, RtspStreamInfoHandle, RtspTransport,
+    RtspUnknownRtcpSsrc, StreamInfo, StreamSelection,
 };
 
 // Runtime control.
