@@ -83,7 +83,7 @@ Feature-gated:
 
 | Factory name | Feature | Properties |
 |---|---|---|
-| `rtspsrc` | `rtsp` | `location` (req), `transport` = tcp\|udp, `timeout-ms`, `video-only`, `audio-only`, `skip-until-keyframe` |
+| `rtspsrc` | `rtsp` | `location` (req), `transport` = tcp\|udp, `timeout-ms`, `video-only`, `audio-only`, `skip-until-keyframe`, `reconnect` (bool, **default true**), `reconnect-max-retries`, `reconnect-initial-backoff-ms`, `reconnect-max-backoff-ms` |
 | `zenohsrc` | `zenoh` | `key` (req), `profile` = parallax\|media, `resync-on-discont`, `timeout-ms` (heartbeat, keeps the stream open), `stream-timeout-ms` (ends it), `on-publisher-loss` = wait\|eos |
 | `zenohsink` | `zenoh` | `key` (req), `profile` = parallax\|media, `congestion` = block\|drop, `priority`, `express` |
 

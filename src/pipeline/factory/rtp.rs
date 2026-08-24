@@ -167,11 +167,17 @@ fn create_rtpjitterbuffer(props: &Props) -> Result<Box<DynAsyncElement<'static>>
 // ============================================================================
 
 /// `rtspsrc location=<url> [transport=tcp|udp] [timeout-ms=<n>]
-///         [video-only=<bool>] [audio-only=<bool>] [skip-until-keyframe=<bool>]`
+///         [video-only=<bool>] [audio-only=<bool>] [skip-until-keyframe=<bool>]
+///         [reconnect=<bool>] [reconnect-max-retries=<n>]
+///         [reconnect-initial-backoff-ms=<n>] [reconnect-max-backoff-ms=<n>]`
 ///
 /// Credentials embedded in the URL (`rtsp://user:pass@host/...`) are lifted
 /// into RTSP auth automatically. The connection is made here, so a bad URL or
 /// an unreachable camera fails the parse rather than the run.
+///
+/// Reconnection is **on by default** (#206) and retries forever: a live camera
+/// feed must survive a switch reboot. `reconnect=false` restores the
+/// fail-the-run behaviour, which is what batch work wants.
 #[cfg(feature = "rtsp")]
 async fn create_rtspsrc(
     props: super::Props,
@@ -202,6 +208,29 @@ async fn create_rtspsrc(
     }
     if let Some(skip) = props.get_bool("skip-until-keyframe")? {
         src = src.skip_until_keyframe(skip);
+    }
+
+    // #206. The individual knobs imply `reconnect=true`; `reconnect=false`
+    // wins outright, because saying "do not reconnect" and then tuning the
+    // backoff is a contradiction the parse should not silently resolve.
+    let mut reconnect = crate::elements::RtspReconnect::default();
+    let mut tuned = false;
+    if let Some(max) = props.get_u32("reconnect-max-retries")? {
+        reconnect.max_retries = Some(max);
+        tuned = true;
+    }
+    if let Some(d) = props.get_ms("reconnect-initial-backoff-ms")? {
+        reconnect.initial_backoff = d;
+        tuned = true;
+    }
+    if let Some(d) = props.get_ms("reconnect-max-backoff-ms")? {
+        reconnect.max_backoff = d;
+        tuned = true;
+    }
+    match props.get_bool("reconnect")? {
+        Some(false) => src = src.without_reconnect(),
+        _ if tuned => src = src.with_reconnect(reconnect),
+        _ => {}
     }
 
     let session = src.connect().await?;

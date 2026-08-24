@@ -172,6 +172,68 @@ pub enum StreamSelection {
     Indices(Vec<usize>),
 }
 
+/// Reconnection policy for a live RTSP source (#206).
+///
+/// Without one, a transient TCP reset — a switch reboot, a camera's nightly
+/// restart, a Wi-Fi hiccup — is an `Err` from the source, and every `Err` that
+/// is not `PoolExhausted` or `Shutdown` ends the whole run (gotcha 13). A
+/// 24/7 camera feed cannot die that way, so this is **on by default**; a batch
+/// consumer that wants the failure reported turns it off with
+/// [`RtspSrc::without_reconnect`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RtspReconnect {
+    /// How many times to retry before giving up. `None` = forever, which is
+    /// what a live source wants: the camera will come back.
+    pub max_retries: Option<u32>,
+    /// The first delay. Doubles per attempt.
+    pub initial_backoff: Duration,
+    /// The ceiling the doubling stops at.
+    pub max_backoff: Duration,
+}
+
+impl Default for RtspReconnect {
+    fn default() -> Self {
+        Self {
+            max_retries: None,
+            initial_backoff: Duration::from_millis(500),
+            max_backoff: Duration::from_secs(30),
+        }
+    }
+}
+
+impl RtspReconnect {
+    /// The delay before attempt `attempt` (0-based), with **full jitter**.
+    ///
+    /// Full jitter — a uniform draw from `[0, capped)` rather than the capped
+    /// value itself — because a rack of cameras behind one switch all lose
+    /// their connection at the same instant. Exponential backoff alone keeps
+    /// them synchronised and they retry in a thundering herd, forever; jitter
+    /// is what spreads them out.
+    ///
+    /// The randomness comes from the clock's nanosecond field rather than a
+    /// `rand` dependency: this picks a sleep duration, not a key.
+    fn delay(&self, attempt: u32) -> Duration {
+        let capped = self
+            .initial_backoff
+            .saturating_mul(1u32.checked_shl(attempt.min(31)).unwrap_or(u32::MAX))
+            .min(self.max_backoff);
+        let nanos = capped.as_nanos() as u64;
+        if nanos == 0 {
+            return Duration::ZERO;
+        }
+        let entropy = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64)
+            .unwrap_or(0);
+        Duration::from_nanos(entropy % nanos)
+    }
+
+    /// Whether another attempt is allowed after `attempts` failures.
+    fn may_retry(&self, attempts: u32) -> bool {
+        self.max_retries.is_none_or(|max| attempts < max)
+    }
+}
+
 /// Configuration for RtspSrc.
 #[derive(Debug, Clone)]
 pub struct RtspConfig {
@@ -200,6 +262,9 @@ pub struct RtspConfig {
     /// garbage or an error. Defaults to `true` — every correct consumer wants
     /// it, and every one of them was writing the same skip loop by hand.
     pub skip_until_keyframe: bool,
+    /// Reconnect on a dropped stream (#206). `Some` by default — see
+    /// [`RtspReconnect`].
+    pub reconnect: Option<RtspReconnect>,
 }
 
 impl Default for RtspConfig {
@@ -215,6 +280,7 @@ impl Default for RtspConfig {
             connect_timeout: Duration::from_secs(10),
             max_timestamp_jump_secs: 10,
             skip_until_keyframe: true,
+            reconnect: Some(RtspReconnect::default()),
         }
     }
 }
@@ -396,8 +462,13 @@ pub struct RtspStats {
     /// ending the session. A non-zero count here means the consumer cannot keep
     /// up with the camera.
     pub frames_dropped: u64,
-    /// Connection start time.
+    /// Connection start time. Re-stamped on every reconnect.
     pub connected_at: Option<std::time::Instant>,
+    /// How many times the session has been rebuilt (#206).
+    ///
+    /// A steadily rising count on a stable network is the signal that
+    /// something upstream is wrong — a camera rebooting, a saturated link.
+    pub reconnects: u32,
 }
 
 // ============================================================================
@@ -490,6 +561,23 @@ impl RtspSrc {
     /// Set audio-only stream selection.
     pub fn audio_only(mut self) -> Self {
         self.config.stream_selection = StreamSelection::AudioOnly;
+        self
+    }
+
+    /// Set the reconnection policy (#206).
+    ///
+    /// On by default; see [`RtspReconnect`].
+    pub fn with_reconnect(mut self, reconnect: RtspReconnect) -> Self {
+        self.config.reconnect = Some(reconnect);
+        self
+    }
+
+    /// Fail the pipeline on a dropped stream instead of reconnecting (#206).
+    ///
+    /// The right choice for batch work, where a truncated recording that looks
+    /// successful is the worse outcome. Wrong for a camera.
+    pub fn without_reconnect(mut self) -> Self {
+        self.config.reconnect = None;
         self
     }
 
@@ -615,6 +703,12 @@ pub struct RtspSession {
     skip_until_keyframe: bool,
     /// Whether the first keyframe has been seen.
     saw_keyframe: bool,
+    /// Kept so the session can rebuild itself (#206).
+    config: RtspConfig,
+    /// Set after a reconnect; stamps `DISCONT` on the first resumed buffer.
+    pending_discont: bool,
+    /// Reconnects so far, for [`RtspStats`] and the bus warning.
+    reconnects: u32,
 }
 
 impl RtspSession {
@@ -624,7 +718,9 @@ impl RtspSession {
         // `rtsp://user:pass@host/...` into RtspCredentials (explicit
         // `with_credentials` wins if both are present).
         let (url, url_credentials) = split_url_credentials(&config.url)?;
-        let credentials = config.credentials.or(url_credentials);
+        // Cloned rather than moved: the session keeps the whole config so it
+        // can rebuild itself on a reconnect (#206).
+        let credentials = config.credentials.clone().or(url_credentials);
 
         // Build session options
         let mut session_opts = SessionOptions::default()
@@ -778,7 +874,35 @@ impl RtspSession {
                 .grow_to_fit(),
             skip_until_keyframe: config.skip_until_keyframe,
             saw_keyframe: false,
+            config,
+            pending_discont: false,
+            reconnects: 0,
         })
+    }
+
+    /// Tear down and rebuild the session against the same URL (#206).
+    ///
+    /// Everything retina holds — the TCP connection, the RTP sequence origin,
+    /// the SSRC — is replaced, so the next buffer is a genuine discontinuity
+    /// and is stamped as one. The keyframe gate re-arms too: whatever the
+    /// camera sends first lands mid-GOP as surely as the original join did.
+    ///
+    /// The output arena survives, because its budget came from the executor
+    /// and rebuilding it would throw that away.
+    pub async fn reconnect(&mut self) -> Result<()> {
+        let fresh = Self::connect(self.config.clone()).await?;
+        self.session = fresh.session;
+        self.streams = fresh.streams;
+        self.selected_streams = fresh.selected_streams;
+        self.saw_keyframe = false;
+        self.pending_discont = true;
+        self.reconnects += 1;
+        self.stats.reconnects = self.reconnects;
+        self.stats.connected_at = Some(std::time::Instant::now());
+        // Observers waiting on `wait_for_dimensions` must see the new
+        // session's answer, not the dead one's.
+        self.publish_streams();
+        Ok(())
     }
 
     /// Get information about available streams.
@@ -1084,13 +1208,68 @@ impl crate::element::AsyncSource for RtspSession {
         self.output.set_budget(budget);
     }
 
+    /// Pull one buffer, reconnecting through a dropped stream (#206).
+    ///
+    /// A stream error is not fatal when a reconnect policy is configured: it
+    /// is a live source, and the camera will come back. Without one — or once
+    /// the retries run out — the error is returned and the run ends, which is
+    /// what batch work wants.
+    ///
+    /// End of stream is *not* retried. A server that says goodbye said
+    /// goodbye; only a failure is a candidate for a retry.
     async fn produce(
         &mut self,
-        _ctx: &mut crate::element::ProduceContext<'_>,
+        ctx: &mut crate::element::ProduceContext<'_>,
     ) -> Result<ProduceResult> {
-        match self.next_buffer().await? {
-            Some(buffer) => Ok(ProduceResult::OwnBuffer(buffer)),
-            None => Ok(ProduceResult::Eos),
+        let mut attempts: u32 = 0;
+        loop {
+            match self.next_buffer().await {
+                Ok(Some(mut buffer)) => {
+                    if self.pending_discont {
+                        self.pending_discont = false;
+                        buffer.metadata_mut().flags |= BufferFlags::DISCONT;
+                    }
+                    return Ok(ProduceResult::OwnBuffer(buffer));
+                }
+                Ok(None) => return Ok(ProduceResult::Eos),
+                Err(e) => {
+                    let Some(policy) = self.config.reconnect else {
+                        return Err(e);
+                    };
+                    if !policy.may_retry(attempts) {
+                        return Err(Error::Element(format!(
+                            "rtspsrc: giving up after {attempts} reconnect attempts: {e}"
+                        )));
+                    }
+                    let delay = policy.delay(attempts);
+                    attempts += 1;
+                    let warning = format!(
+                        "rtspsrc: stream failed ({e}); reconnect attempt {attempts} in {delay:?}"
+                    );
+                    tracing::warn!("{warning}");
+                    ctx.post_message(crate::pipeline::bus::MessageKind::Warning {
+                        warning,
+                        debug: Some(self.config.url.clone()),
+                    });
+                    tokio::time::sleep(delay).await;
+                    match self.reconnect().await {
+                        Ok(()) => {
+                            tracing::info!("rtspsrc: reconnected after {attempts} attempt(s)");
+                            // Reset the ladder: the next outage starts from
+                            // the bottom rather than from wherever this one
+                            // left off.
+                            attempts = 0;
+                        }
+                        // The reconnect itself failed. Loop: `next_buffer`
+                        // will fail immediately against the dead session and
+                        // the backoff advances, which is the behaviour wanted
+                        // — a server that is down stays retried, more slowly.
+                        Err(retry_err) => {
+                            tracing::debug!("rtspsrc: reconnect failed: {retry_err}");
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1106,6 +1285,77 @@ impl crate::element::AsyncSource for RtspSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #206: the backoff doubles, stops at the ceiling, and never returns the
+    /// ceiling itself — full jitter is what stops a rack of cameras behind one
+    /// switch retrying in lockstep forever.
+    #[test]
+    fn the_backoff_doubles_caps_and_jitters() {
+        let policy = RtspReconnect {
+            max_retries: None,
+            initial_backoff: Duration::from_millis(500),
+            max_backoff: Duration::from_secs(30),
+        };
+
+        // The *bound* is what is deterministic; the draw inside it is not.
+        for (attempt, cap_ms) in [(0u32, 500u64), (1, 1000), (2, 2000), (5, 16000)] {
+            for _ in 0..64 {
+                let d = policy.delay(attempt);
+                assert!(
+                    d < Duration::from_millis(cap_ms),
+                    "attempt {attempt}: {d:?} must be under the {cap_ms}ms cap"
+                );
+            }
+        }
+
+        // Far past the ceiling, the cap holds rather than overflowing.
+        for attempt in [10u32, 31, 40, u32::MAX] {
+            assert!(
+                policy.delay(attempt) < policy.max_backoff,
+                "attempt {attempt}"
+            );
+        }
+
+        // And it really varies — a fixed backoff would defeat the point.
+        let draws: std::collections::HashSet<_> = (0..64).map(|_| policy.delay(5)).collect();
+        assert!(
+            draws.len() > 1,
+            "full jitter must actually draw different values"
+        );
+    }
+
+    #[test]
+    fn the_retry_budget_is_honoured() {
+        let forever = RtspReconnect::default();
+        assert_eq!(forever.max_retries, None);
+        assert!(forever.may_retry(0));
+        assert!(forever.may_retry(1_000_000));
+
+        let bounded = RtspReconnect {
+            max_retries: Some(3),
+            ..Default::default()
+        };
+        assert!(bounded.may_retry(0));
+        assert!(bounded.may_retry(2));
+        assert!(!bounded.may_retry(3), "the fourth attempt is refused");
+    }
+
+    /// A live source must survive a switch reboot. That is the default, and
+    /// turning it off is the deliberate act.
+    #[test]
+    fn reconnection_is_on_by_default() {
+        assert!(
+            RtspConfig::default().reconnect.is_some(),
+            "a camera feed that dies on a TCP reset is the bug #206 is about"
+        );
+        assert!(
+            RtspSrc::new("rtsp://example/stream")
+                .without_reconnect()
+                .config()
+                .reconnect
+                .is_none()
+        );
+    }
 
     #[test]
     fn sdp_encoding_names_map_to_codecs() {
