@@ -375,12 +375,11 @@ impl AsyncSink for IpcSink {
         }
 
         let buffer = ctx.buffer();
-        // Packed is the IPC wire invariant (#194): strided layouts never
-        // cross; nothing in-tree produces a strided Cpu buffer.
-        debug_assert!(
-            !buffer.metadata().has_strided_planes(),
-            "ipcsink: strided plane layout on an IPC-bound buffer"
-        );
+        // Strided layouts cross since #219: the descriptor carries the
+        // `PlaneLayout` inline, which is why it grew to 192 bytes. Before
+        // that the layout was silently dropped and the frame arrived on the
+        // far side describing itself as packed — geometry travels in-band,
+        // and a plane layout is part of the geometry.
         // The descriptor ring speaks arena identity — a dmabuf- or
         // external-backed buffer has none (#145/#194). Per-buffer
         // SCM_RIGHTS fd passing is the honest follow-up for dmabuf; until

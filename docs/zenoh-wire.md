@@ -17,7 +17,33 @@ why.
 | End of stream | a terminal sample **and** liveliness | liveliness only |
 | Owner | parallax | the `@media` specification |
 
-## Chapter P — the parallax plane (contract version 3)
+## Where the schema lives
+
+`WireMetadata` is **not** a zenoh type. It lives in `src/wire/`, always
+compiled, because it is also what the IPC descriptor projects (#219). Keeping
+it behind the `zenoh` feature is what let the two wires drift: `rtp` was
+carried by one and dropped by the other, `planes` was dropped by both, and
+`MediaFormat::Rtp` had an IPC tag and no zenoh mapping at all — so an
+RTP-formatted buffer survived a *process* boundary and lost its format across
+a *machine* boundary.
+
+One schema, two encodings, one proof:
+
+| | Encoding | Why |
+|---|---|---|
+| zenoh attachment | rkyv over `WireMetadata` | variable-length; absent fields cost nothing |
+| IPC descriptor | 192-byte `#[repr(C)]` POD | fixed-stride array in shared memory on the per-buffer hot path |
+
+`tests/wire_projection.rs` round-trips a corpus through both and asserts they
+restore an identical `Metadata`. It runs under **default features**, because a
+test that needed `zenoh` would not be guarding the build that ships the IPC
+ring. The one documented loss is the custom map, which the descriptor overflows
+through the control socket.
+
+Every code both encodings write comes from `wire::codes`, whose lock test pins
+each assignment. Reordering `PixelFormat` is therefore not a wire event.
+
+## Chapter P — the parallax plane (contract version 4)
 
 Each buffer becomes exactly one zenoh sample:
 
@@ -25,9 +51,9 @@ Each buffer becomes exactly one zenoh sample:
 |---|---|
 | payload | the raw buffer bytes, unmodified |
 | encoding | derived from `Metadata.format` (`video/h264`, `image/jpeg`-style MIME hints; `zenoh/bytes` when unknown), overridable via `ZenohSink::with_encoding` |
-| attachment | `[0x50 'P', 0x58 'X', 0x03] ++ rkyv(WireMetadata)` |
+| attachment | `[0x50 'P', 0x58 'X', 0x04] ++ rkyv(WireMetadata)` |
 
-`WireMetadata` (`src/elements/network/zenoh_wire.rs`) carries pts/dts/duration
+`WireMetadata` (`src/wire/metadata.rs`) carries pts/dts/duration
 (ns, `u64::MAX` = unset), sequence, stream_id, `BufferFlags` bits, source byte
 offset, the media format (stable u8 codec / pixel-format codes), the coded
 geometry of encoded video (#236), and whitelisted custom byte entries (e.g.
@@ -51,8 +77,12 @@ type-erased part of the in-memory metadata map cannot cross the wire.
 internal refactors are not wire breaks. Any change to the serialized layout,
 the codec/pixel-format code tables, or the semantics of a field requires
 bumping `WIRE_VERSION` — receivers treat unknown versions as foreign
-publishers (fallback, not error). v2 added the coded-geometry field; v3 added
-the terminal marker below.
+publishers (fallback, not error) — the **IPC** wire takes the opposite policy
+and gates on exact equality, because both ends there are parallax and a
+mismatch is a deployment error rather than a stranger on the network.
+
+v2 added the coded-geometry field; v3 added the terminal marker below; v4
+added `rtp`, `planes` and `WireFormat::Rtp` (#219).
 
 ### Terminal samples (#224)
 

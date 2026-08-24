@@ -22,6 +22,25 @@
 //!
 //! [`elements::network::zenoh_wire`]: crate::elements::network::zenoh_wire
 
+pub mod codes;
+pub mod descriptor;
 mod frame_meta;
+mod metadata;
 
 pub use frame_meta::FrameMeta;
+pub use metadata::{CUSTOM_META, WireFormat, WireMetadata, WirePlanes, WireRtp, WireTerminal};
+
+/// Attachment magic bytes (`"PX"`).
+pub const WIRE_MAGIC: [u8; 2] = [0x50, 0x58];
+
+/// The internal schema's version.
+///
+/// 4: `rtp`, `planes` and `WireFormat::Rtp` (#219) — the fields the two wires
+/// had already diverged on. 3: `terminal` (#224). 2: `coded` (#236).
+///
+/// **The two versions in this tree change independently and must not be
+/// merged.** This one is *semantics*: what a field means, which fields exist.
+/// [`IPC_RING_VERSION`](crate::memory::IPC_RING_VERSION) is *mechanics*: the
+/// ring's layout and handshake. A doc saying "remember to bump both" is a doc
+/// that will be violated.
+pub const WIRE_VERSION: u8 = 4;

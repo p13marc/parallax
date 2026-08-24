@@ -46,14 +46,7 @@
 //! control socket, not in the segment.
 
 use super::eventfd::EventFd;
-use super::shared_refcount::SharedIpcSlotRef;
-use crate::clock::ClockTime;
 use crate::error::{Error, Result};
-use crate::format::{
-    AudioCodec, AudioFormat, Framerate, MediaFormat, PixelFormat, RtpEncoding, RtpFormat,
-    SampleFormat, VideoCodec, VideoFormat,
-};
-use crate::metadata::{BufferFlags, Metadata, RtpMeta};
 use rustix::fd::{AsFd, BorrowedFd, OwnedFd};
 use rustix::mm::{MapFlags, ProtFlags};
 use std::ptr::NonNull;
@@ -64,12 +57,20 @@ const IPC_RING_MAGIC: u64 = 0x504C585F49504352;
 
 /// Ring segment format version, gated by exact equality in [`IpcChannel::from_fds`].
 ///
-/// Bump whenever [`IpcDescriptor`]'s layout changes **or any enum encoded by
-/// discriminant changes its variant set or order** (`PixelFormat`,
-/// `VideoCodec`, `SampleFormat`, `AudioCodec`, the `RtpEncoding` tag table).
-/// The `descriptor_enum_discriminants_locked` test turns that rule into a CI
-/// failure instead of a silent misdecode.
-const IPC_RING_VERSION: u32 = 1;
+/// This is *mechanics*: the segment's layout, the descriptor's size and field
+/// offsets, the handshake. It is **not** the schema version — that is
+/// [`wire::WIRE_VERSION`](crate::wire::WIRE_VERSION), which changes when a
+/// field's meaning or presence changes. The two move independently on purpose;
+/// a doc saying "remember to bump both" is a doc that will be violated.
+///
+/// Bump this whenever [`IpcDescriptor`]'s layout changes. It no longer has to
+/// track enum discriminants: since #219 the descriptor encodes through
+/// [`wire::codes`](crate::wire::codes), whose own lock test pins every
+/// assignment, so reordering `PixelFormat` is not a wire event at all.
+///
+/// 2: the descriptor grew 128 → 192 bytes to carry a `PlaneLayout` inline
+/// (#219). 1: initial.
+const IPC_RING_VERSION: u32 = 2;
 
 /// Default entries per ring.
 pub const DEFAULT_IPC_RING_CAPACITY: u32 = 64;
@@ -137,352 +138,13 @@ fn layout(capacity: u32) -> (usize, usize, usize) {
 // Descriptor
 // ============================================================================
 
-/// One buffer's worth of wire state: the slot reference plus every fixed
-/// metadata field. 128 bytes (two cache lines), plain old data.
-///
-/// The only part of [`Metadata`] that does not ride here is the custom map
-/// (type-erased); its known byte-valued entries overflow through the control
-/// socket (`ControlMessage::MetaOverflow`), flagged by presence bit 2.
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct IpcDescriptor {
-    /// Arena the slot lives in (process-unique since #178).
-    pub arena_id: u64,
-    /// Channel-monotonic sequence — the ack correlation id.
-    pub seq: u64,
-    /// Raw `ClockTime` nanos; `u64::MAX` = NONE. Round-trips exactly.
-    pub pts: u64,
-    /// See `pts`.
-    pub dts: u64,
-    /// See `pts`.
-    pub duration: u64,
-    /// `Metadata.sequence`.
-    pub sequence: u64,
-    /// `Metadata.offset`, valid iff presence bit 0.
-    pub byte_offset: u64,
-    /// Slot data offset within the arena.
-    pub data_offset: u64,
-    /// Payload length.
-    pub len: u64,
-    /// `Metadata.stream_id`.
-    pub stream_id: u32,
-    /// Slot index within the arena.
-    pub slot_index: u32,
-    /// `BufferFlags::bits()`.
-    pub flags: u8,
-    /// Bit 0: byte_offset present. Bit 1: rtp present. Bit 2: a
-    /// `MetaOverflow` control message precedes this descriptor.
-    pub presence: u8,
-    /// MediaFormat tag: 0 none, 1 VideoRaw, 2 Video, 3 AudioRaw, 4 Audio,
-    /// 5 Rtp, 6 MpegTs, 7 Bytes.
-    pub fmt_tag: u8,
-    /// `RtpMeta.pt`.
-    pub rtp_pt: u8,
-    /// `RtpMeta.seq`.
-    pub rtp_seq: u16,
-    /// `RtpMeta.marker` (0/1).
-    pub rtp_marker: u8,
-    _pad0: u8,
-    /// `RtpMeta.ts`.
-    pub rtp_ts: u32,
-    /// `RtpMeta.ssrc`.
-    pub rtp_ssrc: u32,
-    /// MediaFormat payload word 1; meaning per `fmt_tag` (see `encode`).
-    pub fmt_a: u32,
-    /// MediaFormat payload word 2.
-    pub fmt_b: u32,
-    /// MediaFormat payload word 3.
-    pub fmt_c: u32,
-    /// MediaFormat payload word 4.
-    pub fmt_d: u32,
-    /// MediaFormat payload word 5.
-    pub fmt_e: u32,
-    _pad1: [u8; 12],
-}
-
-const _: () = assert!(std::mem::size_of::<IpcDescriptor>() == 128);
-const _: () = assert!(std::mem::align_of::<IpcDescriptor>() == 8);
-
-const PRESENCE_OFFSET: u8 = 1 << 0;
-const PRESENCE_RTP: u8 = 1 << 1;
-const PRESENCE_META_OVERFLOW: u8 = 1 << 2;
-
-const FMT_NONE: u8 = 0;
-const FMT_VIDEO_RAW: u8 = 1;
-const FMT_VIDEO: u8 = 2;
-const FMT_AUDIO_RAW: u8 = 3;
-const FMT_AUDIO: u8 = 4;
-const FMT_RTP: u8 = 5;
-const FMT_MPEG_TS: u8 = 6;
-const FMT_BYTES: u8 = 7;
-
-/// `RtpEncoding` tag table (it is not `repr(u8)` — it carries `Dynamic(u8)`).
-fn rtp_encoding_to_tag(e: RtpEncoding) -> (u32, u32) {
-    match e {
-        RtpEncoding::H264 => (0, 0),
-        RtpEncoding::H265 => (1, 0),
-        RtpEncoding::Vp8 => (2, 0),
-        RtpEncoding::Vp9 => (3, 0),
-        RtpEncoding::Opus => (4, 0),
-        RtpEncoding::Pcmu => (5, 0),
-        RtpEncoding::Pcma => (6, 0),
-        RtpEncoding::Av1 => (7, 0),
-        RtpEncoding::Dynamic(pt) => (8, pt as u32),
-    }
-}
-
-fn rtp_encoding_from_tag(tag: u32, dynamic_pt: u32) -> Result<RtpEncoding> {
-    Ok(match tag {
-        0 => RtpEncoding::H264,
-        1 => RtpEncoding::H265,
-        2 => RtpEncoding::Vp8,
-        3 => RtpEncoding::Vp9,
-        4 => RtpEncoding::Opus,
-        5 => RtpEncoding::Pcmu,
-        6 => RtpEncoding::Pcma,
-        7 => RtpEncoding::Av1,
-        8 => RtpEncoding::Dynamic(dynamic_pt as u8),
-        other => return Err(bad_wire(format!("RtpEncoding tag {other}"))),
-    })
-}
-
-fn pixel_format_from(v: u32) -> Result<PixelFormat> {
-    use PixelFormat::*;
-    Ok(match v {
-        x if x == I420 as u32 => I420,
-        x if x == Nv12 as u32 => Nv12,
-        x if x == I420_10Le as u32 => I420_10Le,
-        x if x == P010 as u32 => P010,
-        x if x == I422 as u32 => I422,
-        x if x == Yuyv as u32 => Yuyv,
-        x if x == Uyvy as u32 => Uyvy,
-        x if x == I444 as u32 => I444,
-        x if x == Rgb24 as u32 => Rgb24,
-        x if x == Rgba as u32 => Rgba,
-        x if x == Bgr24 as u32 => Bgr24,
-        x if x == Bgra as u32 => Bgra,
-        x if x == Argb as u32 => Argb,
-        x if x == Gray8 as u32 => Gray8,
-        x if x == Gray16Le as u32 => Gray16Le,
-        other => return Err(bad_wire(format!("PixelFormat {other}"))),
-    })
-}
-
-fn video_codec_from(v: u32) -> Result<VideoCodec> {
-    use VideoCodec::*;
-    Ok(match v {
-        x if x == H264 as u32 => H264,
-        x if x == H265 as u32 => H265,
-        x if x == Vp8 as u32 => Vp8,
-        x if x == Vp9 as u32 => Vp9,
-        x if x == Av1 as u32 => Av1,
-        x if x == Mjpeg as u32 => Mjpeg,
-        other => return Err(bad_wire(format!("VideoCodec {other}"))),
-    })
-}
-
-fn sample_format_from(v: u32) -> Result<SampleFormat> {
-    use SampleFormat::*;
-    Ok(match v {
-        x if x == S16 as u32 => S16,
-        x if x == S32 as u32 => S32,
-        x if x == F32 as u32 => F32,
-        x if x == U8 as u32 => U8,
-        other => return Err(bad_wire(format!("SampleFormat {other}"))),
-    })
-}
-
-fn audio_codec_from(v: u32) -> Result<AudioCodec> {
-    use AudioCodec::*;
-    Ok(match v {
-        x if x == Opus as u32 => Opus,
-        x if x == Aac as u32 => Aac,
-        x if x == Mp3 as u32 => Mp3,
-        x if x == Pcmu as u32 => Pcmu,
-        x if x == Pcma as u32 => Pcma,
-        x if x == Vorbis as u32 => Vorbis,
-        x if x == Eac3 as u32 => Eac3,
-        other => return Err(bad_wire(format!("AudioCodec {other}"))),
-    })
-}
-
-fn bad_wire(what: String) -> Error {
-    // Unreachable when the version gate holds: both sides run the same
-    // descriptor lineage. Reaching this means segment corruption.
-    Error::InvalidSegment(format!("ipc descriptor: unknown {what}"))
-}
-
-impl IpcDescriptor {
-    /// Encode a slot reference plus metadata. Drops the custom map — the
-    /// element layer overflows its known entries through the control socket
-    /// and flags them with [`set_meta_overflow`](Self::set_meta_overflow).
-    pub fn encode(seq: u64, slot: &SharedIpcSlotRef, meta: &Metadata) -> Self {
-        let mut d = Self {
-            arena_id: slot.arena_id,
-            seq,
-            pts: meta.pts.nanos(),
-            dts: meta.dts.nanos(),
-            duration: meta.duration.nanos(),
-            sequence: meta.sequence,
-            byte_offset: meta.offset.unwrap_or(0),
-            data_offset: slot.data_offset as u64,
-            len: slot.len as u64,
-            stream_id: meta.stream_id,
-            slot_index: slot.slot_index,
-            flags: meta.flags.bits(),
-            presence: 0,
-            fmt_tag: FMT_NONE,
-            rtp_pt: 0,
-            rtp_seq: 0,
-            rtp_marker: 0,
-            _pad0: 0,
-            rtp_ts: 0,
-            rtp_ssrc: 0,
-            fmt_a: 0,
-            fmt_b: 0,
-            fmt_c: 0,
-            fmt_d: 0,
-            fmt_e: 0,
-            _pad1: [0; 12],
-        };
-        if meta.offset.is_some() {
-            d.presence |= PRESENCE_OFFSET;
-        }
-        if let Some(rtp) = meta.rtp {
-            d.presence |= PRESENCE_RTP;
-            d.rtp_pt = rtp.pt;
-            d.rtp_seq = rtp.seq;
-            d.rtp_marker = rtp.marker as u8;
-            d.rtp_ts = rtp.ts;
-            d.rtp_ssrc = rtp.ssrc;
-        }
-        match &meta.format {
-            None => {}
-            Some(MediaFormat::VideoRaw(v)) => {
-                d.fmt_tag = FMT_VIDEO_RAW;
-                d.fmt_a = v.width;
-                d.fmt_b = v.height;
-                d.fmt_c = v.pixel_format as u32;
-                d.fmt_d = v.framerate.num;
-                d.fmt_e = v.framerate.den;
-            }
-            Some(MediaFormat::Video(c)) => {
-                d.fmt_tag = FMT_VIDEO;
-                d.fmt_a = *c as u32;
-                // Coded geometry (#236) rides the same four words
-                // FMT_VIDEO_RAW already uses, so the descriptor does not
-                // grow. Zero means "the producer did not know" — a peer
-                // that predates this fills them with zeros and a reader
-                // that predates it never looks, so both directions
-                // degrade to `coded: None` rather than to garbage.
-                if let Some(cf) = &meta.coded {
-                    d.fmt_b = cf.width;
-                    d.fmt_c = cf.height;
-                    d.fmt_d = cf.framerate.num;
-                    d.fmt_e = cf.framerate.den;
-                }
-            }
-            Some(MediaFormat::AudioRaw(a)) => {
-                d.fmt_tag = FMT_AUDIO_RAW;
-                d.fmt_a = a.sample_rate;
-                d.fmt_b = a.channels as u32;
-                d.fmt_c = a.sample_format as u32;
-            }
-            Some(MediaFormat::Audio(c)) => {
-                d.fmt_tag = FMT_AUDIO;
-                d.fmt_a = *c as u32;
-            }
-            Some(MediaFormat::Rtp(r)) => {
-                d.fmt_tag = FMT_RTP;
-                d.fmt_a = r.payload_type as u32;
-                d.fmt_b = r.clock_rate;
-                let (tag, dynamic) = rtp_encoding_to_tag(r.encoding);
-                d.fmt_c = tag;
-                d.fmt_d = dynamic;
-            }
-            Some(MediaFormat::MpegTs) => d.fmt_tag = FMT_MPEG_TS,
-            Some(MediaFormat::Bytes) => d.fmt_tag = FMT_BYTES,
-        }
-        d
-    }
-
-    /// Mark that a `MetaOverflow` control message precedes this descriptor.
-    pub fn set_meta_overflow(&mut self) {
-        self.presence |= PRESENCE_META_OVERFLOW;
-    }
-
-    /// Whether the element layer must collect overflow metadata first.
-    pub fn has_meta_overflow(&self) -> bool {
-        self.presence & PRESENCE_META_OVERFLOW != 0
-    }
-
-    /// Decode back into a slot reference and metadata (custom map empty —
-    /// the element layer attaches overflow entries afterwards).
-    pub fn decode(&self) -> Result<(SharedIpcSlotRef, Metadata)> {
-        let slot = SharedIpcSlotRef {
-            arena_id: self.arena_id,
-            slot_index: self.slot_index,
-            data_offset: self.data_offset as usize,
-            len: self.len as usize,
-        };
-        // Field-by-field: `custom` is private, so no struct literal/FRU.
-        let mut meta = Metadata::new();
-        meta.pts = ClockTime::from_nanos(self.pts);
-        meta.dts = ClockTime::from_nanos(self.dts);
-        meta.duration = ClockTime::from_nanos(self.duration);
-        meta.sequence = self.sequence;
-        meta.stream_id = self.stream_id;
-        meta.flags = BufferFlags::from_bits(self.flags);
-        if self.presence & PRESENCE_OFFSET != 0 {
-            meta.offset = Some(self.byte_offset);
-        }
-        if self.presence & PRESENCE_RTP != 0 {
-            meta.rtp = Some(RtpMeta {
-                seq: self.rtp_seq,
-                ts: self.rtp_ts,
-                ssrc: self.rtp_ssrc,
-                pt: self.rtp_pt,
-                marker: self.rtp_marker != 0,
-            });
-        }
-        meta.format = match self.fmt_tag {
-            FMT_NONE => None,
-            FMT_VIDEO_RAW => Some(MediaFormat::VideoRaw(VideoFormat {
-                width: self.fmt_a,
-                height: self.fmt_b,
-                pixel_format: pixel_format_from(self.fmt_c)?,
-                framerate: Framerate::new(self.fmt_d, self.fmt_e),
-            })),
-            FMT_VIDEO => {
-                let codec = video_codec_from(self.fmt_a)?;
-                if self.fmt_b > 0 && self.fmt_c > 0 {
-                    meta.coded = Some(crate::format::CodedVideoFormat::new(
-                        codec,
-                        self.fmt_b,
-                        self.fmt_c,
-                        Framerate::new(self.fmt_d, self.fmt_e),
-                    ));
-                }
-                Some(MediaFormat::Video(codec))
-            }
-            FMT_AUDIO_RAW => Some(MediaFormat::AudioRaw(AudioFormat {
-                sample_rate: self.fmt_a,
-                channels: self.fmt_b as u16,
-                sample_format: sample_format_from(self.fmt_c)?,
-            })),
-            FMT_AUDIO => Some(MediaFormat::Audio(audio_codec_from(self.fmt_a)?)),
-            FMT_RTP => Some(MediaFormat::Rtp(RtpFormat {
-                payload_type: self.fmt_a as u8,
-                clock_rate: self.fmt_b,
-                encoding: rtp_encoding_from_tag(self.fmt_c, self.fmt_d)?,
-            })),
-            FMT_MPEG_TS => Some(MediaFormat::MpegTs),
-            FMT_BYTES => Some(MediaFormat::Bytes),
-            other => return Err(bad_wire(format!("format tag {other}"))),
-        };
-        Ok((slot, meta))
-    }
-}
+// The descriptor itself lives in `crate::wire::descriptor` (#219): it is a
+// fixed-size POD *projection* of the same schema the zenoh attachment
+// serializes, and keeping it here kept it drifting from that schema — `rtp`
+// carried by one wire and not the other, `planes` by neither,
+// `MediaFormat::Rtp` with a tag here and no mapping there. What stays here is
+// the ring that carries it.
+pub use crate::wire::descriptor::IpcDescriptor;
 
 // ============================================================================
 // Ring view + segment
@@ -893,6 +555,13 @@ impl IpcChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::ClockTime;
+    use crate::format::{
+        AudioCodec, AudioFormat, Framerate, MediaFormat, PixelFormat, RtpEncoding, RtpFormat,
+        SampleFormat, VideoCodec, VideoFormat,
+    };
+    use crate::memory::SharedIpcSlotRef;
+    use crate::metadata::{BufferFlags, Metadata, RtpMeta};
 
     /// Simulate the receiving process: dup all three fds and attach.
     fn attach(chan: &IpcChannel) -> IpcChannel {
@@ -1215,25 +884,39 @@ mod tests {
         }
     }
 
-    /// Changing any of these discriminants requires bumping
-    /// `IPC_RING_VERSION` — the descriptor encodes them raw.
+    /// The discriminant lock this test used to be is gone (#219): the
+    /// descriptor no longer encodes enum discriminants, it encodes
+    /// `wire::codes`, whose `every_code_is_pinned` test covers **both** wires
+    /// rather than this one. What is left worth pinning here is that the
+    /// descriptor really does go through that table.
     #[test]
-    fn descriptor_enum_discriminants_locked() {
-        assert_eq!(PixelFormat::I420 as u8, 0);
-        assert_eq!(PixelFormat::Gray16Le as u8, 14);
-        assert_eq!(VideoCodec::H264 as u8, 0);
-        assert_eq!(VideoCodec::Av1 as u8, 4);
-        assert_eq!(SampleFormat::S16 as u8, 0);
-        assert_eq!(SampleFormat::U8 as u8, 3);
-        assert_eq!(AudioCodec::Opus as u8, 0);
-        assert_eq!(AudioCodec::Eac3 as u8, 6);
-        assert_eq!(rtp_encoding_to_tag(RtpEncoding::Av1), (7, 0));
-        assert_eq!(rtp_encoding_to_tag(RtpEncoding::Dynamic(50)), (8, 50));
+    fn the_descriptor_encodes_through_the_shared_code_table() {
+        use crate::wire::codes;
+
+        let mut meta = Metadata::new();
+        meta.format = Some(MediaFormat::VideoRaw(VideoFormat {
+            width: 64,
+            height: 48,
+            pixel_format: PixelFormat::Gray16Le,
+            framerate: Framerate::new(25, 1),
+        }));
+        let slot = SharedIpcSlotRef {
+            arena_id: 1,
+            slot_index: 0,
+            data_offset: 0,
+            len: 0,
+        };
+        let d = IpcDescriptor::encode(0, &slot, &meta);
+        assert_eq!(
+            d.fmt_c,
+            codes::pixel_format_to_code(PixelFormat::Gray16Le) as u32
+        );
     }
 
     #[test]
     fn descriptor_and_segment_layout_locked() {
-        assert_eq!(std::mem::size_of::<IpcDescriptor>(), 128);
+        // 192 since #219 (was 128): the plane layout rides inline.
+        assert_eq!(std::mem::size_of::<IpcDescriptor>(), 192);
         assert_eq!(std::mem::align_of::<IpcDescriptor>(), 8);
         assert_eq!(std::mem::size_of::<SegmentHeader>(), 320);
         assert_eq!(std::mem::offset_of!(IpcDescriptor, arena_id), 0);
@@ -1241,10 +924,12 @@ mod tests {
         assert_eq!(std::mem::offset_of!(IpcDescriptor, len), 64);
         assert_eq!(std::mem::offset_of!(IpcDescriptor, flags), 80);
         assert_eq!(std::mem::offset_of!(IpcDescriptor, fmt_a), 96);
+        assert_eq!(std::mem::offset_of!(IpcDescriptor, plane_offset), 116);
+        assert_eq!(std::mem::offset_of!(IpcDescriptor, plane_stride), 132);
         assert_eq!(std::mem::offset_of!(SegmentHeader, data_head), 64);
         assert_eq!(std::mem::offset_of!(SegmentHeader, ack_tail), 256);
         let (total, desc_off, ack_off) = layout(64);
-        assert_eq!((total, desc_off, ack_off), (9024, 320, 8512));
+        assert_eq!((total, desc_off, ack_off), (13120, 320, 12608));
     }
 
     #[tokio::test]
