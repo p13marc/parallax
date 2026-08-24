@@ -192,6 +192,61 @@ tokio::select! {
 
 In hybrid mode the answer waits for `wait()`/`abort()` to join the RT threads, which never end on their own.
 
+### Stopping a live pipeline
+
+A camera or a network source never reaches end-of-stream on its own, so an
+application has to end the run itself. The whole mechanism is
+`PipelineHandle::stopper()`:
+
+```rust
+let handle = pipeline.start()?;
+let stopper = handle.stopper();          // outlives the handle
+
+tokio::spawn(async move {
+    tokio::signal::ctrl_c().await.ok();
+    stopper.stop();                      // graceful: ends as EndReason::Eos
+});
+
+handle.wait().await?;                    // consumes the handle
+```
+
+`stopper()` exists because `wait()` takes the handle **by value**: the caller
+who keeps the handle to control the pipeline cannot also use it to wait, and
+vice versa. A `Stopper` is a cheap clone of the shutdown flag that survives
+both.
+
+| | Ends as | What happens |
+|---|---|---|
+| `stop()` / `Stopper::stop()` | `EndReason::Eos` | Sources end their produce loop at the next iteration and broadcast EOS, so transforms flush and sinks commit exactly as at a natural end. |
+| `abort()` | `EndReason::Aborted` | Raises the same flag **first**, then aborts the tasks. Sinks' `finish()` hooks do not run — an aborted `Mp4FileSink` falls back to its `Drop`. |
+
+**The one caveat**, stated plainly: a source blocked *inside* a synchronous
+`produce()` observes the flag only when that call returns. The bound is one
+`produce()` — in practice one frame, or one device timeout. Nothing in the
+executor can do better without interrupting a call that may be mid-syscall.
+
+#### You do not need to wrap your sources
+
+An application does **not** need a `StoppableSource`-style wrapper around every
+source it builds. Three claims that used to justify one are all false today:
+
+- *Source loops run on blocking threads.* They do not — `spawn_source_task` is
+  a plain `tokio::spawn`. The only `spawn_blocking` in `src/pipeline/` joins RT
+  threads.
+- *The executor ignores downstream channel closure.* It does not — the source
+  loop breaks when every downstream branch is gone, logging
+  "downstream is gone after N buffers, stopping".
+- *`abort()` cannot stop a live source.* It can, since #191: it raises the
+  cooperative flag before aborting tasks, and the source loop checks it at the
+  top of every iteration.
+
+A wrapper is also a standing hazard: every method added to the `Source` trait
+becomes a fresh silent-swallow bug in it unless the wrapper is updated too.
+
+For a live graph, `ExecutorConfig::live_video()` is the matching preset — fully
+async, `channel_capacity = 4` so the link queue is a latency floor rather than
+a buffer, and shedding rather than failing when an arena runs dry.
+
 Executor configuration and the async/RT scheduling model are covered in [scheduling.md](scheduling.md).
 
 ## Bus & messages

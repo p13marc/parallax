@@ -265,6 +265,10 @@ impl<E: VideoEncoder> EncoderElement<E> {
         // Preserve input metadata and update PTS
         let mut metadata = input_metadata.clone();
         metadata.pts = crate::clock::ClockTime::from_nanos(pts as u64);
+        // Stamp what actually came out (#236) rather than propagating the
+        // input's `VideoRaw`. The codec comes from the wrapped encoder, the
+        // geometry from the frame we fed it.
+        self.stamp_coded_format(&mut metadata);
 
         Ok(Buffer::new(
             MemoryHandle::with_len(slot, data.len()),
@@ -278,13 +282,33 @@ impl<E: VideoEncoder> EncoderElement<E> {
         let mut slot = self.output.acquire(data.len(), "encoderelement")?;
         slot.data_mut()[..data.len()].copy_from_slice(&data);
 
-        let metadata =
+        let mut metadata =
             crate::metadata::Metadata::from_pts(crate::clock::ClockTime::from_nanos(pts as u64));
+        // The drain tail must describe itself the same way the steady state
+        // does (#236) — it used to emit `format: None`, so the last packets of
+        // every stream disagreed with the ones before them.
+        self.stamp_coded_format(&mut metadata);
 
         Ok(Buffer::new(
             MemoryHandle::with_len(slot, data.len()),
             metadata,
         ))
+    }
+
+    /// Stamp `format` (and coded geometry, when known) for what this encoder
+    /// produces. `self.format` is the *input* geometry latched in `process`,
+    /// which is also the coded geometry — the encoder does not rescale.
+    fn stamp_coded_format(&self, metadata: &mut crate::metadata::Metadata) {
+        let codec = self.encoder.codec();
+        match self.format {
+            Some(vf) if vf.width > 0 && vf.height > 0 => {
+                metadata.set_coded_video_dims(codec, vf.width, vf.height);
+            }
+            _ => {
+                metadata.format = Some(crate::format::MediaFormat::Video(codec));
+                metadata.planes = None;
+            }
+        }
     }
 }
 
@@ -455,6 +479,18 @@ impl<E: VideoEncoder + 'static> Transform for EncoderElement<E> {
         "EncoderElement"
     }
 
+    /// A keyframe request terminates here (#213).
+    ///
+    /// This wrapper owns a real encoder, so it can satisfy the request and
+    /// nothing upstream of it can. Other upstream events are left alone.
+    fn handle_upstream_event(&mut self, event: &crate::event::Event) -> crate::event::EventResult {
+        if let crate::event::Event::ForceKeyUnit(_) = event {
+            self.control.request_keyframe();
+            return crate::event::EventResult::handled();
+        }
+        crate::event::EventResult::NotHandled
+    }
+
     fn input_media_caps(&self) -> crate::format::ElementMediaCaps {
         use crate::format::{
             CapsValue, ElementMediaCaps, FormatMemoryCap, MemoryCaps, PixelFormat, VideoFormatCaps,
@@ -523,6 +559,10 @@ mod tests {
     }
 
     impl VideoEncoder for RecordingEncoder {
+        fn codec(&self) -> crate::format::VideoCodec {
+            crate::format::VideoCodec::H264
+        }
+
         type Packet = Vec<u8>;
         fn encode(&mut self, frame: VideoFrameRef<'_>) -> Result<Vec<Vec<u8>>> {
             let planes = (0..4)
@@ -706,6 +746,10 @@ mod tests {
 
         struct PackedOnly;
         impl VideoEncoder for PackedOnly {
+            fn codec(&self) -> crate::format::VideoCodec {
+                crate::format::VideoCodec::H264
+            }
+
             type Packet = Vec<u8>;
             fn encode(&mut self, _frame: VideoFrameRef<'_>) -> Result<Vec<Vec<u8>>> {
                 Ok(Vec::new())

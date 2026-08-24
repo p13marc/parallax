@@ -2595,6 +2595,82 @@ impl Pipeline {
         )
     }
 
+    /// Parse a pipeline description, awaiting constructors that need it.
+    ///
+    /// The superset of [`parse`](Self::parse). Elements whose construction
+    /// performs real I/O — `rtspsrc` (DESCRIBE/SETUP/PLAY), `zenohsrc` and
+    /// `zenohsink` (opening a session) — are only reachable this way; the sync
+    /// [`parse`](Self::parse) meets one and says so.
+    ///
+    /// ```rust,no_run
+    /// # async fn f() -> parallax::error::Result<()> {
+    /// use parallax::pipeline::Pipeline;
+    ///
+    /// let pipeline = Pipeline::parse_async(
+    ///     "zenohsrc key=cam/video/h264/high ! h264dec ! nullsink",
+    /// ).await?;
+    /// # Ok(()) }
+    /// ```
+    pub async fn parse_async(description: &str) -> Result<Self> {
+        Self::parse_with_factory_async(
+            description,
+            &crate::pipeline::factory::ElementFactory::new(),
+        )
+        .await
+    }
+
+    /// Parse a pipeline description with a custom factory, awaiting
+    /// constructors that need it.
+    pub async fn parse_with_factory_async(
+        description: &str,
+        factory: &crate::pipeline::factory::ElementFactory,
+    ) -> Result<Self> {
+        let parsed = crate::pipeline::parser::parse_pipeline(description)?;
+        let mut pipeline = Pipeline::new();
+        let mut prev_node: Option<NodeId> = None;
+
+        for (i, elem) in parsed.elements.iter().enumerate() {
+            let element = factory.create_async(elem).await?;
+            let node_id = pipeline.attach_parsed(elem, i, element);
+            if let Some(prev) = prev_node {
+                pipeline.link(prev, node_id)?;
+            }
+            prev_node = Some(node_id);
+        }
+
+        Ok(pipeline)
+    }
+
+    /// Name a freshly built element, add it, and record its factory info.
+    ///
+    /// Shared by the sync and async parse paths so the two cannot drift.
+    fn attach_parsed(
+        &mut self,
+        elem: &crate::pipeline::parser::ParsedElement,
+        index: usize,
+        element: Box<crate::element::DynAsyncElement<'static>>,
+    ) -> NodeId {
+        let name = elem
+            .properties
+            .iter()
+            .find(|(k, _)| k == "name")
+            .map(|(_, v)| v.as_string())
+            .unwrap_or_else(|| format!("{}_{}", elem.name, index));
+
+        let node_id = self.add_node(name, element);
+
+        let factory_props: Vec<_> = elem
+            .properties
+            .iter()
+            .filter(|(k, _)| k != "name")
+            .cloned()
+            .collect();
+        if let Some(node) = self.get_node_mut(node_id) {
+            node.set_factory_info(elem.name.clone(), factory_props);
+        }
+        node_id
+    }
+
     /// Parse a pipeline description string using a custom factory.
     pub fn parse_with_factory(
         description: &str,
@@ -2607,34 +2683,10 @@ impl Pipeline {
 
         for (i, elem) in parsed.elements.iter().enumerate() {
             let element = factory.create(elem)?;
-
-            // Use the "name" property if provided, otherwise generate a name
-            let name = elem
-                .properties
-                .iter()
-                .find(|(k, _)| k == "name")
-                .map(|(_, v)| v.as_string())
-                .unwrap_or_else(|| format!("{}_{}", elem.name, i));
-
-            let node_id = pipeline.add_node(name, element);
-
-            // Store factory info for process isolation (element recreation in child)
-            // Filter out the "name" property since it's used for naming, not construction
-            let factory_props: Vec<_> = elem
-                .properties
-                .iter()
-                .filter(|(k, _)| k != "name")
-                .cloned()
-                .collect();
-            if let Some(node) = pipeline.get_node_mut(node_id) {
-                node.set_factory_info(elem.name.clone(), factory_props);
-            }
-
-            // Link to previous element
+            let node_id = pipeline.attach_parsed(elem, i, element);
             if let Some(prev) = prev_node {
                 pipeline.link(prev, node_id)?;
             }
-
             prev_node = Some(node_id);
         }
 

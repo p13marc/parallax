@@ -683,6 +683,44 @@ async fn a_fed_demuxer_is_flushed_and_sees_the_translated_segment() {
 
 /// An async sink that stages one `Event::Qos` after consuming a set number
 /// of buffers — the element-side origination API in miniature.
+/// A sink that asks upstream for a decoder entry point once.
+struct KeyframeRequestingSink {
+    consumed: u64,
+    staged: Option<Event>,
+    asked: bool,
+}
+
+impl KeyframeRequestingSink {
+    fn new() -> Self {
+        Self {
+            consumed: 0,
+            staged: None,
+            asked: false,
+        }
+    }
+}
+
+impl parallax::element::AsyncSink for KeyframeRequestingSink {
+    async fn consume(&mut self, _ctx: &parallax::element::ConsumeContext<'_>) -> Result<()> {
+        self.consumed += 1;
+        if !self.asked && self.consumed >= 2 {
+            self.asked = true;
+            self.staged = Some(Event::ForceKeyUnit(
+                parallax::event::ForceKeyUnitEvent::new(1),
+            ));
+        }
+        Ok(())
+    }
+
+    fn take_upstream_event(&mut self) -> Option<Event> {
+        self.staged.take()
+    }
+
+    fn name(&self) -> &str {
+        "keyframe_sink"
+    }
+}
+
 struct QosReportingSink {
     consumed: u64,
     report_after: u64,
@@ -725,6 +763,60 @@ impl parallax::element::AsyncSink for QosReportingSink {
     fn name(&self) -> &str {
         "qos_sink"
     }
+}
+
+/// #213: the third upstream family rides the same hop-by-hop path as Seek and
+/// Qos, so it needed no new transport. This is the proof.
+#[tokio::test(flavor = "multi_thread")]
+async fn force_key_unit_travels_from_sink_toward_the_source() {
+    // #213: the third upstream family rides the same hop-by-hop path as Seek
+    // and Qos, so it needed no new transport. This is the proof.
+    use parallax::elements::{AppSrc, PassThrough};
+
+    let mut pipeline = Pipeline::new();
+    let appsrc = AppSrc::with_max_buffers(32);
+    let src_handle = appsrc.handle();
+    let src = pipeline.add_source("src", appsrc);
+    let xfm = pipeline.add_filter("mid", PassThrough::new());
+    let snk = pipeline.add_async_sink("keyframe_sink", KeyframeRequestingSink::new());
+    pipeline.link(src, xfm).unwrap();
+    pipeline.link(xfm, snk).unwrap();
+
+    // An EVENT_UP probe on the source's src pad is the last hop of the route:
+    // if the event reaches here, it crossed the transform too.
+    let seen: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_probe = seen.clone();
+    let _ = pipeline.add_probe(PadRef::src(src), ProbeType::EVENT_UP, move |data| {
+        if let ProbeData::Event(Event::ForceKeyUnit(e)) = data {
+            seen_probe.lock().unwrap().push(e.count);
+        }
+        ProbeReturn::Ok
+    });
+
+    let executor = Executor::new();
+    let _handle = executor.start(&mut pipeline).unwrap();
+
+    for seq in 0..6u64 {
+        let slot = arena().acquire().expect("arena");
+        src_handle
+            .push_buffer(Buffer::new(
+                MemoryHandle::with_len(slot, 8),
+                Metadata::from_sequence(seq),
+            ))
+            .await
+            .unwrap();
+    }
+
+    wait_until(
+        || !seen.lock().unwrap().is_empty(),
+        "the keyframe request at the source pad",
+    )
+    .await;
+    assert_eq!(
+        seen.lock().unwrap().as_slice(),
+        &[1],
+        "the request must arrive once, with its counter intact"
+    );
 }
 
 /// #184: a sink-originated QoS event reaches the source's pad (hop-by-hop

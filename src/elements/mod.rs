@@ -109,8 +109,9 @@ pub use network::{WebSocketSink, WebSocketSrc, WebSocketStats, WsMessageType};
 
 #[cfg(feature = "zenoh")]
 pub use network::{
-    ZenohCongestionControl, ZenohPriority, ZenohQuerier, ZenohQuery, ZenohQueryable, ZenohSink,
-    ZenohSrc, ZenohStats,
+    PublisherLoss, WireProfile, ZenohCongestionControl, ZenohDemandEvent, ZenohPriority,
+    ZenohQuerier, ZenohQuery, ZenohQueryable, ZenohSink, ZenohSinkHandle, ZenohSrc, ZenohSrcHandle,
+    ZenohStats,
 };
 
 // RTP/RTCP/RTSP
@@ -135,8 +136,9 @@ pub use rtp::{
 
 #[cfg(feature = "rtsp")]
 pub use rtp::{
-    MediaType, RtspConfig, RtspCredentials, RtspFrame, RtspFrameFormat, RtspSession, RtspSrc,
-    RtspStats, RtspStreamInfoHandle, RtspTransport, StreamInfo, StreamSelection,
+    MediaType, RtspConfig, RtspCredentials, RtspFrame, RtspFrameFormat, RtspReconnect,
+    RtspSenderReport, RtspSession, RtspSrc, RtspStats, RtspStreamInfoHandle, RtspTransport,
+    RtspUnknownRtcpSsrc, StreamInfo, StreamSelection,
 };
 
 // Runtime control.

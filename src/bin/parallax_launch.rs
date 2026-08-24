@@ -40,7 +40,11 @@ struct Args {
     #[arg(long)]
     list_elements: bool,
 
-    /// Print the parsed pipeline as Graphviz DOT and exit without running
+    /// Print the parsed pipeline as Graphviz DOT and exit without running.
+    ///
+    /// Construction still happens, so elements that connect at construction
+    /// time (tcpsrc, httpsrc, v4l2src, rtspsrc, zenohsrc/sink) will do their
+    /// I/O — the graph is built, just not started.
     #[arg(long)]
     dot: bool,
 
@@ -86,7 +90,9 @@ async fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let mut pipeline = match Pipeline::parse(&description) {
+    // parse_async, not parse: `rtspsrc`, `zenohsrc` and `zenohsink` build by
+    // awaiting real I/O. Sync elements take the same path they always did.
+    let mut pipeline = match Pipeline::parse_async(&description).await {
         Ok(p) => p,
         Err(e) => {
             eprintln!("error: {e}");

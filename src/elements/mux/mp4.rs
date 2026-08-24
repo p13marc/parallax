@@ -708,7 +708,18 @@ impl Mp4FileSink {
     }
 
     /// Finalize and close the MP4 file.
+    ///
+    /// In a pipeline this happens by itself: the executor calls
+    /// [`Sink::finish`](crate::element::Sink::finish) at EOS. This
+    /// `self`-consuming form is for the standalone muxer.
     pub fn finish(mut self) -> Result<()> {
+        self.finalize()
+    }
+
+    /// The finalization both the trait hook and [`finish`](Self::finish)
+    /// share. Idempotent — the muxer is taken, so a second call does nothing,
+    /// which is what lets `Drop` stay a backstop for an aborted pipeline.
+    fn finalize(&mut self) -> Result<()> {
         if let Some(muxer) = self.muxer.take() {
             muxer.finish()?;
             tracing::info!(
@@ -803,8 +814,22 @@ impl Sink for Mp4FileSink {
 
         Ok(())
     }
+
+    /// Write the `moov` atom (#221).
+    ///
+    /// A fragmented-out MP4 is unplayable, so this runs whatever the reason —
+    /// an error mid-stream still leaves a file describing what was written.
+    fn finish(&mut self, _reason: crate::pipeline::EndReason) -> Result<()> {
+        self.finalize()
+    }
 }
 
+/// Last-resort finalization.
+///
+/// #221 moved the real one into [`Sink::finish`], where a failure reaches the
+/// bus instead of a log line. This stays because `abort()` kills the task
+/// outright — no hook runs — and an MP4 whose `moov` was never written is not
+/// a file at all.
 impl Drop for Mp4FileSink {
     fn drop(&mut self) {
         if let Some(muxer) = self.muxer.take()

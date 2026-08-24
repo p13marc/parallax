@@ -77,9 +77,19 @@ Feature-gated:
 | `rtpsink` | `rtp` | `address` (req, dest), `payload-type`, `ssrc`, `clock-rate` |
 | `rtpjitterbuffer` | `rtp` | `latency-ms`, `max-packets`, `clock-rate`, `drop-late` (bool) |
 | `rtp{h264,h265,vp8,vp9,opus,av1}pay` | `rtp` | `mtu` |
-| `rtp{h264,h265,vp8,vp9,opus}depay` | `rtp` | — |
+| `rtp{h264,h265,vp8,vp9,opus}depay` | `rtp` | `donl` (bool, `rtph265depay` only — the sender's `sprop-max-don-diff > 0`) |
 
-Not registered (use the programmatic API): mux/demux elements (the linear grammar cannot name pads), zenoh (async constructors), `rtspsrc`, closure-taking transforms, `AppSrc`/`AppSink`, v4l2-m2m and Vulkan hardware codecs.
+`rtspsrc`, `zenohsrc` and `zenohsink` build by **awaiting** real I/O, so they need `Pipeline::parse_async` (which is what `parallax-launch` uses); the synchronous `Pipeline::parse` meets one and says so rather than pretending the feature is missing.
+
+| Factory name | Feature | Properties |
+|---|---|---|
+| `rtspsrc` | `rtsp` | `location` (req), `transport` = tcp\|udp, `timeout-ms`, `video-only`, `audio-only`, `skip-until-keyframe`, `reconnect` (bool, **default true**), `reconnect-max-retries`, `reconnect-initial-backoff-ms`, `reconnect-max-backoff-ms` |
+| `zenohsrc` | `zenoh` | `key` (req), `profile` = parallax\|media, `resync-on-discont`, `timeout-ms` (heartbeat, keeps the stream open), `stream-timeout-ms` (ends it), `on-publisher-loss` = wait\|eos |
+| `zenohsink` | `zenoh` | `key` (req), `profile` = parallax\|media, `congestion` = block\|drop, `priority`, `express` |
+
+`profile=media` selects the `@media` plane: the codec comes from the key expression (so caps are known before the first sample), the attachment is a CBOR `FrameMeta`, the QoS profile is fixed, and wildcards are refused. Both zenoh elements share one process-wide session, opened on first use and configurable with `PARALLAX_ZENOH_CONFIG`.
+
+Not registered (use the programmatic API): mux/demux elements (the linear grammar cannot name pads), closure-taking transforms, `AppSrc`/`AppSink`, v4l2-m2m and Vulkan hardware codecs.
 
 Network and device constructors do their I/O (connect/bind/open) at parse time, so a bad address fails the parse rather than the run.
 
@@ -171,7 +181,7 @@ anything, so `Aborted` comes from the handle alone.
 | `HttpCacheSrc` `[http]` | `HttpSrc` + a sparse on-disk cache (#188): everything downloaded is written through at true stream offsets, and a seek into an already-downloaded span is served **from disk** — no reconnect, no re-download (works even when the server refused ranges). Forward/hole seeks reconnect lazily at the target. Cache is an unlinked temp file by default; `with_cache_file` names a path. Progress: `Queue2RangesHandle` via `control()` + throttled `DownloadProgress` |
 | `HttpSink` `[http]` | HTTP POST/PUT sink (async sink — one blocking ureq request per buffer on the blocking pool, bounded by `with_timeout`, 30 s default) |
 | `WebSocketSrc` / `WebSocketSink` `[websocket]` | WebSocket message I/O. The sink is an async sink: connect/send run on the blocking pool, so a stalled peer pends the element, not a runtime worker |
-| `ZenohSrc` / `ZenohSink` `[zenoh]` | Zenoh subscribe/publish on key expressions |
+| `ZenohSrc` / `ZenohSink` `[zenoh]` | Zenoh subscribe/publish on key expressions. Two `WireProfile`s — `Parallax` (rkyv `WireMetadata`) and `Media` (the `@media` plane: CBOR `FrameMeta`, exact keys, `frame` QoS, byte-level keyframe promise); see `docs/zenoh-wire.md`. `ZenohSrc::control()` → `ZenohSrcHandle` (three distinct drop counters, `publisher_losses()`, `end_stream()`), `ZenohSink::control()` → `ZenohSinkHandle` (demand signal, publish counters, `request_keyframe()`). End of stream crosses the wire (#224): a terminal sample on the parallax plane, a liveliness token on both — `on_publisher_loss` is `Wait` by default. Publishing copies nothing (#226) |
 | `ZenohQueryable` / `ZenohQuerier` `[zenoh]` | Zenoh query handling / querying |
 
 ## RTP / RTCP / RTSP — `elements::rtp` `[rtp]`

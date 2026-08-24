@@ -450,7 +450,14 @@ impl Sink for RtpSink {
         let metadata = ctx.metadata();
         let payload = ctx.input();
 
-        // Use RTP metadata if present, otherwise generate
+        // Prefer the packetizer's own header fields (#218). Only it knows
+        // which packet is the last of an access unit and which timestamp the
+        // whole unit shares; `ssrc` and `pt` stay this sink's, because they
+        // are transport identity rather than packetization. The fallback below
+        // is for a buffer that was never packetized here — it invents one
+        // sequence number per *buffer* and reads the marker from
+        // `is_keyframe()`, which is a different question and wrong for
+        // anything fragmented.
         let (seq, ts, marker) = if let Some(rtp) = &metadata.rtp {
             (rtp.seq, rtp.ts, rtp.marker)
         } else {

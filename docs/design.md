@@ -102,22 +102,54 @@ Pipeline::parse("v4l2src ! ipc_sink path=/run/parallax/camera")?;
 // Binary B:
 Pipeline::parse("ipc_src path=/run/parallax/camera ! ... ")?;
 
-// Cross-machine (Zenoh: discovery, routing, optional shm transport)
+// Cross-machine (Zenoh: discovery, routing)
 // Machine A:
-Pipeline::parse("camera-element ! zenoh_pub key=factory/camera/1")?;
+Pipeline::parse_async("camera-element ! zenohsink key=factory/camera/1").await?;
 // Machine B:
-Pipeline::parse("zenoh_sub key=factory/camera/1 ! display-element")?;
+Pipeline::parse_async("zenohsrc key=factory/camera/1 ! display-element").await?;
 ```
 
-(Note: `ipc_src`/`zenoh_pub`-style names above are illustrative — today these elements are constructed programmatically; only a small built-in set is registered for string parsing. Registering the full library with the factory is planned.)
+(Note: `ipc_src` above is illustrative — that pair is still constructed
+programmatically. `zenohsrc`/`zenohsink` are registered, and need
+`parse_async` because their constructors await real I/O.)
 
 | Boundary | Bridge | Copy cost |
 |----------|--------|-----------|
 | In-process | the executor's per-edge `tokio::sync::mpsc` channel | zero (move) |
 | Cross-process | `IpcSrc`/`IpcSink` | zero (shared pages; ~bytes of metadata per buffer) |
-| Cross-machine | `ZenohSrc`/`ZenohSink`, TCP links | serialize (rkyv) |
+| Cross-machine | `ZenohSrc`/`ZenohSink`, TCP links | one copy in each direction (the payload never leaves the arena on the way out) |
 
 The in-process row's "zero (move)" is principle 8 in action: the channel carries a handle, the arena carries the pixels.
+
+The cross-machine row is as cheap as a network hop can be (#226). Publishing
+hands zenoh the arena's own bytes — `bytes::Bytes::from_owner` over a cloned
+`Buffer`, which pins the slot for exactly as long as the transport holds it —
+so a frame reaches the socket with **no** payload copy. Receiving copies once,
+walking `ZBytes::slices()` straight into an arena slot, the same as every other
+source. The knock-on effect is that in-flight publishes pin producer slots, so
+`ZenohSink` declares them through `retained_buffers()`; on the parallax plane
+that converts what used to be unbounded heap growth under
+`CongestionControl::Block` into visible backpressure. The `@media` plane is
+`Drop` by contract and does not block.
+
+### Why zenoh's `shared-memory` feature is deliberately not wired
+
+parallax **already is** a shared-memory transport: memfd arenas, refcounts
+inside the shared pages, fds over `SCM_RIGHTS`, a descriptor ring with eventfd
+doorbells. zenoh's SHM has its own allocator (`ShmProvider`/`ZShmMut`), so
+adopting it means either copying arena → zenoh-SHM (which defeats the point) or
+putting a third-party allocator underneath `SharedArena`, `ReleaseQueue`,
+`OutputBudget`, `slot_from_ipc` and the dmabuf/`External` `MemoryHandle`
+variants. That is a core rewrite to solve a problem `IpcSrc`/`IpcSink` already
+solves **better**, because the IPC path also carries dmabuf and codec-owned
+memory, which a CPU-only SHM transport cannot.
+
+It would also do nothing for the case it is being considered for: zenoh SHM
+helps same-host peers only and falls back to copying otherwise, and the reason
+to reach for zenoh at all is two machines.
+
+**`IpcSrc`/`IpcSink` is the same-machine answer; zenoh is the cross-machine
+transport.**
 
 ## Competitive Landscape (as of mid-2026)
 

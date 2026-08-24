@@ -99,7 +99,8 @@ async fn metadata_roundtrip_with_encoding() {
     let mut sink = ZenohSink::with_session(session.clone(), key.clone())
         .await
         .unwrap()
-        .with_forward_custom_keys(&["stanag/klv"]);
+        .with_forward_custom_keys(&["stanag/klv"])
+        .expect("parallax profile forwards custom keys");
 
     let mut metadata = Metadata::new();
     metadata.pts = ClockTime::from_millis(1234);
@@ -265,7 +266,8 @@ async fn without_metadata_mode_omits_attachment() {
     let mut sink = ZenohSink::with_session(session.clone(), key.clone())
         .await
         .unwrap()
-        .without_metadata();
+        .without_metadata()
+        .expect("parallax profile may omit the attachment");
 
     let buffer = payload_buffer(b"raw-only", Metadata::from_sequence(3));
     sink.consume(&ConsumeContext::new(&buffer)).await.unwrap();

@@ -482,6 +482,9 @@ pub use crate::pipeline::flow::FlowStateHandle;
 #[cfg(feature = "image-jpeg")]
 pub use crate::elements::codec::JpegQualityControl;
 
+#[cfg(feature = "zenoh")]
+pub use crate::elements::network::{ZenohDemandEvent, ZenohSinkHandle, ZenohSrcHandle};
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -73,8 +73,9 @@ use crate::buffer::{Buffer, MemoryHandle};
 use crate::clock::ClockTime;
 use crate::element::ProduceResult;
 use crate::error::{Error, Result};
+use crate::format::{AudioCodec, MediaFormat, VideoCodec};
 use crate::memory::{OutputArena, OutputBudget, defaults};
-use crate::metadata::{BufferFlags, Metadata, RtpMeta};
+use crate::metadata::{BufferFlags, Metadata};
 
 use futures::StreamExt;
 use retina::client::{Demuxed, Session, SessionOptions, SetupOptions};
@@ -90,7 +91,7 @@ use url::Url;
 // ============================================================================
 
 /// RTSP transport mode.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RtspTransport {
     /// TCP interleaved (RTP over RTSP connection).
     /// Most reliable, works through firewalls/NAT.
@@ -171,6 +172,68 @@ pub enum StreamSelection {
     Indices(Vec<usize>),
 }
 
+/// Reconnection policy for a live RTSP source (#206).
+///
+/// Without one, a transient TCP reset — a switch reboot, a camera's nightly
+/// restart, a Wi-Fi hiccup — is an `Err` from the source, and every `Err` that
+/// is not `PoolExhausted` or `Shutdown` ends the whole run (gotcha 13). A
+/// 24/7 camera feed cannot die that way, so this is **on by default**; a batch
+/// consumer that wants the failure reported turns it off with
+/// [`RtspSrc::without_reconnect`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RtspReconnect {
+    /// How many times to retry before giving up. `None` = forever, which is
+    /// what a live source wants: the camera will come back.
+    pub max_retries: Option<u32>,
+    /// The first delay. Doubles per attempt.
+    pub initial_backoff: Duration,
+    /// The ceiling the doubling stops at.
+    pub max_backoff: Duration,
+}
+
+impl Default for RtspReconnect {
+    fn default() -> Self {
+        Self {
+            max_retries: None,
+            initial_backoff: Duration::from_millis(500),
+            max_backoff: Duration::from_secs(30),
+        }
+    }
+}
+
+impl RtspReconnect {
+    /// The delay before attempt `attempt` (0-based), with **full jitter**.
+    ///
+    /// Full jitter — a uniform draw from `[0, capped)` rather than the capped
+    /// value itself — because a rack of cameras behind one switch all lose
+    /// their connection at the same instant. Exponential backoff alone keeps
+    /// them synchronised and they retry in a thundering herd, forever; jitter
+    /// is what spreads them out.
+    ///
+    /// The randomness comes from the clock's nanosecond field rather than a
+    /// `rand` dependency: this picks a sleep duration, not a key.
+    fn delay(&self, attempt: u32) -> Duration {
+        let capped = self
+            .initial_backoff
+            .saturating_mul(1u32.checked_shl(attempt.min(31)).unwrap_or(u32::MAX))
+            .min(self.max_backoff);
+        let nanos = capped.as_nanos() as u64;
+        if nanos == 0 {
+            return Duration::ZERO;
+        }
+        let entropy = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64)
+            .unwrap_or(0);
+        Duration::from_nanos(entropy % nanos)
+    }
+
+    /// Whether another attempt is allowed after `attempts` failures.
+    fn may_retry(&self, attempts: u32) -> bool {
+        self.max_retries.is_none_or(|max| attempts < max)
+    }
+}
+
 /// Configuration for RtspSrc.
 #[derive(Debug, Clone)]
 pub struct RtspConfig {
@@ -199,6 +262,11 @@ pub struct RtspConfig {
     /// garbage or an error. Defaults to `true` — every correct consumer wants
     /// it, and every one of them was writing the same skip loop by hand.
     pub skip_until_keyframe: bool,
+    /// Reconnect on a dropped stream (#206). `Some` by default — see
+    /// [`RtspReconnect`].
+    pub reconnect: Option<RtspReconnect>,
+    /// What to do with RTCP from an unexpected SSRC (#207).
+    pub unknown_rtcp_ssrc: RtspUnknownRtcpSsrc,
 }
 
 impl Default for RtspConfig {
@@ -214,6 +282,8 @@ impl Default for RtspConfig {
             connect_timeout: Duration::from_secs(10),
             max_timestamp_jump_secs: 10,
             skip_until_keyframe: true,
+            reconnect: Some(RtspReconnect::default()),
+            unknown_rtcp_ssrc: RtspUnknownRtcpSsrc::default(),
         }
     }
 }
@@ -221,6 +291,106 @@ impl Default for RtspConfig {
 // ============================================================================
 // Stream Information
 // ============================================================================
+
+/// What to do with RTCP whose SSRC is not the one the RTP stream uses (#207).
+///
+/// This matters because of what it silently costs: retina's default **drops**
+/// such packets, and a camera that sends RTCP from a different SSRC than its
+/// RTP therefore has its Sender Reports thrown away — so the wallclock anchor
+/// never arrives and nothing says why. It is a real behaviour in the field,
+/// which is why the knob exists at all.
+///
+/// The default here is retina's, because processing a stranger's report would
+/// anchor this stream to someone else's clock. Reach for `Process` when you
+/// know the camera and know it is the same sender.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RtspUnknownRtcpSsrc {
+    /// Drop the packet (default).
+    #[default]
+    Drop,
+    /// Treat it as if it carried the expected SSRC.
+    Process,
+    /// End the session.
+    AbortSession,
+}
+
+impl From<RtspUnknownRtcpSsrc> for retina::client::UnknownRtcpSsrcPolicy {
+    fn from(policy: RtspUnknownRtcpSsrc) -> Self {
+        match policy {
+            RtspUnknownRtcpSsrc::Drop => Self::DropPackets,
+            RtspUnknownRtcpSsrc::Process => Self::ProcessPackets,
+            RtspUnknownRtcpSsrc::AbortSession => Self::AbortSession,
+        }
+    }
+}
+
+/// The most recent RTCP Sender Report for a stream (#207).
+///
+/// An RTP timestamp is a counter at the media clock rate with an **arbitrary
+/// origin** — whatever the camera's counter happened to be at PLAY. The SR is
+/// the only thing that ties it to a wallclock, and without one:
+///
+/// - two machines cannot agree on when a frame was captured, so end-to-end
+///   latency across a multi-machine topology cannot be measured honestly;
+/// - there is no lip-sync anchor when audio joins;
+/// - a WHEP sink downstream has nothing truthful to put in its own SR.
+///
+/// Many cheap cameras never send one. That is handled, not assumed: without an
+/// SR the PTS mapping stays relative to the RTP origin, as it always was, and
+/// says so once at `debug!`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RtspSenderReport {
+    /// The report's NTP wallclock, converted to nanoseconds since the Unix
+    /// epoch.
+    ///
+    /// NTP counts from 1900 in 32.32 fixed point; this is the same instant in
+    /// the representation the rest of parallax speaks.
+    pub ntp_unix_nanos: u64,
+    /// The RTP timestamp that `ntp_unix_nanos` names. The pair is the anchor.
+    pub rtp_timestamp: u32,
+    /// When this host received the report. Not part of the anchor — kept so a
+    /// consumer can judge how stale it is, and so a report from a camera whose
+    /// clock has jumped can be recognised.
+    pub received_at: std::time::Instant,
+}
+
+/// NTP epoch (1900-01-01) to Unix epoch (1970-01-01), in seconds.
+const NTP_TO_UNIX_SECS: u64 = 2_208_988_800;
+
+impl RtspSenderReport {
+    /// Build from retina's 64-bit NTP field.
+    ///
+    /// A camera whose clock predates 1970 — an unset RTC reporting the NTP
+    /// epoch itself — would produce a negative Unix time. That is not a
+    /// wallclock worth anchoring to, so it is refused rather than saturated:
+    /// a wrong anchor is worse than none, because the fallback is at least
+    /// honest about being relative.
+    fn from_ntp(ntp: u64, rtp_timestamp: u32) -> Option<Self> {
+        let secs = (ntp >> 32).checked_sub(NTP_TO_UNIX_SECS)?;
+        let frac_nanos = ((ntp & 0xFFFF_FFFF) * 1_000_000_000) >> 32;
+        Some(Self {
+            ntp_unix_nanos: secs.checked_mul(1_000_000_000)?.checked_add(frac_nanos)?,
+            rtp_timestamp,
+            received_at: std::time::Instant::now(),
+        })
+    }
+
+    /// Map an RTP timestamp to nanoseconds since the Unix epoch.
+    ///
+    /// The RTP delta is computed as a **wrapping i32**: the timestamp is a
+    /// 32-bit counter and a stream running long enough will wrap, at which
+    /// point an unsigned subtraction would report roughly 13 hours of jump at
+    /// 90 kHz.
+    pub fn to_unix_nanos(&self, rtp_timestamp: u32, clock_rate: u32) -> Option<u64> {
+        if clock_rate == 0 {
+            return None;
+        }
+        let delta = rtp_timestamp.wrapping_sub(self.rtp_timestamp) as i32 as i64;
+        let delta_nanos = (delta as i128 * 1_000_000_000) / clock_rate as i128;
+        let anchored = self.ntp_unix_nanos as i128 + delta_nanos;
+        u64::try_from(anchored).ok()
+    }
+}
 
 /// Information about an RTSP stream.
 #[derive(Debug, Clone)]
@@ -248,6 +418,11 @@ pub struct StreamInfo {
     /// start codes under [`RtspFrameFormat::AnnexB`], a decoder configuration
     /// record under [`RtspFrameFormat::LengthPrefixed`].
     pub codec_data: Option<Vec<u8>>,
+    /// The most recent RTCP Sender Report, once one has arrived (#207).
+    ///
+    /// `None` until then, and on a camera that never sends one it stays
+    /// `None` forever — a supported configuration, not a fault.
+    pub sender_report: Option<RtspSenderReport>,
 }
 
 /// Observe an [`RtspSession`]'s stream metadata while the session is running.
@@ -315,6 +490,29 @@ impl RtspStreamInfoHandle {
                 }
             }
             // Err means every sender is gone, i.e. the session ended.
+            rx.changed().await.ok()?;
+        }
+    }
+
+    /// Wait until stream `index` has an RTCP Sender Report (#207).
+    ///
+    /// The same shape as [`wait_for_dimensions`](Self::wait_for_dimensions),
+    /// for the same reason: a consumer that needs a wallclock anchor should be
+    /// able to wait for one rather than poll.
+    ///
+    /// **It can wait forever, legitimately.** Many cheap cameras never send an
+    /// SR. Wrap it in a timeout and fall back to relative timing — which is
+    /// what the session itself does.
+    pub async fn wait_for_sender_report(&self, index: usize) -> Option<RtspSenderReport> {
+        let mut rx = self.rx.clone();
+        loop {
+            {
+                let streams = rx.borrow_and_update();
+                let stream = streams.get(index)?;
+                if let Some(sr) = stream.sender_report {
+                    return Some(sr);
+                }
+            }
             rx.changed().await.ok()?;
         }
     }
@@ -395,8 +593,13 @@ pub struct RtspStats {
     /// ending the session. A non-zero count here means the consumer cannot keep
     /// up with the camera.
     pub frames_dropped: u64,
-    /// Connection start time.
+    /// Connection start time. Re-stamped on every reconnect.
     pub connected_at: Option<std::time::Instant>,
+    /// How many times the session has been rebuilt (#206).
+    ///
+    /// A steadily rising count on a stable network is the signal that
+    /// something upstream is wrong — a camera rebooting, a saturated link.
+    pub reconnects: u32,
 }
 
 // ============================================================================
@@ -492,6 +695,32 @@ impl RtspSrc {
         self
     }
 
+    /// Set the reconnection policy (#206).
+    ///
+    /// On by default; see [`RtspReconnect`].
+    pub fn with_reconnect(mut self, reconnect: RtspReconnect) -> Self {
+        self.config.reconnect = Some(reconnect);
+        self
+    }
+
+    /// What to do with RTCP from an unexpected SSRC (#207).
+    ///
+    /// The default drops it, which also drops the Sender Reports a camera
+    /// sends from a second SSRC — and with them the wallclock anchor.
+    pub fn with_unknown_rtcp_ssrc(mut self, policy: RtspUnknownRtcpSsrc) -> Self {
+        self.config.unknown_rtcp_ssrc = policy;
+        self
+    }
+
+    /// Fail the pipeline on a dropped stream instead of reconnecting (#206).
+    ///
+    /// The right choice for batch work, where a truncated recording that looks
+    /// successful is the worse outcome. Wrong for a camera.
+    pub fn without_reconnect(mut self) -> Self {
+        self.config.reconnect = None;
+        self
+    }
+
     /// Get the configuration.
     pub fn config(&self) -> &RtspConfig {
         &self.config
@@ -520,6 +749,36 @@ fn split_url_credentials(url_str: &str) -> Result<(Url, Option<RtspCredentials>)
         let _ = url.set_password(None);
     }
     Ok((url, credentials))
+}
+/// Map an SDP rtpmap encoding name to a [`VideoCodec`] (#205).
+///
+/// `StreamInfo::codec` is retina's `encoding_name()` lowercased, i.e. the SDP
+/// spelling rather than an enum. Unknown names return `None`: a stream we
+/// cannot name is better left undeclared than mislabelled.
+fn video_codec_for(name: &str) -> Option<VideoCodec> {
+    Some(match name {
+        "h264" => VideoCodec::H264,
+        "h265" | "hevc" => VideoCodec::H265,
+        "vp8" => VideoCodec::Vp8,
+        "vp9" => VideoCodec::Vp9,
+        "av1" | "av1x" => VideoCodec::Av1,
+        "jpeg" => VideoCodec::Mjpeg,
+        _ => return None,
+    })
+}
+
+/// Map an SDP rtpmap encoding name to an [`AudioCodec`] (#205).
+fn audio_codec_for(name: &str) -> Option<AudioCodec> {
+    Some(match name {
+        // RFC 3640 / RFC 6416 name AAC this way; retina lowercases it.
+        "mpeg4-generic" | "aac" => AudioCodec::Aac,
+        "opus" => AudioCodec::Opus,
+        "pcmu" => AudioCodec::Pcmu,
+        "pcma" => AudioCodec::Pcma,
+        "mpa" | "mp3" => AudioCodec::Mp3,
+        "vorbis" => AudioCodec::Vorbis,
+        _ => return None,
+    })
 }
 
 /// Parse `a=framesize:<pt> <width>-<height>` attributes from a raw SDP.
@@ -584,6 +843,14 @@ pub struct RtspSession {
     skip_until_keyframe: bool,
     /// Whether the first keyframe has been seen.
     saw_keyframe: bool,
+    /// Kept so the session can rebuild itself (#206).
+    config: RtspConfig,
+    /// Set after a reconnect; stamps `DISCONT` on the first resumed buffer.
+    pending_discont: bool,
+    /// Reconnects so far, for [`RtspStats`] and the bus warning.
+    reconnects: u32,
+    /// Whether the "no sender report" fallback has been logged (#207).
+    warned_no_sender_report: bool,
 }
 
 impl RtspSession {
@@ -593,7 +860,9 @@ impl RtspSession {
         // `rtsp://user:pass@host/...` into RtspCredentials (explicit
         // `with_credentials` wins if both are present).
         let (url, url_credentials) = split_url_credentials(&config.url)?;
-        let credentials = config.credentials.or(url_credentials);
+        // Cloned rather than moved: the session keeps the whole config so it
+        // can rebuild itself on a reconnect (#206).
+        let credentials = config.credentials.clone().or(url_credentials);
 
         // Build session options
         let mut session_opts = SessionOptions::default()
@@ -671,6 +940,7 @@ impl RtspSession {
                 sample_rate,
                 framerate: stream.framerate(),
                 codec_data,
+                sender_report: None,
             });
         }
 
@@ -714,6 +984,7 @@ impl RtspSession {
 
         // Play
         let play_opts = retina::client::PlayOptions::default()
+            .unknown_rtcp_ssrc(config.unknown_rtcp_ssrc.into())
             .enforce_timestamps_with_max_jump_secs(
                 NonZeroU32::new(config.max_timestamp_jump_secs)
                     .unwrap_or(NonZeroU32::new(10).unwrap()),
@@ -747,7 +1018,41 @@ impl RtspSession {
                 .grow_to_fit(),
             skip_until_keyframe: config.skip_until_keyframe,
             saw_keyframe: false,
+            config,
+            pending_discont: false,
+            reconnects: 0,
+            warned_no_sender_report: false,
         })
+    }
+
+    /// Tear down and rebuild the session against the same URL (#206).
+    ///
+    /// Everything retina holds — the TCP connection, the RTP sequence origin,
+    /// the SSRC — is replaced, so the next buffer is a genuine discontinuity
+    /// and is stamped as one. The keyframe gate re-arms too: whatever the
+    /// camera sends first lands mid-GOP as surely as the original join did.
+    ///
+    /// The output arena survives, because its budget came from the executor
+    /// and rebuilding it would throw that away.
+    pub async fn reconnect(&mut self) -> Result<()> {
+        let fresh = Self::connect(self.config.clone()).await?;
+        self.session = fresh.session;
+        self.streams = fresh.streams;
+        self.selected_streams = fresh.selected_streams;
+        self.saw_keyframe = false;
+        self.pending_discont = true;
+        // The RTP origin changed with the session, so the old anchor is a lie
+        // (#207). `fresh.streams` already carries `sender_report: None`; this
+        // is the assignment above, said explicitly because it is load-bearing.
+        debug_assert!(self.streams.iter().all(|s| s.sender_report.is_none()));
+        self.warned_no_sender_report = false;
+        self.reconnects += 1;
+        self.stats.reconnects = self.reconnects;
+        self.stats.connected_at = Some(std::time::Instant::now());
+        // Observers waiting on `wait_for_dimensions` must see the new
+        // session's answer, not the dead one's.
+        self.publish_streams();
+        Ok(())
     }
 
     /// Get information about available streams.
@@ -874,9 +1179,9 @@ impl RtspSession {
                             self.stats.bytes_received += buffer.len() as u64;
                             return Ok(Some(RtspFrame::Audio(buffer)));
                         }
-                        CodecItem::Rtcp(_rtcp) => {
+                        CodecItem::Rtcp(rtcp) => {
                             self.stats.rtcp_packets += 1;
-                            // Continue to next item
+                            self.record_sender_report(&rtcp);
                         }
                         _ => {
                             // Skip other item types
@@ -893,41 +1198,115 @@ impl RtspSession {
         }
     }
 
+    /// Keep the newest Sender Report for the stream it names (#207).
+    ///
+    /// A compound RTCP packet only counts if it *begins* with an SR — the
+    /// RFC's rule for a compound packet, and what retina's accessor answers.
+    /// A receiver report from a mid-stream sender carries no anchor.
+    fn record_sender_report(&mut self, rtcp: &retina::rtcp::ReceivedCompoundPacket) {
+        let Some(first) = rtcp.pkts().next() else {
+            return;
+        };
+        let Ok(Some(sr)) = first.as_sender_report() else {
+            return;
+        };
+        let Some(report) = RtspSenderReport::from_ntp(sr.ntp_timestamp().0, sr.rtp_timestamp())
+        else {
+            // A camera whose clock predates 1970. Anchoring to it would make
+            // every PTS wrong in a way that looks authoritative.
+            tracing::debug!("rtspsrc: ignoring a sender report with a pre-Unix NTP time");
+            return;
+        };
+        let Some(stream) = self.streams.get_mut(rtcp.stream_id()) else {
+            return;
+        };
+        let first_report = stream.sender_report.is_none();
+        stream.sender_report = Some(report);
+        if first_report {
+            tracing::debug!(
+                "rtspsrc: stream {} anchored to a wallclock by its first sender report",
+                rtcp.stream_id()
+            );
+        }
+        self.publish_streams();
+    }
+
+    /// Nanoseconds for an RTP timestamp on `stream_index` (#207).
+    ///
+    /// With a Sender Report the answer is a **wallclock**: nanoseconds since
+    /// the Unix epoch, so two machines watching the same camera agree on when
+    /// a frame was captured. Without one it is the old relative mapping — the
+    /// RTP counter scaled to nanoseconds, whose origin is whatever the camera
+    /// happened to be counting at PLAY.
+    ///
+    /// Falling back is normal, not a failure: many cheap cameras never send an
+    /// SR. It is logged once per session so an operator investigating skewed
+    /// timestamps can tell which mapping they are looking at.
+    fn timestamp_nanos(&mut self, stream_index: usize, ts: i64, default_rate: u32) -> u64 {
+        let stream = self.streams.get(stream_index);
+        let clock_rate = stream.map(|s| s.clock_rate).unwrap_or(default_rate);
+        if let Some(sr) = stream.and_then(|s| s.sender_report)
+            && let Some(nanos) = sr.to_unix_nanos(ts as u32, clock_rate)
+        {
+            return nanos;
+        }
+        if !self.warned_no_sender_report {
+            self.warned_no_sender_report = true;
+            tracing::debug!(
+                "rtspsrc: no RTCP sender report yet; timestamps are relative to the \
+                 RTP origin, not to a wallclock"
+            );
+        }
+        if ts < 0 || clock_rate == 0 {
+            return 0;
+        }
+        ((ts as u128 * 1_000_000_000) / clock_rate as u128) as u64
+    }
+
     /// Convert a retina VideoFrame to a Parallax Buffer.
     fn video_frame_to_buffer(&mut self, frame: VideoFrame) -> Result<Option<Buffer>> {
         let data = frame.data();
         let is_keyframe = frame.is_random_access_point();
         let timestamp = frame.timestamp();
 
-        // Get stream info for clock rate
-        let stream_info = self.streams.get(frame.stream_id());
-        let clock_rate = stream_info.map(|s| s.clock_rate).unwrap_or(90000) as u128;
-
-        // Build metadata
-        let ts = timestamp.timestamp();
-        let nanos = if ts >= 0 {
-            (ts as u128 * 1_000_000_000) / clock_rate
-        } else {
-            0
-        };
+        // Wallclock-anchored when an SR has arrived, relative otherwise (#207).
+        let nanos = self.timestamp_nanos(frame.stream_id(), timestamp.timestamp(), 90_000);
 
         let mut flags = BufferFlags::NONE;
         if is_keyframe {
             flags |= BufferFlags::SYNC_POINT;
         }
 
-        let rtp_timestamp = ts as u32;
-        let metadata = Metadata::new()
-            .with_pts(ClockTime::from_nanos(nanos as u64))
+        // No `RtpMeta` (#208). retina hands back demuxed access units, not
+        // packets: `seq`, `ssrc` and `pt` are simply not available here, and
+        // filling them with zeros published plausible-looking garbage to
+        // anything that read them — including the IPC descriptor, which
+        // faithfully carries `RtpMeta` across a process boundary. `marker` was
+        // worse: it was being used to mean "keyframe", which `SYNC_POINT`
+        // already says correctly two lines up, while the RTP marker bit
+        // actually means "last packet of an access unit". The RTP timestamp is
+        // not lost — `pts` above is derived from it.
+        let mut metadata = Metadata::new()
+            .with_pts(ClockTime::from_nanos(nanos))
             .with_stream_id(frame.stream_id() as u32)
-            .with_flags(flags)
-            .with_rtp(RtpMeta {
-                seq: 0, // Not available from demuxed frame
-                ts: rtp_timestamp,
-                ssrc: 0,
-                pt: 0,
-                marker: is_keyframe,
-            });
+            .with_flags(flags);
+
+        // Say what these bytes are (#205). Without this every consumer had to
+        // be told out of band — example 58 pinned its converter's input format
+        // by hand — and a zenoh publisher downstream derived `zenoh/bytes`
+        // instead of `video/h264`.
+        //
+        // Geometry, when the SDP or an in-band SPS has given us any, rides
+        // `coded` rather than `set_video_dims`: these are access units, not
+        // frames, and `VideoRaw` would promise planes that are not there.
+        if let Some(info) = self.streams.get(frame.stream_id())
+            && let Some(codec) = video_codec_for(&info.codec)
+        {
+            match info.dimensions {
+                Some((w, h)) => metadata.set_coded_video_dims(codec, w, h),
+                None => metadata.format = Some(MediaFormat::Video(codec)),
+            }
+        }
 
         self.create_buffer_from_bytes_with_metadata(data, metadata)
     }
@@ -937,29 +1316,22 @@ impl RtspSession {
         let data = frame.data();
         let timestamp = frame.timestamp();
 
-        // Get stream info for clock rate
-        let stream_info = self.streams.get(frame.stream_id());
-        let clock_rate = stream_info.map(|s| s.clock_rate).unwrap_or(48000) as u128;
+        // Same anchor as video (#207) — which is what makes lip sync possible
+        // at all: both streams' timestamps land on one wallclock.
+        let nanos = self.timestamp_nanos(frame.stream_id(), timestamp.timestamp(), 48_000);
 
-        // Build metadata
-        let ts = timestamp.timestamp();
-        let nanos = if ts >= 0 {
-            (ts as u128 * 1_000_000_000) / clock_rate
-        } else {
-            0
-        };
+        // No `RtpMeta` — see the video path (#208).
+        let mut metadata = Metadata::new()
+            .with_pts(ClockTime::from_nanos(nanos))
+            .with_stream_id(frame.stream_id() as u32);
 
-        let rtp_timestamp = ts as u32;
-        let metadata = Metadata::new()
-            .with_pts(ClockTime::from_nanos(nanos as u64))
-            .with_stream_id(frame.stream_id() as u32)
-            .with_rtp(RtpMeta {
-                seq: 0,
-                ts: rtp_timestamp,
-                ssrc: 0,
-                pt: 0,
-                marker: false,
-            });
+        // Declare the audio codec too (#205) — a muxer or a publisher
+        // downstream has no other way to learn it.
+        if let Some(info) = self.streams.get(frame.stream_id())
+            && let Some(codec) = audio_codec_for(&info.codec)
+        {
+            metadata.format = Some(MediaFormat::Audio(codec));
+        }
 
         self.create_buffer_from_bytes_with_metadata(data, metadata)
     }
@@ -1034,13 +1406,81 @@ impl crate::element::AsyncSource for RtspSession {
         self.output.set_budget(budget);
     }
 
+    /// Pull one buffer, reconnecting through a dropped stream (#206).
+    ///
+    /// A stream error is not fatal when a reconnect policy is configured: it
+    /// is a live source, and the camera will come back. Without one — or once
+    /// the retries run out — the error is returned and the run ends, which is
+    /// what batch work wants.
+    ///
+    /// **A stream that simply ends is retried too, when a policy is set.**
+    /// That is not an oversight: RTSP has no in-band end-of-stream for a live
+    /// stream, so a server whose process dies looks to the client exactly like
+    /// one that finished — retina yields `None` for a clean FIN either way.
+    /// Configuring a reconnect policy *is* the statement "this source is
+    /// live", and a live source running out is abnormal. A finite stream — a
+    /// recording served over RTSP — wants `without_reconnect()`, which makes
+    /// the end an end.
     async fn produce(
         &mut self,
-        _ctx: &mut crate::element::ProduceContext<'_>,
+        ctx: &mut crate::element::ProduceContext<'_>,
     ) -> Result<ProduceResult> {
-        match self.next_buffer().await? {
-            Some(buffer) => Ok(ProduceResult::OwnBuffer(buffer)),
-            None => Ok(ProduceResult::Eos),
+        let mut attempts: u32 = 0;
+        loop {
+            match self.next_buffer().await {
+                Ok(Some(mut buffer)) => {
+                    if self.pending_discont {
+                        self.pending_discont = false;
+                        buffer.metadata_mut().flags |= BufferFlags::DISCONT;
+                    }
+                    return Ok(ProduceResult::OwnBuffer(buffer));
+                }
+                Ok(None) if self.config.reconnect.is_none() => {
+                    return Ok(ProduceResult::Eos);
+                }
+                outcome => {
+                    let policy = self
+                        .config
+                        .reconnect
+                        .expect("the None-without-policy arm returned above");
+                    let e = match outcome {
+                        Err(e) => e,
+                        _ => Error::Element("stream ended".into()),
+                    };
+                    if !policy.may_retry(attempts) {
+                        return Err(Error::Element(format!(
+                            "rtspsrc: giving up after {attempts} reconnect attempts: {e}"
+                        )));
+                    }
+                    let delay = policy.delay(attempts);
+                    attempts += 1;
+                    let warning = format!(
+                        "rtspsrc: stream failed ({e}); reconnect attempt {attempts} in {delay:?}"
+                    );
+                    tracing::warn!("{warning}");
+                    ctx.post_message(crate::pipeline::bus::MessageKind::Warning {
+                        warning,
+                        debug: Some(self.config.url.clone()),
+                    });
+                    tokio::time::sleep(delay).await;
+                    match self.reconnect().await {
+                        Ok(()) => {
+                            tracing::info!("rtspsrc: reconnected after {attempts} attempt(s)");
+                            // Reset the ladder: the next outage starts from
+                            // the bottom rather than from wherever this one
+                            // left off.
+                            attempts = 0;
+                        }
+                        // The reconnect itself failed. Loop: `next_buffer`
+                        // will fail immediately against the dead session and
+                        // the backoff advances, which is the behaviour wanted
+                        // — a server that is down stays retried, more slowly.
+                        Err(retry_err) => {
+                            tracing::debug!("rtspsrc: reconnect failed: {retry_err}");
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1056,6 +1496,153 @@ impl crate::element::AsyncSource for RtspSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #207: an RTP timestamp is a counter with an arbitrary origin; the SR
+    /// is the only thing that turns it into a time two machines can agree on.
+    #[test]
+    fn a_sender_report_anchors_rtp_time_to_a_wallclock() {
+        // 2024-01-01T00:00:00Z as NTP: seconds since 1900, no fraction.
+        let ntp_secs = 1_704_067_200u64 + NTP_TO_UNIX_SECS;
+        let sr = RtspSenderReport::from_ntp(ntp_secs << 32, 90_000).expect("a real wallclock");
+        assert_eq!(sr.ntp_unix_nanos, 1_704_067_200_000_000_000);
+
+        // The anchoring timestamp maps to the anchor itself.
+        assert_eq!(
+            sr.to_unix_nanos(90_000, 90_000),
+            Some(1_704_067_200_000_000_000)
+        );
+        // One second later at 90 kHz.
+        assert_eq!(
+            sr.to_unix_nanos(180_000, 90_000),
+            Some(1_704_067_201_000_000_000)
+        );
+        // …and *before* the anchor, which a stream that has been running does
+        // reach: the delta is signed.
+        assert_eq!(sr.to_unix_nanos(0, 90_000), Some(1_704_067_199_000_000_000));
+    }
+
+    /// The RTP timestamp is a 32-bit counter and a long-running stream wraps
+    /// it. An unsigned subtraction would report ~13 hours of jump at 90 kHz.
+    #[test]
+    fn the_rtp_delta_wraps_rather_than_exploding() {
+        let ntp_secs = 1_704_067_200u64 + NTP_TO_UNIX_SECS;
+        let sr = RtspSenderReport::from_ntp(ntp_secs << 32, u32::MAX - 44_999)
+            .expect("a real wallclock");
+
+        // 90 000 ticks later, straight through the wrap point.
+        let after = sr.to_unix_nanos(45_000, 90_000).expect("mapped");
+        assert_eq!(
+            after - sr.ntp_unix_nanos,
+            1_000_000_000,
+            "one second, not thirteen hours"
+        );
+    }
+
+    /// A camera with an unset RTC reports the NTP epoch. Anchoring to it makes
+    /// every PTS wrong in a way that looks authoritative, so it is refused —
+    /// the relative fallback is at least honest about being relative.
+    #[test]
+    fn a_pre_unix_wallclock_is_refused_rather_than_saturated() {
+        assert_eq!(RtspSenderReport::from_ntp(0, 0), None);
+        assert_eq!(RtspSenderReport::from_ntp(1 << 32, 0), None);
+        // The Unix epoch itself is the first acceptable instant.
+        let epoch = RtspSenderReport::from_ntp(NTP_TO_UNIX_SECS << 32, 0).expect("1970 is fine");
+        assert_eq!(epoch.ntp_unix_nanos, 0);
+    }
+
+    #[test]
+    fn a_zero_clock_rate_maps_to_nothing() {
+        let sr = RtspSenderReport::from_ntp((NTP_TO_UNIX_SECS + 1) << 32, 0).unwrap();
+        assert_eq!(sr.to_unix_nanos(0, 0), None);
+    }
+
+    /// #206: the backoff doubles, stops at the ceiling, and never returns the
+    /// ceiling itself — full jitter is what stops a rack of cameras behind one
+    /// switch retrying in lockstep forever.
+    #[test]
+    fn the_backoff_doubles_caps_and_jitters() {
+        let policy = RtspReconnect {
+            max_retries: None,
+            initial_backoff: Duration::from_millis(500),
+            max_backoff: Duration::from_secs(30),
+        };
+
+        // The *bound* is what is deterministic; the draw inside it is not.
+        for (attempt, cap_ms) in [(0u32, 500u64), (1, 1000), (2, 2000), (5, 16000)] {
+            for _ in 0..64 {
+                let d = policy.delay(attempt);
+                assert!(
+                    d < Duration::from_millis(cap_ms),
+                    "attempt {attempt}: {d:?} must be under the {cap_ms}ms cap"
+                );
+            }
+        }
+
+        // Far past the ceiling, the cap holds rather than overflowing.
+        for attempt in [10u32, 31, 40, u32::MAX] {
+            assert!(
+                policy.delay(attempt) < policy.max_backoff,
+                "attempt {attempt}"
+            );
+        }
+
+        // And it really varies — a fixed backoff would defeat the point.
+        let draws: std::collections::HashSet<_> = (0..64).map(|_| policy.delay(5)).collect();
+        assert!(
+            draws.len() > 1,
+            "full jitter must actually draw different values"
+        );
+    }
+
+    #[test]
+    fn the_retry_budget_is_honoured() {
+        let forever = RtspReconnect::default();
+        assert_eq!(forever.max_retries, None);
+        assert!(forever.may_retry(0));
+        assert!(forever.may_retry(1_000_000));
+
+        let bounded = RtspReconnect {
+            max_retries: Some(3),
+            ..Default::default()
+        };
+        assert!(bounded.may_retry(0));
+        assert!(bounded.may_retry(2));
+        assert!(!bounded.may_retry(3), "the fourth attempt is refused");
+    }
+
+    /// A live source must survive a switch reboot. That is the default, and
+    /// turning it off is the deliberate act.
+    #[test]
+    fn reconnection_is_on_by_default() {
+        assert!(
+            RtspConfig::default().reconnect.is_some(),
+            "a camera feed that dies on a TCP reset is the bug #206 is about"
+        );
+        assert!(
+            RtspSrc::new("rtsp://example/stream")
+                .without_reconnect()
+                .config()
+                .reconnect
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn sdp_encoding_names_map_to_codecs() {
+        // retina hands back `encoding_name()` lowercased, i.e. the SDP
+        // spelling, so these are the strings that actually arrive.
+        assert_eq!(video_codec_for("h264"), Some(VideoCodec::H264));
+        assert_eq!(video_codec_for("h265"), Some(VideoCodec::H265));
+        assert_eq!(video_codec_for("jpeg"), Some(VideoCodec::Mjpeg));
+        assert_eq!(audio_codec_for("mpeg4-generic"), Some(AudioCodec::Aac));
+        assert_eq!(audio_codec_for("opus"), Some(AudioCodec::Opus));
+        assert_eq!(audio_codec_for("pcmu"), Some(AudioCodec::Pcmu));
+
+        // A stream we cannot name stays undeclared rather than mislabelled.
+        assert_eq!(video_codec_for("theora"), None);
+        assert_eq!(audio_codec_for("speex"), None);
+        assert_eq!(video_codec_for(""), None);
+    }
 
     #[test]
     fn framesize_maps_to_its_media_section() {
@@ -1215,9 +1802,9 @@ mod tests {
 
     // ---- RtspStreamInfoHandle -------------------------------------------
     //
-    // Driving a real session needs a server (see `just rtsp-server` and
-    // examples 57/58). These cover the handle itself, which is the part that
-    // has to behave when the SDP was silent.
+    // Driving a real session happens in `tests/rtsp_integration.rs` against
+    // the test server in `tests/support/` (#209). These cover the pieces that
+    // need no socket: the handle, the backoff arithmetic, the SR anchor.
 
     fn video_stream(dimensions: Option<(u32, u32)>) -> StreamInfo {
         StreamInfo {
@@ -1230,6 +1817,7 @@ mod tests {
             sample_rate: None,
             framerate: None,
             codec_data: None,
+            sender_report: None,
         }
     }
 

@@ -7,3 +7,4 @@
 //! linking an encoder.
 
 pub mod annexb;
+pub mod vpx;

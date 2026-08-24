@@ -701,6 +701,49 @@ pub enum VideoCodec {
     Vp9,
     /// AV1.
     Av1,
+    /// Motion JPEG — a stream of independently decodable JPEG frames.
+    ///
+    /// Appended last on purpose: `descriptor_enum_discriminants_locked` in
+    /// `memory::ipc_ring` pins `H264 as u8 == 0` and `Av1 as u8 == 4`, so a
+    /// new variant may only go on the end. A peer that predates this variant
+    /// decodes it as "unknown codec" and degrades to `format: None` rather
+    /// than misreading an existing one.
+    Mjpeg,
+}
+
+/// Encoded video format: the codec plus the geometry of the pictures it
+/// carries (16 bytes, `Copy`).
+///
+/// The mirror of [`VideoFormat`] for compressed data, and deliberately *not*
+/// part of [`MediaFormat::Video`]: caps declarations
+/// (`Caps::new(MediaFormat::Video(VideoCodec::H264))`) and producers that know
+/// the codec but not the geometry — the RTP depayloaders, for instance — must
+/// stay expressible. Geometry rides on [`Metadata::set_coded_video_dims`]
+/// instead, next to the codec it describes.
+///
+/// [`Metadata::set_coded_video_dims`]: crate::metadata::Metadata::set_coded_video_dims
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CodedVideoFormat {
+    /// The codec these bytes are encoded with.
+    pub codec: VideoCodec,
+    /// Coded picture width in pixels.
+    pub width: u32,
+    /// Coded picture height in pixels.
+    pub height: u32,
+    /// Frame rate, when the producer knows it.
+    pub framerate: Framerate,
+}
+
+impl CodedVideoFormat {
+    /// Create an encoded video format.
+    pub const fn new(codec: VideoCodec, width: u32, height: u32, framerate: Framerate) -> Self {
+        Self {
+            codec,
+            width,
+            height,
+            framerate,
+        }
+    }
 }
 
 /// Frame rate as numerator/denominator (8 bytes, Copy).

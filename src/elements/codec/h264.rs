@@ -847,6 +847,15 @@ impl Element for H264Encoder {
             }
             return EventResult::NotHandled;
         }
+
+        // A keyframe request stops here (#213): this encoder can satisfy it,
+        // and nothing further upstream can. `Handled` is what keeps a request
+        // raised by one sink from being acted on twice.
+        if let Event::ForceKeyUnit(_) = event {
+            self.control.request_keyframe();
+            return EventResult::handled();
+        }
+
         EventResult::NotHandled
     }
 
@@ -914,6 +923,19 @@ impl Element for H264Encoder {
         // Preserve input buffer's PTS for proper timing, update sequence number
         let mut metadata = buffer.metadata().clone();
         metadata.sequence = self.frame_count().saturating_sub(1);
+        // These bytes are an H.264 access unit, not a frame (#236). Carrying
+        // the input's `VideoRaw` format forward told every downstream element
+        // it could index into I420 planes that are no longer there — and made
+        // the zenoh `Encoding` come out as `video/raw`. Geometry survives on
+        // `Metadata.coded`, where it describes the coded picture.
+        if let Some((w, h)) = buffer.metadata().video_dims() {
+            metadata.set_coded_video_dims(crate::format::VideoCodec::H264, w, h);
+        } else {
+            metadata.format = Some(crate::format::MediaFormat::Video(
+                crate::format::VideoCodec::H264,
+            ));
+            metadata.planes = None;
+        }
         // SYNC_POINT must reflect the ENCODED stream, not the input: raw
         // sources flag every uncompressed frame as a sync point, and a
         // delta AU wrongly advertised as a keyframe sends fresh decoders
@@ -965,6 +987,10 @@ impl Element for H264Encoder {
 ///
 /// This allows H264Encoder to be used with `EncoderElement` for pipeline integration.
 impl super::traits::VideoEncoder for H264Encoder {
+    fn codec(&self) -> crate::format::VideoCodec {
+        crate::format::VideoCodec::H264
+    }
+
     type Packet = Vec<u8>;
 
     fn encode(&mut self, frame: super::common::VideoFrameRef<'_>) -> Result<Vec<Self::Packet>> {
@@ -1774,6 +1800,30 @@ mod tests {
             }
         }
         assert!(seen_any, "expected some NAL units");
+    }
+
+    #[test]
+    fn the_encoder_stamps_h264_not_the_input_frame_format() {
+        // #236: the output used to carry the input's `VideoRaw(I420)`, which
+        // told downstream elements a bitstream had addressable planes — and
+        // made the zenoh `Encoding` come out as `video/raw`.
+        let mut encoder = H264Encoder::new(H264EncoderConfig::new()).unwrap();
+        let out = encoder
+            .process(yuv_buffer(&detailed_frame(320, 240, 0), 320, 240))
+            .unwrap()
+            .expect("encoded AU");
+
+        let meta = out.metadata();
+        assert_eq!(
+            meta.format,
+            Some(crate::format::MediaFormat::Video(
+                crate::format::VideoCodec::H264
+            )),
+            "encoded output must describe itself as H.264"
+        );
+        assert_eq!(meta.coded_video_dims(), Some((320, 240)));
+        assert_eq!(meta.video_dims(), None, "a bitstream has no raw geometry");
+        assert!(meta.planes.is_none(), "a bitstream has no plane layout");
     }
 
     #[test]

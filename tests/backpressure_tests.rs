@@ -68,17 +68,39 @@ mod link_monitoring {
     use parallax::elements::{AppSink, AppSrc, Pulled};
     use parallax::pipeline::{Executor, LinkPolicy, Pipeline};
 
-    /// Poll a condition without timers: an AppSink whose queue is full holds
-    /// its task in `consume`, and timer-based waits against blocked elements
-    /// can stall the tokio time driver (see CLAUDE.md).
+    /// Wait for a condition, bounded by the **clock** (#241).
+    ///
+    /// This used to spin `yield_now()` 200 000 times and call that a timeout.
+    /// It is not one — it is a CPU budget, and it moves the wrong way: on a
+    /// faster machine the 200 000 yields take *less* wall time, while under
+    /// parallel load the thing being waited for takes more. So the test
+    /// starved on a busy runner and passed on an idle one.
+    ///
+    /// The comment that justified the spin said timers cannot be trusted
+    /// because a full `AppSink` holds its task inside `consume` and a blocking
+    /// element can stall the tokio time driver. That was true until #168 made
+    /// `AppSink` an `AsyncSink` that *awaits* for space instead of blocking a
+    /// worker — which is exactly what makes a timer safe here. The rule in
+    /// CLAUDE.md still stands for elements that genuinely block; this one no
+    /// longer does.
+    ///
+    /// A short yield burst first, so the common case still costs no timer
+    /// latency, then a real deadline.
     async fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
-        for _ in 0..200_000 {
+        for _ in 0..64 {
             if cond() {
                 return;
             }
             tokio::task::yield_now().await;
         }
-        panic!("timed out waiting for {what}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        panic!("timed out waiting for {what} after 10s");
     }
 
     #[tokio::test(flavor = "multi_thread")]

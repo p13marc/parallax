@@ -16,6 +16,11 @@ pub(super) fn register(f: &mut ElementFactory) {
     f.register("tcpsink", create_tcpsink);
     f.register("udpsrc", create_udpsrc);
     f.register("udpsink", create_udpsink);
+    #[cfg(feature = "zenoh")]
+    {
+        f.register_async("zenohsrc", |p| Box::pin(create_zenohsrc(p)));
+        f.register_async("zenohsink", |p| Box::pin(create_zenohsink(p)));
+    }
     f.register("unixsrc", create_unixsrc);
     f.register("unixsink", create_unixsink);
     f.register("multicastsrc", create_multicastsrc);
@@ -208,6 +213,115 @@ fn create_wssink(props: &Props) -> Result<Box<DynAsyncElement<'static>>> {
         ],
     )? {
         sink = sink.with_message_type(mt);
+    }
+    Ok(DynAsyncElement::new_box(AsyncSinkAdapter::new(sink)))
+}
+
+// ============================================================================
+// Zenoh (async constructors — see `ElementConstructor::Async`)
+// ============================================================================
+
+/// `zenohsrc key=<key-expr> [profile=media] [resync-on-discont=<bool>]
+///          [timeout-ms=<n>] [stream-timeout-ms=<n>]
+///          [on-publisher-loss=wait|eos]`
+///
+/// `profile=media` subscribes to the `@media` plane: the codec comes from the
+/// key expression (so caps are known before the first sample), the attachment
+/// is a CBOR `FrameMeta`, and samples are dropped until the first keyframe.
+///
+/// The two timeouts mean different things (#224): `timeout-ms` is a heartbeat
+/// that keeps the stream open, `stream-timeout-ms` ends it.
+#[cfg(feature = "zenoh")]
+async fn create_zenohsrc(props: Props) -> Result<Box<DynAsyncElement<'static>>> {
+    use crate::elements::network::shared_session;
+    use crate::elements::{PublisherLoss, ZenohSrc, network::WireProfile};
+
+    let key = props.req_str("key")?;
+    let profile = props
+        .get_enum(
+            "profile",
+            &[
+                ("parallax", WireProfile::Parallax),
+                ("media", WireProfile::Media),
+            ],
+        )?
+        .unwrap_or(WireProfile::Parallax);
+
+    let session = shared_session().await?;
+    let mut src = match profile {
+        WireProfile::Media => ZenohSrc::media_with_session(session, key).await?,
+        WireProfile::Parallax => ZenohSrc::with_session(session, key).await?,
+    };
+    if let Some(resync) = props.get_bool("resync-on-discont")? {
+        src = src.with_resync_on_discont(resync);
+    }
+    if let Some(timeout) = props.get_ms("timeout-ms")? {
+        src = src.with_timeout(timeout);
+    }
+    if let Some(timeout) = props.get_ms("stream-timeout-ms")? {
+        src = src.with_stream_timeout(timeout);
+    }
+    if let Some(policy) = props.get_enum(
+        "on-publisher-loss",
+        &[("wait", PublisherLoss::Wait), ("eos", PublisherLoss::Eos)],
+    )? {
+        src = src.on_publisher_loss(policy);
+    }
+    Ok(DynAsyncElement::new_box(AsyncSourceAdapter::new(src)))
+}
+
+/// `zenohsink key=<key-expr> [profile=media] [congestion=block|drop]
+///           [priority=<name>] [express=<bool>]`
+///
+/// `profile=media` publishes on the `@media` plane, which fixes the QoS
+/// profile (best-effort, drop, interactive-high, express) — the individual
+/// knobs are for the parallax plane.
+#[cfg(feature = "zenoh")]
+async fn create_zenohsink(props: Props) -> Result<Box<DynAsyncElement<'static>>> {
+    use crate::elements::network::shared_session;
+    use crate::elements::{ZenohCongestionControl, ZenohPriority, ZenohSink, network::WireProfile};
+
+    let key = props.req_str("key")?;
+    let profile = props
+        .get_enum(
+            "profile",
+            &[
+                ("parallax", WireProfile::Parallax),
+                ("media", WireProfile::Media),
+            ],
+        )?
+        .unwrap_or(WireProfile::Parallax);
+
+    let session = shared_session().await?;
+    let mut sink = match profile {
+        WireProfile::Media => ZenohSink::media_with_session(session, key).await?,
+        WireProfile::Parallax => ZenohSink::with_session(session, key).await?,
+    };
+    if let Some(cc) = props.get_enum(
+        "congestion",
+        &[
+            ("block", ZenohCongestionControl::Block),
+            ("drop", ZenohCongestionControl::Drop),
+        ],
+    )? {
+        sink = sink.with_congestion_control(cc);
+    }
+    if let Some(priority) = props.get_enum(
+        "priority",
+        &[
+            ("realtime", ZenohPriority::RealTime),
+            ("interactive-high", ZenohPriority::InteractiveHigh),
+            ("interactive-low", ZenohPriority::InteractiveLow),
+            ("data-high", ZenohPriority::DataHigh),
+            ("data", ZenohPriority::Data),
+            ("data-low", ZenohPriority::DataLow),
+            ("background", ZenohPriority::Background),
+        ],
+    )? {
+        sink = sink.with_priority(priority);
+    }
+    if let Some(express) = props.get_bool("express")? {
+        sink = sink.with_express(express);
     }
     Ok(DynAsyncElement::new_box(AsyncSinkAdapter::new(sink)))
 }

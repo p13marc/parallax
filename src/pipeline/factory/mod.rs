@@ -39,8 +39,38 @@ use crate::plugin::PluginRegistry;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Type alias for element constructor functions.
-pub type ElementConstructor = fn(&Props) -> Result<Box<DynAsyncElement<'static>>>;
+/// A synchronous element constructor.
+pub type SyncConstructor = fn(&Props) -> Result<Box<DynAsyncElement<'static>>>;
+
+/// An asynchronous element constructor.
+///
+/// Takes `Props` by value because the returned future is `'static`. The
+/// factory keeps its own clone to run [`Props::finish`] on afterwards — the
+/// consumption set is shared, so unknown-property rejection works exactly as
+/// it does on the sync path.
+pub type AsyncConstructor =
+    fn(Props) -> futures::future::BoxFuture<'static, Result<Box<DynAsyncElement<'static>>>>;
+
+/// How a registered name builds its element (#222).
+///
+/// Elements whose construction performs real I/O — an RTSP DESCRIBE/SETUP/PLAY,
+/// opening a zenoh session — cannot be built from a synchronous function, which
+/// is why `rtspsrc`, `zenohsrc` and `zenohsink` were unreachable from a pipeline
+/// string until this existed. `Pipeline::parse_async` is the entry point that
+/// can drive them; `Pipeline::parse` stays, and says so when it meets one.
+#[derive(Clone, Copy)]
+pub enum ElementConstructor {
+    /// Built synchronously.
+    Sync(SyncConstructor),
+    /// Built by awaiting a future.
+    Async(AsyncConstructor),
+}
+
+impl From<SyncConstructor> for ElementConstructor {
+    fn from(f: SyncConstructor) -> Self {
+        Self::Sync(f)
+    }
+}
 
 /// Factory names that exist but are compiled out without their cargo feature.
 ///
@@ -90,8 +120,6 @@ pub const GATED_ELEMENTS: &[(&str, &str)] = &[
     ("rtpopuspay", "rtp"),
     ("rtpopusdepay", "rtp"),
     ("rtpav1pay", "rtp"),
-    // Not yet registered even with the feature on (async constructor);
-    // the error message is still more useful than "unknown element".
     ("zenohsrc", "zenoh"),
     ("zenohsink", "zenoh"),
     ("rtspsrc", "rtsp"),
@@ -150,16 +178,39 @@ impl ElementFactory {
     }
 
     /// Register a custom element constructor.
-    pub fn register(&mut self, name: &str, constructor: ElementConstructor) {
-        self.constructors.insert(name.to_string(), constructor);
+    pub fn register(&mut self, name: &str, constructor: SyncConstructor) {
+        self.constructors
+            .insert(name.to_string(), ElementConstructor::Sync(constructor));
+    }
+
+    /// Register a constructor that must be awaited.
+    ///
+    /// Deliberately a separate method rather than a generic `register` taking
+    /// `impl Into<ElementConstructor>`: several domains register non-capturing
+    /// **closures** (`|p| pay(p, Pay::H264)`), and closure-to-fn-pointer
+    /// coercion does not fire through a generic bound — the parameter type
+    /// stops being inferable and 11 call sites would need turbofishing.
+    pub fn register_async(&mut self, name: &str, constructor: AsyncConstructor) {
+        self.constructors
+            .insert(name.to_string(), ElementConstructor::Async(constructor));
     }
 
     /// Create an element from a parsed description.
+    ///
+    /// A name whose constructor must be awaited errors here rather than
+    /// falling through — falling through would reach the [`GATED_ELEMENTS`]
+    /// arm and claim a missing cargo feature, which would be a lie.
     pub fn create(&self, parsed: &ParsedElement) -> Result<Box<DynAsyncElement<'static>>> {
         // First try built-in constructors
         if let Some(constructor) = self.constructors.get(&parsed.name) {
+            let ElementConstructor::Sync(constructor) = constructor else {
+                return Err(Error::Parse(format!(
+                    "element '{}' performs I/O at construction; build the pipeline with                      Pipeline::parse_async (parallax-launch does)",
+                    parsed.name
+                )));
+            };
             let map: HashMap<String, PropertyValue> = parsed.properties.iter().cloned().collect();
-            let props = Props::new(&parsed.name, &map);
+            let props = Props::new(&parsed.name, map);
             let element = constructor(&props)?;
             props.finish()?;
             return Ok(element);
@@ -183,6 +234,26 @@ impl ElementFactory {
         }
 
         Err(Error::Parse(format!("unknown element: {}", parsed.name)))
+    }
+
+    /// Create an element, awaiting constructors that need it.
+    ///
+    /// The superset of [`create`](Self::create): sync names take the same
+    /// path, async ones are awaited. `Props` is cloned before being moved into
+    /// the future, and the consumption set is shared, so `finish()` still sees
+    /// everything the constructor looked at.
+    pub async fn create_async(
+        &self,
+        parsed: &ParsedElement,
+    ) -> Result<Box<DynAsyncElement<'static>>> {
+        if let Some(ElementConstructor::Async(constructor)) = self.constructors.get(&parsed.name) {
+            let map: HashMap<String, PropertyValue> = parsed.properties.iter().cloned().collect();
+            let props = Props::new(&parsed.name, map);
+            let element = constructor(props.clone()).await?;
+            props.finish()?;
+            return Ok(element);
+        }
+        self.create(parsed)
     }
 
     /// Check if an element type is registered.
@@ -363,6 +434,46 @@ mod tests {
             Err(e) => e.to_string(),
         };
         assert!(err.contains("alsa") && err.contains("feature"), "{err}");
+    }
+
+    #[cfg(feature = "zenoh")]
+    #[test]
+    fn an_async_element_tells_the_sync_parser_where_to_go() {
+        // Falling through to the GATED_ELEMENTS arm would claim the feature is
+        // missing, which would be a lie in a build that has it.
+        let factory = ElementFactory::new();
+        let parsed = ParsedElement {
+            name: "zenohsrc".to_string(),
+            properties: vec![("key".to_string(), PropertyValue::String("a/b".to_string()))],
+        };
+        let err = match factory.create(&parsed) {
+            Ok(_) => panic!("the sync path must not build an async element"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("parse_async"),
+            "the error must point at the async entry point, got: {err}"
+        );
+        assert!(
+            !err.contains("cargo feature"),
+            "must not claim a missing feature: {err}"
+        );
+    }
+
+    #[cfg(feature = "zenoh")]
+    #[test]
+    fn async_names_count_as_registered() {
+        // `--list-elements` and the gated-overlap invariant both read these.
+        let factory = ElementFactory::new();
+        assert!(factory.is_registered("zenohsrc"));
+        assert!(factory.list_elements().iter().any(|n| n == "zenohsink"));
+        assert!(
+            !factory
+                .unavailable_elements()
+                .iter()
+                .any(|(n, _)| *n == "zenohsrc"),
+            "a registered name must not be reported unavailable"
+        );
     }
 
     #[test]

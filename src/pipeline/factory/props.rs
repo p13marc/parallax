@@ -8,31 +8,41 @@
 
 use crate::error::{Error, Result};
 use crate::pipeline::parser::PropertyValue;
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// A view over one element's parsed properties.
-pub struct Props<'a> {
-    element: &'a str,
-    map: &'a HashMap<String, PropertyValue>,
-    consumed: RefCell<HashSet<String>>,
+///
+/// Owning and cheaply cloneable, with the consumption set **shared** between
+/// clones (#222). An async constructor takes `Props` by value and moves it
+/// into its future, so the factory can no longer hold the same value to call
+/// [`finish`](Self::finish) on afterwards — it keeps a clone instead, and the
+/// clone sees everything the constructor consumed.
+///
+/// `Arc<Mutex<_>>` rather than `Rc<RefCell<_>>` because that future has to be
+/// `Send`.
+#[derive(Clone)]
+pub struct Props {
+    element: Arc<str>,
+    map: Arc<HashMap<String, PropertyValue>>,
+    consumed: Arc<Mutex<HashSet<String>>>,
 }
 
-impl<'a> Props<'a> {
+impl Props {
     /// Wrap a property map for the named element.
-    pub fn new(element: &'a str, map: &'a HashMap<String, PropertyValue>) -> Self {
+    pub fn new(element: &str, map: HashMap<String, PropertyValue>) -> Self {
         let mut consumed = HashSet::new();
         consumed.insert("name".to_string());
         Self {
-            element,
-            map,
-            consumed: RefCell::new(consumed),
+            element: Arc::from(element),
+            map: Arc::new(map),
+            consumed: Arc::new(Mutex::new(consumed)),
         }
     }
 
-    fn raw(&self, key: &str) -> Option<&'a PropertyValue> {
-        self.consumed.borrow_mut().insert(key.to_string());
+    fn raw(&self, key: &str) -> Option<&PropertyValue> {
+        self.consumed.lock().unwrap().insert(key.to_string());
         self.map.get(key)
     }
 
@@ -239,7 +249,7 @@ impl<'a> Props<'a> {
 
     /// Error on any property the constructor never consumed.
     pub fn finish(&self) -> Result<()> {
-        let consumed = self.consumed.borrow();
+        let consumed = self.consumed.lock().unwrap();
         let mut unknown: Vec<&str> = self
             .map
             .keys()
@@ -277,7 +287,7 @@ mod tests {
     #[test]
     fn unknown_property_is_rejected() {
         let m = map(&[("fps", PropertyValue::Integer(30))]);
-        let p = Props::new("videotestsrc", &m);
+        let p = Props::new("videotestsrc", m);
         assert!(p.finish().is_err(), "unconsumed key must fail finish()");
         let err = p.finish().unwrap_err().to_string();
         assert!(err.contains("fps") && err.contains("videotestsrc"), "{err}");
@@ -286,7 +296,7 @@ mod tests {
     #[test]
     fn consumed_properties_pass_finish() {
         let m = map(&[("count", PropertyValue::Integer(5))]);
-        let p = Props::new("nullsource", &m);
+        let p = Props::new("nullsource", m);
         assert_eq!(p.get_u64("count").unwrap(), Some(5));
         p.finish().unwrap();
     }
@@ -294,21 +304,21 @@ mod tests {
     #[test]
     fn name_is_preconsumed() {
         let m = map(&[("name", PropertyValue::String("x".into()))]);
-        let p = Props::new("nullsink", &m);
+        let p = Props::new("nullsink", m);
         p.finish().unwrap();
     }
 
     #[test]
     fn type_mismatch_errors() {
         let m = map(&[("count", PropertyValue::String("many".into()))]);
-        let p = Props::new("nullsource", &m);
+        let p = Props::new("nullsource", m);
         assert!(p.get_u64("count").is_err());
     }
 
     #[test]
     fn required_missing_errors() {
         let m = map(&[]);
-        let p = Props::new("filesrc", &m);
+        let p = Props::new("filesrc", m);
         let err = p.req_str("location").unwrap_err().to_string();
         assert!(err.contains("location") && err.contains("filesrc"), "{err}");
     }
@@ -316,12 +326,12 @@ mod tests {
     #[test]
     fn enum_lookup_and_error() {
         let m = map(&[("mode", PropertyValue::String("Fast".into()))]);
-        let p = Props::new("x", &m);
+        let p = Props::new("x", m);
         let v = p.get_enum("mode", &[("fast", 1), ("slow", 2)]).unwrap();
         assert_eq!(v, Some(1));
 
         let m = map(&[("mode", PropertyValue::String("warp".into()))]);
-        let p = Props::new("x", &m);
+        let p = Props::new("x", m);
         let err = p
             .get_enum("mode", &[("fast", 1), ("slow", 2)])
             .unwrap_err()
@@ -332,29 +342,29 @@ mod tests {
     #[test]
     fn size_pair_requires_both() {
         let m = map(&[("width", PropertyValue::Integer(640))]);
-        let p = Props::new("x", &m);
+        let p = Props::new("x", m);
         assert!(p.get_size().is_err());
 
         let m = map(&[
             ("width", PropertyValue::Integer(640)),
             ("height", PropertyValue::Integer(480)),
         ]);
-        let p = Props::new("x", &m);
+        let p = Props::new("x", m);
         assert_eq!(p.get_size().unwrap(), Some((640, 480)));
     }
 
     #[test]
     fn framerate_int_and_fraction() {
         let m = map(&[("framerate", PropertyValue::Integer(30))]);
-        let p = Props::new("x", &m);
+        let p = Props::new("x", m);
         assert_eq!(p.get_framerate("framerate").unwrap(), Some((30, 1)));
 
         let m = map(&[("framerate", PropertyValue::String("30000/1001".into()))]);
-        let p = Props::new("x", &m);
+        let p = Props::new("x", m);
         assert_eq!(p.get_framerate("framerate").unwrap(), Some((30000, 1001)));
 
         let m = map(&[("framerate", PropertyValue::String("fast".into()))]);
-        let p = Props::new("x", &m);
+        let p = Props::new("x", m);
         assert!(p.get_framerate("framerate").is_err());
     }
 }

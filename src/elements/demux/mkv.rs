@@ -181,6 +181,39 @@ pub struct MkvVideoInfo {
     pub frame_rate: Option<f64>,
 }
 
+impl MkvCodec {
+    /// The pipeline's video codec for this track, if it is video (#238).
+    ///
+    /// `None` for audio, subtitles, and codecs parallax has no variant for —
+    /// an undeclared format beats a mislabelled one.
+    fn video_codec(&self) -> Option<crate::format::VideoCodec> {
+        use crate::format::VideoCodec;
+        Some(match self {
+            Self::H264 => VideoCodec::H264,
+            Self::H265 => VideoCodec::H265,
+            Self::Vp8 => VideoCodec::Vp8,
+            Self::Vp9 => VideoCodec::Vp9,
+            Self::Av1 => VideoCodec::Av1,
+            _ => return None,
+        })
+    }
+
+    /// The pipeline's audio codec for this track, if it is audio (#238).
+    fn audio_codec(&self) -> Option<crate::format::AudioCodec> {
+        use crate::format::AudioCodec;
+        Some(match self {
+            Self::Aac => AudioCodec::Aac,
+            Self::Opus => AudioCodec::Opus,
+            Self::Vorbis => AudioCodec::Vorbis,
+            Self::Eac3 => AudioCodec::Eac3,
+            Self::Mp3 => AudioCodec::Mp3,
+            // No `Ac3` variant in the pipeline's vocabulary; leave it
+            // undeclared rather than calling it E-AC-3.
+            _ => return None,
+        })
+    }
+}
+
 /// Audio parameters of a Matroska track.
 #[derive(Debug, Clone)]
 pub struct MkvAudioInfo {
@@ -667,6 +700,25 @@ impl<R: Read + Seek> MkvDemux<R> {
         if is_keyframe {
             metadata.flags |= BufferFlags::SYNC_POINT;
         }
+
+        // Say what this is (#238). The demuxer parsed the codec and the pixel
+        // dimensions out of the track entry and used to throw both away, so a
+        // `mkvdemux ! zenohsink` published H.264 as `zenoh/bytes` with no
+        // geometry, and `EncoderElement` errors outright on a buffer that
+        // declares no format.
+        if let Some(track_info) = self.tracks.iter().find(|t| t.id == track) {
+            if let Some(codec) = track_info.codec.video_codec() {
+                match &track_info.video_info {
+                    Some(v) if v.width > 0 && v.height > 0 => {
+                        metadata.set_coded_video_dims(codec, v.width, v.height)
+                    }
+                    _ => metadata.format = Some(crate::format::MediaFormat::Video(codec)),
+                }
+            } else if let Some(codec) = track_info.codec.audio_codec() {
+                metadata.format = Some(crate::format::MediaFormat::Audio(codec));
+            }
+        }
+
         Ok(Buffer::new(handle, metadata))
     }
 

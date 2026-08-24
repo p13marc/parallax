@@ -715,8 +715,18 @@ impl SimpleSink for DashSink {
     fn execution_hints(&self) -> ExecutionHints {
         ExecutionHints::io_bound()
     }
+
+    /// Write the last segment and the final manifest (#221).
+    ///
+    /// Same reasoning as [`HlsSink::finish`](super::HlsSink): a manifest that
+    /// never learns the stream ended keeps every player waiting, and doing it
+    /// in `Drop` discarded the error.
+    fn finish(&mut self, _reason: crate::pipeline::EndReason) -> Result<()> {
+        self.finalize()
+    }
 }
 
+/// Last-resort finalization; the real one is [`SimpleSink::finish`] (#221).
 impl Drop for DashSink {
     fn drop(&mut self) {
         // Try to finalize on drop

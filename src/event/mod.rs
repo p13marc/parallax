@@ -97,6 +97,24 @@ pub enum Event {
     /// [`QosEvent::proportion`] (idempotent), not accumulate the counters.
     Qos(QosEvent),
 
+    /// Request a decoder entry point from upstream (#213).
+    ///
+    /// The third upstream family, and deliberately not a [`QosEvent`]
+    /// variant. QoS is a *rate advisory*: `proportion` is idempotent,
+    /// consumers observe and forward it, and origins throttle it to about
+    /// 1/s. A keyframe request is a discrete *imperative* with no
+    /// proportion, which must not be aggregated the same way, and which the
+    /// first encoder that sees it should **consume** rather than forward.
+    /// Overloading `QosType` would have forced a "this one means something
+    /// else" branch into every existing QoS consumer.
+    ///
+    /// Travels the same hop-by-hop upstream path as `Seek` and `Qos`, so it
+    /// needs no new transport. Terminates at the first encoder, which sets its
+    /// `KeyframeHandle` and answers `Handled` — nothing further upstream can
+    /// act on it. An RTSP source answers `NotHandled` and that is honest:
+    /// RTSP has no standard way to ask a camera for an IDR.
+    ForceKeyUnit(ForceKeyUnitEvent),
+
     // ========== Bidirectional Events ==========
     /// Flush start - immediately discard buffered data.
     FlushStart,
@@ -134,7 +152,10 @@ impl Event {
 
     /// Check if this is an upstream event (flows against data).
     pub fn is_upstream(&self) -> bool {
-        matches!(self, Event::Seek(_) | Event::Qos(_))
+        matches!(
+            self,
+            Event::Seek(_) | Event::Qos(_) | Event::ForceKeyUnit(_)
+        )
     }
 
     /// Check if this is a bidirectional event.
@@ -173,6 +194,7 @@ impl Event {
             Event::Gap(_) => "gap",
             Event::Seek(_) => "seek",
             Event::Qos(_) => "qos",
+            Event::ForceKeyUnit(_) => "force-key-unit",
             Event::FlushStart => "flush-start",
             Event::FlushStop(_) => "flush-stop",
             Event::Pause => "pause",
@@ -870,6 +892,37 @@ pub enum QosType {
     Overflow,
 }
 
+/// A request for the next decoder entry point (#213).
+///
+/// Raised by a consumer that cannot start — a subscriber joining a live
+/// stream, a decoder that lost sync — and carried upstream to whoever can do
+/// something about it.
+#[derive(Debug, Clone)]
+pub struct ForceKeyUnitEvent {
+    /// When the request was raised, in running time. `ClockTime::NONE` when
+    /// the origin has no clock.
+    pub running_time: crate::clock::ClockTime,
+    /// Whether the entry point must carry its parameter sets in band.
+    ///
+    /// A consumer joining a stream mid-flight needs them; an encoder that
+    /// only emits them once must be told to repeat them.
+    pub all_headers: bool,
+    /// Monotonic per-origin counter, so a consumer can tell a repeated
+    /// request from a retransmitted one.
+    pub count: u32,
+}
+
+impl ForceKeyUnitEvent {
+    /// A request for the next possible entry point, with parameter sets.
+    pub fn new(count: u32) -> Self {
+        Self {
+            running_time: crate::clock::ClockTime::NONE,
+            all_headers: true,
+            count,
+        }
+    }
+}
+
 /// Quality-of-service feedback carried by [`Event::Qos`] (#184).
 ///
 /// Originated by a sink (via `Sink::take_upstream_event` /
@@ -883,7 +936,7 @@ pub enum QosType {
 /// `1/proportion`; the H.264 encoder turns on frame skipping under
 /// sustained pressure. Decisions should key on `proportion` — the counters
 /// are window totals that can double-count in diamond topologies.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct QosEvent {
     /// The kind of pressure being reported.
     pub qos_type: QosType,

@@ -75,6 +75,14 @@ pub trait VideoEncoder: Send {
     /// Encoded packet type (usually `Vec<u8>`).
     type Packet: AsRef<[u8]> + Send;
 
+    /// Which codec this encoder produces (#236).
+    ///
+    /// [`EncoderElement`](super::EncoderElement) is generic and has no other
+    /// way to name what came out of it, so it cannot stamp an honest
+    /// `Metadata.format` without this. Not part of the plugin ABI — adding it
+    /// needs no `PARALLAX_ABI_VERSION` bump.
+    fn codec(&self) -> crate::format::VideoCodec;
+
     /// Encode a video frame.
     ///
     /// Takes a borrowed view so callers can feed pipeline buffers without

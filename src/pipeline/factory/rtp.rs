@@ -4,13 +4,17 @@ use super::ElementFactory;
 #[cfg(feature = "rtp")]
 use super::Props;
 #[cfg(feature = "rtp")]
-use crate::element::{DynAsyncElement, ElementAdapter, SinkAdapter, SourceAdapter};
+use crate::element::{
+    DynAsyncElement, ElementAdapter, SinkAdapter, SourceAdapter, TransformAdapter,
+};
 #[cfg(feature = "rtp")]
 use crate::error::Result;
 
 pub(super) fn register(f: &mut ElementFactory) {
     #[cfg(feature = "rtp")]
     {
+        #[cfg(feature = "rtsp")]
+        f.register_async("rtspsrc", |p| Box::pin(create_rtspsrc(p)));
         f.register("rtpsrc", create_rtpsrc);
         f.register("rtpsink", create_rtpsink);
         f.register("rtpjitterbuffer", create_rtpjitterbuffer);
@@ -63,7 +67,8 @@ fn pay(props: &Props, kind: Pay) -> Result<Box<DynAsyncElement<'static>>> {
             if let Some(mtu) = mtu {
                 p = p.with_mtu(mtu);
             }
-            DynAsyncElement::new_box(ElementAdapter::new(p))
+            // #218: the payloaders are `Transform`s — one buffer per packet.
+            DynAsyncElement::new_box(TransformAdapter::new(p))
         }};
     }
     Ok(match kind {
@@ -76,15 +81,25 @@ fn pay(props: &Props, kind: Pay) -> Result<Box<DynAsyncElement<'static>>> {
     })
 }
 
+/// `rtph265depay [donl=<bool>]` — see [`RtpH265Depay::with_donl`]; the other
+/// depayloaders take no properties.
+///
+/// [`RtpH265Depay::with_donl`]: crate::elements::rtp::RtpH265Depay::with_donl
 #[cfg(feature = "rtp")]
-fn depay(_props: &Props, kind: Depay) -> Result<Box<DynAsyncElement<'static>>> {
+fn depay(props: &Props, kind: Depay) -> Result<Box<DynAsyncElement<'static>>> {
     use crate::elements::rtp::{
         RtpH264Depay, RtpH265Depay, RtpOpusDepay, RtpVp8Depay, RtpVp9Depay,
     };
 
     Ok(match kind {
         Depay::H264 => DynAsyncElement::new_box(ElementAdapter::new(RtpH264Depay::new())),
-        Depay::H265 => DynAsyncElement::new_box(ElementAdapter::new(RtpH265Depay::new())),
+        Depay::H265 => {
+            let mut d = RtpH265Depay::new();
+            if let Some(donl) = props.get_bool("donl")? {
+                d = d.with_donl(donl);
+            }
+            DynAsyncElement::new_box(ElementAdapter::new(d))
+        }
         Depay::Vp8 => DynAsyncElement::new_box(ElementAdapter::new(RtpVp8Depay::new())),
         Depay::Vp9 => DynAsyncElement::new_box(ElementAdapter::new(RtpVp9Depay::new())),
         Depay::Opus => DynAsyncElement::new_box(ElementAdapter::new(RtpOpusDepay::new())),
@@ -145,4 +160,81 @@ fn create_rtpjitterbuffer(props: &Props) -> Result<Box<DynAsyncElement<'static>>
         jb = jb.with_drop_late(drop);
     }
     Ok(DynAsyncElement::new_box(ElementAdapter::new(jb)))
+}
+
+// ============================================================================
+// RTSP (async constructor — DESCRIBE/SETUP/PLAY happen here)
+// ============================================================================
+
+/// `rtspsrc location=<url> [transport=tcp|udp] [timeout-ms=<n>]
+///         [video-only=<bool>] [audio-only=<bool>] [skip-until-keyframe=<bool>]
+///         [reconnect=<bool>] [reconnect-max-retries=<n>]
+///         [reconnect-initial-backoff-ms=<n>] [reconnect-max-backoff-ms=<n>]`
+///
+/// Credentials embedded in the URL (`rtsp://user:pass@host/...`) are lifted
+/// into RTSP auth automatically. The connection is made here, so a bad URL or
+/// an unreachable camera fails the parse rather than the run.
+///
+/// Reconnection is **on by default** (#206) and retries forever: a live camera
+/// feed must survive a switch reboot. `reconnect=false` restores the
+/// fail-the-run behaviour, which is what batch work wants.
+#[cfg(feature = "rtsp")]
+async fn create_rtspsrc(
+    props: super::Props,
+) -> crate::error::Result<Box<crate::element::DynAsyncElement<'static>>> {
+    use crate::element::AsyncSourceAdapter;
+    use crate::elements::{RtspSrc, RtspTransport};
+
+    let location = props.req_str("location")?;
+    let mut src = RtspSrc::new(location);
+
+    if let Some(transport) = props.get_enum(
+        "transport",
+        &[
+            ("tcp", RtspTransport::TcpInterleaved),
+            ("udp", RtspTransport::Udp),
+        ],
+    )? {
+        src = src.with_transport(transport);
+    }
+    if let Some(timeout) = props.get_ms("timeout-ms")? {
+        src = src.with_timeout(timeout);
+    }
+    if props.get_bool("video-only")?.unwrap_or(false) {
+        src = src.video_only();
+    }
+    if props.get_bool("audio-only")?.unwrap_or(false) {
+        src = src.audio_only();
+    }
+    if let Some(skip) = props.get_bool("skip-until-keyframe")? {
+        src = src.skip_until_keyframe(skip);
+    }
+
+    // #206. The individual knobs imply `reconnect=true`; `reconnect=false`
+    // wins outright, because saying "do not reconnect" and then tuning the
+    // backoff is a contradiction the parse should not silently resolve.
+    let mut reconnect = crate::elements::RtspReconnect::default();
+    let mut tuned = false;
+    if let Some(max) = props.get_u32("reconnect-max-retries")? {
+        reconnect.max_retries = Some(max);
+        tuned = true;
+    }
+    if let Some(d) = props.get_ms("reconnect-initial-backoff-ms")? {
+        reconnect.initial_backoff = d;
+        tuned = true;
+    }
+    if let Some(d) = props.get_ms("reconnect-max-backoff-ms")? {
+        reconnect.max_backoff = d;
+        tuned = true;
+    }
+    match props.get_bool("reconnect")? {
+        Some(false) => src = src.without_reconnect(),
+        _ if tuned => src = src.with_reconnect(reconnect),
+        _ => {}
+    }
+
+    let session = src.connect().await?;
+    Ok(crate::element::DynAsyncElement::new_box(
+        AsyncSourceAdapter::new(session),
+    ))
 }

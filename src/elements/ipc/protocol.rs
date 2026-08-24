@@ -20,14 +20,6 @@ use crate::error::{Error, Result};
 /// hostile length prefix cannot balloon an allocation.
 pub const MAX_CONTROL_MESSAGE_SIZE: usize = 64 * 1024;
 
-/// Custom-metadata keys forwarded across the IPC boundary.
-///
-/// Keys are `&'static str` in [`crate::metadata::Metadata`], so only keys
-/// known at compile time can be re-attached on the receiving side. Mirrors
-/// `zenoh_wire::KNOWN_CUSTOM_KEYS` (feature-gated, hence the small
-/// duplication); keep the two lists in sync when adding keys.
-pub const KNOWN_CUSTOM_KEYS: &[&str] = &["stanag/klv", "h264/sei"];
-
 /// Control messages between IpcSink and IpcSrc.
 ///
 /// Every variant is sink→src; the src's only signal back to the sink is
@@ -59,7 +51,9 @@ pub enum ControlMessage {
     MetaOverflow {
         /// The descriptor's ack-correlation seq.
         seq: u64,
-        /// `(key, bytes)` pairs; only [`KNOWN_CUSTOM_KEYS`] survive the trip.
+        /// `(key, bytes)` pairs. Every byte-valued custom entry travels
+        /// since #220; the receiver re-attaches each under its real key via
+        /// [`Metadata::intern`](crate::metadata::Metadata::intern).
         entries: Vec<(String, Vec<u8>)>,
     },
 

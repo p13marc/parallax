@@ -78,11 +78,13 @@
 //! └─────────────────────────────────────────────────────────────────┘
 //! ```
 //!
-//! # Feature Flags
+//! # Feature flags: there are none
 //!
-//! - `hls` - Enable HLS output (requires `mpeg-ts` feature)
-//! - `dash` - Enable DASH output (requires `mp4-demux` feature)
-//! - `streaming-protocols` - Enable both HLS and DASH
+//! This module compiles unconditionally. It used to advertise `hls`, `dash`
+//! and `streaming-protocols`; **none of those features exist in
+//! `Cargo.toml`** and none ever did. The segmenters are pure byte arithmetic
+//! over already-encoded data, so there is nothing to gate: producing the
+//! *input* needs `mpeg-ts` or `mp4-demux`, and that is where the gate is.
 
 mod dash;
 mod hls;

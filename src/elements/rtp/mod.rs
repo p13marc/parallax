@@ -32,6 +32,9 @@ mod rtp;
 mod rtcp;
 
 #[cfg(feature = "rtp")]
+mod h265_depacket;
+
+#[cfg(feature = "rtp")]
 mod rtp_codecs;
 
 #[cfg(feature = "rtp")]
@@ -66,6 +69,7 @@ pub use jitter_buffer::{
 // RTSP
 #[cfg(feature = "rtsp")]
 pub use rtsp::{
-    MediaType, RtspConfig, RtspCredentials, RtspFrame, RtspFrameFormat, RtspSession, RtspSrc,
-    RtspStats, RtspStreamInfoHandle, RtspTransport, StreamInfo, StreamSelection,
+    MediaType, RtspConfig, RtspCredentials, RtspFrame, RtspFrameFormat, RtspReconnect,
+    RtspSenderReport, RtspSession, RtspSrc, RtspStats, RtspStreamInfoHandle, RtspTransport,
+    RtspUnknownRtcpSsrc, StreamInfo, StreamSelection,
 };
