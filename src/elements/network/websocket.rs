@@ -406,11 +406,37 @@ impl AsyncSink for WebSocketSink {
         Ok(())
     }
 
+    /// Send the Close frame (#221).
+    ///
+    /// `close()` is blocking tungstenite, so it goes to the blocking pool for
+    /// the same reason `consume` does — and the socket has to come back, or
+    /// `Drop` would try to close a socket this already closed. Before this
+    /// hook existed, `Drop` was the only close path: a peer learned the stream
+    /// had ended only when the TCP connection dropped, with no status code.
+    async fn finish(&mut self, _reason: crate::pipeline::EndReason) -> Result<()> {
+        let Some(mut socket) = self.socket.take() else {
+            self.connected = false;
+            return Ok(());
+        };
+        let result = tokio::task::spawn_blocking(move || {
+            socket
+                .close(None)
+                .map_err(|e| Error::Element(format!("close error: {}", e)))
+        })
+        .await
+        .map_err(|e| Error::Element(format!("websocket sink close join error: {}", e)))?;
+        self.connected = false;
+        result
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
 }
 
+/// Last-resort close for the paths no hook runs on (`abort()`); the real one
+/// is [`AsyncSink::finish`] (#221), which took the socket, so this is a no-op
+/// after a normal end.
 impl Drop for WebSocketSink {
     fn drop(&mut self) {
         let _ = self.close();

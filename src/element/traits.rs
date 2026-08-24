@@ -9,6 +9,7 @@ use crate::element::context::{ConsumeContext, ProduceContext, ProduceResult};
 use crate::error::Result;
 use crate::event::{Event, EventResult};
 use crate::format::{Caps, ElementMediaCaps};
+use crate::pipeline::EndReason;
 use dynosaur::dynosaur;
 use smallvec::SmallVec;
 use std::any::Any;
@@ -851,6 +852,31 @@ pub trait Sink: Send {
         0
     }
 
+    /// Say goodbye, once, after the last buffer (#221).
+    ///
+    /// Called by the executor when the stream has ended — after the terminal
+    /// `handle_downstream_event`, before the element is dropped — with the
+    /// reason the run ended. This is where a sink *commits*: finalize a
+    /// container, close a playlist, flush a socket. Doing it in `Drop`
+    /// instead loses the error (a `Drop` cannot return one) and, for anything
+    /// that blocks, strands a Tokio worker (gotcha 15).
+    ///
+    /// Called at most once, and not at all when the pipeline is `abort()`ed —
+    /// aborting kills the tasks outright, so `Drop` must stay a correct, if
+    /// silent, backstop for anything that must not be left half-written.
+    ///
+    /// `Sink` is the *synchronous* author trait, so its hook is synchronous
+    /// too: the same call runs on the executor's async side wrapped by the
+    /// adapter, exactly as `consume` does. A sink whose goodbye is genuinely
+    /// async — one that awaits a socket — belongs on [`AsyncSink`], whose
+    /// [`finish`](AsyncSink::finish) returns a future.
+    ///
+    /// An `Err` is reported on the bus and does not change the run's outcome:
+    /// by the time it is called, the run already ended.
+    fn finish(&mut self, _reason: EndReason) -> Result<()> {
+        Ok(())
+    }
+
     /// Get a clock provider if this sink can provide a clock.
     ///
     /// Audio sinks typically provide a hardware clock that can be used
@@ -944,6 +970,30 @@ pub trait AsyncSink: Send {
     /// [`Sink::retained_buffers`].
     fn retained_buffers(&self) -> usize {
         0
+    }
+
+    /// Say goodbye, once, after the last buffer (#221) — the async form of
+    /// [`Sink::finish`].
+    ///
+    /// This is the hook a sink needs when its terminal action is I/O:
+    /// publishing an end-of-stream sample, sending a WebSocket Close frame,
+    /// POSTing a final chunk. `handle_downstream_event` is synchronous and
+    /// the task drops the element right after it, so before this existed the
+    /// only options were a detached `tokio::spawn` (which races teardown) or
+    /// blocking in `Drop` (which strands a worker — gotcha 15). Both are
+    /// wrong; this is the seam.
+    ///
+    /// Ordering is guaranteed by construction: it runs after the last
+    /// `consume` returned, on the same element, and the executor bounds it
+    /// with [`ExecutorConfig::finish_timeout`] so a wedged goodbye cannot
+    /// hang the pipeline's teardown.
+    ///
+    /// [`ExecutorConfig::finish_timeout`]: crate::pipeline::ExecutorConfig::finish_timeout
+    fn finish(
+        &mut self,
+        _reason: EndReason,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        async { Ok(()) }
     }
 
     /// Get a clock provider if this sink can provide a clock.
@@ -2004,6 +2054,25 @@ pub trait AsyncElementDyn {
         async { Ok(Vec::new()) }
     }
 
+    /// The terminal goodbye (#221) — see [`Sink::finish`]/[`AsyncSink::finish`].
+    ///
+    /// Awaited by the sink task once the run has ended, after the terminal
+    /// downstream event and before the element is dropped, bounded by
+    /// [`ExecutorConfig::finish_timeout`]. Only the sink families forward it;
+    /// every other adapter keeps the default, because a mid-graph element's
+    /// terminal work is [`flush`](Self::flush) — which already exists and
+    /// runs earlier, while there is still somewhere for its output to go.
+    ///
+    /// ABI 12: a new vtable slot.
+    ///
+    /// [`ExecutorConfig::finish_timeout`]: crate::pipeline::ExecutorConfig::finish_timeout
+    fn finish(
+        &mut self,
+        _reason: EndReason,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        async { Ok(()) }
+    }
+
     /// Set the pipeline clock for this element.
     ///
     /// Called by the executor when starting the pipeline to provide
@@ -2662,6 +2731,17 @@ impl<S: Sink + Send + 'static> SendAsyncElementDyn for SinkAdapter<S> {
             self.inner.consume(&ctx)?;
         }
         Ok(None)
+    }
+
+    // #221: the sync author trait's goodbye, run on the async side. Same
+    // shape as `consume` above — the adapter is the only place the two
+    // worlds meet.
+    fn finish(
+        &mut self,
+        reason: crate::pipeline::EndReason,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        let result = self.inner.finish(reason);
+        async move { result }
     }
 
     async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
@@ -3355,6 +3435,15 @@ impl<S: AsyncSink + Send + 'static> SendAsyncElementDyn for AsyncSinkAdapter<S> 
     // close its device on EOS.
     fn handle_downstream_event(&mut self, event: Event) -> Option<Event> {
         self.inner.handle_downstream_event(event)
+    }
+
+    // #221: and this is where it says goodbye — after that event, before it
+    // is dropped, with an await available.
+    fn finish(
+        &mut self,
+        reason: crate::pipeline::EndReason,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        self.inner.finish(reason)
     }
 
     fn as_clock_provider(&self) -> Option<&dyn ClockProvider> {

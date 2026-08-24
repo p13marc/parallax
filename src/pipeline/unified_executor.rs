@@ -60,6 +60,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 use tokio::sync::mpsc::{Receiver as MsgReceiver, Sender as MsgSender, channel as message_channel};
 
@@ -102,6 +103,17 @@ pub struct ExecutorConfig {
     /// transcode producing a file with gaps in it should stop and say so rather
     /// than finish and look successful.
     pub shed_fatal_after: Option<u64>,
+
+    /// How long a sink's terminal [`finish`](crate::element::AsyncSink::finish)
+    /// may take before the executor stops waiting (#221). Default: 2 s.
+    ///
+    /// The hook exists so a sink can commit — finalize a container, publish an
+    /// end-of-stream sample, close a socket — after its last buffer. That work
+    /// is I/O, and I/O wedges: a bounded wait is what keeps one unreachable
+    /// peer from hanging the whole teardown. On expiry the executor posts a
+    /// bus warning naming the element and carries on; the run's outcome is
+    /// already decided by then and does not change.
+    pub finish_timeout: Duration,
 }
 
 impl Default for ExecutorConfig {
@@ -113,6 +125,7 @@ impl Default for ExecutorConfig {
             driver: None,
             auto_strategy: true, // Enable automatic by default
             shed_fatal_after: None,
+            finish_timeout: Duration::from_secs(2),
         }
     }
 }
@@ -185,6 +198,14 @@ impl ExecutorConfig {
     /// indefinitely, which is right for live media and wrong for batch work.
     pub fn with_shed_fatal_after(mut self, limit: u64) -> Self {
         self.shed_fatal_after = Some(limit);
+        self
+    }
+
+    /// Bound a sink's terminal goodbye (#221).
+    ///
+    /// See [`finish_timeout`](Self::finish_timeout).
+    pub fn with_finish_timeout(mut self, timeout: Duration) -> Self {
+        self.finish_timeout = timeout;
         self
     }
 
@@ -2184,6 +2205,7 @@ impl Executor {
                     hop,
                     bus,
                     ShedTracker::new(self.config.shed_fatal_after),
+                    self.config.finish_timeout,
                     share,
                 )
             }
@@ -2954,6 +2976,50 @@ async fn guard<T>(node: &str, call: impl std::future::Future<Output = Result<T>>
             node: node.to_owned(),
             message: crate::error::panic_message(payload.as_ref()),
         }),
+    }
+}
+
+/// Run a sink's terminal goodbye (#221), bounded and never fatal.
+///
+/// Called once, from every path a sink task can leave by — and there are
+/// seven: EOS, an upstream error, a bare channel close, the RT bridge's two
+/// terminations, a cooperative shutdown, and a fatal error out of `consume`.
+/// A hook that only ran on the happy one would be worse than none, because
+/// the cases where a sink most needs to commit are exactly the unhappy ones.
+///
+/// Three properties, all deliberate:
+/// - **Bounded.** The work is I/O; I/O wedges. `finish_timeout` expiring
+///   posts a warning naming the element rather than hanging teardown.
+/// - **Never fatal.** The run's outcome is already decided by the time this
+///   runs, and re-deciding it here would let a sink turn a clean EOS into a
+///   failure after every consumer already saw the EOS.
+/// - **Guarded.** A panic inside surfaces as `Error::Panic` naming the
+///   element, like any other element call (#85) — reported, not unwound into
+///   the task.
+async fn finish_sink(
+    element: &mut Box<DynAsyncElement<'static>>,
+    name: &str,
+    reason: EndReason,
+    timeout: Duration,
+    bus: &BusHandle,
+) {
+    let call = guard(name, element.finish(reason));
+    match tokio::time::timeout(timeout, call).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::warn!("sink '{name}': finish() failed: {e}");
+            bus.post_warning(
+                format!("sink '{name}': finish() failed: {e}"),
+                Some(name.to_owned()),
+            );
+        }
+        Err(_) => {
+            tracing::warn!("sink '{name}': finish() timed out after {timeout:?}");
+            bus.post_warning(
+                format!("sink '{name}': finish() did not complete within {timeout:?}"),
+                Some(name.to_owned()),
+            );
+        }
     }
 }
 
@@ -3813,6 +3879,7 @@ fn spawn_sink_task(
     upstream: Option<UpstreamHop>,
     bus: BusHandle,
     mut shed: ShedTracker,
+    finish_timeout: Duration,
     share: TaskGuard,
 ) -> JoinHandle<Result<()>> {
     // Advance the shared last-presented-PTS cell. `max` keeps it monotonic
@@ -3880,6 +3947,10 @@ fn spawn_sink_task(
 
         let sink_pad = crate::pipeline::probe::PadRef::sink(node_id);
         let mut count: u64 = 0;
+        // #221: which of the seven exits this task took. The two `return`
+        // paths say goodbye where they stand; every `break` records it here
+        // and the tail below does it once.
+        let mut end_reason: Option<EndReason> = None;
 
         let n_inputs = inputs.len();
         tracing::debug!("sink '{}': {} inputs", name, n_inputs);
@@ -4071,10 +4142,24 @@ fn spawn_sink_task(
                             // ends EndReason::Eos once the cascade drains.
                             Err(Error::Shutdown) => {
                                 tracing::info!("sink '{name}': element requested shutdown");
+                                // A cooperative shutdown ends the run as Eos
+                                // (#191), so that is what the goodbye says.
+                                finish_sink(
+                                    &mut element,
+                                    &name,
+                                    EndReason::Eos,
+                                    finish_timeout,
+                                    &bus,
+                                )
+                                .await;
                                 wind_down.begin();
                                 return Ok(());
                             }
                             Err(e) => {
+                                let reason =
+                                    EndReason::Error(StreamError::new(name.clone(), e.to_string()));
+                                finish_sink(&mut element, &name, reason, finish_timeout, &bus)
+                                    .await;
                                 events.send_error(e.to_string(), Some(name.clone()));
                                 return Err(e);
                             }
@@ -4113,12 +4198,14 @@ fn spawn_sink_task(
                         // Deliver EOS to the element so sinks with external
                         // consumers (AppSink) can unblock them.
                         let _ = element.handle_downstream_event(crate::event::Event::Eos);
+                        end_reason = Some(EndReason::Eos);
                         break;
                     }
                     Some(Message::Error(err)) => {
                         // The whole point of #85: the consumer learns the
                         // pipeline *failed*, not that the stream ended.
                         tracing::error!("sink '{}': upstream failed: {}", name, err);
+                        end_reason = Some(EndReason::Error(err.clone()));
                         let _ = element.handle_downstream_event(crate::event::Event::Error(err));
                         break;
                     }
@@ -4127,7 +4214,13 @@ fn spawn_sink_task(
                         // its sender, so a bare close means the pipeline was
                         // aborted rather than that it ended.
                         tracing::debug!("sink '{}': channel closed after {}", name, count);
+                        // The in-band event stays `Eos` — `Event` has no
+                        // aborted variant and an AppSink consumer must still
+                        // be released — but `finish()` is told the truth
+                        // (#221), because that is the reason the executor
+                        // itself will record.
                         let _ = element.handle_downstream_event(crate::event::Event::Eos);
+                        end_reason = Some(EndReason::Aborted);
                         break;
                     }
                 }
@@ -4166,10 +4259,16 @@ fn spawn_sink_task(
                         // #191: see the channel path.
                         Err(Error::Shutdown) => {
                             tracing::info!("sink '{name}': element requested shutdown");
+                            // See the channel path.
+                            finish_sink(&mut element, &name, EndReason::Eos, finish_timeout, &bus)
+                                .await;
                             wind_down.begin();
                             return Ok(());
                         }
                         Err(e) => {
+                            let reason =
+                                EndReason::Error(StreamError::new(name.clone(), e.to_string()));
+                            finish_sink(&mut element, &name, reason, finish_timeout, &bus).await;
                             events.send_error(e.to_string(), Some(name.clone()));
                             return Err(e);
                         }
@@ -4190,6 +4289,10 @@ fn spawn_sink_task(
                             crate::event::Event::Eos
                         }
                     };
+                    end_reason = Some(match &event {
+                        crate::event::Event::Error(err) => EndReason::Error(err.clone()),
+                        _ => EndReason::Eos,
+                    });
                     let _ = element.handle_downstream_event(event);
                     break;
                 }
@@ -4198,10 +4301,18 @@ fn spawn_sink_task(
                     Ok(()) => {}
                     Err(e) => {
                         tracing::error!("sink '{}': bridge eventfd error: {}", name, e);
+                        end_reason = Some(EndReason::Error(StreamError::new(
+                            name.clone(),
+                            format!("bridge eventfd error: {e}"),
+                        )));
                         break;
                     }
                 }
             }
+        }
+
+        if let Some(reason) = end_reason {
+            finish_sink(&mut element, &name, reason, finish_timeout, &bus).await;
         }
 
         events.send_node_finished(&name, count);

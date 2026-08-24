@@ -387,6 +387,13 @@ pub trait PipelineElement {
     /// Get the element's type (source, sink, transform, demuxer, muxer).
     fn element_type(&self) -> ElementType;
 
+    /// Say goodbye, once, after the last buffer (#221).
+    ///
+    /// Only sinks are asked; see [`SimpleSink::finish`].
+    fn finish(&mut self, _reason: crate::pipeline::EndReason) -> Result<()> {
+        Ok(())
+    }
+
     /// Get the element's name (for debugging/logging).
     fn name(&self) -> &str {
         std::any::type_name::<Self>()
@@ -583,6 +590,15 @@ pub trait SimpleSink: Send {
         Some(event)
     }
 
+    /// Say goodbye, once, after the last buffer (#221).
+    ///
+    /// See [`Sink::finish`](crate::element::Sink::finish) — this is the same
+    /// hook for the unified simple traits, and it is where an `HlsSink` or a
+    /// `DashSink` closes its playlist instead of doing it in `Drop`.
+    fn finish(&mut self, _reason: crate::pipeline::EndReason) -> Result<()> {
+        Ok(())
+    }
+
     /// How many buffers the downstream graph can hold in flight.
     ///
     /// See [`Element::set_output_budget`](crate::element::Element::set_output_budget).
@@ -765,6 +781,10 @@ impl<T: SimpleSink + 'static> SendPipelineElement for Snk<T> {
     fn handle_downstream_event(&mut self, event: Event) -> Option<Event> {
         self.0.handle_downstream_event(event)
     }
+
+    fn finish(&mut self, reason: crate::pipeline::EndReason) -> Result<()> {
+        self.0.finish(reason)
+    }
 }
 
 /// Wrapper to convert a `SimpleTransform` into a `PipelineElement`.
@@ -916,6 +936,17 @@ impl<T: SendPipelineElement + 'static> super::traits::SendAsyncElementDyn
 
     fn handle_downstream_event(&mut self, event: Event) -> Option<Event> {
         self.inner.handle_downstream_event(event)
+    }
+
+    // #221: `HlsSink`/`DashSink` are `SimpleSink`s, so the goodbye has to
+    // reach them through this adapter too — they were the two sinks whose
+    // only close path was `Drop`.
+    fn finish(
+        &mut self,
+        reason: crate::pipeline::EndReason,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        let result = SendPipelineElement::finish(&mut self.inner, reason);
+        async move { result }
     }
 
     fn handle_upstream_event(&mut self, event: &Event) -> EventResult {

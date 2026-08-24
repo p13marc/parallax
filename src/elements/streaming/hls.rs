@@ -428,8 +428,19 @@ impl SimpleSink for HlsSink {
     fn execution_hints(&self) -> ExecutionHints {
         ExecutionHints::io_bound()
     }
+
+    /// Write the last segment and close the playlist (#221).
+    ///
+    /// A live playlist without its `#EXT-X-ENDLIST` reads as still-running to
+    /// every player, so this has to happen on the error paths too — and it
+    /// used to happen only in `Drop`, where the error went nowhere.
+    fn finish(&mut self, _reason: crate::pipeline::EndReason) -> Result<()> {
+        self.finalize()
+    }
 }
 
+/// Last-resort finalization; the real one is [`SimpleSink::finish`] (#221).
+/// `abort()` runs no hook, and `finalize` is idempotent.
 impl Drop for HlsSink {
     fn drop(&mut self) {
         // Try to finalize on drop
