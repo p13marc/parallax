@@ -847,6 +847,15 @@ impl Element for H264Encoder {
             }
             return EventResult::NotHandled;
         }
+
+        // A keyframe request stops here (#213): this encoder can satisfy it,
+        // and nothing further upstream can. `Handled` is what keeps a request
+        // raised by one sink from being acted on twice.
+        if let Event::ForceKeyUnit(_) = event {
+            self.control.request_keyframe();
+            return EventResult::handled();
+        }
+
         EventResult::NotHandled
     }
 

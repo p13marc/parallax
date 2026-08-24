@@ -30,12 +30,20 @@ fn test_arena() -> &'static SharedArena {
     ARENA.get_or_init(|| SharedArena::new(8192, 64).unwrap())
 }
 
-/// A port nobody else in this binary will claim.
-fn unique_port() -> u16 {
+/// An endpoint no other test can collide with.
+///
+/// A unix socket rather than a TCP port on purpose: nextest gives every test
+/// its own process, so a pid-derived port range is not actually unique — two
+/// concurrent test processes with nearby pids will pick the same port and one
+/// of them fails to bind. A path under `TMPDIR` cannot collide.
+fn unique_endpoint() -> (String, std::path::PathBuf) {
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    // High, and offset by pid so parallel test binaries do not collide.
-    let base = 38_000u64 + (std::process::id() as u64 % 4_000);
-    (base + NEXT.fetch_add(1, Ordering::Relaxed) * 7) as u16
+    let path = std::env::temp_dir().join(format!(
+        "parallax-zenoh-{}-{}.sock",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    (format!("unixsock-stream/{}", path.display()), path)
 }
 
 fn unique_key(tag: &str) -> String {
@@ -53,8 +61,10 @@ fn unique_key(tag: &str) -> String {
 /// Both have multicast *and* gossip scouting disabled, so they find each other
 /// only through the endpoint we hand them and nothing else on the machine.
 async fn session_pair() -> (zenoh::Session, zenoh::Session) {
-    let port = unique_port();
-    let endpoint = format!("tcp/127.0.0.1:{port}");
+    let (endpoint, path) = unique_endpoint();
+    // The socket file outlives the sessions; clean it up rather than
+    // littering TMPDIR across a test run.
+    let _ = std::fs::remove_file(&path);
 
     let mut listen = zenoh::Config::default();
     listen
@@ -390,6 +400,40 @@ async fn a_foreign_publisher_does_not_break_the_subscriber() {
 
     let received = next_buffer(&mut src).await;
     assert_eq!(received.as_bytes(), b"not an access unit");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_keyframe_request_is_raised_upstream_and_coalesced() {
+    let (pub_session, _sub) = session_pair().await;
+    let key = unique_key("video/h264/high");
+
+    let mut sink = ZenohSink::media_with_session(pub_session, &key)
+        .await
+        .expect("media sink");
+
+    assert!(
+        sink.take_upstream_event().is_none(),
+        "nothing to send before anyone asks"
+    );
+
+    // A viewer under loss asks far faster than a GOP; those must collapse.
+    sink.request_keyframe();
+    sink.request_keyframe();
+    sink.request_keyframe();
+    assert_eq!(sink.keyframe_requests(), 1, "requests coalesce");
+
+    match sink.take_upstream_event() {
+        Some(parallax::event::Event::ForceKeyUnit(e)) => {
+            assert!(e.all_headers, "a joining viewer needs the parameter sets");
+            assert_eq!(e.count, 1);
+        }
+        other => panic!("expected a ForceKeyUnit, got {other:?}"),
+    }
+
+    // Collected, so the next ask is a fresh one.
+    assert!(sink.take_upstream_event().is_none());
+    sink.request_keyframe();
+    assert_eq!(sink.keyframe_requests(), 2);
 }
 
 #[test]

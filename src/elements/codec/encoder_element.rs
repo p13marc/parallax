@@ -479,6 +479,18 @@ impl<E: VideoEncoder + 'static> Transform for EncoderElement<E> {
         "EncoderElement"
     }
 
+    /// A keyframe request terminates here (#213).
+    ///
+    /// This wrapper owns a real encoder, so it can satisfy the request and
+    /// nothing upstream of it can. Other upstream events are left alone.
+    fn handle_upstream_event(&mut self, event: &crate::event::Event) -> crate::event::EventResult {
+        if let crate::event::Event::ForceKeyUnit(_) = event {
+            self.control.request_keyframe();
+            return crate::event::EventResult::handled();
+        }
+        crate::event::EventResult::NotHandled
+    }
+
     fn input_media_caps(&self) -> crate::format::ElementMediaCaps {
         use crate::format::{
             CapsValue, ElementMediaCaps, FormatMemoryCap, MemoryCaps, PixelFormat, VideoFormatCaps,

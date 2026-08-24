@@ -611,6 +611,10 @@ pub struct ZenohSink {
     /// `Media` only: keeps every published keyframe a self-contained decoder
     /// entry point.
     param_sets: Option<crate::codec::annexb::ParamSetCache>,
+    /// A keyframe request waiting to be handed to the executor's upstream
+    /// path, and the monotonic counter that stamps it.
+    pending_keyframe: Option<crate::event::ForceKeyUnitEvent>,
+    keyframe_requests: u64,
     bytes_sent: u64,
     samples_sent: u64,
 }
@@ -650,6 +654,8 @@ impl ZenohSink {
             profile: WireProfile::Parallax,
             wire_sequence: 0,
             param_sets: None,
+            pending_keyframe: None,
+            keyframe_requests: 0,
             bytes_sent: 0,
             samples_sent: 0,
         })
@@ -710,6 +716,30 @@ impl ZenohSink {
     /// Which wire contract this sink speaks.
     pub fn profile(&self) -> WireProfile {
         self.profile
+    }
+
+    /// Ask upstream for a decoder entry point (#213, #234).
+    ///
+    /// Queues an [`Event::ForceKeyUnit`](crate::event::Event::ForceKeyUnit)
+    /// for the executor to carry toward the sources, where the first encoder
+    /// consumes it. In a passthrough graph — an RTSP camera republished
+    /// verbatim — nothing can satisfy it, and that is the honest outcome:
+    /// RTSP has no standard way to ask a camera for an IDR.
+    ///
+    /// Repeated calls before the executor collects coalesce into one request.
+    /// A viewer under packet loss will ask far faster than a GOP.
+    pub fn request_keyframe(&mut self) {
+        if self.pending_keyframe.is_none() {
+            self.keyframe_requests += 1;
+            self.pending_keyframe = Some(crate::event::ForceKeyUnitEvent::new(
+                self.keyframe_requests as u32,
+            ));
+        }
+    }
+
+    /// How many keyframe requests this sink has raised.
+    pub fn keyframe_requests(&self) -> u64 {
+        self.keyframe_requests
     }
 
     /// Set a custom name.
@@ -911,6 +941,16 @@ impl AsyncSink for ZenohSink {
 
     fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Hand a queued keyframe request to the executor's upstream path.
+    ///
+    /// Polled after every `consume`, so a request raised between samples goes
+    /// out on the next one.
+    fn take_upstream_event(&mut self) -> Option<crate::event::Event> {
+        self.pending_keyframe
+            .take()
+            .map(crate::event::Event::ForceKeyUnit)
     }
 }
 
