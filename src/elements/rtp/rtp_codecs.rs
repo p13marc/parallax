@@ -598,10 +598,17 @@ impl Element for RtpVp8Depay {
                 let mut metadata = buffer.metadata().clone();
                 metadata.format = Some(MediaFormat::Video(VideoCodec::Vp8));
 
-                // VP8 keyframe detection
-                if !output.is_empty() && (output[0] & 0x01) == 0 {
-                    metadata.flags = metadata.flags.insert(BufferFlags::SYNC_POINT);
-                }
+                // VP8 read the frame-type bit correctly but only ever *set*
+                // the flag (#239), so an inter frame kept the SYNC_POINT
+                // `RtpSrc` had set from the RTP marker bit — which means "end
+                // of access unit", not "keyframe". The verdict has to clear it
+                // too. An unreadable frame leaves the flag alone rather than
+                // asserting anything about bytes it could not parse.
+                metadata.flags = match crate::codec::vpx::vp8_is_keyframe(&output) {
+                    Some(true) => metadata.flags.insert(BufferFlags::SYNC_POINT),
+                    Some(false) => metadata.flags.remove(BufferFlags::SYNC_POINT),
+                    None => metadata.flags,
+                };
 
                 Ok(Some(Buffer::new(handle, metadata)))
             }
@@ -786,6 +793,16 @@ impl Element for RtpVp9Depay {
 
                 let mut metadata = buffer.metadata().clone();
                 metadata.format = Some(MediaFormat::Video(VideoCodec::Vp9));
+
+                // VP9 had no detection at all (#239) and inherited the RTP
+                // marker bit's SYNC_POINT, so roughly every frame claimed to
+                // be an entry point. `annexb` does not apply here — VP9 has no
+                // start codes — so the uncompressed header answers it.
+                metadata.flags = match crate::codec::vpx::vp9_is_keyframe(&output) {
+                    Some(true) => metadata.flags.insert(BufferFlags::SYNC_POINT),
+                    Some(false) => metadata.flags.remove(BufferFlags::SYNC_POINT),
+                    None => metadata.flags,
+                };
 
                 Ok(Some(Buffer::new(handle, metadata)))
             }
@@ -1371,6 +1388,76 @@ mod tests {
             "600-byte OBU at MTU 200 must fragment, got {} packets",
             pay.stats().packets_out
         );
+    }
+
+    /// A buffer whose metadata already claims SYNC_POINT — which is what
+    /// `RtpSrc` hands a depayloader, because it sets the flag from the RTP
+    /// *marker* bit ("end of access unit"), not from the bitstream.
+    fn marked_buffer(data: &[u8]) -> Buffer {
+        let arena = test_arena();
+        arena.reclaim();
+        let mut slot = arena.acquire().unwrap();
+        slot.data_mut()[..data.len()].copy_from_slice(data);
+        let handle = crate::buffer::MemoryHandle::with_len(slot, data.len());
+        let mut metadata = Metadata::default();
+        metadata.flags = metadata.flags.insert(BufferFlags::SYNC_POINT);
+        Buffer::new(handle, metadata)
+    }
+
+    /// #239: the VPx depayloaders must *clear* the inherited marker-bit flag
+    /// on an inter frame, not merely fail to set it.
+    #[test]
+    fn the_vpx_depayloaders_clear_an_inherited_sync_point() {
+        // VP8 frame tag: bit 0 is frame_type, inverted.
+        let vp8_key = [0x00u8, 0x9D, 0x01, 0x2A];
+        let vp8_inter = [0x01u8, 0x9D, 0x01, 0x2A];
+        for (frame, expect_key) in [(&vp8_key[..], true), (&vp8_inter[..], false)] {
+            let mut pay = RtpVp8Pay::new();
+            let packet = pay
+                .process(create_test_buffer(frame))
+                .unwrap()
+                .expect("one packet");
+            let mut depay = RtpVp8Depay::new();
+            let out = depay
+                .process(marked_buffer(packet.as_bytes()))
+                .unwrap()
+                .expect("frame out");
+            // Proves the round-trip really carried the frame — without this
+            // an unparsed payload would keep the inherited flag and the
+            // keyframe half of the assertion would pass for the wrong reason.
+            assert_eq!(out.as_bytes(), frame, "the descriptor is stripped");
+            assert_eq!(
+                out.metadata().flags.is_keyframe(),
+                expect_key,
+                "VP8 keyframe verdict must come from the bitstream, not the marker bit"
+            );
+        }
+
+        // VP9 profile 0: frame_marker=10, profile bits 0, show_existing=0,
+        // then frame_type.
+        let vp9_key = [0b1000_0000u8, 0x49, 0x83, 0x42];
+        let vp9_inter = [0b1000_0100u8, 0x49, 0x83, 0x42];
+        for (frame, expect_key) in [(&vp9_key[..], true), (&vp9_inter[..], false)] {
+            let mut pay = RtpVp9Pay::new();
+            let packet = pay
+                .process(create_test_buffer(frame))
+                .unwrap()
+                .expect("one packet");
+            let mut depay = RtpVp9Depay::new();
+            let out = depay
+                .process(marked_buffer(packet.as_bytes()))
+                .unwrap()
+                .expect("frame out");
+            // Proves the round-trip really carried the frame — without this
+            // an unparsed payload would keep the inherited flag and the
+            // keyframe half of the assertion would pass for the wrong reason.
+            assert_eq!(out.as_bytes(), frame, "the descriptor is stripped");
+            assert_eq!(
+                out.metadata().flags.is_keyframe(),
+                expect_key,
+                "VP9 keyframe verdict must come from the uncompressed header"
+            );
+        }
     }
 
     #[test]
