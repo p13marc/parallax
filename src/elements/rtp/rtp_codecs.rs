@@ -31,11 +31,11 @@
 //! ```
 
 use crate::buffer::Buffer;
-use crate::element::Element;
+use crate::element::{Element, Output, Transform};
 use crate::error::{Error, Result};
 use crate::format::{MediaFormat, RtpEncoding, RtpFormat, VideoCodec};
 use crate::memory::{OutputArena, OutputBudget, defaults};
-use crate::metadata::BufferFlags;
+use crate::metadata::{BufferFlags, RtpMeta};
 
 use bytes::Bytes;
 use rtp::codecs::av1::Av1Payloader;
@@ -221,6 +221,92 @@ impl Element for RtpH264Depay {
 }
 
 // ============================================================================
+// Packetization (#218)
+// ============================================================================
+
+/// The RTP clock for video, in Hz. Every video payload type in RFC 3551 and
+/// its successors uses 90 kHz.
+const VIDEO_CLOCK_RATE: u32 = 90_000;
+
+/// Per-packet stamping, shared by every payloader (#218).
+///
+/// A payloader used to concatenate an access unit's packets into one buffer,
+/// which `RtpSink` then wrapped in a *single* RTP header — so any frame that
+/// fragmented (every keyframe) went out as one malformed, oversized packet.
+/// The fix is one buffer per packet, and stamping the header fields that only
+/// the packetizer knows:
+///
+/// - `seq` is monotonic across the stream, not per access unit;
+/// - `ts` is **shared** by every packet of one access unit — that is what
+///   makes them one frame to a receiver;
+/// - `marker` is set on the **last** packet of the access unit, which is what
+///   the bit means. `RtpSink`'s fallback set it from `is_keyframe()`, which is
+///   a different question entirely.
+///
+/// `ssrc` and `pt` stay 0: they are transport identity, owned by the sink,
+/// which already overrides them with its own.
+struct PayStamp {
+    next_seq: u16,
+    clock_rate: u32,
+}
+
+impl PayStamp {
+    fn new(clock_rate: u32) -> Self {
+        Self {
+            next_seq: 0,
+            clock_rate,
+        }
+    }
+
+    /// One buffer per packet, over **one** arena slot.
+    ///
+    /// The packets are copied contiguously and handed out as zero-copy slices
+    /// of that slot. A slot each would be the obvious shape and the wrong one:
+    /// `Output::Multiple` hands the executor every buffer at once, so a
+    /// 60 KB keyframe at a 1200-byte MTU would need fifty slots live
+    /// simultaneously and exhaust an arena sized for the link.
+    fn emit(
+        &mut self,
+        packets: &[Bytes],
+        input: &Buffer,
+        format: MediaFormat,
+        arena: &mut OutputArena,
+        stats: &mut PayStats,
+        name: &'static str,
+    ) -> Result<Output> {
+        if packets.is_empty() {
+            return Ok(Output::None);
+        }
+
+        let total: usize = packets.iter().map(|p| p.len()).sum();
+        let mut slot = arena.acquire(total, name)?;
+        let mut offset = 0;
+        for packet in packets {
+            slot.data_mut()[offset..offset + packet.len()].copy_from_slice(packet.as_ref());
+            offset += packet.len();
+        }
+        let whole = crate::buffer::MemoryHandle::with_len(slot, total);
+
+        let ts = RtpMeta::clock_to_timestamp(input.metadata().pts, self.clock_rate);
+        let last = packets.len() - 1;
+        let mut out = Vec::with_capacity(packets.len());
+        let mut offset = 0;
+        for (i, packet) in packets.iter().enumerate() {
+            let mut metadata = input.metadata().clone();
+            metadata.format = Some(format.clone());
+            metadata.rtp = Some(RtpMeta::new(self.next_seq, ts, 0, 0, i == last));
+            self.next_seq = self.next_seq.wrapping_add(1);
+            out.push(Buffer::new(whole.slice(offset, packet.len()), metadata));
+            offset += packet.len();
+        }
+
+        stats.packets_out += packets.len() as u64;
+        stats.bytes_out += total as u64;
+        Ok(Output::Multiple(out))
+    }
+}
+
+// ============================================================================
 // H.264 Payloader
 // ============================================================================
 
@@ -242,6 +328,8 @@ impl Element for RtpH264Depay {
 /// ```
 pub struct RtpH264Pay {
     name: String,
+    /// Per-packet RTP header stamping (#218).
+    stamp: PayStamp,
     payloader: H264Payloader,
     mtu: usize,
     stats: PayStats,
@@ -253,6 +341,7 @@ impl RtpH264Pay {
     pub fn new() -> Self {
         Self {
             name: "rtp-h264-pay".into(),
+            stamp: PayStamp::new(VIDEO_CLOCK_RATE),
             payloader: H264Payloader::default(),
             mtu: DEFAULT_MTU,
             stats: PayStats::default(),
@@ -286,47 +375,50 @@ impl Default for RtpH264Pay {
     }
 }
 
-impl Element for RtpH264Pay {
+impl Transform for RtpH264Pay {
     fn set_output_budget(&mut self, budget: OutputBudget) {
         self.output.set_budget(budget);
     }
 
-    fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
+    /// One buffer per RTP packet (#218).
+    fn transform(&mut self, buffer: Buffer) -> Result<Output> {
         let payload = Bytes::copy_from_slice(buffer.as_bytes());
         self.stats.frames_in += 1;
 
         match self.payloader.payload(self.mtu, &payload) {
-            Ok(packets) => {
-                if packets.is_empty() {
-                    return Ok(None);
-                }
-
-                // For now, concatenate all packets into one buffer
-                // In a real implementation, we'd use Output::Multiple
-                let total_len: usize = packets.iter().map(|p| p.len()).sum();
-                self.stats.packets_out += packets.len() as u64;
-                self.stats.bytes_out += total_len as u64;
-
-                let mut slot = self.output.acquire(total_len, "rtph264pay")?;
-
-                let mut offset = 0;
-                for packet in &packets {
-                    slot.data_mut()[offset..offset + packet.len()].copy_from_slice(packet.as_ref());
-                    offset += packet.len();
-                }
-
-                let handle = crate::buffer::MemoryHandle::with_len(slot, total_len);
-
-                let mut metadata = buffer.metadata().clone();
-                metadata.format = Some(MediaFormat::Rtp(RtpFormat::H264));
-
-                Ok(Some(Buffer::new(handle, metadata)))
-            }
+            Ok(packets) => self.stamp.emit(
+                &packets,
+                &buffer,
+                MediaFormat::Rtp(RtpFormat::H264),
+                &mut self.output,
+                &mut self.stats,
+                "rtph264pay",
+            ),
             Err(e) => {
                 self.stats.errors += 1;
                 Err(Error::Element(format!("H.264 packetize error: {}", e)))
             }
         }
+    }
+
+    /// A payloader accepts the codec it packetizes and emits RTP (#218).
+    ///
+    /// No RTP element declared caps before this, so a mis-wired graph got no
+    /// answer from `prepare()` at all.
+    fn input_media_caps(&self) -> crate::format::ElementMediaCaps {
+        use crate::format::{ElementMediaCaps, FormatCaps, FormatMemoryCap, MemoryCaps};
+        ElementMediaCaps::new(vec![FormatMemoryCap::new(
+            FormatCaps::Video(VideoCodec::H264),
+            MemoryCaps::cpu_only(),
+        )])
+    }
+
+    fn output_media_caps(&self) -> crate::format::ElementMediaCaps {
+        use crate::format::{ElementMediaCaps, FormatCaps, FormatMemoryCap, MemoryCaps};
+        ElementMediaCaps::new(vec![FormatMemoryCap::new(
+            FormatCaps::Rtp(RtpFormat::H264),
+            MemoryCaps::cpu_only(),
+        )])
     }
 
     fn name(&self) -> &str {
@@ -438,6 +530,8 @@ impl Element for RtpH265Depay {
 /// H.265/HEVC RTP packetizer.
 pub struct RtpH265Pay {
     name: String,
+    /// Per-packet RTP header stamping (#218).
+    stamp: PayStamp,
     payloader: HevcPayloader,
     mtu: usize,
     stats: PayStats,
@@ -449,6 +543,7 @@ impl RtpH265Pay {
     pub fn new() -> Self {
         Self {
             name: "rtp-h265-pay".into(),
+            stamp: PayStamp::new(VIDEO_CLOCK_RATE),
             payloader: HevcPayloader::default(),
             mtu: DEFAULT_MTU,
             stats: PayStats::default(),
@@ -482,46 +577,50 @@ impl Default for RtpH265Pay {
     }
 }
 
-impl Element for RtpH265Pay {
+impl Transform for RtpH265Pay {
     fn set_output_budget(&mut self, budget: OutputBudget) {
         self.output.set_budget(budget);
     }
 
-    fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
+    /// One buffer per RTP packet (#218).
+    fn transform(&mut self, buffer: Buffer) -> Result<Output> {
         let payload = Bytes::copy_from_slice(buffer.as_bytes());
         self.stats.frames_in += 1;
 
         match self.payloader.payload(self.mtu, &payload) {
-            Ok(packets) => {
-                let packets: Vec<Bytes> = packets;
-                if packets.is_empty() {
-                    return Ok(None);
-                }
-
-                let total_len: usize = packets.iter().map(|p: &Bytes| p.len()).sum();
-                self.stats.packets_out += packets.len() as u64;
-                self.stats.bytes_out += total_len as u64;
-
-                let mut slot = self.output.acquire(total_len, "rtph265pay")?;
-
-                let mut offset = 0;
-                for packet in &packets {
-                    slot.data_mut()[offset..offset + packet.len()].copy_from_slice(packet.as_ref());
-                    offset += packet.len();
-                }
-
-                let handle = crate::buffer::MemoryHandle::with_len(slot, total_len);
-
-                let mut metadata = buffer.metadata().clone();
-                metadata.format = Some(MediaFormat::Rtp(RtpFormat::H265));
-
-                Ok(Some(Buffer::new(handle, metadata)))
-            }
+            Ok(packets) => self.stamp.emit(
+                &packets,
+                &buffer,
+                MediaFormat::Rtp(RtpFormat::H265),
+                &mut self.output,
+                &mut self.stats,
+                "rtph265pay",
+            ),
             Err(e) => {
                 self.stats.errors += 1;
                 Err(Error::Element(format!("H.265 packetize error: {}", e)))
             }
         }
+    }
+
+    /// A payloader accepts the codec it packetizes and emits RTP (#218).
+    ///
+    /// No RTP element declared caps before this, so a mis-wired graph got no
+    /// answer from `prepare()` at all.
+    fn input_media_caps(&self) -> crate::format::ElementMediaCaps {
+        use crate::format::{ElementMediaCaps, FormatCaps, FormatMemoryCap, MemoryCaps};
+        ElementMediaCaps::new(vec![FormatMemoryCap::new(
+            FormatCaps::Video(VideoCodec::H265),
+            MemoryCaps::cpu_only(),
+        )])
+    }
+
+    fn output_media_caps(&self) -> crate::format::ElementMediaCaps {
+        use crate::format::{ElementMediaCaps, FormatCaps, FormatMemoryCap, MemoryCaps};
+        ElementMediaCaps::new(vec![FormatMemoryCap::new(
+            FormatCaps::Rtp(RtpFormat::H265),
+            MemoryCaps::cpu_only(),
+        )])
     }
 
     fn name(&self) -> &str {
@@ -631,6 +730,8 @@ impl Element for RtpVp8Depay {
 /// VP8 RTP packetizer.
 pub struct RtpVp8Pay {
     name: String,
+    /// Per-packet RTP header stamping (#218).
+    stamp: PayStamp,
     payloader: Vp8Payloader,
     mtu: usize,
     stats: PayStats,
@@ -642,6 +743,7 @@ impl RtpVp8Pay {
     pub fn new() -> Self {
         Self {
             name: "rtp-vp8-pay".into(),
+            stamp: PayStamp::new(VIDEO_CLOCK_RATE),
             payloader: Vp8Payloader::default(),
             mtu: DEFAULT_MTU,
             stats: PayStats::default(),
@@ -675,49 +777,50 @@ impl Default for RtpVp8Pay {
     }
 }
 
-impl Element for RtpVp8Pay {
+impl Transform for RtpVp8Pay {
     fn set_output_budget(&mut self, budget: OutputBudget) {
         self.output.set_budget(budget);
     }
 
-    fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
+    /// One buffer per RTP packet (#218).
+    fn transform(&mut self, buffer: Buffer) -> Result<Output> {
         let payload = Bytes::copy_from_slice(buffer.as_bytes());
         self.stats.frames_in += 1;
 
         match self.payloader.payload(self.mtu, &payload) {
-            Ok(packets) => {
-                if packets.is_empty() {
-                    return Ok(None);
-                }
-
-                let total_len: usize = packets.iter().map(|p| p.len()).sum();
-                self.stats.packets_out += packets.len() as u64;
-                self.stats.bytes_out += total_len as u64;
-
-                let mut slot = self.output.acquire(total_len, "rtpvp8pay")?;
-
-                let mut offset = 0;
-                for packet in &packets {
-                    slot.data_mut()[offset..offset + packet.len()].copy_from_slice(packet.as_ref());
-                    offset += packet.len();
-                }
-
-                let handle = crate::buffer::MemoryHandle::with_len(slot, total_len);
-
-                let mut metadata = buffer.metadata().clone();
-                metadata.format = Some(MediaFormat::Rtp(RtpFormat::new(
-                    96,
-                    90000,
-                    RtpEncoding::Vp8,
-                )));
-
-                Ok(Some(Buffer::new(handle, metadata)))
-            }
+            Ok(packets) => self.stamp.emit(
+                &packets,
+                &buffer,
+                MediaFormat::Rtp(RtpFormat::new(96, 90000, RtpEncoding::Vp8)),
+                &mut self.output,
+                &mut self.stats,
+                "rtpvp8pay",
+            ),
             Err(e) => {
                 self.stats.errors += 1;
                 Err(Error::Element(format!("VP8 packetize error: {}", e)))
             }
         }
+    }
+
+    /// A payloader accepts the codec it packetizes and emits RTP (#218).
+    ///
+    /// No RTP element declared caps before this, so a mis-wired graph got no
+    /// answer from `prepare()` at all.
+    fn input_media_caps(&self) -> crate::format::ElementMediaCaps {
+        use crate::format::{ElementMediaCaps, FormatCaps, FormatMemoryCap, MemoryCaps};
+        ElementMediaCaps::new(vec![FormatMemoryCap::new(
+            FormatCaps::Video(VideoCodec::Vp8),
+            MemoryCaps::cpu_only(),
+        )])
+    }
+
+    fn output_media_caps(&self) -> crate::format::ElementMediaCaps {
+        use crate::format::{ElementMediaCaps, FormatCaps, FormatMemoryCap, MemoryCaps};
+        ElementMediaCaps::new(vec![FormatMemoryCap::new(
+            FormatCaps::Rtp(RtpFormat::new(96, 90000, RtpEncoding::Vp8)),
+            MemoryCaps::cpu_only(),
+        )])
     }
 
     fn name(&self) -> &str {
@@ -825,6 +928,8 @@ impl Element for RtpVp9Depay {
 /// VP9 RTP packetizer.
 pub struct RtpVp9Pay {
     name: String,
+    /// Per-packet RTP header stamping (#218).
+    stamp: PayStamp,
     payloader: Vp9Payloader,
     mtu: usize,
     stats: PayStats,
@@ -836,6 +941,7 @@ impl RtpVp9Pay {
     pub fn new() -> Self {
         Self {
             name: "rtp-vp9-pay".into(),
+            stamp: PayStamp::new(VIDEO_CLOCK_RATE),
             payloader: Vp9Payloader::default(),
             mtu: DEFAULT_MTU,
             stats: PayStats::default(),
@@ -869,49 +975,50 @@ impl Default for RtpVp9Pay {
     }
 }
 
-impl Element for RtpVp9Pay {
+impl Transform for RtpVp9Pay {
     fn set_output_budget(&mut self, budget: OutputBudget) {
         self.output.set_budget(budget);
     }
 
-    fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
+    /// One buffer per RTP packet (#218).
+    fn transform(&mut self, buffer: Buffer) -> Result<Output> {
         let payload = Bytes::copy_from_slice(buffer.as_bytes());
         self.stats.frames_in += 1;
 
         match self.payloader.payload(self.mtu, &payload) {
-            Ok(packets) => {
-                if packets.is_empty() {
-                    return Ok(None);
-                }
-
-                let total_len: usize = packets.iter().map(|p| p.len()).sum();
-                self.stats.packets_out += packets.len() as u64;
-                self.stats.bytes_out += total_len as u64;
-
-                let mut slot = self.output.acquire(total_len, "rtpvp9pay")?;
-
-                let mut offset = 0;
-                for packet in &packets {
-                    slot.data_mut()[offset..offset + packet.len()].copy_from_slice(packet.as_ref());
-                    offset += packet.len();
-                }
-
-                let handle = crate::buffer::MemoryHandle::with_len(slot, total_len);
-
-                let mut metadata = buffer.metadata().clone();
-                metadata.format = Some(MediaFormat::Rtp(RtpFormat::new(
-                    98,
-                    90000,
-                    RtpEncoding::Vp9,
-                )));
-
-                Ok(Some(Buffer::new(handle, metadata)))
-            }
+            Ok(packets) => self.stamp.emit(
+                &packets,
+                &buffer,
+                MediaFormat::Rtp(RtpFormat::new(98, 90000, RtpEncoding::Vp9)),
+                &mut self.output,
+                &mut self.stats,
+                "rtpvp9pay",
+            ),
             Err(e) => {
                 self.stats.errors += 1;
                 Err(Error::Element(format!("VP9 packetize error: {}", e)))
             }
         }
+    }
+
+    /// A payloader accepts the codec it packetizes and emits RTP (#218).
+    ///
+    /// No RTP element declared caps before this, so a mis-wired graph got no
+    /// answer from `prepare()` at all.
+    fn input_media_caps(&self) -> crate::format::ElementMediaCaps {
+        use crate::format::{ElementMediaCaps, FormatCaps, FormatMemoryCap, MemoryCaps};
+        ElementMediaCaps::new(vec![FormatMemoryCap::new(
+            FormatCaps::Video(VideoCodec::Vp9),
+            MemoryCaps::cpu_only(),
+        )])
+    }
+
+    fn output_media_caps(&self) -> crate::format::ElementMediaCaps {
+        use crate::format::{ElementMediaCaps, FormatCaps, FormatMemoryCap, MemoryCaps};
+        ElementMediaCaps::new(vec![FormatMemoryCap::new(
+            FormatCaps::Rtp(RtpFormat::new(98, 90000, RtpEncoding::Vp9)),
+            MemoryCaps::cpu_only(),
+        )])
     }
 
     fn name(&self) -> &str {
@@ -1020,6 +1127,8 @@ impl Element for RtpOpusDepay {
 /// ```
 pub struct RtpOpusPay {
     name: String,
+    /// Per-packet RTP header stamping (#218).
+    stamp: PayStamp,
     payloader: OpusPayloader,
     mtu: usize,
     stats: PayStats,
@@ -1031,6 +1140,7 @@ impl RtpOpusPay {
     pub fn new() -> Self {
         Self {
             name: "rtp-opus-pay".into(),
+            stamp: PayStamp::new(48_000),
             payloader: OpusPayloader,
             mtu: DEFAULT_MTU,
             stats: PayStats::default(),
@@ -1064,45 +1174,50 @@ impl Default for RtpOpusPay {
     }
 }
 
-impl Element for RtpOpusPay {
+impl Transform for RtpOpusPay {
     fn set_output_budget(&mut self, budget: OutputBudget) {
         self.output.set_budget(budget);
     }
 
-    fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
+    /// One buffer per RTP packet (#218).
+    fn transform(&mut self, buffer: Buffer) -> Result<Output> {
         let payload = Bytes::copy_from_slice(buffer.as_bytes());
         self.stats.frames_in += 1;
 
         match self.payloader.payload(self.mtu, &payload) {
-            Ok(packets) => {
-                if packets.is_empty() {
-                    return Ok(None);
-                }
-
-                let total_len: usize = packets.iter().map(|p| p.len()).sum();
-                self.stats.packets_out += packets.len() as u64;
-                self.stats.bytes_out += total_len as u64;
-
-                let mut slot = self.output.acquire(total_len, "rtpopuspay")?;
-
-                let mut offset = 0;
-                for packet in &packets {
-                    slot.data_mut()[offset..offset + packet.len()].copy_from_slice(packet.as_ref());
-                    offset += packet.len();
-                }
-
-                let handle = crate::buffer::MemoryHandle::with_len(slot, total_len);
-
-                let mut metadata = buffer.metadata().clone();
-                metadata.format = Some(MediaFormat::Rtp(RtpFormat::OPUS));
-
-                Ok(Some(Buffer::new(handle, metadata)))
-            }
+            Ok(packets) => self.stamp.emit(
+                &packets,
+                &buffer,
+                MediaFormat::Rtp(RtpFormat::OPUS),
+                &mut self.output,
+                &mut self.stats,
+                "rtpopuspay",
+            ),
             Err(e) => {
                 self.stats.errors += 1;
                 Err(Error::Element(format!("Opus packetize error: {}", e)))
             }
         }
+    }
+
+    /// A payloader accepts the codec it packetizes and emits RTP (#218).
+    ///
+    /// No RTP element declared caps before this, so a mis-wired graph got no
+    /// answer from `prepare()` at all.
+    fn input_media_caps(&self) -> crate::format::ElementMediaCaps {
+        use crate::format::{ElementMediaCaps, FormatCaps, FormatMemoryCap, MemoryCaps};
+        ElementMediaCaps::new(vec![FormatMemoryCap::new(
+            FormatCaps::Audio(crate::format::AudioCodec::Opus),
+            MemoryCaps::cpu_only(),
+        )])
+    }
+
+    fn output_media_caps(&self) -> crate::format::ElementMediaCaps {
+        use crate::format::{ElementMediaCaps, FormatCaps, FormatMemoryCap, MemoryCaps};
+        ElementMediaCaps::new(vec![FormatMemoryCap::new(
+            FormatCaps::Rtp(RtpFormat::OPUS),
+            MemoryCaps::cpu_only(),
+        )])
     }
 
     fn name(&self) -> &str {
@@ -1121,6 +1236,8 @@ impl Element for RtpOpusPay {
 /// this is one-way interop towards RTP-native AV1 receivers.
 pub struct RtpAv1Pay {
     name: String,
+    /// Per-packet RTP header stamping (#218).
+    stamp: PayStamp,
     payloader: Av1Payloader,
     mtu: usize,
     stats: PayStats,
@@ -1132,6 +1249,7 @@ impl RtpAv1Pay {
     pub fn new() -> Self {
         Self {
             name: "rtp-av1-pay".into(),
+            stamp: PayStamp::new(VIDEO_CLOCK_RATE),
             payloader: Av1Payloader {},
             mtu: DEFAULT_MTU,
             stats: PayStats::default(),
@@ -1165,50 +1283,50 @@ impl Default for RtpAv1Pay {
     }
 }
 
-impl Element for RtpAv1Pay {
+impl Transform for RtpAv1Pay {
     fn set_output_budget(&mut self, budget: OutputBudget) {
         self.output.set_budget(budget);
     }
 
-    fn process(&mut self, buffer: Buffer) -> Result<Option<Buffer>> {
+    /// One buffer per RTP packet (#218).
+    fn transform(&mut self, buffer: Buffer) -> Result<Output> {
         let payload = Bytes::copy_from_slice(buffer.as_bytes());
         self.stats.frames_in += 1;
 
         match self.payloader.payload(self.mtu, &payload) {
-            Ok(packets) => {
-                if packets.is_empty() {
-                    return Ok(None);
-                }
-
-                let total_len: usize = packets.iter().map(|p| p.len()).sum();
-                self.stats.packets_out += packets.len() as u64;
-                self.stats.bytes_out += total_len as u64;
-
-                let mut slot = self.output.acquire(total_len, "rtpav1pay")?;
-
-                let mut offset = 0;
-                for packet in &packets {
-                    slot.data_mut()[offset..offset + packet.len()].copy_from_slice(packet.as_ref());
-                    offset += packet.len();
-                }
-
-                let handle = crate::buffer::MemoryHandle::with_len(slot, total_len);
-
-                let mut metadata = buffer.metadata().clone();
-                // AV1 has no static payload type; 98 is a common dynamic choice.
-                metadata.format = Some(MediaFormat::Rtp(RtpFormat::new(
-                    98,
-                    90000,
-                    crate::format::RtpEncoding::Av1,
-                )));
-
-                Ok(Some(Buffer::new(handle, metadata)))
-            }
+            Ok(packets) => self.stamp.emit(
+                &packets,
+                &buffer,
+                MediaFormat::Rtp(RtpFormat::new(98, 90000, crate::format::RtpEncoding::Av1)),
+                &mut self.output,
+                &mut self.stats,
+                "rtpav1pay",
+            ),
             Err(e) => {
                 self.stats.errors += 1;
                 Err(Error::Element(format!("AV1 packetize error: {}", e)))
             }
         }
+    }
+
+    /// A payloader accepts the codec it packetizes and emits RTP (#218).
+    ///
+    /// No RTP element declared caps before this, so a mis-wired graph got no
+    /// answer from `prepare()` at all.
+    fn input_media_caps(&self) -> crate::format::ElementMediaCaps {
+        use crate::format::{ElementMediaCaps, FormatCaps, FormatMemoryCap, MemoryCaps};
+        ElementMediaCaps::new(vec![FormatMemoryCap::new(
+            FormatCaps::Video(VideoCodec::Av1),
+            MemoryCaps::cpu_only(),
+        )])
+    }
+
+    fn output_media_caps(&self) -> crate::format::ElementMediaCaps {
+        use crate::format::{ElementMediaCaps, FormatCaps, FormatMemoryCap, MemoryCaps};
+        ElementMediaCaps::new(vec![FormatMemoryCap::new(
+            FormatCaps::Rtp(RtpFormat::new(98, 90000, crate::format::RtpEncoding::Av1)),
+            MemoryCaps::cpu_only(),
+        )])
     }
 
     fn name(&self) -> &str {
@@ -1335,10 +1453,19 @@ mod tests {
         assert!(!is_entry_point(&trail, NalCodec::H265));
     }
 
+    /// Payload a frame and return the packets, one buffer each (#218).
+    fn packetize(out: Output) -> Vec<Buffer> {
+        match out {
+            Output::Multiple(v) => v,
+            Output::Single(b) => vec![b],
+            Output::None => Vec::new(),
+        }
+    }
+
     #[test]
     fn test_h264_depay_creation() {
         let depay = RtpH264Depay::new();
-        assert_eq!(depay.name(), "rtp-h264-depay");
+        assert_eq!(Element::name(&depay), "rtp-h264-depay");
         assert!(!depay.depacketizer.is_avc);
     }
 
@@ -1348,12 +1475,15 @@ mod tests {
     fn test_opus_pay_depay_roundtrip() {
         let opus_frame = b"\xfc\x01\x02\x03\x04opus-ish";
         let mut pay = RtpOpusPay::new();
-        let paid = pay
-            .process(create_test_buffer(opus_frame))
-            .unwrap()
-            .expect("one packet out");
+        let packets = packetize(pay.transform(create_test_buffer(opus_frame)).unwrap());
+        assert_eq!(packets.len(), 1, "one Opus frame is one RTP packet");
+        let paid = packets.into_iter().next().unwrap();
         assert_eq!(pay.stats().packets_out, 1);
         assert!(matches!(paid.metadata().format, Some(MediaFormat::Rtp(_))));
+        // #218: the last (here only) packet of an access unit carries the
+        // marker bit, and every packet carries its own header fields.
+        let rtp = paid.metadata().rtp.expect("per-packet RtpMeta");
+        assert!(rtp.marker);
 
         let mut depay = RtpOpusDepay::new();
         let depaid = depay.process(paid).unwrap().expect("frame out");
@@ -1368,11 +1498,9 @@ mod tests {
         // (Temporal delimiters alone are stripped per the AV1 RTP spec.)
         let small = [0x32u8, 0x03, 1, 2, 3];
         let mut pay = RtpAv1Pay::new();
-        let out = pay
-            .process(create_test_buffer(&small))
-            .unwrap()
-            .expect("packet out");
-        assert!(!out.is_empty());
+        let packets = packetize(pay.transform(create_test_buffer(&small)).unwrap());
+        assert_eq!(packets.len(), 1);
+        assert!(!packets[0].is_empty());
         assert_eq!(pay.stats().packets_out, 1);
 
         // A large payload must fragment into multiple packets.
@@ -1382,7 +1510,7 @@ mod tests {
         large.push(0x32);
         large.extend_from_slice(&[0xD8, 0x04]); // leb128(600)
         large.extend(std::iter::repeat_n(0xAB, 600));
-        pay.process(create_test_buffer(&large)).unwrap();
+        pay.transform(create_test_buffer(&large)).unwrap();
         assert!(
             pay.stats().packets_out > 1,
             "600-byte OBU at MTU 200 must fragment, got {} packets",
@@ -1413,10 +1541,8 @@ mod tests {
         let vp8_inter = [0x01u8, 0x9D, 0x01, 0x2A];
         for (frame, expect_key) in [(&vp8_key[..], true), (&vp8_inter[..], false)] {
             let mut pay = RtpVp8Pay::new();
-            let packet = pay
-                .process(create_test_buffer(frame))
-                .unwrap()
-                .expect("one packet");
+            let packets = packetize(pay.transform(create_test_buffer(frame)).unwrap());
+            let packet = packets.into_iter().next().expect("one packet");
             let mut depay = RtpVp8Depay::new();
             let out = depay
                 .process(marked_buffer(packet.as_bytes()))
@@ -1439,10 +1565,8 @@ mod tests {
         let vp9_inter = [0b1000_0100u8, 0x49, 0x83, 0x42];
         for (frame, expect_key) in [(&vp9_key[..], true), (&vp9_inter[..], false)] {
             let mut pay = RtpVp9Pay::new();
-            let packet = pay
-                .process(create_test_buffer(frame))
-                .unwrap()
-                .expect("one packet");
+            let packets = packetize(pay.transform(create_test_buffer(frame)).unwrap());
+            let packet = packets.into_iter().next().expect("one packet");
             let mut depay = RtpVp9Depay::new();
             let out = depay
                 .process(marked_buffer(packet.as_bytes()))
@@ -1488,32 +1612,32 @@ mod tests {
     #[test]
     fn test_h264_pay_creation() {
         let pay = RtpH264Pay::new().with_mtu(1200);
-        assert_eq!(pay.name(), "rtp-h264-pay");
+        assert_eq!(Transform::name(&pay), "rtp-h264-pay");
         assert_eq!(pay.mtu, 1200);
     }
 
     #[test]
     fn test_h265_depay_creation() {
         let depay = RtpH265Depay::new();
-        assert_eq!(depay.name(), "rtp-h265-depay");
+        assert_eq!(Element::name(&depay), "rtp-h265-depay");
     }
 
     #[test]
     fn test_vp8_depay_creation() {
         let depay = RtpVp8Depay::new();
-        assert_eq!(depay.name(), "rtp-vp8-depay");
+        assert_eq!(Element::name(&depay), "rtp-vp8-depay");
     }
 
     #[test]
     fn test_vp9_depay_creation() {
         let depay = RtpVp9Depay::new();
-        assert_eq!(depay.name(), "rtp-vp9-depay");
+        assert_eq!(Element::name(&depay), "rtp-vp9-depay");
     }
 
     #[test]
     fn test_opus_depay_creation() {
         let depay = RtpOpusDepay::new();
-        assert_eq!(depay.name(), "rtp-opus-depay");
+        assert_eq!(Element::name(&depay), "rtp-opus-depay");
     }
 
     #[test]

@@ -4,7 +4,9 @@ use super::ElementFactory;
 #[cfg(feature = "rtp")]
 use super::Props;
 #[cfg(feature = "rtp")]
-use crate::element::{DynAsyncElement, ElementAdapter, SinkAdapter, SourceAdapter};
+use crate::element::{
+    DynAsyncElement, ElementAdapter, SinkAdapter, SourceAdapter, TransformAdapter,
+};
 #[cfg(feature = "rtp")]
 use crate::error::Result;
 
@@ -65,7 +67,8 @@ fn pay(props: &Props, kind: Pay) -> Result<Box<DynAsyncElement<'static>>> {
             if let Some(mtu) = mtu {
                 p = p.with_mtu(mtu);
             }
-            DynAsyncElement::new_box(ElementAdapter::new(p))
+            // #218: the payloaders are `Transform`s — one buffer per packet.
+            DynAsyncElement::new_box(TransformAdapter::new(p))
         }};
     }
     Ok(match kind {
