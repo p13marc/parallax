@@ -67,7 +67,9 @@ handle.wait().await?;
 // or: executor.run(&mut pipeline).await?;
 ```
 
-Presets: `ExecutorConfig::auto()`, `async_only()`, `hybrid()`, `low_latency_audio()` (quantum 64, priority 50), `video(fps)`.
+Presets: `ExecutorConfig::auto()`, `async_only()`, `hybrid()`, `low_latency_audio()` (quantum 64, priority 50), `video(fps)`, `live_video()`.
+
+`live_video()` is the camera-to-network preset (#237): fully async, because a live graph is I/O at both ends and nothing in it is RT-safe; `channel_capacity = 4`, because the link channel *is* the queue and its depth is the latency floor; and `shed_fatal_after` left at `None`, because a dropped frame beats a dead live pipeline. Not for file transcoding, where a deeper queue is free throughput and a silently degraded output is the worse failure.
 
 `channel_capacity` does double duty: besides the channel depth, the executor uses
 it to size each element's **output arena**, so an element cannot run out of slots

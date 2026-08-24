@@ -421,3 +421,40 @@ async fn ended_can_be_awaited_after_wait_consumed_the_handle() {
         .expect("the outcome was not retained past wait()");
     assert_eq!(reason, EndReason::Eos);
 }
+
+/// #237: `stopper()` is the answer for a live pipeline, and its whole point is
+/// that it still works after the handle has been moved into `wait()`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stopper_ends_an_infinite_source_after_the_handle_is_gone() {
+    use parallax::pipeline::ExecutorConfig;
+
+    let calls = Arc::new(AtomicU64::new(0));
+    let mut pipeline = live_pipeline(calls.clone());
+    let handle = Executor::with_config(ExecutorConfig::live_video())
+        .start(&mut pipeline)
+        .unwrap();
+    let stopper = handle.stopper();
+    let ended = handle.ended();
+
+    let waiting = calls.clone();
+    tokio::spawn(async move {
+        while waiting.load(Ordering::Relaxed) < 4 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        stopper.stop();
+    });
+
+    // The handle is consumed here; the stopper is what still works.
+    tokio::time::timeout(LIMIT, handle.wait())
+        .await
+        .expect("a stopped live pipeline must end")
+        .unwrap();
+
+    assert_eq!(
+        tokio::time::timeout(LIMIT, ended)
+            .await
+            .expect("the outcome never arrived"),
+        EndReason::Eos,
+        "stop() is graceful: sinks commit exactly as at a natural end"
+    );
+}

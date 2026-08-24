@@ -169,6 +169,32 @@ impl ExecutorConfig {
         }
     }
 
+    /// Live video: fully async, shallow links, never gives up (#237).
+    ///
+    /// The preset a camera-to-network pipeline wants, and the one every such
+    /// application has been hand-rolling. Three choices, each for a reason:
+    ///
+    /// - **Async, not hybrid.** A live graph is I/O at both ends — a capture
+    ///   device and a socket — and nothing in it is RT-safe, so `Hybrid` would
+    ///   log a warning and fall back to exactly this.
+    /// - **`channel_capacity = 4`.** The link channel *is* the queue, so its
+    ///   depth is the pipeline's latency floor. Four frames is enough to
+    ///   absorb a scheduling hiccup and short enough that a stalled consumer
+    ///   shows up as backpressure in a few dozen milliseconds rather than a
+    ///   second. It also keeps the executor-sized output arenas small.
+    /// - **`shed_fatal_after` stays `None`.** A dropped frame beats a dead
+    ///   live pipeline; batch work is the case that wants the opposite.
+    ///
+    /// Not for file transcoding, where a deeper queue is free throughput and a
+    /// silently degraded output is the worse failure.
+    pub fn live_video() -> Self {
+        Self {
+            scheduling: SchedulingMode::Async,
+            channel_capacity: 4,
+            ..Default::default()
+        }
+    }
+
     /// Create config for video processing.
     pub fn video(fps: u32) -> Self {
         Self {
