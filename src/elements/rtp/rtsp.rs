@@ -73,6 +73,7 @@ use crate::buffer::{Buffer, MemoryHandle};
 use crate::clock::ClockTime;
 use crate::element::ProduceResult;
 use crate::error::{Error, Result};
+use crate::format::{AudioCodec, MediaFormat, VideoCodec};
 use crate::memory::{OutputArena, OutputBudget, defaults};
 use crate::metadata::{BufferFlags, Metadata, RtpMeta};
 
@@ -521,6 +522,36 @@ fn split_url_credentials(url_str: &str) -> Result<(Url, Option<RtspCredentials>)
     }
     Ok((url, credentials))
 }
+/// Map an SDP rtpmap encoding name to a [`VideoCodec`] (#205).
+///
+/// `StreamInfo::codec` is retina's `encoding_name()` lowercased, i.e. the SDP
+/// spelling rather than an enum. Unknown names return `None`: a stream we
+/// cannot name is better left undeclared than mislabelled.
+fn video_codec_for(name: &str) -> Option<VideoCodec> {
+    Some(match name {
+        "h264" => VideoCodec::H264,
+        "h265" | "hevc" => VideoCodec::H265,
+        "vp8" => VideoCodec::Vp8,
+        "vp9" => VideoCodec::Vp9,
+        "av1" | "av1x" => VideoCodec::Av1,
+        "jpeg" => VideoCodec::Mjpeg,
+        _ => return None,
+    })
+}
+
+/// Map an SDP rtpmap encoding name to an [`AudioCodec`] (#205).
+fn audio_codec_for(name: &str) -> Option<AudioCodec> {
+    Some(match name {
+        // RFC 3640 / RFC 6416 name AAC this way; retina lowercases it.
+        "mpeg4-generic" | "aac" => AudioCodec::Aac,
+        "opus" => AudioCodec::Opus,
+        "pcmu" => AudioCodec::Pcmu,
+        "pcma" => AudioCodec::Pcma,
+        "mpa" | "mp3" => AudioCodec::Mp3,
+        "vorbis" => AudioCodec::Vorbis,
+        _ => return None,
+    })
+}
 
 /// Parse `a=framesize:<pt> <width>-<height>` attributes from a raw SDP.
 ///
@@ -917,7 +948,7 @@ impl RtspSession {
         }
 
         let rtp_timestamp = ts as u32;
-        let metadata = Metadata::new()
+        let mut metadata = Metadata::new()
             .with_pts(ClockTime::from_nanos(nanos as u64))
             .with_stream_id(frame.stream_id() as u32)
             .with_flags(flags)
@@ -928,6 +959,23 @@ impl RtspSession {
                 pt: 0,
                 marker: is_keyframe,
             });
+
+        // Say what these bytes are (#205). Without this every consumer had to
+        // be told out of band — example 58 pinned its converter's input format
+        // by hand — and a zenoh publisher downstream derived `zenoh/bytes`
+        // instead of `video/h264`.
+        //
+        // Geometry, when the SDP or an in-band SPS has given us any, rides
+        // `coded` rather than `set_video_dims`: these are access units, not
+        // frames, and `VideoRaw` would promise planes that are not there.
+        if let Some(info) = self.streams.get(frame.stream_id())
+            && let Some(codec) = video_codec_for(&info.codec)
+        {
+            match info.dimensions {
+                Some((w, h)) => metadata.set_coded_video_dims(codec, w, h),
+                None => metadata.format = Some(MediaFormat::Video(codec)),
+            }
+        }
 
         self.create_buffer_from_bytes_with_metadata(data, metadata)
     }
@@ -950,7 +998,7 @@ impl RtspSession {
         };
 
         let rtp_timestamp = ts as u32;
-        let metadata = Metadata::new()
+        let mut metadata = Metadata::new()
             .with_pts(ClockTime::from_nanos(nanos as u64))
             .with_stream_id(frame.stream_id() as u32)
             .with_rtp(RtpMeta {
@@ -960,6 +1008,14 @@ impl RtspSession {
                 pt: 0,
                 marker: false,
             });
+
+        // Declare the audio codec too (#205) — a muxer or a publisher
+        // downstream has no other way to learn it.
+        if let Some(info) = self.streams.get(frame.stream_id())
+            && let Some(codec) = audio_codec_for(&info.codec)
+        {
+            metadata.format = Some(MediaFormat::Audio(codec));
+        }
 
         self.create_buffer_from_bytes_with_metadata(data, metadata)
     }
@@ -1056,6 +1112,23 @@ impl crate::element::AsyncSource for RtspSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sdp_encoding_names_map_to_codecs() {
+        // retina hands back `encoding_name()` lowercased, i.e. the SDP
+        // spelling, so these are the strings that actually arrive.
+        assert_eq!(video_codec_for("h264"), Some(VideoCodec::H264));
+        assert_eq!(video_codec_for("h265"), Some(VideoCodec::H265));
+        assert_eq!(video_codec_for("jpeg"), Some(VideoCodec::Mjpeg));
+        assert_eq!(audio_codec_for("mpeg4-generic"), Some(AudioCodec::Aac));
+        assert_eq!(audio_codec_for("opus"), Some(AudioCodec::Opus));
+        assert_eq!(audio_codec_for("pcmu"), Some(AudioCodec::Pcmu));
+
+        // A stream we cannot name stays undeclared rather than mislabelled.
+        assert_eq!(video_codec_for("theora"), None);
+        assert_eq!(audio_codec_for("speex"), None);
+        assert_eq!(video_codec_for(""), None);
+    }
 
     #[test]
     fn framesize_maps_to_its_media_section() {
