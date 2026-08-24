@@ -1,7 +1,17 @@
 # Multi-machine video: RTSP → `@media` → browser
 
-Status: filed, not started. Written 2026-08-24, **revised the same day** after
-reading the two sibling repos — see § "What the first draft got wrong".
+Status: **done**. Written 2026-08-24, revised the same day after reading the two
+sibling repos (see § "What the first draft got wrong"), and delivered on
+`feat/236-media-plane` — 31 issues, 30 commits, PR
+[#242](https://git.marcpardo.eu/marcpardo/parallax/pulls/242).
+
+The deployment guide that came out of it is `docs/multi-machine.md`; the wire
+contracts are in `docs/zenoh-wire.md`. Three things this plan did not
+anticipate are recorded on the epic: the demuxers were as guilty as the
+encoders of not declaring their format, the RTP layer had three separate
+defects that were not on the milestone when it started, and RTSP's first
+socket-level test immediately found a hole in the reconnect it was written to
+exercise.
 
 Tracked by [#204](https://git.marcpardo.eu/marcpardo/parallax/issues/204) (**epic**),
 milestone *Multi-machine video: RTSP → @media → browser*. A second milestone,
