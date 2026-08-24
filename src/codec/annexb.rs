@@ -132,6 +132,211 @@ pub fn extract_param_sets(data: &[u8]) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
     (sps, pps)
 }
 
+/// Which codec's NAL header layout to read (#233).
+///
+/// H.264 has a one-byte header with the type in the low 5 bits; H.265 has a
+/// two-byte header with the type in bits 1..6 of the first. Everything that
+/// asks "is this a keyframe" or "are the parameter sets here" needs to know
+/// which — [`NalUnit::nal_type`] answers for H.264 only, and returns
+/// meaningless numbers for HEVC.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NalCodec {
+    /// H.264 / AVC.
+    H264,
+    /// H.265 / HEVC.
+    H265,
+}
+
+/// H.265 NAL unit type for a video parameter set.
+pub const NAL_VPS_H265: u8 = 32;
+/// H.265 NAL unit type for a sequence parameter set.
+pub const NAL_SPS_H265: u8 = 33;
+/// H.265 NAL unit type for a picture parameter set.
+pub const NAL_PPS_H265: u8 = 34;
+
+impl NalCodec {
+    /// The NAL unit type of a NAL payload (start code already stripped).
+    fn nal_type(self, nal: &[u8]) -> u8 {
+        match self {
+            Self::H264 => nal[0] & 0x1F,
+            // Two-byte header; the type is bits 1..6 of the first byte.
+            Self::H265 => (nal[0] >> 1) & 0x3F,
+        }
+    }
+
+    /// Whether this NAL type is a parameter set for this codec.
+    fn is_param_set(self, nal_type: u8) -> bool {
+        match self {
+            Self::H264 => matches!(nal_type, NAL_SPS | NAL_PPS),
+            Self::H265 => matches!(nal_type, NAL_VPS_H265 | NAL_SPS_H265 | NAL_PPS_H265),
+        }
+    }
+
+    /// Whether this NAL type is a decoder entry point.
+    ///
+    /// H.264: an IDR slice. H.265: the IRAP set (BLA/IDR/CRA), types 16..=23 —
+    /// the same test `MkvDemux::is_keyframe` uses.
+    fn is_entry_point(self, nal_type: u8) -> bool {
+        match self {
+            Self::H264 => nal_type == NAL_IDR,
+            Self::H265 => matches!(nal_type, 16..=23),
+        }
+    }
+}
+
+/// Whether this access unit is a decoder entry point — an IDR (H.264) or an
+/// IRAP picture (H.265).
+///
+/// The codec-aware counterpart of [`has_idr`], and the check a publisher owes
+/// its subscribers: a sample advertised as a keyframe must be one *in the
+/// bytes*, not merely in whatever metadata the upstream element attached.
+pub fn is_entry_point(data: &[u8], codec: NalCodec) -> bool {
+    nal_units(data).any(|nal| codec.is_entry_point(codec.nal_type(nal.data)))
+}
+
+/// Whether this access unit carries its own parameter sets.
+///
+/// H.264 wants an SPS *and* a PPS; H.265 wants VPS, SPS and PPS. A keyframe
+/// that answers `false` here cannot start a fresh decoder on its own — see
+/// [`ParamSetCache`].
+pub fn has_param_sets(data: &[u8], codec: NalCodec) -> bool {
+    let (mut sps, mut pps, mut vps) = (false, false, false);
+    for nal in nal_units(data) {
+        match (codec, codec.nal_type(nal.data)) {
+            (NalCodec::H264, NAL_SPS) => sps = true,
+            (NalCodec::H264, NAL_PPS) => pps = true,
+            (NalCodec::H265, NAL_VPS_H265) => vps = true,
+            (NalCodec::H265, NAL_SPS_H265) => sps = true,
+            (NalCodec::H265, NAL_PPS_H265) => pps = true,
+            _ => {}
+        }
+    }
+    match codec {
+        NalCodec::H264 => sps && pps,
+        NalCodec::H265 => vps && sps && pps,
+    }
+}
+
+/// Every parameter set in this access unit, **with their start codes, in
+/// stream order**, concatenated.
+///
+/// This is the form you cache once and memcpy in front of a bare keyframe.
+/// [`extract_param_sets`] returns the sets stripped and split, which cannot
+/// express a second PPS, loses the original start-code lengths, and cannot
+/// represent a PPS-only refresh — so a caller that wants to *replay* the sets
+/// verbatim wants this instead.
+///
+/// Returns `None` when the access unit carries no parameter sets at all.
+pub fn param_set_blob(data: &[u8], codec: NalCodec) -> Option<Vec<u8>> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut cursor = 0usize;
+
+    while cursor < data.len() {
+        let Some(sc) = start_code_len(data, cursor) else {
+            cursor += 1;
+            continue;
+        };
+        let start = cursor + sc;
+        if start >= data.len() {
+            break;
+        }
+        let mut end = data.len();
+        let mut j = start + 1;
+        while j < data.len() {
+            if start_code_len(data, j).is_some() {
+                end = j;
+                break;
+            }
+            j += 1;
+        }
+        if codec.is_param_set(codec.nal_type(&data[start..end])) {
+            // Copy the start code too, exactly as it appeared.
+            out.extend_from_slice(&data[cursor..end]);
+        }
+        cursor = end;
+    }
+
+    (!out.is_empty()).then_some(out)
+}
+
+/// Remembers a stream's parameter sets so every keyframe can be made a
+/// self-contained decoder entry point (#233).
+///
+/// The `@media` plane requires the keyframe flag to be a *byte-level promise*:
+/// a fresh decoder must be able to start at any sample flagged as a keyframe.
+/// Cameras do not always cooperate — an RTSP source may announce SPS/PPS only
+/// in the SDP and never repeat them in band — so a publisher caches what it
+/// has seen and repairs a bare keyframe on its way out.
+///
+/// ```
+/// use parallax::codec::annexb::{NalCodec, ParamSetCache};
+///
+/// let mut cache = ParamSetCache::new(NalCodec::H264);
+///
+/// // A keyframe with its parameter sets: cached, and passed through untouched.
+/// let good = [0, 0, 0, 1, 0x67, 0x42, 0, 0, 0, 1, 0x68, 0xCE, 0, 0, 0, 1, 0x65, 0xAA];
+/// assert!(matches!(cache.prepare(&good), std::borrow::Cow::Borrowed(_)));
+///
+/// // A later keyframe without them is repaired from the cache.
+/// let bare = [0, 0, 0, 1, 0x65, 0xBB];
+/// let repaired = cache.prepare(&bare);
+/// assert!(matches!(repaired, std::borrow::Cow::Owned(_)));
+/// assert!(parallax::codec::annexb::has_param_sets(&repaired, NalCodec::H264));
+/// ```
+#[derive(Clone, Debug)]
+pub struct ParamSetCache {
+    codec: NalCodec,
+    sets: Option<Vec<u8>>,
+}
+
+impl ParamSetCache {
+    /// A cache for a stream of `codec`.
+    pub fn new(codec: NalCodec) -> Self {
+        Self { codec, sets: None }
+    }
+
+    /// Observe an access unit, caching any parameter sets it carries, and
+    /// return what should actually be published.
+    ///
+    /// Borrowed in the overwhelmingly common case — every delta frame, and
+    /// every keyframe that already carries its sets — so a zero-copy publish
+    /// path stays zero-copy. Owned only when a keyframe had to be repaired.
+    pub fn prepare<'a>(&mut self, au: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
+        if let Some(fresh) = param_set_blob(au, self.codec) {
+            self.sets = Some(fresh);
+            return std::borrow::Cow::Borrowed(au);
+        }
+
+        // No sets in this AU. Only a keyframe needs them.
+        if !is_entry_point(au, self.codec) {
+            return std::borrow::Cow::Borrowed(au);
+        }
+
+        match &self.sets {
+            Some(cached) => {
+                let mut out = Vec::with_capacity(cached.len() + au.len());
+                out.extend_from_slice(cached);
+                out.extend_from_slice(au);
+                std::borrow::Cow::Owned(out)
+            }
+            // Nothing cached yet: pass it through and let the caller's
+            // keyframe verdict (which reads the prepared bytes) say no.
+            None => std::borrow::Cow::Borrowed(au),
+        }
+    }
+
+    /// The cached parameter sets, if any have been seen.
+    pub fn param_sets(&self) -> Option<&[u8]> {
+        self.sets.as_deref()
+    }
+
+    /// Forget the cached sets — call on a discontinuity or a stream restart,
+    /// where replaying stale sets would be worse than not repairing at all.
+    pub fn reset(&mut self) {
+        self.sets = None;
+    }
+}
+
 /// Prepend `sps` and `pps` (raw, no start codes) to an Annex-B access unit.
 ///
 /// Use this to make a keyframe self-contained for a late joiner when the encoder
@@ -421,6 +626,111 @@ mod tests {
 
         let types: Vec<_> = nal_units(&complete).map(|n| n.nal_type()).collect();
         assert_eq!(types, vec![NAL_SPS, NAL_PPS, NAL_IDR]);
+    }
+
+    /// H.265: VPS (32), SPS (33), PPS (34), IDR_W_RADL (19). Two-byte headers.
+    fn hevc_keyframe() -> Vec<u8> {
+        let mut v = Vec::new();
+        for (ty, payload) in [(32u8, 0xAAu8), (33, 0xBB), (34, 0xCC), (19, 0xDD)] {
+            v.extend_from_slice(&[0, 0, 0, 1]);
+            v.push(ty << 1);
+            v.push(0x01);
+            v.push(payload);
+        }
+        v
+    }
+
+    #[test]
+    fn entry_points_are_codec_aware() {
+        assert!(is_entry_point(&keyframe(), NalCodec::H264));
+        assert!(!is_entry_point(&delta_frame(), NalCodec::H264));
+
+        // The whole point: an H.265 IRAP is invisible to the H.264 reading,
+        // and an H.264 IDR is invisible to the H.265 one.
+        assert!(is_entry_point(&hevc_keyframe(), NalCodec::H265));
+        assert!(!is_entry_point(&hevc_keyframe(), NalCodec::H264));
+        assert!(!is_entry_point(&keyframe(), NalCodec::H265));
+    }
+
+    #[test]
+    fn param_sets_are_codec_aware() {
+        assert!(has_param_sets(&keyframe(), NalCodec::H264));
+        assert!(!has_param_sets(&delta_frame(), NalCodec::H264));
+
+        // H.265 needs all three; H.264's SPS+PPS do not satisfy it.
+        assert!(has_param_sets(&hevc_keyframe(), NalCodec::H265));
+        assert!(!has_param_sets(&keyframe(), NalCodec::H265));
+    }
+
+    #[test]
+    fn param_set_blob_preserves_start_codes_and_order() {
+        // A 3-byte start code on the PPS: the blob must not normalise it,
+        // because the point is to replay the producer's bytes verbatim.
+        let au = [
+            0, 0, 0, 1, 0x67, 0x42, // SPS, 4-byte SC
+            0, 0, 1, 0x68, 0xCE, // PPS, 3-byte SC
+            0, 0, 0, 1, 0x65, 0xAA, // IDR
+        ];
+        let blob = param_set_blob(&au, NalCodec::H264).expect("sets present");
+        assert_eq!(blob, [0, 0, 0, 1, 0x67, 0x42, 0, 0, 1, 0x68, 0xCE]);
+
+        assert!(param_set_blob(&delta_frame(), NalCodec::H264).is_none());
+    }
+
+    #[test]
+    fn param_set_blob_keeps_every_set_not_just_the_last() {
+        // Two PPSs — `extract_param_sets` can only return one of them.
+        let au = [
+            0, 0, 0, 1, 0x67, 0x42, // SPS
+            0, 0, 0, 1, 0x68, 0x01, // PPS #1
+            0, 0, 0, 1, 0x68, 0x02, // PPS #2
+            0, 0, 0, 1, 0x65, 0xAA, // IDR
+        ];
+        let blob = param_set_blob(&au, NalCodec::H264).expect("sets present");
+        let types: Vec<u8> = nal_units(&blob).map(|n| n.nal_type()).collect();
+        assert_eq!(types, vec![NAL_SPS, NAL_PPS, NAL_PPS]);
+    }
+
+    #[test]
+    fn the_cache_repairs_a_bare_keyframe_and_borrows_otherwise() {
+        use std::borrow::Cow;
+
+        let mut cache = ParamSetCache::new(NalCodec::H264);
+
+        // Self-contained keyframe: cached, passed through by reference.
+        let good = keyframe();
+        assert!(matches!(cache.prepare(&good), Cow::Borrowed(_)));
+        assert!(cache.param_sets().is_some());
+
+        // Delta frames never get repaired, even though they lack sets.
+        let delta = delta_frame();
+        assert!(matches!(cache.prepare(&delta), Cow::Borrowed(_)));
+
+        // A bare keyframe is made self-contained.
+        let bare = [0, 0, 0, 1, 0x65, 0xBB];
+        let repaired = cache.prepare(&bare);
+        assert!(matches!(repaired, Cow::Owned(_)));
+        assert!(has_param_sets(&repaired, NalCodec::H264));
+        assert!(is_entry_point(&repaired, NalCodec::H264));
+    }
+
+    #[test]
+    fn the_cache_cannot_invent_sets_it_has_never_seen() {
+        use std::borrow::Cow;
+
+        let mut cache = ParamSetCache::new(NalCodec::H264);
+        let bare = [0, 0, 0, 1, 0x65, 0xBB];
+        // Nothing cached: pass through untouched so the caller's keyframe
+        // verdict reads the real bytes and says no.
+        assert!(matches!(cache.prepare(&bare), Cow::Borrowed(_)));
+
+        // And a reset makes it forget, rather than replaying stale sets.
+        let good = keyframe();
+        cache.prepare(&good);
+        assert!(cache.param_sets().is_some());
+        cache.reset();
+        assert!(cache.param_sets().is_none());
+        assert!(matches!(cache.prepare(&bare), Cow::Borrowed(_)));
     }
 
     #[test]
