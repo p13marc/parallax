@@ -75,7 +75,7 @@ use crate::element::ProduceResult;
 use crate::error::{Error, Result};
 use crate::format::{AudioCodec, MediaFormat, VideoCodec};
 use crate::memory::{OutputArena, OutputBudget, defaults};
-use crate::metadata::{BufferFlags, Metadata, RtpMeta};
+use crate::metadata::{BufferFlags, Metadata};
 
 use futures::StreamExt;
 use retina::client::{Demuxed, Session, SessionOptions, SetupOptions};
@@ -947,18 +947,19 @@ impl RtspSession {
             flags |= BufferFlags::SYNC_POINT;
         }
 
-        let rtp_timestamp = ts as u32;
+        // No `RtpMeta` (#208). retina hands back demuxed access units, not
+        // packets: `seq`, `ssrc` and `pt` are simply not available here, and
+        // filling them with zeros published plausible-looking garbage to
+        // anything that read them — including the IPC descriptor, which
+        // faithfully carries `RtpMeta` across a process boundary. `marker` was
+        // worse: it was being used to mean "keyframe", which `SYNC_POINT`
+        // already says correctly two lines up, while the RTP marker bit
+        // actually means "last packet of an access unit". The RTP timestamp is
+        // not lost — `pts` above is derived from it.
         let mut metadata = Metadata::new()
             .with_pts(ClockTime::from_nanos(nanos as u64))
             .with_stream_id(frame.stream_id() as u32)
-            .with_flags(flags)
-            .with_rtp(RtpMeta {
-                seq: 0, // Not available from demuxed frame
-                ts: rtp_timestamp,
-                ssrc: 0,
-                pt: 0,
-                marker: is_keyframe,
-            });
+            .with_flags(flags);
 
         // Say what these bytes are (#205). Without this every consumer had to
         // be told out of band — example 58 pinned its converter's input format
@@ -997,17 +998,10 @@ impl RtspSession {
             0
         };
 
-        let rtp_timestamp = ts as u32;
+        // No `RtpMeta` — see the video path (#208).
         let mut metadata = Metadata::new()
             .with_pts(ClockTime::from_nanos(nanos as u64))
-            .with_stream_id(frame.stream_id() as u32)
-            .with_rtp(RtpMeta {
-                seq: 0,
-                ts: rtp_timestamp,
-                ssrc: 0,
-                pt: 0,
-                marker: false,
-            });
+            .with_stream_id(frame.stream_id() as u32);
 
         // Declare the audio codec too (#205) — a muxer or a publisher
         // downstream has no other way to learn it.
