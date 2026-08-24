@@ -28,6 +28,8 @@ use crate::element::{AsyncSink, AsyncSource, ConsumeContext, ProduceContext, Pro
 use crate::error::{Error, Result};
 use crate::memory::{OutputArena, OutputBudget, defaults};
 use crate::metadata::{BufferFlags, Metadata};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use zenoh::Session;
 use zenoh::key_expr::KeyExpr;
@@ -174,6 +176,105 @@ const DEFAULT_ARENA_SLOT: usize = 64 * 1024;
 /// Slots for a querier, which holds every reply to one query at once.
 const QUERIER_SLOT_COUNT: usize = 64;
 
+/// What became of one received sample (#225).
+///
+/// `Ok(None)` used to mean both "the gate swallowed it" and "no arena slot",
+/// and `produce` mapped both to `WouldBlock` — so a deliberate drop cost the
+/// same 1 ms executor sleep as real back-pressure.
+// `Buffer` is ~488 bytes and the other two are empty, which the size-difference
+// lint flags. Boxing would add a heap allocation to the *delivery* path — the
+// common case — to shrink two variants that are never allocated at all.
+#[allow(clippy::large_enum_variant)]
+enum SampleOutcome {
+    /// Delivered.
+    Buffer(Buffer),
+    /// Swallowed on purpose (keyframe gate).
+    Dropped,
+    /// No output arena slot was free; the sample is lost.
+    NoSlot,
+}
+
+/// Receive-queue depth, in samples (#225).
+///
+/// Small on purpose: this is live media, and a deep queue converts
+/// publisher-side loss into latency rather than absorbing it. Not a builder
+/// knob — the channel has to exist before the subscriber is declared, so a
+/// `with_queue` called afterwards could not resize it, and a knob that
+/// silently does nothing is worse than none.
+const DEFAULT_RECV_QUEUE: usize = 8;
+
+/// Counters behind [`ZenohSrcHandle`], shared with the subscriber callback.
+#[derive(Debug, Default)]
+struct ZenohSrcCounters {
+    bytes_received: AtomicU64,
+    samples_received: AtomicU64,
+    /// The receive queue was full: the local pipeline is not keeping up.
+    dropped_queue: AtomicU64,
+    /// No output arena slot was free: the arena is undersized, or a consumer
+    /// retains more than it declared through `retained_buffers()`.
+    dropped_no_slot: AtomicU64,
+    /// Samples the publisher sent that never arrived, inferred from a gap in
+    /// the wire sequence — congestion drop, route change, or a late join.
+    lost_wire: AtomicU64,
+    /// Samples dropped because the keyframe gate had not opened yet.
+    dropped_pre_keyframe: AtomicU64,
+}
+
+/// Read-only runtime view of a [`ZenohSrc`] (#225).
+///
+/// Clone it *before* `Executor::start()` — the element is moved into its task
+/// there. Follows the [`Queue2RangesHandle`](crate::control::Queue2RangesHandle)
+/// shape: an `Arc` of atomics, polled whenever the application likes.
+///
+/// The three drop counters are deliberately separate. They mean different
+/// things and point at different machines: `dropped_queue` says this host is
+/// too slow, `dropped_no_slot` says this pipeline's arena is undersized, and
+/// `lost_wire` says the samples never arrived. Conflating them makes an
+/// operator debug the wrong end.
+#[derive(Clone, Debug)]
+pub struct ZenohSrcHandle {
+    counters: Arc<ZenohSrcCounters>,
+}
+
+impl ZenohSrcHandle {
+    /// Payload bytes delivered to the pipeline.
+    pub fn bytes_received(&self) -> u64 {
+        self.counters.bytes_received.load(Ordering::Relaxed)
+    }
+    /// Samples taken off the wire.
+    pub fn samples_received(&self) -> u64 {
+        self.counters.samples_received.load(Ordering::Relaxed)
+    }
+    /// Samples evicted because the receive queue was full.
+    pub fn dropped_queue(&self) -> u64 {
+        self.counters.dropped_queue.load(Ordering::Relaxed)
+    }
+    /// Samples dropped because no output arena slot was free.
+    pub fn dropped_no_slot(&self) -> u64 {
+        self.counters.dropped_no_slot.load(Ordering::Relaxed)
+    }
+    /// Samples inferred lost on the wire from a sequence gap.
+    pub fn lost_wire(&self) -> u64 {
+        self.counters.lost_wire.load(Ordering::Relaxed)
+    }
+    /// Samples dropped while waiting for the first keyframe.
+    pub fn dropped_pre_keyframe(&self) -> u64 {
+        self.counters.dropped_pre_keyframe.load(Ordering::Relaxed)
+    }
+}
+
+/// `1, 10, 100, …` — the rate-limit ladder for drop warnings, matching the
+/// executor's shed reporting. A per-sample warning would bury everything else.
+fn is_power_of_ten(mut n: u64) -> bool {
+    if n == 0 {
+        return false;
+    }
+    while n.is_multiple_of(10) {
+        n /= 10;
+    }
+    n == 1
+}
+
 /// A Zenoh source that subscribes to a key expression.
 ///
 /// Implements [`AsyncSource`]; add to a pipeline with
@@ -207,9 +308,11 @@ pub struct ZenohSrc {
     _session: Session,
     // Held to keep the subscription alive.
     _subscriber: zenoh::pubsub::Subscriber<()>,
-    receiver: tokio::sync::mpsc::UnboundedReceiver<zenoh::sample::Sample>,
-    bytes_received: u64,
-    samples_received: u64,
+    /// Bounded and lossy (#225). An unbounded channel here meant a stalled
+    /// pipeline grew memory without limit; drop-oldest is the right policy for
+    /// live media, where the freshest frame is the one worth having.
+    receiver: crate::pipeline::leaky::LeakyReceiver<zenoh::sample::Sample>,
+    counters: Arc<ZenohSrcCounters>,
     /// Local counter for fabricated (legacy/foreign) metadata.
     sequence: u64,
     /// Last sequence number seen on the wire (for DISCONT detection).
@@ -227,8 +330,6 @@ pub struct ZenohSrc {
     waiting_for_keyframe: bool,
     /// `Media` only: whether the keyframe gate re-arms after a wire gap.
     resync_on_discont: bool,
-    /// Samples dropped because the gate had not opened yet.
-    dropped_pre_keyframe: u64,
 }
 
 impl ZenohSrc {
@@ -249,12 +350,28 @@ impl ZenohSrc {
         let key_expr = key_expr.into();
         let name = format!("zenohsrc-{}", &key_expr[..key_expr.len().min(30)]);
 
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let counters = Arc::new(ZenohSrcCounters::default());
+        let (tx, rx) = crate::pipeline::leaky::channel(DEFAULT_RECV_QUEUE);
 
+        let cb_counters = Arc::clone(&counters);
+        let cb_name = name.clone();
         let subscriber = session
             .declare_subscriber(&key_expr)
             .callback(move |sample| {
-                let _ = tx.send(sample);
+                use crate::pipeline::leaky::LossyPush;
+                // This runs on a zenoh runtime thread and must never block, so
+                // there is no back-pressure to apply — the honest choice is to
+                // drop the oldest and say how often.
+                if let LossyPush::SentEvictedOldest(_) = tx.send_lossy(sample) {
+                    let n = cb_counters.dropped_queue.fetch_add(1, Ordering::Relaxed) + 1;
+                    crate::observability::record_buffer_dropped("pipeline", &cb_name);
+                    if is_power_of_ten(n) {
+                        tracing::warn!(
+                            "{cb_name}: receive queue full, dropping oldest samples \
+                             ({n} total) — the pipeline is not keeping up with the publisher"
+                        );
+                    }
+                }
             })
             .await
             .map_err(|e| Error::Element(format!("Zenoh subscribe error: {}", e)))?;
@@ -265,8 +382,7 @@ impl ZenohSrc {
             _session: session,
             _subscriber: subscriber,
             receiver: rx,
-            bytes_received: 0,
-            samples_received: 0,
+            counters,
             sequence: 0,
             last_wire_sequence: None,
             warned_foreign: false,
@@ -276,7 +392,6 @@ impl ZenohSrc {
             shape: super::media_key::MediaKeyShape::Opaque,
             waiting_for_keyframe: false,
             resync_on_discont: false,
-            dropped_pre_keyframe: 0,
         })
     }
 
@@ -331,7 +446,14 @@ impl ZenohSrc {
 
     /// Samples dropped because the keyframe gate had not opened yet.
     pub fn dropped_pre_keyframe(&self) -> u64 {
-        self.dropped_pre_keyframe
+        self.counters.dropped_pre_keyframe.load(Ordering::Relaxed)
+    }
+
+    /// A read-only view of this source's counters, cloneable before start.
+    pub fn control(&self) -> ZenohSrcHandle {
+        ZenohSrcHandle {
+            counters: Arc::clone(&self.counters),
+        }
     }
 
     /// Set a custom name.
@@ -354,19 +476,19 @@ impl ZenohSrc {
 
     /// Get the number of bytes received.
     pub fn bytes_received(&self) -> u64 {
-        self.bytes_received
+        self.counters.bytes_received.load(Ordering::Relaxed)
     }
 
     /// Get the number of samples received.
     pub fn samples_received(&self) -> u64 {
-        self.samples_received
+        self.counters.samples_received.load(Ordering::Relaxed)
     }
 
     /// Get statistics.
     pub fn stats(&self) -> ZenohStats {
         ZenohStats {
-            bytes_transferred: self.bytes_received,
-            samples: self.samples_received,
+            bytes_transferred: self.bytes_received(),
+            samples: self.samples_received(),
         }
     }
 
@@ -380,14 +502,26 @@ impl ZenohSrc {
         self.output.try_acquire(len, "zenohsrc")
     }
 
+    /// Await the next sample. `None` once every sender is gone.
+    ///
+    /// `LeakyReceiver::recv` is test-only by design — production drives it
+    /// through `poll_recv` — so poll it directly rather than widening that.
+    async fn next_sample(&mut self) -> Option<zenoh::sample::Sample> {
+        std::future::poll_fn(|cx| self.receiver.poll_recv(cx)).await
+    }
+
     /// Build a buffer from a received sample.
     /// `None` means no output slot was free. The sample is already off the
     /// wire, so it is lost — the same as any other zenoh congestion drop, and
     /// the receiver's DISCONT tracking already reports it.
-    fn sample_to_buffer(&mut self, sample: zenoh::sample::Sample) -> Result<Option<Buffer>> {
+    fn sample_to_buffer(&mut self, sample: zenoh::sample::Sample) -> Result<SampleOutcome> {
         let data = sample.payload().to_bytes().into_owned();
-        self.bytes_received += data.len() as u64;
-        self.samples_received += 1;
+        self.counters
+            .bytes_received
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
+        self.counters
+            .samples_received
+            .fetch_add(1, Ordering::Relaxed);
 
         if self.profile == WireProfile::Media {
             return self.media_sample_to_buffer(sample, data);
@@ -405,6 +539,10 @@ impl ZenohSrc {
                     && wire.sequence != prev.wrapping_add(1)
                 {
                     metadata.flags |= BufferFlags::DISCONT;
+                    self.counters.lost_wire.fetch_add(
+                        wire.sequence.wrapping_sub(prev).wrapping_sub(1),
+                        Ordering::Relaxed,
+                    );
                 }
                 self.last_wire_sequence = Some(wire.sequence);
                 metadata
@@ -429,15 +567,7 @@ impl ZenohSrc {
             metadata.set(KEY_EXPR_META, key.to_string());
         }
 
-        let Some(mut slot) = self.acquire(data.len())? else {
-            return Ok(None);
-        };
-        slot.data_mut()[..data.len()].copy_from_slice(&data);
-
-        Ok(Some(Buffer::new(
-            MemoryHandle::with_len(slot, data.len()),
-            metadata,
-        )))
+        self.buffer_from(data, metadata)
     }
 
     /// An empty TIMEOUT-flagged buffer (produced when `with_timeout` fires).
@@ -450,7 +580,7 @@ impl ZenohSrc {
         &mut self,
         sample: zenoh::sample::Sample,
         data: Vec<u8>,
-    ) -> Result<Option<Buffer>> {
+    ) -> Result<SampleOutcome> {
         let frame = sample
             .attachment()
             .and_then(|a| crate::wire::FrameMeta::from_cbor(&a.to_bytes()));
@@ -479,7 +609,18 @@ impl ZenohSrc {
         // *is* a discontinuity, and it never used to be flagged because the
         // "previous sequence" started empty.
         let discont = match self.last_wire_sequence {
-            Some(prev) => frame.sequence != prev.wrapping_add(1),
+            Some(prev) => {
+                let gap = frame.sequence != prev.wrapping_add(1);
+                if gap {
+                    self.counters.lost_wire.fetch_add(
+                        frame.sequence.wrapping_sub(prev).wrapping_sub(1),
+                        Ordering::Relaxed,
+                    );
+                }
+                gap
+            }
+            // The first sample of a subscription: a late join is a
+            // discontinuity, but nothing was lost on the wire.
             None => true,
         };
         if discont {
@@ -493,14 +634,18 @@ impl ZenohSrc {
         // Never hand a decoder a mid-GOP access unit.
         if self.waiting_for_keyframe {
             if !frame.keyframe {
-                self.dropped_pre_keyframe += 1;
-                if self.dropped_pre_keyframe == 1 {
+                let n = self
+                    .counters
+                    .dropped_pre_keyframe
+                    .fetch_add(1, Ordering::Relaxed)
+                    + 1;
+                if n == 1 {
                     tracing::debug!(
                         "zenohsrc '{}': waiting for a keyframe before delivering",
                         self.name
                     );
                 }
-                return Ok(None);
+                return Ok(SampleOutcome::Dropped);
             }
             self.waiting_for_keyframe = false;
         }
@@ -516,12 +661,12 @@ impl ZenohSrc {
     }
 
     /// Copy `data` into an arena slot and pair it with `metadata`.
-    fn buffer_from(&mut self, data: Vec<u8>, metadata: Metadata) -> Result<Option<Buffer>> {
+    fn buffer_from(&mut self, data: Vec<u8>, metadata: Metadata) -> Result<SampleOutcome> {
         let Some(mut slot) = self.acquire(data.len())? else {
-            return Ok(None);
+            return Ok(SampleOutcome::NoSlot);
         };
         slot.data_mut()[..data.len()].copy_from_slice(&data);
-        Ok(Some(Buffer::new(
+        Ok(SampleOutcome::Buffer(Buffer::new(
             MemoryHandle::with_len(slot, data.len()),
             metadata,
         )))
@@ -538,34 +683,78 @@ impl ZenohSrc {
     }
 }
 
+impl crate::control::Controllable for ZenohSrc {
+    type Control = ZenohSrcHandle;
+
+    /// A poll-anytime view of this source's counters.
+    ///
+    /// Clone it *before* `executor.start()` — the element is moved into its
+    /// task there.
+    fn control(&self) -> ZenohSrcHandle {
+        ZenohSrc::control(self)
+    }
+}
+
 impl AsyncSource for ZenohSrc {
     fn set_output_budget(&mut self, budget: OutputBudget) {
         self.output.set_budget(budget);
     }
 
-    async fn produce(&mut self, _ctx: &mut ProduceContext<'_>) -> Result<ProduceResult> {
-        let sample = if let Some(timeout) = self.timeout {
-            match tokio::time::timeout(timeout, self.receiver.recv()).await {
-                Ok(Some(sample)) => sample,
-                Ok(None) => return Ok(ProduceResult::Eos),
-                Err(_) => {
-                    return Ok(match self.timeout_buffer()? {
-                        Some(b) => ProduceResult::OwnBuffer(b),
-                        None => ProduceResult::WouldBlock,
-                    });
+    async fn produce(&mut self, ctx: &mut ProduceContext<'_>) -> Result<ProduceResult> {
+        // Loop rather than answering `WouldBlock` for a sample the keyframe
+        // gate deliberately swallowed (#225): the executor sleeps 1 ms per
+        // `WouldBlock`, so a pre-keyframe burst — a whole GOP, routinely —
+        // used to be paced at 1 kHz for no reason. `WouldBlock` is reserved
+        // for the one case that genuinely means "ask me again later": no
+        // output slot was free.
+        loop {
+            let sample = if let Some(timeout) = self.timeout {
+                match tokio::time::timeout(timeout, self.next_sample()).await {
+                    Ok(Some(sample)) => sample,
+                    Ok(None) => return Ok(ProduceResult::Eos),
+                    Err(_) => {
+                        return Ok(match self.timeout_buffer()? {
+                            Some(b) => ProduceResult::OwnBuffer(b),
+                            None => ProduceResult::WouldBlock,
+                        });
+                    }
                 }
-            }
-        } else {
-            match self.receiver.recv().await {
-                Some(sample) => sample,
-                None => return Ok(ProduceResult::Eos),
-            }
-        };
+            } else {
+                match self.next_sample().await {
+                    Some(sample) => sample,
+                    None => return Ok(ProduceResult::Eos),
+                }
+            };
 
-        Ok(match self.sample_to_buffer(sample)? {
-            Some(b) => ProduceResult::OwnBuffer(b),
-            None => ProduceResult::WouldBlock,
-        })
+            match self.sample_to_buffer(sample)? {
+                SampleOutcome::Buffer(b) => return Ok(ProduceResult::OwnBuffer(b)),
+                SampleOutcome::NoSlot => {
+                    let n = self
+                        .counters
+                        .dropped_no_slot
+                        .fetch_add(1, Ordering::Relaxed)
+                        + 1;
+                    crate::observability::record_buffer_dropped("pipeline", &self.name);
+                    if is_power_of_ten(n) {
+                        tracing::warn!(
+                            "{}: no output slot for an arriving sample ({n} total) — the \
+                             arena is undersized, or a consumer retains more than it declares",
+                            self.name
+                        );
+                        ctx.post_message(crate::pipeline::bus::MessageKind::Warning {
+                            warning: format!(
+                                "{}: dropping samples, no output arena slot ({n} total)",
+                                self.name
+                            ),
+                            debug: None,
+                        });
+                    }
+                    return Ok(ProduceResult::WouldBlock);
+                }
+                // Swallowed on purpose — go straight back for the next one.
+                SampleOutcome::Dropped => continue,
+            }
+        }
     }
 
     fn name(&self) -> &str {

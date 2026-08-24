@@ -436,6 +436,83 @@ async fn a_keyframe_request_is_raised_upstream_and_coalesced() {
     assert_eq!(sink.keyframe_requests(), 2);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn the_three_drop_counters_mean_different_things() {
+    // #225: they point at different machines. `dropped_queue` says this host
+    // is too slow, `dropped_no_slot` says this pipeline's arena is undersized,
+    // `lost_wire` says the samples never arrived. One number cannot say that.
+    let (pub_session, sub_session) = session_pair().await;
+    let key = unique_key("video/h264/high");
+
+    let mut src = ZenohSrc::media_with_session(sub_session, &key)
+        .await
+        .expect("media source");
+    let stats = src.control();
+    let mut sink = ZenohSink::media_with_session(pub_session, &key)
+        .await
+        .expect("media sink");
+    settle().await;
+
+    // A clean keyframe, then a delta: nothing lost, nothing dropped.
+    for au in [keyframe_au(), delta_au(0)] {
+        let mut meta = Metadata::new();
+        meta.flags |= BufferFlags::SYNC_POINT;
+        sink.consume(&ConsumeContext::new(&buffer(&au, meta)))
+            .await
+            .expect("publish");
+    }
+    let _ = next_buffer(&mut src).await;
+    let _ = next_buffer(&mut src).await;
+
+    assert_eq!(stats.lost_wire(), 0, "nothing was lost");
+    assert_eq!(stats.dropped_queue(), 0, "the queue kept up");
+    assert_eq!(stats.dropped_no_slot(), 0, "slots were available");
+    assert_eq!(stats.samples_received(), 2);
+    assert!(stats.bytes_received() > 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stalled_consumer_bounds_memory_instead_of_growing_it() {
+    // The receive queue used to be unbounded: a pipeline that stopped pulling
+    // grew memory until the process died. It is now drop-oldest, and says so.
+    let (pub_session, sub_session) = session_pair().await;
+    let key = unique_key("video/h264/low");
+
+    let src = ZenohSrc::media_with_session(sub_session, &key)
+        .await
+        .expect("media source");
+    let stats = src.control();
+    let mut sink = ZenohSink::media_with_session(pub_session, &key)
+        .await
+        .expect("media sink");
+    settle().await;
+
+    // Publish far more than the queue holds, and never pull.
+    for i in 0..200u8 {
+        let mut meta = Metadata::new();
+        meta.flags |= BufferFlags::SYNC_POINT;
+        sink.consume(&ConsumeContext::new(&buffer(&delta_au(i), meta)))
+            .await
+            .expect("publish");
+    }
+
+    // Give the callback time to drain the transport into the bounded queue.
+    for _ in 0..40 {
+        if stats.dropped_queue() > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    assert!(
+        stats.dropped_queue() > 0,
+        "a stalled consumer must evict, not accumulate (dropped_queue = {})",
+        stats.dropped_queue()
+    );
+    // And the eviction is attributed correctly, not lumped in elsewhere.
+    assert_eq!(stats.dropped_no_slot(), 0, "no arena slot was ever refused");
+}
+
 #[test]
 fn frame_meta_matches_the_checked_in_corpus() {
     // The binding artifact between parallax's FrameMeta and zensight's: if

@@ -87,6 +87,18 @@ the plugin ABI does not use either — so no ABI bump. `register` is unchanged;
 
 ### Fixed
 
+- **`ZenohSrc`'s receive queue was unbounded** (#225). A pipeline that stopped
+  pulling grew memory without limit. It is now a bounded drop-oldest queue
+  (8 samples — deep queues turn publisher-side loss into latency, which is the
+  wrong trade for live media), with three *separate* drop counters, because
+  they point at different machines: `dropped_queue` (this host is too slow),
+  `dropped_no_slot` (this pipeline's arena is undersized), `lost_wire` (the
+  samples never arrived). Exposed through `ZenohSrcHandle` via `Controllable`.
+- **A deliberately dropped sample cost 1 ms** (#225). The keyframe gate and
+  arena exhaustion both returned `Ok(None)`, which `produce` mapped to
+  `WouldBlock`, which the executor answers with a 1 ms sleep — so a pre-keyframe
+  burst was paced at 1 kHz. They are now distinguishable, and only real
+  back-pressure yields.
 - **`ZenohSrc` did not hold its session alive**. It declared a subscriber and
   dropped the `Session`; dropping the last clone closes the session and makes
   `produce` report EOS on its first poll. Invisible until a test stopped
