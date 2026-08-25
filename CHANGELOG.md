@@ -195,6 +195,22 @@ the plugin ABI does not use either — so no ABI bump. `register` is unchanged;
 
 ### Fixed
 
+- **`tests/zenoh_media.rs` asserted delivery on a plane that promises none.**
+  Two separate failures, one root cause each. `settle()` slept a fixed 300 ms
+  and hoped the subscription had propagated; it now declares a throwaway probe
+  subscriber and publishes to it until something arrives, which *proves*
+  propagation — sound because the probe is declared after whatever the test
+  declared and both travel the same link, which delivers declarations in order.
+  It is also faster than the sleep it replaced. Separately,
+  `the_gate_holds_until_the_first_keyframe` published one burst and required all
+  of it to arrive: instrumenting a starved run showed the sink reporting four
+  samples sent against two received with `lost_wire == 0` — no wire gap, just
+  samples `CongestionControl::Drop` was entitled to discard. It now republishes
+  until a round lands, and only checks the pre-keyframe counter when a delta
+  actually arrived. Verified 25/25 and the whole binary 5/5 under twenty
+  spinning threads pinned to two cores, where it previously failed one run in
+  six.
+
 - **`just check-media-full` was red on master** and had been since the 1.98
   toolchain pin. `f2625b1` swept clippy's new `drain_collect` out of the AAC
   encoder but missed its twin in the Opus one, because no CI job builds `opus` —
