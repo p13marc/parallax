@@ -1210,3 +1210,61 @@ async fn the_send_rate_rises_with_published_samples_and_decays_when_publishing_s
         "the counter does not decay — that is the point of keeping both"
     );
 }
+
+/// #256: the receive side reports a rate too, measured the same way the sink
+/// measures its own — so a gap between the two is loss rather than an artefact
+/// of two different definitions.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_receive_rate_tracks_arrivals_and_decays_when_they_stop() {
+    let (pub_session, sub_session) = session_pair().await;
+    let key = unique_key("video/h264/high");
+
+    let mut src = ZenohSrc::media_with_session(sub_session.clone(), &key)
+        .await
+        .expect("media source");
+    let stats = src.control();
+    let mut sink = ZenohSink::media_with_session(pub_session.clone(), &key)
+        .await
+        .expect("media sink");
+    settle(&pub_session, &sub_session).await;
+
+    assert_eq!(stats.samples_per_second(), 0.0, "nothing received yet");
+    assert_eq!(stats.bits_per_second(), 0.0);
+
+    // Publish and consume ~30 samples over ~1 s. The source has to be pumped:
+    // `samples_received` counts what the subscriber callback took, but the
+    // keyframe gate means only a real produce moves buffers on.
+    for i in 0..30u8 {
+        let mut meta = Metadata::new();
+        meta.flags |= BufferFlags::SYNC_POINT;
+        sink.consume(&ConsumeContext::new(&buffer(&keyframe_au(), meta)))
+            .await
+            .expect("publish");
+        let _ = tokio::time::timeout(Duration::from_millis(33), async {
+            let mut ctx = ProduceContext::without_buffer();
+            src.produce(&mut ctx).await
+        })
+        .await;
+        let _ = i;
+    }
+
+    let receiving = stats.samples_per_second();
+    assert!(
+        receiving > 5.0,
+        "a stream arriving at ~30/s must not read as idle, got {receiving:.1}"
+    );
+    assert!(stats.bits_per_second() > 0.0);
+    assert!(stats.samples_received() > 0, "and the counter still counts");
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let stopped = stats.samples_per_second();
+    assert!(
+        stopped < receiving / 10.0,
+        "a stalled receiver must read as stalled: {receiving:.1} -> {stopped:.3} /s"
+    );
+    let total = stats.samples_received();
+    assert!(
+        total > 0,
+        "the counter does not decay — that is why both exist"
+    );
+}

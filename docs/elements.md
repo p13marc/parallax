@@ -181,7 +181,7 @@ anything, so `Aborted` comes from the handle alone.
 | `HttpCacheSrc` `[http]` | `HttpSrc` + a sparse on-disk cache (#188): everything downloaded is written through at true stream offsets, and a seek into an already-downloaded span is served **from disk** — no reconnect, no re-download (works even when the server refused ranges). Forward/hole seeks reconnect lazily at the target. Cache is an unlinked temp file by default; `with_cache_file` names a path. Progress: `Queue2RangesHandle` via `control()` + throttled `DownloadProgress` |
 | `HttpSink` `[http]` | HTTP POST/PUT sink (async sink — one blocking ureq request per buffer on the blocking pool, bounded by `with_timeout`, 30 s default) |
 | `WebSocketSrc` / `WebSocketSink` `[websocket]` | WebSocket message I/O. The sink is an async sink: connect/send run on the blocking pool, so a stalled peer pends the element, not a runtime worker |
-| `ZenohSrc` / `ZenohSink` `[zenoh]` | Zenoh subscribe/publish on key expressions. Two `WireProfile`s — `Parallax` (rkyv `WireMetadata`) and `Media` (the `@media` plane: CBOR `FrameMeta`, exact keys, `frame` QoS, byte-level keyframe promise); see `docs/zenoh-wire.md`. `ZenohSrc::control()` → `ZenohSrcHandle` (three distinct drop counters, `publisher_losses()`, `end_stream()`), `ZenohSink::control()` → `ZenohSinkHandle` (demand signal, publish counters, `request_keyframe()`). End of stream crosses the wire (#224): a terminal sample on the parallax plane, a liveliness token on both — `on_publisher_loss` is `Wait` by default. Publishing copies nothing (#226) |
+| `ZenohSrc` / `ZenohSink` `[zenoh]` | Zenoh subscribe/publish on key expressions. Two `WireProfile`s — `Parallax` (rkyv `WireMetadata`) and `Media` (the `@media` plane: CBOR `FrameMeta`, exact keys, `frame` QoS, byte-level keyframe promise); see `docs/zenoh-wire.md`. `ZenohSrc::control()` → `ZenohSrcHandle` (three distinct drop counters, receive rates, `publisher_losses()`, `end_stream()`), `ZenohSink::control()` → `ZenohSinkHandle` (demand signal, publish counters, `request_keyframe()`). End of stream crosses the wire (#224): a terminal sample on the parallax plane, a liveliness token on both — `on_publisher_loss` is `Wait` by default. Publishing copies nothing (#226) |
 | `ZenohQueryable` / `ZenohQuerier` `[zenoh]` | Zenoh query handling / querying |
 
 ## RTP / RTCP / RTSP — `elements::rtp` `[rtp]`
@@ -478,7 +478,9 @@ last value; counters do not decay, which is why you want both.
 | `ZenohSinkHandle` | `keyframes_sent()` | *none* — one per GOP is not a figure anyone reads per second |
 | `ZenohSinkHandle` | `publish_errors()` | *none* — a failed publish is fatal to the sink task, so the count cannot exceed one. It is also **not** a congestion signal: under `CongestionControl::Drop`, which the `@media` profile pins, a congested link drops the sample and returns success |
 | `ZenohSinkHandle` | `keyframe_requests()`, `rising_edges()`, `falling_edges()` | *none* |
-| `ZenohSrcHandle` | all nine receive counters | *none today* — the receive side has no consumer asking for one yet |
+| `ZenohSrcHandle` | `samples_received()` | `samples_per_second()` |
+| `ZenohSrcHandle` | `bytes_received()` | `bits_per_second()` — payload only, so it is comparable across the wire to the publisher's own figure; the gap between them is loss |
+| `ZenohSrcHandle` | `dropped_queue()`, `dropped_no_slot()`, `lost_wire()`, `dropped_pre_keyframe()`, `publisher_losses()`, `heartbeats()` | *none* — these mean deliberately different things and point at different machines (too slow / arena undersized / never arrived); a smoothed version of any of them says less, not more |
 
 A distribution rather than `last_encode_ns` alone because a single last value
 cannot show a tail, and the tail is what causes a dropped frame: one 900 ms

@@ -307,11 +307,12 @@ Default features are **empty** — everything below is opt-in.
 | Feature | Description | External deps |
 |---------|-------------|---------------|
 | `macros` | Plugin authoring proc-macros (`parallax-macros`) | — |
-| `huge-pages` | 2 MB/1 GB huge page segments | — |
+| `cli` | `parallax-launch`, the gst-launch-style pipeline runner | — |
 | **Network** | | |
 | `http` | HTTP source/sink (ureq) | — |
 | `websocket` | WebSocket source/sink (tungstenite) | — |
 | `zenoh` | Zenoh pub/sub + query elements | — |
+| `zenoh-unstable` | Reliability control + matching listeners (demand signalling) | — |
 | `rtp` | RTP/RTCP elements, payloaders, jitter buffer | — |
 | `rtsp` | RTSP client source (implies `rtp`) | — |
 | **Containers** | | |
@@ -330,6 +331,7 @@ Default features are **empty** — everything below is opt-in.
 | `audio-codecs` | FLAC+MP3+AAC+Vorbis decoders (Symphonia, pure Rust) | — |
 | `audio-flac` / `audio-mp3` / `audio-aac` / `audio-vorbis` | Individual Symphonia decoders | — |
 | `opus` | Opus encode/decode | libopus |
+| `eac3` | E-AC-3 decode (pure Rust) | — |
 | `aac-encode` | AAC encoder (FDK-AAC — **license restrictions**) | libfdk-aac |
 | **Images** | | |
 | `image-codecs` | JPEG decode (zune-jpeg) + PNG encode/decode — pure Rust | — |
@@ -338,16 +340,17 @@ Default features are **empty** — everything below is opt-in.
 | `simd-colorspace` | SIMD YUV↔RGB via the `yuv` crate (AVX-512/AVX2/SSE4.1/NEON) | — |
 | **Devices** | | |
 | `v4l2` | V4L2 capture, DMA-BUF export | libv4l headers |
+| `v4l2-m2m` | V4L2 stateful M2M hardware encode | libclang + kernel headers |
 | `libcamera` | libcamera capture | libcamera |
 | `pipewire` | PipeWire audio/video capture + playback | libpipewire |
 | `alsa` | ALSA capture/playback + hardware clock | alsa-lib |
 | `screen-capture` | XDG-portal screen capture (implies `pipewire`) | — |
 | `device-capture` | pipewire + libcamera | |
 | `device-all` | All device backends | |
+| `hotplug` | `DeviceMonitor` — udev + libcamera device events | libudev |
 | **Display** | | |
 | `display` | `AutoVideoSink` window (winit + softbuffer) | — |
-| **Placeholders** | | |
-| `gpu`, `rdma` | Reserved for future use — currently no-ops | — |
+| `display-gpu` | GPU presentation via wgpu, incl. zero-copy dma-buf import | — (drivers at runtime) |
 
 ## Examples
 
