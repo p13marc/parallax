@@ -150,7 +150,7 @@ pub use rtp::{
 // [`codec`], because `codec` is only compiled when a codec feature is enabled
 // while the handles themselves always are.
 pub use crate::control::{
-    Controllable, EncoderControl, EncoderParams, EncoderStats, EncoderStatsHandle,
+    Controllable, EncodeLatency, EncoderControl, EncoderParams, EncoderStats, EncoderStatsHandle,
     KEYFRAME_REQUEST, KeyframeHandle, RateControlMode,
 };
 

@@ -1,5 +1,13 @@
 # ZenSight "parallax" Video Sensor — Gap Analysis & Roadmap
 
+> **Historical (2026-08-25).** A gap-analysis report from 2026-07-04, superseded by
+> [plan 29](29_multi_machine_browser.md) and by what shipped. Several of its findings were true
+> when written and are not now — most visibly the note below that "the `zenoh` feature does not
+> compile", which was fixed long ago. Read it for the reasoning behind the keyspace (§4) and the
+> `FrameMeta` schema (§2b), not as a description of the tree. The GitHub issue links are stale
+> hosts; the repository is at `git.marcpardo.eu/marcpardo/parallax` and the numbers are unchanged.
+
+
 *Report date: 2026-07-04. Revised 2026-07-07: zensight shipped the media-plane
 enabler (#359) — see §1.4. Covers parallax @ master (6a61849), zensight @ master
 (b190784), zenoh 1.9.*

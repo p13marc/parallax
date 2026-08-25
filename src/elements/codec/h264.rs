@@ -698,14 +698,19 @@ impl H264Encoder {
             .map_err(|e| Error::Config(format!("H.264 encode failed: {:?}", e)))?;
 
         let encoded = bitstream.to_vec();
-        let elapsed_ns = started.elapsed().as_nanos() as u64;
+        // One clock read gives both the encode duration and the rate meters
+        // their timestamp; taking a second would double the hot path's
+        // clock cost for nothing.
+        let finished = std::time::Instant::now();
+        let elapsed_ns = finished.duration_since(started).as_nanos() as u64;
 
         if encoded.is_empty() {
             // Rate control swallowed the frame. Routine once skip_frames is on,
             // and counted nowhere before this.
-            self.stats.record_rc_drop(elapsed_ns);
+            self.stats.record_rc_drop_at(elapsed_ns, finished);
         } else {
-            self.stats.record_frame(encoded.len(), elapsed_ns);
+            self.stats
+                .record_frame_at(encoded.len(), elapsed_ns, finished);
         }
 
         Ok(encoded)

@@ -24,6 +24,7 @@
 #![cfg(feature = "zenoh")]
 
 use crate::buffer::{Buffer, MemoryHandle};
+use crate::control::RateMeter;
 use crate::element::{AsyncSink, AsyncSource, ConsumeContext, ProduceContext, ProduceResult};
 use crate::error::{Error, Result};
 use crate::memory::{OutputArena, OutputBudget, defaults};
@@ -152,17 +153,124 @@ static SHARED_SESSION: tokio::sync::OnceCell<Session> = tokio::sync::OnceCell::c
 /// Environment variable naming a zenoh JSON5 config file for [`shared_session`].
 pub const ZENOH_CONFIG_ENV: &str = "PARALLAX_ZENOH_CONFIG";
 
+/// The config key both helpers read and write.
+const TIMESTAMPING_KEY: &str = "timestamping/enabled";
+
+/// Raised once if an operator's config file turns session timestamping off.
+static TIMESTAMPING_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// The zenoh config parallax opens its own sessions with (#245).
+///
+/// zenoh's defaults plus **session timestamping**, which the `@media` profile
+/// requires: [`FrameMeta`](crate::wire::FrameMeta) carries no wallclock on
+/// purpose, so the HLC stamp zenoh puts on the sample is the only clock a
+/// consumer has for frame age. zenoh's own default is
+/// `{router: true, peer: false, client: false}` and parallax opens as a peer,
+/// so without this every sample it publishes goes out unstamped.
+///
+/// Deliberately does *not* read `PARALLAX_ZENOH_CONFIG` — that belongs to
+/// [`shared_session`], and the standalone constructors have never honoured it.
+///
+/// `drop_future_timestamp` is left at its `false` default on purpose: it makes
+/// a clock-skewed sample get re-stamped rather than dropped, and for a video
+/// plane a re-stamped frame beats a missing one.
+pub fn session_config() -> Result<zenoh::Config> {
+    let mut config = zenoh::Config::default();
+    config
+        .insert_json5(TIMESTAMPING_KEY, "true")
+        .map_err(|e| Error::Element(format!("zenoh config {TIMESTAMPING_KEY}: {e}")))?;
+    Ok(config)
+}
+
+/// Load an operator's config file, filling in timestamping only if it is silent.
+///
+/// The operator wins: a file that says `timestamping/enabled: false` keeps it,
+/// and gets one warning because the `@media` profile is unmeasurable that way.
+/// A file that says *nothing* has expressed no opinion — most exist only to set
+/// `connect/endpoints` — so it gets the same default [`session_config`] uses.
+fn config_from_file(path: &str) -> Result<zenoh::Config> {
+    let mut config = zenoh::Config::from_file(path)
+        .map_err(|e| Error::Element(format!("{ZENOH_CONFIG_ENV}={path}: {e}")))?;
+
+    if matches!(config.get_json(TIMESTAMPING_KEY).as_deref(), Ok("null")) {
+        config
+            .insert_json5(TIMESTAMPING_KEY, "true")
+            .map_err(|e| Error::Element(format!("zenoh config {TIMESTAMPING_KEY}: {e}")))?;
+    } else {
+        warn_if_timestamping_off(&config, path, &TIMESTAMPING_WARNED);
+    }
+    Ok(config)
+}
+
+/// Which zenoh mode this config will open in.
+///
+/// `Config::default()` leaves `mode` unset and zenoh fills it in at
+/// `expanded()` with `WhatAmI::default()`, which is `Peer` — so an absent mode
+/// means peer, and that is the common case rather than an edge one.
+fn config_mode(config: &zenoh::Config) -> &'static str {
+    let raw = match config.get_json("mode") {
+        Ok(raw) => raw,
+        Err(_) => return "peer",
+    };
+    match serde_json::from_str::<Option<String>>(&raw).ok().flatten() {
+        Some(mode) if mode == "router" => "router",
+        Some(mode) if mode == "client" => "client",
+        _ => "peer",
+    }
+}
+
+/// zenoh's own default for `timestamping/enabled` in a given mode.
+fn timestamping_default(mode: &str) -> bool {
+    mode == "router"
+}
+
+/// Whether `config` will run an HLC, and so stamp what it publishes.
+///
+/// Mirrors zenoh's own resolution: the value may be absent, a bare bool, or a
+/// per-mode map — and a map that omits *this* mode falls back to zenoh's
+/// default for it, not to the map's other entries.
+fn timestamping_enabled(config: &zenoh::Config) -> bool {
+    let mode = config_mode(config);
+    let Ok(raw) = config.get_json(TIMESTAMPING_KEY) else {
+        return timestamping_default(mode);
+    };
+    match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(serde_json::Value::Bool(enabled)) => enabled,
+        Ok(serde_json::Value::Object(per_mode)) => per_mode
+            .get(mode)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or_else(|| timestamping_default(mode)),
+        _ => timestamping_default(mode),
+    }
+}
+
+/// Warn once if `config` leaves timestamping off for its own mode.
+///
+/// Returns whether it warned, so `warned` doubles as a test's observation
+/// point rather than the warning only existing inside a tracing subscriber.
+fn warn_if_timestamping_off(config: &zenoh::Config, source: &str, warned: &AtomicBool) -> bool {
+    if timestamping_enabled(config) || warned.swap(true, Ordering::Relaxed) {
+        return false;
+    }
+    tracing::warn!(
+        "{source} disables zenoh session timestamping. The @media plane carries no \
+         wallclock of its own, so consumers will read frame age against their own \
+         clock instead of the publisher's — plausibly, and wrongly. Set \
+         `timestamping: {{ enabled: true }}` unless you mean it."
+    );
+    true
+}
+
 /// The process-wide zenoh session, opening it on first use.
 ///
-/// Configured from the file named by `PARALLAX_ZENOH_CONFIG`, or zenoh's
-/// defaults when that is unset.
+/// Configured from the file named by `PARALLAX_ZENOH_CONFIG`, or
+/// [`session_config`] when that is unset.
 pub async fn shared_session() -> Result<Session> {
     SHARED_SESSION
         .get_or_try_init(|| async {
             let config = match std::env::var(ZENOH_CONFIG_ENV) {
-                Ok(path) => zenoh::Config::from_file(&path)
-                    .map_err(|e| Error::Element(format!("{ZENOH_CONFIG_ENV}={path}: {e}")))?,
-                Err(_) => zenoh::Config::default(),
+                Ok(path) => config_from_file(&path)?,
+                Err(_) => session_config()?,
             };
             zenoh::open(config)
                 .await
@@ -421,7 +529,7 @@ pub struct ZenohSrc {
 impl ZenohSrc {
     /// Create a new Zenoh source with a new session.
     pub async fn new(key_expr: impl Into<String>) -> Result<Self> {
-        let session = zenoh::open(zenoh::Config::default())
+        let session = zenoh::open(session_config()?)
             .await
             .map_err(|e| Error::Element(format!("Zenoh open error: {}", e)))?;
 
@@ -527,7 +635,7 @@ impl ZenohSrc {
     /// is honest before a single sample arrives — which is what lets a graph
     /// under `ConverterPolicy::Deny` prepare deterministically.
     pub async fn media(key_expr: impl Into<String>) -> Result<Self> {
-        let session = zenoh::open(zenoh::Config::default())
+        let session = zenoh::open(session_config()?)
             .await
             .map_err(|e| Error::Element(format!("Zenoh open error: {}", e)))?;
         Self::media_with_session(session, key_expr).await
@@ -1133,8 +1241,8 @@ pub enum ZenohDemandEvent {
 /// listener's callback.
 #[derive(Debug, Default)]
 struct ZenohSinkCounters {
-    bytes_sent: AtomicU64,
-    samples_sent: AtomicU64,
+    bytes_sent: RateMeter,
+    samples_sent: RateMeter,
     keyframes_sent: AtomicU64,
     publish_errors: AtomicU64,
     /// Whether anyone is currently subscribed.
@@ -1243,20 +1351,46 @@ impl ZenohSinkHandle {
 
     /// Samples published.
     pub fn samples_sent(&self) -> u64 {
-        self.counters.samples_sent.load(Ordering::Relaxed)
+        self.counters.samples_sent.total()
     }
 
     /// Payload bytes published.
     pub fn bytes_sent(&self) -> u64 {
-        self.counters.bytes_sent.load(Ordering::Relaxed)
+        self.counters.bytes_sent.total()
+    }
+
+    /// Samples published per second, smoothed over
+    /// [`RATE_WINDOW`](crate::control::RATE_WINDOW).
+    pub fn samples_per_second(&self) -> f64 {
+        self.counters.samples_sent.per_second()
+    }
+
+    /// Published bitrate in bits per second, smoothed over
+    /// [`RATE_WINDOW`](crate::control::RATE_WINDOW).
+    ///
+    /// Payload only: zenoh's own framing, the CBOR attachment and the transport
+    /// headers are not counted, so this is lower than what a packet capture
+    /// sees. It is the figure comparable to an encoder's
+    /// [`bits_per_second`](crate::control::EncoderStatsHandle::bits_per_second).
+    pub fn bits_per_second(&self) -> f64 {
+        self.counters.bytes_sent.per_second() * 8.0
     }
 
     /// Samples published carrying a decoder entry point.
+    ///
+    /// No rate: one per GOP is not a figure anyone reads per second.
     pub fn keyframes_sent(&self) -> u64 {
         self.counters.keyframes_sent.load(Ordering::Relaxed)
     }
 
     /// Publishes that failed.
+    ///
+    /// **Not a congestion signal, and bounded by one.** Under
+    /// [`ZenohCongestionControl::Drop`] — which the `@media` profile pins — a
+    /// congested link drops the sample and returns success, and zenoh offers no
+    /// way to read that back. So this counts session and transport faults only.
+    /// A failed publish is also fatal to the sink task, so the count cannot
+    /// exceed one before the run ends; there is deliberately no rate.
     pub fn publish_errors(&self) -> u64 {
         self.counters.publish_errors.load(Ordering::Relaxed)
     }
@@ -1330,7 +1464,7 @@ pub struct ZenohSink {
 impl ZenohSink {
     /// Create a new Zenoh sink with a new session.
     pub async fn new(key_expr: impl Into<String>) -> Result<Self> {
-        let session = zenoh::open(zenoh::Config::default())
+        let session = zenoh::open(session_config()?)
             .await
             .map_err(|e| Error::Element(format!("Zenoh open error: {}", e)))?;
 
@@ -1396,7 +1530,7 @@ impl ZenohSink {
     /// subscribing under one would interleave every tier of a stream on a
     /// single subscriber.
     pub async fn media(key_expr: impl Into<String>) -> Result<Self> {
-        let session = zenoh::open(zenoh::Config::default())
+        let session = zenoh::open(session_config()?)
             .await
             .map_err(|e| Error::Element(format!("Zenoh open error: {}", e)))?;
         Self::media_with_session(session, key_expr).await
@@ -1552,12 +1686,12 @@ impl ZenohSink {
 
     /// Get the number of bytes sent.
     pub fn bytes_sent(&self) -> u64 {
-        self.counters.bytes_sent.load(Ordering::Relaxed)
+        self.counters.bytes_sent.total()
     }
 
     /// Get the number of samples sent.
     pub fn samples_sent(&self) -> u64 {
-        self.counters.samples_sent.load(Ordering::Relaxed)
+        self.counters.samples_sent.total()
     }
 
     /// Get statistics.
@@ -1736,7 +1870,10 @@ impl ZenohSink {
             .put(Vec::new())
             .attachment(attachment)
             .await
-            .map_err(|e| Error::Element(format!("Zenoh terminal put error: {e}")))
+            .map_err(|e| {
+                self.counters.publish_errors.fetch_add(1, Ordering::Relaxed);
+                Error::Element(format!("Zenoh terminal put error: {e}"))
+            })
     }
 }
 
@@ -1751,6 +1888,11 @@ impl AsyncSink for ZenohSink {
             .encoding
             .clone()
             .unwrap_or_else(|| encoding_for_format(metadata.format.as_ref()));
+
+        // The `@media` arm decides this by reading the bytes; the parallax arm
+        // has only what upstream flagged. Hoisted out of the match so
+        // `keyframes_sent` can count either.
+        let mut keyframe = metadata.flags.is_keyframe();
 
         let (data, attachment) = match self.profile {
             WireProfile::Parallax => {
@@ -1768,7 +1910,7 @@ impl AsyncSink for ZenohSink {
                     None => std::borrow::Cow::Borrowed(ctx.input()),
                 };
 
-                let keyframe = match self.param_sets.as_ref().map(|c| c.codec()) {
+                keyframe = match self.param_sets.as_ref().map(|c| c.codec()) {
                     Some(codec) => crate::codec::annexb::is_entry_point(&prepared, codec),
                     // No Annex-B notion of an entry point (JPEG, VP8/9, AV1):
                     // trust what the pipeline flagged.
@@ -1800,13 +1942,17 @@ impl AsyncSink for ZenohSink {
             None => put,
         };
 
-        put.await
-            .map_err(|e| Error::Element(format!("Zenoh put error: {}", e)))?;
+        if let Err(e) = put.await {
+            self.counters.publish_errors.fetch_add(1, Ordering::Relaxed);
+            return Err(Error::Element(format!("Zenoh put error: {e}")));
+        }
 
-        self.counters
-            .bytes_sent
-            .fetch_add(len as u64, Ordering::Relaxed);
-        self.counters.samples_sent.fetch_add(1, Ordering::Relaxed);
+        let now = std::time::Instant::now();
+        self.counters.bytes_sent.add_at(len as u64, now);
+        self.counters.samples_sent.add_at(1, now);
+        if keyframe {
+            self.counters.keyframes_sent.fetch_add(1, Ordering::Relaxed);
+        }
 
         Ok(())
     }
@@ -1897,7 +2043,7 @@ pub struct ZenohQueryable {
 impl ZenohQueryable {
     /// Create a new Zenoh queryable with a new session.
     pub async fn new(key_expr: impl Into<String>) -> Result<Self> {
-        let session = zenoh::open(zenoh::Config::default())
+        let session = zenoh::open(session_config()?)
             .await
             .map_err(|e| Error::Element(format!("Zenoh open error: {}", e)))?;
 
@@ -2054,7 +2200,7 @@ pub struct ZenohQuerier {
 impl ZenohQuerier {
     /// Create a new Zenoh querier with a new session.
     pub async fn new() -> Result<Self> {
-        let session = zenoh::open(zenoh::Config::default())
+        let session = zenoh::open(session_config()?)
             .await
             .map_err(|e| Error::Element(format!("Zenoh open error: {}", e)))?;
 
@@ -2234,5 +2380,142 @@ mod tests {
     fn test_zenoh_congestion_control_default() {
         let cc = ZenohCongestionControl::default();
         assert_eq!(cc, ZenohCongestionControl::Block);
+    }
+
+    // ---------------------------------------------------------------- #245
+
+    /// Write `body` to a `.json5` temp file — `Config::from_file` dispatches on
+    /// the extension and rejects anything else outright.
+    fn config_file(body: &str) -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut f = tempfile::Builder::new()
+            .suffix(".json5")
+            .tempfile()
+            .expect("temp file");
+        f.write_all(body.as_bytes()).expect("write config");
+        f.flush().expect("flush config");
+        f
+    }
+
+    fn load(body: &str) -> zenoh::Config {
+        let f = config_file(body);
+        config_from_file(f.path().to_str().unwrap()).expect("load config")
+    }
+
+    /// The load-bearing test: everything else here reads zenoh's config through
+    /// `get_json`, so pin the exact strings it answers with. A zenoh bump that
+    /// changes the serialisation fails here rather than silently downgrading
+    /// `timestamping_enabled` to its fallback.
+    #[test]
+    fn zenoh_reports_its_config_the_way_we_read_it() {
+        let default = zenoh::Config::default();
+        assert_eq!(default.get_json(TIMESTAMPING_KEY).unwrap(), "null");
+        assert_eq!(default.get_json("mode").unwrap(), "null");
+
+        let ours = session_config().unwrap();
+        assert_eq!(ours.get_json(TIMESTAMPING_KEY).unwrap(), "true");
+
+        let f = config_file(r#"{ timestamping: { enabled: false } }"#);
+        let off = zenoh::Config::from_file(f.path()).unwrap();
+        assert_eq!(off.get_json(TIMESTAMPING_KEY).unwrap(), "false");
+
+        let f = config_file(
+            r#"{ mode: "client", timestamping: { enabled: { router: true, peer: false, client: false } } }"#,
+        );
+        let per_mode = zenoh::Config::from_file(f.path()).unwrap();
+        assert_eq!(
+            per_mode.get_json(TIMESTAMPING_KEY).unwrap(),
+            r#"{"router":true,"peer":false,"client":false}"#
+        );
+        assert_eq!(per_mode.get_json("mode").unwrap(), r#""client""#);
+    }
+
+    #[test]
+    fn the_shipped_default_config_turns_timestamping_on() {
+        assert!(timestamping_enabled(&session_config().unwrap()));
+    }
+
+    /// The premise of #245: zenoh enables timestamping for routers only, and
+    /// parallax opens as a peer.
+    #[test]
+    fn zenoh_s_own_default_leaves_a_peer_unstamped() {
+        let default = zenoh::Config::default();
+        assert_eq!(config_mode(&default), "peer");
+        assert!(!timestamping_enabled(&default));
+    }
+
+    #[test]
+    fn a_router_config_is_already_stamped_without_our_help() {
+        let f = config_file(r#"{ mode: "router" }"#);
+        let config = zenoh::Config::from_file(f.path()).unwrap();
+        assert_eq!(config_mode(&config), "router");
+        assert!(timestamping_enabled(&config));
+    }
+
+    #[test]
+    fn a_per_mode_map_is_read_for_this_session_s_own_mode() {
+        let map = r#"timestamping: { enabled: { router: true, peer: false, client: false } }"#;
+
+        let f = config_file(&format!("{{ {map} }}"));
+        let as_peer = zenoh::Config::from_file(f.path()).unwrap();
+        assert!(!timestamping_enabled(&as_peer), "peer entry is false");
+
+        let f = config_file(&format!(r#"{{ mode: "router", {map} }}"#));
+        let as_router = zenoh::Config::from_file(f.path()).unwrap();
+        assert!(timestamping_enabled(&as_router), "router entry is true");
+    }
+
+    /// A map that omits this mode falls back to zenoh's default for it — not to
+    /// the map's other entries.
+    #[test]
+    fn a_per_mode_map_that_omits_this_mode_falls_back_to_zenoh_s_default() {
+        let f = config_file(r#"{ timestamping: { enabled: { router: true } } }"#);
+        let config = zenoh::Config::from_file(f.path()).unwrap();
+        assert_eq!(config_mode(&config), "peer");
+        assert!(!timestamping_enabled(&config));
+    }
+
+    #[test]
+    fn an_operator_file_that_turns_timestamping_off_is_left_alone() {
+        let config = load(r#"{ timestamping: { enabled: false } }"#);
+        assert!(!timestamping_enabled(&config));
+        assert_eq!(
+            config.get_json(TIMESTAMPING_KEY).unwrap(),
+            "false",
+            "the operator's value must survive verbatim"
+        );
+    }
+
+    /// A file that says nothing about timestamping has expressed no opinion, so
+    /// filling it in is not overruling the operator.
+    #[test]
+    fn an_operator_file_that_says_nothing_gets_timestamping_filled_in() {
+        let config = load(r#"{ scouting: { multicast: { enabled: false } } }"#);
+        assert!(timestamping_enabled(&config));
+        assert_eq!(config.get_json(TIMESTAMPING_KEY).unwrap(), "true");
+    }
+
+    #[test]
+    fn the_timestamping_warning_is_raised_exactly_once() {
+        let f = config_file(r#"{ timestamping: { enabled: false } }"#);
+        let config = zenoh::Config::from_file(f.path()).unwrap();
+        let warned = AtomicBool::new(false);
+
+        assert!(warn_if_timestamping_off(&config, "test", &warned));
+        assert!(!warn_if_timestamping_off(&config, "test", &warned));
+    }
+
+    #[test]
+    fn a_stamped_config_never_warns() {
+        let warned = AtomicBool::new(false);
+        assert!(!warn_if_timestamping_off(
+            &session_config().unwrap(),
+            "test",
+            &warned
+        ));
+        assert!(
+            !warned.load(Ordering::Relaxed),
+            "the flag must stay unspent"
+        );
     }
 }

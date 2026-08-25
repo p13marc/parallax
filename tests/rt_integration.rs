@@ -993,11 +993,28 @@ fn test_manual_driver_gated_processing() {
         "Output bridge should be empty before driver fires"
     );
 
-    // Fire the driver exactly 3 times — each cycle should process one buffer
-    for _ in 0..3 {
+    // Wait for the data thread to reach `want` buffers, or give up.
+    //
+    // A fixed sleep per cycle is what made this test flaky: it asserted that
+    // the RT thread gets scheduled inside 10 ms, which on a loaded runner it
+    // does not, and CI failed with "got 1" while nothing was wrong. What is
+    // under test is that each trigger yields one cycle, not how promptly the
+    // scheduler runs it — so wait on the count and let a busy machine take
+    // longer.
+    let settle = |want: usize| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while output_bridge.len() < want && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    };
+
+    // Fire the driver exactly 3 times — each cycle should process one buffer.
+    //
+    // One trigger at a time, each awaited: the trigger is an eventfd, and
+    // firing three back-to-back lets the wakeups coalesce into fewer cycles.
+    for n in 1..=3 {
         driver.trigger().unwrap();
-        // Give data thread time to wake and process
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        settle(n);
     }
 
     // Should have ~3 buffers in output (one per cycle)
@@ -1008,15 +1025,16 @@ fn test_manual_driver_gated_processing() {
     );
 
     // Fire 2 more times to drain remaining
-    for _ in 0..2 {
+    for n in 4..=5 {
         driver.trigger().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        settle(n);
     }
 
-    // Now signal EOS on input bridge and fire driver to let thread notice
+    // Now signal EOS on input bridge and fire driver to let thread notice.
+    // Nothing more reaches the output, so there is no count to wait on — the
+    // `join` below is what actually proves the thread saw it.
     input_bridge.signal_eos();
     driver.trigger().unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(50));
 
     // Drain remaining output and count total
     let mut total = 0;

@@ -118,7 +118,7 @@ pub use common::{PixelFormat, VideoFrame, VideoFrameRef};
 // documents the clone-before-start invariant — and are re-exported here so the
 // codec-facing paths keep working.
 pub use crate::control::{
-    Controllable, EncoderControl, EncoderParams, EncoderStats, EncoderStatsHandle,
+    Controllable, EncodeLatency, EncoderControl, EncoderParams, EncoderStats, EncoderStatsHandle,
     KEYFRAME_REQUEST, KeyframeHandle,
 };
 

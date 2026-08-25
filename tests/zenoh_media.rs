@@ -61,17 +61,21 @@ fn unique_key(tag: &str) -> String {
     )
 }
 
-/// A listening session and a session connected to it.
+/// A listening session and a session connected to it, from two given configs.
 ///
-/// Both have multicast *and* gossip scouting disabled, so they find each other
-/// only through the endpoint we hand them and nothing else on the machine.
-async fn session_pair() -> (zenoh::Session, zenoh::Session) {
+/// Both get multicast *and* gossip scouting disabled and a unique unix-socket
+/// endpoint, so they find each other only through what we hand them and
+/// nothing else on the machine.
+async fn session_pair_from(
+    publisher: zenoh::Config,
+    subscriber: zenoh::Config,
+) -> (zenoh::Session, zenoh::Session) {
     let (endpoint, path) = unique_endpoint();
     // The socket file outlives the sessions; clean it up rather than
     // littering TMPDIR across a test run.
     let _ = std::fs::remove_file(&path);
 
-    let mut listen = zenoh::Config::default();
+    let mut listen = publisher;
     listen
         .insert_json5("scouting/multicast/enabled", "false")
         .unwrap();
@@ -83,7 +87,7 @@ async fn session_pair() -> (zenoh::Session, zenoh::Session) {
         .unwrap();
     let publisher = zenoh::open(listen).await.expect("open listening session");
 
-    let mut connect = zenoh::Config::default();
+    let mut connect = subscriber;
     connect
         .insert_json5("scouting/multicast/enabled", "false")
         .unwrap();
@@ -100,14 +104,84 @@ async fn session_pair() -> (zenoh::Session, zenoh::Session) {
     (publisher, subscriber)
 }
 
-/// Wait for a freshly declared subscription to reach the other session.
+/// The pair every test in this file runs on.
+///
+/// The publisher runs **the shipped config** — `session_config()`, timestamping
+/// on (#245) — so these tests exercise what actually ships rather than a
+/// hand-rolled default.
+///
+/// The subscriber is deliberately left on zenoh's own default, which for a peer
+/// means timestamping **off**. Do not "fix" that: a session with timestamping on
+/// stamps unstamped *incoming* samples with its own HLC before delivering them
+/// (`treat_timestamp!` in zenoh's `route_data`), so with both ends on,
+/// `sample.timestamp().is_some()` would pass against a publisher that stamps
+/// nothing. Off, any timestamp seen in this file provably came from the
+/// publisher.
+async fn session_pair() -> (zenoh::Session, zenoh::Session) {
+    session_pair_from(
+        parallax::elements::network::session_config().expect("parallax session config"),
+        zenoh::Config::default(),
+    )
+    .await
+}
+
+/// Wait until a subscription declared on `subscriber` is genuinely matched by
+/// `publisher`, rather than hoping a fixed sleep was long enough.
 ///
 /// Over a real transport, declaring a subscriber and publishing are not
 /// ordered: the declaration has to propagate before the publisher will match
-/// it, and a sample sent into that window is simply gone. Tests that publish
-/// exactly one sample notice; tests that publish several accidentally do not.
-async fn settle() {
-    tokio::time::sleep(Duration::from_millis(300)).await;
+/// it, and a sample sent into that window is simply **gone** — this plane is
+/// best-effort and drop-by-contract. Tests that publish exactly one sample
+/// notice; tests that publish several used to accidentally not.
+///
+/// A 300 ms sleep used to stand in for that, and it is what made
+/// `the_gate_holds_until_the_first_keyframe` and
+/// `a_stalled_consumer_bounds_memory_instead_of_growing_it` fail on a busy CI
+/// runner: the whole burst went into the unmatched window, leaving zero samples
+/// received and a failure that said nothing about the behaviour under test.
+///
+/// So this probes instead. It declares one more subscriber, on a throwaway key,
+/// and publishes to it until something arrives. The load-bearing detail is the
+/// **ordering**: the probe is declared *after* whatever the test declared, and
+/// both travel the same link, which delivers declarations in order. So a
+/// publisher that has matched the probe has necessarily already processed the
+/// test's declaration.
+///
+/// Also faster than the sleep it replaced — it normally returns on the first
+/// round trip, in single-digit milliseconds.
+async fn settle(publisher: &zenoh::Session, subscriber: &zenoh::Session) {
+    static PROBE: AtomicU64 = AtomicU64::new(0);
+    let key = format!(
+        "parallax-settle/{}/{}",
+        std::process::id(),
+        PROBE.fetch_add(1, Ordering::Relaxed)
+    );
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let _probe = subscriber
+        .declare_subscriber(&key)
+        .callback(move |_| {
+            let _ = tx.send(());
+        })
+        .await
+        .expect("probe subscriber");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        // Ignore the error: a put with no matching route is not a failure, it
+        // is exactly the state we are waiting to leave.
+        let _ = publisher.put(&key, vec![0u8]).await;
+        if tokio::time::timeout(Duration::from_millis(20), rx.recv())
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the two sessions never matched a probe subscription in 10 s"
+        );
+    }
 }
 
 fn buffer(payload: &[u8], metadata: Metadata) -> Buffer {
@@ -161,13 +235,13 @@ async fn an_access_unit_crosses_two_sessions_intact() {
     let (pub_session, sub_session) = session_pair().await;
     let key = unique_key("video/h264/high");
 
-    let mut src = ZenohSrc::media_with_session(sub_session, &key)
+    let mut src = ZenohSrc::media_with_session(sub_session.clone(), &key)
         .await
         .expect("media source");
-    let mut sink = ZenohSink::media_with_session(pub_session, &key)
+    let mut sink = ZenohSink::media_with_session(pub_session.clone(), &key)
         .await
         .expect("media sink");
-    settle().await;
+    settle(&pub_session, &sub_session).await;
 
     let au = keyframe_au();
     let mut meta = Metadata::new();
@@ -206,35 +280,65 @@ async fn the_gate_holds_until_the_first_keyframe() {
     let (pub_session, sub_session) = session_pair().await;
     let key = unique_key("video/h264/low");
 
-    let mut src = ZenohSrc::media_with_session(sub_session, &key)
+    let mut src = ZenohSrc::media_with_session(sub_session.clone(), &key)
         .await
         .expect("media source");
-    let mut sink = ZenohSink::media_with_session(pub_session, &key)
+    let mut sink = ZenohSink::media_with_session(pub_session.clone(), &key)
         .await
         .expect("media sink");
-    settle().await;
+    settle(&pub_session, &sub_session).await;
 
     // Three delta frames, then a keyframe. A decoder must not see the deltas.
-    for i in 0..3u8 {
-        let meta = Metadata::new();
-        sink.consume(&ConsumeContext::new(&buffer(&delta_au(i), meta)))
-            .await
-            .expect("publish delta");
-    }
+    //
+    // Republished until a round lands, because this plane is best-effort and
+    // drop-by-contract and really does drop. Instrumenting a starved run showed
+    // the sink reporting four samples sent and the subscriber receiving two,
+    // with `lost_wire == 0` — no wire gap, just samples the transport was
+    // entitled to discard. A fixed burst that must all arrive is asserting
+    // something `@media` never promised, and that is what timed this test out
+    // on CI. What is under test is the *gate*, not delivery.
     let au = keyframe_au();
-    let mut meta = Metadata::new();
-    meta.flags |= BufferFlags::SYNC_POINT;
-    sink.consume(&ConsumeContext::new(&buffer(&au, meta)))
-        .await
-        .expect("publish keyframe");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let received = loop {
+        for i in 0..3u8 {
+            let meta = Metadata::new();
+            sink.consume(&ConsumeContext::new(&buffer(&delta_au(i), meta)))
+                .await
+                .expect("publish delta");
+        }
+        let mut meta = Metadata::new();
+        meta.flags |= BufferFlags::SYNC_POINT;
+        sink.consume(&ConsumeContext::new(&buffer(&au, meta)))
+            .await
+            .expect("publish keyframe");
 
-    let received = next_buffer(&mut src).await;
+        // Safe to abandon: `LeakyReceiver::recv` is cancel-safe, and
+        // `leaky::tests::cancelled_recv_loses_nothing` pins that.
+        let mut ctx = ProduceContext::without_buffer();
+        match tokio::time::timeout(Duration::from_millis(500), src.produce(&mut ctx)).await {
+            Ok(Ok(ProduceResult::OwnBuffer(b))) => break b,
+            Ok(Err(e)) => panic!("produce failed: {e}"),
+            _ => {}
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no round of deltas-then-keyframe was ever delivered"
+        );
+    };
+
     assert_eq!(
         received.as_bytes(),
         &au[..],
         "the first delivered buffer must be the keyframe, not a delta"
     );
-    assert!(src.dropped_pre_keyframe() >= 1, "deltas should be counted");
+    // Only meaningful if a delta actually arrived — one the transport dropped
+    // was never the gate's to count.
+    if src.control().samples_received() > 1 {
+        assert!(
+            src.dropped_pre_keyframe() >= 1,
+            "a delta that arrived before the keyframe must be counted, not delivered"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -242,13 +346,13 @@ async fn the_publisher_owns_the_sequence_and_a_gap_shows() {
     let (pub_session, sub_session) = session_pair().await;
     let key = unique_key("video/h264/medium");
 
-    let mut src = ZenohSrc::media_with_session(sub_session, &key)
+    let mut src = ZenohSrc::media_with_session(sub_session.clone(), &key)
         .await
         .expect("media source");
-    let mut sink = ZenohSink::media_with_session(pub_session, &key)
+    let mut sink = ZenohSink::media_with_session(pub_session.clone(), &key)
         .await
         .expect("media sink");
-    settle().await;
+    settle(&pub_session, &sub_session).await;
 
     // Wildly inconsistent buffer sequence numbers — an encoder rewrites them
     // mid-graph, so the publisher must not trust them.
@@ -289,13 +393,13 @@ async fn a_bare_keyframe_is_repaired_on_the_way_out() {
     let (pub_session, sub_session) = session_pair().await;
     let key = unique_key("video/h264/high");
 
-    let mut src = ZenohSrc::media_with_session(sub_session, &key)
+    let mut src = ZenohSrc::media_with_session(sub_session.clone(), &key)
         .await
         .expect("media source");
-    let mut sink = ZenohSink::media_with_session(pub_session, &key)
+    let mut sink = ZenohSink::media_with_session(pub_session.clone(), &key)
         .await
         .expect("media sink");
-    settle().await;
+    settle(&pub_session, &sub_session).await;
 
     // First a full keyframe, so the publisher learns the parameter sets.
     let mut meta = Metadata::new();
@@ -331,7 +435,7 @@ async fn caps_are_known_before_a_single_sample_arrives() {
     let (_pub_session, sub_session) = session_pair().await;
     let key = unique_key("video/h264/high");
 
-    let src = ZenohSrc::media_with_session(sub_session, &key)
+    let src = ZenohSrc::media_with_session(sub_session.clone(), &key)
         .await
         .expect("media source");
 
@@ -351,13 +455,13 @@ async fn a_wildcard_key_is_refused_on_both_sides() {
     let wild = "test/v1/*/@media/parallax/cam0/video/h264/high";
 
     assert!(
-        ZenohSrc::media_with_session(sub_session, wild)
+        ZenohSrc::media_with_session(sub_session.clone(), wild)
             .await
             .is_err(),
         "a wildcard subscription would interleave every tier, or every host"
     );
     assert!(
-        ZenohSink::media_with_session(pub_session, wild)
+        ZenohSink::media_with_session(pub_session.clone(), wild)
             .await
             .is_err(),
         "publishing under a wildcard is a lie about identity"
@@ -377,7 +481,7 @@ async fn media_refuses_the_parallax_plane_s_options() {
         "@media samples must carry a FrameMeta"
     );
 
-    let sink = ZenohSink::media_with_session(pub_session, &key)
+    let sink = ZenohSink::media_with_session(pub_session.clone(), &key)
         .await
         .expect("media sink");
     assert!(
@@ -393,10 +497,10 @@ async fn a_foreign_publisher_does_not_break_the_subscriber() {
     let (pub_session, sub_session) = session_pair().await;
     let key = unique_key("video/h264/high");
 
-    let mut src = ZenohSrc::media_with_session(sub_session, &key)
+    let mut src = ZenohSrc::media_with_session(sub_session.clone(), &key)
         .await
         .expect("media source");
-    settle().await;
+    settle(&pub_session, &sub_session).await;
 
     pub_session
         .put(&key, b"not an access unit".to_vec())
@@ -420,20 +524,20 @@ async fn a_viewer_arriving_raises_the_demand_signal_and_asks_for_a_keyframe() {
     let (pub_session, sub_session) = session_pair().await;
     let key = unique_key("video/h264/high");
 
-    let mut sink = ZenohSink::media_with_session(pub_session, &key)
+    let mut sink = ZenohSink::media_with_session(pub_session.clone(), &key)
         .await
         .expect("media sink");
     let demand = sink.control();
 
     // The publisher is lazy, so declare it (and the listener) up front.
     sink.ensure_publisher().await.expect("publisher");
-    settle().await;
+    settle(&pub_session, &sub_session).await;
 
     assert!(!demand.has_viewers(), "nobody is watching yet");
     assert_eq!(demand.rising_edges(), 0);
 
     // A viewer appears.
-    let _src = ZenohSrc::media_with_session(sub_session, &key)
+    let _src = ZenohSrc::media_with_session(sub_session.clone(), &key)
         .await
         .expect("media source");
 
@@ -465,14 +569,14 @@ async fn the_last_viewer_leaving_is_observable() {
     let (pub_session, sub_session) = session_pair().await;
     let key = unique_key("video/h264/low");
 
-    let mut sink = ZenohSink::media_with_session(pub_session, &key)
+    let mut sink = ZenohSink::media_with_session(pub_session.clone(), &key)
         .await
         .expect("media sink");
     let demand = sink.control();
     sink.ensure_publisher().await.expect("publisher");
-    settle().await;
+    settle(&pub_session, &sub_session).await;
 
-    let src = ZenohSrc::media_with_session(sub_session, &key)
+    let src = ZenohSrc::media_with_session(sub_session.clone(), &key)
         .await
         .expect("media source");
     assert_eq!(
@@ -496,7 +600,7 @@ async fn the_handle_counts_what_was_published() {
     let (pub_session, _sub) = session_pair().await;
     let key = unique_key("video/h264/high");
 
-    let mut sink = ZenohSink::media_with_session(pub_session, &key)
+    let mut sink = ZenohSink::media_with_session(pub_session.clone(), &key)
         .await
         .expect("media sink");
     let stats = sink.control();
@@ -509,6 +613,8 @@ async fn the_handle_counts_what_was_published() {
 
     assert_eq!(stats.samples_sent(), 1);
     assert!(stats.bytes_sent() > 0);
+    // Meaningful since #246: the error path increments this now. It used to
+    // have no writer at all, so the assertion passed vacuously.
     assert_eq!(stats.publish_errors(), 0);
 }
 
@@ -517,7 +623,7 @@ async fn a_keyframe_request_is_raised_upstream_and_coalesced() {
     let (pub_session, _sub) = session_pair().await;
     let key = unique_key("video/h264/high");
 
-    let mut sink = ZenohSink::media_with_session(pub_session, &key)
+    let mut sink = ZenohSink::media_with_session(pub_session.clone(), &key)
         .await
         .expect("media sink");
 
@@ -554,14 +660,14 @@ async fn the_three_drop_counters_mean_different_things() {
     let (pub_session, sub_session) = session_pair().await;
     let key = unique_key("video/h264/high");
 
-    let mut src = ZenohSrc::media_with_session(sub_session, &key)
+    let mut src = ZenohSrc::media_with_session(sub_session.clone(), &key)
         .await
         .expect("media source");
     let stats = src.control();
-    let mut sink = ZenohSink::media_with_session(pub_session, &key)
+    let mut sink = ZenohSink::media_with_session(pub_session.clone(), &key)
         .await
         .expect("media sink");
-    settle().await;
+    settle(&pub_session, &sub_session).await;
 
     // A clean keyframe, then a delta: nothing lost, nothing dropped.
     for au in [keyframe_au(), delta_au(0)] {
@@ -588,36 +694,48 @@ async fn a_stalled_consumer_bounds_memory_instead_of_growing_it() {
     let (pub_session, sub_session) = session_pair().await;
     let key = unique_key("video/h264/low");
 
-    let src = ZenohSrc::media_with_session(sub_session, &key)
+    let src = ZenohSrc::media_with_session(sub_session.clone(), &key)
         .await
         .expect("media source");
     let stats = src.control();
-    let mut sink = ZenohSink::media_with_session(pub_session, &key)
+    let mut sink = ZenohSink::media_with_session(pub_session.clone(), &key)
         .await
         .expect("media sink");
-    settle().await;
+    settle(&pub_session, &sub_session).await;
 
-    // Publish far more than the queue holds, and never pull.
-    for i in 0..200u8 {
-        let mut meta = Metadata::new();
-        meta.flags |= BufferFlags::SYNC_POINT;
-        sink.consume(&ConsumeContext::new(&buffer(&delta_au(i), meta)))
-            .await
-            .expect("publish");
-    }
-
-    // Give the callback time to drain the transport into the bounded queue.
-    for _ in 0..40 {
-        if stats.dropped_queue() > 0 {
-            break;
+    // Publish far more than the queue holds, and never pull — and keep
+    // publishing until the queue visibly evicts.
+    //
+    // The retry is what makes this test honest rather than lucky. Declaring a
+    // subscriber and publishing are not ordered (see `settle`), and a sample
+    // sent before the declaration propagates is simply gone — so under CPU
+    // contention a single fixed-size burst can arrive *entirely* in that
+    // window, leaving `samples_received == 0` and a failure that says nothing
+    // about the bound under test. Republishing lets a slow handshake catch up.
+    // The first burst is enough in the normal case, and the loop exits in a
+    // few milliseconds.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut published = 0u32;
+    while stats.dropped_queue() == 0 && std::time::Instant::now() < deadline {
+        for i in 0..64u8 {
+            let mut meta = Metadata::new();
+            meta.flags |= BufferFlags::SYNC_POINT;
+            sink.consume(&ConsumeContext::new(&buffer(&delta_au(i), meta)))
+                .await
+                .expect("publish");
+            published += 1;
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        // Let the subscriber's callback run before deciding to publish more.
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
     assert!(
         stats.dropped_queue() > 0,
-        "a stalled consumer must evict, not accumulate (dropped_queue = {})",
-        stats.dropped_queue()
+        "a stalled consumer must evict, not accumulate \
+         (published {published}, dropped_queue = {}, samples_received = {} — if \
+          the last is 0 the subscription never matched, not the queue unbounded)",
+        stats.dropped_queue(),
+        stats.samples_received()
     );
     // And the eviction is attributed correctly, not lumped in elsewhere.
     assert_eq!(stats.dropped_no_slot(), 0, "no arena slot was ever refused");
@@ -663,13 +781,13 @@ use parallax::pipeline::EndReason;
 async fn parallax_pair(tag: &str) -> (ZenohSrc, ZenohSink, String) {
     let (pub_session, sub_session) = session_pair().await;
     let key = unique_key(tag);
-    let src = ZenohSrc::with_session(sub_session, &key)
+    let src = ZenohSrc::with_session(sub_session.clone(), &key)
         .await
         .expect("source");
-    let sink = ZenohSink::with_session(pub_session, &key)
+    let sink = ZenohSink::with_session(pub_session.clone(), &key)
         .await
         .expect("sink");
-    settle().await;
+    settle(&pub_session, &sub_session).await;
     (src, sink, key)
 }
 
@@ -744,13 +862,13 @@ async fn a_publisher_failure_crosses_the_wire_as_a_failure() {
 async fn the_media_plane_gets_no_terminal_sample() {
     let (pub_session, sub_session) = session_pair().await;
     let key = unique_key("video/h264/high");
-    let mut src = ZenohSrc::media_with_session(sub_session, &key)
+    let mut src = ZenohSrc::media_with_session(sub_session.clone(), &key)
         .await
         .expect("media source");
-    let mut sink = ZenohSink::media_with_session(pub_session, &key)
+    let mut sink = ZenohSink::media_with_session(pub_session.clone(), &key)
         .await
         .expect("media sink");
-    settle().await;
+    settle(&pub_session, &sub_session).await;
 
     let mut meta = Metadata::new();
     meta.flags |= BufferFlags::SYNC_POINT;
@@ -771,14 +889,14 @@ async fn the_media_plane_gets_no_terminal_sample() {
 async fn a_vanished_publisher_ends_the_stream_under_the_eos_policy() {
     let (pub_session, sub_session) = session_pair().await;
     let key = unique_key("video/h264/high");
-    let mut src = ZenohSrc::media_with_session(sub_session, &key)
+    let mut src = ZenohSrc::media_with_session(sub_session.clone(), &key)
         .await
         .expect("media source")
         .on_publisher_loss(PublisherLoss::Eos);
-    let mut sink = ZenohSink::media_with_session(pub_session, &key)
+    let mut sink = ZenohSink::media_with_session(pub_session.clone(), &key)
         .await
         .expect("media sink");
-    settle().await;
+    settle(&pub_session, &sub_session).await;
 
     let mut meta = Metadata::new();
     meta.flags |= BufferFlags::SYNC_POINT;
@@ -807,14 +925,14 @@ async fn a_vanished_publisher_ends_the_stream_under_the_eos_policy() {
 async fn a_vanished_publisher_only_warns_by_default() {
     let (pub_session, sub_session) = session_pair().await;
     let key = unique_key("video/h264/high");
-    let mut src = ZenohSrc::media_with_session(sub_session, &key)
+    let mut src = ZenohSrc::media_with_session(sub_session.clone(), &key)
         .await
         .expect("media source");
     let handle: ZenohSrcHandle = src.control();
-    let mut sink = ZenohSink::media_with_session(pub_session, &key)
+    let mut sink = ZenohSink::media_with_session(pub_session.clone(), &key)
         .await
         .expect("media sink");
-    settle().await;
+    settle(&pub_session, &sub_session).await;
 
     let mut meta = Metadata::new();
     meta.flags |= BufferFlags::SYNC_POINT;
@@ -859,7 +977,7 @@ async fn end_stream_ends_a_source_parked_on_the_wire() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stream_timeout_ends_a_silent_stream() {
     let (_pub_session, sub_session) = session_pair().await;
-    let mut src = ZenohSrc::with_session(sub_session, unique_key("stream-timeout"))
+    let mut src = ZenohSrc::with_session(sub_session.clone(), unique_key("stream-timeout"))
         .await
         .expect("source")
         .with_stream_timeout(Duration::from_millis(200));
@@ -879,7 +997,7 @@ async fn a_stream_timeout_ends_a_silent_stream() {
 async fn an_at_media_heartbeat_never_produces_a_frame() {
     let (_pub_session, sub_session) = session_pair().await;
     let key = unique_key("video/h264/high");
-    let mut src = ZenohSrc::media_with_session(sub_session, &key)
+    let mut src = ZenohSrc::media_with_session(sub_session.clone(), &key)
         .await
         .expect("media source")
         .with_timeout(Duration::from_millis(100));
@@ -896,4 +1014,199 @@ async fn an_at_media_heartbeat_never_produces_a_frame() {
             "@media must never emit a zero-length frame, got {result:?}"
         );
     }
+}
+
+// ------------------------------------------------------------------- #245
+
+/// Wait for one sample on a raw subscriber, or fail loudly.
+async fn next_sample(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<zenoh::sample::Sample>,
+) -> zenoh::sample::Sample {
+    tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("a sample within 5 s")
+        .expect("the raw subscriber is still alive")
+}
+
+/// The acceptance criterion for #245.
+///
+/// `FrameMeta` carries no wallclock, so the zenoh HLC stamp on the sample is
+/// the only clock a consumer has for frame age. A peer session leaves
+/// timestamping off by default, which used to make every `@media` sample
+/// parallax published unstamped.
+///
+/// The subscriber session here has timestamping off (see `session_pair`), so a
+/// timestamp on the received sample can only have come from the publisher.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_media_sample_carries_a_zenoh_timestamp_across_two_sessions() {
+    let (pub_session, sub_session) = session_pair().await;
+    let key = unique_key("video/h264/high");
+
+    let (raw_tx, mut raw_rx) = tokio::sync::mpsc::unbounded_channel();
+    let _raw_sub = sub_session
+        .declare_subscriber(&key)
+        .callback(move |sample| {
+            let _ = raw_tx.send(sample);
+        })
+        .await
+        .expect("raw subscriber");
+
+    let mut sink = ZenohSink::media_with_session(pub_session.clone(), &key)
+        .await
+        .expect("media sink");
+    settle(&pub_session, &sub_session).await;
+
+    let mut meta = Metadata::new();
+    meta.flags |= BufferFlags::SYNC_POINT;
+    sink.consume(&ConsumeContext::new(&buffer(&keyframe_au(), meta)))
+        .await
+        .expect("publish keyframe");
+
+    let sample = next_sample(&mut raw_rx).await;
+    assert!(
+        sample.timestamp().is_some(),
+        "the @media plane's only clock is the HLC stamp on the sample"
+    );
+}
+
+/// An operator's config wins, and the plane still carries frames without it.
+///
+/// The sharper half is `timestamp().is_none()`: it proves parallax honoured the
+/// file rather than quietly overriding it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_config_with_timestamping_off_still_carries_frames() {
+    use std::io::Write;
+
+    let mut file = tempfile::Builder::new()
+        .suffix(".json5")
+        .tempfile()
+        .expect("temp config");
+    file.write_all(br#"{ timestamping: { enabled: false } }"#)
+        .expect("write config");
+    file.flush().expect("flush config");
+
+    let publisher_config = zenoh::Config::from_file(file.path()).expect("load operator config");
+    let (pub_session, sub_session) =
+        session_pair_from(publisher_config, zenoh::Config::default()).await;
+    let key = unique_key("video/h264/high");
+
+    let (raw_tx, mut raw_rx) = tokio::sync::mpsc::unbounded_channel();
+    let _raw_sub = sub_session
+        .declare_subscriber(&key)
+        .callback(move |sample| {
+            let _ = raw_tx.send(sample);
+        })
+        .await
+        .expect("raw subscriber");
+
+    let mut sink = ZenohSink::media_with_session(pub_session.clone(), &key)
+        .await
+        .expect("media sink");
+    settle(&pub_session, &sub_session).await;
+
+    let au = keyframe_au();
+    let mut meta = Metadata::new();
+    meta.flags |= BufferFlags::SYNC_POINT;
+    sink.consume(&ConsumeContext::new(&buffer(&au, meta)))
+        .await
+        .expect("publish keyframe");
+
+    let sample = next_sample(&mut raw_rx).await;
+    assert_eq!(
+        sample.payload().to_bytes().as_ref(),
+        au.as_slice(),
+        "the frame still crosses intact"
+    );
+    let frame = FrameMeta::from_cbor(
+        &sample
+            .attachment()
+            .expect("FrameMeta attachment")
+            .to_bytes(),
+    )
+    .expect("decodable FrameMeta");
+    assert!(frame.keyframe, "and its metadata is intact too");
+    assert!(
+        sample.timestamp().is_none(),
+        "the operator said no; parallax must not override them"
+    );
+}
+
+/// `keyframes_sent` had no writer at all before #246 — the counter was
+/// declared, exposed on the handle, and never incremented by anything.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_handle_counts_keyframes_separately_from_samples() {
+    let (pub_session, _sub) = session_pair().await;
+    let key = unique_key("video/h264/high");
+
+    let mut sink = ZenohSink::media_with_session(pub_session.clone(), &key)
+        .await
+        .expect("media sink");
+    let stats = sink.control();
+
+    let mut keyframe = Metadata::new();
+    keyframe.flags |= BufferFlags::SYNC_POINT;
+    sink.consume(&ConsumeContext::new(&buffer(&keyframe_au(), keyframe)))
+        .await
+        .expect("publish keyframe");
+
+    // A delta frame, even one upstream mislabelled as a sync point: on this
+    // plane the flag is decided by reading the bytes.
+    let mut delta = Metadata::new();
+    delta.flags |= BufferFlags::SYNC_POINT;
+    sink.consume(&ConsumeContext::new(&buffer(&delta_au(1), delta)))
+        .await
+        .expect("publish delta");
+
+    assert_eq!(stats.samples_sent(), 2);
+    assert_eq!(
+        stats.keyframes_sent(),
+        1,
+        "only the access unit that really is a decoder entry point counts"
+    );
+}
+
+/// The send rate is the figure a health panel reads; the counter behind it is
+/// the figure an exporter reads. Both, and they must agree about the stream
+/// having stopped.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_send_rate_rises_with_published_samples_and_decays_when_publishing_stops() {
+    let (pub_session, _sub) = session_pair().await;
+    let key = unique_key("video/h264/high");
+
+    let mut sink = ZenohSink::media_with_session(pub_session.clone(), &key)
+        .await
+        .expect("media sink");
+    let stats = sink.control();
+
+    assert_eq!(stats.samples_per_second(), 0.0, "nothing published yet");
+
+    // ~30 samples over ~1 s.
+    for i in 0..30u8 {
+        let mut meta = Metadata::new();
+        meta.flags |= BufferFlags::SYNC_POINT;
+        sink.consume(&ConsumeContext::new(&buffer(&delta_au(i), meta)))
+            .await
+            .expect("publish");
+        tokio::time::sleep(Duration::from_millis(33)).await;
+    }
+
+    let publishing = stats.samples_per_second();
+    let bitrate = stats.bits_per_second();
+    assert!(
+        publishing > 5.0,
+        "a stream publishing at ~30/s must not read as idle, got {publishing:.1}"
+    );
+    assert!(bitrate > 0.0, "and its bitrate must be positive");
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let stopped = stats.samples_per_second();
+    assert!(
+        stopped < publishing / 10.0,
+        "a stalled publisher must read as stalled: {publishing:.1} -> {stopped:.3} /s"
+    );
+    assert_eq!(
+        stats.samples_sent(),
+        30,
+        "the counter does not decay — that is the point of keeping both"
+    );
 }

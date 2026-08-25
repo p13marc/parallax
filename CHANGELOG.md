@@ -16,6 +16,13 @@ no intermediate build advertises a half-migrated format.
 
 ### Breaking
 
+- **`EncoderStats` is no longer `Eq`** (#246). It gained three `f64` rate fields
+  and an `EncodeLatency`, so the derive had to go. `PartialEq`, `Copy`, `Clone`,
+  `Debug` and `Default` all remain, which is everything `assert_eq!` and the
+  rest of the tree actually used — and asking whether two stats snapshots taken
+  at different instants are *equal* was never a meaningful question. Matches
+  `Queue2Stats`, which has carried `f64` rates beside `u64` counters all along.
+
 **`MediaFormat` and encoded geometry** (#236). `VideoCodec` gains `Mjpeg`,
 appended last so the discriminants `ipc_ring`'s `descriptor_enum_discriminants_locked`
 pins do not move. `Metadata` gains a `coded` field carrying encoded video's
@@ -188,11 +195,39 @@ the plugin ABI does not use either — so no ABI bump. `register` is unchanged;
 
 ### Fixed
 
+- **`tests/zenoh_media.rs` asserted delivery on a plane that promises none.**
+  Two separate failures, one root cause each. `settle()` slept a fixed 300 ms
+  and hoped the subscription had propagated; it now declares a throwaway probe
+  subscriber and publishes to it until something arrives, which *proves*
+  propagation — sound because the probe is declared after whatever the test
+  declared and both travel the same link, which delivers declarations in order.
+  It is also faster than the sleep it replaced. Separately,
+  `the_gate_holds_until_the_first_keyframe` published one burst and required all
+  of it to arrive: instrumenting a starved run showed the sink reporting four
+  samples sent against two received with `lost_wire == 0` — no wire gap, just
+  samples `CongestionControl::Drop` was entitled to discard. It now republishes
+  until a round lands, and only checks the pre-keyframe counter when a delta
+  actually arrived. Verified 25/25 and the whole binary 5/5 under twenty
+  spinning threads pinned to two cores, where it previously failed one run in
+  six.
+
 - **`just check-media-full` was red on master** and had been since the 1.98
   toolchain pin. `f2625b1` swept clippy's new `drain_collect` out of the AAC
   encoder but missed its twin in the Opus one, because no CI job builds `opus` —
   the feature appears only in that recipe, which no workflow mirrors. It is also
   the only recipe that covers `vpx`, so the gap hid a second thing.
+
+- **`a_stalled_consumer_bounds_memory_instead_of_growing_it` was flaky, and had
+  turned CI red on master.** It published one fixed burst 300 ms after
+  declaring the subscriber, then gave the callback one second to show an
+  eviction. Under CPU contention the subscription had not propagated yet, so
+  the whole burst went into the unmatched window and vanished — `@media` is
+  best-effort and drop-by-contract — leaving `samples_received == 0` and a
+  failure that said nothing about the bound under test. It now republishes
+  until the queue visibly evicts, and its assertion prints
+  `samples_received` so a future failure distinguishes a lost handshake from a
+  real regression. Verified at 10/10 under 24 spinning threads on a 6-core
+  box, still finishing in under a second.
 
 - **Two `ZenohSinkHandle` counters had no writer at all** (#246).
   `keyframes_sent` and `publish_errors` were declared, exposed on the handle and

@@ -444,8 +444,13 @@ mod jpeg_codec {
             // knob operators reach for — so bytes-per-frame and encode time
             // need to be readable while the pipeline runs, not just after.
             // JPEG has no rate control, so frames_dropped_by_rc stays zero.
-            self.stats
-                .record_frame(output.len(), started.elapsed().as_nanos() as u64);
+            // One clock read for both the duration and the rate meters' timestamp.
+            let finished = std::time::Instant::now();
+            self.stats.record_frame_at(
+                output.len(),
+                finished.duration_since(started).as_nanos() as u64,
+                finished,
+            );
 
             let mut slot = self.output.acquire(output.len(), "jpegencoder")?;
             slot.data_mut()[..output.len()].copy_from_slice(&output);
@@ -732,8 +737,13 @@ mod png_codec {
             // Same rationale as JpegEncoder: the element is moved into its
             // executor task at start, so per-frame cost has to be readable
             // through a handle. PNG has no rate control either.
-            self.stats
-                .record_frame(output.len(), started.elapsed().as_nanos() as u64);
+            // One clock read for both the duration and the rate meters' timestamp.
+            let finished = std::time::Instant::now();
+            self.stats.record_frame_at(
+                output.len(),
+                finished.duration_since(started).as_nanos() as u64,
+                finished,
+            );
 
             let mut slot = self.output.acquire(output.len(), "pngencoder")?;
             slot.data_mut()[..output.len()].copy_from_slice(&output);

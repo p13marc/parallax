@@ -297,14 +297,18 @@ impl<E: HwVideoEncoder + 'static> Transform for HwEncoderElement<E> {
         // Encode frame
         let started = std::time::Instant::now();
         let packets = self.encoder.encode(&frame)?;
-        let elapsed_ns = started.elapsed().as_nanos() as u64;
+        // One clock read gives both the encode duration and the rate meters
+        // their timestamp; taking a second would double the hot path's
+        // clock cost for nothing.
+        let finished = std::time::Instant::now();
+        let elapsed_ns = finished.duration_since(started).as_nanos() as u64;
 
         // If no packets, the encoder is buffering (B-frame reorder) or rate
         // control swallowed the frame. Either way nothing came out for this
         // input, which is exactly the event a sender-side bitrate loop needs
         // to see.
         if packets.is_empty() {
-            self.stats.record_rc_drop(elapsed_ns);
+            self.stats.record_rc_drop_at(elapsed_ns, finished);
             return Ok(Output::None);
         }
 
@@ -323,7 +327,8 @@ impl<E: HwVideoEncoder + 'static> Transform for HwEncoderElement<E> {
             buffers.push(self.packet_to_buffer(data, pts, is_keyframe)?);
             self.packets_out += 1;
         }
-        self.stats.record_frame(encoded_bytes, elapsed_ns);
+        self.stats
+            .record_frame_at(encoded_bytes, elapsed_ns, finished);
 
         Ok(Output::from(buffers))
     }
