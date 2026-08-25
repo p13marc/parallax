@@ -22,7 +22,7 @@
 //! | Handle | From | Changes |
 //! |--------|------|---------|
 //! | [`EncoderControl`] | `H264Encoder`, `EncoderElement` | bitrate, GOP, QP, rate-control mode, frame skipping, keyframe requests |
-//! | [`EncoderStatsHandle`] | `H264Encoder`, `EncoderElement` | *read-only*: frames, bytes, rate-control drops, encode time |
+//! | [`EncoderStatsHandle`] | `H264Encoder`, `EncoderElement` | *read-only*: frames, bytes and rate-control drops, each as a counter **and** a rate, plus an encode-latency distribution |
 //! | [`KeyframeHandle`] | `…::keyframe_handle()` | force the next frame to be an IDR |
 //! | [`ScaleControl`] | `VideoScale` | target resolution (`set_max_height`, `passthrough`) |
 //! | [`ThrottleControl`] | `Throttle` | framerate (drop-based; also auto-degrades on `Event::Qos` underflow, #184 — recovery stays app-driven through this handle) |
@@ -31,6 +31,7 @@
 //! | [`Queue2RangesHandle`] | `Queue2` (download mode) | *read-only*: downloaded byte ranges, total, write position |
 //! | [`GainControl`] | `Gain` | audio volume (`set_factor`, `set_db`) |
 //! | [`FlowStateHandle`] | `Pipeline::monitor_link` | backpressure signalling to live sources |
+//! | `ZenohSinkHandle` `[zenoh]` | `ZenohSink::control()` | viewer presence and edges, keyframe requests, publish counters and rates |
 //!
 //! # Example
 //!
@@ -47,11 +48,28 @@
 //! control.request_keyframe();           // next encoded frame is an IDR
 //! // ... or when the link gets congested:
 //! control.set_bitrate(400_000);         // 400 kbps, applied seamlessly
-//! println!("{} kbps", stats.bytes_encoded());
+//! println!("{:.0} kbps", stats.bits_per_second() / 1000.0);
 //! ```
+//!
+//! # Counters and rates
+//!
+//! Handles report both, because they answer different questions: a counter is
+//! monotonic and is what you difference over an arbitrary interval or hand to an
+//! exporter, while a rate is what a human reads. Rates are an EWMA over
+//! [`RATE_WINDOW`] with a [`RATE_TIME_CONSTANT`] time constant — a stated
+//! constant rather than a caller's choice, so "encoded fps" means the same thing
+//! in every consumer — and they decay toward zero when writes stop.
+//!
+//! `docs/elements.md` § "Runtime control (bandwidth knobs)" has the full table
+//! of which figure is which.
+
+mod meter;
+
+pub use meter::{EncodeLatency, LatencyHistogram, RATE_TIME_CONSTANT, RATE_WINDOW, RateMeter};
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::time::Instant;
 
 /// An element that exposes a runtime control handle.
 ///
@@ -394,10 +412,11 @@ pub struct EncoderStatsHandle(Arc<EncoderStatsInner>);
 
 #[derive(Debug, Default)]
 struct EncoderStatsInner {
-    frames_encoded: AtomicU64,
-    bytes_encoded: AtomicU64,
-    frames_dropped_by_rc: AtomicU64,
+    frames_encoded: RateMeter,
+    bytes_encoded: RateMeter,
+    frames_dropped_by_rc: RateMeter,
     last_encode_ns: AtomicU64,
+    encode_latency: LatencyHistogram,
 }
 
 impl EncoderStatsHandle {
@@ -408,12 +427,12 @@ impl EncoderStatsHandle {
 
     /// Frames the encoder emitted a bitstream for.
     pub fn frames_encoded(&self) -> u64 {
-        self.0.frames_encoded.load(Ordering::Relaxed)
+        self.0.frames_encoded.total()
     }
 
     /// Total bytes of encoded bitstream produced.
     pub fn bytes_encoded(&self) -> u64 {
-        self.0.bytes_encoded.load(Ordering::Relaxed)
+        self.0.bytes_encoded.total()
     }
 
     /// Input frames the encoder swallowed without emitting anything.
@@ -423,42 +442,110 @@ impl EncoderStatsHandle {
     /// the input frame simply produces no output — which any downstream
     /// fps/kbps accounting has to know about.
     pub fn frames_dropped_by_rc(&self) -> u64 {
-        self.0.frames_dropped_by_rc.load(Ordering::Relaxed)
+        self.0.frames_dropped_by_rc.total()
     }
 
     /// Wall-clock duration of the most recent encode call, in nanoseconds.
+    ///
+    /// The cheapest "is it alive" read there is. For the shape of the tail —
+    /// which is what actually causes a missed frame budget — use
+    /// [`encode_latency`](Self::encode_latency).
     pub fn last_encode_ns(&self) -> u64 {
         self.0.last_encode_ns.load(Ordering::Relaxed)
     }
 
-    /// A consistent-enough snapshot of every counter.
+    /// Frames encoded per second, smoothed over [`RATE_WINDOW`].
+    ///
+    /// Frames the encoder produced a bitstream *for* — input frames minus
+    /// anything rate control swallowed, which
+    /// [`rc_drops_per_second`](Self::rc_drops_per_second) counts separately.
+    pub fn frames_encoded_per_second(&self) -> f64 {
+        self.0.frames_encoded.per_second()
+    }
+
+    /// Output bitrate in bits per second, smoothed over [`RATE_WINDOW`].
+    ///
+    /// Bits rather than kilobits so it is directly comparable to
+    /// [`EncoderControl::set_bitrate`], with no unit conversion and no
+    /// kilo-is-1000-or-1024 question.
+    pub fn bits_per_second(&self) -> f64 {
+        self.0.bytes_encoded.per_second() * 8.0
+    }
+
+    /// Frames per second swallowed by rate control, smoothed over
+    /// [`RATE_WINDOW`].
+    pub fn rc_drops_per_second(&self) -> f64 {
+        self.0.frames_dropped_by_rc.per_second()
+    }
+
+    /// The distribution of encode durations, all-time.
+    ///
+    /// A rate answers "how fast right now"; this answers "what does the tail
+    /// look like", and a tail needs history — so unlike the rates it is not
+    /// windowed. Percentiles are quantised **up**, never down.
+    pub fn encode_latency(&self) -> EncodeLatency {
+        self.0.encode_latency.snapshot()
+    }
+
+    /// A consistent-enough snapshot of every counter and rate.
     pub fn snapshot(&self) -> EncoderStats {
+        self.snapshot_at(Instant::now())
+    }
+
+    /// [`snapshot`](Self::snapshot) as of a given instant.
+    pub fn snapshot_at(&self, at: Instant) -> EncoderStats {
         EncoderStats {
             frames_encoded: self.frames_encoded(),
             bytes_encoded: self.bytes_encoded(),
             frames_dropped_by_rc: self.frames_dropped_by_rc(),
             last_encode_ns: self.last_encode_ns(),
+            frames_encoded_per_second: self.0.frames_encoded.per_second_at(at),
+            bits_per_second: self.0.bytes_encoded.per_second_at(at) * 8.0,
+            rc_drops_per_second: self.0.frames_dropped_by_rc.per_second_at(at),
+            encode_latency: self.encode_latency(),
         }
     }
 
     /// Record an encoded frame. Called by encoder elements.
     pub fn record_frame(&self, bytes: usize, encode_ns: u64) {
-        self.0.frames_encoded.fetch_add(1, Ordering::Relaxed);
-        self.0
-            .bytes_encoded
-            .fetch_add(bytes as u64, Ordering::Relaxed);
+        self.record_frame_at(bytes, encode_ns, Instant::now());
+    }
+
+    /// Record an encoded frame that finished at a given instant.
+    ///
+    /// Encoders already read the clock to measure `encode_ns`; pass that same
+    /// `Instant` here rather than taking a second reading, which would double
+    /// the hot path's clock cost for nothing.
+    pub fn record_frame_at(&self, bytes: usize, encode_ns: u64, at: Instant) {
+        self.0.frames_encoded.add_at(1, at);
+        self.0.bytes_encoded.add_at(bytes as u64, at);
         self.0.last_encode_ns.store(encode_ns, Ordering::Relaxed);
+        self.0.encode_latency.record(encode_ns);
     }
 
     /// Record an input frame that rate control produced no output for.
     pub fn record_rc_drop(&self, encode_ns: u64) {
-        self.0.frames_dropped_by_rc.fetch_add(1, Ordering::Relaxed);
+        self.record_rc_drop_at(encode_ns, Instant::now());
+    }
+
+    /// [`record_rc_drop`](Self::record_rc_drop) at a given instant.
+    pub fn record_rc_drop_at(&self, encode_ns: u64, at: Instant) {
+        self.0.frames_dropped_by_rc.add_at(1, at);
         self.0.last_encode_ns.store(encode_ns, Ordering::Relaxed);
+        self.0.encode_latency.record(encode_ns);
     }
 }
 
-/// A point-in-time copy of [`EncoderStatsHandle`]'s counters.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// A point-in-time copy of [`EncoderStatsHandle`]'s counters and rates.
+///
+/// Counters are monotonic and exact; rates are smoothed over
+/// [`RATE_WINDOW`]. Both, because they answer different questions: a counter is
+/// what you difference over an arbitrary interval and hand to an exporter, a
+/// rate is what a human reads.
+///
+/// Not `Eq`: the rates are `f64`, and asking whether two snapshots taken at
+/// different instants are *equal* was never a meaningful question anyway.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct EncoderStats {
     /// Frames the encoder emitted a bitstream for.
     pub frames_encoded: u64,
@@ -468,6 +555,15 @@ pub struct EncoderStats {
     pub frames_dropped_by_rc: u64,
     /// Duration of the most recent encode, in nanoseconds.
     pub last_encode_ns: u64,
+    /// Frames encoded per second, smoothed.
+    pub frames_encoded_per_second: f64,
+    /// Output bitrate in bits per second, smoothed — the same units as
+    /// [`EncoderControl::set_bitrate`].
+    pub bits_per_second: f64,
+    /// Frames per second swallowed by rate control, smoothed.
+    pub rc_drops_per_second: f64,
+    /// The all-time distribution of encode durations.
+    pub encode_latency: EncodeLatency,
 }
 
 // ============================================================================

@@ -24,6 +24,7 @@
 #![cfg(feature = "zenoh")]
 
 use crate::buffer::{Buffer, MemoryHandle};
+use crate::control::RateMeter;
 use crate::element::{AsyncSink, AsyncSource, ConsumeContext, ProduceContext, ProduceResult};
 use crate::error::{Error, Result};
 use crate::memory::{OutputArena, OutputBudget, defaults};
@@ -1240,8 +1241,8 @@ pub enum ZenohDemandEvent {
 /// listener's callback.
 #[derive(Debug, Default)]
 struct ZenohSinkCounters {
-    bytes_sent: AtomicU64,
-    samples_sent: AtomicU64,
+    bytes_sent: RateMeter,
+    samples_sent: RateMeter,
     keyframes_sent: AtomicU64,
     publish_errors: AtomicU64,
     /// Whether anyone is currently subscribed.
@@ -1350,20 +1351,46 @@ impl ZenohSinkHandle {
 
     /// Samples published.
     pub fn samples_sent(&self) -> u64 {
-        self.counters.samples_sent.load(Ordering::Relaxed)
+        self.counters.samples_sent.total()
     }
 
     /// Payload bytes published.
     pub fn bytes_sent(&self) -> u64 {
-        self.counters.bytes_sent.load(Ordering::Relaxed)
+        self.counters.bytes_sent.total()
+    }
+
+    /// Samples published per second, smoothed over
+    /// [`RATE_WINDOW`](crate::control::RATE_WINDOW).
+    pub fn samples_per_second(&self) -> f64 {
+        self.counters.samples_sent.per_second()
+    }
+
+    /// Published bitrate in bits per second, smoothed over
+    /// [`RATE_WINDOW`](crate::control::RATE_WINDOW).
+    ///
+    /// Payload only: zenoh's own framing, the CBOR attachment and the transport
+    /// headers are not counted, so this is lower than what a packet capture
+    /// sees. It is the figure comparable to an encoder's
+    /// [`bits_per_second`](crate::control::EncoderStatsHandle::bits_per_second).
+    pub fn bits_per_second(&self) -> f64 {
+        self.counters.bytes_sent.per_second() * 8.0
     }
 
     /// Samples published carrying a decoder entry point.
+    ///
+    /// No rate: one per GOP is not a figure anyone reads per second.
     pub fn keyframes_sent(&self) -> u64 {
         self.counters.keyframes_sent.load(Ordering::Relaxed)
     }
 
     /// Publishes that failed.
+    ///
+    /// **Not a congestion signal, and bounded by one.** Under
+    /// [`ZenohCongestionControl::Drop`] — which the `@media` profile pins — a
+    /// congested link drops the sample and returns success, and zenoh offers no
+    /// way to read that back. So this counts session and transport faults only.
+    /// A failed publish is also fatal to the sink task, so the count cannot
+    /// exceed one before the run ends; there is deliberately no rate.
     pub fn publish_errors(&self) -> u64 {
         self.counters.publish_errors.load(Ordering::Relaxed)
     }
@@ -1659,12 +1686,12 @@ impl ZenohSink {
 
     /// Get the number of bytes sent.
     pub fn bytes_sent(&self) -> u64 {
-        self.counters.bytes_sent.load(Ordering::Relaxed)
+        self.counters.bytes_sent.total()
     }
 
     /// Get the number of samples sent.
     pub fn samples_sent(&self) -> u64 {
-        self.counters.samples_sent.load(Ordering::Relaxed)
+        self.counters.samples_sent.total()
     }
 
     /// Get statistics.
@@ -1843,7 +1870,10 @@ impl ZenohSink {
             .put(Vec::new())
             .attachment(attachment)
             .await
-            .map_err(|e| Error::Element(format!("Zenoh terminal put error: {e}")))
+            .map_err(|e| {
+                self.counters.publish_errors.fetch_add(1, Ordering::Relaxed);
+                Error::Element(format!("Zenoh terminal put error: {e}"))
+            })
     }
 }
 
@@ -1858,6 +1888,11 @@ impl AsyncSink for ZenohSink {
             .encoding
             .clone()
             .unwrap_or_else(|| encoding_for_format(metadata.format.as_ref()));
+
+        // The `@media` arm decides this by reading the bytes; the parallax arm
+        // has only what upstream flagged. Hoisted out of the match so
+        // `keyframes_sent` can count either.
+        let mut keyframe = metadata.flags.is_keyframe();
 
         let (data, attachment) = match self.profile {
             WireProfile::Parallax => {
@@ -1875,7 +1910,7 @@ impl AsyncSink for ZenohSink {
                     None => std::borrow::Cow::Borrowed(ctx.input()),
                 };
 
-                let keyframe = match self.param_sets.as_ref().map(|c| c.codec()) {
+                keyframe = match self.param_sets.as_ref().map(|c| c.codec()) {
                     Some(codec) => crate::codec::annexb::is_entry_point(&prepared, codec),
                     // No Annex-B notion of an entry point (JPEG, VP8/9, AV1):
                     // trust what the pipeline flagged.
@@ -1907,13 +1942,17 @@ impl AsyncSink for ZenohSink {
             None => put,
         };
 
-        put.await
-            .map_err(|e| Error::Element(format!("Zenoh put error: {}", e)))?;
+        if let Err(e) = put.await {
+            self.counters.publish_errors.fetch_add(1, Ordering::Relaxed);
+            return Err(Error::Element(format!("Zenoh put error: {e}")));
+        }
 
-        self.counters
-            .bytes_sent
-            .fetch_add(len as u64, Ordering::Relaxed);
-        self.counters.samples_sent.fetch_add(1, Ordering::Relaxed);
+        let now = std::time::Instant::now();
+        self.counters.bytes_sent.add_at(len as u64, now);
+        self.counters.samples_sent.add_at(1, now);
+        if keyframe {
+            self.counters.keyframes_sent.fetch_add(1, Ordering::Relaxed);
+        }
 
         Ok(())
     }

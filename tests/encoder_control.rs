@@ -463,3 +463,139 @@ fn sink_handle_total(sink: &parallax::elements::app::AppSinkHandle) -> u64 {
     }
     total
 }
+
+// ------------------------------------------------------------------- #246
+
+/// The acceptance criterion for #246: a running pipeline reports a bitrate that
+/// tracks a mid-flight `set_bitrate`, and the counters are unchanged.
+///
+/// The pushes are **paced**, and that is not incidental. `bits_per_second()` is
+/// a wall-clock rate, so an unpaced loop would measure how fast this machine can
+/// encode rather than the bitrate the encoder was told to hold — a figure in the
+/// hundreds of Mbps that has nothing to do with the knob, and which would still
+/// halve when the knob halves, so the test would look like it worked.
+///
+/// The sink is drained as we go: `AppSink` holds 64 buffers and then
+/// back-pressures, which would stall the pacing loop well before the second
+/// phase finished.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mid_flight_bitrate_change_moves_the_reported_bitrate() {
+    const FPS: u64 = 30;
+    const PHASE_FRAMES: u64 = 45; // 1.5 s each — about two time constants
+
+    let src = AppSrc::new();
+    let src_handle = src.handle();
+    let sink = AppSink::new();
+    let sink_handle = sink.handle();
+
+    let encoder = quiet_encoder(
+        H264EncoderConfig::new()
+            .bitrate(4_000_000)
+            .rate_control(RateControlMode::Bitrate)
+            // Spend quality, not frames: a dropped frame would move
+            // frames_encoded and muddy the counter assertions below.
+            .skip_frames(false),
+    );
+    let control = encoder.control();
+    let stats = encoder.stats();
+
+    let mut pipeline = Pipeline::new();
+    let s = pipeline.add_source("src", src);
+    let e = pipeline.add_filter("enc", encoder);
+    let k = pipeline.add_async_sink("sink", sink);
+    pipeline.link(s, e).unwrap();
+    pipeline.link(e, k).unwrap();
+
+    let executor = Executor::new();
+    let handle = executor.start(&mut pipeline).unwrap();
+
+    // Counted only to keep the sink's queue short; the assertions read the
+    // encoder's own meters.
+    let mut received = 0usize;
+    let push_paced = async |first: u64, count: u64, received: &mut usize| {
+        for seq in first..first + count {
+            src_handle.push_buffer(yuv_frame(seq)).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(1000 / FPS)).await;
+            while let Pulled::Buffer(_) = sink_handle.try_pull_buffer() {
+                *received += 1;
+            }
+        }
+    };
+
+    push_paced(0, PHASE_FRAMES, &mut received).await;
+    let fast = stats.bits_per_second();
+    let fast_fps = stats.frames_encoded_per_second();
+
+    control.set_bitrate(400_000);
+
+    push_paced(PHASE_FRAMES, PHASE_FRAMES, &mut received).await;
+    let slow = stats.bits_per_second();
+
+    assert!(
+        slow < fast / 2.0,
+        "a tenfold bitrate cut must show in the reported bitrate: {fast:.0} -> {slow:.0} bps"
+    );
+    assert!(
+        (fast_fps - FPS as f64).abs() < FPS as f64 / 2.0,
+        "the frame rate should track the ~{FPS} fps being pushed, got {fast_fps:.1}"
+    );
+
+    src_handle.end_stream();
+    handle.wait().await.unwrap();
+    assert!(received > 0, "the drain loop really did pull frames");
+
+    // Rates are additive: the counters must be exactly what they always were.
+    let end = stats.snapshot();
+    assert_eq!(end.frames_encoded, PHASE_FRAMES * 2);
+    assert!(end.bytes_encoded > 0);
+    assert_eq!(end.frames_dropped_by_rc, 0);
+    assert_eq!(end.rc_drops_per_second, 0.0);
+}
+
+/// `last_encode_ns` is one sample and cannot show a tail; the distribution can.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_encode_latency_distribution_fills_in_on_a_running_pipeline() {
+    let src = AppSrc::new();
+    let src_handle = src.handle();
+    let sink = AppSink::new();
+    let sink_handle = sink.handle();
+
+    let encoder = quiet_encoder(H264EncoderConfig::new());
+    let stats = encoder.stats();
+
+    let mut pipeline = Pipeline::new();
+    let s = pipeline.add_source("src", src);
+    let e = pipeline.add_filter("enc", encoder);
+    let k = pipeline.add_async_sink("sink", sink);
+    pipeline.link(s, e).unwrap();
+    pipeline.link(e, k).unwrap();
+
+    let executor = Executor::new();
+    let handle = executor.start(&mut pipeline).unwrap();
+
+    assert_eq!(
+        stats.encode_latency(),
+        parallax::control::EncodeLatency::default(),
+        "an encoder that has done nothing reports nothing, not a bogus percentile"
+    );
+
+    for seq in 0..16 {
+        src_handle.push_buffer(yuv_frame(seq)).await.unwrap();
+    }
+    wait_for(&sink_handle, 16).await;
+
+    let latency = stats.encode_latency();
+    assert_eq!(latency.count, 16);
+    assert!(latency.p50_ns > 0, "encodes take a measurable time");
+    assert!(latency.min_ns <= latency.p50_ns);
+    assert!(latency.p50_ns <= latency.p95_ns);
+    assert!(latency.p95_ns <= latency.p99_ns);
+    assert!(latency.p99_ns <= latency.max_ns);
+    assert!(
+        latency.max_ns >= stats.last_encode_ns(),
+        "the distribution's top must cover the single last sample"
+    );
+
+    src_handle.end_stream();
+    handle.wait().await.unwrap();
+}

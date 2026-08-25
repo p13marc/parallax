@@ -420,7 +420,7 @@ Every controllable element implements `Controllable`, so the accessor is always 
 | Handle | From | Changes |
 |--------|------|---------|
 | `EncoderControl` | `H264Encoder::control()`, `EncoderElement::control()` | `set_bitrate`, `set_keyframe_interval`, `set_qp`, `set_rate_control`, `set_skip_frames`, `request_keyframe` |
-| `EncoderStatsHandle` | `H264Encoder::stats()`, `EncoderElement::stats()` | *read-only*: `frames_encoded`, `bytes_encoded`, `frames_dropped_by_rc`, `last_encode_ns` |
+| `EncoderStatsHandle` | `H264Encoder::stats()`, `EncoderElement::stats()` | *read-only*: counters (`frames_encoded`, `bytes_encoded`, `frames_dropped_by_rc`, `last_encode_ns`), rates (`frames_encoded_per_second`, `bits_per_second`, `rc_drops_per_second`) and `encode_latency()` — see the table below |
 | `KeyframeHandle` | `…::keyframe_handle()` | `request()` — force the next frame to be an IDR |
 | `ScaleControl` | `VideoScale::control()` | `set_target(w, h)`, `set_max_height(h)` / `set_max_width(w)` (aspect-preserving, never upscale), `passthrough()`, `resolve(src_w, src_h)` |
 | `ThrottleControl` | `Throttle::control()` | `set_rate(fps)`, `set_min_interval(d)` |
@@ -428,6 +428,7 @@ Every controllable element implements `Controllable`, so the accessor is always 
 | `ValveControl` | `Valve::control()` | `open()` / `close()` |
 | `GainControl` | `Gain::control()` | `set_factor(f)` / `set_db(db)`, `factor()` / `db()` |
 | `FlowStateHandle` | `Pipeline::monitor_link` | backpressure signalling to live sources |
+| `ZenohSinkHandle` | `ZenohSink::control()` `[zenoh]` | *read-only* except `request_keyframe()`: `has_viewers`, rise/fall edge counters, `samples_sent`/`bytes_sent` + their rates, `keyframes_sent`, `publish_errors` |
 | `AppSinkHandle` / `AppSrcHandle` | `AppSink::handle()` / `AppSrc::handle()` | async-first `pull_buffer`/`push_buffer` (+`_timeout`; `*_blocking` twins for plain threads), `try_pull_buffer`/`try_push_buffer`, `stats()` |
 | `AutoVideoSinkHandle` | `AutoVideoSink::handle()` `[display]` | window events (`try_event`/`event_timeout` → `VideoWindowEvent`: keys as `VideoKey`, mouse, close, resize; bounded and sender-side lossy), `set_fullscreen(bool)`, `is_open()`. No handle taken ⇒ no events |
 
@@ -450,10 +451,41 @@ let handle = executor.start(&mut pipeline)?;   // sync — elements move into th
 // ...later, on a viewer's request or a congested link:
 scale.set_max_height(360);      // quarter the pixels, aspect preserved
 control.set_bitrate(800_000);   // and a fifth of the bits — no IDR, the GOP survives
-println!("{} frames, {} bytes", stats.frames_encoded(), stats.bytes_encoded());
+println!("{} frames, {:.0} kbps", stats.frames_encoded(), stats.bits_per_second() / 1000.0);
 ```
 
 Both changes take effect on the next frame, with no teardown.
+
+**Counters, rates, and the window.** Every figure a handle reports is one of two
+kinds, and both are there because they answer different questions. A **counter**
+is monotonic and never resets: difference it over whatever interval you like, and
+hand it to an exporter unchanged. A **rate** is an exponentially-weighted moving
+average over a fixed 500 ms window with a 0.72 s time constant
+(`control::RATE_WINDOW`, `control::RATE_TIME_CONSTANT`) — deliberately *not* a
+caller's choice, because three consumers each picking their own window is three
+chances to disagree about what "encoded fps" means. Rates decay toward zero when
+writes stop, so a stalled sender reads as stalled rather than freezing at its
+last value; counters do not decay, which is why you want both.
+
+| Handle | Counter | Rate — 500 ms EWMA, τ 0.72 s |
+|---|---|---|
+| `EncoderStatsHandle` | `frames_encoded()` | `frames_encoded_per_second()` |
+| `EncoderStatsHandle` | `bytes_encoded()` | `bits_per_second()` — the same units as `EncoderControl::set_bitrate`, so the two are directly comparable |
+| `EncoderStatsHandle` | `frames_dropped_by_rc()` | `rc_drops_per_second()` |
+| `EncoderStatsHandle` | `last_encode_ns()` — one sample | `encode_latency()` → `EncodeLatency` — a **distribution**, not a rate: p50/p95/p99 + min/max, all-time, each quantised **up** to its bucket (≤19% high, never low) |
+| `ZenohSinkHandle` | `samples_sent()` | `samples_per_second()` |
+| `ZenohSinkHandle` | `bytes_sent()` | `bits_per_second()` — payload only, excluding zenoh framing and the CBOR attachment |
+| `ZenohSinkHandle` | `keyframes_sent()` | *none* — one per GOP is not a figure anyone reads per second |
+| `ZenohSinkHandle` | `publish_errors()` | *none* — a failed publish is fatal to the sink task, so the count cannot exceed one. It is also **not** a congestion signal: under `CongestionControl::Drop`, which the `@media` profile pins, a congested link drops the sample and returns success |
+| `ZenohSinkHandle` | `keyframe_requests()`, `rising_edges()`, `falling_edges()` | *none* |
+| `ZenohSrcHandle` | all nine receive counters | *none today* — the receive side has no consumer asking for one yet |
+
+A distribution rather than `last_encode_ns` alone because a single last value
+cannot show a tail, and the tail is what causes a dropped frame: one 900 ms
+first frame among a thousand 4 ms ones moves `max_ns` and leaves `p95_ns` where
+it belongs. Percentiles report the top of their bucket rather than interpolating
+inside it — guessing a position across a 1.19× span would make the number look
+more precise than it is.
 
 **Predicting the scaled geometry.** If you advertise a stream's size ahead of the frames
 — a catalogue, per-tier status, wire metadata — ask the scaler rather than reimplementing

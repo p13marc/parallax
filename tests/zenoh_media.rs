@@ -534,6 +534,8 @@ async fn the_handle_counts_what_was_published() {
 
     assert_eq!(stats.samples_sent(), 1);
     assert!(stats.bytes_sent() > 0);
+    // Meaningful since #246: the error path increments this now. It used to
+    // have no writer at all, so the assertion passed vacuously.
     assert_eq!(stats.publish_errors(), 0);
 }
 
@@ -1035,5 +1037,85 @@ async fn an_operator_config_with_timestamping_off_still_carries_frames() {
     assert!(
         sample.timestamp().is_none(),
         "the operator said no; parallax must not override them"
+    );
+}
+
+/// `keyframes_sent` had no writer at all before #246 — the counter was
+/// declared, exposed on the handle, and never incremented by anything.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_handle_counts_keyframes_separately_from_samples() {
+    let (pub_session, _sub) = session_pair().await;
+    let key = unique_key("video/h264/high");
+
+    let mut sink = ZenohSink::media_with_session(pub_session, &key)
+        .await
+        .expect("media sink");
+    let stats = sink.control();
+
+    let mut keyframe = Metadata::new();
+    keyframe.flags |= BufferFlags::SYNC_POINT;
+    sink.consume(&ConsumeContext::new(&buffer(&keyframe_au(), keyframe)))
+        .await
+        .expect("publish keyframe");
+
+    // A delta frame, even one upstream mislabelled as a sync point: on this
+    // plane the flag is decided by reading the bytes.
+    let mut delta = Metadata::new();
+    delta.flags |= BufferFlags::SYNC_POINT;
+    sink.consume(&ConsumeContext::new(&buffer(&delta_au(1), delta)))
+        .await
+        .expect("publish delta");
+
+    assert_eq!(stats.samples_sent(), 2);
+    assert_eq!(
+        stats.keyframes_sent(),
+        1,
+        "only the access unit that really is a decoder entry point counts"
+    );
+}
+
+/// The send rate is the figure a health panel reads; the counter behind it is
+/// the figure an exporter reads. Both, and they must agree about the stream
+/// having stopped.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_send_rate_rises_with_published_samples_and_decays_when_publishing_stops() {
+    let (pub_session, _sub) = session_pair().await;
+    let key = unique_key("video/h264/high");
+
+    let mut sink = ZenohSink::media_with_session(pub_session, &key)
+        .await
+        .expect("media sink");
+    let stats = sink.control();
+
+    assert_eq!(stats.samples_per_second(), 0.0, "nothing published yet");
+
+    // ~30 samples over ~1 s.
+    for i in 0..30u8 {
+        let mut meta = Metadata::new();
+        meta.flags |= BufferFlags::SYNC_POINT;
+        sink.consume(&ConsumeContext::new(&buffer(&delta_au(i), meta)))
+            .await
+            .expect("publish");
+        tokio::time::sleep(Duration::from_millis(33)).await;
+    }
+
+    let publishing = stats.samples_per_second();
+    let bitrate = stats.bits_per_second();
+    assert!(
+        publishing > 5.0,
+        "a stream publishing at ~30/s must not read as idle, got {publishing:.1}"
+    );
+    assert!(bitrate > 0.0, "and its bitrate must be positive");
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let stopped = stats.samples_per_second();
+    assert!(
+        stopped < publishing / 10.0,
+        "a stalled publisher must read as stalled: {publishing:.1} -> {stopped:.3} /s"
+    );
+    assert_eq!(
+        stats.samples_sent(),
+        30,
+        "the counter does not decay — that is the point of keeping both"
     );
 }

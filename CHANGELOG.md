@@ -16,6 +16,13 @@ no intermediate build advertises a half-migrated format.
 
 ### Breaking
 
+- **`EncoderStats` is no longer `Eq`** (#246). It gained three `f64` rate fields
+  and an `EncodeLatency`, so the derive had to go. `PartialEq`, `Copy`, `Clone`,
+  `Debug` and `Default` all remain, which is everything `assert_eq!` and the
+  rest of the tree actually used — and asking whether two stats snapshots taken
+  at different instants are *equal* was never a meaningful question. Matches
+  `Queue2Stats`, which has carried `f64` rates beside `u64` counters all along.
+
 **`MediaFormat` and encoded geometry** (#236). `VideoCodec` gains `Mjpeg`,
 appended last so the discriminants `ipc_ring`'s `descriptor_enum_discriminants_locked`
 pins do not move. `Metadata` gains a `coded` field carrying encoded video's

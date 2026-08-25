@@ -83,8 +83,9 @@ pub mod prelude {
     // parameters on a running pipeline. See [`crate::control`] for the
     // clone-before-`start()` invariant that governs every handle here.
     pub use crate::control::{
-        Controllable, EncoderControl, EncoderParams, EncoderStats, EncoderStatsHandle,
-        KeyframeHandle, RateControlMode, ScaleControl, ThrottleControl, ValveControl,
+        Controllable, EncodeLatency, EncoderControl, EncoderParams, EncoderStats,
+        EncoderStatsHandle, KeyframeHandle, RateControlMode, ScaleControl, ThrottleControl,
+        ValveControl,
     };
     pub use crate::element::{
         AsyncElementDyn, AsyncSink, AsyncSource, AsyncTransform, DynAsyncElement, Element, Output,
