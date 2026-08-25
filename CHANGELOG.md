@@ -8,11 +8,18 @@ ride minor bumps.
 Earlier releases predate this file — their notes live in the `Bump to X.Y.Z`
 commit messages and the Forgejo releases.
 
-## [Unreleased]
+## [0.8.0] — 2026-08-25
 
-Work on the `@media` plane (milestone *Multi-machine video: RTSP → @media →
-browser*, epic #204). Several wire-format breaks land together on purpose, so
-no intermediate build advertises a half-migrated format.
+63 commits since 0.7.0, and the release a parallax pipeline becomes a
+*multi-machine* one: it publishes and consumes the ratified zenkey `@media`
+plane, ingests RTSP well enough to leave running, and reports enough about
+itself for a consumer to measure what it is getting.
+
+Every out-of-tree plugin must be rebuilt: the plugin ABI went **11 → 12**.
+Peers must be upgraded together: the zenoh attachment went **v1 → v4** and the
+IPC descriptor **128 → 192 bytes**. Several wire-format breaks land in one
+release on purpose, so that no intermediate build advertises a half-migrated
+format.
 
 ### Breaking
 
