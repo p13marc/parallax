@@ -920,13 +920,32 @@ async fn mp4_fast_forward_emits_keyframes_only() {
         }
     }
     // Everything from the landing keyframe on is a keyframe time.
-    let landing = pts.iter().position(|p| *p == 500).expect("landing at 500");
+    //
+    // The boundary is the frame after the last NON-keyframe, not the first
+    // 500. `seek` does not wait for the flush (its doc says to watch for
+    // `MessageKind::SeekDone`), so up to five pre-seek frames are already past
+    // the epoch shed — in the link queue, in the AppSink's two slots, and one
+    // in the sink task's hand. On a slow runner that startup lap reaches 500
+    // before the seek lands, and `position(|p| *p == 500)` then picks a
+    // normal-speed frame and drags the following 600 into the assertion. CI
+    // hit exactly that: [200,300,400,500,600 | 500,1000,1500,0,500,1000,1500],
+    // where the post-seek half was perfect.
+    //
+    // The sibling ACCURATE test hit the same race and was fixed in 117276e;
+    // `rposition(|p| *p == 500)` is right there and wrong here, because
+    // fast-forward loops and 500 recurs after the seek.
+    let landing = pts
+        .iter()
+        .rposition(|p| !p.is_multiple_of(500))
+        .map_or(0, |i| i + 1);
     assert!(
         pts.len() - landing >= 6,
         "expected several trick frames after the landing: {pts:?}"
     );
     assert!(
-        pts[landing..].iter().all(|p| p.is_multiple_of(500)),
+        pts[landing..]
+            .iter()
+            .all(|p| [0, 500, 1000, 1500].contains(p)),
         "fast-forward emitted a non-keyframe: {pts:?}"
     );
 

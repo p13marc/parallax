@@ -28,13 +28,20 @@ fn buffer_with_pts(pts_ns: u64) -> Buffer {
 }
 
 async fn wait_until(mut cond: impl FnMut() -> bool, what: &str) {
-    for _ in 0..2000 {
-        if cond() {
-            return;
-        }
+    // Bounded by the clock, not by an iteration count. `for _ in 0..2000` with
+    // a 5 ms sleep is ten seconds only while timers fire on time; under
+    // starvation each sleep costs far more and the real ceiling is unbounded,
+    // so an overrun gets killed by nextest's terminate-after with no output at
+    // all rather than panicking with `what`. That is how a hang in this file
+    // cost three CI rounds to identify.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !cond() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    panic!("timed out waiting for {what}");
 }
 
 /// Pause stops delivery; resume restarts it; the counters prove both.
@@ -291,15 +298,42 @@ async fn a_paused_sink_delivers_pause_resume_and_replays_the_stash() {
     handle.pause();
     handle.pause(); // idempotent: must not deliver a second Pause event
 
+    // Wait for the sink to actually observe the gate before sampling.
+    //
+    // The margin here used to be zero: `pause()` lands microseconds into the
+    // sink's deliberate 150 ms block, the sink can only see the gate when that
+    // `consume` returns — at ~t+150 ms — and the old code sampled `frozen`
+    // after its own `sleep(150ms)`, the same instant. A few milliseconds of
+    // contention put "ev:pause" on the wrong side of the sample and the
+    // assertion fired. `yield_now`, not a timer, because the sink's blocking
+    // consume is exactly the case CLAUDE.md warns about.
+    let t1 = std::time::Instant::now();
+    while !log.lock().unwrap().iter().any(|e| e == "ev:pause") {
+        assert!(
+            t1.elapsed() < Duration::from_secs(10),
+            "the sink never saw the pause: {:?}",
+            log.lock().unwrap()
+        );
+        tokio::task::yield_now().await;
+    }
+
     // While paused nothing more is consumed (the stash is held, not played).
-    tokio::time::sleep(Duration::from_millis(150)).await;
     let frozen = log.lock().unwrap().len();
     tokio::time::sleep(Duration::from_millis(200)).await;
+    // Snapshot once. Locking twice inside `assert_eq!` deadlocks the test
+    // against itself: the macro expands to `match (&$left, &$right)`, and a
+    // temporary in a match scrutinee lives to the end of the match — so the
+    // guard from the left operand is still held when the failure arm formats
+    // the message. `std::sync::Mutex` is not reentrant, so the failure path
+    // hung for 120 s and printed nothing, which is why this took three CI
+    // rounds to find.
+    let (len, snapshot) = {
+        let guard = log.lock().unwrap();
+        (guard.len(), guard.clone())
+    };
     assert_eq!(
-        log.lock().unwrap().len(),
-        frozen,
-        "the sink kept working while paused: {:?}",
-        log.lock().unwrap()
+        len, frozen,
+        "the sink kept working while paused: {snapshot:?}"
     );
 
     handle.resume();
@@ -310,7 +344,12 @@ async fn a_paused_sink_delivers_pause_resume_and_replays_the_stash() {
     .await;
 
     src_handle.end_stream();
-    handle.wait().await.unwrap();
+    // Bounded, like `pause_with_full_block_links_resumes_to_eos` below: an
+    // unbounded join here turns any regression into a silent 120 s kill.
+    tokio::time::timeout(Duration::from_secs(30), handle.wait())
+        .await
+        .expect("the pipeline never finished")
+        .unwrap();
 
     let log = log.lock().unwrap();
     let buffers: Vec<&String> = log.iter().filter(|e| e.starts_with("buf:")).collect();
