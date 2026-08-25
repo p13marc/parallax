@@ -146,18 +146,25 @@ fmt-check:
     cargo fmt --check
 
 # Run all checks (format, lint, test)
-# Clippy on the **stable** toolchain, which is what CI lints with.
+# The clippy invocations CI runs, across every combo it lints.
 #
-# The default toolchain here is the MSRV (1.97), so `just lint` cannot see a
-# lint that a newer stable added — and that is not hypothetical: 1.98 landed
-# `clippy::chunks_exact_to_as_chunks` and turned seven CI jobs red against a
-# tree that was clean locally. Run this before pushing anything CI will lint.
-lint-stable:
-    rustup run stable cargo clippy --all-targets -- -D warnings
-    rustup run stable cargo clippy --all-targets --features {{sensor_features}},image-codecs -- -D warnings
-    rustup run stable cargo clippy --all-targets --features {{media_features}} -- -D warnings
-    rustup run stable cargo clippy --all-targets --features display -- -D warnings
-    rustup run stable cargo clippy --all-targets --features simd-colorspace -- -D warnings
+# No `rustup run` needed any more: `rust-toolchain.toml` pins the toolchain and
+# rustup applies it to every cargo call in this repo, so this *is* CI's clippy.
+# Before the pin it was not — the default toolchain here was the MSRV while CI
+# linted with `stable`, and when stable moved to 1.98 seven jobs went red on
+# lints no one could reproduce locally.
+lint-ci:
+    cargo clippy --all-targets -- -D warnings
+    cargo clippy --all-targets --features {{sensor_features}},image-codecs -- -D warnings
+    cargo clippy --all-targets --features {{media_features}} -- -D warnings
+    cargo clippy --all-targets --features display -- -D warnings
+    cargo clippy --all-targets --features simd-colorspace -- -D warnings
+
+# Build on the MSRV, which the pin deliberately is not. `RUSTUP_TOOLCHAIN`
+# outranks `rust-toolchain.toml`; this mirrors CI's `msrv` job.
+check-msrv:
+    RUSTUP_TOOLCHAIN=1.97 cargo check --all-targets
+    RUSTUP_TOOLCHAIN=1.97 cargo check --all-targets --features {{sensor_features}}
 
 # Rustdoc with warnings denied — mirrors CI's `docs` job, which is the only
 # thing that was checking this and therefore the only thing that caught it.

@@ -1,0 +1,22 @@
+# The one toolchain this project builds and lints with.
+#
+# Pinned, not `stable`, because `stable` is a moving target and the move is
+# silent: Rust 1.98 landed on 2026-08-18, the runner picked it up, and seven CI
+# jobs went red on three new clippy lints against a tree that was clean on
+# every developer's machine. Nothing had changed in the code.
+#
+# rustup applies this file to every `cargo` invocation inside the repo, so a
+# developer and CI now run the *same* clippy by construction rather than by
+# remembering to. Upgrading Rust becomes a one-line pull request that runs the
+# full matrix — which is exactly how you want to meet forty new lints.
+#
+# CI cannot read this file (`dtolnay/rust-toolchain` requires an explicit
+# `toolchain:` input), so `.forgejo/workflows/ci.yml` repeats the version in
+# its `RUST_VERSION` env. `tests/toolchain_pin.rs` fails if the two drift.
+#
+# The MSRV is a *separate* number — `Cargo.toml`'s `rust-version`, enforced by
+# the `msrv` CI job, which overrides this file with `RUSTUP_TOOLCHAIN`. This
+# pin says "what we develop with"; that one says "the oldest we promise".
+[toolchain]
+channel = "1.98.0"
+components = ["clippy", "rustfmt"]
