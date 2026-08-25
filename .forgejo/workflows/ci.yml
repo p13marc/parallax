@@ -173,6 +173,14 @@ jobs:
         with:
           key: vulkan
           cache-targets: false
+      - uses: https://github.com/taiki-e/install-action@v2.86.1
+        with:
+          tool: cargo-nextest
+      # Most of what `vulkan-video` gates is CPU-only and testable without a
+      # GPU: slice-header parsing, POC computation, reference marking, the std
+      # struct marshalling. `tests/vulkan_decode_tests.rs` green-skips when no
+      # capable device is present, so the whole set is safe to run here.
+      - run: cargo nextest run --features image-jpeg,vulkan-video
       - run: cargo check --all-targets --features image-jpeg,vulkan-video
 
   # Feature gates no other job compiles. `display` builds here; `pipewire` and
@@ -197,6 +205,14 @@ jobs:
       # only to run. And the combined build is not a superset in practice — a
       # module that loses its cfg gate compiles here and breaks the
       # `display`-alone build below, which has happened.
+      - uses: https://github.com/taiki-e/install-action@v2.86.1
+        with:
+          tool: cargo-nextest
+      # The tests run headless — the display elements' unit tests are pure
+      # geometry and colour maths (letterbox rects, plane strides, dma-buf
+      # plane validation) and need no window or driver. Clippy alone left 38
+      # test functions compiled and never executed.
+      - run: cargo nextest run --features display,display-gpu
       - run: cargo clippy --all-targets --features display,display-gpu -- -D warnings
       - run: cargo clippy --all-targets --features display -- -D warnings
 
@@ -230,8 +246,13 @@ jobs:
       # by nothing at all (#255) — `cli` gates `src/bin/parallax_launch.rs` and
       # `tests/launch_cli.rs`, a binary and its whole test suite that had never
       # been built here. No new apt packages; they cost only build time.
-      - run: cargo nextest run --features aac-encode,websocket,alsa,v4l2-m2m,eac3,audio-flac,audio-mp3,cli,macros
-      - run: cargo clippy --all-targets --features aac-encode,websocket,alsa,v4l2-m2m,eac3,audio-flac,audio-mp3,cli,macros -- -D warnings
+      # `zenoh` is here for `cli`'s sake, not its own: `tests/launch_cli.rs` is
+      # `required-features = ["cli"]` and its three async-constructor tests —
+      # the acceptance shape for #222 — are additionally `cfg(feature =
+      # "zenoh")`. No job combined the two, so those three had never run.
+      # `image-png` likewise: it was linted and documented, never executed.
+      - run: cargo nextest run --features aac-encode,websocket,alsa,v4l2-m2m,eac3,audio-flac,audio-mp3,cli,macros,zenoh,image-png
+      - run: cargo clippy --all-targets --features aac-encode,websocket,alsa,v4l2-m2m,eac3,audio-flac,audio-mp3,cli,macros,zenoh,image-png -- -D warnings
 
   # The *degraded* zenoh build (#230): `zenoh` without `zenoh-unstable`.
   #

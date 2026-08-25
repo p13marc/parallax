@@ -63,8 +63,8 @@ check-media:
     cargo clippy --all-targets --features {{media_features}} -- -D warnings
 
 # Media combo plus the system-library codecs (libvpx/libdav1d/libopus dev
-# packages + libclang required, and nasm for rav1e; not in CI). This is the
-# only recipe that clippies `av1-encode` — no CI job does.
+# packages + libclang required, and nasm for rav1e). Mirrors CI's `codec-libs`
+# job, which reuses `$MEDIA_FEATURES` so the two cannot drift (#255).
 media_full_features := media_features + ",vpx,av1-decode,av1-encode,opus,h264"
 
 check-media-full:
@@ -94,6 +94,7 @@ check-display:
 # that compiles them. They had rotted before; a `gpu::Codec` variant added
 # for VA-API broke them again.
 check-vulkan:
+    cargo nextest run --features image-jpeg,vulkan-video
     cargo check --all-targets --features image-jpeg,vulkan-video
 
 # Colorspace SIMD combo (the `yuv` crate) — what parallax-player actually
@@ -107,9 +108,13 @@ check-simd:
 # `aac-encode` had rotted un-compiled against an fdk-aac signature that never
 # shipped; mirrors CI's feature-gates job. Needs g++ (fdk-aac builds FDK from
 # source), libclang + kernel headers (v4l2r bindgen) and libasound2/alsa-lib.
+#
+# `zenoh` rides along for `cli`'s sake: `tests/launch_cli.rs` is
+# `required-features = ["cli"]` and its async-constructor tests are
+# additionally `cfg(feature = "zenoh")`, so without both they never run (#255).
 check-feature-gates:
-    cargo nextest run --features aac-encode,websocket,alsa,v4l2-m2m
-    cargo clippy --all-targets --features aac-encode,websocket,alsa,v4l2-m2m -- -D warnings
+    cargo nextest run --features aac-encode,websocket,alsa,v4l2-m2m,eac3,audio-flac,audio-mp3,cli,macros,zenoh,image-png
+    cargo clippy --all-targets --features aac-encode,websocket,alsa,v4l2-m2m,eac3,audio-flac,audio-mp3,cli,macros,zenoh,image-png -- -D warnings
 
 # Check + test + lint VA-API hardware decode (#193). Build needs libva-devel
 # + libclang (cros-libva runs bindgen); the tests green-skip when no VA driver
@@ -126,7 +131,7 @@ check-vaapi:
     cargo nextest run --features vaapi,mkv-demux,mp4-demux,vpx,h264
     cargo clippy --all-targets --features vaapi,mkv-demux,mp4-demux,vpx,h264 -- -D warnings
 
-# Check + test + lint the V4L2 M2M hardware encoder (mirrors CI's test-v4l2-m2m job).
+# Check + test + lint the V4L2 M2M hardware encoder (mirrors the `v4l2-m2m` arm of CI's `feature-gates` job).
 # Needs libclang + kernel headers (on immutable Fedora: run inside a toolbox).
 # Live queue test: modprobe vicodec, then PARALLAX_VICODEC_TEST_DEVICE=auto just check-m2m
 check-m2m:
@@ -146,7 +151,10 @@ fmt-check:
     cargo fmt --check
 
 # Run all checks (format, lint, test)
-# The clippy invocations CI runs, across every combo it lints.
+# The clippy invocations CI runs on a machine with no extra system libraries.
+# Not the whole matrix: the system-library combos live in `check-vaapi`,
+# `check-media-full`, `check-feature-gates` and `check-display`, and CI also
+# clippies the workspace members (`cargo clippy -p …`).
 #
 # No `rustup run` needed any more: `rust-toolchain.toml` pins the toolchain and
 # rustup applies it to every cargo call in this repo, so this *is* CI's clippy.

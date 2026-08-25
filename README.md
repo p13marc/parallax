@@ -10,7 +10,7 @@ A Rust-native streaming pipeline engine with zero-copy, multi-process shared mem
 
 Parallax lets you build media and data pipelines the way GStreamer does — sources, transforms, sinks, connected into a graph — but with a design that is Rust-first throughout: memfd-backed buffers that are always ready for cross-process sharing, reference counts stored *in* shared memory so they work across processes, a hybrid Tokio + real-time-thread executor inspired by PipeWire, and a typed pipeline API with compile-time type checking.
 
-> **Status:** Parallax is a young project (v0.7, pre-1.0). The core engine — memory, pipelines, executor, elements, caps negotiation, plugins — is implemented and covered by 1700+ tests. Some subsystems are still scaffolding (see [Project status](#project-status)). Expect API churn before 1.0.
+> **Status:** Parallax is a young project (v0.8, pre-1.0). The core engine — memory, pipelines, executor, elements, caps negotiation, plugins — is implemented and covered by 1500+ tests on a default build and 1800+ with the media and network features enabled. Some subsystems are still scaffolding (see [Project status](#project-status)). Expect API churn before 1.0.
 
 **Requirements:** Linux only (memfd_create, SCM_RIGHTS, eventfd) · Rust **1.97+** (edition 2024)
 
@@ -21,7 +21,7 @@ Parallax lets you build media and data pipelines the way GStreamer does — sour
 - **Hybrid scheduling** — the executor runs I/O-bound elements as Tokio tasks and RT-safe, low-latency elements on dedicated real-time threads (optionally `SCHED_FIFO`), connected by lock-free SPSC bridges with eventfd wakeup. Strategy is chosen automatically from element-declared `ExecutionHints`.
 - **Progressive typing** — build pipelines dynamically from strings (`Pipeline::parse`) or programmatically, or use the typed API (`pipeline(src) >> map(..) >> filter(..)`) with compile-time type checking.
 - **Caps negotiation** — elements declare multiple format+memory capabilities in preference order; the pipeline negotiates per link, including DMA-BUF vs CPU memory selection, and can auto-insert converters (opt-in).
-- **Batteries included** — 100+ built-in elements: file/TCP/UDP/Unix/HTTP/WebSocket/Zenoh I/O, RTP/RTCP/RTSP, MPEG-TS and MP4 mux/demux, HLS/DASH output, V4L2/libcamera/PipeWire/ALSA/screen capture, codecs (H.264, AV1, Opus, AAC, FLAC/MP3/Vorbis, JPEG/PNG), KLV/STANAG metadata, and a rich set of flow/timing/transform utilities.
+- **Batteries included** — 100+ built-in elements: file/TCP/UDP/Unix/HTTP/WebSocket/Zenoh I/O, RTP/RTCP/RTSP, MPEG-TS and MP4 mux/demux, HLS/DASH output, V4L2/libcamera/PipeWire/ALSA/screen capture, codecs (H.264, AV1, VP8/VP9, Opus, AAC, E-AC-3, FLAC/MP3/Vorbis, JPEG/PNG) with VA-API hardware decode, KLV/STANAG metadata, and a rich set of flow/timing/transform utilities.
 - **Hardware decode that stays zero-copy** — VA-API decodes H.264/VP8/VP9 on the GPU's video engine and the decoded dma-buf goes straight to the display without a copy. Measured against the software path at 1080p H.264: 0.54 → 0.12 CPU cores, 88 MB → 34 MB of arena.
 - **Pure Rust where possible** — rav1e, Symphonia, zune-jpeg, png, mp4, mpeg2ts-reader; C libraries only where unavoidable (OpenH264, dav1d, libopus, FDK-AAC).
 - **Observability** — pipeline bus (GStreamer-style messages), pad probes, latency/framerate/drop tracers, `metrics`/`tracing` integration, DOT graph export.
@@ -30,7 +30,7 @@ Parallax lets you build media and data pipelines the way GStreamer does — sour
 
 ```toml
 [dependencies]
-parallax-pipeline = "0.7"   # lib name is `parallax`: code writes `use parallax::...`
+parallax-pipeline = "0.8"   # lib name is `parallax`: code writes `use parallax::...`
 ```
 
 ### Parse a pipeline from a string
@@ -50,7 +50,7 @@ async fn main() -> parallax::Result<()> {
 
 The string grammar is a **linear chain**: `element prop=value ... ! element ...`. Values may be quoted strings, integers, floats, or booleans; `name=foo` gives the node a custom name for later retrieval. Branching (tee), caps filters, and bins are *not* expressible in the string syntax — use the programmatic API for those.
 
-Most of the element library is registered as factory names — ~37 always-on (`filesrc`, `videotestsrc`, `videoconvert`, `videoscale`, `queue2`, `tcpsrc`, `hlssink`, …) plus ~30 feature-gated ones (`h264enc`, `alsasink`, `rtpsrc`, …). See `docs/elements.md` § "Pipeline-string factory names" for the full table with properties. Unknown properties are hard errors; more names can be registered through a `PluginRegistry` (`Pipeline::parse_with_factory`).
+Most of the element library is registered as factory names — ~46 always-on (`filesrc`, `videotestsrc`, `videoconvert`, `videoscale`, `queue2`, `tcpsrc`, `hlssink`, …) plus ~45 feature-gated ones (`h264enc`, `alsasink`, `rtpsrc`, …). See `docs/elements.md` § "Pipeline-string factory names" for the full table with properties. Unknown properties are hard errors; more names can be registered through a `PluginRegistry` (`Pipeline::parse_with_factory`).
 
 There is also a gst-launch-style binary (feature `cli`):
 
@@ -283,7 +283,7 @@ Full catalog with feature flags in **[docs/elements.md](docs/elements.md)**. Sum
 | **Timing** | `Delay`, `Timeout`, `Debounce`, `Throttle`, `RateLimiter` |
 | **Metadata** | `SequenceNumber`, `Timestamper`, `MetadataInject`/`MetadataExtract`, `TimestampDebug`, `KlvEncoder` (STANAG 4609/MISB) |
 | **Mux/Demux** | `TsMux`/`TsMuxElement`, `TsDemux`, `Mp4Mux`/`Mp4FileSink`, `Mp4Demux`, `StreamIdDemux` |
-| **Codecs** | H.264 (OpenH264), AV1 encode (rav1e) / decode (dav1d), Opus, AAC (FDK encode, Symphonia decode), FLAC/MP3/Vorbis (Symphonia), JPEG (zune-jpeg), PNG |
+| **Codecs** | H.264 (OpenH264), AV1 encode (rav1e) / decode (dav1d), VP8/VP9 decode (libvpx), Opus, AAC (FDK encode, Symphonia decode), E-AC-3, FLAC/MP3/Vorbis (Symphonia), JPEG (zune-jpeg), PNG. Hardware decode via VA-API — H.264, VP8, VP9, with zero-copy dma-buf display |
 | **Devices** | `V4l2Src` (DMA-BUF export), `LibCameraSrc`, `PipeWireSrc`/`PipeWireSink`, `ScreenCaptureSrc` (XDG portal), `AlsaSrc`/`AlsaSink` (provides hardware clock) |
 | **Streaming out** | `HlsSink` (TS segments + M3U8, ABR variants), `DashSink` (fMP4 + MPD, live & VOD) |
 | **IPC** | `IpcSrc`/`IpcSink` (zero-copy cross-process over a shm descriptor ring) |
@@ -354,7 +354,7 @@ Default features are **empty** — everything below is opt-in.
 
 ## Examples
 
-43 numbered examples, one concept each (`cargo run --example <name> [--features ...]`):
+45 numbered examples, one concept each (`cargo run --example <name> [--features ...]`):
 
 | Range | Topic |
 |-------|-------|
@@ -366,8 +366,9 @@ Default features are **empty** — everything below is opt-in.
 | `47`–`56` | Infrastructure: flow control, clocks, element retrieval, hybrid scheduling, bus, seeking, probes, tracers, Queue2 buffering, typefind |
 | `57`–`59` | RTSP capture/display (`rtsp`), window events (`display`) |
 | `60` | Two-process zero-copy IPC over the shm descriptor ring |
+| `62`–`63` | Zenoh pub/sub across processes (`zenoh`), consuming the `@media` plane (`zenoh,h264`) |
 
-(Numbers 12, 19, 21, 27–40 are retired/unassigned.)
+(Numbers 12, 19, 21, 27–40 and 61 are retired/unassigned.)
 
 ## Performance
 
@@ -405,6 +406,8 @@ Honest accounting of where things stand:
 | [Memory](docs/memory.md) | SharedArena, buffer pools, DMA-BUF, IPC |
 | [Elements](docs/elements.md) | Complete element catalog with feature flags |
 | [Formats & negotiation](docs/formats.md) | Caps model, negotiation, converters, SIMD |
+| [Multi-machine](docs/multi-machine.md) | Deploying across hosts: RTSP → `@media` → browser, key layout, QoS |
+| [Zenoh wire](docs/zenoh-wire.md) | The two zenoh wire contracts, and what crosses a machine boundary |
 | [Plugins](docs/plugins.md) | Writing and loading dynamic plugins |
 | [API overview](docs/api.md) | Map of the public API (`cargo doc` for the full reference) |
 | [Security](docs/security.md) | Current security model and its limits |

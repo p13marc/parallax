@@ -367,4 +367,50 @@ mod tests {
         let p = Props::new("x", m);
         assert!(p.get_framerate("framerate").is_err());
     }
+
+    /// #222: an async constructor is handed a *clone* and the factory calls
+    /// `finish()` on the original afterwards. That only rejects unknown
+    /// properties correctly because the consumption set is shared, and nothing
+    /// asserted it — the claim lived in a doc comment and in one CLI test that
+    /// no CI job ran.
+    #[test]
+    fn a_clone_shares_the_consumption_set_with_the_original() {
+        let m = map(&[
+            ("key", PropertyValue::String("demo".into())),
+            ("timeout-ms", PropertyValue::Integer(500)),
+        ]);
+        let original = Props::new("zenohsrc", m);
+
+        // What an awaited constructor does with its clone.
+        let moved = original.clone();
+        assert_eq!(moved.get_str("key").as_deref(), Some("demo"));
+        assert_eq!(moved.get_u64("timeout-ms").unwrap(), Some(500));
+
+        // The original must see both as consumed, or every async element would
+        // reject its own valid properties.
+        original
+            .finish()
+            .expect("the clone's reads must count against the original");
+    }
+
+    /// The other half: sharing must not make `finish()` blind. A property no
+    /// one read is still an error, whichever handle asks.
+    #[test]
+    fn a_clone_does_not_hide_an_unknown_property() {
+        let m = map(&[
+            ("key", PropertyValue::String("demo".into())),
+            ("nonsense", PropertyValue::Bool(true)),
+        ]);
+        let original = Props::new("zenohsrc", m);
+        let moved = original.clone();
+        let _ = moved.get_str("key");
+
+        for (who, p) in [("original", &original), ("clone", &moved)] {
+            let err = p
+                .finish()
+                .expect_err("an unread property must still be rejected")
+                .to_string();
+            assert!(err.contains("nonsense"), "{who}: {err}");
+        }
+    }
 }

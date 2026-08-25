@@ -79,6 +79,35 @@ brings in: `Buffer`, `Metadata`/`BufferFlags`/`RtpMeta`, clock types (`Clock`, `
 
 The built-in element library — full catalog in [elements.md](elements.md).
 
+### `parallax::control`
+
+Runtime control handles, cloned from an element *before* `Executor::start` moves
+it into its task. `Controllable` (so the accessor is always `control()`),
+`EncoderControl`, `EncoderStatsHandle`/`EncoderStats`/`EncodeLatency`,
+`KeyframeHandle`, `ScaleControl`, `ThrottleControl`, `ValveControl`,
+`GainControl`, `Queue2RangesHandle`, `FlowStateHandle`, and the rate primitives
+`RateMeter`/`RATE_WINDOW`/`RATE_TIME_CONSTANT`. See
+[elements.md](elements.md#runtime-control-bandwidth-knobs).
+
+### `parallax::codec`
+
+Bitstream helpers that need no codec feature: `annexb::{nal_units, has_idr,
+is_entry_point, extract_param_sets, annex_b_to_avcc, NalConfig, parse_avcc,
+parse_hvcc, ParamSetCache, h264_profile_level_id}` and `vpx::{vp8_is_keyframe,
+vp9_is_keyframe}`.
+
+### `parallax::wire`
+
+What a `Metadata` means on a wire, always compiled: `FrameMeta` (the `@media`
+plane's CBOR attachment), `WireMetadata`/`WireFormat`/`WireTerminal` (the
+parallax plane's rkyv form), the `IpcDescriptor` projection, the `codes` table
+and `WIRE_VERSION`. See [zenoh-wire.md](zenoh-wire.md).
+
+### `parallax::temporal`
+
+Typed temporal joins: `Timestamp` (distinct from `clock::ClockTime` — no
+conversion is provided), `TemporalJoin`, `AlignmentStrategy`, `Lerp`.
+
 ### `parallax::converters`
 
 `VideoConvert`, `AudioConvert`/`AudioChannelMix`/`ChannelLayout`, `AudioResample`/`ResampleQuality`, `ScaleEngine`/`ScaleMode`, plus this module's own `PixelFormat`/`SampleFormat`/`ColorMatrix` (distinct from `format::` — see [formats.md](formats.md#pitfalls)).

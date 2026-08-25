@@ -5,13 +5,13 @@ This guide takes you from an empty project to a running pipeline with custom ele
 ## Requirements
 
 - **Linux.** Parallax uses `memfd_create`, `SCM_RIGHTS` fd passing, and `eventfd`; there is no macOS/Windows support.
-- **Rust 1.85+** (edition 2024).
+- **Rust 1.97+** (edition 2024).
 
 ## Installation
 
 ```toml
 [dependencies]
-parallax-pipeline = "0.7"   # lib name is `parallax`: code writes `use parallax::...`
+parallax-pipeline = "0.8"   # lib name is `parallax`: code writes `use parallax::...`
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 

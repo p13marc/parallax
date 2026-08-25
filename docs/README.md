@@ -12,6 +12,7 @@
 | [elements.md](elements.md) | Complete catalog of built-in elements with feature flags |
 | [formats.md](formats.md) | Caps model, negotiation, converters, SIMD colorspace |
 | [multi-machine.md](multi-machine.md) | Deploying across hosts: the RTSP → `@media` → browser topology, key layout, QoS, and what crosses a machine boundary |
+| [zenoh-wire.md](zenoh-wire.md) | The two zenoh wire contracts: the parallax plane's rkyv `WireMetadata` and the `@media` plane's CBOR `FrameMeta`, QoS profile, terminal samples and keyframe promise |
 | [plugins.md](plugins.md) | Writing and loading dynamic plugins (C ABI) |
 | [api.md](api.md) | Map of the public API surface (use `cargo doc --open` for the full reference) |
 | [security.md](security.md) | Current security model, its limits, and history |
