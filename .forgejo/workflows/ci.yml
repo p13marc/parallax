@@ -342,7 +342,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v7.0.1
-      - run: sudo apt-get update && sudo apt-get install -y libudev-dev g++ libclang-dev libdav1d-dev libopus-dev pkg-config
+      # `parallax-player` pulls a lot in: vpx, av1-decode, opus, h264, alsa and
+      # vaapi all want a system library, and its Cargo.toml is the list.
+      - run: sudo apt-get update && sudo apt-get install -y libudev-dev g++ libclang-dev libdav1d-dev libopus-dev libvpx-dev libasound2-dev libva-dev pkg-config
       - uses: https://github.com/dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_VERSION }}
