@@ -13,6 +13,7 @@ Completed plans have been removed (see git history). Only plans with an existing
 | 11 | [GPU Codec Framework](11_GPU_CODEC_FRAMEWORK.md) | Medium-High | Large | 🟡 ~80% — H.264 decode fully wired (submission, POC/DPB refs, RAII memory) and fixture-tested; hardware validation pending (#3); no encode, no H.265/AV1 |
 | 16 | [Process Isolation](16_PROCESS_ISOLATION.md) | Low | Large | ⬜ Not started — **note:** the earlier scaffolding (`src/execution/`) was removed in `da6df59`; any implementation starts from scratch with a spawn-based design |
 | 29 | [Multi-machine video: RTSP → @media → browser](29_multi_machine_browser.md) | High | Large | 🟢 **Done** — all 31 issues in the milestone closed; epic [#204](https://git.marcpardo.eu/marcpardo/parallax/issues/204), PR [#242](https://git.marcpardo.eu/marcpardo/parallax/pulls/242). Make `ZenohSink`/`ZenohSrc` speak the ratified zenkey `@media` plane (CBOR `FrameMeta`, exact tier keys, `frame` QoS, byte-level keyframe promise), fix the encoders that never stamp `MediaFormat`, and harden RTSP ingest. WHEP egress stays deferred to its own milestone; the browser frontend is zenoh-ts + WebCodecs, tracked in zensight. See `docs/multi-machine.md` for the deployment guide. |
+| — | [Bandwidth control (ZenSight ↔ Parallax sensor)](bandwidth-control.md) | Medium | Medium | 🟢 **Phase A done** — [#24](https://git.marcpardo.eu/marcpardo/parallax/issues/24)–[#32](https://git.marcpardo.eu/marcpardo/parallax/issues/32), epic [#33](https://git.marcpardo.eu/marcpardo/parallax/issues/33), all closed. Runtime control primitives shipped in `src/control.rs` (not the planned `elements/codec/control.rs`) — see the plan's reconciliation section. Phase B is zensight-side. |
 
 ## Proposed Plans (no plan file yet)
 
@@ -25,9 +26,17 @@ Completed plans have been removed (see git history). Only plans with an existing
 | 28 | Streaming protocol expansion | Medium | MoQ sink (Rust stacks exist), SRT, RTMP. **WHIP/WHEP moved to plan 29** (str0m, ICE-lite, frame-level API) |
 | — | Wayland `ext-image-copy-capture-v1` source | Low | Lower-latency screen capture without the portal/PipeWire path |
 
-**Legend:** ⬜ Not Started | 🟡 In Progress | ✅ Complete
+**Legend:** ⬜ Not Started | 🟡 In Progress | 🟢 **Done**
 
 ---
+
+## Historical reports (kept for the rationale)
+
+- **[ZenSight "parallax" video sensor — gap analysis & roadmap](zensight-parallax-sensor.md)**
+  (2026-07-04). The study that started the sensor work. Superseded by plan 29 and by what
+  actually shipped: several of its claims — notably "the `zenoh` feature does not compile" — were
+  true when written and are not now. Kept because the keyspace and `FrameMeta` decisions in §2b
+  and §4 are where the `@media` design came from.
 
 ## Completed Plans (files removed)
 

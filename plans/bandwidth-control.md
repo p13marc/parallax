@@ -1,19 +1,48 @@
 # Bandwidth control for the ZenSight ↔ Parallax sensor
 
-Status: filed, not started. Written 2026-07-14.
+Status: **Phase A complete.** Written 2026-07-14; status revised 2026-08-25.
 
-Tracked by [#33](https://github.com/p13marc/parallax/issues/33) (epic). Phase A is broken out into
-[#24](https://github.com/p13marc/parallax/issues/24) (`EncoderControl` handle),
-[#25](https://github.com/p13marc/parallax/issues/25) (H.264 live bitrate/GOP/QP),
-[#26](https://github.com/p13marc/parallax/issues/26) (H.264 pinned resolution),
-[#27](https://github.com/p13marc/parallax/issues/27) (missing openh264 knobs),
-[#28](https://github.com/p13marc/parallax/issues/28) (`VideoScale`),
-[#29](https://github.com/p13marc/parallax/issues/29) (`VideoConvertElement` latching),
-[#30](https://github.com/p13marc/parallax/issues/30) (`Throttle`),
-[#31](https://github.com/p13marc/parallax/issues/31) (`JpegEncoder` quality),
-[#32](https://github.com/p13marc/parallax/issues/32) (V4L2 M2M live controls).
-Phase B (the zensight sensor, wire protocol and GUI) is not filed yet — it lands in the zensight
-repo once this API exists.
+Tracked by [#33](https://git.marcpardo.eu/marcpardo/parallax/issues/33) (epic, closed). Phase A
+was broken out into
+[#24](https://git.marcpardo.eu/marcpardo/parallax/issues/24) (`EncoderControl` handle),
+[#25](https://git.marcpardo.eu/marcpardo/parallax/issues/25) (H.264 live bitrate/GOP/QP),
+[#26](https://git.marcpardo.eu/marcpardo/parallax/issues/26) (H.264 pinned resolution),
+[#27](https://git.marcpardo.eu/marcpardo/parallax/issues/27) (missing openh264 knobs),
+[#28](https://git.marcpardo.eu/marcpardo/parallax/issues/28) (`VideoScale`),
+[#29](https://git.marcpardo.eu/marcpardo/parallax/issues/29) (`VideoConvertElement` latching),
+[#30](https://git.marcpardo.eu/marcpardo/parallax/issues/30) (`Throttle`),
+[#31](https://git.marcpardo.eu/marcpardo/parallax/issues/31) (`JpegEncoder` quality),
+[#32](https://git.marcpardo.eu/marcpardo/parallax/issues/32) (V4L2 M2M live controls) — **all
+nine closed**, along with the epic. Phase B (the sensor, wire protocol and GUI) is zensight-side
+and lands in that repo; nothing further is owed here.
+
+The plan below is kept as written, because it is the argument for the design and that argument
+still holds. What follows is the reconciliation.
+
+## What shipped, and where it differs from this plan
+
+Five differences worth knowing before reading Part 2 as if it described the tree:
+
+- **A1 named `src/elements/codec/control.rs`. It shipped in `src/control.rs`** — always
+  compiled, with a `Controllable` trait so the accessor is uniformly `control()` rather than a
+  per-element name. A broader design than planned, and a reader sent to the planned path finds
+  nothing there.
+- **More handles than the plan listed.** Also `EncoderStatsHandle`, `ValveControl`,
+  `GainControl`, `FlowStateHandle`, `AutoVideoSinkHandle` — and, since
+  [#246](https://git.marcpardo.eu/marcpardo/parallax/issues/246), rates and an encode-latency
+  distribution beside the raw counters.
+- **`EncoderControl` grew past bitrate/GOP/QP/keyframe**, gaining frame skipping and
+  `set_rate_control`.
+- **§1.3's gap 5 is fixed.** "QoS is dead weight — `Event::Qos` never emitted" stopped being
+  true with [#184](https://git.marcpardo.eu/marcpardo/parallax/issues/184): sinks originate QoS,
+  it travels upstream hop by hop, and `Throttle` scales its interval on an underflow. Recovery
+  stays app policy, through `ThrottleControl`.
+- **A8 asked for three tests; `tests/encoder_control.rs` carries more**, including
+  `a_bitrate_change_is_seamless_and_forces_no_idr` — a proof the plan did not think to ask for,
+  and the one that pins the openh264 `SetOption` path.
+
+Reference documentation for what shipped: `docs/elements.md` § "Runtime control (bandwidth
+knobs)".
 
 ## Context
 
@@ -304,15 +333,23 @@ there is no RTCP-style loss/jitter signal to close a loop on. The signals that *
 instead. A real ABR loop should wait for a transport that reports congestion (or for the RTP
 path, where Parallax's `RtcpHandler` could supply receiver reports).
 
+**Corroborated since.** That call has been reached independently three times over. The reference
+sensor arrived at the same conclusion from the other side
+([zensight #504](https://git.marcpardo.eu/marcpardo/zensight/issues/504),
+[#513](https://git.marcpardo.eu/marcpardo/zensight/issues/513)), and
+[zenkey #368](https://git.marcpardo.eu/marcpardo/zenkey/issues/368) is making it normative in
+RFC 07: **tiers are the quality knob, and the subscription is the choice.** A producer publishes
+the ladder; a consumer picks a rung by subscribing to it. That is a deliberate, observable lever
+in the consumer's hands, where an ABR loop would be a guess in the producer's.
+
 ---
 
-## Dependency / release note
+## Release note
 
-ZenSight consumes `parallax-pipeline = "0.1.3"` **from crates.io**, not a path dep. Phase A
-therefore ships as a Parallax **0.2.0** release: the `VideoEncoder` trait gains defaulted
-methods (source-compatible), but `H264Encoder`'s resolution behaviour changes, which is
-semver-visible. During development, point ZenSight at a `path = "../parallax"` override; cut
-the release before merging Phase B.
+Phase A shipped. It went out over the 0.2.x–0.7.x line rather than in the single 0.2.0 release
+this section originally planned, and the crate is at **0.7.0** now — `H264Encoder`'s resolution
+behaviour and the `VideoEncoder` trait's new defaulted methods both landed long ago, and
+ZenSight consumes them from crates.io. Nothing here is outstanding.
 
 ## Verification
 
