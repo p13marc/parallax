@@ -423,4 +423,4 @@ pub fn create_decoder(codec: Codec, prefer_gpu: bool) -> Box<dyn VideoDecoder> {
 
 ---
 
-*Created January 2026 based on [Project Analysis Report](../docs/PROJECT_ANALYSIS_REPORT.md)*
+*Created January 2026 based on [Project Analysis Report](../docs/design.md)*

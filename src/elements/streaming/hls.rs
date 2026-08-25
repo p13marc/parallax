@@ -167,6 +167,12 @@ pub struct HlsSink {
     total_segments: u64,
     /// Statistics: total bytes written.
     total_bytes: u64,
+    /// The stream is over: `finalize` has run, so the playlist may close.
+    ///
+    /// Separate from `is_vod`, which says the playlist was *always* complete.
+    /// A live stream that ends is also complete — from that moment — and HLS
+    /// has one way to say so.
+    finished: bool,
 }
 
 impl HlsSink {
@@ -197,6 +203,7 @@ impl HlsSink {
             first_segment: true,
             total_segments: 0,
             total_bytes: 0,
+            finished: false,
         })
     }
 
@@ -241,8 +248,12 @@ impl HlsSink {
             playlist.push_str(&format!("{}\n", segment.filename));
         }
 
-        // Add endlist for VOD
-        if self.config.is_vod {
+        // `#EXT-X-ENDLIST` means "no more segments are coming". That is true
+        // of a VOD playlist from the start, and true of a live one from the
+        // moment the stream ends — and a live playlist that ends without it
+        // reads as still-running to every player, which keeps them polling a
+        // stream that will never grow again (#221).
+        if self.config.is_vod || self.finished {
             playlist.push_str("#EXT-X-ENDLIST\n");
         }
 
@@ -363,7 +374,8 @@ impl HlsSink {
             self.total_segments += 1;
         }
 
-        // Write final playlist (with ENDLIST for VOD)
+        // Set before the write: this playlist is the final one, so it closes.
+        self.finished = true;
         self.write_playlist()?;
 
         // Write master playlist if configured
@@ -519,6 +531,7 @@ mod tests {
             first_segment: false,
             total_segments: 2,
             total_bytes: 0,
+            finished: false,
         };
 
         let playlist = sink.generate_media_playlist();
@@ -560,6 +573,7 @@ mod tests {
             first_segment: true,
             total_segments: 0,
             total_bytes: 0,
+            finished: false,
         };
 
         let master = sink.generate_master_playlist();

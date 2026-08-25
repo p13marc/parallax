@@ -8,13 +8,33 @@ ride minor bumps.
 Earlier releases predate this file — their notes live in the `Bump to X.Y.Z`
 commit messages and the Forgejo releases.
 
-## [Unreleased]
+## [0.8.0] — 2026-08-25
 
-Work on the `@media` plane (milestone *Multi-machine video: RTSP → @media →
-browser*, epic #204). Several wire-format breaks land together on purpose, so
-no intermediate build advertises a half-migrated format.
+63 commits since 0.7.0, and the release a parallax pipeline becomes a
+*multi-machine* one: it publishes and consumes the ratified zenkey `@media`
+plane, ingests RTSP well enough to leave running, and reports enough about
+itself for a consumer to measure what it is getting.
+
+Every out-of-tree plugin must be rebuilt: the plugin ABI went **11 → 12**.
+Peers must be upgraded together: the zenoh attachment went **v1 → v4** and the
+IPC descriptor **128 → 192 bytes**. Several wire-format breaks land in one
+release on purpose, so that no intermediate build advertises a half-migrated
+format.
 
 ### Breaking
+
+- **`RtspSrc` no longer attaches `RtpMeta`** (#208). `Metadata.rtp` is now
+  `None` on buffers from an RTSP source, where it used to be `Some` with three
+  of its five fields zeroed. retina hands back demuxed access units, not
+  packets, so `seq`, `ssrc` and `pt` were never available — and zeros are not
+  "absent", they are plausible-looking garbage that anything reading them
+  believed, including the IPC descriptor, which faithfully carries `RtpMeta`
+  across a process boundary. `marker` was worse than wrong: it was being set to
+  mean "keyframe", which `BufferFlags::SYNC_POINT` already says correctly two
+  lines earlier, while the RTP marker bit actually means "last packet of an
+  access unit" — so an RTP-aware consumer read the one field that lied. The RTP
+  timestamp is not lost; `pts` is derived from it. `RtpSrc` is untouched: it
+  reads real packets and populates `RtpMeta` honestly.
 
 - **`EncoderStats` is no longer `Eq`** (#246). It gained three `f64` rate fields
   and an `EncodeLatency`, so the derive had to go. `PartialEq`, `Copy`, `Clone`,
@@ -62,6 +82,30 @@ element. New vtable slot, so every out-of-tree plugin must be rebuilt.
 zero-payload sample carrying it is the parallax plane's end-of-stream marker;
 it rides the media key expression, because zenoh orders only within a flow and
 a terminal on a sibling key could overtake the last frame.
+
+**Zenoh attachment v3 → v4, and the IPC descriptor 128 → 192 bytes** (#219).
+One schema, one code table, two encodings — and both grew the three fields the
+drift had eaten: `rtp` (carried by IPC, dropped by zenoh), `planes` (dropped by
+both, so a strided producer's frame arrived claiming to be packed) and
+`WireFormat::Rtp`. The descriptor takes `planes` inline rather than pushing it
+through the control socket, which is what costs the extra 64 bytes; it is still
+written scalar-by-scalar with nothing allocated per buffer.
+
+`IPC_RING_VERSION` stays 2 — the *layout* around the descriptor did not change
+— so note that the two version constants move independently and on purpose:
+`WIRE_VERSION` is semantics, `IPC_RING_VERSION` is mechanics. Skew policy
+differs by transport, also on purpose: zenoh treats an unknown version as a
+foreign publisher and falls back, IPC gates on exact equality and errors,
+because both ends of an IPC channel are parallax and a mismatch is a
+deployment error rather than someone else's traffic.
+
+**`RtspSrc` reconnects by default** (#206). A stream error used to end the run;
+it now rebuilds the session against the same URL with exponential backoff and
+full jitter, unlimited retries, posting a bus `Warning` per attempt and
+stamping `DISCONT` on the first resumed buffer. That is right for a camera and
+wrong for batch work, which wants a failure to be a failure — `.without_reconnect()`
+or `reconnect=false` restores the old behaviour. EOS is never retried: a server
+that said goodbye said goodbye.
 
 **The RTP payloaders are `Transform`s** (#218). All six emit one buffer per RTP
 packet via `Output::Multiple` instead of concatenating an access unit's packets
@@ -208,6 +252,28 @@ the plugin ABI does not use either — so no ABI bump. `register` is unchanged;
   attachment agree.
 
 ### Fixed
+
+- **`HlsSink::finish` never closed a live playlist.** `#EXT-X-ENDLIST` was
+  written only when `is_vod`, so a live stream that ended left a playlist every
+  player reads as still-running and keeps polling — the exact failure the
+  `finish` hook's own doc comment describes. It is now written whenever the
+  stream is over, which is what the tag means: no more segments are coming.
+  Found by writing the first end-to-end test of #221's two real users; before
+  it, the only `ENDLIST` assertion in the tree asserted its *absence*.
+- **`vaapih265dec` handed out advice you could not act on.** It sat in
+  `GATED_ELEMENTS`, so a build that already had `vaapi` was told to "rebuild
+  with --features vaapi". HEVC is not gated by a feature — it is not built at
+  any combination, because `cros-codecs`' `h265` feature does not compile
+  against its published release (#200). A second category,
+  `UNAVAILABLE_ELEMENTS`, now says that instead.
+- **CI compiled four combos it never ran.** `display-check` and `vulkan-check`
+  were clippy/check only, leaving 75 already-written test functions compiled and
+  never executed — the display geometry and colour maths, the dma-buf plane
+  validation, and the CPU-only half of the Vulkan decoder (slice headers, POC,
+  reference marking). Both run `nextest` now. `image-png` was linted and
+  documented but never tested, and `cli` and `zenoh` were never enabled
+  together, so the three async-constructor acceptance tests for #222 had never
+  run at all. Both are fixed in `feature-gates`.
 
 - **`Queue2`'s rate estimation is `control::RateMeter`** (#257) instead of a
   second hand-rolled EWMA. One user-visible change: the buffering ETA now

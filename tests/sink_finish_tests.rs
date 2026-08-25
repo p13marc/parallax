@@ -22,6 +22,21 @@ use parallax::pipeline::bus::MessageKind;
 use parallax::pipeline::{EndReason, Executor, ExecutorConfig, Pipeline};
 use tokio::sync::Mutex;
 
+use parallax::buffer::MemoryHandle;
+use parallax::memory::SharedArena;
+use parallax::metadata::Metadata;
+
+/// A buffer of `bytes` carrying `metadata`, from a shared test arena.
+fn payload(bytes: &[u8], metadata: Metadata) -> Buffer {
+    use std::sync::OnceLock;
+    static ARENA: OnceLock<SharedArena> = OnceLock::new();
+    let arena = ARENA.get_or_init(|| SharedArena::new(4096, 32).unwrap());
+    arena.reclaim();
+    let mut slot = arena.acquire().expect("test arena slot");
+    slot.data_mut()[..bytes.len()].copy_from_slice(bytes);
+    Buffer::new(MemoryHandle::with_len(slot, bytes.len()), metadata)
+}
+
 /// A sink that records what its `finish` was told, from inside an `await`.
 struct RecordingSink {
     /// `Some(reason)` once `finish` ran. A `tokio::sync::Mutex` because the
@@ -201,4 +216,55 @@ async fn the_simple_sink_family_gets_the_hook_too() {
     handle.wait().await.unwrap();
 
     assert!(said.load(Ordering::SeqCst));
+}
+
+/// #221's whole point, on the two sinks that actually motivated it.
+///
+/// The hook's *mechanism* was pinned above with a fake sink. What was never
+/// checked is that `HlsSink` and `DashSink` use it to write the thing that
+/// makes a stream readable as finished — and a live playlist without its
+/// `#EXT-X-ENDLIST` reads as still-running to every player, forever. Before
+/// this, the only `ENDLIST` assertion in the tree asserted its *absence* in a
+/// string built by a pure function.
+#[test]
+fn hls_finish_writes_the_endlist_that_marks_the_stream_over() {
+    use parallax::element::SimpleSink;
+    use parallax::elements::streaming::{HlsConfig, HlsSink};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = HlsConfig {
+        output_dir: dir.path().to_path_buf(),
+        segment_duration: 0.05,
+        // Live, not VOD. A VOD playlist carries `#EXT-X-ENDLIST` from its
+        // first write, so it could not tell us anything about `finish()`.
+        is_vod: false,
+        ..Default::default()
+    };
+    let playlist = dir.path().join(&config.playlist_name);
+    let mut sink = HlsSink::new(config).expect("hls sink");
+
+    // Two keyframes far enough apart to close a segment between them.
+    for (i, pts_ms) in [0u64, 100].into_iter().enumerate() {
+        let mut meta = Metadata::new();
+        meta.pts = parallax::clock::ClockTime::from_millis(pts_ms);
+        meta.flags |= parallax::metadata::BufferFlags::SYNC_POINT;
+        meta.sequence = i as u64;
+        SimpleSink::consume(&mut sink, &payload(&[0xAB; 512], meta)).expect("consume");
+    }
+
+    // Whatever is on disk now is a *live* playlist: still running.
+    if let Ok(before) = std::fs::read_to_string(&playlist) {
+        assert!(
+            !before.contains("#EXT-X-ENDLIST"),
+            "a running stream must not claim to be over: {before}"
+        );
+    }
+
+    SimpleSink::finish(&mut sink, EndReason::Eos).expect("finish");
+
+    let after = std::fs::read_to_string(&playlist).expect("a playlist on disk");
+    assert!(
+        after.contains("#EXT-X-ENDLIST"),
+        "finish() must close the playlist, or players wait forever: {after}"
+    );
 }

@@ -429,6 +429,8 @@ Every controllable element implements `Controllable`, so the accessor is always 
 | `GainControl` | `Gain::control()` | `set_factor(f)` / `set_db(db)`, `factor()` / `db()` |
 | `FlowStateHandle` | `Pipeline::monitor_link` | backpressure signalling to live sources |
 | `ZenohSinkHandle` | `ZenohSink::control()` `[zenoh]` | *read-only* except `request_keyframe()`: `has_viewers`, rise/fall edge counters, `samples_sent`/`bytes_sent` + their rates, `keyframes_sent`, `publish_errors` |
+| `ZenohSrcHandle` | `ZenohSrc::control()` `[zenoh]` | *read-only*: `samples_received`/`bytes_received` + their rates, three distinct drop counters, `lost_wire`, `publisher_losses`; plus `end_stream()` |
+| `Queue2RangesHandle` | `Queue2::control()` (download mode) | *read-only*: downloaded byte ranges, total, write position |
 | `AppSinkHandle` / `AppSrcHandle` | `AppSink::handle()` / `AppSrc::handle()` | async-first `pull_buffer`/`push_buffer` (+`_timeout`; `*_blocking` twins for plain threads), `try_pull_buffer`/`try_push_buffer`, `stats()` |
 | `AutoVideoSinkHandle` | `AutoVideoSink::handle()` `[display]` | window events (`try_event`/`event_timeout` → `VideoWindowEvent`: keys as `VideoKey`, mouse, close, resize; bounded and sender-side lossy), `set_fullscreen(bool)`, `is_open()`. No handle taken ⇒ no events |
 

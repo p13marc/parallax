@@ -72,13 +72,26 @@ impl From<SyncConstructor> for ElementConstructor {
     }
 }
 
+/// Names that are known, unavailable, and that **no** feature will provide.
+///
+/// Distinct from [`GATED_ELEMENTS`] on purpose: telling someone to rebuild with
+/// a feature they already have is worse than saying nothing. `vaapih265dec` is
+/// the case — the VA-API driver may well expose HEVC, but `cros-codecs`' `h265`
+/// feature does not compile against its published release, so the element is
+/// not built at any feature combination (#200).
+pub const UNAVAILABLE_ELEMENTS: &[(&str, &str)] = &[(
+    "vaapih265dec",
+    "HEVC is not built: cros-codecs' h265 feature does not compile against its \
+     published release, and no cargo feature enables it (see #200). There is no \
+     software HEVC decoder in this tree either",
+)];
+
 /// Factory names that exist but are compiled out without their cargo feature.
 ///
 /// Kept unconditional so a build without the feature can say *why* a name is
 /// unavailable. `--list-elements` in parallax-launch prints these too.
 pub const GATED_ELEMENTS: &[(&str, &str)] = &[
     ("vaapih264dec", "vaapi"),
-    ("vaapih265dec", "vaapi"),
     ("vaapivp8dec", "vaapi"),
     ("vaapivp9dec", "vaapi"),
     ("autovideosink", "display"),
@@ -223,6 +236,15 @@ impl ElementFactory {
             return registry.create_element(&parsed.name).map_err(|e| {
                 Error::Parse(format!("failed to create element '{}': {}", parsed.name, e))
             });
+        }
+
+        // A name no feature will ever provide gets the honest reason, not
+        // advice the caller cannot act on.
+        if let Some((_, why)) = UNAVAILABLE_ELEMENTS.iter().find(|(n, _)| *n == parsed.name) {
+            return Err(Error::Parse(format!(
+                "element '{}' is unavailable: {why}",
+                parsed.name
+            )));
         }
 
         // A known-but-compiled-out name gets a pointed error.
@@ -484,5 +506,33 @@ mod tests {
         for (name, _) in factory.unavailable_elements() {
             assert!(!factory.is_registered(name), "{name} is both");
         }
+    }
+
+    /// A name no feature will ever provide must say so, not hand out advice
+    /// the caller has already taken.
+    ///
+    /// `vaapih265dec` used to sit in `GATED_ELEMENTS`, so a build that *had*
+    /// `vaapi` was told to "rebuild with --features vaapi". HEVC is not gated
+    /// by a feature; it is not built at all (#200).
+    #[test]
+    fn an_unavailable_element_gives_a_reason_not_impossible_advice() {
+        let parsed = ParsedElement {
+            name: "vaapih265dec".to_string(),
+            properties: vec![],
+        };
+        let err = match ElementFactory::new().create(&parsed) {
+            Ok(_) => panic!("vaapih265dec is not built at any feature combination"),
+            Err(e) => e.to_string(),
+        };
+
+        assert!(err.contains("unavailable"), "{err}");
+        assert!(
+            err.contains("#200"),
+            "the reason must point somewhere: {err}"
+        );
+        assert!(
+            !err.contains("rebuild with"),
+            "no feature enables it, so do not suggest one: {err}"
+        );
     }
 }

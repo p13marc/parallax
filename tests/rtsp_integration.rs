@@ -17,6 +17,7 @@ mod support;
 
 use std::time::Duration;
 
+use parallax::clock::ClockTime;
 use parallax::element::{AsyncSource, ProduceContext, ProduceResult};
 use parallax::elements::{RtspReconnect, RtspSrc};
 use parallax::metadata::BufferFlags;
@@ -79,6 +80,23 @@ async fn connect_play_and_receive_annex_b_frames() {
         first.metadata().is_keyframe(),
         "the keyframe gate holds until the first IDR, so the first buffer is one"
     );
+
+    // #208: no fabricated `RtpMeta`. retina hands back demuxed access units,
+    // not packets, so `seq`, `ssrc` and `pt` are simply not available — and
+    // filling them with zeros published plausible-looking garbage to anything
+    // that read them, including the IPC descriptor, which carries `RtpMeta`
+    // across a process boundary. `None` is the truthful answer, and the RTP
+    // timestamp is not lost: `pts` is derived from it.
+    assert!(
+        first.metadata().rtp.is_none(),
+        "RTSP must not attach RtpMeta it does not have: {:?}",
+        first.metadata().rtp
+    );
+    assert!(
+        first.metadata().pts.nanos() > 0 || first.metadata().pts == ClockTime::ZERO,
+        "the RTP timestamp still reaches pts"
+    );
+
     assert_eq!(server.plays(), 1);
 }
 

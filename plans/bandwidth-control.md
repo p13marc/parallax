@@ -23,7 +23,7 @@ still holds. What follows is the reconciliation.
 
 Five differences worth knowing before reading Part 2 as if it described the tree:
 
-- **A1 named `src/elements/codec/control.rs`. It shipped in `src/control.rs`** — always
+- **A1 named `src/elements/codec/control.rs`. It shipped in `src/control/`** — always
   compiled, with a `Controllable` trait so the accessor is uniformly `control()` rather than a
   per-element name. A broader design than planned, and a reader sent to the planned path finds
   nothing there.
