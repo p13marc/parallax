@@ -12,6 +12,15 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # The pinned toolchain. Must equal `rust-toolchain.toml`'s channel —
+  # `tests/toolchain_pin.rs` fails if it does not. Repeated here only because
+  # `dtolnay/rust-toolchain` requires an explicit `toolchain:` input and will
+  # not read the file.
+  #
+  # Not `@stable`: that is a moving target, and when it moved to 1.98 on
+  # 2026-08-18 it turned seven jobs red on new clippy lints with no code
+  # change. Bumping Rust is now a pull request that runs the whole matrix.
+  RUST_VERSION: "1.98.0"
   # `zenoh-unstable` is in here rather than appended per-job because the
   # matching-listener demand signal (#234) lives behind it: with it only on the
   # clippy and doc jobs, a test covering that code compiled and never ran.
@@ -43,8 +52,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v7.0.1
-      - uses: https://github.com/dtolnay/rust-toolchain@stable
+      - uses: https://github.com/dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_VERSION }}
           components: rustfmt
       - run: cargo fmt --check
 
@@ -53,8 +63,9 @@ jobs:
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v7.0.1
       - run: sudo apt-get update && sudo apt-get install -y libudev-dev g++ libclang-dev
-      - uses: https://github.com/dtolnay/rust-toolchain@stable
+      - uses: https://github.com/dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_VERSION }}
           components: clippy
       - uses: https://github.com/Swatinem/rust-cache@v2.9.2
         with:
@@ -68,7 +79,9 @@ jobs:
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v7.0.1
       - run: sudo apt-get update && sudo apt-get install -y libudev-dev g++ libclang-dev
-      - uses: https://github.com/dtolnay/rust-toolchain@stable
+      - uses: https://github.com/dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
       - uses: https://github.com/Swatinem/rust-cache@v2.9.2
         with:
           cache-targets: false
@@ -91,9 +104,20 @@ jobs:
 
   msrv:
     runs-on: ubuntu-24.04
+    # Outranks `rust-toolchain.toml` (rustup: RUSTUP_TOOLCHAIN > directory
+    # override > default), which is the only reason this job still tests the
+    # MSRV rather than re-testing the pin.
+    env:
+      RUSTUP_TOOLCHAIN: "1.97"
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v7.0.1
       - run: sudo apt-get update && sudo apt-get install -y libudev-dev g++ libclang-dev
+      # `rust-toolchain.toml` pins the *development* toolchain and rustup
+      # applies it to every cargo invocation in the repo — including this one,
+      # which would quietly turn the MSRV job into a second copy of the others.
+      # `RUSTUP_TOOLCHAIN` outranks the file, so this is what keeps the job
+      # honest. The number here is the MSRV; `Cargo.toml`'s `rust-version` is
+      # the contract it enforces.
       - uses: https://github.com/dtolnay/rust-toolchain@master
         with:
           toolchain: "1.97"
@@ -115,8 +139,9 @@ jobs:
       # no node in fedora:44 → install it first so JS actions work
       - run: dnf install -y nodejs git gcc gcc-c++ clang-devel libcamera-devel systemd-devel pipewire-devel pkgconf-pkg-config tar xz zstd
       - uses: https://data.forgejo.org/actions/checkout@v7.0.1
-      - uses: https://github.com/dtolnay/rust-toolchain@stable
+      - uses: https://github.com/dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_VERSION }}
           components: clippy
       - uses: https://github.com/Swatinem/rust-cache@v2.9.2
         with:
@@ -141,7 +166,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v7.0.1
-      - uses: https://github.com/dtolnay/rust-toolchain@stable
+      - uses: https://github.com/dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
       - uses: https://github.com/Swatinem/rust-cache@v2.9.2
         with:
           key: vulkan
@@ -155,10 +182,11 @@ jobs:
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v7.0.1
       - run: sudo apt-get update && sudo apt-get install -y libudev-dev g++ libclang-dev
-      - uses: https://github.com/dtolnay/rust-toolchain@stable
-        # Without this the toolchain has no clippy and the job fails with
-        # "'cargo-clippy' is not installed", not with a lint.
+      # Without `components`, the toolchain has no clippy and the job fails
+      # with "'cargo-clippy' is not installed", not with a lint.
+      - uses: https://github.com/dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_VERSION }}
           components: clippy
       - uses: https://github.com/Swatinem/rust-cache@v2.9.2
         with:
@@ -181,8 +209,9 @@ jobs:
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v7.0.1
       - run: sudo apt-get update && sudo apt-get install -y g++ libclang-dev libasound2-dev
-      - uses: https://github.com/dtolnay/rust-toolchain@stable
+      - uses: https://github.com/dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_VERSION }}
           components: clippy
       - uses: https://github.com/Swatinem/rust-cache@v2.9.2
         with:
@@ -206,8 +235,9 @@ jobs:
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v7.0.1
       - run: sudo apt-get update && sudo apt-get install -y g++
-      - uses: https://github.com/dtolnay/rust-toolchain@stable
+      - uses: https://github.com/dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_VERSION }}
           components: clippy
       - uses: https://github.com/Swatinem/rust-cache@v2.9.2
         with:
@@ -226,8 +256,9 @@ jobs:
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v7.0.1
       - run: sudo apt-get update && sudo apt-get install -y libva-dev libclang-dev libvpx-dev pkg-config g++
-      - uses: https://github.com/dtolnay/rust-toolchain@stable
+      - uses: https://github.com/dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_VERSION }}
           components: clippy
       - uses: https://github.com/Swatinem/rust-cache@v2.9.2
         with:
@@ -247,8 +278,9 @@ jobs:
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v7.0.1
       - run: sudo apt-get update && sudo apt-get install -y libudev-dev g++ libclang-dev
-      - uses: https://github.com/dtolnay/rust-toolchain@stable
+      - uses: https://github.com/dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_VERSION }}
           components: clippy
       - uses: https://github.com/Swatinem/rust-cache@v2
         with:
@@ -267,7 +299,9 @@ jobs:
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v7.0.1
       - run: sudo apt-get update && sudo apt-get install -y libudev-dev g++ libclang-dev
-      - uses: https://github.com/dtolnay/rust-toolchain@stable
+      - uses: https://github.com/dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
       - uses: https://github.com/Swatinem/rust-cache@v2.9.2
         with:
           cache-targets: false
