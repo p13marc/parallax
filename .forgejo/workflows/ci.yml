@@ -192,6 +192,12 @@ jobs:
         with:
           key: display
           cache-targets: false
+      # Both, and in this order. `display-gpu` gates the whole wgpu backend
+      # (#190) and was compiled by nothing (#255); it needs no driver to build,
+      # only to run. And the combined build is not a superset in practice — a
+      # module that loses its cfg gate compiles here and breaks the
+      # `display`-alone build below, which has happened.
+      - run: cargo clippy --all-targets --features display,display-gpu -- -D warnings
       - run: cargo clippy --all-targets --features display -- -D warnings
 
   # The last feature gates nothing else compiles. Not a theoretical gap:
@@ -217,7 +223,15 @@ jobs:
         with:
           key: feature-gates
           cache-targets: false
-      - run: cargo clippy --all-targets --features aac-encode,websocket,alsa,v4l2-m2m -- -D warnings
+      - uses: https://github.com/taiki-e/install-action@v2.86.1
+        with:
+          tool: cargo-nextest
+      # `eac3,audio-flac,audio-mp3,cli,macros` are pure Rust and were compiled
+      # by nothing at all (#255) — `cli` gates `src/bin/parallax_launch.rs` and
+      # `tests/launch_cli.rs`, a binary and its whole test suite that had never
+      # been built here. No new apt packages; they cost only build time.
+      - run: cargo nextest run --features aac-encode,websocket,alsa,v4l2-m2m,eac3,audio-flac,audio-mp3,cli,macros
+      - run: cargo clippy --all-targets --features aac-encode,websocket,alsa,v4l2-m2m,eac3,audio-flac,audio-mp3,cli,macros -- -D warnings
 
   # The *degraded* zenoh build (#230): `zenoh` without `zenoh-unstable`.
   #
@@ -291,6 +305,57 @@ jobs:
           tool: cargo-nextest
       - run: cargo nextest run --features simd-colorspace
       - run: cargo clippy --all-targets --features simd-colorspace -- -D warnings
+
+  # The media-full combo (`just check-media-full`), which no workflow mirrored
+  # (#255). `opus`, `av1-decode` and `av1-encode` were compiled by nothing at
+  # all — and that gap hid a clippy error in the Opus encoder from the moment
+  # the toolchain was pinned to 1.98 until it was found by accident, leaving
+  # the recipe red on master the whole time.
+  #
+  # `$MEDIA_FEATURES` is reused rather than spelled out so this job and the
+  # recipe cannot drift apart the way the recipe drifted from CI.
+  codec-libs:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@v7.0.1
+      - run: sudo apt-get update && sudo apt-get install -y libopus-dev libdav1d-dev libvpx-dev nasm g++ libclang-dev pkg-config
+      - uses: https://github.com/dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: clippy
+      - uses: https://github.com/Swatinem/rust-cache@v2.9.2
+        with:
+          key: codec-libs
+          cache-targets: false
+      - uses: https://github.com/taiki-e/install-action@v2.86.1
+        with:
+          tool: cargo-nextest
+      - run: cargo nextest run --features "$MEDIA_FEATURES,vpx,av1-decode,av1-encode,opus,h264"
+      - run: cargo clippy --all-targets --features "$MEDIA_FEATURES,vpx,av1-decode,av1-encode,opus,h264" -- -D warnings
+
+  # The three workspace members nothing builds. `default-members = ["."]` keeps
+  # a bare `cargo build` narrow on purpose (see Cargo.toml), and no job passes
+  # `-p` or `--workspace` — so the player, the proc-macro crate and the example
+  # plugin were never compiled by CI at all (#255). Checking them explicitly
+  # closes that without widening the default set.
+  workspace-members:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@v7.0.1
+      # `parallax-player` pulls a lot in: vpx, av1-decode, opus, h264, alsa and
+      # vaapi all want a system library, and its Cargo.toml is the list.
+      - run: sudo apt-get update && sudo apt-get install -y libudev-dev g++ libclang-dev libdav1d-dev libopus-dev libvpx-dev libasound2-dev libva-dev pkg-config
+      - uses: https://github.com/dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: clippy
+      - uses: https://github.com/Swatinem/rust-cache@v2.9.2
+        with:
+          key: workspace-members
+          cache-targets: false
+      - run: cargo clippy -p parallax-pipeline-macros --all-targets -- -D warnings
+      - run: cargo clippy -p example-plugin --all-targets -- -D warnings
+      - run: cargo clippy -p parallax-player --all-targets -- -D warnings
 
   docs:
     runs-on: ubuntu-24.04

@@ -85,6 +85,20 @@ the plugin ABI does not use either — so no ABI bump. `register` is unchanged;
 
 ### Added
 
+- **Receive-side rates on `ZenohSrcHandle`** (#256). `samples_per_second()` and
+  `bits_per_second()`, measured the way #246 measures the sink side — payload
+  bits, same window — so the two are comparable across the wire and the gap
+  between them is loss rather than an artefact of two definitions. The drop and
+  loss counters stay counters: they mean deliberately different things and
+  point at different machines, and a smoothed version of any of them says less.
+- **CI compiles nine features and three crates it never did** (#255): `opus`,
+  `av1-decode`, `av1-encode`, `eac3`, `audio-flac`, `audio-mp3`, `display-gpu`,
+  `macros` and `cli` — the last of which gates `parallax-launch` and its test
+  suite — plus `parallax-player`, `parallax-pipeline-macros` and
+  `examples/example-plugin`, which no job built because none passes `-p`.
+  Two new jobs (`codec-libs`, `workspace-members`) and two extensions.
+  `default-members` is unchanged, so a bare `cargo build` is unaffected.
+
 - **VP9 decodes into buffers parallax supplies** (#198). With
   `MemoryType::External` negotiated, `VpxDecoder` hands libvpx its own frame
   buffers through `vpx_codec_set_frame_buffer_functions` and emits the decoded
@@ -194,6 +208,19 @@ the plugin ABI does not use either — so no ABI bump. `register` is unchanged;
   attachment agree.
 
 ### Fixed
+
+- **`Queue2`'s rate estimation is `control::RateMeter`** (#257) instead of a
+  second hand-rolled EWMA. One user-visible change: the buffering ETA now
+  responds in about 0.72 s rather than 1.4 s, so it is a little jumpier and a
+  lot more honest — the old estimator held its last value indefinitely, so a
+  stalled download kept reporting the throughput it used to have.
+- **The README's feature table** (#259) documented three features that had been
+  deleted (`huge-pages`, `gpu`, `rdma`) and omitted six that exist (`cli`,
+  `display-gpu`, `eac3`, `hotplug`, `v4l2-m2m`, `zenoh-unstable`). A test now
+  diffs it against `[features]` in both directions.
+- **`toolchain_pin` checked the action ref, not the compiler** (#254). A job
+  written as `rust-toolchain@master` with `toolchain: stable` floated exactly
+  as badly as a floating action ref and passed the check meant to stop it.
 
 - **`tests/zenoh_media.rs` asserted delivery on a plane that promises none.**
   Two separate failures, one root cause each. `settle()` slept a fixed 300 ms

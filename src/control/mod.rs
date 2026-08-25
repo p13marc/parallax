@@ -32,6 +32,7 @@
 //! | [`GainControl`] | `Gain` | audio volume (`set_factor`, `set_db`) |
 //! | [`FlowStateHandle`] | `Pipeline::monitor_link` | backpressure signalling to live sources |
 //! | `ZenohSinkHandle` `[zenoh]` | `ZenohSink::control()` | viewer presence and edges, keyframe requests, publish counters and rates |
+//! | `ZenohSrcHandle` `[zenoh]` | `ZenohSrc::control()` | *read-only*: receive counters and rates, three distinct drop counters, `publisher_losses` |
 //!
 //! # Example
 //!

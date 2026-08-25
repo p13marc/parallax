@@ -352,8 +352,8 @@ pub enum PublisherLoss {
 /// Counters behind [`ZenohSrcHandle`], shared with the subscriber callback.
 #[derive(Debug, Default)]
 struct ZenohSrcCounters {
-    bytes_received: AtomicU64,
-    samples_received: AtomicU64,
+    bytes_received: RateMeter,
+    samples_received: RateMeter,
     /// The receive queue was full: the local pipeline is not keeping up.
     dropped_queue: AtomicU64,
     /// No output arena slot was free: the arena is undersized, or a consumer
@@ -398,11 +398,26 @@ pub struct ZenohSrcHandle {
 impl ZenohSrcHandle {
     /// Payload bytes delivered to the pipeline.
     pub fn bytes_received(&self) -> u64 {
-        self.counters.bytes_received.load(Ordering::Relaxed)
+        self.counters.bytes_received.total()
     }
     /// Samples taken off the wire.
     pub fn samples_received(&self) -> u64 {
-        self.counters.samples_received.load(Ordering::Relaxed)
+        self.counters.samples_received.total()
+    }
+    /// Samples arriving per second, smoothed over
+    /// [`RATE_WINDOW`](crate::control::RATE_WINDOW).
+    pub fn samples_per_second(&self) -> f64 {
+        self.counters.samples_received.per_second()
+    }
+    /// Arriving bitrate in bits per second, smoothed over
+    /// [`RATE_WINDOW`](crate::control::RATE_WINDOW).
+    ///
+    /// Payload only, so it is directly comparable to the publisher's
+    /// [`ZenohSinkHandle::bits_per_second`] across the wire — a gap between the
+    /// two is loss, and both are measured the same way. zenoh's framing and the
+    /// attachment are not counted.
+    pub fn bits_per_second(&self) -> f64 {
+        self.counters.bytes_received.per_second() * 8.0
     }
     /// Samples evicted because the receive queue was full.
     pub fn dropped_queue(&self) -> u64 {
@@ -738,12 +753,12 @@ impl ZenohSrc {
 
     /// Get the number of bytes received.
     pub fn bytes_received(&self) -> u64 {
-        self.counters.bytes_received.load(Ordering::Relaxed)
+        self.counters.bytes_received.total()
     }
 
     /// Get the number of samples received.
     pub fn samples_received(&self) -> u64 {
-        self.counters.samples_received.load(Ordering::Relaxed)
+        self.counters.samples_received.total()
     }
 
     /// Get statistics.
@@ -795,12 +810,11 @@ impl ZenohSrc {
         // No `into_owned()` (#226): the payload is copied once, straight into
         // the arena slot, the same as every other source in this tree. It used
         // to be materialised as a `Vec` first and then copied again.
+        let now = std::time::Instant::now();
         self.counters
             .bytes_received
-            .fetch_add(sample.payload().len() as u64, Ordering::Relaxed);
-        self.counters
-            .samples_received
-            .fetch_add(1, Ordering::Relaxed);
+            .add_at(sample.payload().len() as u64, now);
+        self.counters.samples_received.add_at(1, now);
 
         if self.profile == WireProfile::Media {
             return self.media_sample_to_buffer(sample);

@@ -149,13 +149,20 @@ fn spawn_puller(handle: AppSinkHandle) -> Collected {
 }
 
 async fn wait_until(mut cond: impl FnMut() -> bool, what: &str) {
-    for _ in 0..2000 {
-        if cond() {
-            return;
-        }
+    // Bounded by the clock, not by an iteration count. `for _ in 0..2000` with
+    // a 5 ms sleep is ten seconds only while timers fire on time; under
+    // starvation each sleep costs far more and the real ceiling is unbounded,
+    // so an overrun gets killed by nextest's terminate-after with no output at
+    // all rather than panicking with `what`. That is how a hang in this file
+    // cost three CI rounds to identify.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !cond() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    panic!("timed out waiting for {what}");
 }
 
 fn assert_gapless(seqs: &[u64], what: &str) {

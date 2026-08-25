@@ -27,14 +27,9 @@ impl Element for Doubler {
 }
 
 /// A transform element that counts buffers passing through.
+#[derive(Default)]
 pub struct Counter {
     count: u64,
-}
-
-impl Default for Counter {
-    fn default() -> Self {
-        Self { count: 0 }
-    }
 }
 
 impl Element for Counter {
@@ -65,7 +60,7 @@ parallax::define_plugin! {
             name: "doubler",
             description: "Doubles byte values in buffers",
             element_type: TRANSFORM,
-            create: || DynAsyncElement::new_box(ElementAdapter::new(Doubler::default())),
+            create: || DynAsyncElement::new_box(ElementAdapter::new(Doubler)),
         },
         {
             name: "counter",
@@ -81,8 +76,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_doubler_default() {
-        let _doubler = Doubler::default();
+    fn test_doubler_constructs() {
+        let _doubler = Doubler;
     }
 
     #[test]

@@ -84,3 +84,34 @@ fn no_ci_job_installs_a_floating_toolchain() {
         "these steps install a moving toolchain instead of the pin: {floating:#?}"
     );
 }
+
+/// The action ref is only half the line. `rust-toolchain@master` pins the
+/// *action*; `toolchain:` picks the *compiler*, and a job that says
+/// `toolchain: stable` floats exactly as badly as `rust-toolchain@stable`
+/// would — while sailing through the check above.
+///
+/// So every `toolchain:` input must name a version this repo has decided on:
+/// the pin (usually through `RUST_VERSION`), or the MSRV, which the `msrv` job
+/// installs deliberately. Anything else — `stable`, `beta`, `nightly` — is the
+/// moving target the pin exists to remove.
+#[test]
+fn every_ci_toolchain_input_names_a_version_we_chose() {
+    let pinned = scalar(TOOLCHAIN_TOML, "channel").expect("rust-toolchain.toml has a channel");
+    let msrv = scalar(CARGO_TOML, "rust-version").expect("Cargo.toml has a rust-version");
+
+    let floating: Vec<&str> = CI_YML
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("toolchain:") && !l.starts_with('#'))
+        .filter(|l| {
+            let value = l.trim_start_matches("toolchain:").trim().trim_matches('"');
+            value != "${{ env.RUST_VERSION }}" && value != pinned && value != msrv
+        })
+        .collect();
+
+    assert!(
+        floating.is_empty(),
+        "these steps select a toolchain that is neither the pin ({pinned}) nor \
+         the MSRV ({msrv}): {floating:#?}"
+    );
+}

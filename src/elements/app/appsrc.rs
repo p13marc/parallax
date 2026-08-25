@@ -416,7 +416,11 @@ mod tests {
 
     fn create_test_buffer(seq: u64) -> Buffer {
         let arena = test_arena();
-        let slot = arena.acquire().unwrap();
+        // Recycle: the arena is shared across this module and has 128 slots, so
+        // without this a test that pushes more buffers than that fails on
+        // `acquire()` returning None rather than on what it is testing.
+        arena.reclaim();
+        let slot = arena.acquire().expect("test arena slot");
         let handle = MemoryHandle::with_len(slot, 100);
         Buffer::new(handle, Metadata::from_sequence(seq))
     }
@@ -624,5 +628,51 @@ mod tests {
         let handle = src.handle();
         handle.set_flushing(true);
         assert!(handle.try_push_buffer(create_test_buffer(0)).is_err());
+    }
+
+    /// Many pushers against a one-slot queue, with a drain colliding with them
+    /// rather than stepping politely around. There was no coverage of
+    /// `push_buffer` under contention at all before this.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_pushers_against_one_slot_all_make_progress() {
+        const PUSHERS: u64 = 8;
+        const EACH: u64 = 100;
+
+        let mut src = AppSrc::with_max_buffers(1);
+        let handle = src.handle();
+
+        let pushers: Vec<_> = (0..PUSHERS)
+            .map(|p| {
+                let h = handle.clone();
+                tokio::spawn(async move {
+                    for i in 0..EACH {
+                        h.push_buffer(create_test_buffer(p * EACH + i)).await?;
+                    }
+                    Ok::<(), Error>(())
+                })
+            })
+            .collect();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut drained = 0u64;
+        while drained < PUSHERS * EACH {
+            match produce_buffer(&mut src).unwrap() {
+                ProduceResult::OwnBuffer(_) => drained += 1,
+                _ => tokio::task::yield_now().await,
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "drained only {drained} of {}",
+                PUSHERS * EACH
+            );
+        }
+
+        for pusher in pushers {
+            tokio::time::timeout(Duration::from_secs(5), pusher)
+                .await
+                .expect("a pusher never finished")
+                .expect("pusher task panicked")
+                .expect("push_buffer errored");
+        }
     }
 }

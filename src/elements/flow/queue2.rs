@@ -24,6 +24,7 @@
 //! let queue = Queue2::timeshift("/tmp/parallax_ts.tmp", 60 * 1024 * 1024);
 //! ```
 
+use crate::control::RateMeter;
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write as IoWrite};
@@ -320,12 +321,24 @@ pub struct Queue2 {
     ranges: Arc<RangesShared>,
 }
 
+/// At most one `MessageKind::Buffering` per this interval.
+const RATE_POST_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Byte rates in and out, plus the cadence bus messages ride on.
+///
+/// The smoothing is `control::RateMeter` (#257), the one definition of a rate
+/// in this tree — lock-free, and decaying to zero when the flow stops, which
+/// the hand-rolled EWMA here did not do: it held its last value forever, so a
+/// stalled download kept reporting the throughput it used to have.
+///
+/// `last_post` stays separate because the old 500 ms gate did two jobs at
+/// once. It was the smoothing window *and* the throttle on
+/// `MessageKind::Buffering`. `RateMeter` rolls internally and does not say
+/// when, so the throttle needs its own clock.
 struct RateState {
-    last_time: Instant,
-    last_bytes_in: u64,
-    last_bytes_out: u64,
-    avg_in_rate: f64,
-    avg_out_rate: f64,
+    last_post: Instant,
+    bytes_in: RateMeter,
+    bytes_out: RateMeter,
 }
 
 impl Queue2 {
@@ -397,11 +410,9 @@ impl Queue2 {
             buffers_in: 0,
             buffers_out: 0,
             rate_state: RateState {
-                last_time: Instant::now(),
-                last_bytes_in: 0,
-                last_bytes_out: 0,
-                avg_in_rate: 0.0,
-                avg_out_rate: 0.0,
+                last_post: Instant::now(),
+                bytes_in: RateMeter::new(),
+                bytes_out: RateMeter::new(),
             },
             bus: None,
             file: None,
@@ -433,8 +444,8 @@ impl Queue2 {
             is_buffering: self.is_buffering,
             bytes_in: self.bytes_in,
             bytes_out: self.bytes_out,
-            avg_in_rate: self.rate_state.avg_in_rate,
-            avg_out_rate: self.rate_state.avg_out_rate,
+            avg_in_rate: self.avg_in_rate(),
+            avg_out_rate: self.avg_out_rate(),
             current_size: self.current_bytes,
             buffers_in: self.buffers_in,
             buffers_out: self.buffers_out,
@@ -465,6 +476,7 @@ impl Queue2 {
         self.ring.push_back(buffer);
         self.current_bytes += buf_len;
         self.bytes_in += buf_len as u64;
+        self.rate_state.bytes_in.add(buf_len as u64);
         self.buffers_in += 1;
 
         // Enforce max size by dropping oldest
@@ -475,7 +487,7 @@ impl Queue2 {
         }
 
         self.percent = self.calculate_stream_percent();
-        self.update_rate_estimates();
+        self.ready_to_post();
 
         if self.is_buffering {
             if self.percent >= self.config.high_percent {
@@ -499,6 +511,7 @@ impl Queue2 {
         let buf = self.ring.pop_front()?;
         self.current_bytes = self.current_bytes.saturating_sub(buf.len());
         self.bytes_out += buf.len() as u64;
+        self.rate_state.bytes_out.add(buf.len() as u64);
         self.buffers_out += 1;
         // Ring fill is only what `percent` means in stream/live mode;
         // download mode's percent is downloaded-bytes-of-total and must not
@@ -559,6 +572,7 @@ impl Queue2 {
         self.file_write_pos = end;
         self.stream_pos = end;
         self.bytes_in += len;
+        self.rate_state.bytes_in.add(len);
         self.buffers_in += 1;
 
         {
@@ -596,7 +610,7 @@ impl Queue2 {
             self.ring.push_back(buf);
         }
 
-        if self.update_rate_estimates() {
+        if self.ready_to_post() {
             self.post_download_progress();
         }
         self.post_buffering(self.percent);
@@ -651,6 +665,7 @@ impl Queue2 {
 
         self.file_write_pos += len;
         self.bytes_in += len;
+        self.rate_state.bytes_in.add(len);
         self.buffers_in += 1;
 
         // Also keep in memory ring for immediate forwarding
@@ -664,15 +679,16 @@ impl Queue2 {
             }
         }
 
-        self.update_rate_estimates();
+        self.ready_to_post();
         Ok(BufferingAction::Forward)
     }
 
     /// Get the available rewind duration in timeshift mode.
     pub fn available_rewind(&self) -> Duration {
         let available_bytes = self.file_write_pos.min(self.config.max_size_bytes as u64);
-        if self.rate_state.avg_in_rate > 0.0 {
-            Duration::from_secs_f64(available_bytes as f64 / self.rate_state.avg_in_rate)
+        let in_rate = self.avg_in_rate();
+        if in_rate > 0.0 {
+            Duration::from_secs_f64(available_bytes as f64 / in_rate)
         } else {
             Duration::ZERO
         }
@@ -682,33 +698,30 @@ impl Queue2 {
     // Rate Estimation
     // ========================================================================
 
-    /// Returns `true` when the 500 ms window elapsed and the estimates were
-    /// refreshed — the cadence throttled bus traffic rides on.
-    fn update_rate_estimates(&mut self) -> bool {
+    /// Whether 500 ms have passed since the last bus message — the cadence
+    /// throttled bus traffic rides on.
+    ///
+    /// The rates themselves are maintained by the `RateMeter`s as bytes move,
+    /// so this no longer computes anything; it only decides whether it is time
+    /// to say something. Kept as a call rather than folded into the callers so
+    /// the "at most one message per 500 ms" rule stays in one place.
+    fn ready_to_post(&mut self) -> bool {
         let now = Instant::now();
-        let elapsed = now.duration_since(self.rate_state.last_time).as_secs_f64();
-
-        // Update every 500ms
-        if elapsed < 0.5 {
+        if now.duration_since(self.rate_state.last_post) < RATE_POST_INTERVAL {
             return false;
         }
-
-        let bytes_in_delta = self.bytes_in - self.rate_state.last_bytes_in;
-        let bytes_out_delta = self.bytes_out - self.rate_state.last_bytes_out;
-
-        let in_rate = bytes_in_delta as f64 / elapsed;
-        let out_rate = bytes_out_delta as f64 / elapsed;
-
-        // Exponential moving average (alpha=0.3)
-        const ALPHA: f64 = 0.3;
-        self.rate_state.avg_in_rate = ALPHA * in_rate + (1.0 - ALPHA) * self.rate_state.avg_in_rate;
-        self.rate_state.avg_out_rate =
-            ALPHA * out_rate + (1.0 - ALPHA) * self.rate_state.avg_out_rate;
-
-        self.rate_state.last_time = now;
-        self.rate_state.last_bytes_in = self.bytes_in;
-        self.rate_state.last_bytes_out = self.bytes_out;
+        self.rate_state.last_post = now;
         true
+    }
+
+    /// Bytes per second arriving, smoothed.
+    fn avg_in_rate(&self) -> f64 {
+        self.rate_state.bytes_in.per_second()
+    }
+
+    /// Bytes per second leaving, smoothed.
+    fn avg_out_rate(&self) -> f64 {
+        self.rate_state.bytes_out.per_second()
     }
 
     // ========================================================================
@@ -717,9 +730,10 @@ impl Queue2 {
 
     fn post_buffering(&self, percent: u32) {
         if let Some(ref bus) = self.bus {
-            let estimated_total = if self.rate_state.avg_in_rate > 0.0 && percent < 100 {
+            let in_rate = self.avg_in_rate();
+            let estimated_total = if in_rate > 0.0 && percent < 100 {
                 let remaining_bytes = self.config.max_size_bytes as f64 - self.current_bytes as f64;
-                let eta_secs = remaining_bytes / self.rate_state.avg_in_rate;
+                let eta_secs = remaining_bytes / in_rate;
                 if eta_secs > 0.0 && eta_secs < 3600.0 {
                     Some(crate::clock::ClockTime::from_nanos(
                         (eta_secs * 1_000_000_000.0) as u64,
@@ -734,8 +748,8 @@ impl Queue2 {
             bus.post(MessageKind::Buffering {
                 percent,
                 mode: self.config.mode,
-                avg_in_rate: Some(self.rate_state.avg_in_rate as u64),
-                avg_out_rate: Some(self.rate_state.avg_out_rate as u64),
+                avg_in_rate: Some(in_rate as u64),
+                avg_out_rate: Some(self.avg_out_rate() as u64),
                 estimated_total,
             });
         }
@@ -1281,5 +1295,42 @@ mod tests {
                 msg.kind
             );
         }
+    }
+
+    /// #257: the rates are actually fed, and they decay.
+    ///
+    /// Nothing asserted on `avg_in_rate` before, so wiring the meters to
+    /// nothing would have passed every test in the tree. It also pins the
+    /// behaviour change the `RateMeter` conversion brought: the old
+    /// hand-rolled EWMA held its last value forever, so a stalled download
+    /// kept reporting the throughput it used to have.
+    #[test]
+    fn the_byte_rates_are_fed_and_fall_away_when_the_flow_stops() {
+        let mut q = Queue2::stream(4096);
+
+        assert_eq!(q.stats().avg_in_rate, 0.0, "nothing has arrived yet");
+
+        for seq in 0..8 {
+            let _ = q.process_stream_push(make_buffer(256, seq));
+        }
+        assert_eq!(q.bytes_in, 8 * 256, "the counter is exact");
+        let flowing = q.stats().avg_in_rate;
+        assert!(
+            flowing > 0.0,
+            "bytes arrived, so the in-rate must be positive"
+        );
+
+        // Nothing more arrives. The counter must not move and the rate must.
+        // 1.2 s is a bit under two time constants (RATE_TIME_CONSTANT is
+        // 0.72 s), so a halving is a comfortable margin — and the old
+        // hand-rolled EWMA would have reported `flowing` unchanged here,
+        // forever, which is the behaviour this pins.
+        std::thread::sleep(Duration::from_millis(1200));
+        let stalled = q.stats().avg_in_rate;
+        assert_eq!(q.bytes_in, 8 * 256, "the counter does not decay");
+        assert!(
+            stalled < flowing / 2.0,
+            "a stalled flow must read as stalled: {flowing:.0} -> {stalled:.0} B/s"
+        );
     }
 }
