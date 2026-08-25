@@ -624,27 +624,39 @@ async fn a_stalled_consumer_bounds_memory_instead_of_growing_it() {
         .expect("media sink");
     settle().await;
 
-    // Publish far more than the queue holds, and never pull.
-    for i in 0..200u8 {
-        let mut meta = Metadata::new();
-        meta.flags |= BufferFlags::SYNC_POINT;
-        sink.consume(&ConsumeContext::new(&buffer(&delta_au(i), meta)))
-            .await
-            .expect("publish");
-    }
-
-    // Give the callback time to drain the transport into the bounded queue.
-    for _ in 0..40 {
-        if stats.dropped_queue() > 0 {
-            break;
+    // Publish far more than the queue holds, and never pull — and keep
+    // publishing until the queue visibly evicts.
+    //
+    // The retry is what makes this test honest rather than lucky. Declaring a
+    // subscriber and publishing are not ordered (see `settle`), and a sample
+    // sent before the declaration propagates is simply gone — so under CPU
+    // contention a single fixed-size burst can arrive *entirely* in that
+    // window, leaving `samples_received == 0` and a failure that says nothing
+    // about the bound under test. Republishing lets a slow handshake catch up.
+    // The first burst is enough in the normal case, and the loop exits in a
+    // few milliseconds.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut published = 0u32;
+    while stats.dropped_queue() == 0 && std::time::Instant::now() < deadline {
+        for i in 0..64u8 {
+            let mut meta = Metadata::new();
+            meta.flags |= BufferFlags::SYNC_POINT;
+            sink.consume(&ConsumeContext::new(&buffer(&delta_au(i), meta)))
+                .await
+                .expect("publish");
+            published += 1;
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        // Let the subscriber's callback run before deciding to publish more.
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
     assert!(
         stats.dropped_queue() > 0,
-        "a stalled consumer must evict, not accumulate (dropped_queue = {})",
-        stats.dropped_queue()
+        "a stalled consumer must evict, not accumulate \
+         (published {published}, dropped_queue = {}, samples_received = {} — if \
+          the last is 0 the subscription never matched, not the queue unbounded)",
+        stats.dropped_queue(),
+        stats.samples_received()
     );
     // And the eviction is attributed correctly, not lumped in elsewhere.
     assert_eq!(stats.dropped_no_slot(), 0, "no arena slot was ever refused");

@@ -201,6 +201,18 @@ the plugin ABI does not use either — so no ABI bump. `register` is unchanged;
   the feature appears only in that recipe, which no workflow mirrors. It is also
   the only recipe that covers `vpx`, so the gap hid a second thing.
 
+- **`a_stalled_consumer_bounds_memory_instead_of_growing_it` was flaky, and had
+  turned CI red on master.** It published one fixed burst 300 ms after
+  declaring the subscriber, then gave the callback one second to show an
+  eviction. Under CPU contention the subscription had not propagated yet, so
+  the whole burst went into the unmatched window and vanished — `@media` is
+  best-effort and drop-by-contract — leaving `samples_received == 0` and a
+  failure that said nothing about the bound under test. It now republishes
+  until the queue visibly evicts, and its assertion prints
+  `samples_received` so a future failure distinguishes a lost handshake from a
+  real regression. Verified at 10/10 under 24 spinning threads on a 6-core
+  box, still finishing in under a second.
+
 - **Two `ZenohSinkHandle` counters had no writer at all** (#246).
   `keyframes_sent` and `publish_errors` were declared, exposed on the handle and
   never incremented by anything; `tests/zenoh_media.rs` asserted
