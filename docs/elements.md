@@ -87,7 +87,7 @@ Feature-gated:
 | `zenohsrc` | `zenoh` | `key` (req), `profile` = parallax\|media, `resync-on-discont`, `timeout-ms` (heartbeat, keeps the stream open), `stream-timeout-ms` (ends it), `on-publisher-loss` = wait\|eos |
 | `zenohsink` | `zenoh` | `key` (req), `profile` = parallax\|media, `congestion` = block\|drop, `priority`, `express` |
 
-`profile=media` selects the `@media` plane: the codec comes from the key expression (so caps are known before the first sample), the attachment is a CBOR `FrameMeta`, the QoS profile is fixed, and wildcards are refused. Both zenoh elements share one process-wide session, opened on first use and configurable with `PARALLAX_ZENOH_CONFIG`.
+`profile=media` selects the `@media` plane: the codec comes from the key expression (so caps are known before the first sample), the attachment is a CBOR `FrameMeta`, the QoS profile is fixed, and wildcards are refused. Both zenoh elements share one process-wide session, opened on first use and configurable with `PARALLAX_ZENOH_CONFIG`. Every session parallax opens enables zenoh **session timestamping** (#245) — the `@media` plane's `FrameMeta` carries no wallclock, so the HLC stamp on the sample is a consumer's only clock for frame age. An operator's config file wins, and gets one warning if it turns timestamping off.
 
 Not registered (use the programmatic API): mux/demux elements (the linear grammar cannot name pads), closure-taking transforms, `AppSrc`/`AppSink`, v4l2-m2m and Vulkan hardware codecs.
 

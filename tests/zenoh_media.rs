@@ -61,17 +61,21 @@ fn unique_key(tag: &str) -> String {
     )
 }
 
-/// A listening session and a session connected to it.
+/// A listening session and a session connected to it, from two given configs.
 ///
-/// Both have multicast *and* gossip scouting disabled, so they find each other
-/// only through the endpoint we hand them and nothing else on the machine.
-async fn session_pair() -> (zenoh::Session, zenoh::Session) {
+/// Both get multicast *and* gossip scouting disabled and a unique unix-socket
+/// endpoint, so they find each other only through what we hand them and
+/// nothing else on the machine.
+async fn session_pair_from(
+    publisher: zenoh::Config,
+    subscriber: zenoh::Config,
+) -> (zenoh::Session, zenoh::Session) {
     let (endpoint, path) = unique_endpoint();
     // The socket file outlives the sessions; clean it up rather than
     // littering TMPDIR across a test run.
     let _ = std::fs::remove_file(&path);
 
-    let mut listen = zenoh::Config::default();
+    let mut listen = publisher;
     listen
         .insert_json5("scouting/multicast/enabled", "false")
         .unwrap();
@@ -83,7 +87,7 @@ async fn session_pair() -> (zenoh::Session, zenoh::Session) {
         .unwrap();
     let publisher = zenoh::open(listen).await.expect("open listening session");
 
-    let mut connect = zenoh::Config::default();
+    let mut connect = subscriber;
     connect
         .insert_json5("scouting/multicast/enabled", "false")
         .unwrap();
@@ -98,6 +102,27 @@ async fn session_pair() -> (zenoh::Session, zenoh::Session) {
     // Let the transport come up before anyone publishes.
     tokio::time::sleep(Duration::from_millis(300)).await;
     (publisher, subscriber)
+}
+
+/// The pair every test in this file runs on.
+///
+/// The publisher runs **the shipped config** — `session_config()`, timestamping
+/// on (#245) — so these tests exercise what actually ships rather than a
+/// hand-rolled default.
+///
+/// The subscriber is deliberately left on zenoh's own default, which for a peer
+/// means timestamping **off**. Do not "fix" that: a session with timestamping on
+/// stamps unstamped *incoming* samples with its own HLC before delivering them
+/// (`treat_timestamp!` in zenoh's `route_data`), so with both ends on,
+/// `sample.timestamp().is_some()` would pass against a publisher that stamps
+/// nothing. Off, any timestamp seen in this file provably came from the
+/// publisher.
+async fn session_pair() -> (zenoh::Session, zenoh::Session) {
+    session_pair_from(
+        parallax::elements::network::session_config().expect("parallax session config"),
+        zenoh::Config::default(),
+    )
+    .await
 }
 
 /// Wait for a freshly declared subscription to reach the other session.
@@ -896,4 +921,119 @@ async fn an_at_media_heartbeat_never_produces_a_frame() {
             "@media must never emit a zero-length frame, got {result:?}"
         );
     }
+}
+
+// ------------------------------------------------------------------- #245
+
+/// Wait for one sample on a raw subscriber, or fail loudly.
+async fn next_sample(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<zenoh::sample::Sample>,
+) -> zenoh::sample::Sample {
+    tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("a sample within 5 s")
+        .expect("the raw subscriber is still alive")
+}
+
+/// The acceptance criterion for #245.
+///
+/// `FrameMeta` carries no wallclock, so the zenoh HLC stamp on the sample is
+/// the only clock a consumer has for frame age. A peer session leaves
+/// timestamping off by default, which used to make every `@media` sample
+/// parallax published unstamped.
+///
+/// The subscriber session here has timestamping off (see `session_pair`), so a
+/// timestamp on the received sample can only have come from the publisher.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_media_sample_carries_a_zenoh_timestamp_across_two_sessions() {
+    let (pub_session, sub_session) = session_pair().await;
+    let key = unique_key("video/h264/high");
+
+    let (raw_tx, mut raw_rx) = tokio::sync::mpsc::unbounded_channel();
+    let _raw_sub = sub_session
+        .declare_subscriber(&key)
+        .callback(move |sample| {
+            let _ = raw_tx.send(sample);
+        })
+        .await
+        .expect("raw subscriber");
+
+    let mut sink = ZenohSink::media_with_session(pub_session, &key)
+        .await
+        .expect("media sink");
+    settle().await;
+
+    let mut meta = Metadata::new();
+    meta.flags |= BufferFlags::SYNC_POINT;
+    sink.consume(&ConsumeContext::new(&buffer(&keyframe_au(), meta)))
+        .await
+        .expect("publish keyframe");
+
+    let sample = next_sample(&mut raw_rx).await;
+    assert!(
+        sample.timestamp().is_some(),
+        "the @media plane's only clock is the HLC stamp on the sample"
+    );
+}
+
+/// An operator's config wins, and the plane still carries frames without it.
+///
+/// The sharper half is `timestamp().is_none()`: it proves parallax honoured the
+/// file rather than quietly overriding it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_config_with_timestamping_off_still_carries_frames() {
+    use std::io::Write;
+
+    let mut file = tempfile::Builder::new()
+        .suffix(".json5")
+        .tempfile()
+        .expect("temp config");
+    file.write_all(br#"{ timestamping: { enabled: false } }"#)
+        .expect("write config");
+    file.flush().expect("flush config");
+
+    let publisher_config = zenoh::Config::from_file(file.path()).expect("load operator config");
+    let (pub_session, sub_session) =
+        session_pair_from(publisher_config, zenoh::Config::default()).await;
+    let key = unique_key("video/h264/high");
+
+    let (raw_tx, mut raw_rx) = tokio::sync::mpsc::unbounded_channel();
+    let _raw_sub = sub_session
+        .declare_subscriber(&key)
+        .callback(move |sample| {
+            let _ = raw_tx.send(sample);
+        })
+        .await
+        .expect("raw subscriber");
+
+    let mut sink = ZenohSink::media_with_session(pub_session, &key)
+        .await
+        .expect("media sink");
+    settle().await;
+
+    let au = keyframe_au();
+    let mut meta = Metadata::new();
+    meta.flags |= BufferFlags::SYNC_POINT;
+    sink.consume(&ConsumeContext::new(&buffer(&au, meta)))
+        .await
+        .expect("publish keyframe");
+
+    let sample = next_sample(&mut raw_rx).await;
+    assert_eq!(
+        sample.payload().to_bytes().as_ref(),
+        au.as_slice(),
+        "the frame still crosses intact"
+    );
+    let frame = FrameMeta::from_cbor(
+        &sample
+            .attachment()
+            .expect("FrameMeta attachment")
+            .to_bytes(),
+    )
+    .expect("decodable FrameMeta");
+    assert!(frame.keyframe, "and its metadata is intact too");
+    assert!(
+        sample.timestamp().is_none(),
+        "the operator said no; parallax must not override them"
+    );
 }

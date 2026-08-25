@@ -150,6 +150,21 @@ What parallax guarantees on it:
 - **The `frame` QoS profile**: best-effort, drop, interactive-high, express. A
   plain declared publisher, never an `AdvancedPublisher` — recovering a
   superseded frame is anti-useful.
+- **Session timestamping is on** (#245). `FrameMeta` carries no wallclock on
+  purpose, so the zenoh HLC stamp on the sample is the only clock a consumer has
+  for frame age or end-to-end latency. zenoh's own default is
+  `{router: true, peer: false, client: false}` and parallax opens as a peer, so
+  it turns timestamping on explicitly in every session it opens
+  (`network::session_config`). This is not a measurement nicety: a receiving
+  session that *has* timestamping on stamps an **unstamped** incoming sample
+  with its own clock before delivering it, so a publisher that leaves it off
+  does not produce missing timestamps downstream — it produces plausible, wrong
+  ones that read as zero frame age. An operator's `PARALLAX_ZENOH_CONFIG` still
+  wins; parallax warns once if that file turns timestamping off, and fills the
+  value in only when the file says nothing about it. Keep host clocks inside
+  `uhlc`'s 500 ms max delta (`UHLC_MAX_DELTA_MS`), or the receiver logs an error
+  per sample and replaces the publisher's timestamp with its own — the same
+  corruption by a different route.
 - **The keyframe flag is a byte-level promise.** The publisher runs a
   `ParamSetCache` (`src/codec/annexb.rs`), repairs a keyframe that arrived
   without its parameter sets, and then decides the flag by reading the bytes it
