@@ -271,7 +271,7 @@ impl AudioEncoder for OpusEncoder {
         self.buffer
             .extend(std::iter::repeat_n(0i16, padding_needed));
 
-        let frame: Vec<i16> = self.buffer.drain(..).collect();
+        let frame = std::mem::take(&mut self.buffer);
         Ok(vec![self.encode_frame(&frame)?])
     }
 

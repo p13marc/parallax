@@ -192,6 +192,8 @@ pub use decoder::Dav1dDecoder;
 #[cfg(feature = "vpx")]
 mod vpx;
 #[cfg(feature = "vpx")]
+mod vpx_pool;
+#[cfg(feature = "vpx")]
 pub use vpx::{VpxCodec, VpxDecoder};
 
 #[cfg(feature = "av1-encode")]
