@@ -64,6 +64,17 @@ pub struct VpxDecoder {
     ctx: ffi::vpx_codec_ctx_t,
     codec: VpxCodec,
     output: OutputArena,
+    /// Caller-supplied frame buffers, when the link negotiated External
+    /// (#198). `None` on VP8, which libvpx cannot do this for, and on any
+    /// link that asked for CPU memory.
+    pool: Option<std::sync::Arc<super::vpx_pool::VpxFramePool>>,
+    /// What the downstream link negotiated; `None` before `prepare()`.
+    negotiated: Option<crate::memory::MemoryType>,
+    /// Whether `vpx_codec_set_frame_buffer_functions` has been attempted.
+    /// It must be called before the first decode, and only once.
+    frame_buffers_installed: bool,
+    /// Rate-limits the fall-back-to-copy warning to one per decoder.
+    warned_external_fallback: bool,
     last_dims: Option<(u32, u32)>,
     /// Input timings awaiting their decoded frame (FIFO — no reordering).
     pending: VecDeque<Metadata>,
@@ -123,6 +134,10 @@ impl VpxDecoder {
             codec,
             output: OutputArena::new(defaults::VIDEO_DECODER_SLOT_COUNT)
                 .with_min_slot_size(4 * 1024 * 1024),
+            pool: None,
+            negotiated: None,
+            frame_buffers_installed: false,
+            warned_external_fallback: false,
             last_dims: None,
             pending: VecDeque::new(),
             frames_out: 0,
@@ -147,6 +162,16 @@ impl VpxDecoder {
         self.bytes_decoded
     }
 
+    /// How many frame buffers this decoder has handed libvpx (#198), or `None`
+    /// when it is decoding into the arena instead.
+    ///
+    /// The one number that says whether the zero-copy path is behaving: libvpx
+    /// needs about sixteen for its own references, and anything far above that
+    /// means the pipeline is holding frames longer than its budget allowed.
+    pub fn pooled_frame_buffers(&self) -> Option<usize> {
+        self.pool.as_ref().map(|p| p.len())
+    }
+
     fn codec_error(&self, what: &str) -> Error {
         // SAFETY: ctx is initialized; vpx_codec_error returns a static or
         // context-owned NUL-terminated string.
@@ -159,6 +184,139 @@ impl VpxDecoder {
             }
         };
         Error::Config(format!("libvpx {}: {what}: {detail}", self.codec))
+    }
+
+    /// Hand libvpx our own frame buffers, once, before the first decode.
+    ///
+    /// Only when the link negotiated [`MemoryType::External`] — supplying
+    /// buffers costs a pool of at least sixteen full frames, which is pure
+    /// overhead if the output is going to be copied into an arena slot anyway.
+    ///
+    /// VP8 is skipped without trying: `vpx_decoder.h` says the API "currently
+    /// only works with VP9", and a VP8 context answers `VPX_CODEC_INCAPABLE`.
+    /// A refusal from any other cause is not fatal either — the decoder simply
+    /// keeps the packed copy path, which is always legal on this link because
+    /// `external_preferred()` consumers also accept CPU memory.
+    fn install_frame_buffers(&mut self) {
+        if self.frame_buffers_installed {
+            return;
+        }
+        self.frame_buffers_installed = true;
+
+        if self.codec != VpxCodec::Vp9
+            || self.negotiated != Some(crate::memory::MemoryType::External)
+        {
+            return;
+        }
+
+        let pool = super::vpx_pool::VpxFramePool::new();
+        // SAFETY: `cb_priv` must outlive the codec context. It does: the pool
+        // is a field of this struct, and `Drop for VpxDecoder` destroys the
+        // context before any field is dropped.
+        let err = unsafe {
+            ffi::vpx_codec_set_frame_buffer_functions(
+                &mut self.ctx,
+                Some(super::vpx_pool::get_frame_buffer),
+                Some(super::vpx_pool::release_frame_buffer),
+                std::sync::Arc::as_ptr(&pool) as *mut std::ffi::c_void,
+            )
+        };
+        if err != ffi::vpx_codec_err_t::VPX_CODEC_OK {
+            tracing::debug!(
+                "vpxdecoder: libvpx refused caller-supplied frame buffers ({err:?}); \
+                 decoding into the arena instead"
+            );
+            return;
+        }
+        self.pool = Some(pool);
+        tracing::debug!("vpxdecoder: decoding into caller-supplied frame buffers (#198)");
+    }
+
+    /// Emit a decoded frame without copying it (#198).
+    ///
+    /// The frame already lives in one of our pooled buffers, so the `Buffer`
+    /// wraps that allocation directly and declares libvpx's real strides. The
+    /// `PipelineHold` owner is what keeps the memory alive and what tells the
+    /// pool the frame is off screen.
+    ///
+    /// `Ok(None)` whenever the planes do not sit inside the buffer the way
+    /// [`PlaneLayout`](crate::format::PlaneLayout) requires — every plane
+    /// addressable for its whole `stride * rows`, per #196 — and the caller
+    /// falls back to the packed copy.
+    fn image_to_external(
+        &mut self,
+        img: &ffi::vpx_image_t,
+        source: Metadata,
+    ) -> Result<Option<Buffer>> {
+        let Some(pool) = self.pool.clone() else {
+            return Ok(None);
+        };
+        if img.fb_priv.is_null() {
+            return Ok(None);
+        }
+        let Some(owner) = pool.find(img.fb_priv) else {
+            return Ok(None);
+        };
+
+        let (base, span) = owner.span();
+        let (w, h) = (img.d_w as usize, img.d_h as usize);
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+
+        let mut descs = Vec::with_capacity(3);
+        for (plane, rows, row_bytes) in [(0usize, h, w), (1, ch, cw), (2, ch, cw)] {
+            let ptr = img.planes[plane];
+            let stride = img.stride[plane] as usize;
+            if ptr.is_null() || stride < row_bytes {
+                return Ok(None);
+            }
+            // The plane must start inside the buffer...
+            if (ptr as usize) < base as usize {
+                return Ok(None);
+            }
+            let offset = ptr as usize - base as usize;
+            // ...and be addressable for its whole stride * rows. libvpx's
+            // frame buffers carry a border below the last row, so this
+            // normally holds with room to spare — but it is the invariant the
+            // SIMD colorspace backend walks planes on, so check rather than
+            // assume.
+            if offset + stride.saturating_mul(rows) > span {
+                return Ok(None);
+            }
+            descs.push(crate::format::PlaneDesc { offset, stride });
+        }
+
+        let dims = (w as u32, h as u32);
+        if self.last_dims.is_some_and(|last| last != dims) {
+            self.output.reset();
+        }
+        self.last_dims = Some(dims);
+
+        let hold = pool.claim_for_pipeline(img.fb_priv).ok_or_else(|| {
+            Error::Config("vpxdecoder: frame buffer vanished from the pool".into())
+        })?;
+
+        // SAFETY: `base..base + span` is the pooled allocation. `hold` keeps it
+        // alive, and the pool will not hand it back to libvpx until `hold`
+        // drops, so nothing writes to it while this buffer lives. External
+        // buffers are never written by the pipeline.
+        let slot =
+            unsafe { crate::memory::ExternalSlot::new(base, span, hold, "vpx-frame-buffer") };
+
+        self.frame_count += 1;
+        let mut metadata = source;
+        metadata.sequence = self.frames_out;
+        self.frames_out += 1;
+        metadata.set_video_planes(
+            dims.0,
+            dims.1,
+            crate::format::PixelFormat::I420,
+            crate::format::PlaneLayout::from_planes(&descs),
+        );
+
+        Ok(Some(Buffer::new(
+            MemoryHandle::from_external(std::sync::Arc::new(slot)),
+            metadata,
+        )))
     }
 
     /// Copy a decoded image into a packed I420 output buffer.
@@ -224,6 +382,38 @@ impl Element for VpxDecoder {
         self.output.set_budget(budget);
     }
 
+    fn set_negotiated_memory(&mut self, memory: crate::memory::MemoryType) {
+        self.negotiated = Some(memory);
+    }
+
+    fn output_media_caps(&self) -> crate::format::ElementMediaCaps {
+        use crate::format::{
+            CapsValue, ElementMediaCaps, FormatCaps, FormatMemoryCap, MemoryCaps, MemoryLayout,
+            VideoFormatCaps,
+        };
+        // #198: VP9 can decode straight into buffers we supply, so an opted-in
+        // consumer takes the frame zero-copy and everyone else gets the packed
+        // Cpu copy the solver downgrades to. VP8 cannot — libvpx's
+        // caller-supplied frame buffers are VP9-only — so it says so rather
+        // than advertising a capability it would silently fall back from.
+        let memory = match self.codec {
+            VpxCodec::Vp9 => MemoryCaps::external_preferred(),
+            VpxCodec::Vp8 => MemoryCaps::cpu_only(),
+        };
+        ElementMediaCaps::new([FormatMemoryCap::new(
+            FormatCaps::VideoRaw(VideoFormatCaps {
+                width: CapsValue::Any,
+                height: CapsValue::Any,
+                // libvpx is asked for nothing else here; `image_to_buffer`
+                // errors on any other `vpx_img_fmt`.
+                pixel_format: CapsValue::Fixed(crate::format::PixelFormat::I420),
+                framerate: CapsValue::Any,
+                layout: MemoryLayout::NONE,
+            }),
+            memory,
+        )])
+    }
+
     // Decoders never skip an input (it may be a reference frame); on arena
     // exhaustion the *output copy* fails after libvpx already consumed the
     // data, and the executor sheds that single frame.
@@ -232,6 +422,8 @@ impl Element for VpxDecoder {
             self.pending.pop_front();
         }
         self.pending.push_back(buffer.metadata().clone());
+
+        self.install_frame_buffers();
 
         let data = buffer.as_bytes();
         self.bytes_decoded += data.len() as u64;
@@ -261,10 +453,24 @@ impl Element for VpxDecoder {
                 break;
             }
             let source = self.pending.pop_front().unwrap_or_default();
-            self.frame_count += 1;
-            // SAFETY: img points at a decoder-owned image, valid until the
-            // next decode call on this context.
-            out = Some(self.image_to_buffer(unsafe { &*img }, source)?);
+            // SAFETY: img points at an image valid until the next decode call
+            // on this context (or, with caller-supplied buffers, until libvpx
+            // releases the frame buffer — which it cannot do before then).
+            let img = unsafe { &*img };
+            out = match self.image_to_external(img, source.clone())? {
+                Some(buffer) => Some(buffer),
+                None => {
+                    if self.pool.is_some() && !self.warned_external_fallback {
+                        self.warned_external_fallback = true;
+                        tracing::warn!(
+                            "vpxdecoder: decoded frame's planes do not satisfy the \
+                             stride*rows layout contract; copying into the arena instead"
+                        );
+                    }
+                    self.frame_count += 1;
+                    Some(self.image_to_buffer(img, source)?)
+                }
+            };
         }
         // ACCURATE clipping (#165): decoded, but out-of-segment.
         if let Some(b) = &out

@@ -78,6 +78,43 @@ the plugin ABI does not use either — so no ABI bump. `register` is unchanged;
 
 ### Added
 
+- **VP9 decodes into buffers parallax supplies** (#198). With
+  `MemoryType::External` negotiated, `VpxDecoder` hands libvpx its own frame
+  buffers through `vpx_codec_set_frame_buffer_functions` and emits the decoded
+  frame in an `ExternalSlot` with libvpx's real strides — no plane copy at all,
+  the shape `Dav1dDecoder` already used for its pictures. **VP9 only**: libvpx's
+  header says the API "currently only works with VP9", so VP8 declares
+  `cpu_only()` caps rather than advertising a capability it would silently fall
+  back from on every frame. The pool's load-bearing rule is that a buffer has
+  **two** independent holders — libvpx's release callback and the pipeline's
+  last `Buffer` — and returns to the free list only when both are done; handing
+  it back early would let the decoder draw the next frame over one still on
+  screen. A frame whose planes do not satisfy `PlaneLayout::full_span_len`
+  falls back to the packed copy with a warn-once, which is always legal because
+  `external_preferred()` consumers also accept CPU memory.
+  `VpxDecoder::pooled_frame_buffers()` reports the pool size.
+
+- **Rates beside the counters, and an encode-latency distribution** (#246).
+  Every control handle reported monotonic counters and not one rate, so every
+  consumer wrote its own sampling loop with its own window — three
+  implementations of one EWMA are three chances to disagree about what "encoded
+  fps" means. `control::RateMeter` is now that one definition: a counter that
+  also knows its own rate, folded over a stated `RATE_WINDOW` of 500 ms with a
+  `RATE_TIME_CONSTANT` of 0.72 s, lock-free and allocation-free, and free on the
+  hot path because the encoders already read the clock to time themselves.
+  `EncoderStatsHandle` gains `frames_encoded_per_second`, `bits_per_second`
+  (the same units as `EncoderControl::set_bitrate`, so the reading and the knob
+  are directly comparable) and `rc_drops_per_second`; `ZenohSinkHandle` gains
+  `samples_per_second` and `bits_per_second`. The counters are unchanged — a
+  rate is what a human reads, a counter is what you difference and export.
+  A stopped stream decays toward zero rather than freezing at its last value.
+  `EncoderStatsHandle::encode_latency()` returns an `EncodeLatency`: p50/p95/p99
+  plus min/max from a 768-byte lock-free histogram, four sub-buckets per octave
+  so a percentile is located within 19% rather than within a factor of two.
+  `last_encode_ns` stays — one sample cannot show a tail, and a tail is what
+  causes a dropped frame. `docs/elements.md` § "Runtime control" has one table
+  saying which figure is a counter, which is a rate, and over what window.
+
 - **`rtspsrc`, `zenohsrc` and `zenohsink` from a pipeline string** (#222).
   `Pipeline::parse_async` / `parse_with_factory_async` await constructors that
   perform real I/O; `Pipeline::parse` stays and, on such an element, points at
@@ -150,6 +187,34 @@ the plugin ABI does not use either — so no ABI bump. `register` is unchanged;
   attachment agree.
 
 ### Fixed
+
+- **`just check-media-full` was red on master** and had been since the 1.98
+  toolchain pin. `f2625b1` swept clippy's new `drain_collect` out of the AAC
+  encoder but missed its twin in the Opus one, because no CI job builds `opus` —
+  the feature appears only in that recipe, which no workflow mirrors. It is also
+  the only recipe that covers `vpx`, so the gap hid a second thing.
+
+- **Two `ZenohSinkHandle` counters had no writer at all** (#246).
+  `keyframes_sent` and `publish_errors` were declared, exposed on the handle and
+  never incremented by anything; `tests/zenoh_media.rs` asserted
+  `publish_errors() == 0` and passed vacuously. Both are wired now. Note what
+  `publish_errors` does and does not mean: a failed publish is fatal to the sink
+  task, so it is bounded by one, and it is **not** a congestion signal — under
+  `CongestionControl::Drop`, which the `@media` profile pins, a congested link
+  drops the sample and returns success, and zenoh offers no way to read that
+  back. That is why neither counter has a rate.
+
+- **Every `@media` sample parallax published was unstamped** (#245). zenoh
+  enables session timestamping for *routers* by default and parallax opens as a
+  peer, so its publishers ran without an HLC. `FrameMeta` carries no wallclock
+  on purpose, which makes that stamp a consumer's only clock for frame age — and
+  the failure was silent in the worst way: a receiving session with timestamping
+  on stamps unstamped incoming samples itself, so consumers read their own clock
+  as the publisher's and saw a frame age of zero. Every session parallax opens
+  now enables `timestamping/enabled` (`network::session_config`, exported beside
+  `shared_session`). An operator's `PARALLAX_ZENOH_CONFIG` still wins: a file
+  that turns timestamping off keeps it and gets one warning, while a file that
+  says nothing about it gets the default filled in.
 
 - **`ZenohSrc`'s receive queue was unbounded** (#225). A pipeline that stopped
   pulling grew memory without limit. It is now a bounded drop-oldest queue
