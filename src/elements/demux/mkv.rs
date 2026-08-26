@@ -1012,11 +1012,17 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
             };
 
             // After a seek, hold video until a keyframe so a decoder never
-            // joins mid-GOP. Audio passes through (every frame decodes).
-            // Evaluated only after the video track's own skip has cleared —
-            // a pre-target keyframe (the t=0 one, during a rewind scan) can
-            // no longer satisfy the resync while the skip is still
-            // discarding (#158).
+            // joins mid-GOP. Evaluated only after the video track's own skip
+            // has cleared — a pre-target keyframe (the t=0 one, during a
+            // rewind scan) can no longer satisfy the resync while the skip is
+            // still discarding (#158).
+            //
+            // Audio passes through (every frame decodes). It is *not* held
+            // with the video: a seek past the last keyframe legitimately
+            // emits no video at all, and holding audio for a keyframe that
+            // will never come would turn that into silence. What keeps the
+            // two branches opening together instead is the skip floor — see
+            // the forward-snap landing in `handle_upstream_event` (#265).
             if self.video_resync && is_video {
                 if !is_key {
                     discarded += 1;
@@ -1153,8 +1159,14 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
             }
         };
         // Backward snap lands exactly on a cue (skip to the cue's own time,
-        // landing knowable up front); forward keeps the requested tick as
-        // the skip floor and scans ahead to the next keyframe.
+        // landing knowable up front). Forward lands on the next cue when
+        // there is one — cues *are* video keyframes, so that is the honest
+        // landing and it can be reported up front like the backward one
+        // (#265; it used to report `None`, which made the executor synthesize
+        // the segment around the *requested* time while video started a GOP
+        // later). Without cues there is no index to resolve against and the
+        // scan has to find the keyframe, so the landing stays unknown and
+        // `video_resync` holds both tracks until it does.
         let (cue_target, skip_ticks, landing_ticks) = match snap {
             SeekSnap::Before => {
                 // `prev`, or the first cue when the target precedes it —
@@ -1165,6 +1177,14 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
                     (c.time_ticks, c.cluster_offset)
                 });
                 (Some(offset), cue_ticks, Some(cue_ticks))
+            }
+            // Forward with a cue ahead: that cue is the landing.
+            _ if next_ticks.is_some() => {
+                let landing = next_ticks.expect("checked");
+                // Still enter at the *previous* cue's cluster: the target
+                // frame's cluster may begin before it, and the per-track skip
+                // discards everything below the landing anyway.
+                (prev.map(|(_, offset)| offset), landing, Some(landing))
             }
             _ => (prev.map(|(_, offset)| offset), ticks, None),
         };
@@ -1240,10 +1260,12 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
                 // block and the resync scans past it — rare, self-correcting
                 // (video simply starts at the next keyframe).
                 Some(t) => EventResult::handled_at((t * self.timestamp_scale) as i64),
-                // Forward snap: landing unknown until produce() finds the
-                // first keyframe at or after the target — report None and
-                // let the executor fall back to the requested position for
-                // the Segment (#162).
+                // Forward snap on a cue-less file: the landing is unknown
+                // until produce() finds the first keyframe at or after the
+                // target — report None and let the executor fall back to the
+                // requested position for the Segment (#162). `video_resync`
+                // then holds *both* tracks to that keyframe, so the branches
+                // still open together (#265).
                 None => EventResult::handled(),
             }
         } else {
