@@ -44,6 +44,20 @@ per-pad routing, runtime pause/seek/position, the streaming AAC decoder,
 PTS-paced presentation, the ALSA hardware clock) is already merged — see
 issues #64–#76 for the history.
 
+## A/V sync
+
+The ALSA sink provides the pipeline clock (priority 150, counting frames the
+card has actually played) and is the **sync master**: on the first in-segment
+sample after every flush it publishes the pipeline's running-time origin, and
+the video sink presents against that rather than against its own arrival. That
+is what makes a seek land both branches on the same instant instead of on
+whatever skew the two happened to restart with — see the engine's
+`docs/pipeline.md` § A/V synchronization.
+
+Arrow-key seeks coalesce: presses accumulate into one target, settle for
+120 ms, and go out as a single seek whose completion is matched back by
+seqnum. The status line shows the target while the seek is outstanding.
+
 ## Flags
 
 - `--no-audio` — video only, even if the file has audio

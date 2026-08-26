@@ -8,6 +8,103 @@ ride minor bumps.
 Earlier releases predate this file — their notes live in the `Bump to X.Y.Z`
 commit messages and the Forgejo releases.
 
+## [Unreleased]
+
+Every out-of-tree plugin must be rebuilt: the plugin ABI went **12 → 13**.
+
+### Breaking
+
+- **A/V synchronization has one origin instead of two guesses** (#265).
+  Running time used to be `clock.now() - base_time`, where `base_time` was a
+  `ClockTime` snapshotted at `Executor::start` and copied into every element.
+  A flushing seek restarts every segment at running time zero while an
+  audio-provided master clock keeps counting monotonically upward, so after a
+  seek the two quantities no longer named the same instant — and each sink
+  papered over that on its own. `AutoVideoSink` pinned its first post-seek
+  frame's mapped time to whatever running time it happened to *arrive* at;
+  `AlsaSink` was entirely PTS-blind, with no `Event::Segment` arm at all, and
+  simply wrote whatever bytes it was handed. The post-seek A/V offset was
+  therefore the arrival skew between the two branches — a rebuilt openh264 and
+  a keyframe decode on one side against a freshly emptied device accepting a
+  buffer instantly on the other — and it stayed until the next seek re-rolled
+  it. Measured on the test rig: −130 ms at start-up, −330 ms after one seek,
+  430 ms worst across four.
+
+  `base_time` is now a shared, re-anchorable `SyncBase`, reachable through
+  `ProduceContext`/`ConsumeContext`. On the first in-segment buffer of each
+  flush generation exactly one designated **sync master** — the sink whose
+  element provided the selected clock — publishes
+  `base = clock_when_that_sample_is_heard − segment.to_running_time(pts)`;
+  every other sink reads it. A pipeline with no clock provider has no master
+  and the first sink to see data anchors it, which is what the old private
+  anchor did, only shared. A master that never arrives is waited out, so a
+  stalled audio branch cannot freeze the picture. `AutoVideoSink` presents at
+  `running_time >= segment.to_running_time(pts)` and nothing else.
+
+  API breaks: `set_clock` (on `AsyncElementDyn`, the author traits and both
+  contexts) takes a `SyncHandle` instead of a `ClockTime`; `base_time()` keeps
+  its name but reads the live shared cell; `FlushStopEvent` grew the seek
+  epoch that names the generation; `Demuxer` grew `take_downstream_event`.
+- **`Mp4SeekPoint.time_ns` is a composition time**, not a decode time (#265).
+  The seek tables are `stts`/`stss`, which are decode time, while `read_sample`
+  stamps `pts` from composition time — so the landing that becomes the
+  synthesized segment's `start`, the `SeekDone` position and the target every
+  non-reference track is re-sought to was on the wrong clock. On any B-frame
+  stream that put audio ahead of video by the reorder delay, 40–125 ms.
+- **`MkvDemux` reports a forward seek's landing** instead of `None`, and uses
+  it as the skip floor for every track (#265). Cues are video keyframes, so
+  the landing is knowable up front; it used to start audio at the requested
+  time and video at the next keyframe, up to a whole GOP apart.
+- **Audio sinks drop out-of-segment audio.** `AlsaSink` and `PipeWireSink`
+  clip head and tail sample-accurately; they previously played every byte they
+  were handed. A container seeks its non-reference tracks at-or-before the
+  reference keyframe on purpose, so the first post-seek audio buffer routinely
+  straddles `segment.start`.
+- **`with_loop` is no longer a silent rewind.** Both source-style demuxers
+  stage a `Segment` at the lap boundary, so running time stays monotonic
+  across it. Absolute pacing requires it: without the segment, lap two reads
+  as uniformly late and the picture freezes for good.
+- `AudioDecoder` gained a defaulted `reset()`. Out-of-tree decoders keep
+  compiling, but any with inter-packet state should override it — it is what a
+  flushing seek now calls.
+
+### Fixed
+
+- `AudioDecoderElement` had no `handle_downstream_event` at all, so a seek
+  never reset the wrapped decoder, its running `current_pts` carried the
+  abandoned position into the new one, and the executor's discarded
+  `FlushStart` drain consumed the one-shot `flushed` latch — losing the real
+  EOS tail from the first seek of a run onwards. A buffer legitimately stamped
+  at `pts == 0` was also treated as unstamped.
+- `AutoVideoSink` had no `FlushStart` arm, so up to four pre-seek frames
+  queued for the display thread were blitted *after* the seek — the old
+  picture flashing back over the new one.
+- `PipeWireSink` had no event handling at all: a flushing seek left up to
+  sixteen buffers of pre-seek audio to play out.
+- A demuxer's pads each anchored their own segment, which forced every stream
+  to running time zero at its own start and erased the offset *between* them.
+  One origin per node now, shared by every pad.
+- `TsDemuxElement`'s ACCURATE refinement judged whichever stream's PTS arrived
+  first — normally audio, running ahead of video — rather than the video the
+  segment and the picture are driven by.
+- `AlsaSink` declared no latency, so a pipeline's audio path was reported as
+  instantaneous; its ~85 ms device buffer is now in
+  `PipelineHandle::latency()`. Its clock also no longer interpolates through a
+  flush gap the device is not playing through, and a seek after EOS no longer
+  leaves the master clock free-running at wall rate forever.
+- `broadcast_eos`/`broadcast_event` fan out concurrently, as buffers already
+  did: a branch that cannot accept the message no longer holds up a sibling
+  that could — which deadlocked teardown in an A/V graph.
+- `PipelineHandle::abort` recorded `Aborted` after raising the cooperative
+  stop, leaving a window for a source to report a clean EOS for a torn-down
+  run.
+- `parallax-player` applied arrow presses to `handle.position()`, which still
+  reports the old position until the seek lands, so a held key walked a target
+  that kept being recomputed from where playback had not moved from yet and
+  each press fired its own flush. Presses coalesce now, one seek is in flight
+  at a time and is matched back by seqnum, and the status line shows the
+  target it is heading for.
+
 ## [0.8.0] — 2026-08-25
 
 63 commits since 0.7.0, and the release a parallax pipeline becomes a
