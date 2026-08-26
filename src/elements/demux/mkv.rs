@@ -305,6 +305,10 @@ pub struct MkvDemux<R: Read + Seek> {
     /// Reusable frame to avoid a fresh allocation per block.
     frame: Frame,
     looping: bool,
+    /// A Segment staged for the executor to emit on every pad before the
+    /// next buffer (#265). The `with_loop` rewind is not a seek, so nothing
+    /// else re-establishes the timeline at the lap boundary.
+    staged_segment: Option<crate::event::SegmentEvent>,
     /// Trick-play rate from the last handled seek (#165): while > 1.0,
     /// only video keyframes are emitted — fast-forward as GStreamer's
     /// keyframe trick mode (audio is muted; every skipped frame would
@@ -430,6 +434,7 @@ impl<R: Read + Seek> MkvDemux<R> {
                 .grow_to_fit(),
             frame: Frame::default(),
             looping: false,
+            staged_segment: None,
             trick_rate: 1.0,
             video_resync: false,
             stop_ticks: None,
@@ -533,8 +538,11 @@ impl<R: Read + Seek> MkvDemux<R> {
     /// Loop playback: at end of stream, seek back to the start and keep
     /// producing instead of reporting EOS.
     ///
-    /// The rewind is silent (no events), so running time restarts each lap.
-    /// For gapless looping with monotonic running time, drive a
+    /// The rewind emits a fresh `Segment` on every pad (#265), so running
+    /// time stays monotonic across the lap boundary and paced sinks keep
+    /// A/V locked through it — but it is not a flush, so anything already
+    /// queued downstream plays out first. For a lap boundary the pipeline
+    /// treats as a real segment end, drive a
     /// [`SeekFlags::SEGMENT`](crate::event::SeekFlags::SEGMENT) seek loop
     /// from the bus instead (respond to `MessageKind::SegmentDone` with a
     /// non-flushing SEGMENT seek back to the start, #165).
@@ -888,6 +896,10 @@ impl<R: Read + Seek> MkvDemux<R> {
 }
 
 impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
+    fn take_downstream_event(&mut self) -> Option<crate::event::Event> {
+        self.staged_segment.take().map(crate::event::Event::Segment)
+    }
+
     fn demux(&mut self, _buffer: Buffer) -> Result<crate::element::RoutedOutput> {
         Err(Error::Config(
             "MkvDemux owns its reader; add it with no input link".into(),
@@ -943,6 +955,11 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
                         .seek(0)
                         .map_err(|e| Error::Config(format!("MKV rewind failed: {e:?}")))?;
                     self.video_resync = true;
+                    // Re-establish the timeline for the new lap: PTS restart
+                    // at zero, running time must not. The executor fills in
+                    // the base already consumed (#265).
+                    self.staged_segment =
+                        Some(crate::event::SegmentEvent::new_time(ClockTime::ZERO, None));
                     // A seek past the last frame leaves skip entries no frame
                     // can ever satisfy; the loop rewind must drop them or it
                     // would discard every frame forever.

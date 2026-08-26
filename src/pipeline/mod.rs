@@ -83,7 +83,9 @@ pub use rt_scheduler::{
     NodeStatus, RtConfig, RtScheduler, SchedulingMode, spawn_data_thread,
 };
 pub use seek::{DurationQuery, LatencyRange, PositionQuery, SeekTranslation, SeekableQuery};
-pub use sync::{ANCHOR_GRACE, INITIAL_GENERATION, SyncBase, SyncHandle, SyncRole};
+pub use sync::{
+    ANCHOR_GRACE, INITIAL_GENERATION, MAX_WAIT, Pace, SyncBase, SyncHandle, SyncRole, schedule,
+};
 pub use tags::{TagList, TagMergeMode, TagValue};
 pub use tracer::{
     DropTracer, ElementStats, FramerateTracer, LatencyTracer, PipelineStats, Tracer,

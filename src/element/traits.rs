@@ -1616,6 +1616,28 @@ pub trait Demuxer: Send {
         None
     }
 
+    /// A downstream event this demuxer wants emitted on **every** pad before
+    /// its next buffer.
+    ///
+    /// Polled by the executor after each `produce`/`demux` call, the
+    /// downstream mirror of [`take_upstream_event`](Self::take_upstream_event).
+    /// It exists for the one thing a demuxer can do that no event reaches it
+    /// for: repositioning itself. A `with_loop` rewind moves the stream back
+    /// to zero without any seek, so without a fresh `Segment` running time
+    /// jumps backwards at the lap boundary and every paced sink either
+    /// clips the new lap as out-of-segment or drops it as hopelessly late.
+    ///
+    /// Stage a Time [`Segment`](crate::event::Event::Segment) starting at
+    /// the new position with `base` left at zero: the executor fills in the
+    /// running time already consumed, installs it in the node's segment
+    /// tracker and broadcasts it to all pads, so running time stays
+    /// monotonic across the rewind and A/V stays locked through it.
+    ///
+    /// Default: none.
+    fn take_downstream_event(&mut self) -> Option<Event> {
+        None
+    }
+
     /// Whether this demuxer supports seeking.
     ///
     /// A source-style demuxer that implements `handle_upstream_event` for
@@ -1993,6 +2015,12 @@ pub trait AsyncElementDyn {
     /// Polled by the demuxer task after every `process_demux` — see
     /// [`Demuxer::take_upstream_event`]. Default: none.
     fn take_upstream_event(&mut self) -> Option<Event> {
+        None
+    }
+
+    /// A downstream event this element wants emitted on every pad before its
+    /// next buffer — see [`Demuxer::take_downstream_event`]. Default: none.
+    fn take_downstream_event(&mut self) -> Option<Event> {
         None
     }
 
@@ -3673,6 +3701,10 @@ impl<D: Demuxer + Send + 'static> SendAsyncElementDyn for DemuxerAdapter<D> {
 
     fn take_upstream_event(&mut self) -> Option<Event> {
         self.inner.take_upstream_event()
+    }
+
+    fn take_downstream_event(&mut self) -> Option<Event> {
+        self.inner.take_downstream_event()
     }
 
     async fn flush_demux(&mut self) -> Result<Vec<(String, Buffer)>> {

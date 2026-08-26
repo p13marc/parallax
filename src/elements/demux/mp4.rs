@@ -1168,6 +1168,10 @@ pub struct Mp4DemuxSource<R: Read + Seek + Send> {
     primed: bool,
     /// Restart from the top at EOS instead of ending (see [`with_loop`](Self::with_loop)).
     looping: bool,
+    /// A Segment staged for the executor to emit on every pad before the
+    /// next buffer (#265). The `with_loop` rewind is not a seek, so nothing
+    /// else re-establishes the timeline at the lap boundary.
+    staged_segment: Option<crate::event::SegmentEvent>,
     /// Trick-play rate from the last handled seek (#165): while > 1.0,
     /// only video keyframes are emitted (audio muted) — fast-forward as
     /// GStreamer's keyframe trick mode. A rate-1.0 seek restores normal
@@ -1214,6 +1218,7 @@ impl<R: Read + Seek + Send> Mp4DemuxSource<R> {
             pending,
             primed: false,
             looping: false,
+            staged_segment: None,
             trick_rate: 1.0,
             stop_ns: None,
             reverse_cursor_ns: None,
@@ -1242,8 +1247,11 @@ impl<R: Read + Seek + Send> Mp4DemuxSource<R> {
     /// and rebuilding it cannot reopen the window. The stream then never
     /// ends on its own; stop it with [`PipelineHandle::stop`].
     ///
-    /// The rewind is silent (no events), so running time restarts each lap.
-    /// For gapless looping with monotonic running time, drive a
+    /// The rewind emits a fresh `Segment` on every pad (#265), so running
+    /// time stays monotonic across the lap boundary and paced sinks keep
+    /// A/V locked through it — but it is not a flush, so anything already
+    /// queued downstream plays out first. For a lap boundary the pipeline
+    /// treats as a real segment end, drive a
     /// [`SeekFlags::SEGMENT`](crate::event::SeekFlags::SEGMENT) seek loop
     /// from the bus instead (respond to `MessageKind::SegmentDone` with a
     /// non-flushing SEGMENT seek back to the start, #165).
@@ -1304,6 +1312,10 @@ impl<R: Read + Seek + Send> Mp4DemuxSource<R> {
 }
 
 impl<R: Read + Seek + Send> crate::element::Demuxer for Mp4DemuxSource<R> {
+    fn take_downstream_event(&mut self) -> Option<crate::event::Event> {
+        self.staged_segment.take().map(crate::event::Event::Segment)
+    }
+
     fn demux(&mut self, _buffer: Buffer) -> Result<crate::element::RoutedOutput> {
         Err(Error::Config(
             "Mp4DemuxSource owns its reader; add it with no input link".into(),
@@ -1364,6 +1376,13 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for Mp4DemuxSource<R> {
                 // then re-prime the read-ahead on the next call.
                 self.demux.seek_all_to_time(0, SeekSnap::Before)?;
                 self.primed = false;
+                // Re-establish the timeline for the new lap: PTS restart at
+                // zero, running time must not. The executor fills in the
+                // base already consumed (#265).
+                self.staged_segment = Some(crate::event::SegmentEvent::new_time(
+                    crate::clock::ClockTime::ZERO,
+                    None,
+                ));
                 return self.produce();
             }
             return Ok(DemuxerProduce::Eos);

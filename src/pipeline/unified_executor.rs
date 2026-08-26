@@ -4865,6 +4865,41 @@ async fn route_demux_buffer(
     (anchored, connected)
 }
 
+/// Emit a downstream event a demuxer staged for itself (`with_loop`'s silent
+/// rewind, #265) on every pad, before the buffers of the call that staged it.
+///
+/// A Time `Segment` is completed here rather than by the element: the running
+/// time already consumed under the outgoing segment lives in the node's
+/// [`SegmentTracker`], not in the demuxer, and it is what keeps running time
+/// monotonic across the rewind. A demuxer stages `base = 0` and gets the
+/// accumulated base filled in — the same rule a non-flushing seek's successor
+/// segment follows.
+async fn emit_staged_downstream(
+    event: Event,
+    outputs_by_pad: &HashMap<String, Vec<OutputBranch>>,
+    src_pad: &crate::pipeline::probe::PadRef,
+    probes: &ProbeRegistry,
+    tracker: &mut SegmentTracker,
+    segment_pads: &mut HashSet<String>,
+) {
+    let event = match event {
+        Event::Segment(mut seg) if seg.format == crate::event::SegmentFormat::Time => {
+            if seg.base == 0 {
+                seg.base = tracker.accumulated_base();
+            }
+            tracker.installed(&seg);
+            // The segment covers every pad, so no pad may re-anchor on its
+            // own afterwards.
+            segment_pads.extend(outputs_by_pad.keys().cloned());
+            Event::Segment(seg)
+        }
+        other => other,
+    };
+    for branches in outputs_by_pad.values() {
+        emit_event(branches, src_pad, probes, event.clone()).await;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_demuxer_task(
     name: String,
@@ -5371,6 +5406,20 @@ fn spawn_demuxer_task(
                 .await
                 {
                     Ok(DemuxResult::Routed(routed)) => {
+                        // A silent reposition (`with_loop`) stages its own
+                        // Segment; it must reach the pads ahead of the
+                        // buffers from the call that staged it.
+                        if let Some(event) = element.take_downstream_event() {
+                            emit_staged_downstream(
+                                event,
+                                &outputs_by_pad,
+                                &src_pad,
+                                &probe_registry,
+                                &mut segment_tracker,
+                                &mut segment_pads,
+                            )
+                            .await;
+                        }
                         // Same stamp-at-send rule as spawn_source_task: a seek
                         // handled in this iteration's control drain already
                         // bumped the epoch.

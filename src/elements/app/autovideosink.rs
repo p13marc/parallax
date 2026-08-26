@@ -29,7 +29,8 @@ use crate::clock::ClockTime;
 use crate::element::{AsyncSink, ConsumeContext};
 use crate::error::{Error, Result};
 use crate::format::{Caps, PixelFormat};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use crate::pipeline::{Pace, schedule};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -71,26 +72,6 @@ const DEFAULT_MAX_LATENESS: Duration = Duration::from_millis(40);
 /// frame is a zero-copy `Buffer` clone pinning a producer arena slot, so
 /// this plus the presented frame is what `retained_buffers()` reports.
 const DISPLAY_QUEUE_DEPTH: usize = 3;
-
-/// Longest single wait the pacer will ask for.
-///
-/// A stream whose timestamps jump forward (a bad demuxer, a wrapped RTP clock)
-/// must not park the sink for minutes. Past this the frame is shown instead.
-const MAX_WAIT: Duration = Duration::from_secs(1);
-
-/// What to do with a frame whose presentation time is known.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Pace {
-    /// Show it now.
-    Present,
-    /// Show it after this long.
-    Wait(Duration),
-    /// Too late to be useful — drop it, `late_ns` past the deadline.
-    DropLate {
-        /// How far past `max_lateness` the frame was (running time, ns).
-        late_ns: u64,
-    },
-}
 
 /// Length of one QoS aggregation window in running time (#184).
 const QOS_WINDOW_NS: u64 = 1_000_000_000;
@@ -152,64 +133,6 @@ impl QosAggregator {
     }
 }
 
-/// Paces presentation in segment running time.
-///
-/// The input is already segment-mapped (#165): `consume` runs each PTS
-/// through [`SegmentEvent::to_running_time`], so segment start/rate/base
-/// take effect upstream of this struct. The first frame still anchors the
-/// stream — its mapped time is pinned to the running time at which it
-/// arrived — because parallax has no LATENCY query: pacing purely against
-/// the clock would mark the first frames late by the pipeline's startup
-/// latency and drop them. The anchor absorbs that latency; a new segment
-/// (seek or start) clears it so the next frame re-anchors.
-///
-/// Reverse playback (#165) needs no special casing here: a reverse
-/// segment's `to_running_time` maps decreasing PTS to *increasing* running
-/// times, so this pacer sees a normal forward timeline.
-///
-/// [`SegmentEvent::to_running_time`]: crate::event::SegmentEvent::to_running_time
-#[derive(Debug, Default)]
-struct PtsPacer {
-    /// `(first PTS, running time when it arrived)`.
-    anchor: Option<(ClockTime, ClockTime)>,
-}
-
-impl PtsPacer {
-    /// Decide what to do with a frame stamped `pts`, given the clock now reads
-    /// `now` in running time.
-    ///
-    /// Both times must be known; the caller checks that before asking.
-    fn schedule(&mut self, pts: ClockTime, now: ClockTime, max_lateness: Duration) -> Pace {
-        let (first_pts, anchor_running) = *self.anchor.get_or_insert((pts, now));
-
-        // A PTS before the anchor means the stream went backwards (a seek, a
-        // reordered first frame). Re-anchor rather than dropping everything.
-        let Some(offset) = pts.nanos().checked_sub(first_pts.nanos()) else {
-            self.anchor = Some((pts, now));
-            return Pace::Present;
-        };
-
-        let target = anchor_running.nanos().saturating_add(offset);
-        let now = now.nanos();
-
-        if target > now {
-            let wait = Duration::from_nanos(target - now);
-            return if wait > MAX_WAIT {
-                Pace::Present
-            } else {
-                Pace::Wait(wait)
-            };
-        }
-
-        let deficit = now - target;
-        if deficit > max_lateness.as_nanos() as u64 {
-            Pace::DropLate { late_ns: deficit }
-        } else {
-            Pace::Present
-        }
-    }
-}
-
 /// A video sink that automatically creates a window and displays frames.
 ///
 /// This sink spawns its own display thread with a winit event loop,
@@ -252,8 +175,27 @@ pub struct AutoVideoSink {
     sync: bool,
     /// How late a frame may be and still be shown, when `sync` is on.
     max_lateness: Duration,
-    /// PTS → running-time mapping, built from the first frame.
-    pacer: PtsPacer,
+    /// The sync generation this sink last anchored (#265). A `FlushStop`
+    /// names the next one in band, so both branches of an A/V graph anchor
+    /// the same generation from the same event.
+    generation: u64,
+    /// When this sink started waiting for the master to anchor the current
+    /// generation. `None` once it has stopped waiting.
+    anchor_wait: Option<std::time::Instant>,
+    /// How long to let the master anchor a generation before anchoring it
+    /// ourselves; see [`with_anchor_grace`](Self::with_anchor_grace).
+    anchor_grace: Duration,
+    /// Whether the first buffer of the current generation is still owed a
+    /// present. It is the frame the user is waiting to see after a seek, so
+    /// it goes up however late it is.
+    generation_opened: bool,
+    /// PTS of the last buffer seen, the pivot an instant rate change bends
+    /// the segment around.
+    last_pts: ClockTime,
+    /// Frames stamped below this are stale — a flushing seek bumped it. Read
+    /// by the display thread, which skips them rather than blitting the
+    /// pre-seek picture back over the new one.
+    display_generation: Arc<AtomicU64>,
     /// Current segment (#165): PTS map through
     /// [`SegmentEvent::to_running_time`] before pacing, so a segment's
     /// start/rate/base take effect. `None` until the initial segment
@@ -407,7 +349,12 @@ impl AutoVideoSink {
             name: "autovideosink".to_string(),
             sync: false,
             max_lateness: DEFAULT_MAX_LATENESS,
-            pacer: PtsPacer::default(),
+            generation: crate::pipeline::INITIAL_GENERATION,
+            anchor_wait: None,
+            anchor_grace: crate::pipeline::ANCHOR_GRACE,
+            generation_opened: false,
+            last_pts: ClockTime::NONE,
+            display_generation: Arc::new(AtomicU64::new(0)),
             segment: None,
             dropped: 0,
             qos: QosAggregator::default(),
@@ -474,6 +421,20 @@ impl AutoVideoSink {
 
     /// How late a frame may be and still be shown (default 40 ms).
     ///
+    /// How long to wait for the sync master to define running-time zero
+    /// before doing it ourselves (#265).
+    ///
+    /// The master is the sink that provides the pipeline clock — an
+    /// `AlsaSink`, whose device's progress *is* the timeline. This sink
+    /// normally arrives second (a video branch restarting after a seek has
+    /// to rebuild its decoder and decode a keyframe), so the wait usually
+    /// costs nothing. It exists so a stalled or absent audio branch cannot
+    /// freeze the picture; a pipeline with no master never waits at all.
+    pub fn with_anchor_grace(mut self, grace: Duration) -> Self {
+        self.anchor_grace = grace;
+        self
+    }
+
     /// Only consulted when [`with_sync`](Self::with_sync) is on. A later frame
     /// is dropped and counted rather than displayed out of time.
     pub fn with_max_lateness(mut self, max_lateness: Duration) -> Self {
@@ -491,6 +452,65 @@ impl AutoVideoSink {
         self.dropped += 1;
         crate::observability::record_buffer_dropped("pipeline", &self.name);
         tracing::debug!("autovideosink: dropping frame ({reason})");
+    }
+
+    /// A flush opened sync generation `epoch` (#265).
+    ///
+    /// Arms the anchor handshake for it and marks the next frame as the one
+    /// that must be shown however late it is.
+    fn open_generation(&mut self, epoch: u64) {
+        self.generation = epoch;
+        self.anchor_wait = None;
+        self.generation_opened = true;
+    }
+
+    /// Retire the frames already handed to the display thread.
+    ///
+    /// They belong to the stream position a flushing seek just abandoned.
+    /// The receiver lives on the display thread and `std::sync::mpsc` has no
+    /// second consumer, so instead of draining the channel this bumps a
+    /// shared counter and the display loop skips anything stamped below it —
+    /// which also catches the frame it may have dequeued a moment ago.
+    fn retire_queued_frames(&mut self) {
+        self.display_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Make sure this generation's running-time origin is fixed before
+    /// pacing against it (#265).
+    ///
+    /// The master — the sink whose element provides the pipeline clock — is
+    /// the one whose answer counts, because its device's progress *is* the
+    /// timeline. This sink is normally not it, so it waits: a video branch
+    /// restarting after a seek is slower than an audio one (the decoder is
+    /// rebuilt, a keyframe must be decoded), so the master has usually
+    /// anchored before the first frame even arrives and the wait costs
+    /// nothing. When there is no master at all — a video-only pipeline on
+    /// the system clock — this sink anchors immediately, which is exactly
+    /// what the old private per-sink anchor did.
+    ///
+    /// The wait is bounded by [`with_anchor_grace`](Self::with_anchor_grace):
+    /// a stalled or absent audio branch must not freeze the picture.
+    async fn settle_anchor(&mut self, ctx: &ConsumeContext<'_>, target: ClockTime) {
+        let Some(sync) = ctx.sync() else { return };
+        if sync.is_anchored(self.generation) && !sync.is_master() {
+            return;
+        }
+        if sync.is_master() || !sync.has_master() {
+            sync.anchor(self.generation, ctx.clock_time(), target);
+            return;
+        }
+        let started = *self.anchor_wait.get_or_insert_with(std::time::Instant::now);
+        while !sync.is_anchored(self.generation) {
+            if started.elapsed() >= self.anchor_grace {
+                tracing::debug!(
+                    "autovideosink: no sync anchor after {:?}; anchoring this branch itself",
+                    self.anchor_grace
+                );
+                sync.anchor(self.generation, ctx.clock_time(), target);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
     }
 
     /// Whether this PTS is out-of-segment pre-roll a sync sink should drop
@@ -542,6 +562,7 @@ impl AutoVideoSink {
         running.store(true, Ordering::SeqCst);
 
         let prefer_gpu = self.gpu;
+        let display_generation = Arc::clone(&self.display_generation);
         let handle = thread::spawn(move || {
             if let Err(e) = run_display_loop(
                 receiver,
@@ -553,6 +574,7 @@ impl AutoVideoSink {
                 fullscreen,
                 proxy.clone(),
                 prefer_gpu,
+                display_generation,
             ) {
                 eprintln!("Display error: {}", e);
             }
@@ -636,10 +658,13 @@ impl AsyncSink for AutoVideoSink {
 
     /// Instant rate change (#165): `seek.rate` replaces the current
     /// segment's rate in this sink's own mapping, effective at the next
-    /// frame — the pacer re-anchors so running time continues from here
-    /// instead of jumping. Sign flips are rejected (reverse needs a real
-    /// seek: the data order itself must change); a later Segment (any real
-    /// seek) re-establishes its own rate. Everything else is not ours.
+    /// frame. `base` is recomputed so the *current* position keeps the
+    /// running time it already had — the mapping bends, it does not jump.
+    /// (The old code cleared the pacer's private anchor instead, which hid
+    /// the discontinuity; with absolute pacing there is nowhere to hide it.)
+    /// Sign flips are rejected (reverse needs a real seek: the data order
+    /// itself must change); a later Segment (any real seek) re-establishes
+    /// its own rate. Everything else is not ours.
     fn handle_upstream_event(&mut self, event: &crate::event::Event) -> crate::event::EventResult {
         use crate::event::{Event, EventResult, SeekFlags};
         if let Event::Seek(seek) = event
@@ -657,8 +682,20 @@ impl AsyncSink for AutoVideoSink {
                 );
                 return EventResult::NotHandled;
             }
+            // Pivot on the last frame presented, or the segment start when
+            // nothing has been shown yet: `to_running_time(pivot)` must read
+            // the same before and after.
+            let pivot = self
+                .last_pts
+                .to_option()
+                .unwrap_or(ClockTime::from_nanos(seg.start.max(0) as u64));
+            let before = seg.to_running_time(pivot);
             seg.rate = seek.rate;
-            self.pacer.anchor = None;
+            if let (Some(before), Some(after)) =
+                (before.to_option(), seg.to_running_time(pivot).to_option())
+            {
+                seg.base += before.nanos() as i64 - after.nanos() as i64;
+            }
             return EventResult::handled();
         }
         EventResult::NotHandled
@@ -679,22 +716,27 @@ impl AsyncSink for AutoVideoSink {
         event: crate::event::Event,
     ) -> Option<crate::event::Event> {
         match &event {
-            // A flushing seek moved the stream: drop the PTS anchor so the
-            // first post-seek frame re-anchors at its own arrival time.
-            // Without this a forward seek would schedule every new frame
-            // `seek distance` in the future (capped by MAX_WAIT, but still
-            // a stall).
-            crate::event::Event::FlushStop(_) => {
-                self.pacer.anchor = None;
+            // A flushing seek abandoned the stream position the queued
+            // frames belong to. Drop them: the display channel holds up to
+            // DISPLAY_QUEUE_DEPTH + 1 of them, and without this they are
+            // blitted *after* the seek — the pre-seek picture flashing back
+            // over the new one.
+            crate::event::Event::FlushStart => {
+                self.retire_queued_frames();
             }
-            // A new segment re-defines the mapping (#165) — and re-anchors,
-            // which also covers the forward NON-flushing seek (the queued
-            // Segment arrives with no FlushStop to clear the anchor).
+            // The flush names the sync generation to anchor for (#265), so
+            // both branches of an A/V graph derive it from the same event.
+            crate::event::Event::FlushStop(stop) => {
+                self.open_generation(stop.epoch);
+            }
+            // A new segment re-defines the PTS → running-time mapping
+            // (#165). It no longer re-anchors anything: the origin is
+            // shared, and the segment's own `start`/`base`/`rate` are the
+            // whole mapping.
             crate::event::Event::Segment(seg)
                 if seg.format == crate::event::SegmentFormat::Time =>
             {
                 self.segment = Some(seg.clone());
-                self.pacer.anchor = None;
             }
             _ => {}
         }
@@ -770,25 +812,33 @@ impl AsyncSink for AutoVideoSink {
             return Ok(());
         }
 
+        self.last_pts = meta.pts;
+
         // Presentation pacing (#66). Opt-in: a clock-less pipeline, an
         // un-timestamped stream, or plain `sync=false` all keep the historical
         // blit-on-arrival behaviour, so capture previews do not regress.
         if self.sync
             && ctx.clock().is_some()
             && let Some(pts) = meta.pts.to_option()
-            && let Some(now) = ctx.running_time().to_option()
+            && ctx.running_time().is_some()
             // Map through the current segment (#165): (pts − start)/|rate| +
             // base. A PTS past the segment stop has no valid mapping
             // (below-start ones were dropped above) — present it immediately
             // rather than pace it.
-            && let Some(pts) = self
+            && let Some(target) = self
                 .segment
                 .as_ref()
                 .map_or(meta.pts, |seg| seg.to_running_time(pts))
                 .to_option()
         {
+            // Define running-time zero for this generation, or wait for the
+            // sink that owns the clock to do it (#265). Absolute pacing is
+            // only meaningful once the origin is fixed.
+            self.settle_anchor(ctx, target).await;
+
+            let now = ctx.running_time();
             let mut now_ns = now.nanos();
-            let mut pace = self.pacer.schedule(pts, now, self.max_lateness);
+            let mut pace = schedule(target, now, self.max_lateness);
             // Waiting here is the point: it is what back-pressures the
             // decoder and the source down to real time. Since #172 the wait
             // is an await, so it pends this element's future instead of
@@ -798,21 +848,28 @@ impl AsyncSink for AutoVideoSink {
             // full delay: against a clock frozen by `PipelineHandle::pause`
             // a one-shot sleep would keep presenting at wall-clock rate,
             // while re-reading running time stalls right here — and resumes
-            // gap-free, because the clock does. `MAX_WAIT` still applies to
-            // each *computed* deficit (the PTS-jump escape hatch), not to the
-            // frozen-clock stall, where the deficit never shrinks but stays
-            // under the cap.
+            // gap-free, because the clock does. Re-reading is also what makes
+            // a mid-wait re-anchor by the master self-correcting. `MAX_WAIT`
+            // still applies to each *computed* deficit (the PTS-jump escape
+            // hatch), not to the frozen-clock stall, where the deficit never
+            // shrinks but stays under the cap.
             while let Pace::Wait(delay) = pace {
                 tokio::time::sleep(delay.min(Duration::from_millis(10))).await;
                 match ctx.running_time().to_option() {
                     Some(now) => {
                         now_ns = now.nanos();
-                        pace = self.pacer.schedule(pts, now, self.max_lateness);
+                        pace = schedule(target, now, self.max_lateness);
                     }
                     None => break,
                 }
             }
-            if let Pace::DropLate { late_ns } = pace {
+            // The first frame of a generation goes up however late it is:
+            // after a seek it is the frame the user is waiting to see, and
+            // dropping it would leave the pre-seek picture on screen until
+            // the branch caught up.
+            if self.generation_opened {
+                self.generation_opened = false;
+            } else if let Pace::DropLate { late_ns } = pace {
                 self.qos.dropped_late(now_ns, late_ns);
                 self.drop_frame("late");
                 return Ok(());
@@ -841,6 +898,7 @@ impl AsyncSink for AutoVideoSink {
         }
 
         let frame = DisplayFrame {
+            generation: self.display_generation.load(Ordering::Acquire),
             // Refcount bump, not a copy: the display thread maps the same
             // arena slot — or pins the same decoder picture (#194) — the
             // producer wrote (#141).
@@ -986,6 +1044,7 @@ fn run_display_loop(
     fullscreen: Arc<AtomicBool>,
     proxy_slot: SharedProxy,
     prefer_gpu: bool,
+    display_generation: Arc<AtomicU64>,
 ) -> Result<()> {
     use super::present::RenderBackend;
     use winit::application::ApplicationHandler;
@@ -1014,6 +1073,8 @@ fn run_display_loop(
         is_fullscreen: bool,
         /// Last cursor position, for MousePressed coordinates.
         cursor: (f64, f64),
+        /// Frames stamped below this were retired by a flushing seek.
+        display_generation: Arc<AtomicU64>,
     }
 
     impl VideoApp {
@@ -1034,6 +1095,12 @@ fn run_display_loop(
         /// was still being built is made up on the next event.
         fn drain_frames(&mut self) {
             while let Ok(frame) = self.receiver.try_recv() {
+                // A flushing seek retired everything queued before it (#265);
+                // blitting those now would flash the pre-seek picture back
+                // over the new position.
+                if frame.generation < self.display_generation.load(Ordering::Acquire) {
+                    continue;
+                }
                 self.current_frame = Some(frame);
                 self.render();
             }
@@ -1239,6 +1306,7 @@ fn run_display_loop(
         fullscreen,
         is_fullscreen: false,
         cursor: (0.0, 0.0),
+        display_generation,
     };
 
     event_loop
@@ -1249,6 +1317,28 @@ fn run_display_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A clock stopped at one reading, so an anchor's arithmetic is exact.
+    struct FixedClock(ClockTime);
+
+    impl crate::clock::Clock for FixedClock {
+        fn now(&self) -> ClockTime {
+            self.0
+        }
+        fn name(&self) -> &str {
+            "fixed"
+        }
+    }
+
+    /// The smallest real buffer a `ConsumeContext` can be built over.
+    fn one_byte_buffer() -> crate::buffer::Buffer {
+        let arena = crate::memory::SharedArena::new(64, 2).unwrap();
+        let slot = arena.acquire().unwrap();
+        crate::buffer::Buffer::new(
+            crate::buffer::MemoryHandle::with_len(slot, 1),
+            crate::metadata::Metadata::new(),
+        )
+    }
 
     #[test]
     fn handle_events_flow_and_fullscreen_toggles() {
@@ -1317,20 +1407,18 @@ mod tests {
     }
 
     #[test]
-    fn a_time_segment_is_stored_and_re_anchors() {
+    fn a_time_segment_is_stored_as_the_whole_mapping() {
         use crate::element::AsyncSink;
         use crate::event::{Event, SegmentEvent};
 
         let mut sink = AutoVideoSink::new();
-        sink.pacer.anchor = Some((ns(0), ns(0)));
 
-        // A Time segment installs the mapping and clears the anchor, so the
-        // next frame re-anchors in the new segment's running-time domain —
-        // this is also what un-stalls a forward NON-flushing seek (#165).
+        // A Time segment installs the mapping, and that is all it does: the
+        // running-time origin is shared and re-anchored by the flush, not by
+        // the segment (#265).
         let seg = SegmentEvent::new_time(ClockTime::from_secs(10), None).with_rate(2.0);
         let fwd = sink.handle_downstream_event(Event::Segment(seg));
         assert!(matches!(fwd, Some(Event::Segment(_))), "segment forwarded");
-        assert!(sink.pacer.anchor.is_none(), "new segment re-anchors");
         let stored = sink.segment.as_ref().expect("segment stored");
         assert_eq!(stored.start, 10_000_000_000);
         assert_eq!(stored.rate, 2.0);
@@ -1348,13 +1436,8 @@ mod tests {
         );
 
         // A Bytes segment is not a video timeline; ignored.
-        sink.pacer.anchor = Some((ns(0), ns(0)));
         let bytes_seg = SegmentEvent::new_bytes(0, None);
         let _ = sink.handle_downstream_event(Event::Segment(bytes_seg));
-        assert!(
-            sink.pacer.anchor.is_some(),
-            "bytes segment leaves pacing alone"
-        );
         assert_eq!(
             sink.segment.as_ref().unwrap().format,
             crate::event::SegmentFormat::Time
@@ -1362,78 +1445,17 @@ mod tests {
     }
 
     #[test]
-    fn the_first_frame_anchors_the_stream() {
-        let mut pacer = PtsPacer::default();
-
-        // A stream that starts at 10s of PTS must not stall for 10s: the
-        // anchor pins that PTS to the running time it arrived at.
-        assert_eq!(
-            pacer.schedule(ns(10_000_000_000), ns(5_000_000), DEFAULT_MAX_LATENESS),
-            Pace::Present
-        );
-        // ...and the next frame is one frame interval after it.
-        assert_eq!(
-            pacer.schedule(
-                ns(10_000_000_000 + FRAME_25FPS),
-                ns(5_000_000),
-                DEFAULT_MAX_LATENESS
-            ),
-            Pace::Wait(Duration::from_nanos(FRAME_25FPS))
-        );
-    }
-
-    #[test]
     fn a_25fps_stream_waits_one_frame_interval() {
-        let mut pacer = PtsPacer::default();
-        let start = 1_000_000_000;
-
-        assert_eq!(
-            pacer.schedule(ns(0), ns(start), DEFAULT_MAX_LATENESS),
-            Pace::Present
-        );
-
-        // Decoder runs flat out: the clock has barely moved, so each frame is
-        // held back to its own presentation instant.
+        // Decoder runs flat out: the clock has barely moved, so each frame
+        // is held back to its own presentation instant. Absolute now — the
+        // origin is the shared base, not this sink's first arrival.
         for frame in 1..10u64 {
             assert_eq!(
-                pacer.schedule(ns(frame * FRAME_25FPS), ns(start), DEFAULT_MAX_LATENESS),
+                schedule(ns(frame * FRAME_25FPS), ns(0), DEFAULT_MAX_LATENESS),
                 Pace::Wait(Duration::from_nanos(frame * FRAME_25FPS)),
                 "frame {frame}"
             );
         }
-    }
-
-    #[test]
-    fn a_frame_that_is_on_time_is_presented() {
-        let mut pacer = PtsPacer::default();
-        pacer.schedule(ns(0), ns(0), DEFAULT_MAX_LATENESS);
-
-        // Arrived 39 ms late — inside the 40 ms budget, so still worth showing.
-        assert_eq!(
-            pacer.schedule(
-                ns(FRAME_25FPS),
-                ns(FRAME_25FPS + 39_000_000),
-                DEFAULT_MAX_LATENESS
-            ),
-            Pace::Present
-        );
-    }
-
-    #[test]
-    fn a_frame_past_the_lateness_budget_is_dropped() {
-        let mut pacer = PtsPacer::default();
-        pacer.schedule(ns(0), ns(0), DEFAULT_MAX_LATENESS);
-
-        assert_eq!(
-            pacer.schedule(
-                ns(FRAME_25FPS),
-                ns(FRAME_25FPS + 41_000_000),
-                DEFAULT_MAX_LATENESS
-            ),
-            Pace::DropLate {
-                late_ns: 41_000_000
-            }
-        );
     }
 
     #[test]
@@ -1473,67 +1495,21 @@ mod tests {
     }
 
     #[test]
-    fn the_lateness_budget_is_configurable() {
-        let generous = Duration::from_millis(500);
-        let mut pacer = PtsPacer::default();
-        pacer.schedule(ns(0), ns(0), generous);
-
-        // The same 41 ms of lateness that the default drops, this one shows.
-        assert_eq!(
-            pacer.schedule(ns(FRAME_25FPS), ns(FRAME_25FPS + 41_000_000), generous),
-            Pace::Present
-        );
-    }
-
-    #[test]
-    fn an_absurd_pts_jump_does_not_park_the_sink() {
-        let mut pacer = PtsPacer::default();
-        pacer.schedule(ns(0), ns(0), DEFAULT_MAX_LATENESS);
-
-        // An hour into the future — a wrapped RTP clock or a broken demuxer.
-        // Show it rather than sleeping through the rest of the stream.
-        assert_eq!(
-            pacer.schedule(ns(3_600_000_000_000), ns(0), DEFAULT_MAX_LATENESS),
-            Pace::Present
-        );
-    }
-
-    #[test]
-    fn a_backwards_pts_re_anchors_instead_of_dropping_the_stream() {
-        let mut pacer = PtsPacer::default();
-        pacer.schedule(ns(10 * FRAME_25FPS), ns(0), DEFAULT_MAX_LATENESS);
-
-        // A seek back to the start: without re-anchoring, every frame from
-        // here on would look eternally late and be dropped forever.
-        assert_eq!(
-            pacer.schedule(ns(0), ns(500_000_000), DEFAULT_MAX_LATENESS),
-            Pace::Present
-        );
-        assert_eq!(
-            pacer.schedule(ns(FRAME_25FPS), ns(500_000_000), DEFAULT_MAX_LATENESS),
-            Pace::Wait(Duration::from_nanos(FRAME_25FPS))
-        );
-    }
-
-    #[test]
     fn a_frozen_clock_keeps_the_pacer_waiting() {
         // PipelineHandle::pause freezes running time. Re-scheduling against
         // the same `now` must keep answering Wait with a constant deficit —
         // never Present — which is what makes the consume() poll loop stall
         // for as long as the pause lasts.
-        let mut pacer = PtsPacer::default();
-        pacer.schedule(ns(0), ns(0), DEFAULT_MAX_LATENESS);
-
         let frozen_now = ns(0);
         for _ in 0..100 {
             assert_eq!(
-                pacer.schedule(ns(FRAME_25FPS), frozen_now, DEFAULT_MAX_LATENESS),
+                schedule(ns(FRAME_25FPS), frozen_now, DEFAULT_MAX_LATENESS),
                 Pace::Wait(Duration::from_nanos(FRAME_25FPS))
             );
         }
         // Resume: time advances past the target and the frame presents.
         assert_eq!(
-            pacer.schedule(ns(FRAME_25FPS), ns(FRAME_25FPS), DEFAULT_MAX_LATENESS),
+            schedule(ns(FRAME_25FPS), ns(FRAME_25FPS), DEFAULT_MAX_LATENESS),
             Pace::Present
         );
     }
@@ -1566,9 +1542,83 @@ mod tests {
         assert!(!sink.clips_out_of_segment(ns(500_000_000)));
     }
 
+    /// #265: a flush names the generation to anchor, opens the "show the
+    /// next frame however late" window, and retires whatever the display
+    /// thread has queued from before the seek.
+    #[test]
+    fn a_flush_opens_the_generation_it_names() {
+        use crate::element::AsyncSink;
+        use crate::event::{Event, FlushStopEvent};
+
+        let mut sink = AutoVideoSink::new();
+        assert_eq!(sink.generation, crate::pipeline::INITIAL_GENERATION);
+        assert!(!sink.generation_opened);
+
+        let before = sink.display_generation.load(Ordering::Acquire);
+        let _ = sink.handle_downstream_event(Event::FlushStart);
+        assert!(
+            sink.display_generation.load(Ordering::Acquire) > before,
+            "queued pre-seek frames are retired, not blitted after the seek"
+        );
+
+        let _ = sink
+            .handle_downstream_event(Event::FlushStop(FlushStopEvent::new(true).with_epoch(48)));
+        assert_eq!(sink.generation, 48, "the flush names the generation");
+        assert!(
+            sink.generation_opened,
+            "the first frame after a seek is the one the user is waiting for"
+        );
+        assert!(sink.anchor_wait.is_none(), "the grace window restarts");
+    }
+
+    /// A pipeline with no clock provider has no master, so the sink anchors
+    /// its own first frame — which is exactly what the old private per-sink
+    /// anchor did, only now the answer is shared with every other sink.
+    #[tokio::test]
+    async fn a_masterless_pipeline_anchors_on_the_spot() {
+        use crate::pipeline::{SyncBase, SyncHandle, SyncRole};
+        use std::sync::Arc;
+
+        let base = Arc::new(SyncBase::new(ClockTime::ZERO, None));
+        let handle = SyncHandle::new(Arc::clone(&base), SyncRole::Slave);
+        let clock: Arc<dyn crate::clock::Clock> = Arc::new(FixedClock(ns(7_000_000_000)));
+        let buffer = one_byte_buffer();
+        let mut ctx = crate::element::ConsumeContext::new(&buffer);
+        ctx.set_clock(&clock, &handle);
+
+        let mut sink = AutoVideoSink::new();
+        sink.settle_anchor(&ctx, ns(2_000_000_000)).await;
+
+        assert!(base.is_anchored(0));
+        // Running time 2 s maps to clock 7 s, so the origin sits at 5 s.
+        assert_eq!(base.base_time(), ns(5_000_000_000));
+    }
+
+    /// With a master in the graph the video sink waits for it — bounded, so
+    /// a stalled audio branch cannot freeze the picture forever.
+    #[tokio::test(start_paused = true)]
+    async fn a_slave_gives_up_waiting_after_the_grace() {
+        use crate::pipeline::{SyncBase, SyncHandle, SyncRole};
+        use std::sync::Arc;
+
+        let base = Arc::new(SyncBase::new(ClockTime::ZERO, Some(9)));
+        let handle = SyncHandle::new(Arc::clone(&base), SyncRole::Slave);
+        let clock: Arc<dyn crate::clock::Clock> = Arc::new(FixedClock(ns(3_000_000_000)));
+        let buffer = one_byte_buffer();
+        let mut ctx = crate::element::ConsumeContext::new(&buffer);
+        ctx.set_clock(&clock, &handle);
+
+        let mut sink = AutoVideoSink::new().with_anchor_grace(Duration::from_millis(100));
+        sink.settle_anchor(&ctx, ClockTime::ZERO).await;
+
+        assert!(base.is_anchored(0), "the wait is bounded");
+        assert_eq!(base.base_time(), ns(3_000_000_000));
+    }
+
     /// #165 instant rate change: same-sign rates replace the segment's rate
-    /// and re-anchor the pacer; sign flips, rate 0, and a mapping-less sink
-    /// decline. Only INSTANT_RATE_CHANGE seeks are ours.
+    /// while `base` absorbs the change so the current position keeps the
+    /// running time it already had; sign flips, rate 0, and a mapping-less
+    /// sink decline. Only INSTANT_RATE_CHANGE seeks are ours.
     #[test]
     fn instant_rate_change_updates_the_mapping() {
         use crate::element::AsyncSink;
@@ -1584,13 +1634,40 @@ mod tests {
         ));
 
         sink.segment = Some(SegmentEvent::new_time(ns(0), None));
-        sink.pacer.anchor = Some((ns(0), ns(0)));
+        // Four seconds in, mapping to running time 4 s at rate 1.0.
+        sink.last_pts = ns(4_000_000_000);
+        let before = sink
+            .segment
+            .as_ref()
+            .unwrap()
+            .to_running_time(sink.last_pts);
+        assert_eq!(before, ns(4_000_000_000));
+
         assert!(matches!(
             sink.handle_upstream_event(&ev),
             EventResult::Handled { .. }
         ));
         assert_eq!(sink.segment.as_ref().unwrap().rate, 2.0);
-        assert!(sink.pacer.anchor.is_none(), "pacer re-anchors");
+        // The mapping bends around the current position instead of jumping:
+        // at rate 2.0 the raw mapping would read 2 s, so `base` makes up the
+        // difference. With the private arrival anchor gone there is nowhere
+        // left to hide a discontinuity here.
+        assert_eq!(
+            sink.segment
+                .as_ref()
+                .unwrap()
+                .to_running_time(sink.last_pts),
+            before,
+            "instant rate change is continuous at the current position"
+        );
+        // And from here on, one second of content takes half a second.
+        assert_eq!(
+            sink.segment
+                .as_ref()
+                .unwrap()
+                .to_running_time(ns(5_000_000_000)),
+            ns(4_500_000_000)
+        );
 
         // Sign flip and rate 0 decline; the mapping is untouched.
         for bad in [-1.0, 0.0] {

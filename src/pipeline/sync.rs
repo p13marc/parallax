@@ -320,6 +320,63 @@ impl SyncHandle {
     }
 }
 
+// ============================================================================
+// Presentation pacing
+// ============================================================================
+
+/// Longest single wait a pacing sink will ask for.
+///
+/// A stream whose timestamps jump forward (a bad demuxer, a wrapped RTP
+/// clock) must not park the sink for minutes. Past this the buffer is
+/// presented instead.
+pub const MAX_WAIT: Duration = Duration::from_secs(1);
+
+/// What to do with a buffer whose presentation time is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pace {
+    /// Show it now.
+    Present,
+    /// Show it after this long.
+    Wait(Duration),
+    /// Too late to be useful — drop it, `late_ns` past the deadline.
+    DropLate {
+        /// How far past `max_lateness` the buffer was (running time, ns).
+        late_ns: u64,
+    },
+}
+
+/// Decide what to do with a buffer whose segment running time is `target`,
+/// given the clock now reads `now` in running time.
+///
+/// Both are measured against the same shared [`SyncBase`], which is what
+/// makes two sinks on two branches agree. There is deliberately no state
+/// here: the pacer used to carry a private anchor pinning its first buffer's
+/// mapped time to whatever running time it happened to *arrive* at, which
+/// silently discarded the segment's absolute mapping on every seek and made
+/// the A/V offset the arrival skew between the branches.
+pub fn schedule(target: ClockTime, now: ClockTime, max_lateness: Duration) -> Pace {
+    let (Some(target), Some(now)) = (target.to_option(), now.to_option()) else {
+        return Pace::Present;
+    };
+    let (target, now) = (target.nanos(), now.nanos());
+
+    if target > now {
+        let wait = Duration::from_nanos(target - now);
+        return if wait > MAX_WAIT {
+            Pace::Present
+        } else {
+            Pace::Wait(wait)
+        };
+    }
+
+    let late_ns = now - target;
+    if late_ns > max_lateness.as_nanos() as u64 {
+        Pace::DropLate { late_ns }
+    } else {
+        Pace::Present
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,5 +477,64 @@ mod tests {
         assert!(base.is_anchored(48));
         assert!(!base.is_anchored(64));
         assert_eq!(base.anchored_generation(), Some(48));
+    }
+}
+
+#[cfg(test)]
+mod pacing_tests {
+    use super::*;
+
+    const LATE: Duration = Duration::from_millis(40);
+
+    #[test]
+    fn a_buffer_due_later_waits_exactly_that_long() {
+        let pace = schedule(
+            ClockTime::from_millis(100),
+            ClockTime::from_millis(60),
+            LATE,
+        );
+        assert_eq!(pace, Pace::Wait(Duration::from_millis(40)));
+    }
+
+    #[test]
+    fn a_buffer_within_the_lateness_budget_is_presented() {
+        assert_eq!(
+            schedule(ClockTime::from_millis(60), ClockTime::from_millis(90), LATE),
+            Pace::Present
+        );
+    }
+
+    #[test]
+    fn a_buffer_past_the_lateness_budget_is_dropped() {
+        assert_eq!(
+            schedule(
+                ClockTime::from_millis(60),
+                ClockTime::from_millis(200),
+                LATE
+            ),
+            Pace::DropLate {
+                late_ns: 140_000_000
+            }
+        );
+    }
+
+    #[test]
+    fn an_absurd_wait_presents_instead_of_parking_the_sink() {
+        assert_eq!(
+            schedule(ClockTime::from_secs(3600), ClockTime::ZERO, LATE),
+            Pace::Present
+        );
+    }
+
+    #[test]
+    fn an_unmappable_time_presents_rather_than_guessing() {
+        assert_eq!(
+            schedule(ClockTime::NONE, ClockTime::ZERO, LATE),
+            Pace::Present
+        );
+        assert_eq!(
+            schedule(ClockTime::ZERO, ClockTime::NONE, LATE),
+            Pace::Present
+        );
     }
 }
