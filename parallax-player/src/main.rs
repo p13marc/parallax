@@ -899,6 +899,24 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
     let mut vol_db: f32 = 0.0;
     let mut muted = false;
 
+    // Seek state, player-side. Arrow presses used to be applied straight to
+    // `handle.position()`, which still reports the *old* position until the
+    // seek's Segment lands — so holding the key walked a target that kept
+    // being recomputed from where playback had not moved from yet, and each
+    // press fired a fresh flush through the graph. Now the presses accumulate
+    // into a local target, one seek is in flight at a time, and its
+    // completion is recognised by seqnum on the bus.
+    let mut pending_target: Option<u64> = None;
+    let mut seek_due: Option<std::time::Instant> = None;
+    let mut in_flight: Option<(u64, u64)> = None; // (seqnum, target ns)
+    let mut seek_sent: Option<std::time::Instant> = None;
+    let mut notes = String::new();
+    // Long enough to swallow a held arrow key's repeats, short enough that a
+    // single press still feels immediate.
+    const SEEK_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(120);
+    // A seek that never reports back must not wedge the controls.
+    const SEEK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
     // The window opens lazily on the first displayed frame, so is_open()
     // starts out false — only treat false as "closed" after it was seen open.
     let mut window_seen = false;
@@ -929,24 +947,13 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
                 } else {
                     String::new()
                 };
-                let mut notes = String::new();
-                if let Some(bus) = bus.as_mut() {
-                    use parallax::pipeline::bus::MessageKind;
-                    while let Some(msg) = bus.poll() {
-                        match msg.kind {
-                            MessageKind::Error { error, .. } => {
-                                notes = format!(" · ERROR: {error}");
-                            }
-                            MessageKind::Warning { warning, .. } => {
-                                notes = format!(" · warning: {warning}");
-                            }
-                            MessageKind::Buffering { percent, .. } => {
-                                notes = format!(" · buffering {percent}%");
-                            }
-                            _ => {}
-                        }
-                    }
-                }
+                // Where the transport is *heading*, so a held arrow key shows
+                // its accumulated target immediately instead of a position
+                // that will not move until the seek lands.
+                let seeking = pending_target
+                    .or(in_flight.map(|(_, t)| t))
+                    .map(|t| format!(" → {}", mmss(t)))
+                    .unwrap_or_default();
                 let vol = if volume.is_none() {
                     String::new()
                 } else if muted {
@@ -957,7 +964,7 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
                     String::new()
                 };
                 print!(
-                    "\r\x1b[K{} / {}{state}{vol}{drops}{notes}",
+                    "\r\x1b[K{} / {}{seeking}{state}{vol}{drops}{notes}",
                     mmss(position),
                     mmss(duration_ns)
                 );
@@ -992,18 +999,29 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
                             }
                         }
                         Command::SeekBy(secs) => {
-                            let position = handle.position().to_option()
-                                .map(|p| p.nanos() as i64)
-                                .unwrap_or(0);
+                            // From where the last press aimed, not from
+                            // `position()`: until the seek's Segment lands
+                            // that still reports the old position, so a
+                            // second press would walk from there and undo
+                            // the first.
+                            let from = pending_target
+                                .or(in_flight.map(|(_, t)| t))
+                                .map(|t| t as i64)
+                                .unwrap_or_else(|| {
+                                    handle.position().to_option()
+                                        .map(|p| p.nanos() as i64)
+                                        .unwrap_or(0)
+                                });
                             // duration 0 means *unknown* (MKV/WebM with no
                             // Segment Duration), not an empty file — clamping
                             // against it sent every seek to t=0. Leave the
                             // upper end open and let the demuxer land it.
-                            let mut target = (position + secs * 1_000_000_000).max(0);
+                            let mut target = (from + secs * 1_000_000_000).max(0);
                             if duration_ns > 0 {
                                 target = target.min(duration_ns.saturating_sub(1) as i64);
                             }
-                            handle.seek_time(ClockTime::from_nanos(target as u64)).await;
+                            pending_target = Some(target as u64);
+                            seek_due = Some(std::time::Instant::now() + SEEK_DEBOUNCE);
                         }
                         Command::VolumeBy(delta) => {
                             if let Some(volume) = &volume {
@@ -1033,6 +1051,61 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
                             quit = true;
                         }
                     }
+                }
+
+                // Bus draining moved here from the 250 ms status tick: the
+                // seek's completion arrives on it, and waiting a quarter of a
+                // second to notice would make every seek feel like one.
+                if let Some(bus) = bus.as_mut() {
+                    use parallax::pipeline::bus::MessageKind;
+                    while let Some(msg) = bus.poll() {
+                        match msg.kind {
+                            MessageKind::Error { error, .. } => {
+                                notes = format!(" · ERROR: {error}");
+                            }
+                            MessageKind::Warning { warning, .. } => {
+                                notes = format!(" · warning: {warning}");
+                            }
+                            MessageKind::Buffering { percent, .. } => {
+                                notes = format!(" · buffering {percent}%");
+                            }
+                            // Correlated by seqnum, which is the point of
+                            // having one: a stale completion from a
+                            // superseded seek is ignored rather than
+                            // clearing the seek that superseded it.
+                            MessageKind::SeekDone { seqnum, .. }
+                                if in_flight.is_some_and(|(s, _)| s == seqnum) =>
+                            {
+                                in_flight = None;
+                                seek_sent = None;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                // Fire the coalesced seek once the presses have settled, and
+                // only ever one at a time — overlapping flushes through the
+                // graph buy nothing and cost a decoder restart each.
+                let timed_out = seek_sent.is_some_and(|t| t.elapsed() > SEEK_TIMEOUT);
+                if let Some(target) = pending_target
+                    && seek_due.is_some_and(|due| std::time::Instant::now() >= due)
+                    && (in_flight.is_none() || timed_out)
+                {
+                    let event = parallax::event::SeekEvent::new_time(
+                        ClockTime::from_nanos(target),
+                    );
+                    let seqnum = event.seqnum();
+                    if handle.seek(event).await {
+                        in_flight = Some((seqnum, target));
+                        seek_sent = Some(std::time::Instant::now());
+                    } else {
+                        // Nothing declared itself seekable; say so once
+                        // rather than looking like a dead keypress.
+                        notes = " · not seekable".to_string();
+                    }
+                    pending_target = None;
+                    seek_due = None;
                 }
 
                 if window.is_open() {
