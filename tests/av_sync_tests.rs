@@ -421,3 +421,118 @@ async fn a_silent_loop_rewind_keeps_running_time_monotonic() {
         video.presented.len()
     );
 }
+
+// ===========================================================================
+// The same claim, through the real demuxer and the real decoders
+// ===========================================================================
+
+/// End to end on `tiny_h264_aac.mkv` — 2 s, 20 frames at 10 fps with a
+/// keyframe every 5, plus AAC — with only the two devices stood in for.
+///
+/// Gated on `mkv-demux,h264,audio-aac`, so it runs in CI's `codec-libs` job
+/// (`just check-media-full`) — the `media` combo carries no H.264.
+///
+/// The synthetic source above models the *shape* of the problem; this one
+/// exercises the parts that actually restart on a seek: `MkvDemux`'s cue seek
+/// and per-track skip, `H264Decoder` rebuilding openh264 on `FlushStart` and
+/// waiting for an IDR, and `AudioDecoderElement` resetting its decoder and
+/// its running timestamp. Those are what make the two branches restart at
+/// different instants in the first place.
+#[cfg(all(feature = "mkv-demux", feature = "h264", feature = "audio-aac"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_real_mkv_keeps_lip_sync_across_a_seek() {
+    use parallax::elements::codec::AudioDecoderElement;
+    use parallax::elements::demux::MkvDemux;
+    use parallax::elements::{AacDecoder, H264Decoder};
+
+    const H264_AAC_MKV: &[u8] = include_bytes!("fixtures/tiny_h264_aac.mkv");
+
+    let demux = MkvDemux::new(std::io::Cursor::new(H264_AAC_MKV.to_vec()))
+        .expect("the fixture is readable Matroska");
+    let audio_track = demux.audio_track().expect("the fixture has audio");
+    let info = audio_track.audio_info.as_ref().expect("audio info");
+    let (rate, channels) = (info.sample_rate, info.channels as u32);
+    let asc = info
+        .codec_private
+        .clone()
+        .expect("AAC CodecPrivate is the AudioSpecificConfig");
+
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_demuxer("demux", demux);
+    let dec = pipeline.add_filter("decode", H264Decoder::new().expect("openh264"));
+    // AAC decodes to interleaved f32.
+    let audio = ClockAudioSink::new(rate, channels, 4);
+    let audio_log = audio.log();
+    let video = PacedVideoSink::new();
+    let video_log = video.log();
+    let adec = pipeline.add_transform(
+        "audiodec",
+        AudioDecoderElement::new(AacDecoder::from_asc(&asc).expect("ASC")),
+    );
+    let vsink = pipeline.add_async_sink("display", video);
+    let asink = pipeline.add_async_sink("speaker", audio);
+
+    // Shallower than the player's 24/96 on purpose: the fixture is two
+    // seconds long and the player's depths would swallow all of it, so the
+    // demuxer would reach EOS before the seek was ever issued. Audio still
+    // fills first (8 AAC frames ≈ 170 ms against 4 video frames ≈ 400 ms),
+    // which is what keeps the video branch from starving it.
+    pipeline
+        .link_pads_full(src, "video", dec, "sink", LinkPolicy::Block, Some(4))
+        .unwrap();
+    pipeline.link(dec, vsink).unwrap();
+    pipeline
+        .link_pads_full(src, "audio", adec, "sink", LinkPolicy::Block, Some(8))
+        .unwrap();
+    pipeline.link(adec, asink).unwrap();
+
+    let executor = Executor::with_config(ExecutorConfig::default());
+    let handle = executor.start(&mut pipeline).unwrap();
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let before = snapshot(&audio_log).presented.len();
+    // 300 ms is not a keyframe; MKV's default snap is forward, so video lands
+    // on the 500 ms cue — and since #265 audio's skip floor lands there too.
+    assert!(handle.seek_time(ClockTime::from_millis(300)).await);
+    tokio::time::sleep(Duration::from_millis(900)).await;
+
+    let audio = snapshot(&audio_log);
+    let video = snapshot(&video_log);
+    handle.stop();
+    let _ = handle.wait().await;
+
+    assert!(
+        audio.presented.len() > before,
+        "audio resumed after the seek"
+    );
+
+    // MKV forward-snaps, and the landing is the cue — a real video keyframe —
+    // reported up front and shared by both branches. It used to be the
+    // *requested* time on the audio pad while video waited a GOP for its
+    // keyframe.
+    let landing = audio.segments.last().expect("a post-seek segment").start;
+    assert_eq!(landing, 500_000_000, "landed on the 500 ms cue keyframe");
+    assert_eq!(
+        video.segments.last().map(|s| s.start),
+        Some(landing),
+        "both pads carry the same post-seek segment"
+    );
+
+    let mark = audio.presented[before].at;
+    let resumed: Vec<_> = video
+        .presented
+        .iter()
+        .filter(|p| p.pts.nanos() as i64 >= landing)
+        .collect();
+    assert!(
+        resumed.len() >= 3,
+        "video resumed after the seek: {} frames",
+        resumed.len()
+    );
+
+    let drift = settled_drift_ms(&audio, &video, mark);
+    assert!(
+        drift.abs() < TOLERANCE_MS,
+        "real MKV drifted {drift:.1} ms across the seek"
+    );
+}
