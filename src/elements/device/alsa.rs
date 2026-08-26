@@ -39,6 +39,7 @@ use crate::format::{
     AudioFormatCaps, CapsValue, ElementMediaCaps, FormatCaps, FormatMemoryCap, MemoryCaps,
 };
 use crate::pipeline::flow::FlowStateHandle;
+use crate::pipeline::sync::{clip_to_segment, frames_to_nanos};
 
 use super::DeviceError;
 
@@ -486,8 +487,10 @@ pub struct AlsaSink {
     anchored_generation: Option<u64>,
     /// Frames dropped for falling outside the segment, for observability.
     clipped_frames: u64,
-    /// The sync generation in force, named in band by `FlushStop` (#265).
-    generation: u64,
+    /// This sink's part of the per-generation anchor handshake (#265) — as
+    /// the clock provider it is normally the master, so `settle` publishes
+    /// the origin rather than waiting for one.
+    anchor: crate::pipeline::AnchorGate,
 }
 
 /// Clock provider wrapper for AlsaSink.
@@ -578,7 +581,7 @@ impl AlsaSink {
             segment: None,
             anchored_generation: None,
             clipped_frames: 0,
-            generation: crate::pipeline::INITIAL_GENERATION,
+            anchor: crate::pipeline::AnchorGate::default(),
         })
     }
 
@@ -677,70 +680,6 @@ impl AlsaSink {
     pub fn create_clock(&self) -> AlsaClock {
         AlsaClock::from_position(Arc::clone(&self.position))
     }
-}
-
-/// The frames of a buffer that fall inside the segment (#265).
-///
-/// A seek lands the audio track at or *before* the reference track's
-/// keyframe — MP4 seeks every non-reference track with `SeekSnap::Before`
-/// precisely so playback does not open with an audio gap — so the first
-/// post-seek buffer routinely straddles `segment.start`. The video path has
-/// clipped that pre-roll since #165 (`SegmentClip` in the decoders, and
-/// `AutoVideoSink` as the last line); the audio path clipped it nowhere at
-/// all, so the sink played samples the segment says are not in it and the
-/// stream-time-to-clock mapping was wrong at its origin.
-///
-/// Returns `(skip, keep)` in frames: `skip` frames trimmed off the head,
-/// `keep` frames written. `keep == 0` means the whole buffer is out of
-/// segment. Pure integer arithmetic over the sink's own configured rate, so
-/// it is testable without a device — same reasoning as [`rebase_written`].
-///
-/// Reverse segments are passed through untouched: a PTS below `start` there
-/// is the walk's own termination, not pre-roll, which is the same rule
-/// `AutoVideoSink::clips_out_of_segment` follows.
-fn clip_to_segment(
-    segment: &crate::event::SegmentEvent,
-    pts: ClockTime,
-    frames: usize,
-    sample_rate: u32,
-) -> (usize, usize) {
-    let (Some(pts), true) = (pts.to_option(), segment.rate > 0.0) else {
-        return (0, frames);
-    };
-    let rate = sample_rate.max(1) as u128;
-    let pts_ns = pts.nanos() as i128;
-
-    // Head: round *up*, so a frame straddling the boundary is dropped
-    // rather than played early.
-    let skip = if pts_ns < segment.start as i128 {
-        let gap = (segment.start as i128 - pts_ns) as u128;
-        let f = gap.saturating_mul(rate).div_ceil(1_000_000_000);
-        (f.min(frames as u128)) as usize
-    } else {
-        0
-    };
-
-    // Tail: a seek with a `stop` ends playback there, so a buffer straddling
-    // it keeps only the part below. Round *down* for the mirror reason.
-    let mut keep = frames - skip;
-    if segment.stop >= 0 {
-        let first_ns = pts_ns + (skip as u128).saturating_mul(1_000_000_000).div_ceil(rate) as i128;
-        if first_ns >= segment.stop as i128 {
-            return (skip, 0);
-        }
-        let room = (segment.stop as i128 - first_ns) as u128;
-        let f = room.saturating_mul(rate) / 1_000_000_000;
-        keep = keep.min(f as usize);
-    }
-    (skip, keep)
-}
-
-/// How long `frames` last at `sample_rate`, in nanoseconds.
-fn frames_to_nanos(frames: u64, sample_rate: u32) -> u64 {
-    frames
-        .saturating_mul(1_000_000_000)
-        .checked_div(sample_rate.max(1) as u64)
-        .unwrap_or(0)
 }
 
 /// What `written_frames` becomes after discarding `queued` device frames.
@@ -1074,8 +1013,7 @@ impl AsyncSink for AlsaSink {
         // zero; at start-up it is a device buffer's worth, which used to go
         // unaccounted and made every paced branch run that much early.
         if let Some(sync) = ctx.sync()
-            && sync.is_master()
-            && self.anchored_generation != Some(self.generation)
+            && self.anchored_generation != Some(self.anchor.generation())
             && let Some(seg) = &self.segment
         {
             let first = ClockTime::from_nanos(
@@ -1089,9 +1027,10 @@ impl AsyncSink for AlsaSink {
                     queued,
                     self.format.sample_rate,
                 )));
-            if sync.anchor(self.generation, heard_at, seg.to_running_time(first)) {
-                self.anchored_generation = Some(self.generation);
-            }
+            self.anchor
+                .settle(sync, heard_at, seg.to_running_time(first))
+                .await;
+            self.anchored_generation = Some(self.anchor.generation());
         }
 
         // Register the PCM's poll fd with the tokio reactor once and keep
@@ -1237,7 +1176,7 @@ impl AsyncSink for AlsaSink {
             // The flush names the sync generation to anchor for (#265), so
             // both branches of an A/V graph derive it from the same event.
             crate::event::Event::FlushStop(stop) => {
-                self.generation = stop.epoch;
+                self.anchor.open(stop.epoch);
             }
             // The PTS → running-time mapping, and with it what counts as
             // out-of-segment audio and where running time zero lands.
@@ -1578,77 +1517,10 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Segment clipping and clock honesty across a flush (#265)
+    // Clock honesty across a flush (#265)
     // ------------------------------------------------------------------
 
-    use crate::event::SegmentEvent;
-
     const RATE: u32 = 48_000;
-
-    /// 480 frames = 10 ms at 48 kHz.
-    fn ms(n: u64) -> ClockTime {
-        ClockTime::from_millis(n)
-    }
-
-    #[test]
-    fn a_buffer_wholly_inside_the_segment_is_untouched() {
-        let seg = SegmentEvent::new_time(ms(1_000), None);
-        assert_eq!(clip_to_segment(&seg, ms(1_000), 480, RATE), (0, 480));
-        assert_eq!(clip_to_segment(&seg, ms(5_000), 480, RATE), (0, 480));
-    }
-
-    #[test]
-    fn a_buffer_wholly_below_the_segment_is_dropped() {
-        let seg = SegmentEvent::new_time(ms(1_000), None);
-        // Ends exactly at the boundary: nothing of it is in segment.
-        assert_eq!(clip_to_segment(&seg, ms(990), 480, RATE), (480, 0));
-        assert_eq!(clip_to_segment(&seg, ms(500), 480, RATE), (480, 0));
-    }
-
-    #[test]
-    fn a_straddling_buffer_is_trimmed_sample_accurately() {
-        // MP4 seeks every non-reference track with SeekSnap::Before, so the
-        // first post-seek audio buffer routinely starts below the segment.
-        let seg = SegmentEvent::new_time(ms(1_000), None);
-        // Starts 5 ms early: 240 frames of pre-roll, 240 kept.
-        assert_eq!(clip_to_segment(&seg, ms(995), 480, RATE), (240, 240));
-    }
-
-    #[test]
-    fn a_frame_straddling_the_boundary_is_dropped_not_played_early() {
-        // 1 ns before the start: the first frame is partly out of segment,
-        // so the ceiling drops it rather than playing it a hair early.
-        let seg = SegmentEvent::new_time(ms(1_000), None);
-        let pts = ClockTime::from_nanos(ms(1_000).nanos() - 1);
-        assert_eq!(clip_to_segment(&seg, pts, 480, RATE), (1, 479));
-    }
-
-    #[test]
-    fn a_segment_stop_ends_playback_inside_the_buffer() {
-        // A seek with a stop (#165) really ends there.
-        let seg = SegmentEvent::new_time(ms(1_000), Some(ms(1_005)));
-        assert_eq!(clip_to_segment(&seg, ms(1_000), 480, RATE), (0, 240));
-        // Entirely past the stop.
-        assert_eq!(clip_to_segment(&seg, ms(1_005), 480, RATE), (0, 0));
-    }
-
-    #[test]
-    fn head_and_tail_trims_compose() {
-        let seg = SegmentEvent::new_time(ms(1_000), Some(ms(1_005)));
-        // Starts 5 ms early and runs 5 ms past the stop: only the middle
-        // 5 ms survives.
-        assert_eq!(clip_to_segment(&seg, ms(995), 720, RATE), (240, 240));
-    }
-
-    #[test]
-    fn an_unmappable_or_reverse_segment_clips_nothing() {
-        let seg = SegmentEvent::new_time(ms(1_000), None);
-        assert_eq!(clip_to_segment(&seg, ClockTime::NONE, 480, RATE), (0, 480));
-        // Reverse: a PTS below start is the walk's own termination, the same
-        // rule AutoVideoSink::clips_out_of_segment follows.
-        let rev = SegmentEvent::new_time(ms(0), Some(ms(2_000))).with_rate(-1.0);
-        assert_eq!(clip_to_segment(&rev, ms(500), 480, RATE), (0, 480));
-    }
 
     #[test]
     fn a_stalled_clock_holds_still_instead_of_interpolating() {
@@ -1701,15 +1573,5 @@ mod tests {
             ClockTime::from_secs(2),
             "the device drives the clock again"
         );
-    }
-
-    #[test]
-    fn frames_convert_to_nanos_without_dividing_by_zero() {
-        assert_eq!(frames_to_nanos(48_000, RATE), 1_000_000_000);
-        assert_eq!(frames_to_nanos(4_096, RATE), 85_333_333);
-        assert_eq!(frames_to_nanos(0, RATE), 0);
-        // A zero rate cannot happen (the device configured one), but it must
-        // clamp rather than divide by zero.
-        assert_eq!(frames_to_nanos(1, 0), 1_000_000_000);
     }
 }

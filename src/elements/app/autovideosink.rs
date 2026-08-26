@@ -175,16 +175,10 @@ pub struct AutoVideoSink {
     sync: bool,
     /// How late a frame may be and still be shown, when `sync` is on.
     max_lateness: Duration,
-    /// The sync generation this sink last anchored (#265). A `FlushStop`
-    /// names the next one in band, so both branches of an A/V graph anchor
-    /// the same generation from the same event.
-    generation: u64,
-    /// When this sink started waiting for the master to anchor the current
-    /// generation. `None` once it has stopped waiting.
-    anchor_wait: Option<std::time::Instant>,
-    /// How long to let the master anchor a generation before anchoring it
-    /// ourselves; see [`with_anchor_grace`](Self::with_anchor_grace).
-    anchor_grace: Duration,
+    /// This sink's part of the per-generation anchor handshake (#265). A
+    /// `FlushStop` names the generation in band, so both branches of an A/V
+    /// graph anchor the same one from the same event.
+    anchor: crate::pipeline::AnchorGate,
     /// Whether the first buffer of the current generation is still owed a
     /// present. It is the frame the user is waiting to see after a seek, so
     /// it goes up however late it is.
@@ -349,9 +343,7 @@ impl AutoVideoSink {
             name: "autovideosink".to_string(),
             sync: false,
             max_lateness: DEFAULT_MAX_LATENESS,
-            generation: crate::pipeline::INITIAL_GENERATION,
-            anchor_wait: None,
-            anchor_grace: crate::pipeline::ANCHOR_GRACE,
+            anchor: crate::pipeline::AnchorGate::default(),
             generation_opened: false,
             last_pts: ClockTime::NONE,
             display_generation: Arc::new(AtomicU64::new(0)),
@@ -431,7 +423,7 @@ impl AutoVideoSink {
     /// costs nothing. It exists so a stalled or absent audio branch cannot
     /// freeze the picture; a pipeline with no master never waits at all.
     pub fn with_anchor_grace(mut self, grace: Duration) -> Self {
-        self.anchor_grace = grace;
+        self.anchor.set_grace(grace);
         self
     }
 
@@ -459,8 +451,7 @@ impl AutoVideoSink {
     /// Arms the anchor handshake for it and marks the next frame as the one
     /// that must be shown however late it is.
     fn open_generation(&mut self, epoch: u64) {
-        self.generation = epoch;
-        self.anchor_wait = None;
+        self.anchor.open(epoch);
         self.generation_opened = true;
     }
 
@@ -484,33 +475,11 @@ impl AutoVideoSink {
     /// restarting after a seek is slower than an audio one (the decoder is
     /// rebuilt, a keyframe must be decoded), so the master has usually
     /// anchored before the first frame even arrives and the wait costs
-    /// nothing. When there is no master at all — a video-only pipeline on
-    /// the system clock — this sink anchors immediately, which is exactly
-    /// what the old private per-sink anchor did.
-    ///
-    /// The wait is bounded by [`with_anchor_grace`](Self::with_anchor_grace):
-    /// a stalled or absent audio branch must not freeze the picture.
+    /// nothing. The rules live in [`AnchorGate`](crate::pipeline::AnchorGate)
+    /// so every pacing sink follows the same ones.
     async fn settle_anchor(&mut self, ctx: &ConsumeContext<'_>, target: ClockTime) {
         let Some(sync) = ctx.sync() else { return };
-        if sync.is_anchored(self.generation) && !sync.is_master() {
-            return;
-        }
-        if sync.is_master() || !sync.has_master() {
-            sync.anchor(self.generation, ctx.clock_time(), target);
-            return;
-        }
-        let started = *self.anchor_wait.get_or_insert_with(std::time::Instant::now);
-        while !sync.is_anchored(self.generation) {
-            if started.elapsed() >= self.anchor_grace {
-                tracing::debug!(
-                    "autovideosink: no sync anchor after {:?}; anchoring this branch itself",
-                    self.anchor_grace
-                );
-                sync.anchor(self.generation, ctx.clock_time(), target);
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
+        self.anchor.settle(sync, ctx.clock_time(), target).await;
     }
 
     /// Whether this PTS is out-of-segment pre-roll a sync sink should drop
@@ -1551,7 +1520,10 @@ mod tests {
         use crate::event::{Event, FlushStopEvent};
 
         let mut sink = AutoVideoSink::new();
-        assert_eq!(sink.generation, crate::pipeline::INITIAL_GENERATION);
+        assert_eq!(
+            sink.anchor.generation(),
+            crate::pipeline::INITIAL_GENERATION
+        );
         assert!(!sink.generation_opened);
 
         let before = sink.display_generation.load(Ordering::Acquire);
@@ -1563,12 +1535,15 @@ mod tests {
 
         let _ = sink
             .handle_downstream_event(Event::FlushStop(FlushStopEvent::new(true).with_epoch(48)));
-        assert_eq!(sink.generation, 48, "the flush names the generation");
+        assert_eq!(
+            sink.anchor.generation(),
+            48,
+            "the flush names the generation"
+        );
         assert!(
             sink.generation_opened,
             "the first frame after a seek is the one the user is waiting for"
         );
-        assert!(sink.anchor_wait.is_none(), "the grace window restarts");
     }
 
     /// A pipeline with no clock provider has no master, so the sink anchors

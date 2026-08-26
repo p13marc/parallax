@@ -321,6 +321,161 @@ impl SyncHandle {
 }
 
 // ============================================================================
+// Audio-side helpers shared by every sink that maps stream time to the clock
+// ============================================================================
+/// The frames of a buffer that fall inside the segment (#265).
+///
+/// A seek lands the audio track at or *before* the reference track's
+/// keyframe — MP4 seeks every non-reference track with `SeekSnap::Before`
+/// precisely so playback does not open with an audio gap — so the first
+/// post-seek buffer routinely straddles `segment.start`. The video path has
+/// clipped that pre-roll since #165 (`SegmentClip` in the decoders, and
+/// `AutoVideoSink` as the last line); the audio path clipped it nowhere at
+/// all, so the sink played samples the segment says are not in it and the
+/// stream-time-to-clock mapping was wrong at its origin.
+///
+/// Returns `(skip, keep)` in frames: `skip` frames trimmed off the head,
+/// `keep` frames written. `keep == 0` means the whole buffer is out of
+/// segment. Pure integer arithmetic over the sink's own configured rate, so
+/// it is testable without a device — same reasoning as `AlsaSink`'s `rebase_written`.
+///
+/// Reverse segments are passed through untouched: a PTS below `start` there
+/// is the walk's own termination, not pre-roll, which is the same rule
+/// `AutoVideoSink`'s own clip follows.
+pub fn clip_to_segment(
+    segment: &crate::event::SegmentEvent,
+    pts: ClockTime,
+    frames: usize,
+    sample_rate: u32,
+) -> (usize, usize) {
+    let (Some(pts), true) = (pts.to_option(), segment.rate > 0.0) else {
+        return (0, frames);
+    };
+    let rate = sample_rate.max(1) as u128;
+    let pts_ns = pts.nanos() as i128;
+
+    // Head: round *up*, so a frame straddling the boundary is dropped
+    // rather than played early.
+    let skip = if pts_ns < segment.start as i128 {
+        let gap = (segment.start as i128 - pts_ns) as u128;
+        let f = gap.saturating_mul(rate).div_ceil(1_000_000_000);
+        (f.min(frames as u128)) as usize
+    } else {
+        0
+    };
+
+    // Tail: a seek with a `stop` ends playback there, so a buffer straddling
+    // it keeps only the part below. Round *down* for the mirror reason.
+    let mut keep = frames - skip;
+    if segment.stop >= 0 {
+        let first_ns = pts_ns + (skip as u128).saturating_mul(1_000_000_000).div_ceil(rate) as i128;
+        if first_ns >= segment.stop as i128 {
+            return (skip, 0);
+        }
+        let room = (segment.stop as i128 - first_ns) as u128;
+        let f = room.saturating_mul(rate) / 1_000_000_000;
+        keep = keep.min(f as usize);
+    }
+    (skip, keep)
+}
+
+/// How long `frames` last at `sample_rate`, in nanoseconds.
+pub fn frames_to_nanos(frames: u64, sample_rate: u32) -> u64 {
+    frames
+        .saturating_mul(1_000_000_000)
+        .checked_div(sample_rate.max(1) as u64)
+        .unwrap_or(0)
+}
+
+/// Drives one sink's part of the per-generation anchor handshake (#265).
+///
+/// Held by a pacing sink; see [`SyncBase`] for the contract. The rules it
+/// encodes, in one place so every sink follows the same ones:
+///
+/// - the master anchors immediately — its device's progress *is* the clock;
+/// - with no master in the graph, whoever gets there first anchors, which is
+///   what a video-only pipeline wants and what the old private per-sink
+///   anchor already did;
+/// - otherwise wait for the master, but only for `grace`: a stalled or
+///   absent audio branch must not freeze the picture.
+#[derive(Debug)]
+pub struct AnchorGate {
+    generation: u64,
+    grace: Duration,
+    waiting_since: Option<std::time::Instant>,
+}
+
+impl Default for AnchorGate {
+    fn default() -> Self {
+        Self {
+            generation: INITIAL_GENERATION,
+            grace: ANCHOR_GRACE,
+            waiting_since: None,
+        }
+    }
+}
+
+impl AnchorGate {
+    /// A gate that waits at most `grace` for the master.
+    pub fn with_grace(grace: Duration) -> Self {
+        Self {
+            grace,
+            ..Self::default()
+        }
+    }
+
+    /// How long this gate waits for the master.
+    pub fn grace(&self) -> Duration {
+        self.grace
+    }
+
+    /// Set how long this gate waits for the master.
+    pub fn set_grace(&mut self, grace: Duration) {
+        self.grace = grace;
+    }
+
+    /// The generation currently being anchored.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// A flush opened a new generation, named in band by `FlushStop`.
+    pub fn open(&mut self, generation: u64) {
+        self.generation = generation;
+        self.waiting_since = None;
+    }
+
+    /// Make sure this generation's origin is fixed before pacing against it.
+    ///
+    /// `target` is the buffer's segment running time — the value that must
+    /// map onto `now` on the clock if this sink ends up anchoring.
+    pub async fn settle(&mut self, sync: &SyncHandle, now: ClockTime, target: ClockTime) {
+        if sync.is_master() || !sync.has_master() {
+            sync.anchor(self.generation, now, target);
+            return;
+        }
+        if sync.is_anchored(self.generation) {
+            return;
+        }
+        let started = *self
+            .waiting_since
+            .get_or_insert_with(std::time::Instant::now);
+        while !sync.is_anchored(self.generation) {
+            if started.elapsed() >= self.grace {
+                tracing::debug!(
+                    "sync: no anchor for generation {} after {:?}; anchoring this branch itself",
+                    self.generation,
+                    self.grace
+                );
+                sync.anchor(self.generation, now, target);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+}
+
+// ============================================================================
 // Presentation pacing
 // ============================================================================
 
@@ -536,5 +691,88 @@ mod pacing_tests {
             schedule(ClockTime::ZERO, ClockTime::NONE, LATE),
             Pace::Present
         );
+    }
+}
+
+#[cfg(test)]
+mod clip_tests {
+    use super::*;
+    use crate::event::SegmentEvent;
+
+    const RATE: u32 = 48_000;
+
+    /// 480 frames = 10 ms at 48 kHz.
+    fn ms(n: u64) -> ClockTime {
+        ClockTime::from_millis(n)
+    }
+
+    #[test]
+    fn a_buffer_wholly_inside_the_segment_is_untouched() {
+        let seg = SegmentEvent::new_time(ms(1_000), None);
+        assert_eq!(clip_to_segment(&seg, ms(1_000), 480, RATE), (0, 480));
+        assert_eq!(clip_to_segment(&seg, ms(5_000), 480, RATE), (0, 480));
+    }
+
+    #[test]
+    fn a_buffer_wholly_below_the_segment_is_dropped() {
+        let seg = SegmentEvent::new_time(ms(1_000), None);
+        // Ends exactly at the boundary: nothing of it is in segment.
+        assert_eq!(clip_to_segment(&seg, ms(990), 480, RATE), (480, 0));
+        assert_eq!(clip_to_segment(&seg, ms(500), 480, RATE), (480, 0));
+    }
+
+    #[test]
+    fn a_straddling_buffer_is_trimmed_sample_accurately() {
+        // MP4 seeks every non-reference track with SeekSnap::Before, so the
+        // first post-seek audio buffer routinely starts below the segment.
+        let seg = SegmentEvent::new_time(ms(1_000), None);
+        // Starts 5 ms early: 240 frames of pre-roll, 240 kept.
+        assert_eq!(clip_to_segment(&seg, ms(995), 480, RATE), (240, 240));
+    }
+
+    #[test]
+    fn a_frame_straddling_the_boundary_is_dropped_not_played_early() {
+        // 1 ns before the start: the first frame is partly out of segment,
+        // so the ceiling drops it rather than playing it a hair early.
+        let seg = SegmentEvent::new_time(ms(1_000), None);
+        let pts = ClockTime::from_nanos(ms(1_000).nanos() - 1);
+        assert_eq!(clip_to_segment(&seg, pts, 480, RATE), (1, 479));
+    }
+
+    #[test]
+    fn a_segment_stop_ends_playback_inside_the_buffer() {
+        // A seek with a stop (#165) really ends there.
+        let seg = SegmentEvent::new_time(ms(1_000), Some(ms(1_005)));
+        assert_eq!(clip_to_segment(&seg, ms(1_000), 480, RATE), (0, 240));
+        // Entirely past the stop.
+        assert_eq!(clip_to_segment(&seg, ms(1_005), 480, RATE), (0, 0));
+    }
+
+    #[test]
+    fn head_and_tail_trims_compose() {
+        let seg = SegmentEvent::new_time(ms(1_000), Some(ms(1_005)));
+        // Starts 5 ms early and runs 5 ms past the stop: only the middle
+        // 5 ms survives.
+        assert_eq!(clip_to_segment(&seg, ms(995), 720, RATE), (240, 240));
+    }
+
+    #[test]
+    fn an_unmappable_or_reverse_segment_clips_nothing() {
+        let seg = SegmentEvent::new_time(ms(1_000), None);
+        assert_eq!(clip_to_segment(&seg, ClockTime::NONE, 480, RATE), (0, 480));
+        // Reverse: a PTS below start is the walk's own termination, the same
+        // rule AutoVideoSink::clips_out_of_segment follows.
+        let rev = SegmentEvent::new_time(ms(0), Some(ms(2_000))).with_rate(-1.0);
+        assert_eq!(clip_to_segment(&rev, ms(500), 480, RATE), (0, 480));
+    }
+
+    #[test]
+    fn frames_convert_to_nanos_without_dividing_by_zero() {
+        assert_eq!(frames_to_nanos(48_000, RATE), 1_000_000_000);
+        assert_eq!(frames_to_nanos(4_096, RATE), 85_333_333);
+        assert_eq!(frames_to_nanos(0, RATE), 0);
+        // A zero rate cannot happen (the device configured one), but it must
+        // clamp rather than divide by zero.
+        assert_eq!(frames_to_nanos(1, 0), 1_000_000_000);
     }
 }
