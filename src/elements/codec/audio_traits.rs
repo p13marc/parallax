@@ -331,6 +331,19 @@ pub trait AudioDecoder: Send {
     ///
     /// [`AudioDecoderElement`]: crate::elements::codec::AudioDecoderElement
     fn recycle(&mut self, _data: Vec<u8>) {}
+
+    /// Drop whatever the decoder is carrying and start fresh.
+    ///
+    /// Called on `Event::FlushStart` — a seek abandoned the stream position
+    /// the decoder's state belongs to, and decoding the new position against
+    /// it produces artefacts at best. The same reasoning as `H264Decoder`
+    /// rebuilding its openh264 instance on a flush; the audio wrappers never
+    /// had a hook to do it through.
+    ///
+    /// The default is a no-op, so a stateless decoder (and any out-of-tree
+    /// one) is unaffected. Codecs with inter-packet state — Opus's overlap,
+    /// Vorbis's MDCT priming, AAC's window — should override it.
+    fn reset(&mut self) {}
 }
 
 #[cfg(test)]

@@ -391,6 +391,15 @@ impl AudioDecoder for OpusDecoder {
         Ok(None)
     }
 
+    fn reset(&mut self) {
+        // The overlap-add tail belongs to the abandoned stream position; a
+        // seek that kept it opens the new position with a cross-fade from
+        // wherever playback used to be.
+        if let Err(e) = self.decoder.reset_state() {
+            tracing::warn!("opus decoder reset failed: {e:?}");
+        }
+    }
+
     fn output_sample_rate(&self) -> u32 {
         self.sample_rate
     }

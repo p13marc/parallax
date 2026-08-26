@@ -137,10 +137,14 @@ impl AudioDecoder for VorbisDecoder {
     }
 
     fn flush(&mut self) -> Result<Option<AudioSamples>> {
-        // Reset the MDCT window state so the decoder restarts cleanly after
-        // a flushing seek (AudioDecoderElement routes seeks here).
-        self.inner.reset();
+        // Nothing is held back at end of stream. The MDCT-window reset a
+        // seek needs moved to `reset`, called on every FlushStart rather
+        // than only the first one (see `AacDecoder::flush`).
         Ok(None)
+    }
+
+    fn reset(&mut self) {
+        self.inner.reset();
     }
 
     fn output_sample_rate(&self) -> u32 {
