@@ -183,8 +183,9 @@ pub struct AutoVideoSink {
     /// present. It is the frame the user is waiting to see after a seek, so
     /// it goes up however late it is.
     generation_opened: bool,
-    /// PTS of the last buffer seen, the pivot an instant rate change bends
-    /// the segment around.
+    /// PTS of the last buffer that reached the pacer — the pivot an instant
+    /// rate change bends the segment around, so the change is continuous at
+    /// the position actually being played.
     last_pts: ClockTime,
     /// Frames stamped below this are stale — a flushing seek bumped it. Read
     /// by the display thread, which skips them rather than blitting the
