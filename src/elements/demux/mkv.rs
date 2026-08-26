@@ -1179,15 +1179,15 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
                 });
                 (Some(offset), cue_ticks, Some(cue_ticks))
             }
-            // Forward with a cue ahead: that cue is the landing.
-            _ if next_ticks.is_some() => {
-                let landing = next_ticks.expect("checked");
-                // Still enter at the *previous* cue's cluster: the target
-                // frame's cluster may begin before it, and the per-track skip
-                // discards everything below the landing anyway.
-                (prev.map(|(_, offset)| offset), landing, Some(landing))
-            }
-            _ => (prev.map(|(_, offset)| offset), ticks, None),
+            // Forward. Enter at the *previous* cue's cluster either way: the
+            // landing frame's cluster may begin before it, and the per-track
+            // skip discards everything below the floor anyway.
+            _ => match next_ticks {
+                // A cue ahead of the target is the landing.
+                Some(landing) => (prev.map(|(_, offset)| offset), landing, Some(landing)),
+                // Past the last cue: only the scan can find the keyframe.
+                None => (prev.map(|(_, offset)| offset), ticks, None),
+            },
         };
 
         // Cue-indexed path first, on OUR cue table (`mkv_cues`): the crate's

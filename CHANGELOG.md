@@ -105,9 +105,10 @@ Every out-of-tree plugin must be rebuilt: the plugin ABI went **12 → 13**.
   time while its link filled, which backed the demuxer up, which starved the
   branch whose device drives the clock it was waiting on. `--loop` plus
   repeated seeks reached it in about half a second. `SyncBase::flush_epoch`
-  now rises the instant a flushing seek is dispatched and such a wait drops
-  its frame; `StallWatch` presents after `STALL_LIMIT` of a motionless clock
-  as a backstop, excluding a deliberate pause.
+  now rises the instant a flushing seek is dispatched, and a wait that began
+  before it drops its buffer — the pacing wait and the wait for the sync
+  master alike. `StallWatch` presents after `STALL_LIMIT` of a motionless
+  clock as a backstop, excluding a deliberate pause.
 - `parallax-player` applied arrow presses to `handle.position()`, which still
   reports the old position until the seek lands, so a held key walked a target
   that kept being recomputed from where playback had not moved from yet and
