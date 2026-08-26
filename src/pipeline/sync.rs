@@ -405,6 +405,31 @@ pub enum Realign {
     Restart,
 }
 
+impl Realign {
+    /// Where the first sample actually written lands, given the buffer's
+    /// running time and the cursor it was reconciled against.
+    ///
+    /// Worth stating separately because the arithmetic is easy to get wrong
+    /// in exactly one place: filling a gap advances the device by the silence
+    /// *as well as* the payload, so a cursor advanced by the payload alone
+    /// ends up short by precisely the gap it had just closed — reintroducing
+    /// the drift the fill existed to remove.
+    pub fn placed_at(self, rt: ClockTime, expected: ClockTime) -> ClockTime {
+        match self {
+            // The gap is closed, so the payload starts where it claims to.
+            Self::Silence(_) | Self::Restart => rt,
+            // The trimmed head is exactly what was already written, so the
+            // remainder starts at the cursor. Same for a no-op, whose
+            // sub-tolerance offset is deliberately absorbed rather than
+            // allowed to accumulate.
+            Self::None | Self::Trim(_) => match expected.to_option() {
+                Some(expected) => expected,
+                None => rt,
+            },
+        }
+    }
+}
+
 /// Decide how to place a buffer whose segment running time is `rt` when the
 /// next sample written is due at `expected`.
 ///
@@ -879,6 +904,39 @@ mod realign_tests {
             Realign::Restart
         );
         assert_eq!(realign(ms(0), ms(90_000), RATE, TOL, MAX), Realign::Restart);
+    }
+
+    #[test]
+    fn filling_a_gap_places_the_payload_where_it_claims_to_be() {
+        // The bug this pins: advancing the cursor by the payload alone after
+        // writing silence leaves it short by the gap, so the drift the fill
+        // removed comes straight back.
+        let r = realign(ms(520), ms(500), RATE, TOL, MAX);
+        assert_eq!(r, Realign::Silence(960));
+        assert_eq!(r.placed_at(ms(520), ms(500)), ms(520));
+    }
+
+    #[test]
+    fn a_trim_places_the_remainder_at_the_cursor() {
+        let r = realign(ms(480), ms(500), RATE, TOL, MAX);
+        assert_eq!(r.placed_at(ms(480), ms(500)), ms(500));
+    }
+
+    #[test]
+    fn an_untouched_buffer_absorbs_its_sub_tolerance_offset() {
+        // Accumulating from the cursor, not from the buffer, is what keeps a
+        // steady 1 ms of jitter from adding up into a real offset.
+        let r = realign(ms(501), ms(500), RATE, TOL, MAX);
+        assert_eq!(r, Realign::None);
+        assert_eq!(r.placed_at(ms(501), ms(500)), ms(500));
+    }
+
+    #[test]
+    fn a_restart_places_the_payload_at_its_own_time() {
+        let r = realign(ms(90_000), ms(500), RATE, TOL, MAX);
+        assert_eq!(r.placed_at(ms(90_000), ms(500)), ms(90_000));
+        // And a cursor that was never set starts from the buffer.
+        assert_eq!(Realign::None.placed_at(ms(42), ClockTime::NONE), ms(42));
     }
 
     #[test]

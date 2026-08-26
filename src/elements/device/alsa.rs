@@ -39,7 +39,7 @@ use crate::format::{
     AudioFormatCaps, CapsValue, ElementMediaCaps, FormatCaps, FormatMemoryCap, MemoryCaps,
 };
 use crate::pipeline::flow::FlowStateHandle;
-use crate::pipeline::sync::{clip_to_segment, frames_to_nanos};
+use crate::pipeline::sync::{Realign, clip_to_segment, frames_to_nanos, realign};
 
 use super::DeviceError;
 
@@ -1190,20 +1190,25 @@ impl AsyncSink for AlsaSink {
         // stream moves the content without moving the clock and every
         // branch pacing against it drifts by the gap.
         let mut data = data;
+        // Where the first sample this call writes lands on the timeline —
+        // `Realign::placed_at` owns that rule, and the tests there own why.
+        let mut placed_at = Realign::None.placed_at(running_time, self.expected_rt);
         if self.gap_fill {
             let tolerance = Duration::from_nanos(frames_to_nanos(
                 self.format.period_frames as u64,
                 self.format.sample_rate,
             ));
-            match crate::pipeline::realign(
+            let action = realign(
                 running_time,
                 self.expected_rt,
                 self.format.sample_rate,
                 tolerance,
                 self.max_gap,
-            ) {
-                crate::pipeline::Realign::None => {}
-                crate::pipeline::Realign::Silence(gap) => {
+            );
+            placed_at = action.placed_at(running_time, self.expected_rt);
+            match action {
+                Realign::None => {}
+                Realign::Silence(gap) => {
                     let bytes = gap * self.frame_size;
                     self.silence.clear();
                     self.silence
@@ -1214,16 +1219,18 @@ impl AsyncSink for AlsaSink {
                     written?;
                     tracing::debug!("alsasink: filled a {gap}-frame gap with silence");
                 }
-                crate::pipeline::Realign::Trim(overlap) => {
+                Realign::Trim(overlap) => {
                     if overlap >= frames {
                         // Entirely behind the write cursor: it has already
                         // been played, in effect.
                         return Ok(());
                     }
                     data = &data[overlap * self.frame_size..];
+                    // The trimmed head is exactly what had already been
+                    // written, so the remainder starts at the cursor.
                     tracing::debug!("alsasink: trimmed {overlap} overlapping frames");
                 }
-                crate::pipeline::Realign::Restart => {
+                Realign::Restart => {
                     tracing::warn!(
                         "alsasink: stream time jumped from {} to {running_time}; \
                          restarting the audio timeline there",
@@ -1236,15 +1243,16 @@ impl AsyncSink for AlsaSink {
 
         let placed = data.len() / self.frame_size;
         self.write_all(data).await?;
-        // Where the next sample is due. Anchored from the buffer's own
-        // running time when the timeline (re)starts, then advanced by what
-        // was actually written.
-        let advance =
-            ClockTime::from_nanos(frames_to_nanos(placed as u64, self.format.sample_rate));
-        self.expected_rt = match self.expected_rt.to_option() {
-            Some(expected) => expected.saturating_add(advance),
-            None => running_time.saturating_add(advance),
-        };
+        // Where the next sample is due: where this one landed, plus what was
+        // written. An unmapped stream (no segment, or no PTS) leaves the
+        // cursor unset rather than inventing one from a timestamp there
+        // isn't.
+        if running_time.is_some() {
+            self.expected_rt = placed_at.saturating_add(ClockTime::from_nanos(frames_to_nanos(
+                placed as u64,
+                self.format.sample_rate,
+            )));
+        }
         Ok(())
     }
 
