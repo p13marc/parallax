@@ -262,9 +262,12 @@ struct StreamSummary {
 }
 
 /// The opened demuxer, by container.
+// Both boxed: each demuxer carries its own index and parser state — around a
+// kilobyte — so bare variants would make every `ProbedSource` the size of the
+// larger one, for a value that exists once per run.
 enum ProbedSource {
-    Mp4(Mp4Demux<BufReader<File>>),
-    Mkv(MkvDemux<BufReader<File>>),
+    Mp4(Box<Mp4Demux<BufReader<File>>>),
+    Mkv(Box<MkvDemux<BufReader<File>>>),
 }
 
 /// Everything `play` needs from the container probe.
@@ -425,7 +428,7 @@ fn open_and_probe(args: &Args) -> anyhow::Result<Probed> {
             let demux = Mp4Demux::new(BufReader::with_capacity(1 << 20, file), size)
                 .with_context(|| format!("{} is not a readable MP4", args.file.display()))?;
             let summary = probe_mp4(args, &demux);
-            (ProbedSource::Mp4(demux), summary)
+            (ProbedSource::Mp4(Box::new(demux)), summary)
         }
         MediaType::Matroska | MediaType::WebM => {
             // 1 MiB: the matroska parser issues many small reads through a
@@ -435,7 +438,7 @@ fn open_and_probe(args: &Args) -> anyhow::Result<Probed> {
                     format!("{} is not a readable Matroska/WebM", args.file.display())
                 })?;
             let summary = probe_mkv(args, &demux);
-            (ProbedSource::Mkv(demux), summary)
+            (ProbedSource::Mkv(Box::new(demux)), summary)
         }
         other => bail!(
             "{}: {other:?} detected — only MP4 and MKV/WebM are supported for now",
@@ -735,16 +738,16 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
     let src = match source {
         ProbedSource::Mp4(demux) => {
             let s = if audio.is_some() {
-                Mp4DemuxSource::new(demux)
+                Mp4DemuxSource::new(*demux)
             } else {
-                Mp4DemuxSource::video_only(demux)
+                Mp4DemuxSource::video_only(*demux)
             }
             .with_loop(args.loop_playback);
             pipeline.add_demuxer("demux", s)
         }
         ProbedSource::Mkv(demux) => {
             let s = if audio.is_some() {
-                demux
+                *demux
             } else {
                 demux.video_only()
             }
