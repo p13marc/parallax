@@ -387,6 +387,64 @@ pub fn frames_to_nanos(frames: u64, sample_rate: u32) -> u64 {
         .unwrap_or(0)
 }
 
+/// How an audio sink should reconcile the buffer it has been handed with the
+/// point its device has actually reached (#265).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Realign {
+    /// Write it as it is.
+    None,
+    /// The stream skipped ahead: write this many frames of silence first, or
+    /// the device plays the new content early and every later sample is off
+    /// by the gap.
+    Silence(usize),
+    /// The stream overlaps what has already been written: drop this many
+    /// frames off the head.
+    Trim(usize),
+    /// The discontinuity is beyond anything worth papering over. Start the
+    /// timeline again from this buffer.
+    Restart,
+}
+
+/// Decide how to place a buffer whose segment running time is `rt` when the
+/// next sample written is due at `expected`.
+///
+/// An audio sink's clock is its own write cursor, so a gap in the stream —
+/// a lost packet, a demuxer dropping a frame — moves the content without
+/// moving the clock, and every branch pacing against that clock drifts by
+/// the gap. Filling the gap keeps the mapping true; `tolerance` is the slack
+/// below which it is not worth touching (one device period is the sensible
+/// choice), and `max_gap` bounds how much silence a bogus timestamp can talk
+/// the sink into writing before it gives up and re-anchors instead.
+pub fn realign(
+    rt: ClockTime,
+    expected: ClockTime,
+    sample_rate: u32,
+    tolerance: Duration,
+    max_gap: Duration,
+) -> Realign {
+    let (Some(rt), Some(expected)) = (rt.to_option(), expected.to_option()) else {
+        return Realign::None;
+    };
+    let rate = sample_rate.max(1) as u128;
+    let delta = rt.nanos() as i128 - expected.nanos() as i128;
+    let magnitude = delta.unsigned_abs();
+    if magnitude <= tolerance.as_nanos() {
+        return Realign::None;
+    }
+    if magnitude > max_gap.as_nanos() {
+        return Realign::Restart;
+    }
+    let frames = (magnitude.saturating_mul(rate) / 1_000_000_000) as usize;
+    if frames == 0 {
+        return Realign::None;
+    }
+    if delta > 0 {
+        Realign::Silence(frames)
+    } else {
+        Realign::Trim(frames)
+    }
+}
+
 /// Drives one sink's part of the per-generation anchor handshake (#265).
 ///
 /// Held by a pacing sink; see [`SyncBase`] for the contract. The rules it
@@ -774,5 +832,64 @@ mod clip_tests {
         // A zero rate cannot happen (the device configured one), but it must
         // clamp rather than divide by zero.
         assert_eq!(frames_to_nanos(1, 0), 1_000_000_000);
+    }
+}
+
+#[cfg(test)]
+mod realign_tests {
+    use super::*;
+
+    const RATE: u32 = 48_000;
+    const TOL: Duration = Duration::from_millis(2);
+    const MAX: Duration = Duration::from_secs(1);
+
+    fn ms(n: u64) -> ClockTime {
+        ClockTime::from_millis(n)
+    }
+
+    #[test]
+    fn a_contiguous_stream_is_left_alone() {
+        assert_eq!(realign(ms(500), ms(500), RATE, TOL, MAX), Realign::None);
+        // Inside the tolerance: rounding, not a discontinuity.
+        assert_eq!(realign(ms(501), ms(500), RATE, TOL, MAX), Realign::None);
+        assert_eq!(realign(ms(499), ms(500), RATE, TOL, MAX), Realign::None);
+    }
+
+    #[test]
+    fn a_gap_is_filled_with_silence() {
+        // 20 ms missing at 48 kHz = 960 frames.
+        assert_eq!(
+            realign(ms(520), ms(500), RATE, TOL, MAX),
+            Realign::Silence(960)
+        );
+    }
+
+    #[test]
+    fn an_overlap_is_trimmed_off_the_head() {
+        assert_eq!(
+            realign(ms(480), ms(500), RATE, TOL, MAX),
+            Realign::Trim(960)
+        );
+    }
+
+    #[test]
+    fn an_absurd_discontinuity_restarts_rather_than_writing_a_minute_of_silence() {
+        assert_eq!(
+            realign(ms(90_000), ms(500), RATE, TOL, MAX),
+            Realign::Restart
+        );
+        assert_eq!(realign(ms(0), ms(90_000), RATE, TOL, MAX), Realign::Restart);
+    }
+
+    #[test]
+    fn an_unmappable_time_is_left_alone() {
+        assert_eq!(
+            realign(ClockTime::NONE, ms(500), RATE, TOL, MAX),
+            Realign::None
+        );
+        assert_eq!(
+            realign(ms(500), ClockTime::NONE, RATE, TOL, MAX),
+            Realign::None
+        );
     }
 }

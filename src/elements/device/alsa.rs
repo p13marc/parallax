@@ -171,6 +171,17 @@ impl AlsaSampleFormat {
         }
     }
 
+    /// The byte pattern that means digital silence in this format.
+    ///
+    /// Zero for the signed and float formats; U8 is offset-binary, so its
+    /// zero point is mid-scale.
+    pub fn silence_byte(self) -> u8 {
+        match self {
+            AlsaSampleFormat::U8 => 0x80,
+            _ => 0,
+        }
+    }
+
     /// The pipeline caps sample format this maps onto.
     ///
     /// Parallax's [`SampleFormat`] carries no endianness — everything in the
@@ -487,6 +498,16 @@ pub struct AlsaSink {
     anchored_generation: Option<u64>,
     /// Frames dropped for falling outside the segment, for observability.
     clipped_frames: u64,
+    /// Running time the next sample written is due at. `NONE` until the
+    /// first buffer of a generation has been placed.
+    expected_rt: ClockTime,
+    /// Whether to fill a gap in the stream with silence; see
+    /// [`with_gap_fill`](Self::with_gap_fill).
+    gap_fill: bool,
+    /// The largest gap worth papering over before re-anchoring instead.
+    max_gap: Duration,
+    /// Reusable silence, so a gap costs no allocation.
+    silence: Vec<u8>,
     /// This sink's part of the per-generation anchor handshake (#265) — as
     /// the clock provider it is normally the master, so `settle` publishes
     /// the origin rather than waiting for one.
@@ -581,6 +602,10 @@ impl AlsaSink {
             segment: None,
             anchored_generation: None,
             clipped_frames: 0,
+            expected_rt: ClockTime::NONE,
+            gap_fill: true,
+            max_gap: Duration::from_secs(1),
+            silence: Vec::new(),
             anchor: crate::pipeline::AnchorGate::default(),
         })
     }
@@ -591,6 +616,27 @@ impl AlsaSink {
     /// outside the pipeline — the sink itself moves into its executor task.
     pub fn position(&self) -> Arc<AlsaPosition> {
         Arc::clone(&self.position)
+    }
+
+    /// Whether a gap in the incoming stream is filled with silence (default
+    /// on).
+    ///
+    /// This sink's clock is its own write cursor, so a lost packet moves the
+    /// content without moving the clock and every branch pacing against that
+    /// clock drifts by the gap. Filling it keeps the two in step. Turn it off
+    /// for a capture pipeline that would rather hear the join than a pause —
+    /// the timeline then belongs to whatever arrives.
+    pub fn with_gap_fill(mut self, fill: bool) -> Self {
+        self.gap_fill = fill;
+        self
+    }
+
+    /// The largest gap worth filling before re-anchoring instead (default
+    /// 1 s), so a bogus timestamp cannot talk the sink into writing minutes
+    /// of silence.
+    pub fn with_max_gap(mut self, max_gap: Duration) -> Self {
+        self.max_gap = max_gap;
+        self
     }
 
     /// Publish how far the device has actually got.
@@ -972,77 +1018,14 @@ impl Clock for AlsaClock {
     }
 }
 
-// Note: AlsaSink provides a clock automatically via `as_clock_provider()`.
-// The pipeline's `select_clock()` will discover it and use it as the master
-// clock. Manual clock setting is still possible via `pipeline.set_clock()`.
-
-impl AsyncSink for AlsaSink {
-    async fn consume(&mut self, ctx: &ConsumeContext<'_>) -> Result<()> {
-        let data = ctx.input();
-        let frames = data.len() / self.frame_size;
-
-        if frames == 0 {
-            return Ok(());
-        }
-
-        // Segment mapping (#265). Everything below turns on it: what to
-        // clip, and where running time zero sits on the clock this sink
-        // provides.
-        let pts = ctx.metadata().pts;
-        let (skip, frames) = match &self.segment {
-            Some(seg) => clip_to_segment(seg, pts, frames, self.format.sample_rate),
-            None => (0, frames),
-        };
-        if skip > 0 {
-            self.clipped_frames += skip as u64;
-            tracing::debug!(
-                "alsasink: clipped {skip} out-of-segment frames ({} so far)",
-                self.clipped_frames
-            );
-        }
-        if frames == 0 {
-            return Ok(());
-        }
-        let data = &data[skip * self.frame_size..(skip + frames) * self.frame_size];
-
-        // Define running-time zero for this generation, on behalf of the
-        // whole pipeline (#265). This sink is the master because the clock
-        // *is* its device's progress, so the honest anchor is: this sample
-        // is heard when the clock reaches `now + delay`, where `delay` is
-        // the audio already queued ahead of it. Right after a flush that is
-        // zero; at start-up it is a device buffer's worth, which used to go
-        // unaccounted and made every paced branch run that much early.
-        if let Some(sync) = ctx.sync()
-            && self.anchored_generation != Some(self.anchor.generation())
-            && let Some(seg) = &self.segment
-        {
-            let first = ClockTime::from_nanos(
-                pts.nanos()
-                    .saturating_add(frames_to_nanos(skip as u64, self.format.sample_rate)),
-            );
-            let queued = self.pcm.delay().unwrap_or(0).max(0) as u64;
-            let heard_at = ctx
-                .clock_time()
-                .saturating_add(ClockTime::from_nanos(frames_to_nanos(
-                    queued,
-                    self.format.sample_rate,
-                )));
-            self.anchor
-                .settle(sync, heard_at, seg.to_running_time(first))
-                .await;
-            self.anchored_generation = Some(self.anchor.generation());
-        }
-
-        // Register the PCM's poll fd with the tokio reactor once and keep
-        // it — a fresh `AsyncFd` per buffer cost an allocation plus two
-        // epoll_ctl syscalls per audio buffer (#142).
-        if self.poll_fd.is_none()
-            && let Ok(fds) = self.poll_descriptors()
-            && let Some(first) = fds.first()
-        {
-            self.poll_fd = AsyncFd::new(first.fd).ok();
-        }
-
+impl AlsaSink {
+    /// Hand `data` to the device, all of it, retrying around underruns.
+    ///
+    /// Extracted from `consume` so silence and payload go through one path
+    /// (#265): the frame accounting the master clock is built on has to
+    /// count both, or inserting silence would move the audio without moving
+    /// the clock.
+    async fn write_all(&mut self, data: &[u8]) -> Result<()> {
         // Bytes, not `i16`. `io_bytes()` converts the byte count to frames
         // through the PCM's *configured* format, so one path serves S16, S32,
         // F32 and U8 alike — and there is no `from_raw_parts` on a buffer slice
@@ -1052,7 +1035,7 @@ impl AsyncSink for AlsaSink {
         // `writei` can write fewer frames than asked for. The remainder used to
         // be silently discarded, which drops audio and makes the frame
         // accounting the clock depends on wrong.
-        let wanted = frames * self.frame_size;
+        let wanted = data.len();
         let mut written = 0usize;
         let mut underruns = 0u32;
 
@@ -1123,6 +1106,147 @@ impl AsyncSink for AlsaSink {
 
         Ok(())
     }
+}
+
+// Note: AlsaSink provides a clock automatically via `as_clock_provider()`.
+// The pipeline's `select_clock()` will discover it and use it as the master
+// clock. Manual clock setting is still possible via `pipeline.set_clock()`.
+
+impl AsyncSink for AlsaSink {
+    async fn consume(&mut self, ctx: &ConsumeContext<'_>) -> Result<()> {
+        let data = ctx.input();
+        let frames = data.len() / self.frame_size;
+
+        if frames == 0 {
+            return Ok(());
+        }
+
+        // Segment mapping (#265). Everything below turns on it: what to
+        // clip, and where running time zero sits on the clock this sink
+        // provides.
+        let pts = ctx.metadata().pts;
+        let (skip, frames) = match &self.segment {
+            Some(seg) => clip_to_segment(seg, pts, frames, self.format.sample_rate),
+            None => (0, frames),
+        };
+        if skip > 0 {
+            self.clipped_frames += skip as u64;
+            tracing::debug!(
+                "alsasink: clipped {skip} out-of-segment frames ({} so far)",
+                self.clipped_frames
+            );
+        }
+        if frames == 0 {
+            return Ok(());
+        }
+        let data = &data[skip * self.frame_size..(skip + frames) * self.frame_size];
+
+        // Where this buffer's first kept sample belongs on the stream's
+        // timeline. `NONE` for an unmapped stream (no segment, or no PTS),
+        // which turns both the anchor and the realignment below into no-ops.
+        let first = ClockTime::from_nanos(
+            pts.nanos()
+                .saturating_add(frames_to_nanos(skip as u64, self.format.sample_rate)),
+        );
+        let running_time = match (&self.segment, pts.to_option()) {
+            (Some(seg), Some(_)) => seg.to_running_time(first),
+            _ => ClockTime::NONE,
+        };
+
+        // Define running-time zero for this generation, on behalf of the
+        // whole pipeline (#265). This sink is the master because the clock
+        // *is* its device's progress, so the honest anchor is: this sample
+        // is heard when the clock reaches `now + delay`, where `delay` is
+        // the audio already queued ahead of it. Right after a flush that is
+        // zero; at start-up it is a device buffer's worth, which used to go
+        // unaccounted and made every paced branch run that much early.
+        if let Some(sync) = ctx.sync()
+            && self.anchored_generation != Some(self.anchor.generation())
+            && running_time.is_some()
+        {
+            let queued = self.pcm.delay().unwrap_or(0).max(0) as u64;
+            let heard_at = ctx
+                .clock_time()
+                .saturating_add(ClockTime::from_nanos(frames_to_nanos(
+                    queued,
+                    self.format.sample_rate,
+                )));
+            self.anchor.settle(sync, heard_at, running_time).await;
+            self.anchored_generation = Some(self.anchor.generation());
+        }
+
+        // Register the PCM's poll fd with the tokio reactor once and keep
+        // it — a fresh `AsyncFd` per buffer cost an allocation plus two
+        // epoll_ctl syscalls per audio buffer (#142).
+        if self.poll_fd.is_none()
+            && let Ok(fds) = self.poll_descriptors()
+            && let Some(first) = fds.first()
+        {
+            self.poll_fd = AsyncFd::new(first.fd).ok();
+        }
+
+        // Keep the device's write cursor on the stream's timeline (#265).
+        // This sink's clock *is* that cursor, so a gap in the incoming
+        // stream moves the content without moving the clock and every
+        // branch pacing against it drifts by the gap.
+        let mut data = data;
+        if self.gap_fill {
+            let tolerance = Duration::from_nanos(frames_to_nanos(
+                self.format.period_frames as u64,
+                self.format.sample_rate,
+            ));
+            match crate::pipeline::realign(
+                running_time,
+                self.expected_rt,
+                self.format.sample_rate,
+                tolerance,
+                self.max_gap,
+            ) {
+                crate::pipeline::Realign::None => {}
+                crate::pipeline::Realign::Silence(gap) => {
+                    let bytes = gap * self.frame_size;
+                    self.silence.clear();
+                    self.silence
+                        .resize(bytes, self.format.format.silence_byte());
+                    let silence = std::mem::take(&mut self.silence);
+                    let written = self.write_all(&silence).await;
+                    self.silence = silence;
+                    written?;
+                    tracing::debug!("alsasink: filled a {gap}-frame gap with silence");
+                }
+                crate::pipeline::Realign::Trim(overlap) => {
+                    if overlap >= frames {
+                        // Entirely behind the write cursor: it has already
+                        // been played, in effect.
+                        return Ok(());
+                    }
+                    data = &data[overlap * self.frame_size..];
+                    tracing::debug!("alsasink: trimmed {overlap} overlapping frames");
+                }
+                crate::pipeline::Realign::Restart => {
+                    tracing::warn!(
+                        "alsasink: stream time jumped from {} to {running_time}; \
+                         restarting the audio timeline there",
+                        self.expected_rt
+                    );
+                    self.expected_rt = ClockTime::NONE;
+                }
+            }
+        }
+
+        let placed = data.len() / self.frame_size;
+        self.write_all(data).await?;
+        // Where the next sample is due. Anchored from the buffer's own
+        // running time when the timeline (re)starts, then advanced by what
+        // was actually written.
+        let advance =
+            ClockTime::from_nanos(frames_to_nanos(placed as u64, self.format.sample_rate));
+        self.expected_rt = match self.expected_rt.to_option() {
+            Some(expected) => expected.saturating_add(advance),
+            None => running_time.saturating_add(advance),
+        };
+        Ok(())
+    }
 
     fn input_media_caps(&self) -> ElementMediaCaps {
         alsa_media_caps(&self.format)
@@ -1170,8 +1294,10 @@ impl AsyncSink for AlsaSink {
                 // until Resume.
                 self.discard_queued(false);
                 // The mapping this sink was playing under is gone with it;
-                // the Segment behind this flush installs the next one.
+                // the Segment behind this flush installs the next one, and
+                // the timeline restarts from the first buffer under it.
                 self.segment = None;
+                self.expected_rt = ClockTime::NONE;
             }
             // The flush names the sync generation to anchor for (#265), so
             // both branches of an A/V graph derive it from the same event.
