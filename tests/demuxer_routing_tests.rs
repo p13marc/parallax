@@ -724,10 +724,11 @@ async fn demuxer_pads_each_get_stream_start_and_segment() {
         segments,
         vec![
             &format!("segment:{:?}:100000000", SegmentFormat::Time),
-            &format!("segment:{:?}:250000000", SegmentFormat::Time),
+            &format!("segment:{:?}:100000000", SegmentFormat::Time),
         ],
-        "each pad anchors at its own first PTS; the upstream segment is \
-         swallowed: {events:?}"
+        "both pads carry the node's one origin — 100 ms, the first buffer it \
+         routed — so the offset between the streams survives (#265); the \
+         upstream segment is still swallowed: {events:?}"
     );
 }
 
@@ -838,10 +839,12 @@ async fn fed_demuxer_reanchors_segments_after_upstream_seek() {
         post,
         vec![
             &"segment:10000000000".to_string(),
-            &"segment:10250000000".to_string()
+            &"segment:10000000000".to_string()
         ],
-        "each pad re-anchors at its first post-seek PTS; the source's seek \
-         segment is swallowed: {log:?}"
+        "both pads re-anchor around the seek's own target, 10 s — one origin \
+         for the node, so a pad arriving 250 ms later reads as 250 ms of \
+         running time rather than as another zero (#265); the source's seek \
+         segment is still swallowed: {log:?}"
     );
 }
 
