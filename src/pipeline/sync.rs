@@ -1,4 +1,19 @@
-//! The pipeline's shared, re-anchorable running-time base.
+//! Placing a buffer in time: the shared running-time base, and the rules a
+//! sink follows against it.
+//!
+//! One module because they are one contract, and a sink that disagreed with
+//! its siblings on any part of it would put the pipeline out of sync:
+//!
+//! - [`SyncBase`] — the clock reading that means running time zero, shared
+//!   and re-anchored on a flushing seek. [`SyncHandle`] is one element's view
+//!   of it, carrying the [`SyncRole`] the graph gave it.
+//! - [`AnchorGate`] — who fixes that origin for each flush generation, and
+//!   what a sink does while it is not yet fixed ([`Anchor`]).
+//! - [`schedule`] — wait, present, or drop-late, given a target and now.
+//! - [`StallWatch`] — when to stop believing a clock that has stopped moving.
+//! - [`clip_to_segment`] and [`realign`] — the audio side: what part of a
+//!   buffer is in segment, and how to place it against the device's own
+//!   write cursor.
 //!
 //! # Why this exists
 //!

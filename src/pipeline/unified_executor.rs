@@ -5006,17 +5006,32 @@ async fn emit_staged_downstream(
             if seg.base == 0 {
                 seg.base = tracker.accumulated_base();
             }
-            tracker.installed(&seg);
-            // The segment covers every pad, so no pad may re-anchor on its
-            // own afterwards.
-            segment_pads.extend(outputs_by_pad.keys().cloned());
             Event::Segment(seg)
         }
         other => other,
     };
-    for branches in outputs_by_pad.values() {
-        emit_event(branches, src_pad, probes, event.clone()).await;
+    // The src-pad probe sees it once, not once per pad — it is one event —
+    // and before the bookkeeping, so a probe that drops it does not leave
+    // the tracker believing a segment went out that never did.
+    match probes.invoke_event(src_pad, &event, true) {
+        ProbeReturn::Drop | ProbeReturn::Handled => return,
+        _ => {}
     }
+    if let Event::Segment(seg) = &event {
+        tracker.installed(seg);
+        // The segment covers every pad, so no pad may re-anchor on its own
+        // afterwards.
+        segment_pads.extend(outputs_by_pad.keys().cloned());
+    }
+    // Every pad at once, for the reason `broadcast_control` fans out that
+    // way: a pad whose link is full must not hold up the pad next to it —
+    // the one that would drain it.
+    futures::future::join_all(
+        outputs_by_pad
+            .values()
+            .map(|branches| broadcast_event(branches, &event)),
+    )
+    .await;
 }
 
 #[allow(clippy::too_many_arguments)]
