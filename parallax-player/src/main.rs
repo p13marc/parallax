@@ -913,6 +913,10 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
     let mut seek_due: Option<std::time::Instant> = None;
     let mut in_flight: Option<(u64, u64)> = None; // (seqnum, target ns)
     let mut seek_sent: Option<std::time::Instant> = None;
+    // The most recent bus message, shown for one status tick and then let
+    // go. Draining moved to the 20 ms tick (the seek's completion arrives on
+    // the bus), so unlike the old per-tick local this has to be cleared
+    // explicitly or a transient warning would stick for the rest of the run.
     let mut notes = String::new();
     // Long enough to swallow a held arrow key's repeats, short enough that a
     // single press still feels immediate.
@@ -972,6 +976,7 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
                     mmss(duration_ns)
                 );
                 let _ = std::io::stdout().flush();
+                notes.clear();
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
                 let mut commands = Vec::new();
