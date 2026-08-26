@@ -84,8 +84,9 @@ pub use rt_scheduler::{
 };
 pub use seek::{DurationQuery, LatencyRange, PositionQuery, SeekTranslation, SeekableQuery};
 pub use sync::{
-    ANCHOR_GRACE, AnchorGate, INITIAL_GENERATION, MAX_WAIT, Pace, Realign, STALL_LIMIT, StallWatch,
-    SyncBase, SyncHandle, SyncRole, clip_to_segment, frames_to_nanos, realign, schedule,
+    ANCHOR_GRACE, Anchor, AnchorGate, INITIAL_GENERATION, MAX_WAIT, Pace, Realign, STALL_LIMIT,
+    StallWatch, SyncBase, SyncHandle, SyncRole, clip_to_segment, frames_to_nanos, realign,
+    schedule,
 };
 pub use tags::{TagList, TagMergeMode, TagValue};
 pub use tracer::{

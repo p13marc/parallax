@@ -39,7 +39,7 @@ use crate::format::{
     AudioFormatCaps, CapsValue, ElementMediaCaps, FormatCaps, FormatMemoryCap, MemoryCaps,
 };
 use crate::pipeline::flow::FlowStateHandle;
-use crate::pipeline::sync::{Realign, clip_to_segment, frames_to_nanos, realign};
+use crate::pipeline::sync::{Anchor, Realign, clip_to_segment, frames_to_nanos, realign};
 
 use super::DeviceError;
 
@@ -493,9 +493,6 @@ pub struct AlsaSink {
     /// so out-of-segment audio was played in full and no mapping from stream
     /// time to the clock it *provides* ever existed.
     segment: Option<crate::event::SegmentEvent>,
-    /// The sync generation this sink has anchored, so it anchors once per
-    /// flush and not once per buffer.
-    anchored_generation: Option<u64>,
     /// Frames dropped for falling outside the segment, for observability.
     clipped_frames: u64,
     /// Running time the next sample written is due at. `NONE` until the
@@ -600,7 +597,6 @@ impl AlsaSink {
             poll_fd: None,
             position,
             segment: None,
-            anchored_generation: None,
             clipped_frames: 0,
             expected_rt: ClockTime::NONE,
             gap_fill: true,
@@ -1161,8 +1157,8 @@ impl AsyncSink for AlsaSink {
         // zero; at start-up it is a device buffer's worth, which used to go
         // unaccounted and made every paced branch run that much early.
         if let Some(sync) = ctx.sync()
-            && self.anchored_generation != Some(self.anchor.generation())
             && running_time.is_some()
+            && self.anchor.settle(sync, sync.flush_epoch()).await == Anchor::Yours
         {
             let queued = self.pcm.delay().unwrap_or(0).max(0) as u64;
             let heard_at = ctx
@@ -1171,8 +1167,7 @@ impl AsyncSink for AlsaSink {
                     queued,
                     self.format.sample_rate,
                 )));
-            self.anchor.settle(sync, heard_at, running_time).await;
-            self.anchored_generation = Some(self.anchor.generation());
+            sync.anchor(self.anchor.generation(), heard_at, running_time);
         }
 
         // Register the PCM's poll fd with the tokio reactor once and keep

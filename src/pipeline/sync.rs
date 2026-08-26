@@ -593,6 +593,21 @@ impl Default for StallWatch {
     }
 }
 
+/// What a sink should do about this generation's origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Anchor {
+    /// The origin is fixed; pace against it.
+    Ready,
+    /// Nobody else is going to fix it — do it, with a clock reading taken
+    /// *now*. The gate deliberately does not carry one: deciding can involve
+    /// waiting, and a reading taken before the wait would be exactly that
+    /// much wrong.
+    Yours,
+    /// A flushing seek superseded the buffer while we waited for the master.
+    /// It belongs to a position nobody is playing any more.
+    Superseded,
+}
+
 /// Drives one sink's part of the per-generation anchor handshake (#265).
 ///
 /// Held by a pacing sink; see [`SyncBase`] for the contract. The rules it
@@ -609,6 +624,9 @@ pub struct AnchorGate {
     generation: u64,
     grace: Duration,
     waiting_since: Option<std::time::Instant>,
+    /// The generation this sink has already answered for, so the common path
+    /// is an atomic load rather than the anchor's mutex on every buffer.
+    claimed: Option<u64>,
 }
 
 impl Default for AnchorGate {
@@ -617,6 +635,7 @@ impl Default for AnchorGate {
             generation: INITIAL_GENERATION,
             grace: ANCHOR_GRACE,
             waiting_since: None,
+            claimed: None,
         }
     }
 }
@@ -649,32 +668,51 @@ impl AnchorGate {
     pub fn open(&mut self, generation: u64) {
         self.generation = generation;
         self.waiting_since = None;
+        self.claimed = None;
     }
 
-    /// Make sure this generation's origin is fixed before pacing against it.
+    /// Decide what this sink should do about the current generation's origin.
     ///
-    /// `target` is the buffer's segment running time — the value that must
-    /// map onto `now` on the clock if this sink ends up anchoring.
-    pub async fn settle(&mut self, sync: &SyncHandle, now: ClockTime, target: ClockTime) {
-        if sync.is_master() || !sync.has_master() {
-            sync.anchor(self.generation, now, target);
-            return;
+    /// `entered_at` is the flush epoch the buffer began being handled under
+    /// ([`SyncHandle::flush_epoch`]): a seek dispatched *after* it abandons
+    /// the buffer, and waiting the grace out for an anchor nobody will
+    /// publish would hold that seek up by however long is left.
+    ///
+    /// Deliberately narrow: only a seek arriving during this call supersedes.
+    /// Comparing against the generation instead would look tidier and would
+    /// be a trap — an element that declares seekability and then declines the
+    /// seek leaves the epoch permanently ahead, and every buffer thereafter
+    /// would be dropped.
+    pub async fn settle(&mut self, sync: &SyncHandle, entered_at: u64) -> Anchor {
+        // Already dealt with by this sink: the common path, and the reason it
+        // costs an atomic load rather than the anchor's mutex per buffer.
+        if self.claimed == Some(self.generation) {
+            return Anchor::Ready;
         }
-        if sync.is_anchored(self.generation) {
-            return;
+        if sync.is_master() || !sync.has_master() {
+            self.claimed = Some(self.generation);
+            return Anchor::Yours;
         }
         let started = *self
             .waiting_since
             .get_or_insert_with(std::time::Instant::now);
-        while !sync.is_anchored(self.generation) {
+        loop {
+            // Not claimed: the master may still override, and re-reading is
+            // how this sink notices when it does.
+            if sync.is_anchored(self.generation) {
+                return Anchor::Ready;
+            }
+            if sync.flush_epoch() > entered_at {
+                return Anchor::Superseded;
+            }
             if started.elapsed() >= self.grace {
                 tracing::debug!(
                     "sync: no anchor for generation {} after {:?}; anchoring this branch itself",
                     self.generation,
                     self.grace
                 );
-                sync.anchor(self.generation, now, target);
-                return;
+                self.claimed = Some(self.generation);
+                return Anchor::Yours;
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
         }

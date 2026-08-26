@@ -29,7 +29,7 @@ use crate::clock::ClockTime;
 use crate::element::{AsyncSink, ConsumeContext};
 use crate::error::{Error, Result};
 use crate::format::{Caps, PixelFormat};
-use crate::pipeline::{Pace, schedule};
+use crate::pipeline::{Anchor, Pace, schedule};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -497,9 +497,25 @@ impl AutoVideoSink {
     /// anchored before the first frame even arrives and the wait costs
     /// nothing. The rules live in [`AnchorGate`](crate::pipeline::AnchorGate)
     /// so every pacing sink follows the same ones.
-    async fn settle_anchor(&mut self, ctx: &ConsumeContext<'_>, target: ClockTime) {
-        let Some(sync) = ctx.sync() else { return };
-        self.anchor.settle(sync, ctx.clock_time(), target).await;
+    async fn settle_anchor(
+        &mut self,
+        ctx: &ConsumeContext<'_>,
+        target: ClockTime,
+        entered_at: u64,
+    ) -> Anchor {
+        let Some(sync) = ctx.sync() else {
+            return Anchor::Ready;
+        };
+        match self.anchor.settle(sync, entered_at).await {
+            // The clock is read *here*, after any wait the gate did: reading
+            // it before would put however long that wait took straight into
+            // the origin.
+            Anchor::Yours => {
+                sync.anchor(self.anchor.generation(), ctx.clock_time(), target);
+                Anchor::Ready
+            }
+            other => other,
+        }
     }
 
     /// Whether this PTS is out-of-segment pre-roll a sync sink should drop
@@ -820,10 +836,19 @@ impl AsyncSink for AutoVideoSink {
                 .map_or(meta.pts, |seg| seg.to_running_time(pts))
                 .to_option()
         {
+            // The flush epoch this frame is being handled under. A seek
+            // raises it the moment it is dispatched, which is the only signal
+            // that reaches a sink already inside a wait — and both waits
+            // below are waits (#265).
+            let entered_at = ctx.sync().map(|s| s.flush_epoch()).unwrap_or(0);
+
             // Define running-time zero for this generation, or wait for the
-            // sink that owns the clock to do it (#265). Absolute pacing is
-            // only meaningful once the origin is fixed.
-            self.settle_anchor(ctx, target).await;
+            // sink that owns the clock to do it. Absolute pacing is only
+            // meaningful once the origin is fixed.
+            if self.settle_anchor(ctx, target, entered_at).await == Anchor::Superseded {
+                self.drop_frame("superseded by a seek");
+                return Ok(());
+            }
 
             let now = ctx.running_time();
             let mut now_ns = now.nanos();
@@ -843,10 +868,6 @@ impl AsyncSink for AutoVideoSink {
             // hatch), not to the frozen-clock stall, where the deficit never
             // shrinks but stays under the cap.
             let mut stall = crate::pipeline::StallWatch::new(self.stall_limit);
-            // The flush epoch this frame is being paced under. A seek raises
-            // it the moment it is dispatched, which is the only signal that
-            // reaches a sink already inside the wait (#265).
-            let entered_at = ctx.sync().map(|s| s.flush_epoch()).unwrap_or(0);
             let mut abandoned = false;
             while let Pace::Wait(delay) = pace {
                 tokio::time::sleep(delay.min(Duration::from_millis(10))).await;
@@ -1617,7 +1638,10 @@ mod tests {
         ctx.set_clock(&clock, &handle);
 
         let mut sink = AutoVideoSink::new();
-        sink.settle_anchor(&ctx, ns(2_000_000_000)).await;
+        assert_eq!(
+            sink.settle_anchor(&ctx, ns(2_000_000_000), 0).await,
+            Anchor::Ready
+        );
 
         assert!(base.is_anchored(0));
         // Running time 2 s maps to clock 7 s, so the origin sits at 5 s.
@@ -1639,10 +1663,39 @@ mod tests {
         ctx.set_clock(&clock, &handle);
 
         let mut sink = AutoVideoSink::new().with_anchor_grace(Duration::from_millis(100));
-        sink.settle_anchor(&ctx, ClockTime::ZERO).await;
+        assert_eq!(
+            sink.settle_anchor(&ctx, ClockTime::ZERO, 0).await,
+            Anchor::Ready
+        );
 
         assert!(base.is_anchored(0), "the wait is bounded");
         assert_eq!(base.base_time(), ns(3_000_000_000));
+    }
+
+    /// A seek dispatched while this sink waits for the master abandons the
+    /// frame: it belongs to a position nobody is playing any more, and
+    /// waiting the grace out would hold the seek up by whatever is left of
+    /// it (#265).
+    #[tokio::test]
+    async fn a_seek_during_the_anchor_wait_abandons_the_frame() {
+        use crate::pipeline::{SyncBase, SyncHandle, SyncRole};
+        use std::sync::Arc;
+
+        let base = Arc::new(SyncBase::new(ClockTime::ZERO, Some(9)));
+        let handle = SyncHandle::new(Arc::clone(&base), SyncRole::Slave);
+        let clock: Arc<dyn crate::clock::Clock> = Arc::new(FixedClock(ns(3_000_000_000)));
+        let buffer = one_byte_buffer();
+        let mut ctx = crate::element::ConsumeContext::new(&buffer);
+        ctx.set_clock(&clock, &handle);
+
+        // The master never anchors; a seek lands mid-wait instead.
+        base.note_flush(16);
+        let mut sink = AutoVideoSink::new().with_anchor_grace(Duration::from_secs(30));
+        assert_eq!(
+            sink.settle_anchor(&ctx, ClockTime::ZERO, 0).await,
+            Anchor::Superseded
+        );
+        assert!(!base.is_anchored(0), "and nothing was anchored from it");
     }
 
     /// #165 instant rate change: same-sign rates replace the segment's rate

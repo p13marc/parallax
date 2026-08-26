@@ -17,7 +17,7 @@ use parallax::element::{AsyncSink, ConsumeContext};
 use parallax::error::Result;
 use parallax::event::{Event, SegmentEvent, SegmentFormat};
 use parallax::pipeline::{
-    AnchorGate, Pace, StallWatch, clip_to_segment, frames_to_nanos, schedule,
+    Anchor, AnchorGate, Pace, StallWatch, clip_to_segment, frames_to_nanos, schedule,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -149,7 +149,6 @@ pub struct ClockAudioSink {
     frame_size: usize,
     segment: Option<SegmentEvent>,
     anchor: AnchorGate,
-    anchored_generation: Option<u64>,
     log: LogHandle,
 }
 
@@ -169,7 +168,6 @@ impl ClockAudioSink {
             frame_size: bytes_per_sample * channels as usize,
             segment: None,
             anchor: AnchorGate::default(),
-            anchored_generation: None,
             log: Arc::new(Mutex::new(Log::default())),
         }
     }
@@ -211,12 +209,9 @@ impl AsyncSink for ClockAudioSink {
         // The master's anchor: this sample is heard as the clock reads now
         // (nothing is queued ahead of it in this stand-in).
         if let Some(sync) = ctx.sync()
-            && self.anchored_generation != Some(self.anchor.generation())
+            && self.anchor.settle(sync, sync.flush_epoch()).await == Anchor::Yours
         {
-            self.anchor
-                .settle(sync, ctx.clock_time(), running_time)
-                .await;
-            self.anchored_generation = Some(self.anchor.generation());
+            sync.anchor(self.anchor.generation(), ctx.clock_time(), running_time);
         }
 
         let played = ClockTime::from_nanos(frames_to_nanos(frames as u64, self.sample_rate));
@@ -319,11 +314,21 @@ impl AsyncSink for PacedVideoSink {
             return Ok(());
         };
 
-        self.anchor.settle(sync, ctx.clock_time(), target).await;
+        let entered_at = sync.flush_epoch();
+        match self.anchor.settle(sync, entered_at).await {
+            Anchor::Superseded => {
+                record(&self.log, |l| l.superseded += 1);
+                return Ok(());
+            }
+            // Read the clock after the gate's wait, not before it.
+            Anchor::Yours => {
+                sync.anchor(self.anchor.generation(), ctx.clock_time(), target);
+            }
+            Anchor::Ready => {}
+        }
 
         let mut pace = schedule(target, ctx.running_time(), self.max_lateness);
         let mut stall = StallWatch::default();
-        let entered_at = sync.flush_epoch();
         while let Pace::Wait(delay) = pace {
             tokio::time::sleep(delay.min(Duration::from_millis(10))).await;
             // Same two escapes as `AutoVideoSink`: a seek abandons the frame
