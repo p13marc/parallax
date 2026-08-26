@@ -137,11 +137,16 @@ impl AudioDecoder for AacDecoder {
     }
 
     fn flush(&mut self) -> Result<Option<AudioSamples>> {
-        // AAC has no decoder delay symphonia surfaces at end of stream;
-        // reset the channel state so the decoder can restart cleanly (a
-        // flushing seek lands here via AudioDecoderElement).
-        self.inner.reset();
+        // AAC has no decoder delay symphonia surfaces at end of stream, so
+        // an EOS drain has nothing to give. The seek-time reset moved to
+        // `reset`, which the element calls on every FlushStart — this used
+        // to do both, and the wrapper's one-shot `flushed` latch meant only
+        // the *first* seek of a run ever reset anything.
         Ok(None)
+    }
+
+    fn reset(&mut self) {
+        self.inner.reset();
     }
 
     fn output_sample_rate(&self) -> u32 {

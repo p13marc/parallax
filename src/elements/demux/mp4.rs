@@ -366,6 +366,34 @@ fn stts_time_of(entries: impl IntoIterator<Item = (u32, u32)>, sample: u32) -> O
     None
 }
 
+/// Composition-time offset of a 1-based sample index, per the ctts runs.
+///
+/// `entries` are ctts runs as `(sample_count, sample_offset)`. Zero for a
+/// track with no `ctts` box — no reordering, so composition time *is* decode
+/// time.
+///
+/// This exists because the seek tables and the emitted timestamps used to
+/// disagree about which clock they were on (#265). `stts_locate` and
+/// `stts_time_of` walk `stts` only, which is **decode** time, while
+/// `read_sample` stamps `pts` from `sample.start_time`, which is
+/// **composition** time. So `Mp4SeekPoint.time_ns` — which becomes the
+/// synthesized segment's `start`, the `SeekDone` position, and the target
+/// every non-reference track is re-sought to — was a DTS being compared
+/// against CTS everywhere downstream. On any stream with B-frames that put
+/// audio ahead of video by the reorder delay, and left the first video frame
+/// above the segment start where nothing would clip it.
+fn ctts_offset_of(entries: impl IntoIterator<Item = (u32, i32)>, sample: u32) -> i64 {
+    let mut index: u64 = 1;
+    for (count, offset) in entries {
+        let count = count as u64;
+        if (sample as u64) < index + count {
+            return offset as i64;
+        }
+        index += count;
+    }
+    0
+}
+
 /// Snap a 1-based sample index back to the nearest sync sample at or before
 /// it. `sync_samples` is the sorted stss entry list; `None` means every
 /// sample is a sync sample. A target before the first sync sample snaps
@@ -874,8 +902,19 @@ impl<R: Read + Seek> Mp4Demux<R> {
             }
         };
 
-        // The snap changed the index, so recompute its start time.
-        let landing_ticks = stts_time_of(stts(), landing).unwrap_or(0);
+        // The snap changed the index, so recompute its start time — in
+        // *composition* time, because that is the clock `read_sample` stamps
+        // its buffers on and therefore the only one the rest of the pipeline
+        // ever sees. See `ctts_offset_of`.
+        let landing_dts = stts_time_of(stts(), landing).unwrap_or(0) as i64;
+        let ctts = || {
+            stbl.ctts
+                .iter()
+                .flat_map(|c| c.entries.iter().map(|e| (e.sample_count, e.sample_offset)))
+        };
+        let landing_ticks = landing_dts
+            .saturating_add(ctts_offset_of(ctts(), landing))
+            .max(0) as u64;
         let time_ns = (landing_ticks as u128 * 1_000_000_000 / timescale as u128) as u64;
 
         self.sample_indices.insert(track_id, landing);
@@ -1168,6 +1207,10 @@ pub struct Mp4DemuxSource<R: Read + Seek + Send> {
     primed: bool,
     /// Restart from the top at EOS instead of ending (see [`with_loop`](Self::with_loop)).
     looping: bool,
+    /// A Segment staged for the executor to emit on every pad before the
+    /// next buffer (#265). The `with_loop` rewind is not a seek, so nothing
+    /// else re-establishes the timeline at the lap boundary.
+    staged_segment: Option<crate::event::SegmentEvent>,
     /// Trick-play rate from the last handled seek (#165): while > 1.0,
     /// only video keyframes are emitted (audio muted) — fast-forward as
     /// GStreamer's keyframe trick mode. A rate-1.0 seek restores normal
@@ -1214,6 +1257,7 @@ impl<R: Read + Seek + Send> Mp4DemuxSource<R> {
             pending,
             primed: false,
             looping: false,
+            staged_segment: None,
             trick_rate: 1.0,
             stop_ns: None,
             reverse_cursor_ns: None,
@@ -1242,8 +1286,11 @@ impl<R: Read + Seek + Send> Mp4DemuxSource<R> {
     /// and rebuilding it cannot reopen the window. The stream then never
     /// ends on its own; stop it with [`PipelineHandle::stop`].
     ///
-    /// The rewind is silent (no events), so running time restarts each lap.
-    /// For gapless looping with monotonic running time, drive a
+    /// The rewind emits a fresh `Segment` on every pad (#265), so running
+    /// time stays monotonic across the lap boundary and paced sinks keep
+    /// A/V locked through it — but it is not a flush, so anything already
+    /// queued downstream plays out first. For a lap boundary the pipeline
+    /// treats as a real segment end, drive a
     /// [`SeekFlags::SEGMENT`](crate::event::SeekFlags::SEGMENT) seek loop
     /// from the bus instead (respond to `MessageKind::SegmentDone` with a
     /// non-flushing SEGMENT seek back to the start, #165).
@@ -1304,6 +1351,10 @@ impl<R: Read + Seek + Send> Mp4DemuxSource<R> {
 }
 
 impl<R: Read + Seek + Send> crate::element::Demuxer for Mp4DemuxSource<R> {
+    fn take_downstream_event(&mut self) -> Option<crate::event::Event> {
+        self.staged_segment.take().map(crate::event::Event::Segment)
+    }
+
     fn demux(&mut self, _buffer: Buffer) -> Result<crate::element::RoutedOutput> {
         Err(Error::Config(
             "Mp4DemuxSource owns its reader; add it with no input link".into(),
@@ -1364,6 +1415,13 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for Mp4DemuxSource<R> {
                 // then re-prime the read-ahead on the next call.
                 self.demux.seek_all_to_time(0, SeekSnap::Before)?;
                 self.primed = false;
+                // Re-establish the timeline for the new lap: PTS restart at
+                // zero, running time must not. The executor fills in the
+                // base already consumed (#265).
+                self.staged_segment = Some(crate::event::SegmentEvent::new_time(
+                    crate::clock::ClockTime::ZERO,
+                    None,
+                ));
                 return self.produce();
             }
             return Ok(DemuxerProduce::Eos);
@@ -1424,6 +1482,7 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for Mp4DemuxSource<R> {
             for slot in &mut self.pending {
                 *slot = None;
             }
+            self.staged_segment = None;
             self.primed = true; // reverse path bypasses forward priming
             self.trick_rate = seek.rate;
             self.stop_ns = None;
@@ -1450,6 +1509,10 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for Mp4DemuxSource<R> {
                     *slot = None;
                 }
                 self.primed = false;
+                // A loop rewind may have staged a Segment that this seek just
+                // superseded; emitting it afterwards would re-anchor both pads
+                // at zero on top of the seek's own segment (#265).
+                self.staged_segment = None;
                 // Trick play (#165): the seek's rate governs playback until
                 // the next handled seek changes it (rate 0 is nonsense —
                 // treat as normal). A forward seek always leaves reverse.
@@ -1659,6 +1722,34 @@ mod tests {
         assert_eq!(stts_time_of(STTS, 11), Some(1000));
         assert_eq!(stts_time_of(STTS, 15), Some(1800));
         assert_eq!(stts_time_of(STTS, 16), None, "past the end");
+    }
+
+    /// #265: the seek tables are in decode time, the emitted timestamps in
+    /// composition time, and the landing has to be reported on the second.
+    #[test]
+    fn ctts_offset_of_walks_the_runs() {
+        // Three samples offset by two frame durations (a typical B-frame
+        // reorder delay), then five with no offset.
+        const CTTS: [(u32, i32); 2] = [(3, 200), (5, 0)];
+        assert_eq!(ctts_offset_of(CTTS, 1), 200);
+        assert_eq!(ctts_offset_of(CTTS, 3), 200);
+        assert_eq!(ctts_offset_of(CTTS, 4), 0);
+        assert_eq!(ctts_offset_of(CTTS, 8), 0);
+    }
+
+    #[test]
+    fn a_track_without_ctts_composes_at_its_decode_time() {
+        // No ctts box at all — the common case, and the one where the old
+        // DTS-only arithmetic happened to be right.
+        assert_eq!(ctts_offset_of([], 1), 0);
+        // Past the last run: no reordering left to describe.
+        assert_eq!(ctts_offset_of([(2u32, 300i32)], 9), 0);
+    }
+
+    #[test]
+    fn a_negative_ctts_offset_is_honoured() {
+        // Version-1 ctts allows negative offsets (composition before decode).
+        assert_eq!(ctts_offset_of([(4u32, -150i32)], 2), -150);
     }
 
     #[test]

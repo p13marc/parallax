@@ -4,7 +4,7 @@
 #![allow(missing_docs)]
 
 use crate::buffer::Buffer;
-use crate::clock::{Clock, ClockProvider, ClockTime};
+use crate::clock::{Clock, ClockProvider};
 use crate::element::context::{ConsumeContext, ProduceContext, ProduceResult};
 use crate::error::Result;
 use crate::event::{Event, EventResult};
@@ -1616,6 +1616,28 @@ pub trait Demuxer: Send {
         None
     }
 
+    /// A downstream event this demuxer wants emitted on **every** pad before
+    /// its next buffer.
+    ///
+    /// Polled by the executor after each `produce`/`demux` call, the
+    /// downstream mirror of [`take_upstream_event`](Self::take_upstream_event).
+    /// It exists for the one thing a demuxer can do that no event reaches it
+    /// for: repositioning itself. A `with_loop` rewind moves the stream back
+    /// to zero without any seek, so without a fresh `Segment` running time
+    /// jumps backwards at the lap boundary and every paced sink either
+    /// clips the new lap as out-of-segment or drops it as hopelessly late.
+    ///
+    /// Stage a Time [`Segment`](crate::event::Event::Segment) starting at
+    /// the new position with `base` left at zero: the executor fills in the
+    /// running time already consumed, installs it in the node's segment
+    /// tracker and broadcasts it to all pads, so running time stays
+    /// monotonic across the rewind and A/V stays locked through it.
+    ///
+    /// Default: none.
+    fn take_downstream_event(&mut self) -> Option<Event> {
+        None
+    }
+
     /// Whether this demuxer supports seeking.
     ///
     /// A source-style demuxer that implements `handle_upstream_event` for
@@ -1996,6 +2018,12 @@ pub trait AsyncElementDyn {
         None
     }
 
+    /// A downstream event this element wants emitted on every pad before its
+    /// next buffer — see [`Demuxer::take_downstream_event`]. Default: none.
+    fn take_downstream_event(&mut self) -> Option<Event> {
+        None
+    }
+
     /// The processing latency this element deliberately introduces (#184).
     ///
     /// Snapshotted at `Executor::start` and summed along each source→sink
@@ -2073,15 +2101,22 @@ pub trait AsyncElementDyn {
         async { Ok(()) }
     }
 
-    /// Set the pipeline clock for this element.
+    /// Set the pipeline clock and running-time base for this element.
     ///
     /// Called by the executor when starting the pipeline to provide
-    /// source elements with access to the pipeline clock. Sources can
-    /// use this to calculate running time from their hardware timestamps.
+    /// elements with access to the pipeline clock. Sources use it to
+    /// calculate running time from their hardware timestamps; pacing sinks
+    /// use it to decide when to present.
     ///
-    /// Default implementation does nothing. Source adapters override this
-    /// to pass the clock to `ProduceContext`.
-    fn set_clock(&mut self, _clock: Arc<dyn Clock>, _base_time: ClockTime) {
+    /// `sync` is the pipeline's shared [`SyncBase`](crate::pipeline::SyncBase)
+    /// — the clock reading that maps to running time zero. It is shared, not
+    /// copied, because a flushing seek re-anchors it (#265): before that,
+    /// every element held a snapshot and nothing could move the origin after
+    /// `start()`.
+    ///
+    /// Default implementation does nothing. The adapters override this to
+    /// pass both on to `ProduceContext`/`ConsumeContext`.
+    fn set_clock(&mut self, _clock: Arc<dyn Clock>, _sync: crate::pipeline::SyncHandle) {
         // Default: do nothing
     }
 
@@ -2358,7 +2393,7 @@ pub struct SourceAdapter<S: Source> {
     /// Pipeline clock for timestamp calculation.
     clock: Option<Arc<dyn Clock>>,
     /// Base time for running time calculation.
-    base_time: ClockTime,
+    sync: Option<crate::pipeline::SyncHandle>,
     /// Bus handle for posting messages.
     bus: Option<crate::pipeline::bus::BusHandle>,
 }
@@ -2371,7 +2406,7 @@ impl<S: Source> SourceAdapter<S> {
             arena: None,
             pool: None,
             clock: None,
-            base_time: ClockTime::ZERO,
+            sync: None,
             bus: None,
         }
     }
@@ -2383,7 +2418,7 @@ impl<S: Source> SourceAdapter<S> {
             arena: Some(arena),
             pool: None,
             clock: None,
-            base_time: ClockTime::ZERO,
+            sync: None,
             bus: None,
         }
     }
@@ -2395,7 +2430,7 @@ impl<S: Source> SourceAdapter<S> {
             arena: None,
             pool: Some(pool),
             clock: None,
-            base_time: ClockTime::ZERO,
+            sync: None,
             bus: None,
         }
     }
@@ -2542,8 +2577,8 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
     fn process_source_inline(&mut self) -> Result<SourceResult> {
         // Helper to configure clock and bus on context
         let configure_clock = |ctx: &mut ProduceContext| {
-            if let Some(ref clock) = self.clock {
-                ctx.set_clock(clock.clone(), self.base_time);
+            if let (Some(clock), Some(sync)) = (&self.clock, &self.sync) {
+                ctx.set_clock(clock.clone(), sync.clone());
             }
             if let Some(ref bus) = self.bus {
                 ctx.set_bus(bus.clone());
@@ -2626,9 +2661,9 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
         SendAsyncElementDyn::process_source_inline(self)
     }
 
-    fn set_clock(&mut self, clock: Arc<dyn Clock>, base_time: ClockTime) {
+    fn set_clock(&mut self, clock: Arc<dyn Clock>, sync: crate::pipeline::SyncHandle) {
         self.clock = Some(clock);
-        self.base_time = base_time;
+        self.sync = Some(sync);
     }
 
     fn set_bus(&mut self, bus: crate::pipeline::bus::BusHandle) {
@@ -2664,7 +2699,7 @@ impl<S: Source + Send + 'static> SendAsyncElementDyn for SourceAdapter<S> {
 pub struct SinkAdapter<S: Sink> {
     inner: S,
     /// The pipeline clock, once the executor hands it over at start.
-    clock: Option<(Arc<dyn Clock>, ClockTime)>,
+    clock: Option<(Arc<dyn Clock>, crate::pipeline::SyncHandle)>,
 }
 
 impl<S: Sink> SinkAdapter<S> {
@@ -2725,8 +2760,8 @@ impl<S: Sink + Send + 'static> SendAsyncElementDyn for SinkAdapter<S> {
     fn process_inline(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
         if let Some(ref buffer) = input {
             let mut ctx = ConsumeContext::new(buffer);
-            if let Some((clock, base_time)) = &self.clock {
-                ctx.set_clock(clock, *base_time);
+            if let Some((clock, sync)) = &self.clock {
+                ctx.set_clock(clock, sync);
             }
             self.inner.consume(&ctx)?;
         }
@@ -2764,8 +2799,8 @@ impl<S: Sink + Send + 'static> SendAsyncElementDyn for SinkAdapter<S> {
         self.inner.handle_downstream_event(event)
     }
 
-    fn set_clock(&mut self, clock: Arc<dyn Clock>, base_time: ClockTime) {
-        self.clock = Some((clock, base_time));
+    fn set_clock(&mut self, clock: Arc<dyn Clock>, sync: crate::pipeline::SyncHandle) {
+        self.clock = Some((clock, sync));
     }
 
     fn as_clock_provider(&self) -> Option<&dyn ClockProvider> {
@@ -3154,7 +3189,7 @@ pub struct AsyncSourceAdapter<S: AsyncSource> {
     /// Pipeline clock for timestamp calculation.
     clock: Option<Arc<dyn Clock>>,
     /// Base time for running time calculation.
-    base_time: ClockTime,
+    sync: Option<crate::pipeline::SyncHandle>,
     /// Bus handle for posting messages.
     bus: Option<crate::pipeline::bus::BusHandle>,
 }
@@ -3166,7 +3201,7 @@ impl<S: AsyncSource> AsyncSourceAdapter<S> {
             inner: source,
             arena: None,
             clock: None,
-            base_time: ClockTime::ZERO,
+            sync: None,
             bus: None,
         }
     }
@@ -3177,7 +3212,7 @@ impl<S: AsyncSource> AsyncSourceAdapter<S> {
             inner: source,
             arena: Some(arena),
             clock: None,
-            base_time: ClockTime::ZERO,
+            sync: None,
             bus: None,
         }
     }
@@ -3268,8 +3303,8 @@ impl<S: AsyncSource + Send + 'static> SendAsyncElementDyn for AsyncSourceAdapter
     async fn process_source(&mut self) -> Result<SourceResult> {
         // Helper to configure clock and bus on context
         let configure_clock = |ctx: &mut ProduceContext| {
-            if let Some(ref clock) = self.clock {
-                ctx.set_clock(clock.clone(), self.base_time);
+            if let (Some(clock), Some(sync)) = (&self.clock, &self.sync) {
+                ctx.set_clock(clock.clone(), sync.clone());
             }
             if let Some(ref bus) = self.bus {
                 ctx.set_bus(bus.clone());
@@ -3313,9 +3348,9 @@ impl<S: AsyncSource + Send + 'static> SendAsyncElementDyn for AsyncSourceAdapter
         }
     }
 
-    fn set_clock(&mut self, clock: Arc<dyn Clock>, base_time: ClockTime) {
+    fn set_clock(&mut self, clock: Arc<dyn Clock>, sync: crate::pipeline::SyncHandle) {
         self.clock = Some(clock);
-        self.base_time = base_time;
+        self.sync = Some(sync);
     }
 
     fn set_bus(&mut self, bus: crate::pipeline::bus::BusHandle) {
@@ -3351,7 +3386,7 @@ impl<S: AsyncSource + Send + 'static> SendAsyncElementDyn for AsyncSourceAdapter
 pub struct AsyncSinkAdapter<S: AsyncSink> {
     inner: S,
     /// The pipeline clock, once the executor hands it over at start.
-    clock: Option<(Arc<dyn Clock>, ClockTime)>,
+    clock: Option<(Arc<dyn Clock>, crate::pipeline::SyncHandle)>,
 }
 
 impl<S: AsyncSink> AsyncSinkAdapter<S> {
@@ -3406,8 +3441,8 @@ impl<S: AsyncSink + Send + 'static> SendAsyncElementDyn for AsyncSinkAdapter<S> 
     async fn process(&mut self, input: Option<Buffer>) -> Result<Option<Buffer>> {
         if let Some(ref buffer) = input {
             let mut ctx = ConsumeContext::new(buffer);
-            if let Some((clock, base_time)) = &self.clock {
-                ctx.set_clock(clock, *base_time);
+            if let Some((clock, sync)) = &self.clock {
+                ctx.set_clock(clock, sync);
             }
             self.inner.consume(&ctx).await?;
         }
@@ -3426,8 +3461,8 @@ impl<S: AsyncSink + Send + 'static> SendAsyncElementDyn for AsyncSinkAdapter<S> 
         self.inner.execution_hints()
     }
 
-    fn set_clock(&mut self, clock: Arc<dyn Clock>, base_time: ClockTime) {
-        self.clock = Some((clock, base_time));
+    fn set_clock(&mut self, clock: Arc<dyn Clock>, sync: crate::pipeline::SyncHandle) {
+        self.clock = Some((clock, sync));
     }
 
     // Forwarded here for the same reason `SinkAdapter` forwards it: without
@@ -3666,6 +3701,10 @@ impl<D: Demuxer + Send + 'static> SendAsyncElementDyn for DemuxerAdapter<D> {
 
     fn take_upstream_event(&mut self) -> Option<Event> {
         self.inner.take_upstream_event()
+    }
+
+    fn take_downstream_event(&mut self) -> Option<Event> {
+        self.inner.take_downstream_event()
     }
 
     async fn flush_demux(&mut self) -> Result<Vec<(String, Buffer)>> {

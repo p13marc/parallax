@@ -374,6 +374,7 @@ struct Shutdown {
 struct UnpauseHooks {
     pause_tx: watch::Sender<bool>,
     pausable: Option<Arc<crate::clock::PausableClock>>,
+    sync: Option<Arc<crate::pipeline::SyncBase>>,
 }
 
 impl Shutdown {
@@ -388,8 +389,13 @@ impl Shutdown {
         &self,
         pause_tx: watch::Sender<bool>,
         pausable: Option<Arc<crate::clock::PausableClock>>,
+        sync: Option<Arc<crate::pipeline::SyncBase>>,
     ) {
-        let _ = self.unpause.set(UnpauseHooks { pause_tx, pausable });
+        let _ = self.unpause.set(UnpauseHooks {
+            pause_tx,
+            pausable,
+            sync,
+        });
     }
 
     /// Ask the whole pipeline to wind down: raise the cooperative stop flag
@@ -397,15 +403,27 @@ impl Shutdown {
     /// frozen-clock pacers can actually reach their stop checks.
     fn begin(&self) {
         self.stop.store(true, Ordering::Release);
-        if let Some(hooks) = self.unpause.get()
-            && *hooks.pause_tx.borrow()
-        {
+        let Some(hooks) = self.unpause.get() else {
+            return;
+        };
+        if *hooks.pause_tx.borrow() {
             // Clock first, mirroring PipelineHandle::resume — a woken sink
             // paces against running time immediately.
             if let Some(clock) = &hooks.pausable {
                 clock.resume();
             }
+            if let Some(sync) = &hooks.sync {
+                sync.set_paused(false);
+            }
             hooks.pause_tx.send_replace(false);
+        }
+        // Same reasoning as the un-pause, one step further: a sink paced
+        // against a device clock stalls forever if that device stops, and on
+        // the way down it always does. Detaching lets every paced branch
+        // drain its tail instead of deadlocking the teardown against a
+        // producer blocked on its full link (`PausableClock::detach`).
+        if let Some(clock) = &hooks.pausable {
+            clock.detach();
         }
     }
 }
@@ -761,9 +779,10 @@ pub struct PipelineHandle {
     pause_tx: watch::Sender<bool>,
     /// The shared clock wrapper, when the pipeline has a started clock.
     pausable: Option<Arc<crate::clock::PausableClock>>,
-    /// Base time distributed to the elements, for the running-time fallback in
-    /// [`position`](Self::position). `NONE` when the pipeline has no clock.
-    base_time: ClockTime,
+    /// The shared running-time base distributed to the elements, for the
+    /// fallback in [`position`](Self::position). `None` when the pipeline has
+    /// no clock; its own base is `NONE` until a sink anchors it.
+    sync: Option<Arc<crate::pipeline::SyncBase>>,
     /// Last-presented PTS in nanoseconds, written by the sink tasks;
     /// `u64::MAX` until a sink has presented (or after a flush reset it).
     position: Arc<AtomicU64>,
@@ -942,15 +961,17 @@ impl PipelineHandle {
     /// Reported as [`EndReason::Aborted`], distinct from the EOS that
     /// [`stop`](Self::stop) produces: the stream did not run out, it was cut.
     pub fn abort(mut self) {
+        // First of all, before anything that could let a task finish on its
+        // own. The outcome is first-writer-wins, and both the cooperative
+        // stop below and the aborts are asynchronous: a source that noticed
+        // the stop flag and returned EOS in between would report a clean end
+        // for a torn-down run.
+        self.outcome.abort();
         // Best effort for live sources: tasks blocked in a synchronous
         // produce() are never re-polled by abort(), so also raise the
         // cooperative stop flag (and un-pause, #191) — they exit at the next
         // loop iteration.
         self.shutdown.begin();
-        // Before the aborts, not after. Cancellation is asynchronous: the tasks
-        // drop their guards on a worker thread moments later, and whichever got
-        // there first would otherwise report a clean EOS for a torn-down run.
-        self.outcome.abort();
         if let Some(task) = self.rt_driver_task.take() {
             task.abort();
         }
@@ -983,6 +1004,16 @@ impl PipelineHandle {
     /// async-spawned sources (RT-scheduled sources carry no control channel),
     /// or every source task has already finished.
     pub async fn send_event_upstream(&self, event: Event) -> bool {
+        // Same courtesy to the paced sinks as `seek` (#265): a flushing seek
+        // sent through the escape hatch still abandons the position they are
+        // pacing, so they still need telling before the flush trio catches
+        // up with them.
+        if let Event::Seek(seek) = &event
+            && seek.flags.contains(crate::event::SeekFlags::FLUSH)
+            && let Some(sync) = &self.sync
+        {
+            sync.note_flush(seek.epoch());
+        }
         // #163: enter at the sinks and travel hop-by-hop toward the sources
         // (mid-graph elements get their chance to handle or translate);
         // hybrid pipelines keep the legacy direct source fan-out.
@@ -1035,6 +1066,18 @@ impl PipelineHandle {
             .contains(crate::event::SeekFlags::INSTANT_RATE_CHANGE);
         if !instant_rate && !self.controls.iter().any(|c| c.seekable) {
             return false;
+        }
+        // Tell the paced sinks *now*, not when the flush trio reaches them
+        // (#265). A sink inside a clock wait cannot reach its own loop head,
+        // so the `FlushStart` queued behind the buffer it is holding cannot
+        // free it — and that buffer belongs to the position this seek is
+        // abandoning. Raising the epoch here is what lets the wait be cut
+        // short, which is also what keeps a seek from deadlocking against a
+        // clock the waiting sink is itself starving.
+        if seek.flags.contains(crate::event::SeekFlags::FLUSH)
+            && let Some(sync) = &self.sync
+        {
+            sync.note_flush(seek.epoch());
         }
         // #163: dispatch via the sinks so the seek travels hop-by-hop and
         // mid-graph elements can handle it; hybrid pipelines (no sink
@@ -1157,6 +1200,12 @@ impl PipelineHandle {
         if let Some(clock) = &self.pausable {
             clock.pause();
         }
+        // Tell the paced sinks the freeze is deliberate: a sink that gives up
+        // on a motionless clock (#265, `StallWatch`) must not give up on this
+        // one — stalling is the whole point of a pause.
+        if let Some(sync) = &self.sync {
+            sync.set_paused(true);
+        }
         self.pause_tx.send_replace(true);
         self.events
             .send_state_changed(PipelineState::Running, PipelineState::Idle);
@@ -1179,6 +1228,9 @@ impl PipelineHandle {
         self.pause_tx.send_replace(false);
         if let Some(clock) = &self.pausable {
             clock.resume();
+        }
+        if let Some(sync) = &self.sync {
+            sync.set_paused(false);
         }
         self.events
             .send_state_changed(PipelineState::Idle, PipelineState::Running);
@@ -1214,8 +1266,8 @@ impl PipelineHandle {
         if pts != u64::MAX {
             return ClockTime::from_nanos(pts);
         }
-        match &self.pausable {
-            Some(clock) if self.base_time.is_some() => clock.now().saturating_sub(self.base_time),
+        match (&self.pausable, &self.sync) {
+            (Some(clock), Some(sync)) => sync.running_time(clock.now()),
             _ => ClockTime::NONE,
         }
     }
@@ -1393,15 +1445,31 @@ impl Executor {
         pipeline.select_clock();
         pipeline.start_clock();
         let pipeline_clock = pipeline.clock();
+        // The running-time origin is shared, not copied (#265): a flushing
+        // seek re-anchors it from the sink that owns the clock, which is what
+        // keeps the audio and video branches agreeing about *now* across a
+        // seek. See `pipeline::sync`.
+        // The sync master is the node whose element provided the selected
+        // clock — its device's progress *is* the timeline, so its anchor is
+        // the authoritative one. `None` when nobody provided a clock (a
+        // video-only pipeline on the system clock) or when the clock was
+        // installed by hand.
+        let sync_master = pipeline.clock_provider_node();
         let (clock_info, pausable): (
-            Option<(Arc<dyn Clock>, ClockTime)>,
+            Option<(Arc<dyn Clock>, crate::pipeline::SyncHandle)>,
             Option<Arc<crate::clock::PausableClock>>,
         ) = if pipeline_clock.is_started() {
             let wrapped = Arc::new(crate::clock::PausableClock::new(pipeline_clock.clock()));
+            let sync = Arc::new(crate::pipeline::SyncBase::new(
+                pipeline_clock.base_time(),
+                sync_master.map(|n| n.index()),
+            ));
+            // The template carries the Slave role; each element gets its own
+            // handle below, and only the master's says so.
             (
                 Some((
                     wrapped.clone() as Arc<dyn Clock>,
-                    pipeline_clock.base_time(),
+                    crate::pipeline::SyncHandle::new(sync, crate::pipeline::SyncRole::Slave),
                 )),
                 Some(wrapped),
             )
@@ -1413,7 +1481,11 @@ impl Executor {
         let (pause_tx, pause_rx) = watch::channel(false);
         // #191: a wind-down must be able to un-pause, or gated loops and
         // frozen-clock pacers never observe the stop flag.
-        shutdown.install_unpause(pause_tx.clone(), pausable.clone());
+        shutdown.install_unpause(
+            pause_tx.clone(),
+            pausable.clone(),
+            clock_info.as_ref().map(|(_, sync)| Arc::clone(sync.base())),
+        );
         let mut runtime = RuntimeControls {
             controls: Vec::new(),
             upstream_entries: Vec::new(),
@@ -1546,7 +1618,7 @@ impl Executor {
             translations: runtime.translations,
             pause_tx,
             pausable,
-            base_time: clock_info.map(|(_, b)| b).unwrap_or(ClockTime::NONE),
+            sync: clock_info.map(|(_, sync)| Arc::clone(sync.base())),
             position: runtime.position,
             latency,
         })
@@ -1557,7 +1629,7 @@ impl Executor {
     fn run_async(
         &self,
         pipeline: &mut Pipeline,
-        clock_info: Option<&(Arc<dyn Clock>, ClockTime)>,
+        clock_info: Option<&(Arc<dyn Clock>, crate::pipeline::SyncHandle)>,
         events: &EventSender,
         stop: &Arc<AtomicBool>,
         outcome: &Arc<TerminalOutcome>,
@@ -1583,7 +1655,7 @@ impl Executor {
         pipeline: &mut Pipeline,
         partition: &GraphPartition,
         scheduler: &mut RtScheduler,
-        clock_info: Option<&(Arc<dyn Clock>, ClockTime)>,
+        clock_info: Option<&(Arc<dyn Clock>, crate::pipeline::SyncHandle)>,
         events: &EventSender,
         stop: &Arc<AtomicBool>,
         outcome: &Arc<TerminalOutcome>,
@@ -1679,8 +1751,8 @@ impl Executor {
             if let Some(node) = pipeline.get_node_mut(node_id)
                 && let Some(mut element) = node.take_element()
             {
-                if let Some((clock, base_time)) = clock_info {
-                    element.set_clock(clock.clone(), *base_time);
+                if let Some((clock, sync)) = clock_info {
+                    element.set_clock(clock.clone(), sync.for_node(node_id.index()));
                 }
                 element.set_bus(bus);
                 if let Some(budget) = rt_budgets.get(&node_id) {
@@ -1940,7 +2012,7 @@ impl Executor {
         &self,
         pipeline: &mut Pipeline,
         mut channels: ChannelNetwork,
-        clock_info: Option<&(Arc<dyn Clock>, ClockTime)>,
+        clock_info: Option<&(Arc<dyn Clock>, crate::pipeline::SyncHandle)>,
         events: &EventSender,
         stop: &Arc<AtomicBool>,
         outcome: &Arc<TerminalOutcome>,
@@ -2011,7 +2083,7 @@ impl Executor {
         partition: &GraphPartition,
         mut channels: ChannelNetwork,
         scheduler: &RtScheduler,
-        clock_info: Option<&(Arc<dyn Clock>, ClockTime)>,
+        clock_info: Option<&(Arc<dyn Clock>, crate::pipeline::SyncHandle)>,
         events: &EventSender,
         stop: &Arc<AtomicBool>,
         outcome: &Arc<TerminalOutcome>,
@@ -2063,7 +2135,7 @@ impl Executor {
         node_id: NodeId,
         channels: &mut ChannelNetwork,
         upstream: Option<(tokio::sync::mpsc::UnboundedSender<Event>, UpstreamHop)>,
-        clock_info: Option<&(Arc<dyn Clock>, ClockTime)>,
+        clock_info: Option<&(Arc<dyn Clock>, crate::pipeline::SyncHandle)>,
         events: &EventSender,
         stop: &Arc<AtomicBool>,
         outcome: &Arc<TerminalOutcome>,
@@ -2094,7 +2166,7 @@ impl Executor {
         channels: &mut ChannelNetwork,
         output_bridges: Vec<Arc<AsyncRtBridge>>,
         input_bridges: Vec<Arc<AsyncRtBridge>>,
-        clock_info: Option<&(Arc<dyn Clock>, ClockTime)>,
+        clock_info: Option<&(Arc<dyn Clock>, crate::pipeline::SyncHandle)>,
         events: &EventSender,
         stop: &Arc<AtomicBool>,
         outcome: &Arc<TerminalOutcome>,
@@ -2121,8 +2193,8 @@ impl Executor {
         // sink could not see the clock at all — and so could not schedule
         // presentation against running time (#65). The trait method defaults
         // to a no-op, so element types that ignore the clock are unaffected.
-        if let Some((clock, base_time)) = clock_info {
-            element.set_clock(clock.clone(), *base_time);
+        if let Some((clock, sync)) = clock_info {
+            element.set_clock(clock.clone(), sync.for_node(node_id.index()));
         }
 
         // Set bus handle so elements can post messages
@@ -2799,24 +2871,48 @@ async fn broadcast(
     }
 }
 
-/// Send EOS to every branch, **always delivered**.
+/// Send EOS to every branch, **always delivered** and **concurrently**.
 ///
 /// A dropped EOS would leave the branch's sink waiting forever, so the lossy
 /// policies do not apply to it. Only buffers are ever dropped.
+///
+/// Concurrently for the same reason [`broadcast`] fans buffers out that way,
+/// and one sharper one: a sequential loop lets a branch that cannot accept
+/// the message hold up a sibling that could. In an A/V graph that deadlocks
+/// on teardown — the video sink waits on a clock the audio device provides,
+/// its link fills, and the audio sink's EOS (the thing that would release
+/// that clock) queues behind a send that can never complete. Each branch is
+/// its own FIFO, so nothing is ordered across them anyway.
 async fn broadcast_eos(branches: &[OutputBranch]) {
-    for branch in branches {
-        let _ = branch.send_control(Message::Eos).await;
-    }
+    broadcast_control(branches, || Message::Eos).await;
 }
 
 /// Send an in-band event to every branch, **always delivered**.
 ///
 /// Events are control flow, not payload: a dropped FlushStop would leave the
 /// branch's subtree discarding buffers forever, so the lossy policies do not
-/// apply — same reasoning as [`broadcast_eos`].
+/// apply — same reasoning as [`broadcast_eos`], including why the fan-out is
+/// concurrent. For the flush trio that also keeps the two branches of an A/V
+/// graph from restarting at measurably different instants.
 async fn broadcast_event(branches: &[OutputBranch], event: &Event) {
-    for branch in branches {
-        let _ = branch.send_control(Message::Event(event.clone())).await;
+    broadcast_control(branches, || Message::Event(event.clone())).await;
+}
+
+/// The shared fan-out behind [`broadcast_eos`] and [`broadcast_event`].
+///
+/// `message` is a factory rather than a value because `Message` is not
+/// `Clone` — it carries a `Buffer` on the hot path and cloning it there would
+/// be a refcount bump nobody asked for.
+async fn broadcast_control(branches: &[OutputBranch], message: impl Fn() -> Message) {
+    match branches {
+        [] => {}
+        [only] => {
+            let _ = only.send_control(message()).await;
+        }
+        many => {
+            futures::future::join_all(many.iter().map(|branch| branch.send_control(message())))
+                .await;
+        }
     }
 }
 
@@ -2842,15 +2938,33 @@ struct PadReanchor {
     rate: f64,
     base: i64,
     stop: Option<ClockTime>,
+    /// The origin every pad re-anchors around, when the translated seek had
+    /// an absolute target (#265). `None` for a Current/End-relative seek,
+    /// where only the data can say where it landed — then the first pad to
+    /// produce fixes the node's origin, as at cold start.
+    start: Option<ClockTime>,
 }
 
-/// The segment a pad anchors with at its first routed buffer: the plain
-/// lazy initial segment normally, or the translated seek's shape (rate,
-/// base, stop) around this pad's own first post-seek PTS — the honest
-/// per-pad landing, same convention as the translated SeekDone.
+/// The segment a demuxer **node** anchors with at its first routed buffer:
+/// the plain lazy initial segment normally, or the translated seek's shape
+/// (rate, base, stop) around the seek's own target.
+///
+/// One segment for the whole node, not one per pad (#265). Each pad used to
+/// anchor at its *own* first post-seek PTS, which silently forced every
+/// stream to running time zero at its own start and so erased the offset
+/// *between* them — an A/V pair demuxed from one container came out
+/// lip-synced to whichever frame each branch happened to see first. Streams
+/// in one container share a timeline; the segment has to say so.
+///
+/// The origin is the seek's absolute target when it had one, else the first
+/// buffer's PTS. A pad that legitimately starts below that origin — the
+/// trailing side of the container's interleave — is out-of-segment pre-roll
+/// and gets clipped, bounded by the interleave depth. That is the same
+/// trade GStreamer's demuxers make, and it is the right way round: a
+/// fraction of a second of head is cheap, a permanently wrong offset is not.
 fn anchor_segment_for(buffer: &Buffer, reanchor: Option<&PadReanchor>) -> SegmentEvent {
     match (reanchor, buffer.metadata().pts.to_option()) {
-        (Some(r), Some(pts)) => SegmentEvent::new_time(pts, r.stop)
+        (Some(r), Some(pts)) => SegmentEvent::new_time(r.start.unwrap_or(pts), r.stop)
             .with_rate(r.rate)
             .with_base(r.base),
         _ => initial_segment_for(buffer),
@@ -2863,10 +2977,18 @@ fn anchor_segment_for(buffer: &Buffer, reanchor: Option<&PadReanchor>) -> Segmen
 /// time already consumed, so running time stays monotonic across the queued
 /// boundary (GStreamer's `gst_segment_do_seek` non-flush rule).
 ///
-/// One tracker per producing task. A source-style demuxer keeps a single
-/// tracker fed by the max PTS across its pads, so an A/V pair's accumulated
-/// base can skew by about one frame between streams — a documented
-/// approximation, revisit if multi-sink sync ever depends on it.
+/// One tracker per producing task, and one for a demuxer node across all its
+/// pads — which is right, because since #265 the pads share one segment
+/// origin, so there is no per-stream base to skew. What is left is a choice
+/// in `accumulated_base`: it folds the **max** PTS across pads, so a
+/// non-flushing seek's successor segment begins after the furthest-advanced
+/// stream. That leaves the lagging stream a small gap rather than an overlap,
+/// which is the right way round — an overlap would replay audio.
+///
+/// A non-flushing seek deliberately does **not** touch the pipeline's
+/// [`SyncBase`](crate::pipeline::SyncBase): it carries its continuity in
+/// `segment.base` instead, and only a FLUSH seek re-anchors the origin. That
+/// is the sentence multi-sink sync depends on.
 #[derive(Default)]
 struct SegmentTracker {
     /// The Time segment currently on the wire; `None` until one is emitted.
@@ -3270,6 +3392,10 @@ struct PendingTranslation {
     flushing: bool,
     /// The original seek's absolute stop, when it set one.
     stop: Option<u64>,
+    /// The original seek's absolute target, when it had one (#265). It is
+    /// what the demuxer's pads re-anchor around: one origin for the node,
+    /// so the offset *between* its streams survives the translation.
+    target: Option<u64>,
 }
 
 /// Which side of a consuming task's data-vs-upstream select fired.
@@ -3436,7 +3562,9 @@ async fn handle_upstream_hop(
                 if let Some(ev) = emit(Event::FlushStart) {
                     broadcast_event(outputs, &ev).await;
                 }
-                if let Some(ev) = emit(Event::FlushStop(FlushStopEvent::new(true))) {
+                if let Some(ev) = emit(Event::FlushStop(
+                    FlushStopEvent::new(true).with_epoch(seek.epoch()),
+                )) {
                     broadcast_event(outputs, &ev).await;
                 }
             }
@@ -3601,6 +3729,10 @@ async fn handle_upstream_hop(
                 flushing: seek.flags.contains(crate::event::SeekFlags::FLUSH),
                 stop: match seek.stop.seek_type {
                     SeekType::Set => Some(seek.stop.position.max(0) as u64),
+                    _ => None,
+                },
+                target: match seek.start.seek_type {
+                    SeekType::Set => Some(seek.start.position.max(0) as u64),
                     _ => None,
                 },
             });
@@ -4796,6 +4928,7 @@ async fn route_demux_buffer(
     tracers: &TracerRegistry,
     unrouted: &mut u64,
     segment_pads: &mut HashSet<String>,
+    node_origin: &mut Option<SegmentEvent>,
     reanchor: Option<&PadReanchor>,
     src_pad: &crate::pipeline::probe::PadRef,
     probes: &ProbeRegistry,
@@ -4807,11 +4940,14 @@ async fn route_demux_buffer(
     let mut connected = true;
     match outputs_by_pad.get(pad) {
         Some(branches) => {
-            // Per-pad lazy initial segment, anchored at this pad's first
-            // buffer (#165): each elementary stream carries its own PTS
-            // domain, so pads anchor independently.
+            // Lazy initial segment, anchored once for the whole node and
+            // emitted to each pad as it first produces (#165, #265). Pads
+            // used to anchor independently, which erased the offset between
+            // the streams — see `anchor_segment_for`.
             if segment_pads.insert(pad.to_string()) {
-                let seg = anchor_segment_for(&buffer, reanchor);
+                let seg = node_origin
+                    .get_or_insert_with(|| anchor_segment_for(&buffer, reanchor))
+                    .clone();
                 emit_event(branches, src_pad, probes, Event::Segment(seg.clone())).await;
                 anchored = Some(seg);
             }
@@ -4820,7 +4956,9 @@ async fn route_demux_buffer(
         None if pad.is_empty() => {
             // Legacy broadcast pad: one shared segment for every branch.
             if segment_pads.insert(String::new()) {
-                let seg = anchor_segment_for(&buffer, reanchor);
+                let seg = node_origin
+                    .get_or_insert_with(|| anchor_segment_for(&buffer, reanchor))
+                    .clone();
                 for branches in outputs_by_pad.values() {
                     emit_event(branches, src_pad, probes, Event::Segment(seg.clone())).await;
                 }
@@ -4844,6 +4982,56 @@ async fn route_demux_buffer(
         }
     }
     (anchored, connected)
+}
+
+/// Emit a downstream event a demuxer staged for itself (`with_loop`'s silent
+/// rewind, #265) on every pad, before the buffers of the call that staged it.
+///
+/// A Time `Segment` is completed here rather than by the element: the running
+/// time already consumed under the outgoing segment lives in the node's
+/// [`SegmentTracker`], not in the demuxer, and it is what keeps running time
+/// monotonic across the rewind. A demuxer stages `base = 0` and gets the
+/// accumulated base filled in — the same rule a non-flushing seek's successor
+/// segment follows.
+async fn emit_staged_downstream(
+    event: Event,
+    outputs_by_pad: &HashMap<String, Vec<OutputBranch>>,
+    src_pad: &crate::pipeline::probe::PadRef,
+    probes: &ProbeRegistry,
+    tracker: &mut SegmentTracker,
+    segment_pads: &mut HashSet<String>,
+) {
+    let event = match event {
+        Event::Segment(mut seg) if seg.format == crate::event::SegmentFormat::Time => {
+            if seg.base == 0 {
+                seg.base = tracker.accumulated_base();
+            }
+            Event::Segment(seg)
+        }
+        other => other,
+    };
+    // The src-pad probe sees it once, not once per pad — it is one event —
+    // and before the bookkeeping, so a probe that drops it does not leave
+    // the tracker believing a segment went out that never did.
+    match probes.invoke_event(src_pad, &event, true) {
+        ProbeReturn::Drop | ProbeReturn::Handled => return,
+        _ => {}
+    }
+    if let Event::Segment(seg) = &event {
+        tracker.installed(seg);
+        // The segment covers every pad, so no pad may re-anchor on its own
+        // afterwards.
+        segment_pads.extend(outputs_by_pad.keys().cloned());
+    }
+    // Every pad at once, for the reason `broadcast_control` fans out that
+    // way: a pad whose link is full must not hold up the pad next to it —
+    // the one that would drain it.
+    futures::future::join_all(
+        outputs_by_pad
+            .values()
+            .map(|branches| broadcast_event(branches, &event)),
+    )
+    .await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4877,7 +5065,8 @@ fn spawn_demuxer_task(
         let all_branches: Vec<OutputBranch> = outputs_by_pad.values().flatten().cloned().collect();
 
         // #165: this node OWNS its pads' StreamStart/Segment — eager
-        // per-pad StreamStart now, lazy per-pad Segment at each pad's first
+        // per-pad StreamStart now, the node's one lazy Segment at each pad's
+        // first
         // buffer. Upstream StreamStart/Segment (a fed demuxer's byte-domain
         // input) is offered to the element and swallowed below.
         for (pad, branches) in &outputs_by_pad {
@@ -4890,6 +5079,11 @@ fn spawn_demuxer_task(
             .await;
         }
         let mut segment_pads: HashSet<String> = HashSet::new();
+        // One Time segment for the node, emitted to each pad as it first
+        // produces (#265): streams demuxed from one container share a
+        // timeline, so they must share an origin or the offset between them
+        // is lost. Cleared wherever `segment_pads` is.
+        let mut node_origin: Option<SegmentEvent> = None;
         // #191: pads whose every receiver is gone. When all linked pads are
         // dead there is nobody left to feed — stop instead of reading the
         // whole stream into closed channels.
@@ -5044,6 +5238,7 @@ fn spawn_demuxer_task(
                                         &tracers,
                                         &mut unrouted,
                                         &mut segment_pads,
+                                        &mut node_origin,
                                         pad_reanchor.as_ref(),
                                         &src_pad,
                                         &probe_registry,
@@ -5151,8 +5346,10 @@ fn spawn_demuxer_task(
                                     segment_tracker.accumulated_base()
                                 },
                                 stop: pt.stop.map(ClockTime::from_nanos),
+                                start: pt.target.map(ClockTime::from_nanos),
                             });
                             segment_pads.clear();
+                            node_origin = None;
                             tracker_needs_install = true;
                         }
                         // Events go to every output pad, like EOS does.
@@ -5174,11 +5371,13 @@ fn spawn_demuxer_task(
                                     continue;
                                 }
                                 // After an upstream flush (e.g. a byte seek on
-                                // the source below a fed demuxer), each pad
-                                // re-anchors with a fresh Time segment at its
-                                // first post-seek buffer.
+                                // the source below a fed demuxer), the node
+                                // re-anchors with a fresh Time segment — one
+                                // origin, told to each pad as it produces
+                                // (#265).
                                 Event::FlushStop(_) => {
                                     segment_pads.clear();
+                                    node_origin = None;
                                     tracker_needs_install = true;
                                 }
                                 _ => {}
@@ -5222,6 +5421,7 @@ fn spawn_demuxer_task(
                                             &tracers,
                                             &mut unrouted,
                                             &mut segment_pads,
+                                            &mut node_origin,
                                             pad_reanchor.as_ref(),
                                             &src_pad,
                                             &probe_registry,
@@ -5251,6 +5451,7 @@ fn spawn_demuxer_task(
                                         &tracers,
                                         &mut unrouted,
                                         &mut segment_pads,
+                                        &mut node_origin,
                                         pad_reanchor.as_ref(),
                                         &src_pad,
                                         &probe_registry,
@@ -5304,6 +5505,7 @@ fn spawn_demuxer_task(
                         if outcome.segment_emitted {
                             // The seek's segment went to every pad.
                             segment_pads.extend(outputs_by_pad.keys().cloned());
+                            node_origin = None;
                         }
                         track_segment_seek(&outcome, &mut segment_seek);
                     }
@@ -5338,6 +5540,7 @@ fn spawn_demuxer_task(
                             .await;
                             if outcome.segment_emitted {
                                 segment_pads.extend(outputs_by_pad.keys().cloned());
+                                node_origin = None;
                             }
                             track_segment_seek(&outcome, &mut segment_seek);
                         }
@@ -5352,6 +5555,20 @@ fn spawn_demuxer_task(
                 .await
                 {
                     Ok(DemuxResult::Routed(routed)) => {
+                        // A silent reposition (`with_loop`) stages its own
+                        // Segment; it must reach the pads ahead of the
+                        // buffers from the call that staged it.
+                        if let Some(event) = element.take_downstream_event() {
+                            emit_staged_downstream(
+                                event,
+                                &outputs_by_pad,
+                                &src_pad,
+                                &probe_registry,
+                                &mut segment_tracker,
+                                &mut segment_pads,
+                            )
+                            .await;
+                        }
                         // Same stamp-at-send rule as spawn_source_task: a seek
                         // handled in this iteration's control drain already
                         // bumped the epoch.
@@ -5373,6 +5590,7 @@ fn spawn_demuxer_task(
                                 &tracers,
                                 &mut unrouted,
                                 &mut segment_pads,
+                                &mut node_origin,
                                 None,
                                 &src_pad,
                                 &probe_registry,

@@ -373,10 +373,13 @@ Three things to know:
   the historical blit-on-arrival path, and a PTS that jumps more than a second into
   the future is presented instead of slept through.
 
-The first frame anchors the stream — its PTS is pinned to the running time at which
-it arrived — so a stream whose timestamps do not start at zero plays immediately
-instead of stalling for its start offset. A PTS that goes *backwards* (a seek)
-re-anchors rather than condemning every later frame to look eternally late.
+Pacing is **absolute**: the sink presents when `running_time()` reaches the buffer's
+segment running time, against the pipeline's shared origin (`SyncBase`). The origin
+is what makes a stream whose timestamps do not start at zero play immediately rather
+than stalling for its start offset, and what makes a seek land both branches of an
+A/V graph on the same instant — see [pipeline.md](pipeline.md) § A/V synchronization.
+The sink used to hold a private anchor pinning its own first frame's mapped time to
+whenever it arrived, which threw the segment's absolute mapping away on every seek.
 
 ## Reading the clock from an element
 
@@ -390,7 +393,8 @@ schedule against the same time base.
 | `ConsumeContext` (sinks) | `clock()`, `running_time()`, `clock_time()`, `base_time()` |
 
 `running_time()` is the one to compare a buffer's PTS against — it is `clock_time()`
-minus the base time captured when the pipeline started. Both return `ClockTime::NONE`
+minus the pipeline's running-time origin. That origin is shared and re-anchored on a
+flushing seek (`ctx.sync()`), not a value captured once at start. Both return `ClockTime::NONE`
 when no clock is available (the pipeline was never started, or a unit test built the
 context by hand), and a sink that paces presentation must treat that as "consume as
 fast as buffers arrive" rather than stalling:

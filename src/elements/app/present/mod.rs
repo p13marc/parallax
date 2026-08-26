@@ -46,6 +46,11 @@ pub(crate) struct DisplayFrame {
     /// Non-packed plane layout, when the producer declared one (#194):
     /// External frames carry the decoder's real strides. `None` = packed.
     pub(crate) layout: Option<crate::format::PlaneLayout>,
+    /// Which flush generation this frame belongs to (#265). A flushing seek
+    /// bumps the sink's counter, and the display loop skips anything stamped
+    /// below it — otherwise the queued pre-seek frames are blitted *after*
+    /// the seek, flashing the old picture back over the new one.
+    pub(crate) generation: u64,
 }
 
 /// A display-thread-local presentation backend (deliberately not `Send`).
@@ -421,6 +426,7 @@ mod tests {
         let mut slot = arena.acquire().unwrap();
         slot.data_mut()[..len].fill(fill);
         DisplayFrame {
+            generation: 0,
             data: Buffer::new(
                 crate::buffer::MemoryHandle::with_len(slot, len),
                 crate::metadata::Metadata::new(),
@@ -443,6 +449,7 @@ mod tests {
         let mut slot = arena.acquire().unwrap();
         slot.data_mut()[..4].copy_from_slice(&bytes);
         DisplayFrame {
+            generation: 0,
             data: Buffer::new(
                 crate::buffer::MemoryHandle::with_len(slot, 4),
                 crate::metadata::Metadata::new(),

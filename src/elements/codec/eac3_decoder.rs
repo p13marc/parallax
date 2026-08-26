@@ -122,12 +122,16 @@ impl AudioDecoder for Eac3Decoder {
     }
 
     fn flush(&mut self) -> Result<Option<AudioSamples>> {
-        // (E-)AC-3 has no decoder delay across sync frames; reset so a
-        // flushing seek restarts cleanly.
-        self.inner
-            .reset()
-            .map_err(|e| Error::Element(format!("E-AC-3 reset failed: {e:?}")))?;
+        // (E-)AC-3 has no decoder delay across sync frames, so an EOS drain
+        // has nothing to give; the seek-time reset moved to `reset` (see
+        // `AacDecoder::flush`).
         Ok(None)
+    }
+
+    fn reset(&mut self) {
+        if let Err(e) = self.inner.reset() {
+            tracing::warn!("E-AC-3 decoder reset failed: {e:?}");
+        }
     }
 
     fn output_sample_rate(&self) -> u32 {

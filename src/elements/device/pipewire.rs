@@ -26,7 +26,7 @@
 //! ```
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 
 use pipewire as pw;
@@ -484,12 +484,21 @@ impl AsyncSource for PipeWireSrc {
 
 /// PipeWire audio playback sink.
 pub struct PipeWireSink {
-    /// Sender for buffers to play.
-    sender: tokio_mpsc::Sender<Vec<u8>>,
+    /// Sender for buffers to play, each stamped with the flush generation it
+    /// was produced under (#265).
+    sender: tokio_mpsc::Sender<(u64, Vec<u8>)>,
     /// Sender to request shutdown.
     _shutdown: std_mpsc::SyncSender<()>,
     /// Thread handle.
     _thread: Option<thread::JoinHandle<()>>,
+    /// Buffers stamped below this were abandoned by a flushing seek. The
+    /// playback thread skips them; the queue holds up to 16, so without this
+    /// a seek played out that much pre-seek audio before the new position
+    /// was heard.
+    generation: Arc<AtomicU64>,
+    /// The Time segment in force, for clipping out-of-segment audio the way
+    /// `AlsaSink` does.
+    segment: Option<crate::event::SegmentEvent>,
 }
 
 impl PipeWireSink {
@@ -501,26 +510,33 @@ impl PipeWireSink {
     pub fn audio(device: Option<&str>) -> Result<Self> {
         pw::init();
 
-        let (buffer_tx, buffer_rx) = tokio_mpsc::channel::<Vec<u8>>(16);
+        let (buffer_tx, buffer_rx) = tokio_mpsc::channel::<(u64, Vec<u8>)>(16);
         let (shutdown_tx, shutdown_rx) = std_mpsc::sync_channel::<()>(1);
+        let generation = Arc::new(AtomicU64::new(0));
 
         let device = device.map(|s| s.to_string());
-        let thread = thread::spawn(move || {
-            Self::playback_thread(device, buffer_rx, shutdown_rx);
-        });
+        let thread = {
+            let generation = Arc::clone(&generation);
+            thread::spawn(move || {
+                Self::playback_thread(device, buffer_rx, shutdown_rx, generation);
+            })
+        };
 
         Ok(Self {
             sender: buffer_tx,
             _shutdown: shutdown_tx,
             _thread: Some(thread),
+            generation,
+            segment: None,
         })
     }
 
     /// Main playback thread.
     fn playback_thread(
         _device: Option<String>,
-        mut buffer_rx: tokio_mpsc::Receiver<Vec<u8>>,
+        mut buffer_rx: tokio_mpsc::Receiver<(u64, Vec<u8>)>,
         shutdown_rx: std_mpsc::Receiver<()>,
+        generation: Arc<AtomicU64>,
     ) {
         let main_loop = match pw::main_loop::MainLoopRc::new(None) {
             Ok(ml) => ml,
@@ -566,8 +582,9 @@ impl PipeWireSink {
                 // Get buffer from stream to fill
                 if let Some(mut pw_buffer) = stream.dequeue_buffer()
                     && let Some(data) = pw_buffer.datas_mut().first_mut()
-                    // Check if we have data to play
-                    && let Ok(audio_data) = buffer_rx.try_recv()
+                    // Check if we have data to play, skipping anything a
+                    // flushing seek abandoned (#265).
+                    && let Some(audio_data) = next_playable(&mut buffer_rx, &generation)
                     && let Some(slice) = data.data()
                 {
                     let copy_len = audio_data.len().min(slice.len());
@@ -612,11 +629,53 @@ impl PipeWireSink {
     }
 }
 
+/// The next queued buffer that still belongs to the current generation.
+///
+/// Drains and discards anything older — those belong to the stream position
+/// a flushing seek abandoned.
+fn next_playable(
+    rx: &mut tokio_mpsc::Receiver<(u64, Vec<u8>)>,
+    generation: &Arc<AtomicU64>,
+) -> Option<Vec<u8>> {
+    loop {
+        let (stamp, data) = rx.try_recv().ok()?;
+        if stamp >= generation.load(Ordering::Acquire) {
+            return Some(data);
+        }
+    }
+}
+
 impl AsyncSink for PipeWireSink {
     async fn consume(&mut self, ctx: &crate::element::ConsumeContext<'_>) -> Result<()> {
-        let data = ctx.input().to_vec();
+        // Out-of-segment pre-roll, clipped as `AlsaSink` clips it: a seek
+        // lands the audio track at or before the reference track's keyframe,
+        // and playing what the segment says is not in it puts the branches
+        // out of step from the first sample. The sink is format-agnostic, so
+        // the frame size comes from the buffer's own `AudioRaw` declaration;
+        // an undeclared payload is passed through untouched.
+        let audio = match ctx.metadata().format.as_ref() {
+            Some(crate::format::MediaFormat::AudioRaw(af)) => Some(*af),
+            _ => None,
+        };
+        let data = match (&self.segment, audio) {
+            (Some(seg), Some(af)) if af.bytes_per_frame() > 0 => {
+                let frame_size = af.bytes_per_frame();
+                let frames = ctx.input().len() / frame_size;
+                let (skip, keep) = crate::pipeline::clip_to_segment(
+                    seg,
+                    ctx.metadata().pts,
+                    frames,
+                    af.sample_rate,
+                );
+                if keep == 0 {
+                    return Ok(());
+                }
+                ctx.input()[skip * frame_size..(skip + keep) * frame_size].to_vec()
+            }
+            _ => ctx.input().to_vec(),
+        };
         self.sender
-            .send(data)
+            .send((self.generation.load(Ordering::Acquire), data))
             .await
             .map_err(|e| DeviceError::PipeWire(e.to_string()))?;
         Ok(())
@@ -624,6 +683,28 @@ impl AsyncSink for PipeWireSink {
 
     fn execution_hints(&self) -> ExecutionHints {
         ExecutionHints::io_bound()
+    }
+
+    /// #265: this sink had no event handling at all, so a flushing seek left
+    /// the queue holding up to 16 buffers of pre-seek audio to play out after
+    /// it, and no segment to clip against.
+    fn handle_downstream_event(
+        &mut self,
+        event: crate::event::Event,
+    ) -> Option<crate::event::Event> {
+        match &event {
+            crate::event::Event::FlushStart => {
+                self.generation.fetch_add(1, Ordering::AcqRel);
+                self.segment = None;
+            }
+            crate::event::Event::Segment(seg)
+                if seg.format == crate::event::SegmentFormat::Time =>
+            {
+                self.segment = Some(seg.clone());
+            }
+            _ => {}
+        }
+        Some(event)
     }
 }
 

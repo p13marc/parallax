@@ -262,9 +262,12 @@ struct StreamSummary {
 }
 
 /// The opened demuxer, by container.
+// Both boxed: each demuxer carries its own index and parser state — around a
+// kilobyte — so bare variants would make every `ProbedSource` the size of the
+// larger one, for a value that exists once per run.
 enum ProbedSource {
-    Mp4(Mp4Demux<BufReader<File>>),
-    Mkv(MkvDemux<BufReader<File>>),
+    Mp4(Box<Mp4Demux<BufReader<File>>>),
+    Mkv(Box<MkvDemux<BufReader<File>>>),
 }
 
 /// Everything `play` needs from the container probe.
@@ -425,7 +428,7 @@ fn open_and_probe(args: &Args) -> anyhow::Result<Probed> {
             let demux = Mp4Demux::new(BufReader::with_capacity(1 << 20, file), size)
                 .with_context(|| format!("{} is not a readable MP4", args.file.display()))?;
             let summary = probe_mp4(args, &demux);
-            (ProbedSource::Mp4(demux), summary)
+            (ProbedSource::Mp4(Box::new(demux)), summary)
         }
         MediaType::Matroska | MediaType::WebM => {
             // 1 MiB: the matroska parser issues many small reads through a
@@ -435,7 +438,7 @@ fn open_and_probe(args: &Args) -> anyhow::Result<Probed> {
                     format!("{} is not a readable Matroska/WebM", args.file.display())
                 })?;
             let summary = probe_mkv(args, &demux);
-            (ProbedSource::Mkv(demux), summary)
+            (ProbedSource::Mkv(Box::new(demux)), summary)
         }
         other => bail!(
             "{}: {other:?} detected — only MP4 and MKV/WebM are supported for now",
@@ -735,16 +738,16 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
     let src = match source {
         ProbedSource::Mp4(demux) => {
             let s = if audio.is_some() {
-                Mp4DemuxSource::new(demux)
+                Mp4DemuxSource::new(*demux)
             } else {
-                Mp4DemuxSource::video_only(demux)
+                Mp4DemuxSource::video_only(*demux)
             }
             .with_loop(args.loop_playback);
             pipeline.add_demuxer("demux", s)
         }
         ProbedSource::Mkv(demux) => {
             let s = if audio.is_some() {
-                demux
+                *demux
             } else {
                 demux.video_only()
             }
@@ -899,6 +902,32 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
     let mut vol_db: f32 = 0.0;
     let mut muted = false;
 
+    // Seek state, player-side. Arrow presses used to be applied straight to
+    // `handle.position()`, which still reports the *old* position until the
+    // seek's Segment lands — so holding the key walked a target that kept
+    // being recomputed from where playback had not moved from yet, and each
+    // press fired a fresh flush through the graph. Now the presses accumulate
+    // into a local target, one seek is in flight at a time, and its
+    // completion is recognised by seqnum on the bus.
+    let mut pending_target: Option<u64> = None;
+    let mut seek_due: Option<std::time::Instant> = None;
+    let mut in_flight: Option<(u64, u64)> = None; // (seqnum, target ns)
+    let mut seek_sent: Option<std::time::Instant> = None;
+    // The most recent bus message, shown for one status tick and then let
+    // go. Draining moved to the 20 ms tick (the seek's completion arrives on
+    // the bus), so unlike the old per-tick local this has to be cleared
+    // explicitly or a transient warning would stick for the rest of the run.
+    let mut notes = String::new();
+    // Long enough to swallow a held arrow key's repeats, short enough that a
+    // single press still feels immediate.
+    const SEEK_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(120);
+    // How long a newer target waits for the outstanding seek's `SeekDone`
+    // before going out anyway. `SeekDone` normally lands within a frame, so
+    // this only fires when one is lost or a demuxer is genuinely stuck — and
+    // then a superseding seek is the right answer, not an unresponsive
+    // transport. Dispatching twice is harmless: the engine takes the newest.
+    const SEEK_SUPERSEDE: std::time::Duration = std::time::Duration::from_secs(1);
+
     // The window opens lazily on the first displayed frame, so is_open()
     // starts out false — only treat false as "closed" after it was seen open.
     let mut window_seen = false;
@@ -929,24 +958,13 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
                 } else {
                     String::new()
                 };
-                let mut notes = String::new();
-                if let Some(bus) = bus.as_mut() {
-                    use parallax::pipeline::bus::MessageKind;
-                    while let Some(msg) = bus.poll() {
-                        match msg.kind {
-                            MessageKind::Error { error, .. } => {
-                                notes = format!(" · ERROR: {error}");
-                            }
-                            MessageKind::Warning { warning, .. } => {
-                                notes = format!(" · warning: {warning}");
-                            }
-                            MessageKind::Buffering { percent, .. } => {
-                                notes = format!(" · buffering {percent}%");
-                            }
-                            _ => {}
-                        }
-                    }
-                }
+                // Where the transport is *heading*, so a held arrow key shows
+                // its accumulated target immediately instead of a position
+                // that will not move until the seek lands.
+                let seeking = pending_target
+                    .or(in_flight.map(|(_, t)| t))
+                    .map(|t| format!(" → {}", mmss(t)))
+                    .unwrap_or_default();
                 let vol = if volume.is_none() {
                     String::new()
                 } else if muted {
@@ -957,11 +975,12 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
                     String::new()
                 };
                 print!(
-                    "\r\x1b[K{} / {}{state}{vol}{drops}{notes}",
+                    "\r\x1b[K{} / {}{seeking}{state}{vol}{drops}{notes}",
                     mmss(position),
                     mmss(duration_ns)
                 );
                 let _ = std::io::stdout().flush();
+                notes.clear();
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
                 let mut commands = Vec::new();
@@ -992,18 +1011,29 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
                             }
                         }
                         Command::SeekBy(secs) => {
-                            let position = handle.position().to_option()
-                                .map(|p| p.nanos() as i64)
-                                .unwrap_or(0);
+                            // From where the last press aimed, not from
+                            // `position()`: until the seek's Segment lands
+                            // that still reports the old position, so a
+                            // second press would walk from there and undo
+                            // the first.
+                            let from = pending_target
+                                .or(in_flight.map(|(_, t)| t))
+                                .map(|t| t as i64)
+                                .unwrap_or_else(|| {
+                                    handle.position().to_option()
+                                        .map(|p| p.nanos() as i64)
+                                        .unwrap_or(0)
+                                });
                             // duration 0 means *unknown* (MKV/WebM with no
                             // Segment Duration), not an empty file — clamping
                             // against it sent every seek to t=0. Leave the
                             // upper end open and let the demuxer land it.
-                            let mut target = (position + secs * 1_000_000_000).max(0);
+                            let mut target = (from + secs * 1_000_000_000).max(0);
                             if duration_ns > 0 {
                                 target = target.min(duration_ns.saturating_sub(1) as i64);
                             }
-                            handle.seek_time(ClockTime::from_nanos(target as u64)).await;
+                            pending_target = Some(target as u64);
+                            seek_due = Some(std::time::Instant::now() + SEEK_DEBOUNCE);
                         }
                         Command::VolumeBy(delta) => {
                             if let Some(volume) = &volume {
@@ -1033,6 +1063,61 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
                             quit = true;
                         }
                     }
+                }
+
+                // Bus draining moved here from the 250 ms status tick: the
+                // seek's completion arrives on it, and waiting a quarter of a
+                // second to notice would make every seek feel like one.
+                if let Some(bus) = bus.as_mut() {
+                    use parallax::pipeline::bus::MessageKind;
+                    while let Some(msg) = bus.poll() {
+                        match msg.kind {
+                            MessageKind::Error { error, .. } => {
+                                notes = format!(" · ERROR: {error}");
+                            }
+                            MessageKind::Warning { warning, .. } => {
+                                notes = format!(" · warning: {warning}");
+                            }
+                            MessageKind::Buffering { percent, .. } => {
+                                notes = format!(" · buffering {percent}%");
+                            }
+                            // Correlated by seqnum, which is the point of
+                            // having one: a stale completion from a
+                            // superseded seek is ignored rather than
+                            // clearing the seek that superseded it.
+                            MessageKind::SeekDone { seqnum, .. }
+                                if in_flight.is_some_and(|(s, _)| s == seqnum) =>
+                            {
+                                in_flight = None;
+                                seek_sent = None;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                // Fire the coalesced seek once the presses have settled, and
+                // only ever one at a time — overlapping flushes through the
+                // graph buy nothing and cost a decoder restart each.
+                let outstanding = seek_sent.is_some_and(|t| t.elapsed() > SEEK_SUPERSEDE);
+                if let Some(target) = pending_target
+                    && seek_due.is_some_and(|due| std::time::Instant::now() >= due)
+                    && (in_flight.is_none() || outstanding)
+                {
+                    let event = parallax::event::SeekEvent::new_time(
+                        ClockTime::from_nanos(target),
+                    );
+                    let seqnum = event.seqnum();
+                    if handle.seek(event).await {
+                        in_flight = Some((seqnum, target));
+                        seek_sent = Some(std::time::Instant::now());
+                    } else {
+                        // Nothing declared itself seekable; say so once
+                        // rather than looking like a dead keypress.
+                        notes = " · not seekable".to_string();
+                    }
+                    pending_target = None;
+                    seek_due = None;
                 }
 
                 if window.is_open() {

@@ -129,7 +129,7 @@ Timing lives in `src/clock.rs`:
 
 - **`ClockTime`** — nanoseconds in a transparent `u64`, with `ZERO` and a `NONE` sentinel (`u64::MAX`); arithmetic saturates and propagates `NONE`.
 - **`Clock`** trait — `now()`, plus `flags()` (`CAN_BE_MASTER`, `HARDWARE`, `NETWORK`, …), `resolution()`, `name()`. `SystemClock` (monotonic) is the default.
-- **`PipelineClock`** — pairs a clock with a `base_time` set at start; `running_time() = now − base_time`. Async helpers `wait_until(t)` / `wait_for(d)` poll in ≤10 ms steps so clock adjustments are honored.
+- **`PipelineClock`** — pairs a clock with a `base_time` set at start; `running_time() = now − base_time`. Once running, elements read the origin through the pipeline's shared `SyncBase` instead, which a flushing seek re-anchors (see [pipeline.md](pipeline.md) § A/V synchronization). Async helpers `wait_until(t)` / `wait_for(d)` poll in ≤10 ms steps so clock adjustments are honored.
 - **`ClockProvider`** — elements that own a better clock (audio sinks, network sync) implement `provide_clock()` + `clock_priority()`. Priority bands: 0–99 software, 100–199 hardware audio, 200–299 network (NTP), 300+ precision (PTP).
 
 ### Automatic clock selection

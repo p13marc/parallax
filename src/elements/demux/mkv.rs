@@ -305,6 +305,10 @@ pub struct MkvDemux<R: Read + Seek> {
     /// Reusable frame to avoid a fresh allocation per block.
     frame: Frame,
     looping: bool,
+    /// A Segment staged for the executor to emit on every pad before the
+    /// next buffer (#265). The `with_loop` rewind is not a seek, so nothing
+    /// else re-establishes the timeline at the lap boundary.
+    staged_segment: Option<crate::event::SegmentEvent>,
     /// Trick-play rate from the last handled seek (#165): while > 1.0,
     /// only video keyframes are emitted — fast-forward as GStreamer's
     /// keyframe trick mode (audio is muted; every skipped frame would
@@ -430,6 +434,7 @@ impl<R: Read + Seek> MkvDemux<R> {
                 .grow_to_fit(),
             frame: Frame::default(),
             looping: false,
+            staged_segment: None,
             trick_rate: 1.0,
             video_resync: false,
             stop_ticks: None,
@@ -533,8 +538,11 @@ impl<R: Read + Seek> MkvDemux<R> {
     /// Loop playback: at end of stream, seek back to the start and keep
     /// producing instead of reporting EOS.
     ///
-    /// The rewind is silent (no events), so running time restarts each lap.
-    /// For gapless looping with monotonic running time, drive a
+    /// The rewind emits a fresh `Segment` on every pad (#265), so running
+    /// time stays monotonic across the lap boundary and paced sinks keep
+    /// A/V locked through it — but it is not a flush, so anything already
+    /// queued downstream plays out first. For a lap boundary the pipeline
+    /// treats as a real segment end, drive a
     /// [`SeekFlags::SEGMENT`](crate::event::SeekFlags::SEGMENT) seek loop
     /// from the bus instead (respond to `MessageKind::SegmentDone` with a
     /// non-flushing SEGMENT seek back to the start, #165).
@@ -888,6 +896,10 @@ impl<R: Read + Seek> MkvDemux<R> {
 }
 
 impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
+    fn take_downstream_event(&mut self) -> Option<crate::event::Event> {
+        self.staged_segment.take().map(crate::event::Event::Segment)
+    }
+
     fn demux(&mut self, _buffer: Buffer) -> Result<crate::element::RoutedOutput> {
         Err(Error::Config(
             "MkvDemux owns its reader; add it with no input link".into(),
@@ -943,6 +955,11 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
                         .seek(0)
                         .map_err(|e| Error::Config(format!("MKV rewind failed: {e:?}")))?;
                     self.video_resync = true;
+                    // Re-establish the timeline for the new lap: PTS restart
+                    // at zero, running time must not. The executor fills in
+                    // the base already consumed (#265).
+                    self.staged_segment =
+                        Some(crate::event::SegmentEvent::new_time(ClockTime::ZERO, None));
                     // A seek past the last frame leaves skip entries no frame
                     // can ever satisfy; the loop rewind must drop them or it
                     // would discard every frame forever.
@@ -995,11 +1012,17 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
             };
 
             // After a seek, hold video until a keyframe so a decoder never
-            // joins mid-GOP. Audio passes through (every frame decodes).
-            // Evaluated only after the video track's own skip has cleared —
-            // a pre-target keyframe (the t=0 one, during a rewind scan) can
-            // no longer satisfy the resync while the skip is still
-            // discarding (#158).
+            // joins mid-GOP. Evaluated only after the video track's own skip
+            // has cleared — a pre-target keyframe (the t=0 one, during a
+            // rewind scan) can no longer satisfy the resync while the skip is
+            // still discarding (#158).
+            //
+            // Audio passes through (every frame decodes). It is *not* held
+            // with the video: a seek past the last keyframe legitimately
+            // emits no video at all, and holding audio for a keyframe that
+            // will never come would turn that into silence. What keeps the
+            // two branches opening together instead is the skip floor — see
+            // the forward-snap landing in `handle_upstream_event` (#265).
             if self.video_resync && is_video {
                 if !is_key {
                     discarded += 1;
@@ -1086,6 +1109,7 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
             self.pending = None;
             self.skip.clear();
             self.video_resync = false;
+            self.staged_segment = None;
             self.stop_ticks = None;
             self.trick_rate = seek.rate;
             self.reverse_end_ticks = start_ns / self.timestamp_scale;
@@ -1136,8 +1160,14 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
             }
         };
         // Backward snap lands exactly on a cue (skip to the cue's own time,
-        // landing knowable up front); forward keeps the requested tick as
-        // the skip floor and scans ahead to the next keyframe.
+        // landing knowable up front). Forward lands on the next cue when
+        // there is one — cues *are* video keyframes, so that is the honest
+        // landing and it can be reported up front like the backward one
+        // (#265; it used to report `None`, which made the executor synthesize
+        // the segment around the *requested* time while video started a GOP
+        // later). Without cues there is no index to resolve against and the
+        // scan has to find the keyframe, so the landing stays unknown and
+        // `video_resync` holds both tracks until it does.
         let (cue_target, skip_ticks, landing_ticks) = match snap {
             SeekSnap::Before => {
                 // `prev`, or the first cue when the target precedes it —
@@ -1149,7 +1179,15 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
                 });
                 (Some(offset), cue_ticks, Some(cue_ticks))
             }
-            _ => (prev.map(|(_, offset)| offset), ticks, None),
+            // Forward. Enter at the *previous* cue's cluster either way: the
+            // landing frame's cluster may begin before it, and the per-track
+            // skip discards everything below the floor anyway.
+            _ => match next_ticks {
+                // A cue ahead of the target is the landing.
+                Some(landing) => (prev.map(|(_, offset)| offset), landing, Some(landing)),
+                // Past the last cue: only the scan can find the keyframe.
+                None => (prev.map(|(_, offset)| offset), ticks, None),
+            },
         };
 
         // Cue-indexed path first, on OUR cue table (`mkv_cues`): the crate's
@@ -1196,6 +1234,10 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
             tracing::info!("mkvdemux: seek to {target_ns} ns (tick {ticks}, {snap:?})");
             self.pending = None;
             self.video_resync = true;
+            // A loop rewind may have staged a Segment that this seek just
+            // superseded; emitting it afterwards would re-anchor both pads at
+            // zero on top of the seek's own segment (#265).
+            self.staged_segment = None;
             // Trick play (#165): the seek's rate governs playback until the
             // next handled seek changes it. A forward seek leaves reverse.
             self.trick_rate = if seek.rate > 0.0 { seek.rate } else { 1.0 };
@@ -1223,10 +1265,12 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
                 // block and the resync scans past it — rare, self-correcting
                 // (video simply starts at the next keyframe).
                 Some(t) => EventResult::handled_at((t * self.timestamp_scale) as i64),
-                // Forward snap: landing unknown until produce() finds the
-                // first keyframe at or after the target — report None and
-                // let the executor fall back to the requested position for
-                // the Segment (#162).
+                // Forward snap on a cue-less file: the landing is unknown
+                // until produce() finds the first keyframe at or after the
+                // target — report None and let the executor fall back to the
+                // requested position for the Segment (#162). `video_resync`
+                // then holds *both* tracks to that keyframe, so the branches
+                // still open together (#265).
                 None => EventResult::handled(),
             }
         } else {

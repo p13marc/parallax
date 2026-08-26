@@ -493,6 +493,62 @@ mod cue_seek {
         assert!(audio > 0, "audio at/after the target still flows");
     }
 
+    /// #265: a forward-snapped seek opens both branches on the same instant.
+    ///
+    /// The default snap is forward, and the skip floor used to be the
+    /// *requested* tick for every track while `video_resync` held video back
+    /// to the next keyframe. Audio therefore started at the request and video
+    /// up to a whole GOP later, with nothing anywhere reconciling them — a
+    /// permanent lip-sync error the size of the gap. Cues *are* video
+    /// keyframes, so the landing is knowable up front and becomes the floor
+    /// for every track.
+    #[test]
+    fn a_forward_seek_opens_audio_and_video_together() {
+        let (mut demux, _) = counting(H264_AAC_MKV);
+        let mut yields = 0;
+        next_buffer(&mut demux, &mut yields).expect("head frame");
+
+        // 1200 ms sits between the 1000 and 1500 ms cues; forward lands on
+        // 1500, and says so rather than leaving it scan-determined.
+        assert!(
+            matches!(
+                seek_with(&mut demux, 1200, SeekFlags::FLUSH | SeekFlags::KEY_UNIT),
+                EventResult::Handled {
+                    position: Some(1_500_000_000)
+                }
+            ),
+            "the forward landing is the cue"
+        );
+
+        let mut first_audio = None;
+        let mut first_video = None;
+        while first_audio.is_none() || first_video.is_none() {
+            let Some((pad, pts, _)) = next_buffer(&mut demux, &mut yields) else {
+                break;
+            };
+            let slot = if pad == 0 {
+                &mut first_video
+            } else {
+                &mut first_audio
+            };
+            slot.get_or_insert(pts);
+        }
+
+        let video = first_video.expect("video resumed");
+        let audio = first_audio.expect("audio resumed");
+        assert_eq!(video, 1500, "video lands on the cue keyframe");
+        assert!(
+            audio >= 1500,
+            "audio opened {} ms before the video keyframe",
+            1500 - audio as i64
+        );
+        assert!(
+            audio - 1500 < 100,
+            "audio opened {} ms after the video keyframe",
+            audio - 1500
+        );
+    }
+
     /// (D) The scan yields within its budget, so a superseding seek gets a
     /// produce() boundary to land on instead of queueing behind the scan.
     #[test]
@@ -582,9 +638,11 @@ mod cue_seek {
         assert!(
             matches!(
                 seek_with(&mut demux, 1300, nearest),
-                EventResult::Handled { position: None }
+                EventResult::Handled {
+                    position: Some(1_500_000_000)
+                }
             ),
-            "1300 ms resolves forward, whose landing is scan-determined"
+            "1300 ms resolves forward, to the cue that IS the landing keyframe"
         );
         loop {
             let (pad, pts, sync) = next_buffer(&mut demux, &mut yields).expect("post-seek data");

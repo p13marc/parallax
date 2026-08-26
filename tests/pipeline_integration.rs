@@ -901,7 +901,8 @@ fn test_plugin_abi_version() {
     // 3: AsyncElementDyn::process_demux (per-pad demuxer routing, #76)
     // 10: AsyncElementDyn::retained_buffers (#189)
     // 12: AsyncElementDyn::finish (#221)
-    assert_eq!(PARALLAX_ABI_VERSION, 12);
+    // 13: AsyncElementDyn::set_clock takes Arc<SyncBase> (#265)
+    assert_eq!(PARALLAX_ABI_VERSION, 13);
 }
 
 /// Test plugin descriptor struct sizes are non-zero.

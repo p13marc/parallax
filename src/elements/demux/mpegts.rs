@@ -1147,7 +1147,18 @@ impl TsDemuxElement {
         if !state.awaiting_pts {
             return;
         }
-        let Some(pts) = frames.iter().find_map(|f| f.pts) else {
+        // The *video* landing, deliberately (#265). This took whichever
+        // stream's PTS came first, which on an interleaved TS is normally
+        // audio running ahead of video — so refinement converged on a
+        // different instant from the one the segment and the picture are
+        // driven by. A stream with no video at all falls back to whatever
+        // there is.
+        let pts = frames
+            .iter()
+            .find(|f| f.stream_type.is_video())
+            .and_then(|f| f.pts)
+            .or_else(|| frames.iter().find_map(|f| f.pts));
+        let Some(pts) = pts else {
             return;
         };
         state.awaiting_pts = false;

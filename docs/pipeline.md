@@ -329,6 +329,8 @@ handle.seek_time(ClockTime::from_secs(30)).await;     // or seek_bytes / seek(Se
 
 A source that cannot seek posts a bus `Warning` and keeps producing. Sources scheduled on RT threads have no control channel — runtime seek covers the async path only.
 
+Seeks carry a seqnum, and `MessageKind::SeekDone` reports it back, so an application driving a transport should coalesce keypresses into one target, keep one seek in flight, and match its completion by seqnum — `parallax-player` does exactly that. Recomputing the target from `position()` between presses does not work: it still reports the old position until the seek's `Segment` lands.
+
 The handle also pauses and resumes a running pipeline, and reports the stream position:
 
 ```rust
@@ -339,6 +341,20 @@ handle.resume();                   // gap-free: running time continues where it 
 ```
 
 Pause freezes the shared clock, so clock-paced sinks (e.g. `AutoVideoSink` with `sync`) stall mid-wait and resume without a burst of late frames; sources stop producing until resumed. Both post `MessageKind::StateChanged` (`Running ↔ Idle`). `position()` re-anchors on a runtime seek and falls back to running time before the first frame is presented.
+
+A cooperative `stop()` additionally **detaches** the clock: one provided by a device stops when the device does, which is correct during playback and a deadlock on the way down, so from that point it runs at wall rate (never backwards — the device still wins while it plays out) and every paced branch can drain its tail.
+
+### A/V synchronization
+
+Running time is `clock.now() - base`, where `base` is a **shared, re-anchorable** origin (`pipeline::SyncBase`) rather than a value snapshotted at `start()`. It matters because a flushing seek restarts every segment at running time zero while a master clock provided by an audio device keeps counting upward: without a shared origin the two sinks each guess, and the guesses disagree by however differently the two branches happened to restart.
+
+The sink whose element provides the selected clock is the **sync master** — an `AlsaSink`, whose device's progress *is* the timeline. On the first in-segment buffer of each flush generation it publishes `base = clock_when_that_sample_is_heard - segment.to_running_time(pts)`; other sinks read it and present at `running_time >= segment.to_running_time(pts)`. A pipeline with no clock provider has no master and the first sink to see data anchors it. A master that never turns up is waited out (`AutoVideoSink::with_anchor_grace`, 250 ms by default) so a stalled audio branch cannot freeze the picture.
+
+Three consequences worth knowing when writing a sink:
+
+- The generation is the seek's epoch, carried in band by `FlushStopEvent::epoch`, so both branches derive it from the same event.
+- Audio sinks clip to the segment (`pipeline::clip_to_segment`). A container seeks its non-reference tracks at-or-before the reference keyframe on purpose, so the first post-seek audio buffer routinely straddles `segment.start` and must be trimmed rather than played.
+- **The pacing wait must be interruptible.** A sink inside it cannot reach its loop head, so the `FlushStart` behind its buffer cannot free it — and waiting out a superseded presentation time fills its link, backs the producer up and starves the branch driving the clock it is waiting on. `SyncBase::flush_epoch` rises the moment a flushing seek is dispatched; a wait that began earlier should drop its buffer — that goes for the pacing wait and for `AnchorGate::settle`'s wait for the master alike. `StallWatch` is the backstop for a clock that stopped for some other reason: present after `STALL_LIMIT`, unless `sync.is_paused()`.
 
 Under the hood, a `SeekEvent` travels upstream to the source's `handle_upstream_event` (e.g. `FileSrc`). After a seek, a `SegmentEvent` establishes the timestamp mapping:
 

@@ -57,6 +57,7 @@ pub mod probe;
 pub mod rt_bridge;
 pub mod rt_scheduler;
 pub mod seek;
+pub mod sync;
 pub mod tags;
 pub mod tracer;
 pub mod typefind;
@@ -82,6 +83,11 @@ pub use rt_scheduler::{
     NodeStatus, RtConfig, RtScheduler, SchedulingMode, spawn_data_thread,
 };
 pub use seek::{DurationQuery, LatencyRange, PositionQuery, SeekTranslation, SeekableQuery};
+pub use sync::{
+    ANCHOR_GRACE, Anchor, AnchorGate, INITIAL_GENERATION, MAX_WAIT, Pace, Realign, STALL_LIMIT,
+    StallWatch, SyncBase, SyncHandle, SyncRole, clip_to_segment, frames_to_nanos, realign,
+    schedule,
+};
 pub use tags::{TagList, TagMergeMode, TagValue};
 pub use tracer::{
     DropTracer, ElementStats, FramerateTracer, LatencyTracer, PipelineStats, Tracer,

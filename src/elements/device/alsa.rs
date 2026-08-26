@@ -39,6 +39,7 @@ use crate::format::{
     AudioFormatCaps, CapsValue, ElementMediaCaps, FormatCaps, FormatMemoryCap, MemoryCaps,
 };
 use crate::pipeline::flow::FlowStateHandle;
+use crate::pipeline::sync::{Anchor, Realign, clip_to_segment, frames_to_nanos, realign};
 
 use super::DeviceError;
 
@@ -167,6 +168,17 @@ impl AlsaSampleFormat {
             AlsaSampleFormat::S32LE => 4,
             AlsaSampleFormat::F32LE => 4,
             AlsaSampleFormat::U8 => 1,
+        }
+    }
+
+    /// The byte pattern that means digital silence in this format.
+    ///
+    /// Zero for the signed and float formats; U8 is offset-binary, so its
+    /// zero point is mid-scale.
+    pub fn silence_byte(self) -> u8 {
+        match self {
+            AlsaSampleFormat::U8 => 0x80,
+            _ => 0,
         }
     }
 
@@ -476,6 +488,27 @@ pub struct AlsaSink {
     /// syscalls per audio buffer (#142). Lazily built on first consume so
     /// construction stays runtime-independent.
     poll_fd: Option<AsyncFd<std::os::fd::RawFd>>,
+    /// The Time segment currently playing (#265). This sink used to be
+    /// entirely PTS-blind — `consume` read `ctx.input()` and nothing else —
+    /// so out-of-segment audio was played in full and no mapping from stream
+    /// time to the clock it *provides* ever existed.
+    segment: Option<crate::event::SegmentEvent>,
+    /// Frames dropped for falling outside the segment, for observability.
+    clipped_frames: u64,
+    /// Running time the next sample written is due at. `NONE` until the
+    /// first buffer of a generation has been placed.
+    expected_rt: ClockTime,
+    /// Whether to fill a gap in the stream with silence; see
+    /// [`with_gap_fill`](Self::with_gap_fill).
+    gap_fill: bool,
+    /// The largest gap worth papering over before re-anchoring instead.
+    max_gap: Duration,
+    /// Reusable silence, so a gap costs no allocation.
+    silence: Vec<u8>,
+    /// This sink's part of the per-generation anchor handshake (#265) — as
+    /// the clock provider it is normally the master, so `settle` publishes
+    /// the origin rather than waiting for one.
+    anchor: crate::pipeline::AnchorGate,
 }
 
 /// Clock provider wrapper for AlsaSink.
@@ -563,6 +596,13 @@ impl AlsaSink {
             dev_paused: false,
             poll_fd: None,
             position,
+            segment: None,
+            clipped_frames: 0,
+            expected_rt: ClockTime::NONE,
+            gap_fill: true,
+            max_gap: Duration::from_secs(1),
+            silence: Vec::new(),
+            anchor: crate::pipeline::AnchorGate::default(),
         })
     }
 
@@ -572,6 +612,27 @@ impl AlsaSink {
     /// outside the pipeline — the sink itself moves into its executor task.
     pub fn position(&self) -> Arc<AlsaPosition> {
         Arc::clone(&self.position)
+    }
+
+    /// Whether a gap in the incoming stream is filled with silence (default
+    /// on).
+    ///
+    /// This sink's clock is its own write cursor, so a lost packet moves the
+    /// content without moving the clock and every branch pacing against that
+    /// clock drifts by the gap. Filling it keeps the two in step. Turn it off
+    /// for a capture pipeline that would rather hear the join than a pause —
+    /// the timeline then belongs to whatever arrives.
+    pub fn with_gap_fill(mut self, fill: bool) -> Self {
+        self.gap_fill = fill;
+        self
+    }
+
+    /// The largest gap worth filling before re-anchoring instead (default
+    /// 1 s), so a bogus timestamp cannot talk the sink into writing minutes
+    /// of silence.
+    pub fn with_max_gap(mut self, max_gap: Duration) -> Self {
+        self.max_gap = max_gap;
+        self
     }
 
     /// Publish how far the device has actually got.
@@ -613,6 +674,16 @@ impl AlsaSink {
         self.written_frames = rebase_written(self.written_frames, queued, count_as_played);
         self.position
             .update(self.written_frames, std::time::Instant::now());
+        if !count_as_played {
+            // A flush: the device is stopped and empty until fresh audio
+            // arrives, which may be a while. Hold the clock at what was
+            // actually heard rather than interpolating through the gap —
+            // otherwise up to MAX_INTERPOLATION of phantom playback lands in
+            // the base the next anchor is taken against.
+            self.position.stall();
+            // Restart real playback after an EOS-released clock.
+            self.position.unrelease();
+        }
     }
 
     /// Get the audio format.
@@ -711,6 +782,15 @@ pub struct AlsaPosition {
     released_at_nanos: AtomicU64,
     /// The derived playback time captured at release.
     released_base_nanos: AtomicU64,
+    /// Whether the device is stopped and holds nothing (a flush).
+    ///
+    /// While set, [`now_at`](Self::now_at) reports the last published
+    /// position instead of interpolating with wall time. The interpolation
+    /// exists so the clock stays smooth *between* writes; across a seek the
+    /// device genuinely is not playing, and letting it run would fold up to
+    /// `MAX_INTERPOLATION` of playback that never happened into the base a
+    /// sink anchors from. Cleared by the next `update`.
+    stalled: std::sync::atomic::AtomicBool,
     /// The playback time captured at pause, plus one (0 = live).
     ///
     /// While frozen the clock reports exactly this value: a paused device
@@ -731,6 +811,7 @@ impl AlsaPosition {
             sample_rate: sample_rate.max(1),
             released_at_nanos: AtomicU64::new(0),
             released_base_nanos: AtomicU64::new(0),
+            stalled: std::sync::atomic::AtomicBool::new(false),
             frozen_nanos: AtomicU64::new(0),
         }
     }
@@ -779,8 +860,29 @@ impl AlsaPosition {
         }
     }
 
+    /// The device stopped and holds nothing: hold the clock still rather
+    /// than interpolating over a gap it is not playing through (#265).
+    ///
+    /// Cleared by the next [`update`](Self::update).
+    pub fn stall(&self) {
+        self.stalled.store(true, Ordering::Release);
+    }
+
+    /// Undo [`release`](Self::release), so a device that is playing again
+    /// drives the clock again.
+    ///
+    /// `release` is a one-shot latch — after EOS the clock free-runs at wall
+    /// rate so other paced branches can present their tail. A seek *after*
+    /// EOS (looping, scrubbing back from the end) restarts real playback,
+    /// and without this the master clock would stay wall-rate forever.
+    pub fn unrelease(&self) {
+        self.released_at_nanos.store(0, Ordering::Release);
+        self.released_base_nanos.store(0, Ordering::Release);
+    }
+
     /// Publish a new device position, observed at `at`.
     pub fn update(&self, frames_played: u64, at: std::time::Instant) {
+        self.stalled.store(false, Ordering::Release);
         self.frames_played.store(frames_played, Ordering::Release);
         self.updated_at_nanos.store(
             (at.saturating_duration_since(self.epoch).as_nanos() as u64).saturating_add(1),
@@ -817,6 +919,14 @@ impl AlsaPosition {
         }
 
         let frames = self.frames_played.load(Ordering::Acquire);
+        if self.stalled.load(Ordering::Acquire) {
+            let played = frames
+                .saturating_mul(1_000_000_000)
+                .checked_div(self.sample_rate as u64)
+                .unwrap_or(0);
+            let previous = self.last_reported_nanos.fetch_max(played, Ordering::AcqRel);
+            return ClockTime::from_nanos(played.max(previous));
+        }
         let Some(updated_at) = self.updated_at_nanos.load(Ordering::Acquire).checked_sub(1) else {
             // Nothing has played yet. Report zero rather than interpolating
             // off the epoch — see `updated_at_nanos`.
@@ -904,29 +1014,14 @@ impl Clock for AlsaClock {
     }
 }
 
-// Note: AlsaSink provides a clock automatically via `as_clock_provider()`.
-// The pipeline's `select_clock()` will discover it and use it as the master
-// clock. Manual clock setting is still possible via `pipeline.set_clock()`.
-
-impl AsyncSink for AlsaSink {
-    async fn consume(&mut self, ctx: &ConsumeContext<'_>) -> Result<()> {
-        let data = ctx.input();
-        let frames = data.len() / self.frame_size;
-
-        if frames == 0 {
-            return Ok(());
-        }
-
-        // Register the PCM's poll fd with the tokio reactor once and keep
-        // it — a fresh `AsyncFd` per buffer cost an allocation plus two
-        // epoll_ctl syscalls per audio buffer (#142).
-        if self.poll_fd.is_none()
-            && let Ok(fds) = self.poll_descriptors()
-            && let Some(first) = fds.first()
-        {
-            self.poll_fd = AsyncFd::new(first.fd).ok();
-        }
-
+impl AlsaSink {
+    /// Hand `data` to the device, all of it, retrying around underruns.
+    ///
+    /// Extracted from `consume` so silence and payload go through one path
+    /// (#265): the frame accounting the master clock is built on has to
+    /// count both, or inserting silence would move the audio without moving
+    /// the clock.
+    async fn write_all(&mut self, data: &[u8]) -> Result<()> {
         // Bytes, not `i16`. `io_bytes()` converts the byte count to frames
         // through the PCM's *configured* format, so one path serves S16, S32,
         // F32 and U8 alike — and there is no `from_raw_parts` on a buffer slice
@@ -936,7 +1031,7 @@ impl AsyncSink for AlsaSink {
         // `writei` can write fewer frames than asked for. The remainder used to
         // be silently discarded, which drops audio and makes the frame
         // accounting the clock depends on wrong.
-        let wanted = frames * self.frame_size;
+        let wanted = data.len();
         let mut written = 0usize;
         let mut underruns = 0u32;
 
@@ -1007,6 +1102,154 @@ impl AsyncSink for AlsaSink {
 
         Ok(())
     }
+}
+
+// Note: AlsaSink provides a clock automatically via `as_clock_provider()`.
+// The pipeline's `select_clock()` will discover it and use it as the master
+// clock. Manual clock setting is still possible via `pipeline.set_clock()`.
+
+impl AsyncSink for AlsaSink {
+    async fn consume(&mut self, ctx: &ConsumeContext<'_>) -> Result<()> {
+        let data = ctx.input();
+        let frames = data.len() / self.frame_size;
+
+        if frames == 0 {
+            return Ok(());
+        }
+
+        // Segment mapping (#265). Everything below turns on it: what to
+        // clip, and where running time zero sits on the clock this sink
+        // provides.
+        let pts = ctx.metadata().pts;
+        let (skip, frames) = match &self.segment {
+            Some(seg) => clip_to_segment(seg, pts, frames, self.format.sample_rate),
+            None => (0, frames),
+        };
+        if skip > 0 {
+            self.clipped_frames += skip as u64;
+            tracing::debug!(
+                "alsasink: clipped {skip} out-of-segment frames ({} so far)",
+                self.clipped_frames
+            );
+        }
+        if frames == 0 {
+            return Ok(());
+        }
+        let data = &data[skip * self.frame_size..(skip + frames) * self.frame_size];
+
+        // Where this buffer's first kept sample belongs on the stream's
+        // timeline. `NONE` for an unmapped stream (no segment, or no PTS),
+        // which turns both the anchor and the realignment below into no-ops.
+        let first = ClockTime::from_nanos(
+            pts.nanos()
+                .saturating_add(frames_to_nanos(skip as u64, self.format.sample_rate)),
+        );
+        let running_time = match (&self.segment, pts.to_option()) {
+            (Some(seg), Some(_)) => seg.to_running_time(first),
+            _ => ClockTime::NONE,
+        };
+
+        // Define running-time zero for this generation, on behalf of the
+        // whole pipeline (#265). This sink is the master because the clock
+        // *is* its device's progress, so the honest anchor is: this sample
+        // is heard when the clock reaches `now + delay`, where `delay` is
+        // the audio already queued ahead of it. Right after a flush that is
+        // zero; at start-up it is a device buffer's worth, which used to go
+        // unaccounted and made every paced branch run that much early.
+        if let Some(sync) = ctx.sync()
+            && running_time.is_some()
+            && self.anchor.settle(sync, sync.flush_epoch()).await == Anchor::Yours
+        {
+            let queued = self.pcm.delay().unwrap_or(0).max(0) as u64;
+            let heard_at = ctx
+                .clock_time()
+                .saturating_add(ClockTime::from_nanos(frames_to_nanos(
+                    queued,
+                    self.format.sample_rate,
+                )));
+            sync.anchor(self.anchor.generation(), heard_at, running_time);
+        }
+
+        // Register the PCM's poll fd with the tokio reactor once and keep
+        // it — a fresh `AsyncFd` per buffer cost an allocation plus two
+        // epoll_ctl syscalls per audio buffer (#142).
+        if self.poll_fd.is_none()
+            && let Ok(fds) = self.poll_descriptors()
+            && let Some(first) = fds.first()
+        {
+            self.poll_fd = AsyncFd::new(first.fd).ok();
+        }
+
+        // Keep the device's write cursor on the stream's timeline (#265).
+        // This sink's clock *is* that cursor, so a gap in the incoming
+        // stream moves the content without moving the clock and every
+        // branch pacing against it drifts by the gap.
+        let mut data = data;
+        // Where the first sample this call writes lands on the timeline —
+        // `Realign::placed_at` owns that rule, and the tests there own why.
+        let mut placed_at = Realign::None.placed_at(running_time, self.expected_rt);
+        if self.gap_fill {
+            let tolerance = Duration::from_nanos(frames_to_nanos(
+                self.format.period_frames as u64,
+                self.format.sample_rate,
+            ));
+            let action = realign(
+                running_time,
+                self.expected_rt,
+                self.format.sample_rate,
+                tolerance,
+                self.max_gap,
+            );
+            placed_at = action.placed_at(running_time, self.expected_rt);
+            match action {
+                Realign::None => {}
+                Realign::Silence(gap) => {
+                    let bytes = gap * self.frame_size;
+                    self.silence.clear();
+                    self.silence
+                        .resize(bytes, self.format.format.silence_byte());
+                    let silence = std::mem::take(&mut self.silence);
+                    let written = self.write_all(&silence).await;
+                    self.silence = silence;
+                    written?;
+                    tracing::debug!("alsasink: filled a {gap}-frame gap with silence");
+                }
+                Realign::Trim(overlap) => {
+                    if overlap >= frames {
+                        // Entirely behind the write cursor: it has already
+                        // been played, in effect.
+                        return Ok(());
+                    }
+                    data = &data[overlap * self.frame_size..];
+                    // The trimmed head is exactly what had already been
+                    // written, so the remainder starts at the cursor.
+                    tracing::debug!("alsasink: trimmed {overlap} overlapping frames");
+                }
+                Realign::Restart => {
+                    tracing::warn!(
+                        "alsasink: stream time jumped from {} to {running_time}; \
+                         restarting the audio timeline there",
+                        self.expected_rt
+                    );
+                    self.expected_rt = ClockTime::NONE;
+                }
+            }
+        }
+
+        let placed = data.len() / self.frame_size;
+        self.write_all(data).await?;
+        // Where the next sample is due: where this one landed, plus what was
+        // written. An unmapped stream (no segment, or no PTS) leaves the
+        // cursor unset rather than inventing one from a timestamp there
+        // isn't.
+        if running_time.is_some() {
+            self.expected_rt = placed_at.saturating_add(ClockTime::from_nanos(frames_to_nanos(
+                placed as u64,
+                self.format.sample_rate,
+            )));
+        }
+        Ok(())
+    }
 
     fn input_media_caps(&self) -> ElementMediaCaps {
         alsa_media_caps(&self.format)
@@ -1014,6 +1257,20 @@ impl AsyncSink for AlsaSink {
 
     fn execution_hints(&self) -> ExecutionHints {
         ExecutionHints::io_bound()
+    }
+
+    /// Declared latency (#184): the device buffer sits between a written
+    /// sample and a heard one — ~85 ms at the default `AlsaFormat`.
+    ///
+    /// It went undeclared, so `PipelineHandle::latency()` reported a
+    /// pipeline's audio path as instantaneous.
+    fn latency(&self) -> Option<crate::pipeline::seek::LatencyRange> {
+        Some(crate::pipeline::seek::LatencyRange::up_to(
+            ClockTime::from_nanos(frames_to_nanos(
+                self.format.buffer_frames as u64,
+                self.format.sample_rate,
+            )),
+        ))
     }
 
     fn handle_downstream_event(
@@ -1039,6 +1296,23 @@ impl AsyncSink for AlsaSink {
                 // drop supersedes the pause, and the position stays frozen
                 // until Resume.
                 self.discard_queued(false);
+                // The mapping this sink was playing under is gone with it;
+                // the Segment behind this flush installs the next one, and
+                // the timeline restarts from the first buffer under it.
+                self.segment = None;
+                self.expected_rt = ClockTime::NONE;
+            }
+            // The flush names the sync generation to anchor for (#265), so
+            // both branches of an A/V graph derive it from the same event.
+            crate::event::Event::FlushStop(stop) => {
+                self.anchor.open(stop.epoch);
+            }
+            // The PTS → running-time mapping, and with it what counts as
+            // out-of-segment audio and where running time zero lands.
+            crate::event::Event::Segment(seg)
+                if seg.format == crate::event::SegmentFormat::Time =>
+            {
+                self.segment = Some(seg.clone());
             }
             crate::event::Event::Pause => {
                 // Freeze the master clock at what has actually been heard —
@@ -1369,5 +1643,64 @@ mod tests {
                 println!("Failed to enumerate: {}", e);
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Clock honesty across a flush (#265)
+    // ------------------------------------------------------------------
+
+    const RATE: u32 = 48_000;
+
+    #[test]
+    fn a_stalled_clock_holds_still_instead_of_interpolating() {
+        // Across a flush the device is stopped and empty. Interpolation
+        // exists to keep the clock smooth *between* writes; letting it run
+        // here folds up to MAX_INTERPOLATION of playback that never happened
+        // into the base the next anchor is taken against.
+        let position = AlsaPosition::new(RATE);
+        let t0 = std::time::Instant::now();
+        position.update(48_000, t0); // one second played
+        assert_eq!(position.now_at(t0), ClockTime::from_secs(1));
+
+        position.stall();
+        for after in [10, 50, 100, 500] {
+            assert_eq!(
+                position.now_at(t0 + Duration::from_millis(after)),
+                ClockTime::from_secs(1),
+                "stalled clock moved after {after} ms"
+            );
+        }
+
+        // Fresh audio clears the stall and time runs again.
+        position.update(96_000, t0 + Duration::from_millis(500));
+        assert_eq!(
+            position.now_at(t0 + Duration::from_millis(500)),
+            ClockTime::from_secs(2)
+        );
+    }
+
+    #[test]
+    fn a_flush_after_eos_lets_the_device_drive_the_clock_again() {
+        // `release` is a one-shot latch: after EOS the clock free-runs at
+        // wall rate so other paced branches can present their tail. A seek
+        // back into the stream restarts real playback, and without
+        // `unrelease` the master clock would stay wall-rate forever.
+        let position = AlsaPosition::new(RATE);
+        let t0 = std::time::Instant::now();
+        position.update(48_000, t0);
+        position.release(t0);
+        let free_running = position.now_at(t0 + Duration::from_millis(400));
+        assert!(
+            free_running > ClockTime::from_secs(1),
+            "a released clock runs at wall rate"
+        );
+
+        position.unrelease();
+        position.update(96_000, t0 + Duration::from_millis(400));
+        assert_eq!(
+            position.now_at(t0 + Duration::from_millis(400)),
+            ClockTime::from_secs(2),
+            "the device drives the clock again"
+        );
     }
 }

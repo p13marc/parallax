@@ -17,6 +17,12 @@ use std::ffi::{CStr, c_char, c_int, c_void};
 /// bump is not a compatibility inconvenience — it is undefined behaviour.
 ///
 /// History:
+/// - **13**: `AsyncElementDyn::set_clock` takes an `Arc<SyncBase>` instead of
+///   a by-value `ClockTime` base (#265) — the slot's signature changed, and
+///   with it what running time *means*: the origin is now shared and
+///   re-anchored on a flushing seek instead of frozen at `start()`.
+///   `FlushStopEvent` also grew the seek epoch that names the generation
+///   being anchored.
 /// - **12**: `AsyncElementDyn::finish` (#221) — a new vtable slot. The
 ///   terminal hook a sink needs when its goodbye is I/O: publishing an
 ///   end-of-stream sample, finalizing a container, closing a socket.
@@ -45,7 +51,7 @@ use std::ffi::{CStr, c_char, c_int, c_void};
 /// - **3**: `AsyncElementDyn::process_demux` (demuxer routing).
 /// - **2**: `AsyncElementDyn::set_output_budget` (executor-sized output arenas).
 /// - **1**: initial hand-rolled `#[repr(C)]` descriptor ABI.
-pub const PARALLAX_ABI_VERSION: u32 = 12;
+pub const PARALLAX_ABI_VERSION: u32 = 13;
 
 /// Function pointer type for creating element instances.
 ///
@@ -417,8 +423,9 @@ mod tests {
     #[test]
     fn test_abi_version() {
         // Pinned so a vtable change to AsyncElementDyn has to be a decision.
-        // 2: set_output_budget. 10: retained_buffers (#189). 12: finish (#221).
-        assert_eq!(PARALLAX_ABI_VERSION, 12);
+        // 2: set_output_budget. 10: retained_buffers (#189). 12: finish
+        // (#221). 13: set_clock takes a shared SyncBase (#265).
+        assert_eq!(PARALLAX_ABI_VERSION, 13);
     }
 
     #[test]
