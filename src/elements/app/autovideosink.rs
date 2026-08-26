@@ -871,6 +871,9 @@ impl AsyncSink for AutoVideoSink {
             let mut abandoned = false;
             while let Pace::Wait(delay) = pace {
                 tokio::time::sleep(delay.min(Duration::from_millis(10))).await;
+                let Some(now) = ctx.running_time().to_option() else {
+                    break;
+                };
                 if let Some(sync) = ctx.sync() {
                     if sync.flush_epoch() > entered_at {
                         // A flushing seek abandoned the position this frame
@@ -887,7 +890,7 @@ impl AsyncSink for AutoVideoSink {
                     // the branch that drives the clock. Give up on a clock
                     // going nowhere and present: that drains the link and
                     // restarts everything. A deliberate pause is excluded.
-                    if stall.stalled(ctx.running_time(), sync.is_paused()) {
+                    if stall.stalled(now, sync.is_paused()) {
                         tracing::warn!(
                             "autovideosink: the pipeline clock has not moved for {:?}; \
                              presenting instead of waiting on it",
@@ -896,13 +899,8 @@ impl AsyncSink for AutoVideoSink {
                         break;
                     }
                 }
-                match ctx.running_time().to_option() {
-                    Some(now) => {
-                        now_ns = now.nanos();
-                        pace = schedule(target, now, self.max_lateness);
-                    }
-                    None => break,
-                }
+                now_ns = now.nanos();
+                pace = schedule(target, now, self.max_lateness);
             }
             if abandoned {
                 self.drop_frame("superseded by a seek");

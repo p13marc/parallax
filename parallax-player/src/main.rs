@@ -921,8 +921,12 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
     // Long enough to swallow a held arrow key's repeats, short enough that a
     // single press still feels immediate.
     const SEEK_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(120);
-    // A seek that never reports back must not wedge the controls.
-    const SEEK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+    // How long a newer target waits for the outstanding seek's `SeekDone`
+    // before going out anyway. `SeekDone` normally lands within a frame, so
+    // this only fires when one is lost or a demuxer is genuinely stuck — and
+    // then a superseding seek is the right answer, not an unresponsive
+    // transport. Dispatching twice is harmless: the engine takes the newest.
+    const SEEK_SUPERSEDE: std::time::Duration = std::time::Duration::from_secs(1);
 
     // The window opens lazily on the first displayed frame, so is_open()
     // starts out false — only treat false as "closed" after it was seen open.
@@ -1095,10 +1099,10 @@ async fn play(args: &Args) -> anyhow::Result<Outcome> {
                 // Fire the coalesced seek once the presses have settled, and
                 // only ever one at a time — overlapping flushes through the
                 // graph buy nothing and cost a decoder restart each.
-                let timed_out = seek_sent.is_some_and(|t| t.elapsed() > SEEK_TIMEOUT);
+                let outstanding = seek_sent.is_some_and(|t| t.elapsed() > SEEK_SUPERSEDE);
                 if let Some(target) = pending_target
                     && seek_due.is_some_and(|due| std::time::Instant::now() >= due)
-                    && (in_flight.is_none() || timed_out)
+                    && (in_flight.is_none() || outstanding)
                 {
                     let event = parallax::event::SeekEvent::new_time(
                         ClockTime::from_nanos(target),
