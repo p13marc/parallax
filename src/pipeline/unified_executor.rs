@@ -397,15 +397,24 @@ impl Shutdown {
     /// frozen-clock pacers can actually reach their stop checks.
     fn begin(&self) {
         self.stop.store(true, Ordering::Release);
-        if let Some(hooks) = self.unpause.get()
-            && *hooks.pause_tx.borrow()
-        {
+        let Some(hooks) = self.unpause.get() else {
+            return;
+        };
+        if *hooks.pause_tx.borrow() {
             // Clock first, mirroring PipelineHandle::resume — a woken sink
             // paces against running time immediately.
             if let Some(clock) = &hooks.pausable {
                 clock.resume();
             }
             hooks.pause_tx.send_replace(false);
+        }
+        // Same reasoning as the un-pause, one step further: a sink paced
+        // against a device clock stalls forever if that device stops, and on
+        // the way down it always does. Detaching lets every paced branch
+        // drain its tail instead of deadlocking the teardown against a
+        // producer blocked on its full link (`PausableClock::detach`).
+        if let Some(clock) = &hooks.pausable {
+            clock.detach();
         }
     }
 }
@@ -2816,24 +2825,48 @@ async fn broadcast(
     }
 }
 
-/// Send EOS to every branch, **always delivered**.
+/// Send EOS to every branch, **always delivered** and **concurrently**.
 ///
 /// A dropped EOS would leave the branch's sink waiting forever, so the lossy
 /// policies do not apply to it. Only buffers are ever dropped.
+///
+/// Concurrently for the same reason [`broadcast`] fans buffers out that way,
+/// and one sharper one: a sequential loop lets a branch that cannot accept
+/// the message hold up a sibling that could. In an A/V graph that deadlocks
+/// on teardown — the video sink waits on a clock the audio device provides,
+/// its link fills, and the audio sink's EOS (the thing that would release
+/// that clock) queues behind a send that can never complete. Each branch is
+/// its own FIFO, so nothing is ordered across them anyway.
 async fn broadcast_eos(branches: &[OutputBranch]) {
-    for branch in branches {
-        let _ = branch.send_control(Message::Eos).await;
-    }
+    broadcast_control(branches, || Message::Eos).await;
 }
 
 /// Send an in-band event to every branch, **always delivered**.
 ///
 /// Events are control flow, not payload: a dropped FlushStop would leave the
 /// branch's subtree discarding buffers forever, so the lossy policies do not
-/// apply — same reasoning as [`broadcast_eos`].
+/// apply — same reasoning as [`broadcast_eos`], including why the fan-out is
+/// concurrent. For the flush trio that also keeps the two branches of an A/V
+/// graph from restarting at measurably different instants.
 async fn broadcast_event(branches: &[OutputBranch], event: &Event) {
-    for branch in branches {
-        let _ = branch.send_control(Message::Event(event.clone())).await;
+    broadcast_control(branches, || Message::Event(event.clone())).await;
+}
+
+/// The shared fan-out behind [`broadcast_eos`] and [`broadcast_event`].
+///
+/// `message` is a factory rather than a value because `Message` is not
+/// `Clone` — it carries a `Buffer` on the hot path and cloning it there would
+/// be a refcount bump nobody asked for.
+async fn broadcast_control(branches: &[OutputBranch], message: impl Fn() -> Message) {
+    match branches {
+        [] => {}
+        [only] => {
+            let _ = only.send_control(message()).await;
+        }
+        many => {
+            futures::future::join_all(many.iter().map(|branch| branch.send_control(message())))
+                .await;
+        }
     }
 }
 

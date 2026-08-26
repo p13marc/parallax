@@ -511,6 +511,9 @@ pub struct PausableClock {
     paused_at: AtomicU64,
     /// Total time spent paused so far, subtracted from the inner clock.
     offset: AtomicU64,
+    /// Set when the pipeline is winding down: `(wall instant, reading)` at
+    /// the moment it detached. See [`detach`](Self::detach).
+    detached: std::sync::Mutex<Option<(std::time::Instant, ClockTime)>>,
 }
 
 impl PausableClock {
@@ -520,6 +523,7 @@ impl PausableClock {
             inner,
             paused_at: AtomicU64::new(u64::MAX),
             offset: AtomicU64::new(0),
+            detached: std::sync::Mutex::new(None),
         }
     }
 
@@ -551,6 +555,36 @@ impl PausableClock {
     pub fn is_paused(&self) -> bool {
         self.paused_at.load(Ordering::Acquire) != u64::MAX
     }
+
+    /// The pipeline is winding down: run at wall rate from here, whatever the
+    /// inner clock does. Idempotent.
+    ///
+    /// A pipeline clock provided by a device stops when the device does.
+    /// That is right during playback — it is what keeps a paced video sink
+    /// honest against the audio actually being heard — and wrong during
+    /// teardown, where it deadlocks: the video sink waits for a stream time
+    /// the clock will never reach, its link fills, the demuxer blocks
+    /// sending to it, the audio branch is starved of the data that would
+    /// advance the clock, and nothing ever reaches the EOS that would
+    /// release it.
+    ///
+    /// `AlsaSink` already does exactly this at EOS, for exactly this reason
+    /// ("the stream *ending* is not a stall"); detaching generalises it to
+    /// every clock and to the cooperative stop, which reaches no sink at all
+    /// while a producer is blocked. `Shutdown::begin` calls it alongside the
+    /// un-pause, which exists for the same reason.
+    ///
+    /// The reported time never goes backwards: it is the max of the detached
+    /// wall-rate reading and whatever the inner clock still reports, so a
+    /// device that keeps playing out its buffer still wins.
+    pub fn detach(&self) {
+        let now = self.now();
+        let mut guard = self
+            .detached
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.get_or_insert((std::time::Instant::now(), now));
+    }
 }
 
 impl Clock for PausableClock {
@@ -561,7 +595,16 @@ impl Clock for PausableClock {
         } else {
             ClockTime(paused_at)
         };
-        raw.saturating_sub(ClockTime(self.offset.load(Ordering::Acquire)))
+        let reading = raw.saturating_sub(ClockTime(self.offset.load(Ordering::Acquire)));
+        match *self
+            .detached
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            Some((at, base)) => reading
+                .max(base.saturating_add(ClockTime::from_nanos(at.elapsed().as_nanos() as u64))),
+            None => reading,
+        }
     }
 
     fn flags(&self) -> ClockFlags {
