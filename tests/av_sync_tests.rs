@@ -226,6 +226,8 @@ fn snapshot(log: &LogHandle) -> sync::Log {
         late: l.late,
         segments: l.segments.clone(),
         generations: l.generations.clone(),
+        stalled: l.stalled,
+        superseded: l.superseded,
     }
 }
 
@@ -535,4 +537,142 @@ async fn a_real_mkv_keeps_lip_sync_across_a_seek() {
         drift.abs() < TOLERANCE_MS,
         "real MKV drifted {drift:.1} ms across the seek"
     );
+}
+
+/// Reproduction rig for the reported hang: a looping source hammered with
+/// seeks, so rewinds and flushes interleave.
+#[tokio::test(flavor = "multi_thread")]
+async fn looping_under_repeated_seeks_does_not_wedge() {
+    let (mut pipeline, audio_log, video_log) = build(AvSource::new(20).looping());
+    let executor = Executor::with_config(ExecutorConfig::default());
+    let handle = executor.start(&mut pipeline).unwrap();
+
+    // Seek across the lap boundary repeatedly, at intervals that do not line
+    // up with it.
+    for round in 0..12u64 {
+        tokio::time::sleep(Duration::from_millis(130)).await;
+        let target = (round * 370) % 1_900;
+        handle.seek_time(ClockTime::from_millis(target)).await;
+    }
+    // Recovery, not throughput: under a seek every 130 ms most frames are
+    // legitimately superseded before their presentation time.
+    let audio_mark = snapshot(&audio_log).presented.len();
+    let video_mark = snapshot(&video_log).presented.len();
+    let recovered = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if snapshot(&audio_log).presented.len() > audio_mark + 4
+                && snapshot(&video_log).presented.len() > video_mark + 2
+            {
+                return;
+            }
+        }
+    })
+    .await;
+
+    let stopped = tokio::time::timeout(Duration::from_secs(10), async {
+        handle.stop();
+        let _ = handle.wait().await;
+    })
+    .await;
+    assert!(recovered.is_ok(), "wedged after the seek storm");
+    assert!(stopped.is_ok(), "teardown wedged");
+}
+
+/// The reported hang, on the real stack: `--loop` plus repeated seeks, with
+/// the player's own link depths.
+#[cfg(all(feature = "mkv-demux", feature = "h264", feature = "audio-aac"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_looping_real_pipeline_survives_repeated_seeks() {
+    use parallax::elements::codec::AudioDecoderElement;
+    use parallax::elements::demux::MkvDemux;
+    use parallax::elements::{AacDecoder, H264Decoder};
+
+    const H264_AAC_MKV: &[u8] = include_bytes!("fixtures/tiny_h264_aac.mkv");
+
+    let demux = MkvDemux::new(std::io::Cursor::new(H264_AAC_MKV.to_vec()))
+        .expect("readable Matroska")
+        .with_loop(true);
+    let info = demux
+        .audio_track()
+        .and_then(|t| t.audio_info.clone())
+        .expect("audio info");
+    let asc = info.codec_private.clone().expect("ASC");
+
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_demuxer("demux", demux);
+    let dec = pipeline.add_filter("decode", H264Decoder::new().expect("openh264"));
+    let audio = ClockAudioSink::new(info.sample_rate, info.channels as u32, 4);
+    let audio_log = audio.log();
+    let video = PacedVideoSink::new();
+    let video_log = video.log();
+    let adec = pipeline.add_transform(
+        "audiodec",
+        AudioDecoderElement::new(AacDecoder::from_asc(&asc).expect("ASC")),
+    );
+    let vsink = pipeline.add_async_sink("display", video);
+    let asink = pipeline.add_async_sink("speaker", audio);
+
+    // The player's own depths.
+    pipeline
+        .link_pads_full(src, "video", dec, "sink", LinkPolicy::Block, Some(24))
+        .unwrap();
+    pipeline.link(dec, vsink).unwrap();
+    pipeline
+        .link_pads_full(src, "audio", adec, "sink", LinkPolicy::Block, Some(96))
+        .unwrap();
+    pipeline.link(adec, asink).unwrap();
+
+    let executor = Executor::with_config(ExecutorConfig::default());
+    let handle = executor.start(&mut pipeline).unwrap();
+
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::ERROR)
+        .try_init();
+    for round in 0..10u64 {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        handle
+            .seek_time(ClockTime::from_millis((round * 430) % 1_900))
+            .await;
+    }
+
+    // The claim is recovery, not throughput: under a seek every 150 ms most
+    // frames are legitimately superseded before their presentation time, so
+    // what matters is that both branches are moving again once the storm
+    // stops — and that they get there without being nudged.
+    let audio_mark = snapshot(&audio_log).presented.len();
+    let video_mark = snapshot(&video_log).presented.len();
+    let recovered = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if snapshot(&audio_log).presented.len() > audio_mark + 4
+                && snapshot(&video_log).presented.len() > video_mark + 2
+            {
+                return;
+            }
+        }
+    })
+    .await;
+
+    let audio = snapshot(&audio_log);
+    let video = snapshot(&video_log);
+    let stopped = tokio::time::timeout(Duration::from_secs(10), async {
+        handle.stop();
+        let _ = handle.wait().await;
+    })
+    .await;
+
+    assert!(
+        recovered.is_ok(),
+        "wedged after the seek storm: audio {} -> {}, video {} -> {} \
+         (video late={} superseded={} stalled={})",
+        audio_mark,
+        audio.presented.len(),
+        video_mark,
+        video.presented.len(),
+        video.late,
+        video.superseded,
+        video.stalled,
+    );
+    assert!(stopped.is_ok(), "teardown wedged");
 }

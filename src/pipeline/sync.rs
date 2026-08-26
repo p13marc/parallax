@@ -63,7 +63,7 @@
 //! rate after the audio stream ends. Only the origin moves.
 
 use crate::clock::ClockTime;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -115,6 +115,22 @@ pub struct SyncBase {
     /// Separate from the mutex so [`Self::is_anchored`] is a plain load on
     /// the polling path.
     anchored_generation: AtomicU64,
+    /// Whether the pipeline is deliberately paused.
+    ///
+    /// A paced sink waiting on a frozen clock has to know *why* it is frozen:
+    /// a pause is meant to stall it indefinitely, a starved master is not.
+    /// See [`StallWatch`].
+    paused: AtomicBool,
+    /// The epoch of the newest flushing seek to enter the graph.
+    ///
+    /// A sink inside a clock wait cannot reach its own loop head, so it
+    /// cannot see the `FlushStart` queued behind the buffer it is holding —
+    /// and that buffer belongs to a position the seek has abandoned. This is
+    /// the one signal that reaches it in place: raised the moment the seek is
+    /// dispatched, so the wait can be abandoned instead of run to term.
+    /// GStreamer unschedules the sink's clock wait on flush for the same
+    /// reason.
+    flush_epoch: AtomicU64,
     /// The node index of the sync master, if the graph elected one.
     /// `None` means nobody is coming, so a slave anchors immediately instead
     /// of burning [`ANCHOR_GRACE`] first.
@@ -134,6 +150,8 @@ impl SyncBase {
         Self {
             base_ns: AtomicU64::new(base_time.nanos()),
             anchored_generation: AtomicU64::new(0),
+            paused: AtomicBool::new(false),
+            flush_epoch: AtomicU64::new(0),
             master,
             state: Mutex::new(AnchorState {
                 generation: INITIAL_GENERATION,
@@ -141,6 +159,31 @@ impl SyncBase {
                 master_claimed: false,
             }),
         }
+    }
+
+    /// Record whether the pipeline is deliberately paused.
+    #[inline]
+    pub fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Release);
+    }
+
+    /// Whether the pipeline is deliberately paused.
+    #[inline]
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
+    }
+
+    /// A flushing seek is entering the graph. Idempotent and monotonic, so
+    /// a duplicate dispatch cannot walk it backwards.
+    #[inline]
+    pub fn note_flush(&self, epoch: u64) {
+        self.flush_epoch.fetch_max(epoch, Ordering::AcqRel);
+    }
+
+    /// The epoch of the newest flushing seek dispatched into the graph.
+    #[inline]
+    pub fn flush_epoch(&self) -> u64 {
+        self.flush_epoch.load(Ordering::Acquire)
     }
 
     /// Whether any element in this pipeline is the sync master.
@@ -301,6 +344,18 @@ impl SyncHandle {
     #[inline]
     pub fn is_anchored(&self, generation: u64) -> bool {
         self.base.is_anchored(generation)
+    }
+
+    /// Whether the pipeline is deliberately paused.
+    #[inline]
+    pub fn is_paused(&self) -> bool {
+        self.base.is_paused()
+    }
+
+    /// The epoch of the newest flushing seek dispatched into the graph.
+    #[inline]
+    pub fn flush_epoch(&self) -> u64 {
+        self.base.flush_epoch()
     }
 
     /// The same base, bound to the role the node at graph index `node`
@@ -467,6 +522,74 @@ pub fn realign(
         Realign::Silence(frames)
     } else {
         Realign::Trim(frames)
+    }
+}
+
+/// How long a paced sink keeps waiting on a clock that is not moving before
+/// giving up on it.
+///
+/// Long enough to sit through a flush gap or a slow decoder without
+/// flinching; short enough that a starved pipeline recovers in well under a
+/// second rather than never.
+pub const STALL_LIMIT: Duration = Duration::from_millis(500);
+
+/// Watches whether the clock is advancing while a sink waits on it.
+///
+/// A clock provided by a device only moves while that device consumes, and a
+/// sink paced against it can be the reason it stops: the sink holds its
+/// buffer, its link fills, the producer blocks feeding that link, and the
+/// branch that would have advanced the clock is starved of data. Every
+/// participant is then waiting for a consequence of its own wait. The link
+/// depths make it unlikely — that is what `parallax-player`'s 24/96 are for —
+/// but no depth rules it out, and `--loop` with repeated seeks finds it.
+///
+/// So a paced sink gives up on a clock that has stopped: it presents the
+/// buffer, which drains its link and restarts everything. Pacing degrades to
+/// blit-on-arrival, which is what a clockless pipeline does anyway, and it
+/// self-heals the moment the clock moves again. A **deliberate** pause is
+/// excluded — stalling there is the whole point.
+#[derive(Debug)]
+pub struct StallWatch {
+    limit: Duration,
+    last: ClockTime,
+    since: Option<std::time::Instant>,
+}
+
+impl StallWatch {
+    /// A watch that gives up after `limit` of a motionless clock.
+    pub fn new(limit: Duration) -> Self {
+        Self {
+            limit,
+            last: ClockTime::NONE,
+            since: None,
+        }
+    }
+
+    /// Feed the current running time. Returns true once the clock has been
+    /// still for longer than the limit and the pipeline is not paused.
+    ///
+    /// The count starts when a reading is *first* seen, not when it is seen a
+    /// second time, so the limit means what it says however coarsely the
+    /// caller polls.
+    pub fn stalled(&mut self, now: ClockTime, paused: bool) -> bool {
+        if paused {
+            self.since = None;
+            self.last = now;
+            return false;
+        }
+        if now != self.last || self.since.is_none() {
+            self.last = now;
+            self.since = Some(std::time::Instant::now());
+            return false;
+        }
+        self.since
+            .is_some_and(|since| since.elapsed() >= self.limit)
+    }
+}
+
+impl Default for StallWatch {
+    fn default() -> Self {
+        Self::new(STALL_LIMIT)
     }
 }
 
@@ -948,6 +1071,62 @@ mod realign_tests {
         assert_eq!(
             realign(ms(500), ClockTime::NONE, RATE, TOL, MAX),
             Realign::None
+        );
+    }
+}
+
+#[cfg(test)]
+mod stall_tests {
+    use super::*;
+
+    const LIMIT: Duration = Duration::from_millis(30);
+
+    #[test]
+    fn a_moving_clock_never_stalls() {
+        let mut watch = StallWatch::new(LIMIT);
+        for ms in 0..50u64 {
+            assert!(!watch.stalled(ClockTime::from_millis(ms), false));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn a_motionless_clock_stalls_after_the_limit() {
+        let mut watch = StallWatch::new(LIMIT);
+        let frozen = ClockTime::from_millis(500);
+        assert!(!watch.stalled(frozen, false), "not immediately");
+        std::thread::sleep(Duration::from_millis(45));
+        assert!(watch.stalled(frozen, false));
+    }
+
+    #[test]
+    fn a_paused_pipeline_never_stalls() {
+        // Stalling is exactly what a pause is for.
+        let mut watch = StallWatch::new(LIMIT);
+        let frozen = ClockTime::from_millis(500);
+        for _ in 0..5 {
+            assert!(!watch.stalled(frozen, true));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // And resuming the *watch* after a pause starts the count afresh.
+        assert!(!watch.stalled(frozen, false));
+        std::thread::sleep(Duration::from_millis(45));
+        assert!(watch.stalled(frozen, false), "…and then counts normally");
+    }
+
+    #[test]
+    fn the_clock_moving_again_resets_the_count() {
+        let mut watch = StallWatch::new(LIMIT);
+        assert!(!watch.stalled(ClockTime::from_millis(500), false));
+        std::thread::sleep(Duration::from_millis(25));
+        assert!(
+            !watch.stalled(ClockTime::from_millis(510), false),
+            "it moved"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+        assert!(
+            !watch.stalled(ClockTime::from_millis(510), false),
+            "the count restarted at the move"
         );
     }
 }

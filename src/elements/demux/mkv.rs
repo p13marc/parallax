@@ -1109,6 +1109,7 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
             self.pending = None;
             self.skip.clear();
             self.video_resync = false;
+            self.staged_segment = None;
             self.stop_ticks = None;
             self.trick_rate = seek.rate;
             self.reverse_end_ticks = start_ns / self.timestamp_scale;
@@ -1233,6 +1234,10 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
             tracing::info!("mkvdemux: seek to {target_ns} ns (tick {ticks}, {snap:?})");
             self.pending = None;
             self.video_resync = true;
+            // A loop rewind may have staged a Segment that this seek just
+            // superseded; emitting it afterwards would re-anchor both pads at
+            // zero on top of the seek's own segment (#265).
+            self.staged_segment = None;
             // Trick play (#165): the seek's rate governs playback until the
             // next handled seek changes it. A forward seek leaves reverse.
             self.trick_rate = if seek.rate > 0.0 { seek.rate } else { 1.0 };

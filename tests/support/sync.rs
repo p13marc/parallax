@@ -16,7 +16,9 @@ use parallax::clock::{Clock, ClockProvider, ClockTime};
 use parallax::element::{AsyncSink, ConsumeContext};
 use parallax::error::Result;
 use parallax::event::{Event, SegmentEvent, SegmentFormat};
-use parallax::pipeline::{AnchorGate, Pace, clip_to_segment, frames_to_nanos, schedule};
+use parallax::pipeline::{
+    AnchorGate, Pace, StallWatch, clip_to_segment, frames_to_nanos, schedule,
+};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -114,6 +116,10 @@ pub struct Log {
     pub segments: Vec<SegmentEvent>,
     /// Flush generations opened, in order.
     pub generations: Vec<u64>,
+    /// Times this sink gave up on a motionless clock.
+    pub stalled: u64,
+    /// Buffers abandoned mid-wait because a seek superseded them.
+    pub superseded: u64,
 }
 
 impl Log {
@@ -316,9 +322,24 @@ impl AsyncSink for PacedVideoSink {
         self.anchor.settle(sync, ctx.clock_time(), target).await;
 
         let mut pace = schedule(target, ctx.running_time(), self.max_lateness);
+        let mut stall = StallWatch::default();
+        let entered_at = sync.flush_epoch();
         while let Pace::Wait(delay) = pace {
             tokio::time::sleep(delay.min(Duration::from_millis(10))).await;
-            pace = schedule(target, ctx.running_time(), self.max_lateness);
+            // Same two escapes as `AutoVideoSink`: a seek abandons the frame
+            // outright, and a clock going nowhere must not hold this sink
+            // forever — because this sink holding on is one of the reasons a
+            // clock goes nowhere.
+            if sync.flush_epoch() > entered_at {
+                record(&self.log, |l| l.superseded += 1);
+                return Ok(());
+            }
+            let now = ctx.running_time();
+            if stall.stalled(now, sync.is_paused()) {
+                record(&self.log, |l| l.stalled += 1);
+                break;
+            }
+            pace = schedule(target, now, self.max_lateness);
         }
         if self.generation_opened {
             self.generation_opened = false;

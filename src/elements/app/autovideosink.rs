@@ -179,6 +179,9 @@ pub struct AutoVideoSink {
     /// `FlushStop` names the generation in band, so both branches of an A/V
     /// graph anchor the same one from the same event.
     anchor: crate::pipeline::AnchorGate,
+    /// How long to wait on a motionless clock before presenting anyway; see
+    /// [`with_stall_limit`](Self::with_stall_limit).
+    stall_limit: Duration,
     /// Whether the first buffer of the current generation is still owed a
     /// present. It is the frame the user is waiting to see after a seek, so
     /// it goes up however late it is.
@@ -345,6 +348,7 @@ impl AutoVideoSink {
             sync: false,
             max_lateness: DEFAULT_MAX_LATENESS,
             anchor: crate::pipeline::AnchorGate::default(),
+            stall_limit: crate::pipeline::STALL_LIMIT,
             generation_opened: false,
             last_pts: ClockTime::NONE,
             display_generation: Arc::new(AtomicU64::new(0)),
@@ -414,6 +418,21 @@ impl AutoVideoSink {
 
     /// How late a frame may be and still be shown (default 40 ms).
     ///
+    /// How long to keep waiting on a pipeline clock that is not moving
+    /// before presenting anyway (#265).
+    ///
+    /// The clock a paced sink waits on is usually a device's, and this sink
+    /// can be the reason it stopped: holding a frame fills its link, which
+    /// backs the producer up, which starves the branch driving the clock.
+    /// Giving up breaks that circle — pacing degrades to blit-on-arrival
+    /// until the clock moves again, which it then does. A deliberate
+    /// [`PipelineHandle::pause`](crate::pipeline::PipelineHandle::pause) is
+    /// excluded, so pausing still stalls presentation indefinitely.
+    pub fn with_stall_limit(mut self, limit: Duration) -> Self {
+        self.stall_limit = limit;
+        self
+    }
+
     /// How long to wait for the sync master to define running-time zero
     /// before doing it ourselves (#265).
     ///
@@ -823,8 +842,39 @@ impl AsyncSink for AutoVideoSink {
             // still applies to each *computed* deficit (the PTS-jump escape
             // hatch), not to the frozen-clock stall, where the deficit never
             // shrinks but stays under the cap.
+            let mut stall = crate::pipeline::StallWatch::new(self.stall_limit);
+            // The flush epoch this frame is being paced under. A seek raises
+            // it the moment it is dispatched, which is the only signal that
+            // reaches a sink already inside the wait (#265).
+            let entered_at = ctx.sync().map(|s| s.flush_epoch()).unwrap_or(0);
+            let mut abandoned = false;
             while let Pace::Wait(delay) = pace {
                 tokio::time::sleep(delay.min(Duration::from_millis(10))).await;
+                if let Some(sync) = ctx.sync() {
+                    if sync.flush_epoch() > entered_at {
+                        // A flushing seek abandoned the position this frame
+                        // belongs to. Waiting out its presentation time would
+                        // hold the seek up by however long that is — and the
+                        // `FlushStart` that would have freed us is queued
+                        // behind this very buffer.
+                        abandoned = true;
+                        break;
+                    }
+                    // A clock provided by a device stops when that device
+                    // does — and this sink can be why, by holding its buffer
+                    // until its own link backs the producer up and starves
+                    // the branch that drives the clock. Give up on a clock
+                    // going nowhere and present: that drains the link and
+                    // restarts everything. A deliberate pause is excluded.
+                    if stall.stalled(ctx.running_time(), sync.is_paused()) {
+                        tracing::warn!(
+                            "autovideosink: the pipeline clock has not moved for {:?}; \
+                             presenting instead of waiting on it",
+                            self.stall_limit
+                        );
+                        break;
+                    }
+                }
                 match ctx.running_time().to_option() {
                     Some(now) => {
                         now_ns = now.nanos();
@@ -832,6 +882,10 @@ impl AsyncSink for AutoVideoSink {
                     }
                     None => break,
                 }
+            }
+            if abandoned {
+                self.drop_frame("superseded by a seek");
+                return Ok(());
             }
             // The first frame of a generation goes up however late it is:
             // after a seek it is the frame the user is waiting to see, and

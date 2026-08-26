@@ -1482,6 +1482,7 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for Mp4DemuxSource<R> {
             for slot in &mut self.pending {
                 *slot = None;
             }
+            self.staged_segment = None;
             self.primed = true; // reverse path bypasses forward priming
             self.trick_rate = seek.rate;
             self.stop_ns = None;
@@ -1508,6 +1509,10 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for Mp4DemuxSource<R> {
                     *slot = None;
                 }
                 self.primed = false;
+                // A loop rewind may have staged a Segment that this seek just
+                // superseded; emitting it afterwards would re-anchor both pads
+                // at zero on top of the seek's own segment (#265).
+                self.staged_segment = None;
                 // Trick play (#165): the seek's rate governs playback until
                 // the next handled seek changes it (rate 0 is nonsense —
                 // treat as normal). A forward seek always leaves reverse.

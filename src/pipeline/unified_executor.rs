@@ -374,6 +374,7 @@ struct Shutdown {
 struct UnpauseHooks {
     pause_tx: watch::Sender<bool>,
     pausable: Option<Arc<crate::clock::PausableClock>>,
+    sync: Option<Arc<crate::pipeline::SyncBase>>,
 }
 
 impl Shutdown {
@@ -388,8 +389,13 @@ impl Shutdown {
         &self,
         pause_tx: watch::Sender<bool>,
         pausable: Option<Arc<crate::clock::PausableClock>>,
+        sync: Option<Arc<crate::pipeline::SyncBase>>,
     ) {
-        let _ = self.unpause.set(UnpauseHooks { pause_tx, pausable });
+        let _ = self.unpause.set(UnpauseHooks {
+            pause_tx,
+            pausable,
+            sync,
+        });
     }
 
     /// Ask the whole pipeline to wind down: raise the cooperative stop flag
@@ -405,6 +411,9 @@ impl Shutdown {
             // paces against running time immediately.
             if let Some(clock) = &hooks.pausable {
                 clock.resume();
+            }
+            if let Some(sync) = &hooks.sync {
+                sync.set_paused(false);
             }
             hooks.pause_tx.send_replace(false);
         }
@@ -995,6 +1004,16 @@ impl PipelineHandle {
     /// async-spawned sources (RT-scheduled sources carry no control channel),
     /// or every source task has already finished.
     pub async fn send_event_upstream(&self, event: Event) -> bool {
+        // Same courtesy to the paced sinks as `seek` (#265): a flushing seek
+        // sent through the escape hatch still abandons the position they are
+        // pacing, so they still need telling before the flush trio catches
+        // up with them.
+        if let Event::Seek(seek) = &event
+            && seek.flags.contains(crate::event::SeekFlags::FLUSH)
+            && let Some(sync) = &self.sync
+        {
+            sync.note_flush(seek.epoch());
+        }
         // #163: enter at the sinks and travel hop-by-hop toward the sources
         // (mid-graph elements get their chance to handle or translate);
         // hybrid pipelines keep the legacy direct source fan-out.
@@ -1047,6 +1066,18 @@ impl PipelineHandle {
             .contains(crate::event::SeekFlags::INSTANT_RATE_CHANGE);
         if !instant_rate && !self.controls.iter().any(|c| c.seekable) {
             return false;
+        }
+        // Tell the paced sinks *now*, not when the flush trio reaches them
+        // (#265). A sink inside a clock wait cannot reach its own loop head,
+        // so the `FlushStart` queued behind the buffer it is holding cannot
+        // free it — and that buffer belongs to the position this seek is
+        // abandoning. Raising the epoch here is what lets the wait be cut
+        // short, which is also what keeps a seek from deadlocking against a
+        // clock the waiting sink is itself starving.
+        if seek.flags.contains(crate::event::SeekFlags::FLUSH)
+            && let Some(sync) = &self.sync
+        {
+            sync.note_flush(seek.epoch());
         }
         // #163: dispatch via the sinks so the seek travels hop-by-hop and
         // mid-graph elements can handle it; hybrid pipelines (no sink
@@ -1169,6 +1200,12 @@ impl PipelineHandle {
         if let Some(clock) = &self.pausable {
             clock.pause();
         }
+        // Tell the paced sinks the freeze is deliberate: a sink that gives up
+        // on a motionless clock (#265, `StallWatch`) must not give up on this
+        // one — stalling is the whole point of a pause.
+        if let Some(sync) = &self.sync {
+            sync.set_paused(true);
+        }
         self.pause_tx.send_replace(true);
         self.events
             .send_state_changed(PipelineState::Running, PipelineState::Idle);
@@ -1191,6 +1228,9 @@ impl PipelineHandle {
         self.pause_tx.send_replace(false);
         if let Some(clock) = &self.pausable {
             clock.resume();
+        }
+        if let Some(sync) = &self.sync {
+            sync.set_paused(false);
         }
         self.events
             .send_state_changed(PipelineState::Idle, PipelineState::Running);
@@ -1441,7 +1481,11 @@ impl Executor {
         let (pause_tx, pause_rx) = watch::channel(false);
         // #191: a wind-down must be able to un-pause, or gated loops and
         // frozen-clock pacers never observe the stop flag.
-        shutdown.install_unpause(pause_tx.clone(), pausable.clone());
+        shutdown.install_unpause(
+            pause_tx.clone(),
+            pausable.clone(),
+            clock_info.as_ref().map(|(_, sync)| Arc::clone(sync.base())),
+        );
         let mut runtime = RuntimeControls {
             controls: Vec::new(),
             upstream_entries: Vec::new(),
