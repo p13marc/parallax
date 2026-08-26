@@ -761,9 +761,10 @@ pub struct PipelineHandle {
     pause_tx: watch::Sender<bool>,
     /// The shared clock wrapper, when the pipeline has a started clock.
     pausable: Option<Arc<crate::clock::PausableClock>>,
-    /// Base time distributed to the elements, for the running-time fallback in
-    /// [`position`](Self::position). `NONE` when the pipeline has no clock.
-    base_time: ClockTime,
+    /// The shared running-time base distributed to the elements, for the
+    /// fallback in [`position`](Self::position). `None` when the pipeline has
+    /// no clock; its own base is `NONE` until a sink anchors it.
+    sync: Option<Arc<crate::pipeline::SyncBase>>,
     /// Last-presented PTS in nanoseconds, written by the sink tasks;
     /// `u64::MAX` until a sink has presented (or after a flush reset it).
     position: Arc<AtomicU64>,
@@ -1214,8 +1215,8 @@ impl PipelineHandle {
         if pts != u64::MAX {
             return ClockTime::from_nanos(pts);
         }
-        match &self.pausable {
-            Some(clock) if self.base_time.is_some() => clock.now().saturating_sub(self.base_time),
+        match (&self.pausable, &self.sync) {
+            (Some(clock), Some(sync)) => sync.running_time(clock.now()),
             _ => ClockTime::NONE,
         }
     }
@@ -1393,15 +1394,31 @@ impl Executor {
         pipeline.select_clock();
         pipeline.start_clock();
         let pipeline_clock = pipeline.clock();
+        // The running-time origin is shared, not copied (#265): a flushing
+        // seek re-anchors it from the sink that owns the clock, which is what
+        // keeps the audio and video branches agreeing about *now* across a
+        // seek. See `pipeline::sync`.
+        // The sync master is the node whose element provided the selected
+        // clock — its device's progress *is* the timeline, so its anchor is
+        // the authoritative one. `None` when nobody provided a clock (a
+        // video-only pipeline on the system clock) or when the clock was
+        // installed by hand.
+        let sync_master = pipeline.clock_provider_node();
         let (clock_info, pausable): (
-            Option<(Arc<dyn Clock>, ClockTime)>,
+            Option<(Arc<dyn Clock>, crate::pipeline::SyncHandle)>,
             Option<Arc<crate::clock::PausableClock>>,
         ) = if pipeline_clock.is_started() {
             let wrapped = Arc::new(crate::clock::PausableClock::new(pipeline_clock.clock()));
+            let sync = Arc::new(crate::pipeline::SyncBase::new(
+                pipeline_clock.base_time(),
+                sync_master.map(|n| n.index()),
+            ));
+            // The template carries the Slave role; each element gets its own
+            // handle below, and only the master's says so.
             (
                 Some((
                     wrapped.clone() as Arc<dyn Clock>,
-                    pipeline_clock.base_time(),
+                    crate::pipeline::SyncHandle::new(sync, crate::pipeline::SyncRole::Slave),
                 )),
                 Some(wrapped),
             )
@@ -1546,7 +1563,7 @@ impl Executor {
             translations: runtime.translations,
             pause_tx,
             pausable,
-            base_time: clock_info.map(|(_, b)| b).unwrap_or(ClockTime::NONE),
+            sync: clock_info.map(|(_, sync)| Arc::clone(sync.base())),
             position: runtime.position,
             latency,
         })
@@ -1557,7 +1574,7 @@ impl Executor {
     fn run_async(
         &self,
         pipeline: &mut Pipeline,
-        clock_info: Option<&(Arc<dyn Clock>, ClockTime)>,
+        clock_info: Option<&(Arc<dyn Clock>, crate::pipeline::SyncHandle)>,
         events: &EventSender,
         stop: &Arc<AtomicBool>,
         outcome: &Arc<TerminalOutcome>,
@@ -1583,7 +1600,7 @@ impl Executor {
         pipeline: &mut Pipeline,
         partition: &GraphPartition,
         scheduler: &mut RtScheduler,
-        clock_info: Option<&(Arc<dyn Clock>, ClockTime)>,
+        clock_info: Option<&(Arc<dyn Clock>, crate::pipeline::SyncHandle)>,
         events: &EventSender,
         stop: &Arc<AtomicBool>,
         outcome: &Arc<TerminalOutcome>,
@@ -1679,8 +1696,8 @@ impl Executor {
             if let Some(node) = pipeline.get_node_mut(node_id)
                 && let Some(mut element) = node.take_element()
             {
-                if let Some((clock, base_time)) = clock_info {
-                    element.set_clock(clock.clone(), *base_time);
+                if let Some((clock, sync)) = clock_info {
+                    element.set_clock(clock.clone(), sync.for_node(node_id.index()));
                 }
                 element.set_bus(bus);
                 if let Some(budget) = rt_budgets.get(&node_id) {
@@ -1940,7 +1957,7 @@ impl Executor {
         &self,
         pipeline: &mut Pipeline,
         mut channels: ChannelNetwork,
-        clock_info: Option<&(Arc<dyn Clock>, ClockTime)>,
+        clock_info: Option<&(Arc<dyn Clock>, crate::pipeline::SyncHandle)>,
         events: &EventSender,
         stop: &Arc<AtomicBool>,
         outcome: &Arc<TerminalOutcome>,
@@ -2011,7 +2028,7 @@ impl Executor {
         partition: &GraphPartition,
         mut channels: ChannelNetwork,
         scheduler: &RtScheduler,
-        clock_info: Option<&(Arc<dyn Clock>, ClockTime)>,
+        clock_info: Option<&(Arc<dyn Clock>, crate::pipeline::SyncHandle)>,
         events: &EventSender,
         stop: &Arc<AtomicBool>,
         outcome: &Arc<TerminalOutcome>,
@@ -2063,7 +2080,7 @@ impl Executor {
         node_id: NodeId,
         channels: &mut ChannelNetwork,
         upstream: Option<(tokio::sync::mpsc::UnboundedSender<Event>, UpstreamHop)>,
-        clock_info: Option<&(Arc<dyn Clock>, ClockTime)>,
+        clock_info: Option<&(Arc<dyn Clock>, crate::pipeline::SyncHandle)>,
         events: &EventSender,
         stop: &Arc<AtomicBool>,
         outcome: &Arc<TerminalOutcome>,
@@ -2094,7 +2111,7 @@ impl Executor {
         channels: &mut ChannelNetwork,
         output_bridges: Vec<Arc<AsyncRtBridge>>,
         input_bridges: Vec<Arc<AsyncRtBridge>>,
-        clock_info: Option<&(Arc<dyn Clock>, ClockTime)>,
+        clock_info: Option<&(Arc<dyn Clock>, crate::pipeline::SyncHandle)>,
         events: &EventSender,
         stop: &Arc<AtomicBool>,
         outcome: &Arc<TerminalOutcome>,
@@ -2121,8 +2138,8 @@ impl Executor {
         // sink could not see the clock at all — and so could not schedule
         // presentation against running time (#65). The trait method defaults
         // to a no-op, so element types that ignore the clock are unaffected.
-        if let Some((clock, base_time)) = clock_info {
-            element.set_clock(clock.clone(), *base_time);
+        if let Some((clock, sync)) = clock_info {
+            element.set_clock(clock.clone(), sync.for_node(node_id.index()));
         }
 
         // Set bus handle so elements can post messages
@@ -3436,7 +3453,9 @@ async fn handle_upstream_hop(
                 if let Some(ev) = emit(Event::FlushStart) {
                     broadcast_event(outputs, &ev).await;
                 }
-                if let Some(ev) = emit(Event::FlushStop(FlushStopEvent::new(true))) {
+                if let Some(ev) = emit(Event::FlushStop(
+                    FlushStopEvent::new(true).with_epoch(seek.epoch()),
+                )) {
                     broadcast_event(outputs, &ev).await;
                 }
             }

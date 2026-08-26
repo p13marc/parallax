@@ -1009,20 +1009,45 @@ impl CapsChangedEvent {
 /// Flush stop event - resume normal operation after flush.
 #[derive(Debug, Clone)]
 pub struct FlushStopEvent {
-    /// Whether to reset running time to 0.
+    /// Whether running time restarts at zero after this flush.
+    ///
+    /// True for a flushing seek, whose `Segment` carries `base = 0`. It is
+    /// what tells a pacing sink that the origin must be re-anchored rather
+    /// than carried over — see [`epoch`](Self::epoch).
     pub reset_time: bool,
+    /// The seek epoch this flush belongs to — the *generation* every sink
+    /// anchors the shared [`SyncBase`](crate::pipeline::SyncBase) for (#265).
+    ///
+    /// Carried in band so both branches of an A/V graph derive the same
+    /// number from the same event, with no cross-task handshake. Epochs are
+    /// monotonic ([`SeekEvent::epoch`]), so a late anchor from an older seek
+    /// can never overwrite a newer one. Zero for a flush that no seek
+    /// caused.
+    pub epoch: u64,
 }
 
 impl FlushStopEvent {
-    /// Create a new flush stop event.
+    /// Create a new flush stop event, not attributed to any seek.
     pub fn new(reset_time: bool) -> Self {
-        Self { reset_time }
+        Self {
+            reset_time,
+            epoch: 0,
+        }
+    }
+
+    /// Attribute this flush to a seek epoch — the sync generation.
+    pub fn with_epoch(mut self, epoch: u64) -> Self {
+        self.epoch = epoch;
+        self
     }
 }
 
 impl Default for FlushStopEvent {
     fn default() -> Self {
-        Self { reset_time: true }
+        Self {
+            reset_time: true,
+            epoch: 0,
+        }
     }
 }
 

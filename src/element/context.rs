@@ -45,6 +45,7 @@ use crate::error::{Error, Result};
 use crate::memory::{BufferPool, PooledBuffer, SharedSlotRef};
 use crate::metadata::Metadata;
 use crate::pipeline::bus::{BusHandle, MessageKind};
+use crate::pipeline::sync::SyncHandle;
 
 // ============================================================================
 // ProduceResult - return type for source produce()
@@ -157,8 +158,10 @@ pub struct ProduceContext<'a> {
     pool: Option<&'a dyn BufferPool>,
     /// Optional pipeline clock for timing.
     clock: Option<Arc<dyn Clock>>,
-    /// Base time (clock time when pipeline started).
-    base_time: ClockTime,
+    /// The pipeline's shared running-time base (`SyncBase`), re-anchored on
+    /// every flushing seek. Shared rather than copied so a source's notion of
+    /// running time survives a seek — see [`crate::pipeline::sync`].
+    sync: Option<SyncHandle>,
     /// Optional bus handle for posting messages.
     bus: Option<BusHandle>,
 }
@@ -184,7 +187,7 @@ impl<'a> ProduceContext<'a> {
             capacity,
             pool: None,
             clock: None,
-            base_time: ClockTime::NONE,
+            sync: None,
             bus: None,
         }
     }
@@ -209,7 +212,7 @@ impl<'a> ProduceContext<'a> {
             capacity,
             pool: Some(pool),
             clock: None,
-            base_time: ClockTime::NONE,
+            sync: None,
             bus: None,
         }
     }
@@ -225,7 +228,7 @@ impl<'a> ProduceContext<'a> {
             capacity: 0,
             pool: None,
             clock: None,
-            base_time: ClockTime::NONE,
+            sync: None,
             bus: None,
         }
     }
@@ -241,17 +244,17 @@ impl<'a> ProduceContext<'a> {
             capacity: 0,
             pool: Some(pool),
             clock: None,
-            base_time: ClockTime::NONE,
+            sync: None,
             bus: None,
         }
     }
 
-    /// Set the pipeline clock for this context.
+    /// Set the pipeline clock and running-time base for this context.
     ///
     /// This allows sources to access the pipeline clock for timing decisions.
-    pub fn set_clock(&mut self, clock: Arc<dyn Clock>, base_time: ClockTime) {
+    pub fn set_clock(&mut self, clock: Arc<dyn Clock>, sync: SyncHandle) {
         self.clock = Some(clock);
-        self.base_time = base_time;
+        self.sync = Some(sync);
     }
 
     /// Set the bus handle for this context.
@@ -283,9 +286,9 @@ impl<'a> ProduceContext<'a> {
     /// Returns `ClockTime::NONE` if no clock is configured or pipeline hasn't started.
     pub fn running_time(&self) -> ClockTime {
         if let Some(clock) = &self.clock
-            && self.base_time.is_some()
+            && let Some(sync) = &self.sync
         {
-            return clock.now().saturating_sub(self.base_time);
+            return sync.running_time(clock.now());
         }
         ClockTime::NONE
     }
@@ -300,9 +303,19 @@ impl<'a> ProduceContext<'a> {
             .unwrap_or(ClockTime::NONE)
     }
 
-    /// Get the base time (when pipeline started).
+    /// Get the base time: the clock reading that maps to running time zero.
+    ///
+    /// Not a constant any more — a flushing seek re-anchors it (#265).
     pub fn base_time(&self) -> ClockTime {
-        self.base_time
+        self.sync
+            .as_ref()
+            .map(|s| s.base_time())
+            .unwrap_or(ClockTime::NONE)
+    }
+
+    /// The pipeline's shared running-time base, if the pipeline has a clock.
+    pub fn sync(&self) -> Option<&SyncHandle> {
+        self.sync.as_ref()
     }
 
     /// Get the output buffer to write into.
@@ -490,8 +503,10 @@ pub struct ConsumeContext<'a> {
     /// Borrowed rather than owned: a `ConsumeContext` is built per buffer on
     /// the hot path, and an `Arc` clone per frame buys nothing here.
     clock: Option<&'a Arc<dyn Clock>>,
-    /// Base time (clock time when the pipeline started).
-    base_time: ClockTime,
+    /// The pipeline's shared running-time base (`SyncBase`), re-anchored on
+    /// every flushing seek. Borrowed for the same reason the clock is: a
+    /// `ConsumeContext` is built per buffer on the hot path.
+    sync: Option<&'a SyncHandle>,
 }
 
 impl<'a> ConsumeContext<'a> {
@@ -501,7 +516,7 @@ impl<'a> ConsumeContext<'a> {
             buffer,
             bus: None,
             clock: None,
-            base_time: ClockTime::NONE,
+            sync: None,
         }
     }
 
@@ -513,13 +528,14 @@ impl<'a> ConsumeContext<'a> {
         }
     }
 
-    /// Set the pipeline clock for this context.
+    /// Set the pipeline clock and running-time base for this context.
     ///
     /// Called by the sink adapters with the clock the executor selected, so a
-    /// sink can schedule presentation against running time.
-    pub fn set_clock(&mut self, clock: &'a Arc<dyn Clock>, base_time: ClockTime) {
+    /// sink can schedule presentation against running time — and re-anchor
+    /// that running time when a seek moves the stream (see [`Self::sync`]).
+    pub fn set_clock(&mut self, clock: &'a Arc<dyn Clock>, sync: &'a SyncHandle) {
         self.clock = Some(clock);
-        self.base_time = base_time;
+        self.sync = Some(sync);
     }
 
     /// Get the bus handle, if available.
@@ -542,9 +558,9 @@ impl<'a> ConsumeContext<'a> {
     /// decide when — or whether — to present it.
     pub fn running_time(&self) -> ClockTime {
         if let Some(clock) = self.clock
-            && self.base_time.is_some()
+            && let Some(sync) = self.sync
         {
-            return clock.now().saturating_sub(self.base_time);
+            return sync.running_time(clock.now());
         }
         ClockTime::NONE
     }
@@ -559,9 +575,22 @@ impl<'a> ConsumeContext<'a> {
         }
     }
 
-    /// The pipeline's base time — the clock reading when it started.
+    /// The pipeline's base time — the clock reading that maps to running
+    /// time zero.
+    ///
+    /// Not a constant any more: a flushing seek re-anchors it, which is what
+    /// keeps a paced video sink and an audio-clocked pipeline agreeing about
+    /// *now* across a seek (#265).
     pub fn base_time(&self) -> ClockTime {
-        self.base_time
+        self.sync.map(|s| s.base_time()).unwrap_or(ClockTime::NONE)
+    }
+
+    /// The pipeline's shared running-time base, if the pipeline has a clock.
+    ///
+    /// A sink that paces presentation anchors it on the first buffer of each
+    /// flush generation — see [`crate::pipeline::sync`] for the contract.
+    pub fn sync(&self) -> Option<&'a SyncHandle> {
+        self.sync
     }
 
     /// Post a message to the pipeline bus.

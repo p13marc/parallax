@@ -494,6 +494,10 @@ pub struct Pipeline {
     converter_policy: ConverterPolicy,
     /// Pipeline clock for timing and synchronization.
     clock: PipelineClock,
+    /// The node whose element provided [`Self::clock`], when `select_clock`
+    /// chose it. That node is the sync master (`pipeline::sync`); a
+    /// hand-installed clock leaves this `None`, because no node owns it.
+    clock_provider: Option<NodeId>,
     /// Pipeline message bus (taken by executor on start).
     bus: Option<Bus>,
     /// Bus handle for creating element-specific handles.
@@ -516,6 +520,7 @@ impl Pipeline {
             negotiation: None,
             converter_policy: ConverterPolicy::default(),
             clock: PipelineClock::system(),
+            clock_provider: None,
             bus: Some(bus),
             bus_handle,
             probe_registry: ProbeRegistry::new(),
@@ -534,6 +539,7 @@ impl Pipeline {
             negotiation: None,
             converter_policy: ConverterPolicy::default(),
             clock: PipelineClock::new(clock),
+            clock_provider: None,
             bus: Some(bus),
             bus_handle,
             probe_registry: ProbeRegistry::new(),
@@ -590,6 +596,9 @@ impl Pipeline {
     /// while the pipeline is running may cause timing discontinuities.
     pub fn set_clock(&mut self, clock: Arc<dyn Clock>) {
         self.clock = PipelineClock::new(clock);
+        // A hand-installed clock is nobody's: no element's own progress
+        // defines it, so no element may speak for the sync base.
+        self.clock_provider = None;
     }
 
     /// Get the pipeline's bus handle for posting messages.
@@ -621,6 +630,10 @@ impl Pipeline {
     pub fn use_clock_from(&mut self, provider: &dyn ClockProvider) -> bool {
         if let Some(clock) = provider.provide_clock() {
             self.clock = PipelineClock::new(clock);
+            // Same reasoning as `set_clock`: the caller handed us a clock
+            // rather than the graph electing one, so there is no node to
+            // name as sync master.
+            self.clock_provider = None;
             true
         } else {
             false
@@ -644,24 +657,39 @@ impl Pipeline {
     /// - 200-299: Network clocks (NTP)
     /// - 300+: Precision clocks (PTP)
     pub fn select_clock(&mut self) {
-        let mut best: Option<(Arc<dyn Clock>, u32)> = None;
+        let mut best: Option<(NodeId, Arc<dyn Clock>, u32)> = None;
 
-        for (_id, node) in self.nodes() {
+        for (id, node) in self.nodes() {
             if let Some((clock, priority)) = &node.provided_clock
-                && best.as_ref().is_none_or(|(_, p)| *priority > *p)
+                && best.as_ref().is_none_or(|(_, _, p)| *priority > *p)
             {
-                best = Some((clock.clone(), *priority));
+                best = Some((id, clock.clone(), *priority));
             }
         }
 
-        if let Some((clock, priority)) = best {
+        if let Some((id, clock, priority)) = best {
             tracing::info!(
                 "Auto-selected pipeline clock: {} (priority {})",
                 clock.name(),
                 priority
             );
             self.clock = PipelineClock::new(clock);
+            // Remembered because the node that *provides* the clock is the
+            // one whose own progress defines it — an `AlsaSink`'s device is
+            // the timeline. That makes it the sync master for the shared
+            // running-time base (#265, `pipeline::sync`).
+            self.clock_provider = Some(id);
         }
+    }
+
+    /// The node whose element provided the selected clock, if the clock was
+    /// auto-selected from one.
+    ///
+    /// `None` for a pipeline with no clock provider, and for one whose clock
+    /// was installed by hand — a clock nobody in the graph owns has no node
+    /// whose progress it measures, so nothing may speak for it.
+    pub fn clock_provider_node(&self) -> Option<NodeId> {
+        self.clock_provider
     }
 
     /// Set the converter insertion policy.
