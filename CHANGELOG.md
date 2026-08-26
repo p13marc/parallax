@@ -98,6 +98,16 @@ Every out-of-tree plugin must be rebuilt: the plugin ABI went **12 → 13**.
 - `PipelineHandle::abort` recorded `Aborted` after raising the cooperative
   stop, leaving a window for a source to report a clean EOS for a torn-down
   run.
+- **A flushing seek could deadlock a paced pipeline.** A sink inside its
+  pacing wait cannot reach its own loop head, so it never sees the
+  `FlushStart` queued behind the buffer it is holding — a buffer from the
+  position the seek just abandoned. It waited out a superseded presentation
+  time while its link filled, which backed the demuxer up, which starved the
+  branch whose device drives the clock it was waiting on. `--loop` plus
+  repeated seeks reached it in about half a second. `SyncBase::flush_epoch`
+  now rises the instant a flushing seek is dispatched and such a wait drops
+  its frame; `StallWatch` presents after `STALL_LIMIT` of a motionless clock
+  as a backstop, excluding a deliberate pause.
 - `parallax-player` applied arrow presses to `handle.position()`, which still
   reports the old position until the seek lands, so a held key walked a target
   that kept being recomputed from where playback had not moved from yet and
