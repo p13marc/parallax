@@ -42,6 +42,9 @@ const SEEK_SUPERSEDE: Duration = Duration::from_secs(1);
 /// How often the interface re-reads position, drops and the bus.
 const TICK: Duration = Duration::from_millis(50);
 
+/// How long the controls stay up after the last thing the user did.
+const CONTROLS_LINGER: Duration = Duration::from_secs(3);
+
 #[derive(Parser, Debug, Clone)]
 #[command(name = "parallax-play", about = "A video player built on parallax")]
 struct Args {
@@ -126,6 +129,12 @@ enum Message {
     TogglePause,
     /// Seek by a number of seconds, relative to where the transport is headed.
     SeekBy(i64),
+    /// Seek to a fraction of the duration — the scrubber.
+    SeekTo(f32),
+    /// Set the volume in dB — the slider.
+    VolumeTo(f32),
+    /// The pointer moved or a key was pressed: keep the controls up.
+    Activity,
     /// Step the volume in dB.
     VolumeBy(f32),
     /// Mute/unmute.
@@ -180,6 +189,8 @@ struct Player {
 
     fullscreen: bool,
     show_stats: bool,
+    /// When the user last did anything, for the auto-hiding controls.
+    last_activity: Instant,
     status: String,
     error: Option<String>,
 
@@ -200,6 +211,7 @@ impl Player {
             muted: false,
             fullscreen: false,
             show_stats: false,
+            last_activity: Instant::now(),
             status: "no file open".into(),
             error: None,
             deadline: args
@@ -218,6 +230,29 @@ impl Player {
             Some(engine) => format!("{} — parallax", engine.source.summary()),
             None => "parallax".into(),
         }
+    }
+
+    /// The running pipeline, for the diagnostics panel.
+    fn engine(&self) -> Option<&Engine> {
+        self.engine.as_ref()
+    }
+
+    fn has_audio(&self) -> bool {
+        self.engine.as_ref().is_some_and(|e| e.has_audio())
+    }
+
+    /// Keep the controls up for a while longer.
+    fn activity(&mut self) {
+        self.last_activity = Instant::now();
+    }
+
+    /// Whether the transport is on screen.
+    fn controls_visible(&self) -> bool {
+        controls_visible(
+            self.engine.is_some(),
+            self.paused,
+            self.last_activity.elapsed(),
+        )
     }
 
     fn source(&self) -> Option<&SourceDescription> {
@@ -249,6 +284,7 @@ impl Player {
             // nothing queued; the widget reads the mailbox itself.
             Message::Frame => Task::none(),
             Message::TogglePause => {
+                self.activity();
                 if let Some(engine) = &self.engine {
                     if self.paused {
                         engine.handle().resume();
@@ -260,10 +296,31 @@ impl Player {
                 Task::none()
             }
             Message::SeekBy(secs) => {
+                self.activity();
                 self.seek_relative(secs);
                 Task::none()
             }
+            Message::SeekTo(fraction) => {
+                self.activity();
+                if let Some(total) = self.duration().to_option() {
+                    let target = (fraction.clamp(0.0, 1.0) as f64 * total.nanos() as f64) as u64;
+                    self.aim(target);
+                }
+                Task::none()
+            }
+            Message::VolumeTo(db) => {
+                self.activity();
+                self.volume_db = db.clamp(-40.0, 6.0);
+                self.muted = false;
+                self.apply_volume();
+                Task::none()
+            }
+            Message::Activity => {
+                self.activity();
+                Task::none()
+            }
             Message::VolumeBy(delta) => {
+                self.activity();
                 self.volume_db = (self.volume_db + delta).clamp(-40.0, 6.0);
                 // Reaching for the volume always unmutes: the user wants to
                 // hear it.
@@ -272,11 +329,13 @@ impl Player {
                 Task::none()
             }
             Message::ToggleMute => {
+                self.activity();
                 self.muted = !self.muted;
                 self.apply_volume();
                 Task::none()
             }
             Message::ToggleFullscreen => {
+                self.activity();
                 self.fullscreen = !self.fullscreen;
                 let mode = if self.fullscreen {
                     iced::window::Mode::Fullscreen
@@ -286,6 +345,7 @@ impl Player {
                 iced::window::latest().and_then(move |id| iced::window::set_mode(id, mode))
             }
             Message::ToggleStats => {
+                self.activity();
                 self.show_stats = !self.show_stats;
                 Task::none()
             }
@@ -516,6 +576,11 @@ impl Player {
             None => center(text("open a file to start").size(20)).into(),
         };
 
+        let video = iced::widget::mouse_area(video)
+            .on_move(|_| Message::Activity)
+            .on_press(Message::TogglePause)
+            .on_double_click(Message::ToggleFullscreen);
+
         stack![
             container(video)
                 .width(iced::Fill)
@@ -565,5 +630,76 @@ fn shortcut(key: &Key) -> Option<Message> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// Whether the transport should be on screen.
+///
+/// Always, unless something is actually playing: there is nothing to get out
+/// of the way of otherwise, and a paused player is a player someone is about
+/// to touch.
+fn controls_visible(playing: bool, paused: bool, idle: Duration) -> bool {
+    !playing || paused || idle < CONTROLS_LINGER
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_controls_only_get_out_of_the_way_of_playback() {
+        let long = CONTROLS_LINGER + Duration::from_secs(1);
+        assert!(
+            controls_visible(false, false, long),
+            "nothing playing: nothing to hide for"
+        );
+        assert!(
+            controls_visible(true, true, long),
+            "paused: someone is about to touch it"
+        );
+        assert!(controls_visible(true, false, Duration::ZERO), "just used");
+        assert!(
+            !controls_visible(true, false, long),
+            "playing and idle: get out of the way"
+        );
+    }
+
+    #[test]
+    fn an_unknown_duration_reads_as_unknown_not_as_zero() {
+        // The distinction matters beyond cosmetics: clamping a seek against a
+        // zero duration sends every one of them to the start.
+        assert_eq!(ui::timecode(ClockTime::NONE), "--:--");
+        assert_eq!(ui::timecode(ClockTime::ZERO), "00:00");
+        assert_eq!(ui::timecode(ClockTime::from_millis(125_500)), "02:05");
+    }
+
+    #[test]
+    fn a_seek_target_leads_the_position_it_has_not_reached_yet() {
+        let mut seek = SeekState::default();
+        assert_eq!(seek.target(), None);
+        seek.in_flight = Some((7, 5_000_000_000));
+        assert_eq!(seek.target(), Some(5_000_000_000));
+        // A newer press supersedes the one in flight, so the bar leads to the
+        // newest target rather than snapping back to the old one.
+        seek.pending = Some(9_000_000_000);
+        assert_eq!(seek.target(), Some(9_000_000_000));
+    }
+
+    #[test]
+    fn the_key_map_is_the_one_people_already_know() {
+        use iced::keyboard::key::Named;
+        assert!(matches!(
+            shortcut(&Key::Named(Named::Space)),
+            Some(Message::TogglePause)
+        ));
+        assert!(matches!(
+            shortcut(&Key::Named(Named::ArrowLeft)),
+            Some(Message::SeekBy(-10))
+        ));
+        assert!(matches!(
+            shortcut(&Key::Character("q".into())),
+            Some(Message::Quit)
+        ));
+        assert!(shortcut(&Key::Character("z".into())).is_none());
     }
 }

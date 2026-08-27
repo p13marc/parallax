@@ -100,6 +100,7 @@ check-iced:
     cargo clippy -p parallax-iced --all-targets -- -D warnings
     cargo clippy -p parallax-play --all-targets -- -D warnings
     cargo nextest run -p parallax-iced
+    cargo nextest run -p parallax-play
     ! cargo tree -p parallax-iced -d 2>/dev/null | grep -q '^wgpu'
     ! cargo tree -p parallax-play -d 2>/dev/null | grep -q '^wgpu'
 

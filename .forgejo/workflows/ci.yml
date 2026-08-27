@@ -399,6 +399,7 @@ jobs:
       - run: cargo clippy -p parallax-iced --all-targets -- -D warnings
       - run: cargo clippy -p parallax-play --all-targets -- -D warnings
       - run: cargo nextest run -p parallax-iced
+      - run: cargo nextest run -p parallax-play
       - name: exactly one wgpu
         run: |
           ! cargo tree -p parallax-iced -d 2>/dev/null | grep -q "^wgpu"
