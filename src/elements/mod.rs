@@ -183,7 +183,8 @@ pub use transform::{
 
 // App integration
 pub use app::{
-    AppSink, AppSinkHandle, AppSinkStats, AppSrc, AppSrcHandle, AppSrcStats, EndReason, Pulled,
+    AppSink, AppSinkHandle, AppSinkStats, AppSrc, AppSrcHandle, AppSrcStats, AppVideoSink,
+    EndReason, Pulled,
 };
 
 #[cfg(feature = "display")]

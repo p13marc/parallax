@@ -23,6 +23,10 @@
 |-----|----------|
 | [design.md](design.md) | Design rationale, principles, and competitive landscape |
 
+The `parallax::video` module is API documentation rather than a guide: presentation
+maths with no graphics dependency (plane geometry, letterbox, colour matrices, the
+WGSL), shared by parallax's own renderer and by a host GUI on another graphics stack.
+
 ## Historical material
 
 - [research/](research/) — research notes and design explorations that fed into the implementation. These are point-in-time documents: they may describe superseded designs (e.g. pre-implementation clock research, the original caps-negotiation survey, the abandoned stabby plugin ABI direction). Consult the user guides above for current behavior.

@@ -2,10 +2,12 @@
 //!
 //! - [`AppSrc`]: Inject buffers from application code
 //! - [`AppSink`]: Extract buffers to application code
+//! - [`AppVideoSink`]: Hand paced video frames to a GUI toolkit for rendering
 //! - `AutoVideoSink`: Display video in a window (requires `display` feature)
 
 mod appsink;
 mod appsrc;
+mod appvideosink;
 
 #[cfg(feature = "display")]
 mod autovideosink;
@@ -17,6 +19,7 @@ mod present;
 pub use crate::pipeline::EndReason;
 pub use appsink::{AppSink, AppSinkHandle, AppSinkStats, Pulled};
 pub use appsrc::{AppSrc, AppSrcHandle, AppSrcStats};
+pub use appvideosink::AppVideoSink;
 
 #[cfg(feature = "display")]
 pub use autovideosink::{AutoVideoSink, AutoVideoSinkHandle, VideoKey, VideoWindowEvent};

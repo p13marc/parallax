@@ -24,7 +24,10 @@
 //! assignment, so changing one is a deliberate act with a failing test
 //! attached rather than a refactor's side effect.
 
-use crate::format::{AudioCodec, PixelFormat, RtpEncoding, SampleFormat, VideoCodec};
+use crate::format::{
+    AudioCodec, ColorMatrix, ColorPrimaries, ColorRange, PixelFormat, Rotation, RtpEncoding,
+    SampleFormat, TransferFunction, VideoCodec,
+};
 
 // ---------------------------------------------------------------------------
 // MediaFormat tags
@@ -218,6 +221,101 @@ pub fn rtp_encoding_from_code(code: u8, dynamic_pt: u8) -> Option<RtpEncoding> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Colorimetry (#265)
+// ---------------------------------------------------------------------------
+//
+// These four need no table. The enums' discriminants *are* the H.273 /
+// ISO 23091-4 numbers, which is the vocabulary MKV, MP4's `colr`, AV1, VP9 and
+// H.264's VUI all speak — so the container's value, the wire code and the
+// discriminant are one number, and the append-only rule costs nothing: a new
+// variant takes the number the standard already gave it.
+//
+// The `from_code` direction still has to be a match, because a code we have no
+// variant for must answer `None` rather than transmute.
+
+/// Stable wire code for a [`ColorMatrix`] — its H.273 value.
+pub fn color_matrix_to_code(matrix: ColorMatrix) -> u8 {
+    matrix as u8
+}
+
+/// [`ColorMatrix`] for a stable wire code.
+pub fn color_matrix_from_code(code: u8) -> Option<ColorMatrix> {
+    Some(match code {
+        1 => ColorMatrix::Bt709,
+        2 => ColorMatrix::Unspecified,
+        6 => ColorMatrix::Bt601,
+        9 => ColorMatrix::Bt2020Ncl,
+        _ => return None,
+    })
+}
+
+/// Stable wire code for a [`ColorRange`].
+pub fn color_range_to_code(range: ColorRange) -> u8 {
+    range as u8
+}
+
+/// [`ColorRange`] for a stable wire code.
+pub fn color_range_from_code(code: u8) -> Option<ColorRange> {
+    Some(match code {
+        0 => ColorRange::Unspecified,
+        1 => ColorRange::Limited,
+        2 => ColorRange::Full,
+        _ => return None,
+    })
+}
+
+/// Stable wire code for [`ColorPrimaries`] — its H.273 value.
+pub fn color_primaries_to_code(primaries: ColorPrimaries) -> u8 {
+    primaries as u8
+}
+
+/// [`ColorPrimaries`] for a stable wire code.
+pub fn color_primaries_from_code(code: u8) -> Option<ColorPrimaries> {
+    Some(match code {
+        1 => ColorPrimaries::Bt709,
+        2 => ColorPrimaries::Unspecified,
+        5 => ColorPrimaries::Bt470bg,
+        6 => ColorPrimaries::Smpte170m,
+        9 => ColorPrimaries::Bt2020,
+        _ => return None,
+    })
+}
+
+/// Stable wire code for a [`TransferFunction`] — its H.273 value.
+pub fn transfer_to_code(transfer: TransferFunction) -> u8 {
+    transfer as u8
+}
+
+/// [`TransferFunction`] for a stable wire code.
+pub fn transfer_from_code(code: u8) -> Option<TransferFunction> {
+    Some(match code {
+        1 => TransferFunction::Bt709,
+        2 => TransferFunction::Unspecified,
+        13 => TransferFunction::Srgb,
+        14 => TransferFunction::Bt2020_10,
+        16 => TransferFunction::Pq,
+        18 => TransferFunction::Hlg,
+        _ => return None,
+    })
+}
+
+/// Stable wire code for a [`Rotation`] — its quarter-turn count.
+pub fn rotation_to_code(rotation: Rotation) -> u8 {
+    rotation as u8
+}
+
+/// [`Rotation`] for a stable wire code.
+pub fn rotation_from_code(code: u8) -> Option<Rotation> {
+    Some(match code {
+        0 => Rotation::None,
+        1 => Rotation::Cw90,
+        2 => Rotation::Cw180,
+        3 => Rotation::Cw270,
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,9 +327,13 @@ mod tests {
     #[test]
     fn every_code_is_pinned() {
         use AudioCodec as A;
+        use ColorMatrix as CM;
+        use ColorPrimaries as CP;
+        use ColorRange as CR;
         use PixelFormat as P;
         use RtpEncoding as R;
         use SampleFormat as S;
+        use TransferFunction as TF;
         use VideoCodec as V;
 
         for (codec, code) in [
@@ -314,6 +416,57 @@ mod tests {
             ],
             [0, 1, 2, 3, 4, 5, 6, 7]
         );
+
+        // Colour codes are the H.273 numbers themselves (#265), so these
+        // assertions pin them against the standard rather than against a
+        // table we invented — which is the point of choosing them.
+        for (matrix, code) in [
+            (CM::Bt709, 1),
+            (CM::Unspecified, 2),
+            (CM::Bt601, 6),
+            (CM::Bt2020Ncl, 9),
+        ] {
+            assert_eq!(color_matrix_to_code(matrix), code, "{matrix:?}");
+            assert_eq!(color_matrix_from_code(code), Some(matrix));
+        }
+
+        for (range, code) in [(CR::Unspecified, 0), (CR::Limited, 1), (CR::Full, 2)] {
+            assert_eq!(color_range_to_code(range), code, "{range:?}");
+            assert_eq!(color_range_from_code(code), Some(range));
+        }
+
+        for (rotation, code) in [
+            (Rotation::None, 0),
+            (Rotation::Cw90, 1),
+            (Rotation::Cw180, 2),
+            (Rotation::Cw270, 3),
+        ] {
+            assert_eq!(rotation_to_code(rotation), code, "{rotation:?}");
+            assert_eq!(rotation_from_code(code), Some(rotation));
+        }
+
+        for (primaries, code) in [
+            (CP::Bt709, 1),
+            (CP::Unspecified, 2),
+            (CP::Bt470bg, 5),
+            (CP::Smpte170m, 6),
+            (CP::Bt2020, 9),
+        ] {
+            assert_eq!(color_primaries_to_code(primaries), code, "{primaries:?}");
+            assert_eq!(color_primaries_from_code(code), Some(primaries));
+        }
+
+        for (transfer, code) in [
+            (TF::Bt709, 1),
+            (TF::Unspecified, 2),
+            (TF::Srgb, 13),
+            (TF::Bt2020_10, 14),
+            (TF::Pq, 16),
+            (TF::Hlg, 18),
+        ] {
+            assert_eq!(transfer_to_code(transfer), code, "{transfer:?}");
+            assert_eq!(transfer_from_code(code), Some(transfer));
+        }
     }
 
     /// A code no table knows must answer `None`, not panic and not guess: a

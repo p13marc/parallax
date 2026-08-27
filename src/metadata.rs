@@ -523,6 +523,32 @@ pub struct Metadata {
     /// not. Read it with [`coded_video_dims`](Self::coded_video_dims).
     pub coded: Option<crate::format::CodedVideoFormat>,
 
+    /// What the stream says about its own colour (#265).
+    ///
+    /// `None` means nothing was signalled — which is not the same as "assume
+    /// the default", and consumers must treat it as "guess". Set by
+    /// [`set_color_info`](Self::set_color_info), read by
+    /// [`color_info`](Self::color_info).
+    ///
+    /// Here rather than inside `VideoFormat` for the reason
+    /// [`ColorInfo`](crate::format::ColorInfo) documents: caps compare
+    /// `VideoRaw` by whole-struct equality, and `set_video_dims` rebuilds it.
+    /// Unlike `planes` it survives a geometry rewrite, because colour is a
+    /// property of the stream and scaling or converting does not change it —
+    /// the one thing that does, a YUV→RGB conversion, drops the field
+    /// explicitly.
+    pub color: Option<crate::format::ColorInfo>,
+
+    /// How to turn this frame into a picture: pixel aspect ratio and
+    /// rotation (#266). `None` = nobody looked, which a consumer treats the
+    /// same as the identity but a forwarding element can pass through
+    /// unchanged.
+    ///
+    /// Survives a geometry rewrite for the same reason `color` does: a
+    /// converted or scaled frame has the same pixels' shape and the same way
+    /// up. A *rotating* element is what clears it, and there is none yet.
+    pub display: Option<crate::format::DisplayGeometry>,
+
     /// Byte offset in the original source (optional).
     pub offset: Option<u64>,
 
@@ -882,6 +908,30 @@ impl Metadata {
             Some(cf) if cf.width > 0 && cf.height > 0 => Some((cf.width, cf.height)),
             _ => None,
         }
+    }
+
+    /// Declare what the stream says about its colour (#265).
+    ///
+    /// Call it on the *encoded* buffer at the demuxer and on the decoded frame
+    /// at the decoder — the two are different buffers and a decoder must carry
+    /// it across, the way it already carries timestamps.
+    pub fn set_color_info(&mut self, color: crate::format::ColorInfo) {
+        self.color = Some(color);
+    }
+
+    /// What the stream said about its colour, if anything.
+    pub fn color_info(&self) -> Option<crate::format::ColorInfo> {
+        self.color
+    }
+
+    /// Declare the frame's pixel aspect ratio and rotation (#266).
+    pub fn set_display_geometry(&mut self, display: crate::format::DisplayGeometry) {
+        self.display = Some(display);
+    }
+
+    /// How to turn this frame into a picture, if the stream said.
+    pub fn display_geometry(&self) -> Option<crate::format::DisplayGeometry> {
+        self.display
     }
 
     /// The raw video pixel format, if [`format`](Self::format) carries one.

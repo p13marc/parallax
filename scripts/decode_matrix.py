@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Decode-performance matrix runner for parallax-player (#192).
+"""Decode-performance matrix runner for the parallax players (#192, #270).
 
 Runs the player once per (config × repeat) in interleaved order — the
 A/B/A protocol from the #189/#190 rounds, which cancels thermal drift —
@@ -17,6 +17,12 @@ Usage:
 Config syntax: "name:[ENV=VALUE ...] [extra player flags]". The player must support
 --exit-after and print the final "stats: position_ns=… dropped=…" line.
 Stdlib only; Linux only (reads /proc).
+
+For `parallax-play` (the Iced player) pass --headless: it needs a compositor,
+and weston's headless backend plus Mesa's software renderer is enough. It also
+reports frame accounting the old player has no notion of — presented, and drops
+split into late / stale-after-seek / host-too-slow — which is the part of this
+that means anything without a GPU. See the caveat under --headless.
 """
 
 import argparse
@@ -98,6 +104,48 @@ def classify(comm: str) -> str:
     return "other"
 
 
+class Compositor:
+    """A weston headless instance, for players that need a display.
+
+    Started fresh per matrix rather than shared: weston stops repainting when
+    it goes idle, and a Wayland client that never gets a frame callback never
+    draws. That is indistinguishable from a stalled pipeline, and it will
+    silently turn a performance run into a measurement of nothing.
+    """
+
+    def __init__(self, width=1280, height=720):
+        self.socket = f"wayland-matrix-{os.getpid()}"
+        runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+        self.env = {"XDG_RUNTIME_DIR": runtime, "WAYLAND_DISPLAY": self.socket}
+        self.proc = subprocess.Popen(
+            [
+                "weston",
+                "--backend=headless",
+                f"--width={width}",
+                f"--height={height}",
+                f"--socket={self.socket}",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env={**os.environ, "XDG_RUNTIME_DIR": runtime},
+        )
+        deadline = time.monotonic() + 10
+        path = Path(runtime) / self.socket
+        while time.monotonic() < deadline:
+            if path.exists():
+                return
+            time.sleep(0.2)
+        self.stop()
+        raise RuntimeError("weston did not come up")
+
+    def stop(self):
+        self.proc.terminate()
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+
+
 def run_once(player, file, extra_flags, duration, warmup, quiet, env_overrides=None):
     cmd = [player, str(file), f"--exit-after={duration}", *extra_flags]
     env = None
@@ -123,10 +171,16 @@ def run_once(player, file, extra_flags, duration, warmup, quiet, env_overrides=N
     arena = memfd_bytes(pid)
 
     stdout, _ = proc.communicate(timeout=duration + 30)
+    # The two players print different amounts. `position_ns` and `dropped`
+    # come first and adjacent in both; everything after is the Iced player's
+    # frame accounting, absent from the old one.
     stats = {"position_ns": 0, "dropped": -1}
     m = re.search(r"stats: position_ns=(\d+) dropped=(\d+)", stdout or "")
     if m:
         stats = {"position_ns": int(m.group(1)), "dropped": int(m.group(2))}
+    for key in ("presented", "late", "full", "stale", "clipped"):
+        found = re.search(rf"\b{key}=(\d+)", stdout or "")
+        stats[key] = int(found.group(1)) if found else -1
 
     cores = defaultdict(float)
     threads = defaultdict(int)
@@ -146,6 +200,12 @@ def run_once(player, file, extra_flags, duration, warmup, quiet, env_overrides=N
         "window_s": round(wall, 1),
         "position_s": round(stats["position_ns"] / 1e9, 1),
         "dropped": stats["dropped"],
+        # -1 means the player does not report it (the crossterm one).
+        "presented": stats["presented"],
+        "late": stats["late"],
+        "host_slow": stats["full"],
+        "stale": stats["stale"],
+        "clipped": stats["clipped"],
         "exit_code": proc.returncode,
     }
 
@@ -167,6 +227,17 @@ def main():
     ap.add_argument("--gap", type=int, default=3, help="idle seconds between runs")
     ap.add_argument("--out", default=None, help="prefix for .csv/.md result files")
     ap.add_argument("--loud", action="store_true", help="pass player stderr through")
+    ap.add_argument(
+        "--headless",
+        action="store_true",
+        help=(
+            "run under a fresh weston headless compositor (needed by "
+            "parallax-play). NOTE: with no GPU the renderer is software, so "
+            "the *cores* columns measure rasterisation rather than the "
+            "pipeline. Frame accounting, arena bytes and position stay "
+            "meaningful; a cores comparison needs real hardware."
+        ),
+    )
     args = ap.parse_args()
 
     configs = []
@@ -186,32 +257,20 @@ def main():
                 flags.append(token)
         configs.append((name.strip(), flags, env))
 
+    compositor = Compositor() if args.headless else None
+    if compositor:
+        print(
+            f"weston headless on {compositor.socket} — software rendering, so "
+            "read the frame columns, not the cores ones",
+            flush=True,
+        )
+
     rows = []
-    # Interleaved order: A B C A B C … so drift hits every config equally.
-    for rep in range(args.repeat):
-        for name, flags, env in configs:
-            label = f"{name}#{rep + 1}"
-            shown = " ".join([*(f"{k}={v}" for k, v in env.items()), *flags])
-            print(f"[{label}] {shown or '(defaults)'} …", flush=True)
-            r = run_once(
-                args.player,
-                args.file,
-                flags,
-                args.duration,
-                args.warmup,
-                not args.loud,
-                env,
-            )
-            r = {"config": name, "rep": rep + 1, **r}
-            rows.append(r)
-            print(
-                f"[{label}] dav1d {r['dav1d_cores']} cores ({r['dav1d_threads']} thr) · "
-                f"total {r['total_cores']} · rss {r['rss_mb']} MB · "
-                f"arena {r['arena_mb']} MB · drops {r['dropped']} · "
-                f"pos {r['position_s']}s",
-                flush=True,
-            )
-            time.sleep(args.gap)
+    try:
+        run_matrix(args, configs, compositor, rows)
+    finally:
+        if compositor:
+            compositor.stop()
 
     cols = list(rows[0].keys())
     md = ["| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)]
@@ -227,6 +286,40 @@ def main():
             w.writerows(rows)
         Path(f"{args.out}.md").write_text(table + "\n")
         print(f"\nwrote {args.out}.csv and {args.out}.md")
+
+
+def run_matrix(args, configs, compositor, rows):
+    # Interleaved order: A B C A B C … so drift hits every config equally.
+    for rep in range(args.repeat):
+        for name, flags, env in configs:
+            label = f"{name}#{rep + 1}"
+            shown = " ".join([*(f"{k}={v}" for k, v in env.items()), *flags])
+            print(f"[{label}] {shown or '(defaults)'} …", flush=True)
+            r = run_once(
+                args.player,
+                args.file,
+                flags,
+                args.duration,
+                args.warmup,
+                not args.loud,
+                {**(compositor.env if compositor else {}), **env},
+            )
+            r = {"config": name, "rep": rep + 1, **r}
+            rows.append(r)
+            print(
+                f"[{label}] dav1d {r['dav1d_cores']} cores ({r['dav1d_threads']} thr) · "
+                f"total {r['total_cores']} · rss {r['rss_mb']} MB · "
+                f"arena {r['arena_mb']} MB · drops {r['dropped']} · "
+                f"pos {r['position_s']}s"
+                + (
+                    f" · shown {r['presented']} "
+                    f"(late {r['late']}, stale {r['stale']}, slow {r['host_slow']})"
+                    if r["presented"] >= 0
+                    else ""
+                ),
+                flush=True,
+            )
+            time.sleep(args.gap)
 
 
 if __name__ == "__main__":

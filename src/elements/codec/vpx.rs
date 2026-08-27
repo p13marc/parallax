@@ -364,7 +364,49 @@ impl VpxDecoder {
         metadata.sequence = self.frames_out;
         self.frames_out += 1;
         metadata.set_video_dims(dims.0, dims.1, crate::format::PixelFormat::I420);
+        // What the bitstream said, filled in from what the container said
+        // where VPx left an axis unspecified (#265). `source` is the input
+        // buffer's metadata, so the container's answer is already on it.
+        let inherited = metadata.color_info().unwrap_or_default();
+        metadata.set_color_info(image_color(img).or(inherited));
         Ok(Buffer::new(handle, metadata))
+    }
+}
+
+/// What a decoded VPx image says about its own colour (#265).
+///
+/// libvpx has its own small vocabulary rather than H.273 codes, so unlike
+/// dav1d this needs a real table. VP9 signals both axes in the uncompressed
+/// header; VP8 signals neither, and answers `UNKNOWN` + studio range — which
+/// is what the VP8 spec mandates anyway, so the range is honest and the
+/// matrix falls through to the consumer's own guess.
+fn image_color(img: &ffi::vpx_image_t) -> crate::format::ColorInfo {
+    use crate::format::{ColorInfo, ColorMatrix, ColorPrimaries, ColorRange, TransferFunction};
+    use ffi::vpx_color_space::*;
+
+    ColorInfo {
+        matrix: match img.cs {
+            VPX_CS_BT_709 => ColorMatrix::Bt709,
+            VPX_CS_BT_601 | VPX_CS_SMPTE_170 => ColorMatrix::Bt601,
+            VPX_CS_BT_2020 => ColorMatrix::Bt2020Ncl,
+            // SMPTE 240M and sRGB have no variant here, and guessing a near
+            // neighbour would be a lie about which coefficients apply.
+            _ => ColorMatrix::Unspecified,
+        },
+        primaries: match img.cs {
+            VPX_CS_BT_709 => ColorPrimaries::Bt709,
+            VPX_CS_BT_601 => ColorPrimaries::Bt470bg,
+            VPX_CS_SMPTE_170 => ColorPrimaries::Smpte170m,
+            VPX_CS_BT_2020 => ColorPrimaries::Bt2020,
+            _ => ColorPrimaries::Unspecified,
+        },
+        // libvpx conflates matrix, primaries and transfer into one `cs`, so
+        // there is nothing separate to read for this axis.
+        transfer: TransferFunction::Unspecified,
+        range: match img.range {
+            ffi::vpx_color_range::VPX_CR_FULL_RANGE => ColorRange::Full,
+            ffi::vpx_color_range::VPX_CR_STUDIO_RANGE => ColorRange::Limited,
+        },
     }
 }
 

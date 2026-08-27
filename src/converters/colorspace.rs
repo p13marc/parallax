@@ -219,23 +219,44 @@ impl TryFrom<crate::format::PixelFormat> for PixelFormat {
     }
 }
 
-/// Color matrix for YUV ↔ RGB conversion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ColorMatrix {
-    /// BT.601 (SD video, most common)
-    #[default]
-    Bt601,
-    /// BT.709 (HD video)
-    Bt709,
+/// The engine's colour vocabulary is [`crate::format`]'s — there used to be a
+/// second `ColorMatrix` here, with its own default and no relationship to the
+/// one the presentation path used, which is part of how the two ended up
+/// disagreeing (#265).
+pub use crate::format::{ColorInfo, ColorMatrix, ColorRange};
+
+#[cfg(feature = "simd-colorspace")]
+trait ToYuvMatrix {
+    fn to_yuv_matrix(self) -> YuvStandardMatrix;
 }
 
 #[cfg(feature = "simd-colorspace")]
-impl ColorMatrix {
+impl ToYuvMatrix for ColorMatrix {
     /// Convert to yuv crate's YuvStandardMatrix.
     fn to_yuv_matrix(self) -> YuvStandardMatrix {
         match self {
-            ColorMatrix::Bt601 => YuvStandardMatrix::Bt601,
+            // Unspecified answers BT.601 here for the same reason
+            // `video::color::coefficients` does — a caller should have
+            // resolved it, and SD is the historical assumption.
+            ColorMatrix::Bt601 | ColorMatrix::Unspecified => YuvStandardMatrix::Bt601,
             ColorMatrix::Bt709 => YuvStandardMatrix::Bt709,
+            ColorMatrix::Bt2020Ncl => YuvStandardMatrix::Bt2020,
+        }
+    }
+}
+
+#[cfg(feature = "simd-colorspace")]
+trait ToYuvRange {
+    fn to_yuv_range(self) -> YuvRange;
+}
+
+#[cfg(feature = "simd-colorspace")]
+impl ToYuvRange for ColorRange {
+    fn to_yuv_range(self) -> YuvRange {
+        if self.is_limited() {
+            YuvRange::Limited
+        } else {
+            YuvRange::Full
         }
     }
 }
@@ -282,7 +303,7 @@ pub struct VideoConvert {
     output_format: PixelFormat,
     width: u32,
     height: u32,
-    color_matrix: ColorMatrix,
+    color: ColorInfo,
 }
 
 /// One input plane resolved against a buffer: its bytes from the first row
@@ -321,14 +342,37 @@ impl VideoConvert {
             output_format,
             width,
             height,
-            color_matrix: ColorMatrix::default(),
+            color: ColorInfo::default(),
         })
     }
 
-    /// Set the color matrix for YUV conversions.
+    /// Set the colour matrix for YUV conversions.
     pub fn with_color_matrix(mut self, matrix: ColorMatrix) -> Self {
-        self.color_matrix = matrix;
+        self.color.matrix = matrix;
         self
+    }
+
+    /// Declare what the stream said about its colour (#265).
+    ///
+    /// Until this existed the converter always used BT.601 and — on the
+    /// scalar arm — full-range maths, whatever the file said, which is how a
+    /// default build and a `simd-colorspace` build came to render the same
+    /// frame differently.
+    pub fn with_color_info(mut self, color: ColorInfo) -> Self {
+        self.color = color;
+        self
+    }
+
+    /// The colour this converter is configured for.
+    pub fn color_info(&self) -> ColorInfo {
+        self.color
+    }
+
+    /// The matrix, resolved: an unsignalled stream falls back to the height
+    /// heuristic the presentation path uses, so the two agree.
+    fn matrix(&self) -> ColorMatrix {
+        self.color
+            .matrix_or(crate::video::color::matrix_for_height(self.height))
     }
 
     /// Get input format.
@@ -750,8 +794,8 @@ impl VideoConvert {
             &planar,
             output,
             (w * 3) as u32,
-            YuvRange::Limited,
-            self.color_matrix.to_yuv_matrix(),
+            self.color.range.to_yuv_range(),
+            self.matrix().to_yuv_matrix(),
         )
         .expect("SIMD i420_to_rgb24 conversion failed");
     }
@@ -800,8 +844,8 @@ impl VideoConvert {
             &planar,
             output,
             (w * 4) as u32,
-            YuvRange::Limited,
-            self.color_matrix.to_yuv_matrix(),
+            self.color.range.to_yuv_range(),
+            self.matrix().to_yuv_matrix(),
         )
         .expect("SIMD i420_to_rgba conversion failed");
     }
@@ -851,8 +895,8 @@ impl VideoConvert {
             &planar,
             output,
             (w * 3) as u32,
-            YuvRange::Limited,
-            self.color_matrix.to_yuv_matrix(),
+            self.color.range.to_yuv_range(),
+            self.matrix().to_yuv_matrix(),
         )
         .expect("SIMD i420_to_bgr24 conversion failed");
     }
@@ -901,8 +945,8 @@ impl VideoConvert {
             &planar,
             output,
             (w * 4) as u32,
-            YuvRange::Limited,
-            self.color_matrix.to_yuv_matrix(),
+            self.color.range.to_yuv_range(),
+            self.matrix().to_yuv_matrix(),
         )
         .expect("SIMD i420_to_bgra conversion failed");
     }
@@ -954,8 +998,8 @@ impl VideoConvert {
             &bi_planar,
             output,
             (w * 3) as u32,
-            YuvRange::Limited,
-            self.color_matrix.to_yuv_matrix(),
+            self.color.range.to_yuv_range(),
+            self.matrix().to_yuv_matrix(),
             YuvConversionMode::Balanced,
         )
         .expect("SIMD nv12_to_rgb24 conversion failed");
@@ -1004,8 +1048,8 @@ impl VideoConvert {
             &bi_planar,
             output,
             (w * 4) as u32,
-            YuvRange::Limited,
-            self.color_matrix.to_yuv_matrix(),
+            self.color.range.to_yuv_range(),
+            self.matrix().to_yuv_matrix(),
             YuvConversionMode::Balanced,
         )
         .expect("SIMD nv12_to_rgba conversion failed");
@@ -1056,8 +1100,8 @@ impl VideoConvert {
             &bi_planar,
             output,
             (w * 3) as u32,
-            YuvRange::Limited,
-            self.color_matrix.to_yuv_matrix(),
+            self.color.range.to_yuv_range(),
+            self.matrix().to_yuv_matrix(),
             YuvConversionMode::Balanced,
         )
         .expect("SIMD nv12_to_bgr24 conversion failed");
@@ -1107,8 +1151,8 @@ impl VideoConvert {
             &bi_planar,
             output,
             (w * 4) as u32,
-            YuvRange::Limited,
-            self.color_matrix.to_yuv_matrix(),
+            self.color.range.to_yuv_range(),
+            self.matrix().to_yuv_matrix(),
             YuvConversionMode::Balanced,
         )
         .expect("SIMD nv12_to_bgra conversion failed");
@@ -1160,8 +1204,8 @@ impl VideoConvert {
             &packed,
             output,
             (w * 3) as u32,
-            YuvRange::Limited,
-            self.color_matrix.to_yuv_matrix(),
+            self.color.range.to_yuv_range(),
+            self.matrix().to_yuv_matrix(),
         )
         .expect("SIMD yuyv_to_rgb24 conversion failed");
     }
@@ -1213,8 +1257,8 @@ impl VideoConvert {
             &packed,
             output,
             (w * 4) as u32,
-            YuvRange::Limited,
-            self.color_matrix.to_yuv_matrix(),
+            self.color.range.to_yuv_range(),
+            self.matrix().to_yuv_matrix(),
         )
         .expect("SIMD yuyv_to_rgba conversion failed");
     }
@@ -1267,8 +1311,8 @@ impl VideoConvert {
             &packed,
             output,
             (w * 3) as u32,
-            YuvRange::Limited,
-            self.color_matrix.to_yuv_matrix(),
+            self.color.range.to_yuv_range(),
+            self.matrix().to_yuv_matrix(),
         )
         .expect("SIMD yuyv_to_bgr24 conversion failed");
     }
@@ -1319,8 +1363,8 @@ impl VideoConvert {
             &packed,
             output,
             (w * 4) as u32,
-            YuvRange::Limited,
-            self.color_matrix.to_yuv_matrix(),
+            self.color.range.to_yuv_range(),
+            self.matrix().to_yuv_matrix(),
         )
         .expect("SIMD yuyv_to_bgra conversion failed");
     }
@@ -1374,8 +1418,8 @@ impl VideoConvert {
             &packed,
             output,
             (w * 3) as u32,
-            YuvRange::Limited,
-            self.color_matrix.to_yuv_matrix(),
+            self.color.range.to_yuv_range(),
+            self.matrix().to_yuv_matrix(),
         )
         .expect("SIMD uyvy_to_rgb24 conversion failed");
     }
@@ -1427,8 +1471,8 @@ impl VideoConvert {
             &packed,
             output,
             (w * 4) as u32,
-            YuvRange::Limited,
-            self.color_matrix.to_yuv_matrix(),
+            self.color.range.to_yuv_range(),
+            self.matrix().to_yuv_matrix(),
         )
         .expect("SIMD uyvy_to_rgba conversion failed");
     }
@@ -1495,8 +1539,8 @@ impl VideoConvert {
             &mut planar,
             input,
             in_stride as u32,
-            YuvRange::Limited,
-            self.color_matrix.to_yuv_matrix(),
+            self.color.range.to_yuv_range(),
+            self.matrix().to_yuv_matrix(),
             YuvConversionMode::Balanced,
         )
         .expect("SIMD rgb24_to_i420 conversion failed");
@@ -1573,8 +1617,8 @@ impl VideoConvert {
             &mut planar,
             input,
             in_stride as u32,
-            YuvRange::Limited,
-            self.color_matrix.to_yuv_matrix(),
+            self.color.range.to_yuv_range(),
+            self.matrix().to_yuv_matrix(),
             YuvConversionMode::Balanced,
         )
         .expect("SIMD rgba_to_i420 conversion failed");
@@ -1652,8 +1696,8 @@ impl VideoConvert {
             &mut planar,
             input,
             in_stride as u32,
-            YuvRange::Limited,
-            self.color_matrix.to_yuv_matrix(),
+            self.color.range.to_yuv_range(),
+            self.matrix().to_yuv_matrix(),
             YuvConversionMode::Balanced,
         )
         .expect("SIMD bgra_to_i420 conversion failed");
@@ -1733,8 +1777,8 @@ impl VideoConvert {
             &mut planar,
             input,
             in_stride as u32,
-            YuvRange::Limited,
-            self.color_matrix.to_yuv_matrix(),
+            self.color.range.to_yuv_range(),
+            self.matrix().to_yuv_matrix(),
             YuvConversionMode::Balanced,
         )
         .expect("SIMD bgr24_to_i420 conversion failed");
@@ -1810,8 +1854,8 @@ impl VideoConvert {
             &mut bi_planar,
             input,
             in_stride as u32,
-            YuvRange::Limited,
-            self.color_matrix.to_yuv_matrix(),
+            self.color.range.to_yuv_range(),
+            self.matrix().to_yuv_matrix(),
             YuvConversionMode::Balanced,
         )
         .expect("SIMD rgb24_to_nv12 conversion failed");
@@ -1883,8 +1927,8 @@ impl VideoConvert {
             &mut bi_planar,
             input,
             in_stride as u32,
-            YuvRange::Limited,
-            self.color_matrix.to_yuv_matrix(),
+            self.color.range.to_yuv_range(),
+            self.matrix().to_yuv_matrix(),
             YuvConversionMode::Balanced,
         )
         .expect("SIMD rgba_to_nv12 conversion failed");
@@ -1954,8 +1998,8 @@ impl VideoConvert {
             &mut bi_planar,
             input,
             in_stride as u32,
-            YuvRange::Limited,
-            self.color_matrix.to_yuv_matrix(),
+            self.color.range.to_yuv_range(),
+            self.matrix().to_yuv_matrix(),
             YuvConversionMode::Balanced,
         )
         .expect("SIMD bgr24_to_nv12 conversion failed");
@@ -2025,8 +2069,8 @@ impl VideoConvert {
             &mut bi_planar,
             input,
             in_stride as u32,
-            YuvRange::Limited,
-            self.color_matrix.to_yuv_matrix(),
+            self.color.range.to_yuv_range(),
+            self.matrix().to_yuv_matrix(),
             YuvConversionMode::Balanced,
         )
         .expect("SIMD bgra_to_nv12 conversion failed");
@@ -2168,81 +2212,28 @@ impl VideoConvert {
     // Color space math
     // -------------------------------------------------------------------------
 
-    /// Convert YUV to RGB using the configured color matrix.
+    /// Convert YUV to RGB.
     ///
-    /// Only the scalar conversion paths call this; with `simd-colorspace`
-    /// those paths are compiled out and the yuv crate does the math.
+    /// Delegates to [`crate::video::color`], which is the reference the golden
+    /// tests pin and the WGSL mirrors. It used to be a second, hand-rolled
+    /// fixed-point implementation here — matrix-aware but **range-blind**, so
+    /// it did full-range maths on limited-range input while the SIMD arm beside
+    /// it did the studio-range expansion. Two arms of the same converter, two
+    /// pictures, and nothing compared them (#265). One implementation cannot
+    /// disagree with itself.
     #[cfg_attr(feature = "simd-colorspace", allow(dead_code))]
     #[inline]
     fn yuv_to_rgb(&self, y: u8, u: u8, v: u8) -> (u8, u8, u8) {
-        let y = y as i32;
-        let u = u as i32 - 128;
-        let v = v as i32 - 128;
-
-        // Use fixed-point arithmetic for speed
-        let (r, g, b) = match self.color_matrix {
-            ColorMatrix::Bt601 => {
-                // BT.601 coefficients (scaled by 1024)
-                // R = Y + 1.402 * V
-                // G = Y - 0.344136 * U - 0.714136 * V
-                // B = Y + 1.772 * U
-                let r = y + ((1436 * v) >> 10);
-                let g = y - ((352 * u + 731 * v) >> 10);
-                let b = y + ((1815 * u) >> 10);
-                (r, g, b)
-            }
-            ColorMatrix::Bt709 => {
-                // BT.709 coefficients (scaled by 1024)
-                // R = Y + 1.5748 * V
-                // G = Y - 0.1873 * U - 0.4681 * V
-                // B = Y + 1.8556 * U
-                let r = y + ((1613 * v) >> 10);
-                let g = y - ((192 * u + 479 * v) >> 10);
-                let b = y + ((1900 * u) >> 10);
-                (r, g, b)
-            }
-        };
-
-        (
-            r.clamp(0, 255) as u8,
-            g.clamp(0, 255) as u8,
-            b.clamp(0, 255) as u8,
-        )
+        let [r, g, b] = crate::video::color::yuv_to_rgb(y, u, v, self.matrix(), self.color.range);
+        (r, g, b)
     }
 
-    /// Convert RGB to YUV using the configured color matrix.
+    /// Convert RGB to YUV. The inverse of the above, from the same reference.
     #[cfg_attr(feature = "simd-colorspace", allow(dead_code))]
     #[inline]
     fn rgb_to_yuv(&self, r: u8, g: u8, b: u8) -> (u8, u8, u8) {
-        let r = r as i32;
-        let g = g as i32;
-        let b = b as i32;
-
-        // Use fixed-point arithmetic
-        let (y, u, v) = match self.color_matrix {
-            ColorMatrix::Bt601 => {
-                // BT.601 coefficients (scaled by 1024)
-                // Y = 0.299 * R + 0.587 * G + 0.114 * B
-                // U = -0.169 * R - 0.331 * G + 0.5 * B + 128
-                // V = 0.5 * R - 0.419 * G - 0.081 * B + 128
-                let y = ((306 * r + 601 * g + 117 * b) >> 10).clamp(0, 255);
-                let u = (((-173 * r - 339 * g + 512 * b) >> 10) + 128).clamp(0, 255);
-                let v = (((512 * r - 429 * g - 83 * b) >> 10) + 128).clamp(0, 255);
-                (y, u, v)
-            }
-            ColorMatrix::Bt709 => {
-                // BT.709 coefficients (scaled by 1024)
-                // Y = 0.2126 * R + 0.7152 * G + 0.0722 * B
-                // U = -0.1146 * R - 0.3854 * G + 0.5 * B + 128
-                // V = 0.5 * R - 0.4542 * G - 0.0458 * B + 128
-                let y = ((218 * r + 732 * g + 74 * b) >> 10).clamp(0, 255);
-                let u = (((-117 * r - 395 * g + 512 * b) >> 10) + 128).clamp(0, 255);
-                let v = (((512 * r - 465 * g - 47 * b) >> 10) + 128).clamp(0, 255);
-                (y, u, v)
-            }
-        };
-
-        (y as u8, u as u8, v as u8)
+        let [y, u, v] = crate::video::color::rgb_to_yuv(r, g, b, self.matrix(), self.color.range);
+        (y, u, v)
     }
 }
 
@@ -2458,30 +2449,122 @@ mod tests {
         assert_eq!(PixelFormat::Gray8.buffer_size(4, 4), 4 * 4);
     }
 
+    /// Limited-range white is 255, not 235.
+    ///
+    /// These two assertions used to say 235 and 16 — that is, they certified
+    /// that the scalar arm skipped the studio-range expansion, while the SIMD
+    /// arm beside it performed it. The comment on the old version even said
+    /// "full range would be Y=255", which is the tell: the input was declared
+    /// limited range and the expected output was the un-expanded number.
+    /// Inverted deliberately in #265; `video::color`'s goldens are the arbiter.
     #[test]
-    fn test_yuv_to_rgb_white() {
+    fn limited_range_white_expands_to_full_white() {
         let conv = VideoConvert::new(PixelFormat::I420, PixelFormat::Rgb24, 2, 2).unwrap();
-
-        // White in YUV: Y=235, U=128, V=128 (full range would be Y=255)
         let (r, g, b) = conv.yuv_to_rgb(235, 128, 128);
-
-        // Should be close to white
-        assert!((r as i32 - 235).abs() < 5, "r={}", r);
-        assert!((g as i32 - 235).abs() < 5, "g={}", g);
-        assert!((b as i32 - 235).abs() < 5, "b={}", b);
+        assert_eq!((r, g, b), (255, 255, 255));
     }
 
     #[test]
-    fn test_yuv_to_rgb_black() {
+    fn limited_range_black_expands_to_full_black() {
         let conv = VideoConvert::new(PixelFormat::I420, PixelFormat::Rgb24, 2, 2).unwrap();
-
-        // Black in YUV: Y=16, U=128, V=128 (limited range)
         let (r, g, b) = conv.yuv_to_rgb(16, 128, 128);
+        assert_eq!((r, g, b), (0, 0, 0));
+    }
 
-        // Should be close to black
-        assert!((r as i32 - 16).abs() < 5, "r={}", r);
-        assert!((g as i32 - 16).abs() < 5, "g={}", g);
-        assert!((b as i32 - 16).abs() < 5, "b={}", b);
+    /// A stream that says it is full range is believed.
+    #[test]
+    fn a_full_range_stream_is_not_expanded() {
+        let conv = VideoConvert::new(PixelFormat::I420, PixelFormat::Rgb24, 2, 2)
+            .unwrap()
+            .with_color_info(ColorInfo {
+                range: ColorRange::Full,
+                ..ColorInfo::default()
+            });
+        // The same stored bytes, read the way the file asked for.
+        assert_eq!(conv.yuv_to_rgb(235, 128, 128), (235, 235, 235));
+        assert_eq!(conv.yuv_to_rgb(0, 128, 128), (0, 0, 0));
+        assert_eq!(conv.yuv_to_rgb(255, 128, 128), (255, 255, 255));
+    }
+
+    /// Whichever arm is compiled, the answer is `video::color`'s.
+    ///
+    /// This is the test that should have existed. `simd-colorspace` is not a
+    /// default feature, so a plain build gets the scalar arm and CI's
+    /// `simd-check` gets the other one — two implementations, each with its own
+    /// passing tests, and nothing that ever compared them to a third thing.
+    /// They had diverged on the range axis for as long as both existed (#265).
+    ///
+    /// Compiled into both builds on purpose: run it under `--features
+    /// simd-colorspace` and it pins the SIMD arm, run it without and it pins
+    /// the scalar one, and the reference is the same either way.
+    #[test]
+    fn whichever_arm_is_compiled_agrees_with_the_reference() {
+        const W: u32 = 8;
+        const H: u32 = 8;
+
+        for matrix in [ColorMatrix::Bt601, ColorMatrix::Bt709] {
+            for range in [ColorRange::Limited, ColorRange::Full] {
+                // A flat frame per sample, so 4:2:0 subsampling cannot muddy
+                // the comparison — this is asking about colour maths, not
+                // about chroma siting.
+                for &(y, u, v) in &[
+                    (16u8, 128u8, 128u8),
+                    (235, 128, 128),
+                    (126, 128, 128),
+                    (81, 90, 240),
+                    (145, 54, 34),
+                    (41, 240, 110),
+                ] {
+                    let luma = (W * H) as usize;
+                    let chroma = (W / 2 * (H / 2)) as usize;
+                    let mut src = vec![0u8; luma + 2 * chroma];
+                    src[..luma].fill(y);
+                    src[luma..luma + chroma].fill(u);
+                    src[luma + chroma..].fill(v);
+
+                    let conv = VideoConvert::new(PixelFormat::I420, PixelFormat::Rgb24, W, H)
+                        .unwrap()
+                        .with_color_info(ColorInfo {
+                            matrix,
+                            range,
+                            ..ColorInfo::default()
+                        });
+                    let mut out = vec![0u8; conv.output_size()];
+                    conv.convert(&src, conv.packed_input_layout(), &mut out)
+                        .unwrap();
+
+                    let expect = crate::video::color::yuv_to_rgb(y, u, v, matrix, range);
+                    // ±2 for the 8-bit round trip; the SIMD arm's fixed-point
+                    // and the reference's floats are allowed to differ by a
+                    // rounding step, not by a range or a matrix.
+                    for (i, px) in out.as_chunks::<3>().0.iter().enumerate() {
+                        for c in 0..3 {
+                            assert!(
+                                px[c].abs_diff(expect[c]) <= 2,
+                                "{matrix:?}/{range:?} yuv({y},{u},{v}) px{i}: \
+                                 got {px:?}, reference {expect:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A signalled matrix outranks the height heuristic.
+    #[test]
+    fn a_declared_matrix_beats_the_guess() {
+        // 2 rows, so the heuristic would say BT.601 — but the stream said 709.
+        let conv = VideoConvert::new(PixelFormat::I420, PixelFormat::Rgb24, 2, 2)
+            .unwrap()
+            .with_color_info(ColorInfo {
+                matrix: ColorMatrix::Bt709,
+                ..ColorInfo::default()
+            });
+        assert_eq!(conv.matrix(), ColorMatrix::Bt709);
+        // And with nothing said, the guess is what it falls back to.
+        let guessed = VideoConvert::new(PixelFormat::I420, PixelFormat::Rgb24, 2, 2).unwrap();
+        assert_eq!(guessed.matrix(), ColorMatrix::Bt601);
     }
 
     #[test]

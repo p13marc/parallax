@@ -50,6 +50,10 @@ const PRESENCE_RTP: u8 = 1 << 1;
 const PRESENCE_META_OVERFLOW: u8 = 1 << 2;
 /// Bit 3: the plane layout is meaningful (#219).
 const PRESENCE_PLANES: u8 = 1 << 3;
+/// `Metadata.color` is present (#265).
+const PRESENCE_COLOR: u8 = 1 << 4;
+/// `Metadata.display` is present (#266).
+const PRESENCE_DISPLAY: u8 = 1 << 5;
 
 /// One buffer's worth of wire state: the slot reference plus every fixed
 /// metadata field. 192 bytes, plain old data.
@@ -114,10 +118,22 @@ pub struct IpcDescriptor {
     pub plane_offset: [u32; MAX_PLANES],
     /// Per-plane byte strides (#219), valid iff presence bit 3.
     pub plane_stride: [u32; MAX_PLANES],
-    /// Spare. 192 rather than the 160 the fields need: three whole cache
-    /// lines, and 44 bytes of room so the next field to cross a process
-    /// boundary is not another layout break.
-    _pad: [u8; 44],
+    /// Colorimetry as H.273 codes (#265) — `[matrix, range, primaries,
+    /// transfer]`, valid iff presence bit 4.
+    ///
+    /// This is the field the pad below was reserved for, and it cost nothing:
+    /// four bytes out of forty-four, so the descriptor is still 192 bytes and
+    /// `IPC_RING_VERSION` is untouched.
+    pub color: [u8; 4],
+    /// Pixel aspect ratio as `(numerator, denominator)` (#266), valid iff
+    /// presence bit 5.
+    pub par: [u32; 2],
+    /// Rotation in quarter-turns clockwise (#266), valid iff presence bit 5.
+    pub rotation: u8,
+    /// Spare. 192 rather than the bytes the fields need: three whole cache
+    /// lines, and room so the next field to cross a process boundary is not
+    /// another layout break.
+    _pad: [u8; 31],
 }
 
 const _: () = assert!(std::mem::size_of::<IpcDescriptor>() == 192);
@@ -148,6 +164,9 @@ impl IpcDescriptor {
             slot_index: slot.slot_index,
             flags: meta.flags.bits(),
             presence: 0,
+            color: [0; 4],
+            par: [0; 2],
+            rotation: 0,
             fmt_tag: codes::FMT_NONE,
             rtp_pt: 0,
             rtp_seq: 0,
@@ -162,7 +181,7 @@ impl IpcDescriptor {
             fmt_e: 0,
             plane_offset: [0; MAX_PLANES],
             plane_stride: [0; MAX_PLANES],
-            _pad: [0; 44],
+            _pad: [0; 31],
         };
         if meta.offset.is_some() {
             d.presence |= PRESENCE_OFFSET;
@@ -186,6 +205,23 @@ impl IpcDescriptor {
                 d.plane_offset[i] = plane.offset as u32;
                 d.plane_stride[i] = plane.stride as u32;
             }
+        }
+        // Colour (#265) rides its own bytes rather than the `fmt_*` words:
+        // those are exhausted by `VideoRaw`'s five, and colour has to travel
+        // on an *encoded* buffer too, where the demuxer stamps it.
+        if let Some(color) = meta.color {
+            d.color = [
+                codes::color_matrix_to_code(color.matrix),
+                codes::color_range_to_code(color.range),
+                codes::color_primaries_to_code(color.primaries),
+                codes::transfer_to_code(color.transfer),
+            ];
+            d.presence |= PRESENCE_COLOR;
+        }
+        if let Some(display) = meta.display {
+            d.par = [display.par.0, display.par.1];
+            d.rotation = codes::rotation_to_code(display.rotation);
+            d.presence |= PRESENCE_DISPLAY;
         }
         match &meta.format {
             None => {}
@@ -276,6 +312,29 @@ impl IpcDescriptor {
                 ssrc: self.rtp_ssrc,
                 pt: self.rtp_pt,
                 marker: self.rtp_marker != 0,
+            });
+        }
+        if self.presence & PRESENCE_COLOR != 0 {
+            let [m, r, p, t] = self.color;
+            // Both ends of an IPC channel are parallax, so an unknown code is
+            // a deployment error and says so — unlike the zenoh side, where a
+            // foreign publisher is an expected thing to meet.
+            meta.color = Some(crate::format::ColorInfo {
+                matrix: codes::color_matrix_from_code(m)
+                    .ok_or_else(|| bad_wire(format!("ColorMatrix {m}")))?,
+                range: codes::color_range_from_code(r)
+                    .ok_or_else(|| bad_wire(format!("ColorRange {r}")))?,
+                primaries: codes::color_primaries_from_code(p)
+                    .ok_or_else(|| bad_wire(format!("ColorPrimaries {p}")))?,
+                transfer: codes::transfer_from_code(t)
+                    .ok_or_else(|| bad_wire(format!("TransferFunction {t}")))?,
+            });
+        }
+        if self.presence & PRESENCE_DISPLAY != 0 {
+            meta.display = Some(crate::format::DisplayGeometry {
+                par: (self.par[0], self.par[1]),
+                rotation: codes::rotation_from_code(self.rotation)
+                    .ok_or_else(|| bad_wire(format!("Rotation {}", self.rotation)))?,
             });
         }
         meta.format = match self.fmt_tag {

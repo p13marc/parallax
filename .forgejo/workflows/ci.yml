@@ -378,6 +378,33 @@ jobs:
       - run: cargo clippy -p example-plugin --all-targets -- -D warnings
       - run: cargo clippy -p parallax-player --all-targets -- -D warnings
 
+  # The Iced integration crate (#267). Separate from `workspace-members`
+  # because it needs the windowing/font system libraries and nothing else in
+  # the workspace does — and because the `cargo tree -d` assertion below is
+  # the only thing standing between us and two wgpu majors in one binary.
+  iced:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@v7.0.1
+      - run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev fonts-dejavu-core libasound2-dev libva-dev libdav1d-dev libopus-dev libvpx-dev libudev-dev g++ libclang-dev pkg-config
+      - uses: https://github.com/dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: clippy
+      - uses: https://github.com/Swatinem/rust-cache@v2.9.2
+        with:
+          key: iced
+          cache-targets: false
+      - uses: https://github.com/taiki-e/install-action@nextest
+      - run: cargo clippy -p parallax-iced --all-targets -- -D warnings
+      - run: cargo clippy -p parallax-play --all-targets -- -D warnings
+      - run: cargo nextest run -p parallax-iced
+      - run: cargo nextest run -p parallax-play
+      - name: exactly one wgpu
+        run: |
+          ! cargo tree -p parallax-iced -d 2>/dev/null | grep -q "^wgpu"
+          ! cargo tree -p parallax-play -d 2>/dev/null | grep -q "^wgpu"
+
   docs:
     runs-on: ubuntu-24.04
     env:

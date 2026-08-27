@@ -753,56 +753,13 @@ impl AsyncSink for AutoVideoSink {
 
         tracing::debug!("AutoVideoSink: received buffer with {} bytes", data.len());
 
-        // Format: from per-buffer metadata; an undeclared payload is
-        // treated as RGBA (the legacy contract).
+        // Format, geometry and plane layout, read and validated once by
+        // `crate::video` — the same read a host renderer does, so an Iced or
+        // egui presenter cannot disagree with this sink about what a buffer
+        // is (#263).
         let meta = ctx.metadata();
-        let format = meta.video_pixel_format().unwrap_or(PixelFormat::Rgba);
-
-        // A strided frame (#194: External zero-copy from a decoder)
-        // declares its real layout; the size gate must judge against THAT,
-        // not the packed size — a strided frame is larger.
-        let strided = meta
-            .has_strided_planes()
-            .then(|| meta.plane_layout())
-            .flatten();
-
-        // Dimensions: prefer per-buffer metadata (`MediaFormat::VideoRaw`,
-        // the single geometry representation since #160); for RGBA/BGRA,
-        // fall back to guessing from the buffer size. YUV frames REQUIRE
-        // declared geometry — plane layout is unrecoverable without it.
-        let (width, height) = match format {
-            PixelFormat::I420 | PixelFormat::Nv12 => match meta.video_dims() {
-                Some((w, h)) if w > 0 && h > 0 => {
-                    let need = strided
-                        .map(|l| l.required_len(format, w, h))
-                        .unwrap_or_else(|| present::yuv420_len(w, h));
-                    if data.len() < need {
-                        return Err(Error::Element(format!(
-                            "autovideosink: {format:?} buffer is {} bytes but {w}x{h} needs {need}",
-                            data.len(),
-                        )));
-                    }
-                    (w, h)
-                }
-                Some((w, h)) => {
-                    return Err(Error::Element(format!(
-                        "autovideosink: {format:?} buffer declares degenerate geometry {w}x{h}"
-                    )));
-                }
-                None => {
-                    return Err(Error::Element(format!(
-                        "autovideosink: {format:?} buffer carries no video dimensions \
-                         (decoders set them via Metadata::set_video_dims)"
-                    )));
-                }
-            },
-            _ => match meta.video_dims() {
-                Some((w, h)) if w > 0 && h > 0 && (w as usize * h as usize * 4) == data.len() => {
-                    (w, h)
-                }
-                _ => detect_dimensions(data.len()),
-            },
-        };
+        let view = crate::video::FrameView::from_metadata(meta, data.len())?;
+        let (format, width, height, strided) = (view.format, view.width, view.height, view.layout);
 
         tracing::debug!("AutoVideoSink: detected dimensions {}x{}", width, height);
 
@@ -950,6 +907,12 @@ impl AsyncSink for AutoVideoSink {
             height,
             format,
             layout: strided,
+            // What the stream said, if it said anything (#265). The
+            // presenter falls back to the height heuristic; a file that
+            // signalled its matrix outranks that guess.
+            color: ctx.buffer().metadata().color_info(),
+            // Non-square pixels and rotation (#266), same route.
+            display: ctx.buffer().metadata().display_geometry(),
         };
 
         // A full channel means the display cannot keep up. Shed this frame and
@@ -1036,39 +999,6 @@ impl AsyncSink for AutoVideoSink {
             memory,
         )])
     }
-}
-
-/// Detect frame dimensions from buffer size (assuming RGBA format).
-fn detect_dimensions(size: usize) -> (u32, u32) {
-    // Size = width * height * 4 (RGBA)
-    let pixels = size / 4;
-
-    // Try common resolutions
-    const COMMON: &[(u32, u32)] = &[
-        (640, 480),   // VGA
-        (800, 600),   // SVGA
-        (1024, 768),  // XGA
-        (1280, 720),  // 720p
-        (1280, 960),  // SXGA-
-        (1920, 1080), // 1080p
-        (1920, 1200), // WUXGA
-        (2560, 1440), // 1440p
-        (3840, 2160), // 4K
-        (320, 240),   // QVGA
-        (176, 144),   // QCIF
-        (352, 288),   // CIF
-    ];
-
-    for &(w, h) in COMMON {
-        if (w * h) as usize == pixels {
-            return (w, h);
-        }
-    }
-
-    // Fallback: assume 4:3 aspect ratio
-    let height = ((pixels as f64).sqrt() * 0.866) as u32; // sqrt(3/4)
-    let width = pixels as u32 / height.max(1);
-    (width.max(1), height.max(1))
 }
 
 /// Run the winit display loop in the display thread.
@@ -1402,18 +1332,6 @@ mod tests {
         assert!(!handle2.is_fullscreen());
         handle2.set_fullscreen(true);
         assert!(handle.is_fullscreen());
-    }
-
-    #[test]
-    fn test_detect_dimensions() {
-        // 640x480 RGBA = 1,228,800 bytes
-        assert_eq!(detect_dimensions(640 * 480 * 4), (640, 480));
-
-        // 1280x720 RGBA = 3,686,400 bytes
-        assert_eq!(detect_dimensions(1280 * 720 * 4), (1280, 720));
-
-        // 1920x1080 RGBA = 8,294,400 bytes
-        assert_eq!(detect_dimensions(1920 * 1080 * 4), (1920, 1080));
     }
 
     #[test]

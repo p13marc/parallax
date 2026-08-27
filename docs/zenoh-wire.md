@@ -43,7 +43,7 @@ through the control socket.
 Every code both encodings write comes from `wire::codes`, whose lock test pins
 each assignment. Reordering `PixelFormat` is therefore not a wire event.
 
-## Chapter P — the parallax plane (contract version 4)
+## Chapter P — the parallax plane (contract version 5)
 
 Each buffer becomes exactly one zenoh sample:
 
@@ -51,7 +51,7 @@ Each buffer becomes exactly one zenoh sample:
 |---|---|
 | payload | the raw buffer bytes, unmodified |
 | encoding | derived from `Metadata.format` (`video/h264`, `image/jpeg`-style MIME hints; `zenoh/bytes` when unknown), overridable via `ZenohSink::with_encoding` |
-| attachment | `[0x50 'P', 0x58 'X', 0x04] ++ rkyv(WireMetadata)` |
+| attachment | `[0x50 'P', 0x58 'X', 0x05] ++ rkyv(WireMetadata)` |
 
 ### Custom metadata
 
@@ -76,7 +76,8 @@ The type-erased half of the map still cannot travel and never will: a
 `WireMetadata` (`src/wire/metadata.rs`) carries pts/dts/duration
 (ns, `u64::MAX` = unset), sequence, stream_id, `BufferFlags` bits, source byte
 offset, the media format (stable u8 codec / pixel-format codes), the coded
-geometry of encoded video (#236), and whitelisted custom byte entries (e.g.
+geometry of encoded video (#236), the declared colorimetry (#265 — matrix,
+range, primaries and transfer, as their H.273 codes), and custom byte entries (e.g.
 `stanag/klv`, selected with `ZenohSink::with_forward_custom_keys`). The
 type-erased part of the in-memory metadata map cannot cross the wire.
 

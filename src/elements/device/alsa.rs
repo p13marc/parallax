@@ -39,7 +39,9 @@ use crate::format::{
     AudioFormatCaps, CapsValue, ElementMediaCaps, FormatCaps, FormatMemoryCap, MemoryCaps,
 };
 use crate::pipeline::flow::FlowStateHandle;
-use crate::pipeline::sync::{Anchor, Realign, clip_to_segment, frames_to_nanos, realign};
+use crate::pipeline::sync::{
+    Anchor, Realign, clip_to_segment, frames_at_rate, frames_to_nanos, realign,
+};
 
 use super::DeviceError;
 
@@ -495,6 +497,10 @@ pub struct AlsaSink {
     segment: Option<crate::event::SegmentEvent>,
     /// Frames dropped for falling outside the segment, for observability.
     clipped_frames: u64,
+    /// The rate this sink last announced it could not play at (#280), so the
+    /// bus message and the log line happen once per change rather than once
+    /// per buffer.
+    announced_rate: f64,
     /// Running time the next sample written is due at. `NONE` until the
     /// first buffer of a generation has been placed.
     expected_rt: ClockTime,
@@ -597,6 +603,7 @@ impl AlsaSink {
             poll_fd: None,
             position,
             segment: None,
+            announced_rate: 1.0,
             clipped_frames: 0,
             expected_rt: ClockTime::NONE,
             gap_fill: true,
@@ -612,6 +619,31 @@ impl AlsaSink {
     /// outside the pipeline — the sink itself moves into its executor task.
     pub fn position(&self) -> Arc<AlsaPosition> {
         Arc::clone(&self.position)
+    }
+
+    /// Say once, on the bus and in the log, that playback is muted because
+    /// the rate is not 1 (#280) — or that it is audible again.
+    ///
+    /// Once per *change*: `consume` runs per buffer, and a warning per buffer
+    /// is a warning nobody reads.
+    fn announce_rate(&mut self, ctx: &ConsumeContext<'_>, rate: f64) {
+        if rate == self.announced_rate {
+            return;
+        }
+        self.announced_rate = rate;
+        let message = if rate == 1.0 {
+            "alsasink: playing at 1x again; audio is audible".to_string()
+        } else {
+            format!(
+                "alsasink: playing at {rate}x — audio is muted (silence is written at the \
+                 running-time rate so the clock stays true); this sink plays at the hardware \
+                 rate and has no pitch-preserving time-stretch"
+            )
+        };
+        tracing::info!("{message}");
+        if let Some(bus) = ctx.bus() {
+            bus.post_warning(message, None);
+        }
     }
 
     /// Whether a gap in the incoming stream is filled with silence (default
@@ -1236,8 +1268,44 @@ impl AsyncSink for AlsaSink {
             }
         }
 
-        let placed = data.len() / self.frame_size;
-        self.write_all(data).await?;
+        // Rate != 1 (#280). This sink plays at the hardware rate and does
+        // not resample: `converters::resample` offers linear and cubic, which
+        // is not a pitch-preserving time-stretch, and pretending otherwise is
+        // worse than silence.
+        //
+        // What it must still do is keep the *clock* honest, because this
+        // sink's clock is its own write cursor. `to_running_time` compresses
+        // media time by the rate, so a buffer holding N frames of media
+        // occupies N/|rate| of running time. Writing exactly that many frames
+        // of silence advances the clock at wall rate while video maps 2 s of
+        // media into 1 s of running time and plays twice as fast — muted, but
+        // locked, and at the right speed. Playing the audio unchanged instead
+        // leaves the clock a factor of `rate` behind where every paced branch
+        // needs it, which is a guaranteed desync rather than a wrong pitch.
+        let rate = self.segment.as_ref().map_or(1.0, |seg| seg.rate.abs());
+        let placed;
+        if rate != 1.0 && rate > 0.0 {
+            self.announce_rate(ctx, rate);
+            let frames = frames_at_rate(data.len() / self.frame_size, rate);
+            if frames == 0 {
+                // A rate high enough that this buffer rounds to nothing: the
+                // clock does not move, so neither should the cursor.
+                return Ok(());
+            }
+            let bytes = frames * self.frame_size;
+            self.silence.clear();
+            self.silence
+                .resize(bytes, self.format.format.silence_byte());
+            let silence = std::mem::take(&mut self.silence);
+            let written = self.write_all(&silence).await;
+            self.silence = silence;
+            written?;
+            placed = frames;
+        } else {
+            self.announce_rate(ctx, 1.0);
+            placed = data.len() / self.frame_size;
+            self.write_all(data).await?;
+        }
         // Where the next sample is due: where this one landed, plus what was
         // written. An unmapped stream (no segment, or no PTS) leaves the
         // cursor unset rather than inventing one from a timestamp there
@@ -1249,6 +1317,47 @@ impl AsyncSink for AlsaSink {
             )));
         }
         Ok(())
+    }
+
+    /// Offer an `INSTANT_RATE_CHANGE` seek the same answer `AutoVideoSink`
+    /// gives (#280): bend this sink's own mapping, and stop there.
+    ///
+    /// Without this the sink had no `handle_upstream_event` at all, so a rate
+    /// change reached only the video sink — and the *audio* sink is the clock
+    /// master, so the one branch that had to know was the one that never
+    /// heard.
+    fn handle_upstream_event(&mut self, event: &crate::event::Event) -> crate::event::EventResult {
+        use crate::event::{Event, EventResult, SeekFlags};
+        let Event::Seek(seek) = event else {
+            return EventResult::NotHandled;
+        };
+        if !seek.flags.contains(SeekFlags::INSTANT_RATE_CHANGE) {
+            return EventResult::NotHandled;
+        }
+        let Some(seg) = self.segment.as_mut() else {
+            // Nothing playing yet: the Segment behind the next buffer brings
+            // its own rate.
+            return EventResult::NotHandled;
+        };
+        if seek.rate == 0.0 || seek.rate.signum() != seg.rate.signum() {
+            tracing::warn!(
+                "alsasink: instant rate {} rejected (direction change from {})",
+                seek.rate,
+                seg.rate
+            );
+            return EventResult::NotHandled;
+        }
+        // The mapping bends around what has already been heard: the frames in
+        // the device buffer were written under the old rate, and the cursor
+        // this sink paces from must keep naming the same instant across the
+        // change or the clock steps.
+        let pivot = self.expected_rt;
+        seg.rate = seek.rate;
+        // `expected_rt` is a running time and stays one; the rate only
+        // changes how much *media* the next buffer represents, which is what
+        // the silence maths in `consume` reads.
+        let _ = pivot;
+        EventResult::Handled { position: None }
     }
 
     fn input_media_caps(&self) -> ElementMediaCaps {

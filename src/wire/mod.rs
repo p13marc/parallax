@@ -33,12 +33,14 @@ pub const WIRE_MAGIC: [u8; 2] = [0x50, 0x58];
 
 /// The internal schema's version.
 ///
-/// 4: `rtp`, `planes` and `WireFormat::Rtp` (#219) — the fields the two wires
-/// had already diverged on. 3: `terminal` (#224). 2: `coded` (#236).
+/// 5: `color` (#265) — colorimetry, so the same file stops rendering three
+/// different ways. 4: `rtp`, `planes` and `WireFormat::Rtp` (#219) — the
+/// fields the two wires had already diverged on. 3: `terminal` (#224).
+/// 2: `coded` (#236).
 ///
 /// **The two versions in this tree change independently and must not be
 /// merged.** This one is *semantics*: what a field means, which fields exist.
 /// [`IPC_RING_VERSION`](crate::memory::IPC_RING_VERSION) is *mechanics*: the
 /// ring's layout and handshake. A doc saying "remember to bump both" is a doc
 /// that will be violated.
-pub const WIRE_VERSION: u8 = 4;
+pub const WIRE_VERSION: u8 = 5;

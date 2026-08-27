@@ -83,6 +83,13 @@ pub struct WireMetadata {
     /// arrived describing itself as packed — geometry travels in-band
     /// (the Geometry-in-Metadata invariant) and this is part of the geometry.
     pub planes: Option<WirePlanes>,
+    /// What the stream says about its colour (#265), as H.273 codes:
+    /// `(matrix, range, primaries, transfer)`.
+    pub color: Option<(u8, u8, u8, u8)>,
+
+    /// Display geometry as `(par_num, par_den, rotation code)` (#266).
+    /// `None` = the producer said nothing.
+    pub display: Option<(u32, u32, u8)>,
     /// Whitelisted custom byte entries (e.g. KLV, SEI), as (key, bytes).
     pub custom: Vec<(String, Vec<u8>)>,
     /// Set on a terminal sample (#224); `None` on every media sample.
@@ -363,6 +370,17 @@ impl WireMetadata {
             // synthesises a packed one from the geometry, and re-deriving that
             // on the far side is free.
             planes: metadata.planes.as_ref().map(WirePlanes::from_layout),
+            display: metadata
+                .display
+                .map(|d| (d.par.0, d.par.1, codes::rotation_to_code(d.rotation))),
+            color: metadata.color.map(|c| {
+                (
+                    codes::color_matrix_to_code(c.matrix),
+                    codes::color_range_to_code(c.range),
+                    codes::color_primaries_to_code(c.primaries),
+                    codes::transfer_to_code(c.transfer),
+                )
+            }),
             custom,
             terminal: None,
         }
@@ -386,6 +404,8 @@ impl WireMetadata {
             coded: None,
             rtp: None,
             planes: None,
+            color: None,
+            display: None,
             custom: Vec::new(),
             terminal: Some(reason),
         }
@@ -420,6 +440,23 @@ impl WireMetadata {
             marker: r.marker,
         });
         metadata.planes = self.planes.as_ref().map(WirePlanes::to_layout);
+        // A code with no variant here drops the whole `ColorInfo` rather than
+        // guessing a component: a half-understood colour description is worse
+        // than an honest "nothing was said", which consumers already handle.
+        metadata.display = self.display.and_then(|(num, den, rot)| {
+            Some(crate::format::DisplayGeometry {
+                par: (num, den),
+                rotation: codes::rotation_from_code(rot)?,
+            })
+        });
+        metadata.color = self.color.and_then(|(m, r, p, t)| {
+            Some(crate::format::ColorInfo {
+                matrix: codes::color_matrix_from_code(m)?,
+                range: codes::color_range_from_code(r)?,
+                primaries: codes::color_primaries_from_code(p)?,
+                transfer: codes::transfer_from_code(t)?,
+            })
+        });
 
         // Re-attach under the real key (#220). `intern` leaks the key once,
         // bounded, so a receiver is no longer limited to a hardcoded list —
@@ -566,6 +603,8 @@ mod tests {
             coded: None,
             rtp: None,
             planes: None,
+            color: None,
+            display: None,
             custom: vec![("myapp/telemetry".to_string(), vec![1, 2, 3])],
             terminal: None,
         };
@@ -597,6 +636,8 @@ mod tests {
             coded: None,
             rtp: None,
             planes: None,
+            color: None,
+            display: None,
             custom: vec![("no slash here".to_string(), vec![1, 2, 3])],
             terminal: None,
         };

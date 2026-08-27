@@ -158,6 +158,21 @@ Negotiation treats External as **opt-in** (`MemoryType::requires_explicit_optin`
 
 Producers today: `Dav1dDecoder` (emits External when negotiated), `ExternalTestSrc` (`elements::testing`). Consumers: `AutoVideoSink` with the wgpu backend (uploads with real `bytes_per_row`) and with the CPU backend (converts in place), `VideoConvertElement`, `VideoScale`, and `EncoderElement` around openh264/rav1e/v4l2-m2m.
 
+### Colorimetry and display geometry (#265, #266)
+
+Two more things travel per buffer, next to the plane layout and for the same reason — `MediaFormat::compatible` compares `VideoRaw` by whole-struct equality, so anything added there becomes a negotiation axis:
+
+- `Metadata::set_color_info(ColorInfo)` / `color_info()` — matrix, range, primaries and transfer, each an enum whose discriminants **are** the H.273 / ISO 23091-4 codes. So a container's number, the wire code and the Rust value are one number.
+- `Metadata::set_display_geometry(DisplayGeometry)` / `display_geometry()` — pixel aspect ratio and rotation.
+
+Every axis has an `Unspecified` variant meaning *nothing was said*, which is not the same as *assume the default*: `video::color::matrix_for_height` is still the fallback a consumer applies (≥720 lines → BT.709), and `ColorInfo::matrix_or` is how a declaration outranks it.
+
+**Where it comes from.** MKV's `Colour` element and `DisplayWidth`/`DisplayHeight`; MP4's `colr` and `pasp` boxes (read for every visual sample entry, not just the two codecs whose configuration record the demuxer already wanted — H.264's VUI is parsed nowhere in this tree, so `avc1`'s container boxes are the only source it has) and the `tkhd` display matrix; dav1d's sequence header; libvpx's `vpx_image_t.cs`/`.range`. Container-side values ride the **encoded** buffer, and every decoder inherits its input's `Metadata`, so they reach the raw frame for free. A decoder that reads its own bitstream merges **per axis** (`ColorInfo::or`) rather than replacing wholesale: AV1 routinely signals a matrix and nothing else, and whole-struct precedence would erase the container's answer for the rest.
+
+**Two things it deliberately does not cover.** H.264's VUI — openh264 exposes nothing about colour, so reading it means a net-new SPS parser, and H.264 arrives in MP4 or MKV. And MKV rotation — it lives in the `Projection` element, which `matroska-demuxer` 0.8.1 does not model at all (not even an element id), so reading it would mean a raw EBML parse of our own.
+
+**Where it is applied.** `video::fit::display_rect` is the one function every presenter calls: it applies the aspect ratio and the rotation's axis swap, then letterboxes. `video::color` owns the conversion numbers, and the GPU shader, the SIMD converter arm and the scalar converter arm are each pinned to it by test rather than to each other. The softbuffer fallback honours the aspect ratio but draws rotated content upright, with one warning per run — a per-pixel software rotate is not worth writing for a path the GPU already covers.
+
 ## Converters
 
 The real conversion engines live in `parallax::converters` (the pipeline elements `VideoConvertElement`/`AudioConvertElement`/`AudioResampleElement` wrap them):
@@ -171,7 +186,9 @@ let conv = VideoConvert::new(PixelFormat::I420, PixelFormat::Rgba, 1920, 1080)?;
 conv.convert(&yuv_in, &mut rgba_out)?;
 ```
 
-Supported directions: I420/NV12/YUYV/UYVY → RGB24/RGBA/BGR24/BGRA (UYVY: RGB24/RGBA only); RGB24/RGBA/BGR24/BGRA → I420/NV12; **YUYV/UYVY → I420/NV12** (the path a webcam takes to an encoder); **I420 ↔ NV12**; RGB↔BGR swizzles; alpha add/remove; Gray8 → RGB. Color matrices: BT.601 (default), BT.709.
+Supported directions: I420/NV12/YUYV/UYVY → RGB24/RGBA/BGR24/BGRA (UYVY: RGB24/RGBA only); RGB24/RGBA/BGR24/BGRA → I420/NV12; **YUYV/UYVY → I420/NV12** (the path a webcam takes to an encoder); **I420 ↔ NV12**; RGB↔BGR swizzles; alpha add/remove; Gray8 → RGB.
+
+Colour matrices: BT.601, BT.709 and BT.2020 non-constant luminance, in limited or full range — taken from `VideoConvert::with_color_info` when the stream declared it, else guessed from the height. Before #265 the SIMD arm assumed BT.601 limited and the scalar arm assumed BT.601 *full*, so the same crate converted the same frame two different ways depending on one non-default feature flag.
 
 The YUV→YUV directions carry no colour-space maths — they de-interleave and subsample chroma (4:2:2 → 4:2:0 averages the two source rows) — so they are both cheaper and more accurate than routing through RGB.
 
@@ -195,6 +212,6 @@ Nearest-neighbor or bilinear resize of raw frames, in any of I420, NV12, RGB24, 
 
 ## Pitfalls
 
-- **Geometry travels in-band, in `Metadata`.** No element takes dimensions at construction; one that cannot determine its geometry from the buffer **errors** rather than falling back to a stale constructor value. Producers stamp it with `Metadata::set_video_dims(w, h, pixel_format)`, which writes *both* the `MediaFormat::VideoRaw` field and the legacy `"width"`/`"height"` keys — write only one and the other goes stale, silently mis-sizing frames downstream.
+- **Geometry travels in-band, in `Metadata`.** No element takes dimensions at construction; one that cannot determine its geometry from the buffer **errors** rather than falling back to a stale constructor value. Producers stamp it with `Metadata::set_video_dims(w, h, pixel_format)`, which is the ONE representation since #160 — the old `"width"`/`"height"` custom keys carry no geometry any more. Touching `Metadata.format` directly instead loses the framerate the source negotiated.
 - **Two `PixelFormat` enums exist**: `format::PixelFormat` (15 variants, used in caps) and `converters::PixelFormat` (9 variants, used by the conversion engine). They are separate types, but conversion is now explicit and total in one direction: `From<converters::PixelFormat> for format::PixelFormat`, and `TryFrom` back (the caps enum names formats the engine cannot convert). Likewise two `SampleFormat` enums (`format::` vs `converters::audio::`).
 - After changing element caps at runtime, call `pipeline.invalidate_negotiation()` (or check `needs_renegotiation()`).

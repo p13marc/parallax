@@ -353,6 +353,9 @@ impl Dav1dDecoder {
         metadata.sequence = self.frames_out;
         self.frames_out += 1;
         metadata.set_video_planes(dims.0, dims.1, format.into(), layout);
+        // Same merge as the packed path (#265): both are the same frame.
+        let inherited = metadata.color_info().unwrap_or_default();
+        metadata.set_color_info(picture_color(picture).or(inherited));
         self.last_dims = Some(dims);
 
         Ok(Some(Buffer::new(
@@ -441,6 +444,14 @@ impl Dav1dDecoder {
         metadata.sequence = self.frames_out;
         self.frames_out += 1;
         metadata.set_video_dims(dims.0, dims.1, format.into());
+        // What the sequence header said, filled in from what the container
+        // said where AV1 left an axis unspecified (#265). The input metadata
+        // came from `claim_meta_for`, so the container's answer is already
+        // sitting on it — merging rather than overwriting is what keeps an
+        // MKV `Colour` element alive through a stream that signals only a
+        // matrix.
+        let inherited = metadata.color_info().unwrap_or_default();
+        metadata.set_color_info(picture_color(picture).or(inherited));
 
         Ok(Buffer::new(MemoryHandle::with_len(slot, total), metadata))
     }
@@ -454,6 +465,28 @@ impl Dav1dDecoder {
             .and_then(|i| self.pending_meta.remove(i))
             .or_else(|| self.pending_meta.pop_front())
             .unwrap_or_default()
+    }
+}
+
+/// What the AV1 sequence header says about colour (#265).
+///
+/// dav1d re-exports `av-data`'s enums, whose discriminants *are* the H.273
+/// codes, so this is a cast rather than a table — the same reason MKV and
+/// MP4's `colr` need no translation either.
+///
+/// The range is always meaningful: AV1 carries `color_range` whether or not a
+/// colour description is present, defaulting to limited.
+#[cfg(feature = "av1-decode")]
+fn picture_color(picture: &dav1d::Picture) -> crate::format::ColorInfo {
+    use crate::format::{ColorInfo, ColorMatrix, ColorPrimaries, ColorRange, TransferFunction};
+    ColorInfo {
+        matrix: ColorMatrix::from_h273(picture.matrix_coefficients() as u8),
+        primaries: ColorPrimaries::from_h273(picture.color_primaries() as u8),
+        transfer: TransferFunction::from_h273(picture.transfer_characteristic() as u8),
+        range: match picture.color_range() {
+            dav1d::pixel::YUVRange::Full => ColorRange::Full,
+            dav1d::pixel::YUVRange::Limited => ColorRange::Limited,
+        },
     }
 }
 

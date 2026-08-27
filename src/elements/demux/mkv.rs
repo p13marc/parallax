@@ -179,6 +179,123 @@ pub struct MkvVideoInfo {
     pub height: u32,
     /// Frame rate derived from the track's default frame duration, if stated.
     pub frame_rate: Option<f64>,
+    /// What the track's `Colour` element said (#265), if it carried one.
+    pub color: Option<crate::format::ColorInfo>,
+    /// Pixel aspect ratio derived from `DisplayWidth`/`DisplayHeight` (#266).
+    ///
+    /// Rotation is always [`Rotation::None`](crate::format::Rotation::None)
+    /// here: MKV carries it in the `Projection` element, which
+    /// `matroska-demuxer` 0.8.1 does not model at all — not even an element
+    /// id — so reading it would mean a raw EBML parse of our own. Out of
+    /// scope for #266; `docs/formats.md` says so.
+    pub display: Option<crate::format::DisplayGeometry>,
+}
+
+/// Derive the pixel aspect ratio from a track's display dimensions.
+///
+/// One formula covers every `DisplayUnit`: the element pair always states a
+/// *display* aspect, whether it is spelled in pixels, centimetres, inches or
+/// as a bare ratio, so
+///
+/// ```text
+/// PAR = (display_width x pixel_height) : (display_height x pixel_width)
+/// ```
+///
+/// holds throughout. `Unknown` is the one exception — the numbers mean
+/// nothing without a unit, and inventing one would squash the picture on the
+/// strength of a guess.
+///
+/// `None` when nothing was stated, or when the result is square: square
+/// pixels are what a consumer assumes anyway.
+fn display_par(video: &matroska_demuxer::Video) -> Option<(u32, u32)> {
+    use matroska_demuxer::DisplayUnit;
+
+    if matches!(video.display_unit(), Some(DisplayUnit::Unknown)) {
+        return None;
+    }
+    par_from_display(
+        video.display_width()?.get(),
+        video.display_height()?.get(),
+        video.pixel_width().get(),
+        video.pixel_height().get(),
+    )
+}
+
+/// The arithmetic half of [`display_par`], split out because
+/// `matroska_demuxer::Video` cannot be constructed outside its crate — so
+/// this is the part a test can reach.
+fn par_from_display(dw: u64, dh: u64, pw: u64, ph: u64) -> Option<(u32, u32)> {
+    let num = dw.checked_mul(ph)?;
+    let den = dh.checked_mul(pw)?;
+    if num == 0 || den == 0 || num == den {
+        return None;
+    }
+    // Reduce, or a 3840x2160 track states its aspect as 8294400:8294400 and
+    // every consumer carries two eight-digit numbers around forever.
+    let divisor = gcd(num, den);
+    Some((
+        u32::try_from(num / divisor).ok()?,
+        u32::try_from(den / divisor).ok()?,
+    ))
+}
+
+/// Greatest common divisor, for reducing the aspect fraction.
+fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a.max(1)
+}
+
+/// Read a track's `Colour` element into a [`ColorInfo`](crate::format::ColorInfo).
+///
+/// MKV codes every axis with the H.273 numbers, so this is a translation of
+/// `matroska-demuxer`'s enums back to the numbers the rest of the tree uses —
+/// not a second opinion about what they mean.
+///
+/// `None` when the element is absent *or* says nothing, so an empty `Colour`
+/// (which is legal, and common) does not out-rank the height heuristic.
+///
+/// Deliberately not read: `max_cll`/`max_fall`. `matroska-demuxer` 0.8.1 reads
+/// them from the wrong element id.
+fn colour_of(video: &matroska_demuxer::Video) -> Option<crate::format::ColorInfo> {
+    use crate::format::{ColorInfo, ColorMatrix, ColorPrimaries, ColorRange, TransferFunction};
+    use matroska_demuxer::TransferCharacteristics as T;
+    use matroska_demuxer::{MatrixCoefficients as M, Primaries as P, Range as R};
+
+    let colour = video.colour()?;
+    let info = ColorInfo {
+        matrix: match colour.matrix_coefficients() {
+            Some(M::Bt709) => ColorMatrix::Bt709,
+            Some(M::Fcc73682 | M::Bt470bg | M::Smpte170) => ColorMatrix::Bt601,
+            Some(M::Bt2020Ncl) => ColorMatrix::Bt2020Ncl,
+            _ => ColorMatrix::Unspecified,
+        },
+        range: match colour.range() {
+            // `Defined` means "read it off the matrix/transfer", which is not
+            // a claim this type can hold — leave it unsignalled and let the
+            // consumer's own fallback decide.
+            Some(R::Broadcast) => ColorRange::Limited,
+            Some(R::Full) => ColorRange::Full,
+            _ => ColorRange::Unspecified,
+        },
+        primaries: match colour.primaries() {
+            Some(P::Bt709) => ColorPrimaries::Bt709,
+            Some(P::Bt601) => ColorPrimaries::Bt470bg,
+            Some(P::Smpte170) => ColorPrimaries::Smpte170m,
+            Some(P::Bt2020) => ColorPrimaries::Bt2020,
+            _ => ColorPrimaries::Unspecified,
+        },
+        transfer: match colour.transfer_characteristics() {
+            Some(T::Bt709) => TransferFunction::Bt709,
+            Some(T::Iec61966_2_1) => TransferFunction::Srgb,
+            Some(T::Bt220_10) => TransferFunction::Bt2020_10,
+            Some(T::Bt2100) => TransferFunction::Pq,
+            Some(T::Hlg) => TransferFunction::Hlg,
+            _ => TransferFunction::Unspecified,
+        },
+    };
+    (!info.is_unspecified()).then_some(info)
 }
 
 impl MkvCodec {
@@ -400,6 +517,11 @@ impl<R: Read + Seek> MkvDemux<R> {
                 frame_rate: entry
                     .default_duration()
                     .map(|d| 1_000_000_000.0 / d.get() as f64),
+                color: colour_of(v),
+                display: display_par(v).map(|par| crate::format::DisplayGeometry {
+                    par,
+                    rotation: crate::format::Rotation::None,
+                }),
             });
             let audio_info = entry.audio().map(|a| MkvAudioInfo {
                 sample_rate: a
@@ -721,6 +843,16 @@ impl<R: Read + Seek> MkvDemux<R> {
                         metadata.set_coded_video_dims(codec, v.width, v.height)
                     }
                     _ => metadata.format = Some(crate::format::MediaFormat::Video(codec)),
+                }
+                // What the track's `Colour` element said (#265). It rides the
+                // *encoded* buffer, so each decoder carries it across onto the
+                // frame it produces — the demuxer never emits raw video.
+                if let Some(color) = track_info.video_info.as_ref().and_then(|v| v.color) {
+                    metadata.set_color_info(color);
+                }
+                // Non-square pixels (#266), by the same route as the colour.
+                if let Some(display) = track_info.video_info.as_ref().and_then(|v| v.display) {
+                    metadata.set_display_geometry(display);
                 }
             } else if let Some(codec) = track_info.codec.audio_codec() {
                 metadata.format = Some(crate::format::MediaFormat::Audio(codec));
@@ -1322,6 +1454,31 @@ impl<R: Read + Seek> std::fmt::Debug for MkvDemux<R> {
 // ============================================================================
 // Tests
 // ============================================================================
+
+#[cfg(test)]
+mod display_tests {
+    use super::par_from_display;
+
+    #[test]
+    fn the_display_elements_become_a_reduced_pixel_ratio() {
+        // Anamorphic PAL: 720x576 stored, displayed 16:9. One formula covers
+        // every DisplayUnit, because the pair always states a *display*
+        // aspect whatever it is spelled in — pixels here, a bare ratio in the
+        // next case, and the answer is the same.
+        assert_eq!(par_from_display(1024, 576, 720, 576), Some((64, 45)));
+        assert_eq!(par_from_display(16, 9, 720, 576), Some((64, 45)));
+
+        // Square pixels say nothing: it is what a consumer assumes, so
+        // stamping it would cost a wire field per buffer for no answer.
+        assert_eq!(par_from_display(1920, 1080, 1920, 1080), None);
+        // ...including when the numbers differ but the ratio does not.
+        assert_eq!(par_from_display(960, 540, 1920, 1080), None);
+
+        // A zero is a division waiting to happen further downstream.
+        assert_eq!(par_from_display(0, 576, 720, 576), None);
+        assert_eq!(par_from_display(1024, 0, 720, 576), None);
+    }
+}
 
 #[cfg(test)]
 mod tests {

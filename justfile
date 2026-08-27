@@ -88,6 +88,42 @@ check-display:
     cargo clippy --all-targets --features display,display-gpu -- -D warnings
     cargo clippy --all-targets --features display -- -D warnings
 
+# The Iced integration crate and the player built on it (#267). Neither is in
+# `default-members`, so a bare `cargo` invocation never sees them — same
+# reason the `workspace-members` CI job exists.
+#
+# The `cargo tree -d` line is the load-bearing one: this crate compiles
+# against *Iced's* wgpu and parallax's `display-gpu` backend against a
+# different major, so "exactly one wgpu" has to be asserted rather than hoped
+# for. Duplicates would compile and quietly double the build.
+check-iced:
+    cargo clippy -p parallax-iced --all-targets -- -D warnings
+    cargo clippy -p parallax-play --all-targets -- -D warnings
+    cargo nextest run -p parallax-iced
+    cargo nextest run -p parallax-play
+    ! cargo tree -p parallax-iced -d 2>/dev/null | grep -q '^wgpu'
+    ! cargo tree -p parallax-play -d 2>/dev/null | grep -q '^wgpu'
+
+# Run the player against a fixture with no display attached, and check it
+# actually played. weston's headless backend plus Mesa's software Vulkan is
+# enough to drive the real thing end to end — window, shader, pacing.
+#
+# It needs a *live* compositor: weston stops repainting when it goes idle, and
+# a client that never gets a frame callback never draws. That looks exactly
+# like a stalled pipeline, so start it fresh.
+play-headless FILE="tests/fixtures/tiny_h264_aac.mkv" SECS="5":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    cargo build -p parallax-play
+    weston --backend=headless --width=1280 --height=720 --socket=wayland-check &
+    weston_pid=$!
+    trap 'kill $weston_pid 2>/dev/null || true' EXIT
+    sleep 3
+    WAYLAND_DISPLAY=wayland-check ./target/debug/parallax-play --exit-after={{SECS}} {{FILE}} \
+        | tee /dev/stderr | grep -qE 'presented=[1-9]' \
+        || { echo 'no frames were presented'; exit 1; }
+
 # Vulkan Video (#3). Mirrors CI's vulkan-check, and exists because of root
 # CLAUDE.md gotcha 11b: `elements::codec::hw_encoder`/`hw_decoder` need
 # `vulkan-video` AND a codec feature, so this combination is the only one

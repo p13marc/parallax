@@ -1,0 +1,39 @@
+[package]
+name = "parallax-iced"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+publish = false
+description = "Embed parallax video in an Iced application"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# The whole crate compiles against *Iced's* wgpu, reached only through the
+# `iced::wgpu` re-export — never a direct `wgpu` dependency. That is what
+# makes "exactly one wgpu in the tree" a compile-time fact: parallax's own
+# `display-gpu` backend is on wgpu 30 and this is on whatever Iced pins, and
+# the two must never meet.
+#
+# `advanced` is what the `shader` widget needs. `tokio` makes `update()` run
+# inside `runtime.enter()`, which is what lets a parallax `Executor::start`
+# find an ambient runtime, and what lets a pipeline stream live inside an
+# `iced::Subscription`.
+#
+# `tiny-skia` is deliberately *not* enabled. With it, a wgpu init failure
+# falls back to a renderer that no-ops custom primitives — a working UI with
+# a permanently black video pane. A player should fail loudly instead.
+iced = { version = "0.14", default-features = false, features = [
+    "wgpu",
+    "tokio",
+    "advanced",
+    "x11",
+    "wayland",
+] }
+parallax = { package = "parallax-pipeline", path = "..", default-features = false }
+bytemuck = { version = "1", features = ["derive"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+# Offscreen render tests drive wgpu directly; nothing async about it.
+pollster = "1"

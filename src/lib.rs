@@ -70,6 +70,7 @@ pub mod pipeline;
 pub mod plugin;
 pub mod temporal;
 pub mod typed;
+pub mod video;
 pub mod wire;
 
 /// Prelude for convenient imports
