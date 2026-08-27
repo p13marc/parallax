@@ -4456,6 +4456,7 @@ dependencies = [
  "bytemuck",
  "iced",
  "parallax-pipeline",
+ "pollster",
  "tokio",
  "tracing",
 ]

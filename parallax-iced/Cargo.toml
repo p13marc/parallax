@@ -35,3 +35,5 @@ tracing = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+# Offscreen render tests drive wgpu directly; nothing async about it.
+pollster = "1"

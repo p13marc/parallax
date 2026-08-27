@@ -10,9 +10,13 @@
 
 struct Params {
     mode: u32,
+    // 1 when the render target is sRGB and will encode for us, so the
+    // gamma-encoded R'G'B' below has to be linearised first or the transfer
+    // function is applied twice and the picture washes out. Iced picks an
+    // sRGB surface; a backend that configures its own may not.
+    srgb_target: u32,
     _pad0: u32,
     _pad1: u32,
-    _pad2: u32,
     // Where the picture sits inside the viewport, in 0..1 viewport space:
     // (x0, y0, width, height). Everything outside is painted black.
     //
@@ -47,6 +51,25 @@ fn vs_main(@builtin(vertex_index) index: u32) -> VsOut {
     return out;
 }
 
+// The sRGB electro-optical transfer function. MIRRORS
+// video::color::srgb_to_linear — change both together; the golden tests
+// there are the truth.
+fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
+    let lo = c / 12.92;
+    let hi = pow((c + 0.055) / 1.055, vec3<f32>(2.4));
+    return select(hi, lo, c <= vec3<f32>(0.04045));
+}
+
+// Hand the target what it expects: linear when it will encode sRGB itself,
+// the encoded values as-is otherwise.
+fn present(rgb: vec3<f32>) -> vec4<f32> {
+    let clamped = clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+    if params.srgb_target == 1u {
+        return vec4<f32>(srgb_to_linear(clamped), 1.0);
+    }
+    return vec4<f32>(clamped, 1.0);
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let fit = (in.uv - params.fit.xy) / params.fit.zw;
@@ -55,7 +78,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
 
     if params.mode == 4u {
-        return vec4<f32>(textureSample(tex_y, samp, fit).rgb, 1.0);
+        return present(textureSample(tex_y, samp, fit).rgb);
     }
 
     // Limited (studio) range expansion: Y 16..=235, chroma 16..=240.
@@ -83,5 +106,5 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         y - c.y * cbcr.x - c.z * cbcr.y,
         y + c.w * cbcr.x,
     );
-    return vec4<f32>(clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+    return present(rgb);
 }

@@ -71,9 +71,56 @@ pub fn yuv_to_rgb(y: u8, cb: u8, cr: u8, matrix: ColorMatrix) -> [u8; 3] {
     ]
 }
 
+/// The sRGB electro-optical transfer function: encoded value → linear light.
+///
+/// Needed when the render target is sRGB and will encode for us. Everything
+/// upstream of presentation — `yuv_to_rgb`, the decoders, the converters —
+/// works in gamma-encoded R'G'B', so handing those values straight to an sRGB
+/// surface applies the transfer function twice and washes the picture out.
+///
+/// This scalar path is the truth `PRESENT_WGSL`'s copy is pinned to.
+pub fn srgb_to_linear(encoded: f32) -> f32 {
+    if encoded <= 0.04045 {
+        encoded / 12.92
+    } else {
+        ((encoded + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// The inverse of [`srgb_to_linear`]: linear light → encoded value.
+pub fn linear_to_srgb(linear: f32) -> f32 {
+    if linear <= 0.003_130_8 {
+        linear * 12.92
+    } else {
+        1.055 * linear.powf(1.0 / 2.4) - 0.055
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_transfer_function_pins_its_rails_and_its_knee() {
+        // The two ends must be exact: a target that encodes what we
+        // linearised has to give black back as black and white as white, or
+        // every frame is subtly wrong.
+        assert_eq!(srgb_to_linear(0.0), 0.0);
+        assert!((srgb_to_linear(1.0) - 1.0).abs() < 1e-6);
+        assert_eq!(linear_to_srgb(0.0), 0.0);
+        assert!((linear_to_srgb(1.0) - 1.0).abs() < 1e-6);
+
+        // Mid-grey: the number that makes a double-encode obvious. 0.5
+        // encoded is 0.2140 linear; re-encoding *that* would give 0.5 again,
+        // and skipping the step leaves 0.5 where 0.2140 belongs.
+        assert!((srgb_to_linear(0.5) - 0.214_041).abs() < 1e-5);
+
+        // Both sides of the linear-segment knee, and a round trip.
+        for v in [0.0, 0.01, 0.04045, 0.04046, 0.2, 0.5, 0.9, 1.0] {
+            let round = linear_to_srgb(srgb_to_linear(v));
+            assert!((round - v).abs() < 1e-5, "{v} round-tripped to {round}");
+        }
+    }
 
     #[test]
     fn limited_range_black_and_white_hit_the_rails() {
