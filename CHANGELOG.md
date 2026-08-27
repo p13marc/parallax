@@ -62,6 +62,20 @@ Every out-of-tree plugin must be rebuilt: the plugin ABI went **12 → 13**.
   `parallax_iced::DEFAULT_MAX_LATENESS` rather than inventing a second pacing
   policy.
 
+- **The gestures a GUI is expected to have** (#274). Wheel to change the
+  volume, a pointer that disappears with the chrome (under the same rule, so
+  the film is alone on screen when it is playing), `o` for a file dialog
+  through the XDG portal, files dropped on the window, and a list of what was
+  played lately on the empty screen. `Esc` leaves fullscreen rather than
+  entering it; `f` is still the toggle.
+
+  The dialog is `ashpd`, not `rfd`: parallax already depends on ashpd 0.13 for
+  the screencast portal, and `rfd` would pull a second major of it into the
+  same binary — `just check-iced` now refuses that the way it refuses two
+  wgpus. Drag-and-drop is deliberately the garnish rather than the mechanism:
+  Iced's `window::Event::FileDropped` says "**Wayland:** Not implemented" in
+  its own documentation, and this player enables both backends.
+
 - **A playlist, and open-next** (#276). Several files on the command line, or
   dropped on the window, are a queue: it plays through them and stops, or
   repeats one or all. A file that will not open is marked and skipped rather

@@ -4532,10 +4532,12 @@ name = "parallax-player"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ashpd",
  "clap",
  "iced",
  "parallax-iced",
  "parallax-pipeline",
+ "percent-encoding",
  "tokio",
  "tracing",
  "tracing-subscriber",

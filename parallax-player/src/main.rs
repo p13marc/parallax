@@ -8,9 +8,11 @@
 //!        └─ audio ─▶ decode ─▶ downmix ─▶ gain ─▶ AlsaSink (the clock)
 //! ```
 
+mod dialog;
 mod engine;
 mod headless;
 mod playlist;
+mod recent;
 mod ui;
 
 use std::collections::VecDeque;
@@ -20,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use iced::keyboard::{self, Key, key::Named};
-use iced::widget::{center, container, stack, text};
+use iced::widget::{center, container, stack};
 use iced::{Element, Subscription, Task, Theme};
 
 use parallax::clock::ClockTime;
@@ -148,6 +150,22 @@ impl Stage {
     fn accepts_probe(&self, seq: u64) -> bool {
         matches!(self, Self::Probing(request) if request.seq == seq)
     }
+}
+
+/// How far one scroll gesture moves the volume, in dB.
+///
+/// A notch of a wheel is one step of the arrow keys, so the two agree. A
+/// touchpad reports pixels instead, and its own idea of how many make a
+/// notch, so those are scaled and clamped: an inertial flick should not swing
+/// the volume through its whole range.
+fn volume_step(delta: iced::mouse::ScrollDelta) -> f32 {
+    const PIXELS_PER_NOTCH: f32 = 50.0;
+    const STEP_DB: f32 = 2.0;
+    let notches = match delta {
+        iced::mouse::ScrollDelta::Lines { y, .. } => y,
+        iced::mouse::ScrollDelta::Pixels { y, .. } => y / PIXELS_PER_NOTCH,
+    };
+    (notches * STEP_DB).clamp(-STEP_DB * 3.0, STEP_DB * 3.0)
 }
 
 /// Whether to stop skipping past files that will not open.
@@ -391,6 +409,12 @@ enum Message {
     ToggleMute,
     /// Enter or leave fullscreen.
     ToggleFullscreen,
+    /// Leave fullscreen, or quit.
+    Escape,
+    /// Ask the desktop for files to play.
+    OpenDialog,
+    /// The desktop could not be asked, and why.
+    DialogFailed(String),
     /// Show or hide the diagnostics panel.
     ToggleStats,
     /// Write the running graph out as GraphViz.
@@ -444,6 +468,8 @@ struct Player {
     failures: usize,
     /// Whether the playlist panel is on screen.
     show_playlist: bool,
+    /// Files opened lately, newest first — the empty screen's only content.
+    recent: Vec<PathBuf>,
 
     position: ClockTime,
     paused: bool,
@@ -482,6 +508,7 @@ impl Player {
             playlist: Playlist::default(),
             failures: 0,
             show_playlist: false,
+            recent: recent::load(),
             position: ClockTime::ZERO,
             paused: false,
             speed: 1.0,
@@ -699,6 +726,26 @@ impl Player {
                 self.set_speed(rate);
                 Task::none()
             }
+            Message::OpenDialog => {
+                self.activity();
+                Task::perform(dialog::open_files(), |result| match result {
+                    Ok(paths) => Message::Enqueue(paths),
+                    // The portal is missing or the user cancelled; either way
+                    // there is nothing to open and something to say.
+                    Err(reason) => Message::DialogFailed(reason),
+                })
+            }
+            Message::DialogFailed(reason) => {
+                self.note(Level::Warning, reason);
+                Task::none()
+            }
+            Message::Escape => {
+                self.activity();
+                if self.fullscreen {
+                    return self.update(Message::ToggleFullscreen);
+                }
+                iced::exit()
+            }
             Message::ToggleStats => {
                 self.activity();
                 self.show_stats = !self.show_stats;
@@ -854,6 +901,8 @@ impl Player {
                 self.apply_volume_to(&engine);
                 self.engine = Some(engine);
                 self.stage = Stage::Playing;
+                recent::remember(&request.path);
+                self.recent = recent::load();
                 // The transport's state belongs to the *player*, not to the
                 // pipeline that happens to be running: a rate set before a
                 // track change was still shown afterwards while the new
@@ -1196,13 +1245,24 @@ impl Player {
                 .width(iced::Fill)
                 .height(iced::Fill)
                 .into(),
-            None => center(text("open a file to start").size(20)).into(),
+            None => center(ui::welcome(self)).into(),
         };
 
         let video = iced::widget::mouse_area(video)
             .on_move(|_| Message::Activity)
             .on_press(Message::TogglePause)
-            .on_double_click(Message::ToggleFullscreen);
+            .on_double_click(Message::ToggleFullscreen)
+            .on_scroll(|delta| Message::VolumeBy(volume_step(delta)))
+            // The pointer goes away with the chrome, under the same rule:
+            // both are things that are not the film. `MouseArea` only
+            // overrides an interaction the content reported as `None`, which
+            // is what `shader` reports, so the video surface is the only
+            // place this applies — a button still shows a pointer.
+            .interaction(if self.controls_visible() {
+                iced::mouse::Interaction::None
+            } else {
+                iced::mouse::Interaction::Hidden
+            });
 
         stack![
             container(video)
@@ -1255,13 +1315,17 @@ fn shortcut(key: &Key) -> Option<Message> {
         Key::Named(Named::ArrowRight) => Some(Message::SeekBy(10)),
         Key::Named(Named::ArrowUp) => Some(Message::VolumeBy(2.0)),
         Key::Named(Named::ArrowDown) => Some(Message::VolumeBy(-2.0)),
-        Key::Named(Named::Escape) => Some(Message::ToggleFullscreen),
+        // Escape *leaves* fullscreen rather than toggling into it, which is
+        // what every other application does with it; `f` is the toggle. What
+        // it does from a window is decided in `update`, where the state is.
+        Key::Named(Named::Escape) => Some(Message::Escape),
         Key::Character(c) => match c.as_str() {
             "q" => Some(Message::Quit),
             "f" => Some(Message::ToggleFullscreen),
             "m" => Some(Message::ToggleMute),
             "i" => Some(Message::ToggleStats),
             "d" => Some(Message::DumpGraph),
+            "o" => Some(Message::OpenDialog),
             "p" => Some(Message::TogglePlaylist),
             "n" => Some(Message::Next),
             "b" => Some(Message::Previous),
@@ -1455,6 +1519,40 @@ mod tests {
             index: 0,
             path: PathBuf::from("f.mp4"),
         }
+    }
+
+    /// A wheel notch is an arrow key, and a touchpad flick is not a lurch.
+    #[test]
+    fn the_wheel_moves_the_volume_the_way_the_arrow_keys_do() {
+        use iced::mouse::ScrollDelta;
+        assert_eq!(volume_step(ScrollDelta::Lines { x: 0.0, y: 1.0 }), 2.0);
+        assert_eq!(volume_step(ScrollDelta::Lines { x: 0.0, y: -1.0 }), -2.0);
+        // Horizontal scrolling is not a volume gesture.
+        assert_eq!(volume_step(ScrollDelta::Lines { x: 5.0, y: 0.0 }), 0.0);
+        // Pixels: 50 to a notch.
+        assert_eq!(volume_step(ScrollDelta::Pixels { x: 0.0, y: 50.0 }), 2.0);
+        assert_eq!(volume_step(ScrollDelta::Pixels { x: 0.0, y: 25.0 }), 1.0);
+        // An inertial flick is clamped rather than swinging the whole range.
+        assert_eq!(volume_step(ScrollDelta::Pixels { x: 0.0, y: 5000.0 }), 6.0);
+        assert_eq!(volume_step(ScrollDelta::Lines { x: 0.0, y: -40.0 }), -6.0);
+    }
+
+    /// Escape leaves fullscreen; it does not enter it (#274).
+    #[test]
+    fn escape_is_a_way_out_not_a_toggle() {
+        assert!(matches!(
+            shortcut(&Key::Named(Named::Escape)),
+            Some(Message::Escape)
+        ));
+        // `f` remains the toggle, in both directions.
+        assert!(matches!(
+            shortcut(&Key::Character("f".into())),
+            Some(Message::ToggleFullscreen)
+        ));
+        assert!(matches!(
+            shortcut(&Key::Character("o".into())),
+            Some(Message::OpenDialog)
+        ));
     }
 
     /// A warning is passing news; an error is the end of the run (#275).

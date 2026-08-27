@@ -206,6 +206,39 @@ fn speed(player: &Player) -> Element<'_, Message> {
     row.into()
 }
 
+/// What an empty window shows.
+///
+/// Not a slogan: the two things a player with nothing open can offer are a
+/// way in and the files it opened last time.
+pub fn welcome(player: &Player) -> Element<'_, Message> {
+    let mut body = column![
+        text("parallax").size(28),
+        button(text("Open… (o)").size(14))
+            .on_press(Message::OpenDialog)
+            .padding([6, 14]),
+    ]
+    .spacing(14)
+    .align_x(Alignment::Center);
+
+    if !player.recent.is_empty() {
+        let mut list = column![text("recently played").size(12)].spacing(4);
+        for path in &player.recent {
+            let label = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            list = list.push(
+                button(text(label).size(13))
+                    .on_press(Message::Enqueue(vec![path.clone()]))
+                    .padding([3, 8]),
+            );
+        }
+        body = body.push(list.align_x(Alignment::Center));
+    }
+
+    body.into()
+}
+
 /// What is queued. Toggled with `p`, or the button.
 ///
 /// Scrollable and capped in height: a playlist is allowed to be long, and the

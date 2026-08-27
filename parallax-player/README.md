@@ -10,7 +10,9 @@ cargo run -p parallax-player --release -- one.mp4 two.mkv three.webm
 
 Several files are a playlist: it plays through them and stops, or repeats one
 or all (`r`). A file that will not open is marked and skipped rather than
-stopping the list. Note that `--repeat` is a *different* thing — it loops
+stopping the list. Files can also be added with `o` — the XDG portal's dialog,
+so it works from a sandbox — or by dropping them on the window, which Iced
+does not implement on Wayland. Note that `--repeat` is a *different* thing — it loops
 inside the demuxer, gaplessly and without a rebuild, which means the pipeline
 never reaches end-of-stream and the playlist never advances.
 
@@ -42,6 +44,7 @@ software without comment when the driver has not got it.
 | `m` | mute |
 | `f`, double-click | fullscreen |
 | `Esc` | leave fullscreen, else quit |
+| `o` | open files |
 | `s` | playback speed |
 | `i` | diagnostics |
 | `p` | playlist |

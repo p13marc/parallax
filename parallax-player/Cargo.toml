@@ -42,6 +42,16 @@ iced = { version = "0.14", default-features = false, features = [
     # and hope it matched.
     "sysinfo",
 ] }
+# The file dialog, through the XDG portal. Not `rfd`: parallax already
+# depends on ashpd 0.13 for the screencast portal, and rfd would pull a second
+# major of it into the same binary — which `just check-iced` now refuses.
+ashpd = { version = "0.13", default-features = false, features = [
+    "tokio",
+    "file_chooser",
+] }
+# The portal answers in URIs, and a path with a space in it comes back
+# percent-encoded.
+percent-encoding = "2"
 clap = { version = "4", features = ["derive"] }
 # `signal` is declared rather than inherited: the root crate enables it and
 # cargo unifies tokio's features across the graph, so `--headless`'s Ctrl-C
