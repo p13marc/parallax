@@ -479,6 +479,7 @@ mod tests {
                 height: 2,
                 format: PixelFormat::Rgba,
                 layout: None,
+                color: None,
             },
             target: ClockTime::from_millis(target_ms),
             generation,

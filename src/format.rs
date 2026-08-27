@@ -380,6 +380,225 @@ impl VideoFormat {
     }
 }
 
+// ============================================================================
+// Colorimetry (#265)
+// ============================================================================
+
+/// Which matrix converts between Y'CbCr and R'G'B'.
+///
+/// Values are the H.273 / ISO 23091-4 `MatrixCoefficients` codes, which is the
+/// vocabulary MKV, MP4's `colr`, AV1, VP9 and H.264's VUI all speak — so the
+/// container's number, the wire code and this discriminant are one number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[repr(u8)]
+pub enum ColorMatrix {
+    /// Nothing was signalled. Consumers fall back to a guess; see
+    /// [`crate::video::color::matrix_for_height`].
+    #[default]
+    Unspecified = 2,
+    /// ITU-R BT.709 (HD).
+    Bt709 = 1,
+    /// ITU-R BT.601 / SMPTE 170M (SD).
+    Bt601 = 6,
+    /// ITU-R BT.2020, non-constant luminance (UHD).
+    Bt2020Ncl = 9,
+}
+
+impl ColorMatrix {
+    /// Read an H.273 `MatrixCoefficients` code, leniently.
+    ///
+    /// A code with no variant here answers `Unspecified` rather than failing:
+    /// "the file said something I do not model" and "the file said nothing"
+    /// lead a consumer to the same fallback, and refusing would throw away the
+    /// axes alongside it that *were* understood.
+    ///
+    /// Codes 4, 5 and 6 all collapse to [`Bt601`](Self::Bt601): FCC 73.682,
+    /// BT.470BG and SMPTE 170M name the same luma weights to three decimals,
+    /// and this enum is the coefficients, not the citation.
+    pub const fn from_h273(code: u8) -> Self {
+        match code {
+            1 => Self::Bt709,
+            4..=6 => Self::Bt601,
+            9 => Self::Bt2020Ncl,
+            _ => Self::Unspecified,
+        }
+    }
+}
+
+/// Whether Y'CbCr occupies the full 0..255 range or the studio subset.
+///
+/// Getting this wrong is not subtle at the rails: limited-range black (Y=16)
+/// rendered as full range comes out dark grey rather than black, and the whole
+/// picture loses contrast.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[repr(u8)]
+pub enum ColorRange {
+    /// Nothing was signalled; limited is the safe assumption for video.
+    #[default]
+    Unspecified = 0,
+    /// Studio range: Y 16..=235, chroma 16..=240.
+    Limited = 1,
+    /// Full range: 0..=255 throughout.
+    Full = 2,
+}
+
+impl ColorRange {
+    /// Read the range as the containers code it: 1 = limited (broadcast),
+    /// 2 = full, anything else unsignalled.
+    pub const fn from_code(code: u8) -> Self {
+        match code {
+            1 => Self::Limited,
+            2 => Self::Full,
+            _ => Self::Unspecified,
+        }
+    }
+
+    /// Whether to apply studio-range expansion. Unsignalled reads as limited,
+    /// because that is what essentially every decoder in this tree emits.
+    pub const fn is_limited(self) -> bool {
+        !matches!(self, ColorRange::Full)
+    }
+}
+
+/// The colour primaries, as H.273 codes. Carried, not yet acted on — a
+/// consumer that wants to render wide gamut correctly needs it, and dropping
+/// it at the demuxer would make that impossible later.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[repr(u8)]
+pub enum ColorPrimaries {
+    /// Nothing was signalled.
+    #[default]
+    Unspecified = 2,
+    /// ITU-R BT.709.
+    Bt709 = 1,
+    /// ITU-R BT.470BG / EBU 3213.
+    Bt470bg = 5,
+    /// SMPTE 170M.
+    Smpte170m = 6,
+    /// ITU-R BT.2020.
+    Bt2020 = 9,
+}
+
+impl ColorPrimaries {
+    /// Read an H.273 `ColourPrimaries` code, leniently — see
+    /// [`ColorMatrix::from_h273`].
+    pub const fn from_h273(code: u8) -> Self {
+        match code {
+            1 => Self::Bt709,
+            5 => Self::Bt470bg,
+            6 => Self::Smpte170m,
+            9 => Self::Bt2020,
+            _ => Self::Unspecified,
+        }
+    }
+}
+
+/// The transfer function, as H.273 codes. Carried, not yet acted on — the same
+/// argument as [`ColorPrimaries`], and the door to HDR when someone opens it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[repr(u8)]
+pub enum TransferFunction {
+    /// Nothing was signalled.
+    #[default]
+    Unspecified = 2,
+    /// ITU-R BT.709.
+    Bt709 = 1,
+    /// sRGB / IEC 61966-2-1.
+    Srgb = 13,
+    /// ITU-R BT.2020, 10-bit.
+    Bt2020_10 = 14,
+    /// SMPTE ST 2084 (PQ).
+    Pq = 16,
+    /// ARIB STD-B67 (HLG).
+    Hlg = 18,
+}
+
+impl TransferFunction {
+    /// Read an H.273 `TransferCharacteristics` code, leniently — see
+    /// [`ColorMatrix::from_h273`].
+    pub const fn from_h273(code: u8) -> Self {
+        match code {
+            1 => Self::Bt709,
+            13 => Self::Srgb,
+            14 => Self::Bt2020_10,
+            16 => Self::Pq,
+            18 => Self::Hlg,
+            _ => Self::Unspecified,
+        }
+    }
+}
+
+/// What a video stream says about its own colour (#265).
+///
+/// Travels on [`Metadata`](crate::metadata::Metadata), **not** inside
+/// [`VideoFormat`] — the same call [`PlaneLayout`] and
+/// [`CodedVideoFormat`] made, for the same reason. `MediaFormat::compatible`
+/// compares `VideoRaw` by whole-struct equality, so a field here would become a
+/// negotiation axis and a sink declaring "any raw video" would start refusing
+/// BT.709; and `Metadata::set_video_dims` rebuilds `VideoFormat` from scratch,
+/// so a field there would evaporate at every one of its call sites.
+///
+/// Every axis defaults to `Unspecified`, which means "nothing said" and *not*
+/// "assume the default" — a consumer chooses its own fallback, and a file that
+/// actually declared something must outrank that guess.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub struct ColorInfo {
+    /// Y'CbCr ↔ R'G'B' matrix.
+    pub matrix: ColorMatrix,
+    /// Full or studio range.
+    pub range: ColorRange,
+    /// Colour primaries.
+    pub primaries: ColorPrimaries,
+    /// Transfer function.
+    pub transfer: TransferFunction,
+}
+
+impl ColorInfo {
+    /// Whether anything at all was signalled.
+    pub const fn is_unspecified(self) -> bool {
+        matches!(self.matrix, ColorMatrix::Unspecified)
+            && matches!(self.range, ColorRange::Unspecified)
+            && matches!(self.primaries, ColorPrimaries::Unspecified)
+            && matches!(self.transfer, TransferFunction::Unspecified)
+    }
+
+    /// Fill each unsignalled axis from `fallback`, axis by axis.
+    ///
+    /// How a decoder reconciles what the bitstream said with what the
+    /// container said (#265): the bitstream is the closer source and wins
+    /// where it spoke, but an axis it left unspecified must not erase the
+    /// container's answer. Whole-struct precedence would do exactly that —
+    /// AV1 sequence headers routinely signal a matrix and nothing else.
+    pub const fn or(self, fallback: ColorInfo) -> ColorInfo {
+        ColorInfo {
+            matrix: match self.matrix {
+                ColorMatrix::Unspecified => fallback.matrix,
+                v => v,
+            },
+            range: match self.range {
+                ColorRange::Unspecified => fallback.range,
+                v => v,
+            },
+            primaries: match self.primaries {
+                ColorPrimaries::Unspecified => fallback.primaries,
+                v => v,
+            },
+            transfer: match self.transfer {
+                TransferFunction::Unspecified => fallback.transfer,
+                v => v,
+            },
+        }
+    }
+
+    /// The matrix, or `fallback` when the stream said nothing.
+    pub const fn matrix_or(self, fallback: ColorMatrix) -> ColorMatrix {
+        match self.matrix {
+            ColorMatrix::Unspecified => fallback,
+            signalled => signalled,
+        }
+    }
+}
+
 /// Maximum number of planes a [`PlaneLayout`] can describe.
 pub const MAX_PLANES: usize = 4;
 

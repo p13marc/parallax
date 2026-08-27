@@ -3,7 +3,7 @@
 //! Converts between pixel formats (e.g., YUYV -> RGBA for display).
 
 use crate::buffer::{Buffer, MemoryHandle};
-use crate::converters::{PixelFormat, VideoConvert};
+use crate::converters::{ColorInfo, PixelFormat, VideoConvert};
 use crate::element::Element;
 use crate::error::{Error, Result};
 use crate::format::{Caps, PlaneLayout};
@@ -44,7 +44,7 @@ pub struct VideoConvertElement {
     /// The (input format, output format, width, height) the cached converter
     /// was built for. A converter is only valid for one of these — caching it
     /// unconditionally is what made mid-stream format changes impossible.
-    converter_key: Option<(PixelFormat, PixelFormat, u32, u32)>,
+    converter_key: Option<(PixelFormat, PixelFormat, u32, u32, ColorInfo)>,
     /// Element name
     name: String,
     /// Staging for a strided frame the engine cannot address by whole
@@ -180,13 +180,18 @@ impl VideoConvertElement {
         input_format: PixelFormat,
         width: u32,
         height: u32,
+        color: ColorInfo,
     ) -> Result<()> {
-        let key = (input_format, self.output_format, width, height);
+        // Colour is part of the key (#265): a stream that changes matrix or
+        // range mid-flight — a spliced source, a new segment — must not keep
+        // being converted with the previous one's numbers.
+        let key = (input_format, self.output_format, width, height, color);
         if self.converter_key == Some(key) {
             return Ok(());
         }
 
-        let converter = VideoConvert::new(input_format, self.output_format, width, height)?;
+        let converter = VideoConvert::new(input_format, self.output_format, width, height)?
+            .with_color_info(color);
 
         tracing::info!(
             "VideoConvert: {:?} {}x{} -> {:?} {}x{}{}",
@@ -247,6 +252,10 @@ impl Element for VideoConvertElement {
         let (input_format, width, height) =
             self.resolve_input(buffer.metadata(), input_data.len())?;
         let caps_format: crate::format::PixelFormat = input_format.into();
+        // What the stream said about its colour, or nothing — in which case
+        // the converter falls back to the same height heuristic the
+        // presentation path uses, so the two agree (#265).
+        let color = buffer.metadata().color_info().unwrap_or_default();
 
         // Plane geometry comes from the buffer and only from the buffer
         // (#194): `plane_layout()` answers the packed layout for an ordinary
@@ -293,7 +302,7 @@ impl Element for VideoConvertElement {
             )));
         }
 
-        self.ensure_converter(input_format, width, height)?;
+        self.ensure_converter(input_format, width, height, color)?;
 
         // Convert straight into the arena slot — every converter arm writes
         // into the caller's `&mut [u8]`, so a scratch staging buffer would
@@ -544,7 +553,13 @@ mod tests {
         );
         assert_eq!(
             element.converter_key,
-            Some((PixelFormat::Rgba, PixelFormat::I420, 640, 480))
+            Some((
+                PixelFormat::Rgba,
+                PixelFormat::I420,
+                640,
+                480,
+                ColorInfo::default()
+            ))
         );
     }
 
@@ -559,7 +574,16 @@ mod tests {
         element.process(frame(Caps::Rgb24, 640, 480)).unwrap();
 
         assert_eq!(element.converter_key, key, "converter must be reused");
-        assert_eq!(key, Some((PixelFormat::Rgb24, PixelFormat::I420, 640, 480)));
+        assert_eq!(
+            key,
+            Some((
+                PixelFormat::Rgb24,
+                PixelFormat::I420,
+                640,
+                480,
+                ColorInfo::default()
+            ))
+        );
     }
 
     #[test]

@@ -1,15 +1,17 @@
 // Parallax video presentation shader (#190).
 //
-// One pipeline for every input layout; `params.mode` selects:
-//   0 = I420 · BT.709     1 = I420 · BT.601
-//   2 = NV12 · BT.709     3 = NV12 · BT.601
-//   4 = RGB passthrough (tex_y holds the RGBA/BGRA texture)
+// One pipeline for every input layout. `params.planes` says how the planes
+// are arranged and nothing else:
+//   0 = planar YUV (I420)   1 = semi-planar YUV (NV12)   2 = packed RGB
 //
-// The YUV matrix constants MIRROR src/video/color.rs —
-// change both together; the golden tests there are the truth.
+// Colour is *data*, not a branch: the matrix coefficients and the range
+// expansion arrive in the uniform block, computed by src/video/color.rs.
+// Before #265 they were `if`s over a mode enum here, which meant the shader
+// and the CPU converters each carried their own copy of the numbers — and
+// disagreed. Now there is one copy, and this file has none.
 
 struct Params {
-    mode: u32,
+    planes: u32,
     // 1 when the render target is sRGB and will encode for us, so the
     // gamma-encoded R'G'B' below has to be linearised first or the transfer
     // function is applied twice and the picture washes out. Iced picks an
@@ -25,6 +27,11 @@ struct Params {
     // cannot: its render pass loads rather than clears, so a narrowed
     // viewport would leave whatever was underneath showing in the bars.
     fit: vec4<f32>,
+    // [cr_r, cb_g, cr_g, cb_b] — video::color::coefficients.
+    coeffs: vec4<f32>,
+    // [luma offset, luma scale, chroma scale, unused] — video::color::expansion,
+    // with the offset already normalised to 0..1.
+    expansion: vec4<f32>,
 }
 
 @group(0) @binding(0) var samp: sampler;
@@ -77,14 +84,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0, 0.0, 0.0, 1.0);
     }
 
-    if params.mode == 4u {
+    if params.planes == 2u {
         return present(textureSample(tex_y, samp, fit).rgb);
     }
 
-    // Limited (studio) range expansion: Y 16..=235, chroma 16..=240.
-    let y = (textureSample(tex_y, samp, fit).r - 16.0 / 255.0) * (255.0 / 219.0);
     var cbcr: vec2<f32>;
-    if params.mode >= 2u {
+    if params.planes == 1u {
         cbcr = textureSample(tex_u, samp, fit).rg;
     } else {
         cbcr = vec2<f32>(
@@ -92,15 +97,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             textureSample(tex_v, samp, fit).r,
         );
     }
-    cbcr = (cbcr - 128.0 / 255.0) * (255.0 / 224.0);
 
-    // [cr_r, cb_g, cr_g, cb_b] — see video::color::coefficients.
-    var c: vec4<f32>;
-    if params.mode == 0u || params.mode == 2u {
-        c = vec4<f32>(1.5748, 0.187324, 0.468124, 1.8556); // BT.709
-    } else {
-        c = vec4<f32>(1.402, 0.344136, 0.714136, 1.772); // BT.601
-    }
+    // Range expansion: limited (studio) range stores Y in 16..=235 and
+    // chroma in 16..=240, full range stores both whole. The uniform says
+    // which, so this is the same arithmetic either way.
+    let y = (textureSample(tex_y, samp, fit).r - params.expansion.x) * params.expansion.y;
+    cbcr = (cbcr - 128.0 / 255.0) * params.expansion.z;
+
+    let c = params.coeffs;
     let rgb = vec3<f32>(
         y + c.x * cbcr.y,
         y - c.y * cbcr.x - c.z * cbcr.y,

@@ -112,8 +112,8 @@ struct PlaneTextures {
     u: wgpu::Texture,
     v: wgpu::Texture,
     bind_group: wgpu::BindGroup,
-    /// Shader mode (see present.wgsl) for this format + geometry.
-    mode: u32,
+    /// Plane arrangement (see present.wgsl) for this format.
+    layout: u32,
 }
 
 pub(crate) struct WgpuBackend {
@@ -168,7 +168,8 @@ struct ImportedFrame {
     /// Kept alive for as long as the bind group refers to them.
     _planes: Vec<wgpu::Texture>,
     bind_group: wgpu::BindGroup,
-    mode: u32,
+    /// Plane arrangement (see present.wgsl) for this format.
+    layout: u32,
     /// Bumped on use; the least recently used entry is evicted first.
     used: u64,
 }
@@ -359,11 +360,6 @@ impl WgpuBackend {
         })
     }
 
-    /// The shader mode for a frame's format and height.
-    fn shader_mode(format: PixelFormat, height: u32) -> Result<u32> {
-        crate::video::shader_mode_for(format, height)
-    }
-
     /// Import this frame's dma-buf as textures, or reuse an earlier import
     /// of the same allocation.
     ///
@@ -394,11 +390,11 @@ impl WgpuBackend {
             .find(|e| e.key == key && e.geometry == geometry)
         {
             entry.used = self.clock;
-            let mode = entry.mode;
+            let layout = entry.layout;
             self.queue.write_buffer(
                 &self.params,
                 0,
-                &crate::video::shader_params(mode, false, WHOLE_FRAME),
+                &crate::video::shader_params(layout, false, WHOLE_FRAME, frame.resolved_color()),
             );
             return Ok(true);
         }
@@ -456,7 +452,7 @@ impl WgpuBackend {
             textures.push(dummy("import-dummy"));
         }
 
-        let mode = Self::shader_mode(frame.format, frame.height)?;
+        let layout_kind = crate::video::shader_layout(frame.format)?;
         let view = |t: &wgpu::Texture| t.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("autovideosink-imported-bind"),
@@ -487,7 +483,7 @@ impl WgpuBackend {
         self.queue.write_buffer(
             &self.params,
             0,
-            &crate::video::shader_params(mode, false, WHOLE_FRAME),
+            &crate::video::shader_params(layout_kind, false, WHOLE_FRAME, frame.resolved_color()),
         );
 
         if self.imported.len() >= IMPORT_CACHE
@@ -514,7 +510,7 @@ impl WgpuBackend {
             _segment: std::sync::Arc::clone(slot.shared_segment()),
             _planes: textures,
             bind_group,
-            mode,
+            layout: layout_kind,
             used: self.clock,
         });
         // The upload path's textures are now stale for this frame; drop them
@@ -557,9 +553,9 @@ impl WgpuBackend {
             })
         };
 
-        // Formats and mode come from `crate::video`, so this backend and a
+        // Formats and plane arrangement come from `crate::video`, so this backend and a
         // host renderer on another wgpu major cannot drift apart.
-        let mode = Self::shader_mode(frame.format, h)?;
+        let layout_kind = crate::video::shader_layout(frame.format)?;
         let planes = crate::video::layout::plane_formats(frame.format)?;
         // The shader always binds three textures; unused ones are 1x1 padding.
         let dummy = || make("dummy", 1, 1, wgpu::TextureFormat::R8Unorm);
@@ -587,7 +583,7 @@ impl WgpuBackend {
         self.queue.write_buffer(
             &self.params,
             0,
-            &crate::video::shader_params(mode, false, WHOLE_FRAME),
+            &crate::video::shader_params(layout_kind, false, WHOLE_FRAME, frame.resolved_color()),
         );
 
         let view = |t: &wgpu::Texture| t.create_view(&wgpu::TextureViewDescriptor::default());
@@ -624,7 +620,7 @@ impl WgpuBackend {
             u,
             v,
             bind_group,
-            mode,
+            layout: layout_kind,
         });
         Ok(())
     }
@@ -670,8 +666,9 @@ impl WgpuBackend {
                 },
             );
         }
-        // The mode rides the texture set; nothing else changes per frame.
-        let _ = textures.mode;
+        // The plane arrangement rides the texture set; colour is written per
+        // frame, because a stream can change matrix or range mid-flight.
+        let _ = textures.layout;
         Ok(())
     }
 }

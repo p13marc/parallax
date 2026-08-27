@@ -371,12 +371,14 @@ impl shader::Primitive for VideoPrimitive {
             Size::new(bw, bh),
         );
 
-        let mode = video::shader_mode_for(frame.format, frame.height).unwrap_or(4);
+        // `LAYOUT_RGB` is the harmless fallback: an unsupported format never
+        // reaches here — `prepare` would have failed to build textures for it.
+        let layout = video::shader_layout(frame.format).unwrap_or(video::LAYOUT_RGB);
         if let Some(set) = pipeline.videos.get(&self.id) {
             queue.write_buffer(
                 &set.params,
                 0,
-                &video::shader_params(mode, self.srgb_target, fit),
+                &video::shader_params(layout, self.srgb_target, fit, frame.resolved_color()),
             );
         }
     }

@@ -25,6 +25,9 @@ pub struct FrameView {
     /// Non-packed plane layout when the producer declared one (#194):
     /// External frames carry the decoder's real strides. `None` = packed.
     pub layout: Option<PlaneLayout>,
+    /// What the stream said about its colour (#265). `None` = nothing said,
+    /// and a presenter falls back to its own guess.
+    pub color: Option<crate::format::ColorInfo>,
 }
 
 impl FrameView {
@@ -97,6 +100,7 @@ impl FrameView {
             height,
             format,
             layout,
+            color: meta.color_info(),
         })
     }
 }
@@ -117,6 +121,8 @@ pub struct VideoFrame {
     pub format: PixelFormat,
     /// Real strides when the producer declared them; `None` = packed.
     pub layout: Option<PlaneLayout>,
+    /// What the stream said about its colour (#265).
+    pub color: Option<crate::format::ColorInfo>,
 }
 
 impl VideoFrame {
@@ -134,6 +140,7 @@ impl VideoFrame {
             height: view.height,
             format: view.format,
             layout: view.layout,
+            color: view.color,
         }
     }
 
@@ -144,7 +151,16 @@ impl VideoFrame {
             height: self.height,
             format: self.format,
             layout: self.layout,
+            color: self.color,
         }
+    }
+
+    /// The colour to render with: what the stream said, or the height
+    /// heuristic when it said nothing.
+    pub fn resolved_color(&self) -> crate::format::ColorInfo {
+        let mut color = self.color.unwrap_or_default();
+        color.matrix = color.matrix_or(super::color::matrix_for_height(self.height));
+        color
     }
 }
 

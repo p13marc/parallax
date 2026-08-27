@@ -29,8 +29,9 @@
 
 use parallax::clock::ClockTime;
 use parallax::format::{
-    AudioCodec, AudioFormat, Framerate, MediaFormat, PixelFormat, PlaneDesc, PlaneLayout,
-    RtpEncoding, RtpFormat, SampleFormat, VideoCodec, VideoFormat,
+    AudioCodec, AudioFormat, ColorInfo, ColorMatrix, ColorPrimaries, ColorRange, Framerate,
+    MediaFormat, PixelFormat, PlaneDesc, PlaneLayout, RtpEncoding, RtpFormat, SampleFormat,
+    TransferFunction, VideoCodec, VideoFormat,
 };
 use parallax::memory::SharedIpcSlotRef;
 use parallax::metadata::{BufferFlags, Metadata, RtpMeta};
@@ -64,6 +65,7 @@ fn strip_projection_losses(meta: &Metadata) -> Metadata {
     clean.coded = stripped.coded;
     clean.rtp = stripped.rtp;
     clean.planes = stripped.planes;
+    clean.color = stripped.color;
     clean
 }
 
@@ -101,6 +103,7 @@ fn assert_projections_agree(original: &Metadata, what: &str) {
         assert_eq!(got.coded, expected.coded, "{what}/{label}: coded");
         assert_eq!(got.rtp, expected.rtp, "{what}/{label}: rtp");
         assert_eq!(got.planes, expected.planes, "{what}/{label}: planes");
+        assert_eq!(got.color, expected.color, "{what}/{label}: color");
     }
 }
 
@@ -141,6 +144,50 @@ fn every_format() -> Vec<(&'static str, Metadata)> {
             framerate: Framerate::new(30000, 1001),
         }));
         out.push(("video raw", m));
+    }
+
+    // Colour, signalled and not (#265). The unsignalled case is the one that
+    // matters most: `None` must stay `None` across both encodings rather than
+    // collapsing into a default, because "nothing said" and "BT.601" are
+    // different answers and a consumer picks its own fallback for the first.
+    for color in [
+        None,
+        Some(ColorInfo::default()),
+        Some(ColorInfo {
+            matrix: ColorMatrix::Bt709,
+            range: ColorRange::Limited,
+            primaries: ColorPrimaries::Bt709,
+            transfer: TransferFunction::Bt709,
+        }),
+        Some(ColorInfo {
+            matrix: ColorMatrix::Bt601,
+            range: ColorRange::Full,
+            primaries: ColorPrimaries::Bt470bg,
+            transfer: TransferFunction::Srgb,
+        }),
+        Some(ColorInfo {
+            matrix: ColorMatrix::Bt2020Ncl,
+            range: ColorRange::Limited,
+            primaries: ColorPrimaries::Bt2020,
+            transfer: TransferFunction::Pq,
+        }),
+    ] {
+        let mut m = base();
+        m.format = Some(MediaFormat::VideoRaw(VideoFormat {
+            width: 1280,
+            height: 720,
+            pixel_format: PixelFormat::I420,
+            framerate: Framerate::new(25, 1),
+        }));
+        m.color = color;
+        out.push(("video raw + colour", m));
+
+        // And on an *encoded* buffer, which is where a demuxer stamps it —
+        // the decoder is what carries it onto the raw frame.
+        let mut m = base();
+        m.set_coded_video_dims(VideoCodec::H264, 1280, 720);
+        m.color = color;
+        out.push(("coded + colour", m));
     }
 
     for codec in [

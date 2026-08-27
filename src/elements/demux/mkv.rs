@@ -179,6 +179,59 @@ pub struct MkvVideoInfo {
     pub height: u32,
     /// Frame rate derived from the track's default frame duration, if stated.
     pub frame_rate: Option<f64>,
+    /// What the track's `Colour` element said (#265), if it carried one.
+    pub color: Option<crate::format::ColorInfo>,
+}
+
+/// Read a track's `Colour` element into a [`ColorInfo`](crate::format::ColorInfo).
+///
+/// MKV codes every axis with the H.273 numbers, so this is a translation of
+/// `matroska-demuxer`'s enums back to the numbers the rest of the tree uses —
+/// not a second opinion about what they mean.
+///
+/// `None` when the element is absent *or* says nothing, so an empty `Colour`
+/// (which is legal, and common) does not out-rank the height heuristic.
+///
+/// Deliberately not read: `max_cll`/`max_fall`. `matroska-demuxer` 0.8.1 reads
+/// them from the wrong element id.
+fn colour_of(video: &matroska_demuxer::Video) -> Option<crate::format::ColorInfo> {
+    use crate::format::{ColorInfo, ColorMatrix, ColorPrimaries, ColorRange, TransferFunction};
+    use matroska_demuxer::TransferCharacteristics as T;
+    use matroska_demuxer::{MatrixCoefficients as M, Primaries as P, Range as R};
+
+    let colour = video.colour()?;
+    let info = ColorInfo {
+        matrix: match colour.matrix_coefficients() {
+            Some(M::Bt709) => ColorMatrix::Bt709,
+            Some(M::Fcc73682 | M::Bt470bg | M::Smpte170) => ColorMatrix::Bt601,
+            Some(M::Bt2020Ncl) => ColorMatrix::Bt2020Ncl,
+            _ => ColorMatrix::Unspecified,
+        },
+        range: match colour.range() {
+            // `Defined` means "read it off the matrix/transfer", which is not
+            // a claim this type can hold — leave it unsignalled and let the
+            // consumer's own fallback decide.
+            Some(R::Broadcast) => ColorRange::Limited,
+            Some(R::Full) => ColorRange::Full,
+            _ => ColorRange::Unspecified,
+        },
+        primaries: match colour.primaries() {
+            Some(P::Bt709) => ColorPrimaries::Bt709,
+            Some(P::Bt601) => ColorPrimaries::Bt470bg,
+            Some(P::Smpte170) => ColorPrimaries::Smpte170m,
+            Some(P::Bt2020) => ColorPrimaries::Bt2020,
+            _ => ColorPrimaries::Unspecified,
+        },
+        transfer: match colour.transfer_characteristics() {
+            Some(T::Bt709) => TransferFunction::Bt709,
+            Some(T::Iec61966_2_1) => TransferFunction::Srgb,
+            Some(T::Bt220_10) => TransferFunction::Bt2020_10,
+            Some(T::Bt2100) => TransferFunction::Pq,
+            Some(T::Hlg) => TransferFunction::Hlg,
+            _ => TransferFunction::Unspecified,
+        },
+    };
+    (!info.is_unspecified()).then_some(info)
 }
 
 impl MkvCodec {
@@ -400,6 +453,7 @@ impl<R: Read + Seek> MkvDemux<R> {
                 frame_rate: entry
                     .default_duration()
                     .map(|d| 1_000_000_000.0 / d.get() as f64),
+                color: colour_of(v),
             });
             let audio_info = entry.audio().map(|a| MkvAudioInfo {
                 sample_rate: a
@@ -721,6 +775,12 @@ impl<R: Read + Seek> MkvDemux<R> {
                         metadata.set_coded_video_dims(codec, v.width, v.height)
                     }
                     _ => metadata.format = Some(crate::format::MediaFormat::Video(codec)),
+                }
+                // What the track's `Colour` element said (#265). It rides the
+                // *encoded* buffer, so each decoder carries it across onto the
+                // frame it produces — the demuxer never emits raw video.
+                if let Some(color) = track_info.video_info.as_ref().and_then(|v| v.color) {
+                    metadata.set_color_info(color);
                 }
             } else if let Some(codec) = track_info.codec.audio_codec() {
                 metadata.format = Some(crate::format::MediaFormat::Audio(codec));

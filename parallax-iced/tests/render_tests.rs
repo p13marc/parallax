@@ -15,7 +15,7 @@ use iced::widget::shader::{Pipeline, Primitive, Viewport};
 use iced::{Rectangle, Size};
 
 use parallax::buffer::{Buffer, MemoryHandle};
-use parallax::format::PixelFormat;
+use parallax::format::{ColorInfo, ColorMatrix, ColorRange, PixelFormat};
 use parallax::memory::SharedArena;
 use parallax::metadata::Metadata;
 use parallax::video::{VideoFrame, color};
@@ -55,8 +55,20 @@ fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
     }
 }
 
-/// A packed I420 frame of one flat colour.
+/// A packed I420 frame of one flat colour, with nothing signalled about it.
 fn i420(width: u32, height: u32, y: u8, cb: u8, cr: u8) -> VideoFrame {
+    i420_signalling(width, height, y, cb, cr, None)
+}
+
+/// [`i420`], but the frame declares its own colorimetry (#265).
+fn i420_signalling(
+    width: u32,
+    height: u32,
+    y: u8,
+    cb: u8,
+    cr: u8,
+    color: Option<ColorInfo>,
+) -> VideoFrame {
     let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
     let luma = (width * height) as usize;
     let chroma = (cw * ch) as usize;
@@ -72,6 +84,9 @@ fn i420(width: u32, height: u32, y: u8, cb: u8, cr: u8) -> VideoFrame {
     }
     let mut meta = Metadata::default();
     meta.set_video_dims(width, height, PixelFormat::I420);
+    if let Some(color) = color {
+        meta.set_color_info(color);
+    }
     VideoFrame::from_buffer(&Buffer::new(MemoryHandle::with_len(slot, len), meta))
         .expect("a well-formed I420 frame")
 }
@@ -337,4 +352,94 @@ fn two_videos_keep_their_own_textures() {
 #[allow(dead_code)]
 fn _mailbox_is_shareable(m: Arc<parallax::video::FrameMailbox>) -> u64 {
     m.id()
+}
+
+/// The bug #265 is named after: the shader, the CPU converters and the
+/// reference must all turn one frame into the same picture.
+///
+/// This is the half that needs a GPU. `video::color` is the arbiter — the
+/// same one `converters::colorspace`'s cross-arm test uses — so the three
+/// implementations are pinned to one set of numbers rather than to each
+/// other, and a shader that quietly assumed BT.601 for everything (which is
+/// what the CPU arms did) fails here rather than in someone's eyes.
+#[test]
+fn the_shader_renders_the_colour_the_stream_declared() {
+    let Some((device, queue)) = device() else {
+        return;
+    };
+    const SIZE: u32 = 16;
+
+    // Y'CbCr samples spread across the cube, not just the greys: a wrong
+    // matrix is invisible on the achromatic axis, where cb = cr = 128.
+    let samples = [
+        (16u8, 128u8, 128u8),
+        (235, 128, 128),
+        (81, 90, 240),
+        (145, 54, 34),
+        (128, 200, 60),
+    ];
+    let mut id = 100;
+
+    for matrix in [
+        ColorMatrix::Bt709,
+        ColorMatrix::Bt601,
+        ColorMatrix::Bt2020Ncl,
+    ] {
+        for range in [ColorRange::Limited, ColorRange::Full] {
+            let info = ColorInfo {
+                matrix,
+                range,
+                ..ColorInfo::default()
+            };
+            for (y, cb, cr) in samples {
+                id += 1;
+                let primitive = VideoPrimitive {
+                    id,
+                    frame: Some(i420_signalling(SIZE, SIZE, y, cb, cr, Some(info))),
+                    // Not sRGB: comparing against the reference means comparing
+                    // gamma-encoded values, which is what `yuv_to_rgb` returns.
+                    srgb_target: false,
+                };
+                let got = at(&render(&device, &queue, &primitive, SIZE), SIZE, 8, 8);
+                let want = color::yuv_to_rgb(y, cb, cr, matrix, range);
+                for (i, channel) in ["r", "g", "b"].iter().enumerate() {
+                    assert!(
+                        (got[i] as i32 - want[i] as i32).abs() <= 2,
+                        "{matrix:?}/{range:?} {y},{cb},{cr}: shader {got:?} vs \
+                         video::color {want:?} (channel {channel})"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// An unsignalled frame still gets the height heuristic, not a hardcoded
+/// matrix — the fallback survived #265 rather than being replaced by it.
+#[test]
+fn an_unsignalled_frame_falls_back_to_the_height_heuristic() {
+    let Some((device, queue)) = device() else {
+        return;
+    };
+
+    // 720 lines and up is BT.709; below is BT.601. One sample, rendered at
+    // both heights, must come out as the two different matrices say.
+    for (height, matrix) in [(64u32, ColorMatrix::Bt601), (768, ColorMatrix::Bt709)] {
+        let primitive = VideoPrimitive {
+            id: 200 + u64::from(height),
+            frame: Some(i420(64, height, 81, 90, 240)),
+            srgb_target: false,
+        };
+        // Sample the middle of the picture: a 64-wide frame in a square
+        // viewport is letterboxed, and the bars are black.
+        let px = render(&device, &queue, &primitive, 64);
+        let got = at(&px, 64, 32, 32);
+        let want = color::yuv_to_rgb(81, 90, 240, matrix, ColorRange::Limited);
+        for i in 0..3 {
+            assert!(
+                (got[i] as i32 - want[i] as i32).abs() <= 2,
+                "{height} lines: shader {got:?} vs {matrix:?} {want:?}"
+            );
+        }
+    }
 }

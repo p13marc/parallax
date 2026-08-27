@@ -907,6 +907,10 @@ impl AsyncSink for AutoVideoSink {
             height,
             format,
             layout: strided,
+            // What the stream said, if it said anything (#265). The
+            // presenter falls back to the height heuristic; a file that
+            // signalled its matrix outranks that guess.
+            color: ctx.buffer().metadata().color_info(),
         };
 
         // A full channel means the display cannot keep up. Shed this frame and

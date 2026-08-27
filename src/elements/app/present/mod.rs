@@ -45,11 +45,23 @@ pub(crate) struct DisplayFrame {
     /// Non-packed plane layout, when the producer declared one (#194):
     /// External frames carry the decoder's real strides. `None` = packed.
     pub(crate) layout: Option<crate::format::PlaneLayout>,
+    /// What the stream said about its colour (#265). `None` = nothing said.
+    pub(crate) color: Option<crate::format::ColorInfo>,
     /// Which flush generation this frame belongs to (#265). A flushing seek
     /// bumps the sink's counter, and the display loop skips anything stamped
     /// below it — otherwise the queued pre-seek frames are blitted *after*
     /// the seek, flashing the old picture back over the new one.
     pub(crate) generation: u64,
+}
+
+impl DisplayFrame {
+    /// The colour to render with: what the stream said, or the height
+    /// heuristic when it said nothing (#265).
+    pub(crate) fn resolved_color(&self) -> crate::format::ColorInfo {
+        let mut color = self.color.unwrap_or_default();
+        color.matrix = color.matrix_or(crate::video::color::matrix_for_height(self.height));
+        color
+    }
 }
 
 /// A display-thread-local presentation backend (deliberately not `Send`).
@@ -165,7 +177,10 @@ pub(crate) struct CpuBackend {
     /// row-wise by the engine (#196), so it is repacked here first. Real
     /// strided producers allocate whole rows, so this stays empty.
     repack_scratch: Vec<u8>,
-    converter: Option<((PixelFormat, u32, u32), crate::converters::VideoConvert)>,
+    converter: Option<(
+        (PixelFormat, u32, u32, crate::format::ColorInfo),
+        crate::converters::VideoConvert,
+    )>,
     warned_yuv: bool,
 }
 
@@ -211,11 +226,15 @@ impl CpuBackend {
                 )));
             }
         };
-        let key = (frame.format, frame.width, frame.height);
+        // Colour is part of the key (#265): a stream that changes matrix or
+        // range mid-flight must not keep the previous one's converter.
+        let color = frame.resolved_color();
+        let key = (frame.format, frame.width, frame.height, color);
         if self.converter.as_ref().is_none_or(|(k, _)| *k != key) {
             self.converter = Some((
                 key,
-                VideoConvert::new(conv_format, ConvFormat::Bgra, frame.width, frame.height)?,
+                VideoConvert::new(conv_format, ConvFormat::Bgra, frame.width, frame.height)?
+                    .with_color_info(color),
             ));
         }
         // Field borrows below are disjoint (repack_scratch read, scratch
@@ -405,6 +424,7 @@ mod tests {
             height: h,
             format,
             layout: None,
+            color: None,
         }
     }
 
@@ -428,6 +448,7 @@ mod tests {
             height: 1,
             format,
             layout: None,
+            color: None,
         }
     }
 
