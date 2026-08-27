@@ -40,9 +40,11 @@
 #![warn(missing_docs)]
 
 mod render;
+mod subscription;
 mod view;
 
 pub use render::{VideoPipeline, VideoPrimitive};
+pub use subscription::{FrameSignal, frames};
 pub use view::{State, VideoView};
 
 /// Frames this renderer holds beyond the mailbox, for

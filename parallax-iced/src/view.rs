@@ -1,4 +1,5 @@
-//! The widget: a [`shader::Program`] that draws whatever frame is due.
+//! The widget: a [`shader::Program`] that draws the frame that is due, and
+//! asks to be woken when the next one is.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -6,6 +7,8 @@ use std::time::Duration;
 use iced::widget::shader;
 use iced::{Event, Rectangle, mouse, window};
 
+use parallax::clock::ClockTime;
+use parallax::pipeline::StallWatch;
 use parallax::video::{FrameMailbox, PacedFrame};
 
 use crate::render::VideoPrimitive;
@@ -15,16 +18,27 @@ use crate::render::VideoPrimitive;
 /// One frame at 25 fps, the same budget `AutoVideoSink` uses.
 const DEFAULT_MAX_LATENESS: Duration = Duration::from_millis(40);
 
+/// Longest gap between redraws while a stream is live but nothing is queued.
+///
+/// The doorbell subscription is what normally wakes an idle widget; this is
+/// the belt to its braces. A missed wake-up then costs a fifth of a second
+/// rather than freezing the picture until some unrelated event arrives.
+const IDLE_POLL: Duration = Duration::from_millis(200);
+
 /// What the widget carries between redraws.
 ///
-/// Iced builds the `VideoView` fresh on every `view()`, so anything that must
+/// Iced rebuilds the `VideoView` on every `view()`, so anything that must
 /// survive a rebuild lives here.
 #[derive(Debug, Default)]
 pub struct State {
-    /// The frame on screen. Held so a redraw that has no new frame — a resize,
-    /// a UI change, a compositor repaint — draws the picture again rather than
-    /// black.
+    /// The frame on screen. Held so a redraw with no new frame — a resize, a
+    /// UI change, a compositor repaint — draws the picture again rather than
+    /// nothing.
     current: Option<PacedFrame>,
+    /// Watches for a clock that has stopped for reasons no pause explains.
+    stall: StallWatch,
+    /// Whether the current stall has already been logged.
+    warned_stall: bool,
 }
 
 impl State {
@@ -35,8 +49,6 @@ impl State {
 }
 
 /// Draws the video a [`FrameMailbox`] is being filled with.
-///
-/// Put it in a `shader` widget:
 ///
 /// ```no_run
 /// # use std::sync::Arc;
@@ -49,6 +61,18 @@ impl State {
 ///     .into()
 /// # }
 /// ```
+///
+/// # How it is driven
+///
+/// A `RedrawRequested` is the tick. The widget takes whatever is due, then
+/// asks Iced to redraw *at* the next frame's presentation time — expressed as
+/// a duration from the instant that event carried, so pipeline running time
+/// and `Instant` never have to be reconciled. In steady state that is the
+/// only traffic: no messages, no `view()` rebuild per frame.
+///
+/// It never publishes a message from that update. Iced rebuilds the whole
+/// interface when a redraw produces one — up to three times, and then it
+/// warns.
 #[derive(Debug)]
 pub struct VideoView {
     mailbox: Arc<FrameMailbox>,
@@ -81,24 +105,44 @@ impl VideoView {
         self
     }
 
-    /// Take everything that is due, keeping the last of them.
+    /// Take everything due, keeping the last of them.
     ///
     /// Draining rather than taking one is deliberate: if the host fell behind,
     /// the frames between the last drawn one and now are already superseded,
     /// and showing them in sequence at redraw speed would play the video fast.
-    fn advance(&self, state: &mut State) -> bool {
-        let now = self
-            .mailbox
-            .clock()
-            .map(|c| c.now())
-            .unwrap_or(parallax::clock::ClockTime::NONE);
+    fn advance(&self, state: &mut State) {
+        let Some(clock) = self.mailbox.clock() else {
+            // No clock yet — an element only sees one through its consume
+            // context, so there is nothing to pace against until the first
+            // buffer arrives. Draw on arrival.
+            self.drain(state, ClockTime::NONE);
+            return;
+        };
 
-        let mut advanced = false;
+        let now = clock.now();
+        // A clock that stops for reasons no pause explains means the branch
+        // driving it is starved — possibly by this very widget holding
+        // frames. Draw anyway: that drains the mailbox and unblocks it.
+        if state.stall.stalled(now, clock.is_paused()) {
+            if !state.warned_stall {
+                state.warned_stall = true;
+                tracing::warn!(
+                    "parallax-iced: the pipeline clock has not moved for {:?}; \
+                     drawing on arrival instead of waiting on it",
+                    parallax::pipeline::STALL_LIMIT
+                );
+            }
+            self.drain(state, ClockTime::NONE);
+            return;
+        }
+        state.warned_stall = false;
+        self.drain(state, now);
+    }
+
+    fn drain(&self, state: &mut State, now: ClockTime) {
         while let Some(paced) = self.mailbox.take_due(now, self.max_lateness) {
             state.current = Some(paced);
-            advanced = true;
         }
-        advanced
     }
 }
 
@@ -113,18 +157,45 @@ impl<Message> shader::Program<Message> for VideoView {
         _bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> Option<shader::Action<Message>> {
-        // A redraw is the tick: it is the only event that arrives at the rate
-        // the screen actually refreshes.
-        let Event::Window(window::Event::RedrawRequested(_)) = event else {
+        // A redraw is the tick: the only event that arrives at the rate the
+        // screen actually refreshes.
+        let Event::Window(window::Event::RedrawRequested(instant)) = event else {
             return None;
         };
 
         self.advance(state);
 
-        // Deliberately not `Action::publish`: Iced rebuilds the whole
-        // interface when a redraw produces a message — up to three times,
-        // and then it warns. Ask for the next frame and nothing else.
-        Some(shader::Action::request_redraw())
+        let Some(clock) = self.mailbox.clock() else {
+            // Nothing to pace against yet; come back on the next frame.
+            return Some(shader::Action::request_redraw());
+        };
+
+        // A paused clock is supposed to have stopped, so park — returning no
+        // action is how a widget says "wait". The last frame stays on screen,
+        // and a resume always arrives through the application's own message,
+        // which redraws anyway.
+        if clock.is_paused() {
+            return None;
+        }
+
+        match self.mailbox.next_due() {
+            // Due at a known time: ask for exactly that instant.
+            Some(target) if target != ClockTime::NONE => {
+                let wait = target.nanos().saturating_sub(clock.now().nanos());
+                Some(shader::Action::request_redraw_at(
+                    *instant + Duration::from_nanos(wait),
+                ))
+            }
+            // Queued with no timing contract — draw it now.
+            Some(_) => Some(shader::Action::request_redraw()),
+            // Nothing queued. The doorbell subscription is what normally wakes
+            // us; this is the fallback so a missed one costs a fifth of a
+            // second rather than the picture.
+            None if self.mailbox.end_reason().is_none() => {
+                Some(shader::Action::request_redraw_at(*instant + IDLE_POLL))
+            }
+            None => None,
+        }
     }
 
     fn draw(
