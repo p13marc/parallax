@@ -202,7 +202,7 @@ pub use timing::{
 };
 
 // Demux
-pub use demux::{StreamIdDemux, StreamIdDemuxStats, StreamOutput};
+pub use demux::{StreamIdDemux, StreamIdDemuxStats, StreamOutput, TrackLabel};
 
 #[cfg(feature = "mpeg-ts")]
 pub use demux::{

@@ -1555,6 +1555,17 @@ pub trait Demuxer: Send {
         format!("src_{}", pad.0)
     }
 
+    /// Set the bus handle for posting messages.
+    ///
+    /// The executor already calls `set_bus` on every element before it
+    /// dispatches by node type, so a demuxer has always been *handed* one —
+    /// the adapter simply had nowhere to forward it to. Overriding this is
+    /// how a container demuxer reports what it found: `StreamCollection` and
+    /// `Tag` had no producer anywhere in the tree before #278.
+    fn set_bus(&mut self, _bus: crate::pipeline::bus::BusHandle) {
+        // Default: ignore
+    }
+
     /// Handle an upstream event (seek).
     ///
     /// A *source-style* demuxer receives runtime events exactly like a
@@ -3645,6 +3656,10 @@ impl<D: Demuxer + Send + 'static> SendAsyncElementDyn for DemuxerAdapter<D> {
     // Sync author trait: the inline forms are the canonical bodies (#175).
     fn dispatches_inline(&self) -> bool {
         true
+    }
+
+    fn set_bus(&mut self, bus: crate::pipeline::bus::BusHandle) {
+        self.inner.set_bus(bus);
     }
 
     fn set_output_budget(&mut self, budget: crate::memory::OutputBudget) {

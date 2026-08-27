@@ -75,6 +75,8 @@ therefore the video, at wall rate.
 | `--no-sync` | decode as fast as possible; the batch-decode floor |
 | `--headless` | play with no window at all |
 | `--audio-device NAME` | ALSA device to play through; `list` prints them |
+| `--video-track ID` | video track to play, by container id |
+| `--audio-track ID` | audio track to play, by container id |
 | `--exit-after N` | quit after N seconds, printing the summary |
 
 ## The machine-readable summary

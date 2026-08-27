@@ -63,6 +63,11 @@ pub struct Options {
     /// ALSA device to play through. `"default"` is whatever ALSA is
     /// configured to mean, which is usually dmix or PipeWire's bridge.
     pub audio_device: String,
+    /// Video track to play, by container id. `None` takes the container's
+    /// default (#278).
+    pub video_track: Option<u64>,
+    /// Audio track to play, by container id. `None` takes the default.
+    pub audio_track: Option<u64>,
 }
 
 impl Default for Options {
@@ -77,6 +82,8 @@ impl Default for Options {
             channel_capacity: 4,
             sync: true,
             audio_device: "default".into(),
+            video_track: None,
+            audio_track: None,
         }
     }
 }
@@ -237,6 +244,32 @@ pub struct SourceDescription {
     pub duration: ClockTime,
     /// Subtitle tracks present but not rendered (#279).
     pub subtitles: usize,
+    /// Every track the container holds, for the picker (#278).
+    pub tracks: Vec<TrackChoice>,
+}
+
+/// One track a picker can offer.
+#[derive(Debug, Clone)]
+pub struct TrackChoice {
+    /// Container track id, which is what selection is by.
+    pub id: u64,
+    /// Video, audio or subtitle.
+    pub kind: TrackKind,
+    /// What to show for it.
+    pub label: String,
+    /// Whether it is the one playing.
+    pub selected: bool,
+}
+
+/// What a track carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackKind {
+    /// Pictures.
+    Video,
+    /// Sound.
+    Audio,
+    /// Timed text.
+    Subtitle,
 }
 
 impl SourceDescription {
@@ -389,6 +422,36 @@ fn describe_mp4(path: &Path, demux: &Mp4Demux<BufReader<File>>) -> SourceDescrip
             .iter()
             .filter(|t| t.track_type == Mp4TrackType::Subtitle)
             .count(),
+        tracks: demux
+            .tracks()
+            .iter()
+            .filter_map(|track| {
+                let kind = match track.track_type {
+                    Mp4TrackType::Video => TrackKind::Video,
+                    Mp4TrackType::Audio => TrackKind::Audio,
+                    Mp4TrackType::Subtitle => TrackKind::Subtitle,
+                    Mp4TrackType::Unknown => return None,
+                };
+                Some(TrackChoice {
+                    id: track.id as u64,
+                    kind,
+                    label: choice_label(&track.label, &track.codec.to_string()),
+                    selected: match kind {
+                        TrackKind::Video => demux.video_track_id() == Some(track.id),
+                        TrackKind::Audio => demux.audio_track_id() == Some(track.id),
+                        TrackKind::Subtitle => false,
+                    },
+                })
+            })
+            .collect(),
+    }
+}
+
+/// What to show for a track: what the container said, else the codec.
+fn choice_label(label: &parallax::elements::TrackLabel, codec: &str) -> String {
+    match label.describe() {
+        Some(described) => format!("{described} · {codec}"),
+        None => codec.to_string(),
     }
 }
 
@@ -427,6 +490,28 @@ fn describe_mkv(path: &Path, demux: &MkvDemux<BufReader<File>>) -> SourceDescrip
             .iter()
             .filter(|t| t.track_type == MkvTrackType::Subtitle)
             .count(),
+        tracks: demux
+            .tracks()
+            .iter()
+            .filter_map(|track| {
+                let kind = match track.track_type {
+                    MkvTrackType::Video => TrackKind::Video,
+                    MkvTrackType::Audio => TrackKind::Audio,
+                    MkvTrackType::Subtitle => TrackKind::Subtitle,
+                    MkvTrackType::Unknown => return None,
+                };
+                Some(TrackChoice {
+                    id: track.id,
+                    kind,
+                    label: choice_label(&track.label, &track.codec.to_string()),
+                    selected: match kind {
+                        TrackKind::Video => demux.video_track().map(|t| t.id) == Some(track.id),
+                        TrackKind::Audio => demux.audio_track().map(|t| t.id) == Some(track.id),
+                        TrackKind::Subtitle => false,
+                    },
+                })
+            })
+            .collect(),
     }
 }
 
@@ -632,19 +717,28 @@ impl Engine {
         // from existing at all, so nothing warns about an unlinked pad.
         let src = match source {
             ProbedSource::Mp4(demux) => {
+                let selected = Mp4DemuxSource::new(*demux).with_tracks(
+                    opts.video_track.map(|id| id as u32),
+                    opts.audio_track.map(|id| id as u32),
+                )?;
+                // Without an audio branch the audio pad must not exist, or
+                // every audio buffer is dropped into an unlinked pad. Note
+                // `drop_audio()`, not `with_tracks(v, None)`: the latter means
+                // "the container's default audio track", not "no audio".
                 let s = if audio.is_some() {
-                    Mp4DemuxSource::new(*demux)
+                    selected
                 } else {
-                    Mp4DemuxSource::video_only(*demux)
+                    selected.drop_audio()
                 }
                 .with_loop(opts.gapless_loop);
                 pipeline.add_demuxer("demux", s)
             }
             ProbedSource::Mkv(demux) => {
+                let selected = demux.with_tracks(opts.video_track, opts.audio_track)?;
                 let s = if audio.is_some() {
-                    *demux
+                    selected
                 } else {
-                    demux.video_only()
+                    selected.video_only()
                 }
                 .with_loop(opts.gapless_loop);
                 pipeline.add_demuxer("demux", s)

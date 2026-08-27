@@ -62,6 +62,40 @@ Every out-of-tree plugin must be rebuilt: the plugin ABI went **12 → 13**.
   `parallax_iced::DEFAULT_MAX_LATENESS` rather than inventing a second pacing
   policy.
 
+- **Track enumeration and selection** (#278). `Mp4Track` and `MkvTrack` carry
+  a `TrackLabel` — language, name, and the default/forced/enabled flags — so a
+  picker has something to label a row with. MKV had all of it available and
+  unread; MP4 needed three sources (`mdhd`'s packed language code, `hdlr`'s
+  name where several muxers write a title, and `tkhd`'s enabled bit), and its
+  missing pieces are an honest `None` rather than something invented: there is
+  no forced flag in MP4 at all, and `elng` is not modelled by the crate.
+
+  `MkvDemux::with_tracks` and `Mp4DemuxSource::with_tracks` select by
+  container id, falling back to the container's own default flag and then to
+  the first playable track. A track id that does not exist, or names a track
+  of the wrong type, is an **error** — a picker offered it, so a silent
+  fall-back would hide a real bug. `MkvDemux::route` is public with them.
+
+  Selection is construction-time by design, and the player switches tracks by
+  rebuilding and resuming where it was: an AAC track and an E-AC-3 track need
+  different decoder elements, so a switch is a different graph rather than a
+  re-pointed pad. `--video-track` / `--audio-track` and a picker in the
+  diagnostics panel.
+
+- **`MessageKind::StreamCollection` and `MessageKind::Tag` have producers**
+  (#278). Both, plus `StreamInfo`, `BusHandle::post_tags` and all of
+  `pipeline::tags`, shipped as types with no caller anywhere in the tree. The
+  file demuxers now post one collection and one tag list on their first
+  `produce` — a track list with each stream's language, flags and whether it
+  is the one playing, and the container format, duration and selected codecs.
+  `Demuxer` gained a defaulted `set_bus` to reach the bus at all; the executor
+  already called `set_bus` on every element, and the adapter simply had
+  nowhere to forward it to. No ABI change.
+
+- **`TagValue::Bool`** and the `track-default` / `track-forced` /
+  `track-selected` tag keys (#278). `StreamInfo` has no field for which stream
+  is playing, and a collection that cannot say that is half an answer.
+
 - **Audio output device selection** (#284). `--audio-device NAME` picks it,
   `--audio-device list` prints what ALSA offers, and the diagnostics panel
   has a picker; choosing one rebuilds the pipeline and resumes where it was,
@@ -174,6 +208,12 @@ Every out-of-tree plugin must be rebuilt: the plugin ABI went **12 → 13**.
   dependency, with `cfg(test)` off.
 
 ### Fixed
+
+- **MKV could not describe two video tracks** (#278). `nal_config` was a
+  single `Option<NalConfig>` where MP4 has a per-track map, so routing a
+  second video track overwrote the first one's parameter sets outright. It
+  never bit because nothing could select a track; `with_tracks` would have
+  made it reachable. Fixed with it rather than left as a landmine.
 
 - **ALSA no longer plays at a rate the hardware is not using** (#284).
   `AlsaSink::new` asks for a rate with `ValueOr::Nearest`, so a driver that

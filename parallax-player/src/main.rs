@@ -319,6 +319,14 @@ struct Args {
     #[arg(long, default_value = "default")]
     audio_device: String,
 
+    /// Video track to play, by container id; the default is the container's.
+    #[arg(long)]
+    video_track: Option<u64>,
+
+    /// Audio track to play, by container id.
+    #[arg(long)]
+    audio_track: Option<u64>,
+
     /// Play with no window at all, printing the machine-readable summary.
     ///
     /// The pipeline is the same one the window drives, and this process is
@@ -349,6 +357,8 @@ impl Args {
             channel_capacity: self.channel_capacity.max(1),
             sync: !self.no_sync,
             audio_device: self.audio_device.clone(),
+            video_track: self.video_track,
+            audio_track: self.audio_track,
         }
     }
 }
@@ -422,6 +432,8 @@ enum Message {
     TogglePlaylist,
     /// Play through this ALSA device from the next build on.
     AudioDevice(String),
+    /// Play this track of the current file instead.
+    SelectTrack(engine::TrackKind, u64),
     /// Play/pause.
     TogglePause,
     /// Seek by a number of seconds, relative to where the transport is headed.
@@ -689,6 +701,24 @@ impl Player {
                 self.activity();
                 self.show_playlist = !self.show_playlist;
                 Task::none()
+            }
+            Message::SelectTrack(kind, id) => {
+                self.activity();
+                let slot = match kind {
+                    engine::TrackKind::Video => &mut self.options.video_track,
+                    engine::TrackKind::Audio => &mut self.options.audio_track,
+                    // #279 wires the subtitle pad; until then there is
+                    // nothing to select one *into*.
+                    engine::TrackKind::Subtitle => {
+                        self.note(Level::Info, "subtitle tracks are not rendered yet");
+                        return Task::none();
+                    }
+                };
+                if *slot == Some(id) {
+                    return Task::none();
+                }
+                *slot = Some(id);
+                self.reopen_current()
             }
             Message::AudioDevice(device) => {
                 self.activity();

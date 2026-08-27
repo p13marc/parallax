@@ -266,6 +266,36 @@ pub fn welcome(player: &Player) -> Element<'_, Message> {
     body.into()
 }
 
+/// What the container holds, with the playing tracks marked (#278).
+///
+/// Choosing one rebuilds the pipeline and resumes where it was — an AAC track
+/// and an E-AC-3 track need different decoder elements, so a switch is a
+/// different graph, not a re-pointed pad.
+fn tracks(source: &crate::engine::SourceDescription) -> Element<'_, Message> {
+    use crate::engine::TrackKind;
+
+    let mut list = column![].spacing(2);
+    for track in &source.tracks {
+        let kind = match track.kind {
+            TrackKind::Video => "video",
+            TrackKind::Audio => "audio",
+            TrackKind::Subtitle => "subs",
+        };
+        list = list.push(
+            row![
+                text(if track.selected { "•" } else { " " }).size(11),
+                text(kind).size(11),
+                button(text(track.label.clone()).size(11))
+                    .on_press(Message::SelectTrack(track.kind, track.id))
+                    .padding([2, 6]),
+            ]
+            .spacing(4)
+            .align_y(Alignment::Center),
+        );
+    }
+    scrollable(list).height(Length::Fixed(90.0)).into()
+}
+
 /// The output devices, with the one in use marked.
 ///
 /// Choosing one rebuilds the pipeline and resumes where it was: the graph is
@@ -454,6 +484,12 @@ fn stats(player: &Player) -> Element<'_, Message> {
             ))
             .size(12),
         );
+    }
+
+    if let Some(source) = player.source()
+        && !source.tracks.is_empty()
+    {
+        lines = lines.push(text("tracks").size(12)).push(tracks(source));
     }
 
     if !player.audio_devices.is_empty() {
