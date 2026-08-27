@@ -377,14 +377,23 @@ for the first time), and the name `--headless`, which
 
 ### Phase D — engine gaps the player exposes
 
-**D1 ([#278](https://git.marcpardo.eu/marcpardo/parallax/issues/278)). Track enumeration and selection (L).** Language, title, default/forced on
-`Mp4Track`/`MkvTrack`; post `MessageKind::StreamCollection` and `TagList` for the first
-time; a runtime select API on the demuxers.
+**D1 ([#278](https://git.marcpardo.eu/marcpardo/parallax/issues/278)). Track enumeration and selection (L). DONE.** Labels on both track tables, and
+the first `StreamCollection`/`Tag` producers the tree has ever had — `Demuxer` gained a
+defaulted `set_bus` for it, with no ABI change, because `AsyncElementDyn::set_bus`
+already existed and only the adapter's forward was missing. Selection is
+**construction-time** and the docs say why rather than implying a limitation: an AAC
+track and an E-AC-3 track need different decoder elements, so a switch is a different
+graph and the player rebuilds and resumes. Note `with_tracks(v, None)` means *the
+container's default* audio, not none.
 
-**D2 ([#279](https://git.marcpardo.eu/marcpardo/parallax/issues/279)). Subtitles (XL).** Route `S_TEXT/UTF8`, `S_TEXT/ASS` and `tx3g` out of the demuxers
-and parse them. **Render in the Iced layer, not as a pipeline element** — text over
-video is a UI problem, Iced already has the text stack, and a `TextOverlay` element
-would mean rasterising into video frames for no benefit.
+**D2 ([#279](https://git.marcpardo.eu/marcpardo/parallax/issues/279)). Subtitles (XL). DONE for MKV and sidecar `.srt`.** Rendered in the Iced layer, as
+planned. Three things the issue text did not know: a cue is an *interval*, so it needed
+its own store rather than a `FrameMailbox` (whose `take_due` pops and forgets, showing
+each subtitle for one repaint) — and `retire()` has to clear the cue *on screen*, not
+just the queue. **Matroska never stores SRT as SRT**: it converts to `S_TEXT/UTF8` with
+the timing in the container, so there is nothing to parse inside an MKV and the SRT
+parser is for sidecar files. And `tx3g` is reachable but not built — rare outside Apple
+exports, with no fixture here to prove it against.
 
 **D3 ([#280](https://git.marcpardo.eu/marcpardo/parallax/issues/280)). Rate ≠ 1.0, honestly (M).** `AlsaSink` handles `INSTANT_RATE_CHANGE` — at minimum
 by muting and saying so on the bus, rather than today's guaranteed desync, since it is
@@ -398,12 +407,18 @@ the clock master. Time-stretch is out of scope; the UI states what it does.
 handle (`Mp4Demux` → decoder → `AppSink` → `JpegEncoder`), driven from the GUI, with a
 cache. Impossible for cue-less MKV and for HEVC; say so in the UI.
 
-**D6 ([#283](https://git.marcpardo.eu/marcpardo/parallax/issues/283)). Snapshot (S).** `Valve` → `VideoConvert(→Rgb24)` → `PngEncoder` → `FileSink`
-branch, triggered from the UI. Note the encoders take RGB/RGBA/Gray only, so the convert
-is mandatory.
+**D6 ([#283](https://git.marcpardo.eu/marcpardo/parallax/issues/283)). Snapshot (S). DONE — off the mailbox, not through the graph.** The proposed
+branch has three problems the design did not mention: a closed `Valve` *drops* rather
+than queues and has no one-shot mode; `FileSink` cannot be re-targeted and appends, so N
+snapshots concatenate; and `Valve::passthrough()` is true, so the branch adds its whole
+downstream capacity to the decoder's hold. `FrameMailbox::last_presented()` hands over
+the decoder's own frame, which is what the issue actually wanted.
 
-**D7 ([#284](https://git.marcpardo.eu/marcpardo/parallax/issues/284)). Audio output device picker (M).** Wire `AlsaSink::enumerate_devices` to the UI, and
-make `PipeWireSink`'s device parameter actually do something.
+**D7 ([#284](https://git.marcpardo.eu/marcpardo/parallax/issues/284)). Audio output device picker (M). DONE.** And the real find was not the picker:
+`AlsaSink::new` asks for its rate with `ValueOr::Nearest`, so a driver that cannot do
+44.1 kHz substitutes silently while `self.format.sample_rate` keeps the requested value
+— poisoning the pinned caps, the declared latency and `AlsaPosition`, which is the
+master clock. The granted values are read back now and a substituted rate is refused.
 
 **D8 ([#285](https://git.marcpardo.eu/marcpardo/parallax/issues/285)). Deduplicate the two presenters (S, decision). DECIDED — see "The two
 presenters" below.**
