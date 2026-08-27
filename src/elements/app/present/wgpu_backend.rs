@@ -176,6 +176,13 @@ struct ImportedFrame {
 /// Imported allocations kept at once. A producer pool is 4-8 frames.
 const IMPORT_CACHE: usize = 8;
 
+/// This backend owns its surface, so it letterboxes with a viewport and a
+/// black clear (`LoadOp::Clear` — the clear *is* the bars). The shader's fit
+/// rect is therefore always the whole frame. A backend embedded in a GUI
+/// cannot do that: its render pass loads rather than clears, so it paints the
+/// bars in the fragment shader instead.
+const WHOLE_FRAME: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+
 impl WgpuBackend {
     pub(crate) fn new(window: Arc<Window>) -> Result<Self> {
         let size = window.inner_size();
@@ -329,7 +336,7 @@ impl WgpuBackend {
 
         let params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("autovideosink-params"),
-            size: 16,
+            size: crate::video::PARAMS_SIZE,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -391,7 +398,7 @@ impl WgpuBackend {
             self.queue.write_buffer(
                 &self.params,
                 0,
-                &[mode as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                &crate::video::shader_params(mode, false, WHOLE_FRAME),
             );
             return Ok(true);
         }
@@ -480,7 +487,7 @@ impl WgpuBackend {
         self.queue.write_buffer(
             &self.params,
             0,
-            &[mode as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            &crate::video::shader_params(mode, false, WHOLE_FRAME),
         );
 
         if self.imported.len() >= IMPORT_CACHE
@@ -580,7 +587,7 @@ impl WgpuBackend {
         self.queue.write_buffer(
             &self.params,
             0,
-            &[mode as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            &crate::video::shader_params(mode, false, WHOLE_FRAME),
         );
 
         let view = |t: &wgpu::Texture| t.create_view(&wgpu::TextureViewDescriptor::default());

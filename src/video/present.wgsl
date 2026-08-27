@@ -13,6 +13,14 @@ struct Params {
     _pad0: u32,
     _pad1: u32,
     _pad2: u32,
+    // Where the picture sits inside the viewport, in 0..1 viewport space:
+    // (x0, y0, width, height). Everything outside is painted black.
+    //
+    // A backend that owns its surface can letterbox with a scissor and a
+    // black clear instead and pass (0, 0, 1, 1) here. One embedded in a GUI
+    // cannot: its render pass loads rather than clears, so a narrowed
+    // viewport would leave whatever was underneath showing in the bars.
+    fit: vec4<f32>,
 }
 
 @group(0) @binding(0) var samp: sampler;
@@ -41,19 +49,24 @@ fn vs_main(@builtin(vertex_index) index: u32) -> VsOut {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let fit = (in.uv - params.fit.xy) / params.fit.zw;
+    if fit.x < 0.0 || fit.x > 1.0 || fit.y < 0.0 || fit.y > 1.0 {
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
+
     if params.mode == 4u {
-        return vec4<f32>(textureSample(tex_y, samp, in.uv).rgb, 1.0);
+        return vec4<f32>(textureSample(tex_y, samp, fit).rgb, 1.0);
     }
 
     // Limited (studio) range expansion: Y 16..=235, chroma 16..=240.
-    let y = (textureSample(tex_y, samp, in.uv).r - 16.0 / 255.0) * (255.0 / 219.0);
+    let y = (textureSample(tex_y, samp, fit).r - 16.0 / 255.0) * (255.0 / 219.0);
     var cbcr: vec2<f32>;
     if params.mode >= 2u {
-        cbcr = textureSample(tex_u, samp, in.uv).rg;
+        cbcr = textureSample(tex_u, samp, fit).rg;
     } else {
         cbcr = vec2<f32>(
-            textureSample(tex_u, samp, in.uv).r,
-            textureSample(tex_v, samp, in.uv).r,
+            textureSample(tex_u, samp, fit).r,
+            textureSample(tex_v, samp, fit).r,
         );
     }
     cbcr = (cbcr - 128.0 / 255.0) * (255.0 / 224.0);

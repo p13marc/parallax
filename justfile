@@ -88,6 +88,19 @@ check-display:
     cargo clippy --all-targets --features display,display-gpu -- -D warnings
     cargo clippy --all-targets --features display -- -D warnings
 
+# The Iced integration crate and the player built on it (#267). Neither is in
+# `default-members`, so a bare `cargo` invocation never sees them — same
+# reason the `workspace-members` CI job exists.
+#
+# The `cargo tree -d` line is the load-bearing one: this crate compiles
+# against *Iced's* wgpu and parallax's `display-gpu` backend against a
+# different major, so "exactly one wgpu" has to be asserted rather than hoped
+# for. Duplicates would compile and quietly double the build.
+check-iced:
+    cargo clippy -p parallax-iced --all-targets -- -D warnings
+    cargo nextest run -p parallax-iced
+    ! cargo tree -p parallax-iced -d 2>/dev/null | grep -q '^wgpu'
+
 # Vulkan Video (#3). Mirrors CI's vulkan-check, and exists because of root
 # CLAUDE.md gotcha 11b: `elements::codec::hw_encoder`/`hw_decoder` need
 # `vulkan-video` AND a codec feature, so this combination is the only one

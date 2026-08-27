@@ -82,6 +82,29 @@ pub fn shader_mode_for(format: PixelFormat, height: u32) -> Result<u32> {
     shader_mode(format, color::matrix_for_height(height))
 }
 
+/// Size of the uniform block [`PRESENT_WGSL`] declares, in bytes.
+pub const PARAMS_SIZE: u64 = 32;
+
+/// Build the uniform block for one frame.
+///
+/// One function owns the layout because two backends write it, on two
+/// different graphics stacks, and a struct they cannot share is a struct that
+/// will drift. `fit` is `(x0, y0, width, height)` of the picture inside the
+/// viewport in 0..1 space — `(0, 0, 1, 1)` for a backend that letterboxes
+/// with its own viewport and a black clear.
+pub fn shader_params(mode: u32, srgb_target: bool, fit: [f32; 4]) -> [u8; PARAMS_SIZE as usize] {
+    let mut out = [0u8; PARAMS_SIZE as usize];
+    out[0..4].copy_from_slice(&mode.to_le_bytes());
+    out[4..8].copy_from_slice(&u32::from(srgb_target).to_le_bytes());
+    // bytes 8..16 are the two pads WGSL needs to put `fit` on a 16-byte
+    // boundary.
+    for (i, v) in fit.iter().enumerate() {
+        let at = 16 + i * 4;
+        out[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
