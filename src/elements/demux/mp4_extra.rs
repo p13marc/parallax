@@ -27,6 +27,9 @@ pub(crate) struct StsdExtra {
     /// What the `colr` box said about colour (#265), when present and
     /// in a form this tree models.
     pub color: Option<crate::format::ColorInfo>,
+    /// Pixel aspect ratio from the `pasp` box, and rotation from the `tkhd`
+    /// display matrix (#266). `None` when neither said anything.
+    pub display: Option<crate::format::DisplayGeometry>,
 }
 
 /// Sample-entry fourccs that are `VisualSampleEntry`s.
@@ -39,6 +42,62 @@ pub(crate) struct StsdExtra {
 const VISUAL_ENTRIES: [&[u8; 4]; 10] = [
     b"av01", b"avc1", b"avc3", b"hvc1", b"hev1", b"vp08", b"vp09", b"mp4v", b"jpeg", b"raw ",
 ];
+
+/// Read the rotation out of a `tkhd` display matrix.
+///
+/// The matrix is nine 32-bit fixed-point values `{a b u; c d v; x y w}` at
+/// +40 (version 0) or +52 (version 1) from the start of the box payload —
+/// fullbox 4, times 8 or 16, track_ID 4, reserved 4, duration 4 or 8,
+/// reserved 8, then layer/alternate_group/volume/reserved 8.
+///
+/// Only the four right angles are recognised, by the sign pattern of
+/// `a`/`b`/`c`/`d`; an arbitrary affine (a shear, a flip, a non-right
+/// rotation) is refused rather than approximated, because approximating it
+/// would silently show the wrong picture where refusing shows the stored one.
+///
+/// `a` and `d` are 16.16 fixed point, `b` and `c` are too; the standard
+/// rotations use only 0 and ±1.0 (`0x0001_0000`), so exact comparison is
+/// right here and a tolerance would only admit transforms this cannot express.
+fn rotation_from_matrix(m: &[u8]) -> Option<crate::format::Rotation> {
+    use crate::format::Rotation;
+    const ONE: i32 = 0x0001_0000;
+
+    let at = |i: usize| -> Option<i32> {
+        Some(i32::from_be_bytes(
+            m.get(i * 4..i * 4 + 4)?.try_into().ok()?,
+        ))
+    };
+    let quad = (at(0)?, at(1)?, at(3)?, at(4)?);
+    // Written as comparisons rather than patterns because `-ONE` is not one:
+    // a negated constant cannot appear in a pattern position.
+    for (want, rotation) in [
+        ((ONE, 0, 0, ONE), Rotation::None),
+        ((0, ONE, -ONE, 0), Rotation::Cw90),
+        ((-ONE, 0, 0, -ONE), Rotation::Cw180),
+        ((0, -ONE, ONE, 0), Rotation::Cw270),
+    ] {
+        if quad == want {
+            return Some(rotation);
+        }
+    }
+    None
+}
+
+/// Parse a `PixelAspectRatioBox` payload: two 32-bit integers.
+///
+/// A zero in either half is refused — `hSpacing:vSpacing` is a ratio, and a
+/// zero would make every downstream aspect calculation a division by nothing.
+fn parse_pasp(payload: &[u8]) -> Option<(u32, u32)> {
+    let at = |i: usize| -> Option<u32> {
+        Some(u32::from_be_bytes(
+            payload.get(i * 4..i * 4 + 4)?.try_into().ok()?,
+        ))
+    };
+    match (at(0)?, at(1)?) {
+        (0, _) | (_, 0) => None,
+        pair => Some(pair),
+    }
+}
 
 /// Parse a `ColourInformationBox` payload (ISO 14496-12 §12.1.5).
 ///
@@ -193,6 +252,16 @@ fn scan_trak<R: Read + Seek>(
     let id_bytes = read_bytes(r, id_off, 4)?;
     let track_id = u32::from_be_bytes([id_bytes[0], id_bytes[1], id_bytes[2], id_bytes[3]]);
 
+    // The display matrix (#266). Version 1 widens creation/modification time
+    // and duration to 64 bits, which moves everything after them by 12 bytes.
+    // mp4-rs reads this box only for the track id, which is how a portrait
+    // phone video played sideways.
+    let matrix_off = tkhd + if ver == 1 { 52 } else { 40 };
+    let rotation = read_bytes(r, matrix_off, 36)
+        .ok()
+        .as_deref()
+        .and_then(rotation_from_matrix);
+
     // trak → mdia → minf → stbl → stsd.
     let mut cur = (trak_start, trak_end);
     for name in [b"mdia", b"minf", b"stbl", b"stsd"] {
@@ -240,6 +309,21 @@ fn scan_trak<R: Read + Seek>(
         // which makes the container the only place the colour can come from.
         if let Some((colr, colr_end)) = find_child(r, b"colr", children, entry_end)? {
             extra.color = parse_colr(&read_bytes(r, colr, (colr_end - colr) as usize)?);
+        }
+        // `pasp` is codec-independent too (#266). Non-square pixels are why
+        // anamorphic DVD rips come out squished: 720x480 stored, 16:9 shown.
+        let par = match find_child(r, b"pasp", children, entry_end)? {
+            Some((pasp, pasp_end)) => parse_pasp(&read_bytes(r, pasp, (pasp_end - pasp) as usize)?),
+            None => None,
+        };
+        // One `Some` when either half said something. Square pixels and no
+        // rotation is the default a consumer would apply anyway, so stamping
+        // it would only cost a wire field per buffer.
+        if par.is_some() || rotation.is_some_and(|r| r != crate::format::Rotation::None) {
+            extra.display = Some(crate::format::DisplayGeometry {
+                par: par.unwrap_or((1, 1)),
+                rotation: rotation.unwrap_or_default(),
+            });
         }
     } else if &fourcc == b"Opus" {
         // AudioSampleEntry: 6 reserved + 2 dref + 20 bytes of fixed
@@ -316,6 +400,25 @@ mod tests {
 
     /// A one-track file whose single visual sample entry has these children.
     fn visual_file(fourcc: &[u8; 4], children: &[u8]) -> Vec<u8> {
+        visual_file_with_matrix(fourcc, children, &identity_matrix())
+    }
+
+    /// The unity display matrix: `{1 0 0; 0 1 0; 0 0 1}` in 16.16 / 2.30.
+    fn identity_matrix() -> Vec<u8> {
+        matrix_for(0x0001_0000, 0, 0, 0x0001_0000)
+    }
+
+    /// A display matrix with these four rotation cells; the rest is unity.
+    fn matrix_for(a: i32, b: i32, c: i32, d: i32) -> Vec<u8> {
+        let mut m = Vec::new();
+        for v in [a, b, 0, c, d, 0, 0, 0, 0x4000_0000i32] {
+            m.extend_from_slice(&v.to_be_bytes());
+        }
+        m
+    }
+
+    /// [`visual_file`] with an explicit `tkhd` display matrix.
+    fn visual_file_with_matrix(fourcc: &[u8; 4], children: &[u8], matrix: &[u8]) -> Vec<u8> {
         let mut entry_payload = vec![0u8; 6 + 2 + 70];
         entry_payload.extend_from_slice(children);
         let entry = boxed(fourcc, &entry_payload);
@@ -325,9 +428,15 @@ mod tests {
         let stsd = boxed(b"stsd", &stsd_payload);
         let mdia = boxed(b"mdia", &boxed(b"minf", &boxed(b"stbl", &stsd)));
 
+        // v0 tkhd: fullbox(4) + ctime/mtime(8) + track_id(4) + reserved(4)
+        // + duration(4) + reserved(8) + layer/alt/vol/reserved(8) puts the
+        // matrix at +40 from the payload start.
         let mut tkhd_payload = vec![0u8; 4 + 8];
         tkhd_payload.extend_from_slice(&1u32.to_be_bytes());
-        tkhd_payload.extend_from_slice(&[0u8; 8]);
+        tkhd_payload.extend_from_slice(&[0u8; 4 + 4 + 8 + 8]);
+        assert_eq!(tkhd_payload.len(), 40, "the matrix goes at +40");
+        tkhd_payload.extend_from_slice(matrix);
+        tkhd_payload.extend_from_slice(&[0u8; 8]); // width/height
         let mut trak_payload = boxed(b"tkhd", &tkhd_payload);
         trak_payload.extend_from_slice(&mdia);
         let moov = boxed(b"moov", &boxed(b"trak", &trak_payload));
@@ -401,6 +510,70 @@ mod tests {
         // reading whatever bytes happen to follow.
         let scanned = scan(&mut Cursor::new(visual_file(b"avc1", &[]))).unwrap();
         assert!(scanned[0].1.color.is_none());
+    }
+
+    #[test]
+    fn pasp_and_the_display_matrix_become_display_geometry() {
+        use crate::format::Rotation;
+
+        // Anamorphic NTSC: 32:27 pixels, upright.
+        let pasp = boxed(b"pasp", &[0, 0, 0, 32, 0, 0, 0, 27]);
+        let scanned = scan(&mut Cursor::new(visual_file(b"avc1", &pasp))).unwrap();
+        let display = scanned[0].1.display.expect("pasp was read");
+        assert_eq!(display.par, (32, 27));
+        assert_eq!(display.rotation, Rotation::None);
+
+        // Every right angle, by the sign pattern the standard rotations use.
+        const ONE: i32 = 0x0001_0000;
+        for (matrix, want) in [
+            (matrix_for(ONE, 0, 0, ONE), Rotation::None),
+            (matrix_for(0, ONE, -ONE, 0), Rotation::Cw90),
+            (matrix_for(-ONE, 0, 0, -ONE), Rotation::Cw180),
+            (matrix_for(0, -ONE, ONE, 0), Rotation::Cw270),
+        ] {
+            let file = visual_file_with_matrix(b"avc1", &[], &matrix);
+            let got = scan(&mut Cursor::new(file)).unwrap()[0].1.display;
+            match want {
+                // Upright and square is the default a consumer applies
+                // anyway, so nothing is stamped for it.
+                Rotation::None => assert!(got.is_none(), "unity matrix says nothing"),
+                _ => assert_eq!(got.unwrap().rotation, want, "{matrix:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_matrix_that_is_not_a_right_angle_is_refused() {
+        use crate::format::Rotation;
+
+        // A horizontal flip: expressible in the box, not in `Rotation`, and
+        // approximating it would silently mirror the picture.
+        const ONE: i32 = 0x0001_0000;
+        let flipped = visual_file_with_matrix(b"avc1", &[], &matrix_for(-ONE, 0, 0, ONE));
+        assert!(
+            scan(&mut Cursor::new(flipped)).unwrap()[0]
+                .1
+                .display
+                .is_none()
+        );
+
+        // A 45-degree rotation: cos/sin in 16.16, and neither cell matches.
+        let skewed =
+            visual_file_with_matrix(b"avc1", &[], &matrix_for(46341, 46341, -46341, 46341));
+        assert!(
+            scan(&mut Cursor::new(skewed)).unwrap()[0]
+                .1
+                .display
+                .is_none()
+        );
+
+        // A zero in the aspect ratio is a division waiting to happen. The
+        // rotation still comes through, because they are separate boxes.
+        let zero = boxed(b"pasp", &[0, 0, 0, 0, 0, 0, 0, 27]);
+        let file = visual_file_with_matrix(b"avc1", &zero, &matrix_for(0, ONE, -ONE, 0));
+        let display = scan(&mut Cursor::new(file)).unwrap()[0].1.display.unwrap();
+        assert_eq!(display.par, (1, 1), "a zero ratio is refused, not used");
+        assert_eq!(display.rotation, Rotation::Cw90);
     }
 
     #[test]

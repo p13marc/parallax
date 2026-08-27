@@ -5,7 +5,8 @@
 //   0 = planar YUV (I420)   1 = semi-planar YUV (NV12)   2 = packed RGB
 //
 // Colour is *data*, not a branch: the matrix coefficients and the range
-// expansion arrive in the uniform block, computed by src/video/color.rs.
+// expansion arrive in the uniform block, computed by src/video/color.rs, and
+// so does the display rotation (#266).
 // Before #265 they were `if`s over a mode enum here, which meant the shader
 // and the CPU converters each carried their own copy of the numbers — and
 // disagreed. Now there is one copy, and this file has none.
@@ -17,7 +18,10 @@ struct Params {
     // function is applied twice and the picture washes out. Iced picks an
     // sRGB surface; a backend that configures its own may not.
     srgb_target: u32,
-    _pad0: u32,
+    // Quarter-turns clockwise to apply when sampling: 0, 1, 2, 3. The frame
+    // is stored one way up and displayed another (#266); `fit` is already in
+    // display space, so this only has to invert the turn when reading.
+    rotation: u32,
     _pad1: u32,
     // Where the picture sits inside the viewport, in 0..1 viewport space:
     // (x0, y0, width, height). Everything outside is painted black.
@@ -84,24 +88,36 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0, 0.0, 0.0, 1.0);
     }
 
+    // Undo the rotation to get back to stored-frame coordinates. Cheaper
+    // and exacter than a matrix: these are the only four angles a container
+    // can express without resampling.
+    var uv = fit;
+    if params.rotation == 1u {
+        uv = vec2<f32>(fit.y, 1.0 - fit.x);
+    } else if params.rotation == 2u {
+        uv = vec2<f32>(1.0 - fit.x, 1.0 - fit.y);
+    } else if params.rotation == 3u {
+        uv = vec2<f32>(1.0 - fit.y, fit.x);
+    }
+
     if params.planes == 2u {
-        return present(textureSample(tex_y, samp, fit).rgb);
+        return present(textureSample(tex_y, samp, uv).rgb);
     }
 
     var cbcr: vec2<f32>;
     if params.planes == 1u {
-        cbcr = textureSample(tex_u, samp, fit).rg;
+        cbcr = textureSample(tex_u, samp, uv).rg;
     } else {
         cbcr = vec2<f32>(
-            textureSample(tex_u, samp, fit).r,
-            textureSample(tex_v, samp, fit).r,
+            textureSample(tex_u, samp, uv).r,
+            textureSample(tex_v, samp, uv).r,
         );
     }
 
     // Range expansion: limited (studio) range stores Y in 16..=235 and
     // chroma in 16..=240, full range stores both whole. The uniform says
     // which, so this is the same arithmetic either way.
-    let y = (textureSample(tex_y, samp, fit).r - params.expansion.x) * params.expansion.y;
+    let y = (textureSample(tex_y, samp, uv).r - params.expansion.x) * params.expansion.y;
     cbcr = (cbcr - 128.0 / 255.0) * params.expansion.z;
 
     let c = params.coeffs;

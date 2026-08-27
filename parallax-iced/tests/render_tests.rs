@@ -15,7 +15,9 @@ use iced::widget::shader::{Pipeline, Primitive, Viewport};
 use iced::{Rectangle, Size};
 
 use parallax::buffer::{Buffer, MemoryHandle};
-use parallax::format::{ColorInfo, ColorMatrix, ColorRange, PixelFormat};
+use parallax::format::{
+    ColorInfo, ColorMatrix, ColorRange, DisplayGeometry, PixelFormat, Rotation,
+};
 use parallax::memory::SharedArena;
 use parallax::metadata::Metadata;
 use parallax::video::{VideoFrame, color};
@@ -442,4 +444,141 @@ fn an_unsignalled_frame_falls_back_to_the_height_heuristic() {
             );
         }
     }
+}
+
+/// A rotated frame comes out turned, and an anamorphic one comes out
+/// stretched (#266).
+///
+/// Both are pixel questions, so this is the test that can actually answer
+/// them. The frame is half red and half blue along one axis; where those
+/// halves land is the whole assertion.
+#[test]
+fn a_rotated_frame_is_drawn_the_way_up_the_container_asked_for() {
+    let Some((device, queue)) = device() else {
+        return;
+    };
+    const SIZE: u32 = 32;
+
+    // Left half red, right half blue, in a square frame so the rotation is
+    // the only thing that moves anything.
+    let split = |display: Option<DisplayGeometry>| {
+        let (w, h) = (SIZE, SIZE);
+        let luma = (w * h) as usize;
+        let chroma = (w.div_ceil(2) * h.div_ceil(2)) as usize;
+        let len = luma + 2 * chroma;
+        let arena = SharedArena::new(len.next_power_of_two().max(4096), 2).expect("arena");
+        let mut slot = arena.acquire().expect("slot");
+        {
+            let data = &mut slot.data_mut()[..len];
+            // BT.601 limited red (81, 90, 240) and blue (41, 240, 110).
+            for y in 0..h as usize {
+                for x in 0..w as usize {
+                    data[y * w as usize + x] = if x < w as usize / 2 { 81 } else { 41 };
+                }
+            }
+            let cw = w.div_ceil(2) as usize;
+            for y in 0..h.div_ceil(2) as usize {
+                for x in 0..cw {
+                    let left = x < cw / 2;
+                    data[luma + y * cw + x] = if left { 90 } else { 240 };
+                    data[luma + chroma + y * cw + x] = if left { 240 } else { 110 };
+                }
+            }
+        }
+        let mut meta = Metadata::default();
+        meta.set_video_dims(w, h, PixelFormat::I420);
+        if let Some(display) = display {
+            meta.set_display_geometry(display);
+        }
+        VideoFrame::from_buffer(&Buffer::new(MemoryHandle::with_len(slot, len), meta))
+            .expect("a well-formed I420 frame")
+    };
+
+    let reddish = |px: [u8; 4]| px[0] > 128 && px[2] < 128;
+    let bluish = |px: [u8; 4]| px[2] > 128 && px[0] < 128;
+
+    // Upright: red on the left.
+    let px = render(
+        &device,
+        &queue,
+        &VideoPrimitive {
+            id: 300,
+            frame: Some(split(None)),
+            srgb_target: false,
+        },
+        SIZE,
+    );
+    assert!(reddish(at(&px, SIZE, 6, 16)), "upright: red on the left");
+    assert!(bluish(at(&px, SIZE, 25, 16)), "upright: blue on the right");
+
+    // A quarter turn clockwise puts the left half on top.
+    let px = render(
+        &device,
+        &queue,
+        &VideoPrimitive {
+            id: 301,
+            frame: Some(split(Some(DisplayGeometry {
+                par: (1, 1),
+                rotation: Rotation::Cw90,
+            }))),
+            srgb_target: false,
+        },
+        SIZE,
+    );
+    assert!(reddish(at(&px, SIZE, 16, 6)), "turned: red on top");
+    assert!(bluish(at(&px, SIZE, 16, 25)), "turned: blue on the bottom");
+
+    // And half a turn swaps the halves outright.
+    let px = render(
+        &device,
+        &queue,
+        &VideoPrimitive {
+            id: 302,
+            frame: Some(split(Some(DisplayGeometry {
+                par: (1, 1),
+                rotation: Rotation::Cw180,
+            }))),
+            srgb_target: false,
+        },
+        SIZE,
+    );
+    assert!(bluish(at(&px, SIZE, 6, 16)), "half turn: blue on the left");
+    assert!(
+        reddish(at(&px, SIZE, 25, 16)),
+        "half turn: red on the right"
+    );
+}
+
+/// Non-square pixels widen the picture rather than the window's bars (#266).
+#[test]
+fn anamorphic_pixels_stretch_the_picture_not_the_bars() {
+    let Some((device, queue)) = device() else {
+        return;
+    };
+    const SIZE: u32 = 64;
+
+    // A square white frame in a square viewport fills it edge to edge.
+    let square = VideoPrimitive {
+        id: 400,
+        frame: Some(i420(SIZE, SIZE, 235, 128, 128)),
+        srgb_target: false,
+    };
+    let px = render(&device, &queue, &square, SIZE);
+    assert_eq!(at(&px, SIZE, 1, 32)[0], 255, "square: no bars");
+
+    // The same frame at 2:1 pixels is twice as wide as it is tall, so in the
+    // same square viewport it is width-bound and gains bars top and bottom.
+    let mut frame = i420(SIZE, SIZE, 235, 128, 128);
+    frame.display = Some(DisplayGeometry {
+        par: (2, 1),
+        rotation: Rotation::None,
+    });
+    let wide = VideoPrimitive {
+        id: 401,
+        frame: Some(frame),
+        srgb_target: false,
+    };
+    let px = render(&device, &queue, &wide, SIZE);
+    assert_eq!(at(&px, SIZE, 32, 1), [0, 0, 0, 255], "anamorphic: top bar");
+    assert_eq!(at(&px, SIZE, 1, 32)[0], 255, "anamorphic: full width");
 }

@@ -12,7 +12,7 @@ use iced::wgpu;
 use iced::widget::shader::{self, Viewport};
 use iced::{Rectangle, Size};
 
-use parallax::format::PixelFormat;
+use parallax::format::{DisplayGeometry, PixelFormat};
 use parallax::video::{self, TexelFormat, VideoFrame, layout};
 
 /// Frames the renderer keeps alive beyond the one it is drawing.
@@ -366,8 +366,10 @@ impl shader::Primitive for VideoPrimitive {
             (bounds.width * scale).max(1.0),
             (bounds.height * scale).max(1.0),
         );
+        let geometry = frame.resolved_display();
         let fit = fit_rect(
             Size::new(frame.width as f32, frame.height as f32),
+            geometry,
             Size::new(bw, bh),
         );
 
@@ -378,7 +380,13 @@ impl shader::Primitive for VideoPrimitive {
             queue.write_buffer(
                 &set.params,
                 0,
-                &video::shader_params(layout, self.srgb_target, fit, frame.resolved_color()),
+                &video::shader_params(
+                    layout,
+                    self.srgb_target,
+                    fit,
+                    frame.resolved_color(),
+                    geometry.rotation,
+                ),
             );
         }
     }
@@ -397,16 +405,17 @@ impl shader::Primitive for VideoPrimitive {
 /// Aspect-preserving fit, expressed the way the shader wants it: the
 /// picture's rect inside the viewport in 0..1 space.
 ///
-/// The integer arithmetic is [`parallax::video::fit::letterbox_rect`], the
-/// same function `AutoVideoSink` uses, so both put the picture in the same
-/// place.
-fn fit_rect(src: Size, dst: Size) -> [f32; 4] {
+/// The integer arithmetic is [`parallax::video::fit::display_rect`], the same
+/// function `AutoVideoSink` uses, so both put the picture in the same place —
+/// including the pixel aspect ratio and rotation the stream declared (#266).
+fn fit_rect(src: Size, display: DisplayGeometry, dst: Size) -> [f32; 4] {
     if src.width <= 0.0 || src.height <= 0.0 || dst.width <= 0.0 || dst.height <= 0.0 {
         return [0.0, 0.0, 1.0, 1.0];
     }
-    let (x0, y0, w, h) = video::fit::letterbox_rect(
+    let (x0, y0, w, h) = video::fit::display_rect(
         src.width as usize,
         src.height as usize,
+        display,
         dst.width as usize,
         dst.height as usize,
     );
@@ -431,7 +440,11 @@ mod tests {
     #[test]
     fn a_matching_aspect_fills_the_widget() {
         approx(
-            fit_rect(Size::new(1920.0, 1080.0), Size::new(1280.0, 720.0)),
+            fit_rect(
+                Size::new(1920.0, 1080.0),
+                DisplayGeometry::default(),
+                Size::new(1280.0, 720.0),
+            ),
             [0.0, 0.0, 1.0, 1.0],
         );
     }
@@ -439,13 +452,21 @@ mod tests {
     #[test]
     fn a_taller_widget_gets_bars_top_and_bottom() {
         // 16:9 into 16:10 — the same case `letterbox_rect`'s golden test uses.
-        let fit = fit_rect(Size::new(1920.0, 1080.0), Size::new(1920.0, 1200.0));
+        let fit = fit_rect(
+            Size::new(1920.0, 1080.0),
+            DisplayGeometry::default(),
+            Size::new(1920.0, 1200.0),
+        );
         approx(fit, [0.0, 0.05, 1.0, 0.9]);
     }
 
     #[test]
     fn a_wider_widget_gets_bars_left_and_right() {
-        let fit = fit_rect(Size::new(1000.0, 1000.0), Size::new(2000.0, 1000.0));
+        let fit = fit_rect(
+            Size::new(1000.0, 1000.0),
+            DisplayGeometry::default(),
+            Size::new(2000.0, 1000.0),
+        );
         approx(fit, [0.25, 0.0, 0.5, 1.0]);
     }
 
@@ -454,11 +475,19 @@ mod tests {
         // Before layout has run, bounds can legitimately be zero — dividing
         // by that inside `letterbox_rect` would panic.
         approx(
-            fit_rect(Size::new(0.0, 0.0), Size::new(100.0, 100.0)),
+            fit_rect(
+                Size::new(0.0, 0.0),
+                DisplayGeometry::default(),
+                Size::new(100.0, 100.0),
+            ),
             [0.0, 0.0, 1.0, 1.0],
         );
         approx(
-            fit_rect(Size::new(100.0, 100.0), Size::new(0.0, 0.0)),
+            fit_rect(
+                Size::new(100.0, 100.0),
+                DisplayGeometry::default(),
+                Size::new(0.0, 0.0),
+            ),
             [0.0, 0.0, 1.0, 1.0],
         );
     }

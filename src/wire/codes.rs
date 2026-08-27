@@ -25,8 +25,8 @@
 //! attached rather than a refactor's side effect.
 
 use crate::format::{
-    AudioCodec, ColorMatrix, ColorPrimaries, ColorRange, PixelFormat, RtpEncoding, SampleFormat,
-    TransferFunction, VideoCodec,
+    AudioCodec, ColorMatrix, ColorPrimaries, ColorRange, PixelFormat, Rotation, RtpEncoding,
+    SampleFormat, TransferFunction, VideoCodec,
 };
 
 // ---------------------------------------------------------------------------
@@ -300,6 +300,22 @@ pub fn transfer_from_code(code: u8) -> Option<TransferFunction> {
     })
 }
 
+/// Stable wire code for a [`Rotation`] — its quarter-turn count.
+pub fn rotation_to_code(rotation: Rotation) -> u8 {
+    rotation as u8
+}
+
+/// [`Rotation`] for a stable wire code.
+pub fn rotation_from_code(code: u8) -> Option<Rotation> {
+    Some(match code {
+        0 => Rotation::None,
+        1 => Rotation::Cw90,
+        2 => Rotation::Cw180,
+        3 => Rotation::Cw270,
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -417,6 +433,16 @@ mod tests {
         for (range, code) in [(CR::Unspecified, 0), (CR::Limited, 1), (CR::Full, 2)] {
             assert_eq!(color_range_to_code(range), code, "{range:?}");
             assert_eq!(color_range_from_code(code), Some(range));
+        }
+
+        for (rotation, code) in [
+            (Rotation::None, 0),
+            (Rotation::Cw90, 1),
+            (Rotation::Cw180, 2),
+            (Rotation::Cw270, 3),
+        ] {
+            assert_eq!(rotation_to_code(rotation), code, "{rotation:?}");
+            assert_eq!(rotation_from_code(code), Some(rotation));
         }
 
         for (primaries, code) in [

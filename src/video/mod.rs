@@ -102,18 +102,22 @@ pub const PARAMS_SIZE: u64 = 64;
 /// `color` should already be resolved (#265): an `Unspecified` matrix falls
 /// back to BT.601 here, which is the historical assumption but a worse answer
 /// than the caller's own — [`VideoFrame::resolved_color`] is what the
-/// backends in this tree pass.
+/// backends in this tree pass. `rotation` (#266) is the turn `fit` was
+/// already computed for: the shader inverts it when sampling, so the two must
+/// come from the same [`DisplayGeometry`](crate::format::DisplayGeometry).
 pub fn shader_params(
     layout: u32,
     srgb_target: bool,
     fit: [f32; 4],
     color: crate::format::ColorInfo,
+    rotation: crate::format::Rotation,
 ) -> [u8; PARAMS_SIZE as usize] {
     let mut out = [0u8; PARAMS_SIZE as usize];
     out[0..4].copy_from_slice(&layout.to_le_bytes());
     out[4..8].copy_from_slice(&u32::from(srgb_target).to_le_bytes());
-    // bytes 8..16 are the two pads WGSL needs to put `fit` on a 16-byte
-    // boundary.
+    // Quarter-turns (#266). This lives in one of the two words WGSL needed
+    // as padding to put `fit` on a 16-byte boundary, so it cost nothing.
+    out[8..12].copy_from_slice(&u32::from(rotation as u8).to_le_bytes());
     let mut put = |at: usize, v: [f32; 4]| {
         for (i, x) in v.iter().enumerate() {
             out[at + i * 4..at + i * 4 + 4].copy_from_slice(&x.to_le_bytes());
@@ -145,6 +149,7 @@ mod tests {
         assert!(PRESENT_WGSL.contains("    planes: u32,"));
         assert!(PRESENT_WGSL.contains("    coeffs: vec4<f32>,"));
         assert!(PRESENT_WGSL.contains("    expansion: vec4<f32>,"));
+        assert!(PRESENT_WGSL.contains("    rotation: u32,"));
         assert!(
             PRESENT_WGSL.contains("src/video/color.rs"),
             "the shader must point at the module that owns its constants"
@@ -172,7 +177,13 @@ mod tests {
             range: ColorRange::Limited,
             ..ColorInfo::default()
         };
-        let p = shader_params(LAYOUT_PLANAR, false, [0.0, 0.0, 1.0, 1.0], hd);
+        let p = shader_params(
+            LAYOUT_PLANAR,
+            false,
+            [0.0, 0.0, 1.0, 1.0],
+            hd,
+            crate::format::Rotation::None,
+        );
         assert_eq!(p.len(), PARAMS_SIZE as usize);
         for (i, c) in color::coefficients(ColorMatrix::Bt709).iter().enumerate() {
             assert_eq!(read(&p, 32 + i * 4), *c);
@@ -188,8 +199,16 @@ mod tests {
             range: ColorRange::Full,
             ..hd
         };
-        let p = shader_params(LAYOUT_PLANAR, true, [0.0, 0.0, 1.0, 1.0], full);
+        let p = shader_params(
+            LAYOUT_PLANAR,
+            true,
+            [0.0, 0.0, 1.0, 1.0],
+            full,
+            crate::format::Rotation::Cw270,
+        );
         assert_eq!(u32::from_le_bytes(p[4..8].try_into().unwrap()), 1);
+        // Quarter-turns, in the word that used to be padding.
+        assert_eq!(u32::from_le_bytes(p[8..12].try_into().unwrap()), 3);
         assert_eq!(read(&p, 48), 0.0);
         assert_eq!(read(&p, 52), 1.0);
         assert_eq!(read(&p, 56), 1.0);

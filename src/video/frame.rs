@@ -28,6 +28,8 @@ pub struct FrameView {
     /// What the stream said about its colour (#265). `None` = nothing said,
     /// and a presenter falls back to its own guess.
     pub color: Option<crate::format::ColorInfo>,
+    /// Pixel aspect ratio and rotation (#266). `None` = square and upright.
+    pub display: Option<crate::format::DisplayGeometry>,
 }
 
 impl FrameView {
@@ -101,6 +103,7 @@ impl FrameView {
             format,
             layout,
             color: meta.color_info(),
+            display: meta.display_geometry(),
         })
     }
 }
@@ -123,6 +126,8 @@ pub struct VideoFrame {
     pub layout: Option<PlaneLayout>,
     /// What the stream said about its colour (#265).
     pub color: Option<crate::format::ColorInfo>,
+    /// Pixel aspect ratio and rotation (#266). `None` = square and upright.
+    pub display: Option<crate::format::DisplayGeometry>,
 }
 
 impl VideoFrame {
@@ -141,6 +146,7 @@ impl VideoFrame {
             format: view.format,
             layout: view.layout,
             color: view.color,
+            display: view.display,
         }
     }
 
@@ -152,7 +158,13 @@ impl VideoFrame {
             format: self.format,
             layout: self.layout,
             color: self.color,
+            display: self.display,
         }
+    }
+
+    /// How to present this frame: what the stream said, or square and upright.
+    pub fn resolved_display(&self) -> crate::format::DisplayGeometry {
+        self.display.unwrap_or_default()
     }
 
     /// The colour to render with: what the stream said, or the height

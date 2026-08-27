@@ -539,6 +539,16 @@ pub struct Metadata {
     /// explicitly.
     pub color: Option<crate::format::ColorInfo>,
 
+    /// How to turn this frame into a picture: pixel aspect ratio and
+    /// rotation (#266). `None` = nobody looked, which a consumer treats the
+    /// same as the identity but a forwarding element can pass through
+    /// unchanged.
+    ///
+    /// Survives a geometry rewrite for the same reason `color` does: a
+    /// converted or scaled frame has the same pixels' shape and the same way
+    /// up. A *rotating* element is what clears it, and there is none yet.
+    pub display: Option<crate::format::DisplayGeometry>,
+
     /// Byte offset in the original source (optional).
     pub offset: Option<u64>,
 
@@ -912,6 +922,16 @@ impl Metadata {
     /// What the stream said about its colour, if anything.
     pub fn color_info(&self) -> Option<crate::format::ColorInfo> {
         self.color
+    }
+
+    /// Declare the frame's pixel aspect ratio and rotation (#266).
+    pub fn set_display_geometry(&mut self, display: crate::format::DisplayGeometry) {
+        self.display = Some(display);
+    }
+
+    /// How to turn this frame into a picture, if the stream said.
+    pub fn display_geometry(&self) -> Option<crate::format::DisplayGeometry> {
+        self.display
     }
 
     /// The raw video pixel format, if [`format`](Self::format) carries one.

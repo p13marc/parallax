@@ -480,6 +480,7 @@ mod tests {
                 format: PixelFormat::Rgba,
                 layout: None,
                 color: None,
+                display: None,
             },
             target: ClockTime::from_millis(target_ms),
             generation,

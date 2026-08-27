@@ -911,6 +911,8 @@ impl AsyncSink for AutoVideoSink {
             // presenter falls back to the height heuristic; a file that
             // signalled its matrix outranks that guess.
             color: ctx.buffer().metadata().color_info(),
+            // Non-square pixels and rotation (#266), same route.
+            display: ctx.buffer().metadata().display_geometry(),
         };
 
         // A full channel means the display cannot keep up. Shed this frame and

@@ -29,9 +29,9 @@
 
 use parallax::clock::ClockTime;
 use parallax::format::{
-    AudioCodec, AudioFormat, ColorInfo, ColorMatrix, ColorPrimaries, ColorRange, Framerate,
-    MediaFormat, PixelFormat, PlaneDesc, PlaneLayout, RtpEncoding, RtpFormat, SampleFormat,
-    TransferFunction, VideoCodec, VideoFormat,
+    AudioCodec, AudioFormat, ColorInfo, ColorMatrix, ColorPrimaries, ColorRange, DisplayGeometry,
+    Framerate, MediaFormat, PixelFormat, PlaneDesc, PlaneLayout, Rotation, RtpEncoding, RtpFormat,
+    SampleFormat, TransferFunction, VideoCodec, VideoFormat,
 };
 use parallax::memory::SharedIpcSlotRef;
 use parallax::metadata::{BufferFlags, Metadata, RtpMeta};
@@ -66,6 +66,7 @@ fn strip_projection_losses(meta: &Metadata) -> Metadata {
     clean.rtp = stripped.rtp;
     clean.planes = stripped.planes;
     clean.color = stripped.color;
+    clean.display = stripped.display;
     clean
 }
 
@@ -104,6 +105,7 @@ fn assert_projections_agree(original: &Metadata, what: &str) {
         assert_eq!(got.rtp, expected.rtp, "{what}/{label}: rtp");
         assert_eq!(got.planes, expected.planes, "{what}/{label}: planes");
         assert_eq!(got.color, expected.color, "{what}/{label}: color");
+        assert_eq!(got.display, expected.display, "{what}/{label}: display");
     }
 }
 
@@ -188,6 +190,41 @@ fn every_format() -> Vec<(&'static str, Metadata)> {
         m.set_coded_video_dims(VideoCodec::H264, 1280, 720);
         m.color = color;
         out.push(("coded + colour", m));
+    }
+
+    // Display geometry (#266). Absent, identity-but-declared, anamorphic,
+    // rotated, and both at once — the identity case matters because `None`
+    // and `Some(default)` are different claims and both must survive.
+    for display in [
+        None,
+        Some(DisplayGeometry::default()),
+        Some(DisplayGeometry {
+            par: (32, 27),
+            rotation: Rotation::None,
+        }),
+        Some(DisplayGeometry {
+            par: (1, 1),
+            rotation: Rotation::Cw90,
+        }),
+        Some(DisplayGeometry {
+            par: (59, 54),
+            rotation: Rotation::Cw270,
+        }),
+    ] {
+        let mut m = base();
+        m.format = Some(MediaFormat::VideoRaw(VideoFormat {
+            width: 720,
+            height: 480,
+            pixel_format: PixelFormat::I420,
+            framerate: Framerate::new(30000, 1001),
+        }));
+        m.display = display;
+        out.push(("video raw + display geometry", m));
+
+        let mut m = base();
+        m.set_coded_video_dims(VideoCodec::H264, 720, 480);
+        m.display = display;
+        out.push(("coded + display geometry", m));
     }
 
     for codec in [

@@ -47,6 +47,8 @@ pub(crate) struct DisplayFrame {
     pub(crate) layout: Option<crate::format::PlaneLayout>,
     /// What the stream said about its colour (#265). `None` = nothing said.
     pub(crate) color: Option<crate::format::ColorInfo>,
+    /// Pixel aspect ratio and rotation (#266). `None` = square and upright.
+    pub(crate) display: Option<crate::format::DisplayGeometry>,
     /// Which flush generation this frame belongs to (#265). A flushing seek
     /// bumps the sink's counter, and the display loop skips anything stamped
     /// below it — otherwise the queued pre-seek frames are blitted *after*
@@ -61,6 +63,11 @@ impl DisplayFrame {
         let mut color = self.color.unwrap_or_default();
         color.matrix = color.matrix_or(crate::video::color::matrix_for_height(self.height));
         color
+    }
+
+    /// How to present this frame: what the stream said, or square and upright.
+    pub(crate) fn resolved_display(&self) -> crate::format::DisplayGeometry {
+        self.display.unwrap_or_default()
     }
 }
 
@@ -147,7 +154,7 @@ pub fn gpu_dmabuf_import_available() -> bool {
 // wgpu-free so a host toolkit on a different graphics stack can share it —
 // including the colour matrices, which now reach the shader through
 // `video::shader_mode_for` rather than being re-derived here.
-pub(crate) use crate::video::fit::letterbox_rect;
+pub(crate) use crate::video::fit::display_rect;
 
 // ============================================================================
 // CPU backend (softbuffer)
@@ -182,6 +189,9 @@ pub(crate) struct CpuBackend {
         crate::converters::VideoConvert,
     )>,
     warned_yuv: bool,
+    /// Rotation is a GPU-only feature (#266); this keeps the explanation to
+    /// one line per run rather than one per frame.
+    warned_rotation: bool,
 }
 
 impl CpuBackend {
@@ -198,6 +208,7 @@ impl CpuBackend {
             repack_scratch: Vec::new(),
             converter: None,
             warned_yuv: false,
+            warned_rotation: false,
         })
     }
 
@@ -291,10 +302,24 @@ impl RenderBackend for CpuBackend {
             }
             _ => &self.scratch,
         };
+        // Named `geometry`, not `display`: `tracing`'s macros bind `display`
+        // as their own field-value helper, and the warning below would fail
+        // to compile against a local of that name.
+        let geometry = frame.resolved_display();
+        if geometry.rotation != crate::format::Rotation::None && !self.warned_rotation {
+            self.warned_rotation = true;
+            tracing::warn!(
+                "autovideosink/softbuffer: this stream is rotated {degrees} degrees and \
+                 will be drawn upright — a per-pixel software rotate is not worth \
+                 writing for the fallback path; the GPU backend applies it (#266)",
+                degrees = geometry.rotation.degrees()
+            );
+        }
         blit_frame(
             src,
             frame.width as usize,
             frame.height as usize,
+            geometry.par,
             bgra,
             &mut buffer,
             width as usize,
@@ -321,6 +346,7 @@ fn blit_frame(
     src: &[u8],
     src_width: usize,
     src_height: usize,
+    par: (u32, u32),
     bgra: bool,
     buffer: &mut [u32],
     dst_width: usize,
@@ -340,8 +366,21 @@ fn blit_frame(
     // Aspect-preserving letterbox: scale to fit, center, black bars around.
     // Stretching to the window distorted anything whose aspect ratio did not
     // match — obvious the moment a 16:9 stream met a fullscreen 16:10 panel.
-    let (x0, y0, out_width, out_height) =
-        letterbox_rect(src_width, src_height, dst_width, dst_height);
+    //
+    // The pixel aspect ratio (#266) enters here and nowhere else: it changes
+    // the *rect*, and the nearest-neighbour maps below already scale an
+    // arbitrary `out_width` back onto `src_width`, so an anamorphic frame is
+    // stretched by the same code that scales any other.
+    let (x0, y0, out_width, out_height) = display_rect(
+        src_width,
+        src_height,
+        crate::format::DisplayGeometry {
+            par,
+            rotation: crate::format::Rotation::None,
+        },
+        dst_width,
+        dst_height,
+    );
 
     if cache.key != (src_width, out_width) {
         cache.key = (src_width, out_width);
@@ -425,6 +464,7 @@ mod tests {
             format,
             layout: None,
             color: None,
+            display: None,
         }
     }
 
@@ -449,6 +489,7 @@ mod tests {
             format,
             layout: None,
             color: None,
+            display: None,
         }
     }
 
@@ -457,6 +498,7 @@ mod tests {
             frame.data.as_bytes(),
             frame.width as usize,
             frame.height as usize,
+            frame.resolved_display().par,
             frame.format == PixelFormat::Bgra,
             buffer,
             w,

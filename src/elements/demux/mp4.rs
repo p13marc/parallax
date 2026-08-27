@@ -204,6 +204,8 @@ pub struct Mp4VideoInfo {
     pub frame_rate: Option<f64>,
     /// What the sample entry's `colr` box said (#265), if it carried one.
     pub color: Option<crate::format::ColorInfo>,
+    /// Pixel aspect ratio (`pasp`) and rotation (`tkhd` matrix), #266.
+    pub display: Option<crate::format::DisplayGeometry>,
 }
 
 /// Audio track information.
@@ -623,6 +625,7 @@ impl<R: Read + Seek> Mp4Demux<R> {
                     height: track.height() as u32,
                     frame_rate: Some(track.frame_rate()),
                     color: extra.and_then(|e| e.color),
+                    display: extra.and_then(|e| e.display),
                 })
             } else {
                 None
@@ -1153,6 +1156,12 @@ impl<R: Read + Seek> Mp4Demux<R> {
                 // frame it produces — the demuxer never emits raw video.
                 if let Some(color) = track.video_info.as_ref().and_then(|v| v.color) {
                     metadata.set_color_info(color);
+                }
+                // Non-square pixels and rotation (#266) ride the encoded
+                // buffer alongside the colour, and reach the display the same
+                // way — via the decoder's inherited metadata.
+                if let Some(display) = track.video_info.as_ref().and_then(|v| v.display) {
+                    metadata.set_display_geometry(display);
                 }
             } else if let Some(codec) = track.codec.audio_codec() {
                 metadata.format = Some(crate::format::MediaFormat::Audio(codec));

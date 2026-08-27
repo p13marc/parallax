@@ -7,7 +7,7 @@
 //! (8.3 MB read + 8.3 MB written) — collapses into one ~3.1 MB texture
 //! upload the driver performs.
 
-use super::{DisplayFrame, RenderBackend, letterbox_rect};
+use super::{DisplayFrame, RenderBackend, display_rect};
 use crate::error::{Error, Result};
 use crate::format::PixelFormat;
 use crate::video::layout::{TexelFormat, plane_uploads};
@@ -394,7 +394,13 @@ impl WgpuBackend {
             self.queue.write_buffer(
                 &self.params,
                 0,
-                &crate::video::shader_params(layout, false, WHOLE_FRAME, frame.resolved_color()),
+                &crate::video::shader_params(
+                    layout,
+                    false,
+                    WHOLE_FRAME,
+                    frame.resolved_color(),
+                    frame.resolved_display().rotation,
+                ),
             );
             return Ok(true);
         }
@@ -483,7 +489,13 @@ impl WgpuBackend {
         self.queue.write_buffer(
             &self.params,
             0,
-            &crate::video::shader_params(layout_kind, false, WHOLE_FRAME, frame.resolved_color()),
+            &crate::video::shader_params(
+                layout_kind,
+                false,
+                WHOLE_FRAME,
+                frame.resolved_color(),
+                frame.resolved_display().rotation,
+            ),
         );
 
         if self.imported.len() >= IMPORT_CACHE
@@ -583,7 +595,13 @@ impl WgpuBackend {
         self.queue.write_buffer(
             &self.params,
             0,
-            &crate::video::shader_params(layout_kind, false, WHOLE_FRAME, frame.resolved_color()),
+            &crate::video::shader_params(
+                layout_kind,
+                false,
+                WHOLE_FRAME,
+                frame.resolved_color(),
+                frame.resolved_display().rotation,
+            ),
         );
 
         let view = |t: &wgpu::Texture| t.create_view(&wgpu::TextureViewDescriptor::default());
@@ -776,9 +794,14 @@ impl RenderBackend for WgpuBackend {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            let (x0, y0, out_w, out_h) = letterbox_rect(
+            // The picture's rect, not the frame's: non-square pixels and a
+            // rotation change the shape on screen (#266). The shader inverts
+            // the rotation when sampling; this is the half that reserves the
+            // right space for it.
+            let (x0, y0, out_w, out_h) = display_rect(
                 frame.width as usize,
                 frame.height as usize,
+                frame.resolved_display(),
                 self.config.width as usize,
                 self.config.height as usize,
             );

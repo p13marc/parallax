@@ -52,6 +52,8 @@ const PRESENCE_META_OVERFLOW: u8 = 1 << 2;
 const PRESENCE_PLANES: u8 = 1 << 3;
 /// `Metadata.color` is present (#265).
 const PRESENCE_COLOR: u8 = 1 << 4;
+/// `Metadata.display` is present (#266).
+const PRESENCE_DISPLAY: u8 = 1 << 5;
 
 /// One buffer's worth of wire state: the slot reference plus every fixed
 /// metadata field. 192 bytes, plain old data.
@@ -123,10 +125,15 @@ pub struct IpcDescriptor {
     /// four bytes out of forty-four, so the descriptor is still 192 bytes and
     /// `IPC_RING_VERSION` is untouched.
     pub color: [u8; 4],
+    /// Pixel aspect ratio as `(numerator, denominator)` (#266), valid iff
+    /// presence bit 5.
+    pub par: [u32; 2],
+    /// Rotation in quarter-turns clockwise (#266), valid iff presence bit 5.
+    pub rotation: u8,
     /// Spare. 192 rather than the bytes the fields need: three whole cache
     /// lines, and room so the next field to cross a process boundary is not
     /// another layout break.
-    _pad: [u8; 40],
+    _pad: [u8; 31],
 }
 
 const _: () = assert!(std::mem::size_of::<IpcDescriptor>() == 192);
@@ -158,6 +165,8 @@ impl IpcDescriptor {
             flags: meta.flags.bits(),
             presence: 0,
             color: [0; 4],
+            par: [0; 2],
+            rotation: 0,
             fmt_tag: codes::FMT_NONE,
             rtp_pt: 0,
             rtp_seq: 0,
@@ -172,7 +181,7 @@ impl IpcDescriptor {
             fmt_e: 0,
             plane_offset: [0; MAX_PLANES],
             plane_stride: [0; MAX_PLANES],
-            _pad: [0; 40],
+            _pad: [0; 31],
         };
         if meta.offset.is_some() {
             d.presence |= PRESENCE_OFFSET;
@@ -208,6 +217,11 @@ impl IpcDescriptor {
                 codes::transfer_to_code(color.transfer),
             ];
             d.presence |= PRESENCE_COLOR;
+        }
+        if let Some(display) = meta.display {
+            d.par = [display.par.0, display.par.1];
+            d.rotation = codes::rotation_to_code(display.rotation);
+            d.presence |= PRESENCE_DISPLAY;
         }
         match &meta.format {
             None => {}
@@ -314,6 +328,13 @@ impl IpcDescriptor {
                     .ok_or_else(|| bad_wire(format!("ColorPrimaries {p}")))?,
                 transfer: codes::transfer_from_code(t)
                     .ok_or_else(|| bad_wire(format!("TransferFunction {t}")))?,
+            });
+        }
+        if self.presence & PRESENCE_DISPLAY != 0 {
+            meta.display = Some(crate::format::DisplayGeometry {
+                par: (self.par[0], self.par[1]),
+                rotation: codes::rotation_from_code(self.rotation)
+                    .ok_or_else(|| bad_wire(format!("Rotation {}", self.rotation)))?,
             });
         }
         meta.format = match self.fmt_tag {
