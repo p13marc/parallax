@@ -12,6 +12,7 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 
@@ -179,6 +180,27 @@ pub struct VideoStream {
     pub width: u32,
     /// Coded height, or 0 when the container did not say.
     pub height: u32,
+    /// Frames per second, when the container said.
+    ///
+    /// `None` is *unknown*, and has to stay distinguishable from a real rate:
+    /// nothing on the buffer path carries a framerate at all — the demuxers
+    /// emit encoded buffers, whose `MediaFormat::Video` has no slot for one,
+    /// and `Framerate::default()` is 30 fps, so a decoded frame cannot be
+    /// asked either. This is read from the container header and is the only
+    /// honest source the player has. Frame stepping refuses rather than
+    /// guessing 30 (#281).
+    pub frame_rate: Option<f64>,
+}
+
+impl VideoStream {
+    /// How long one frame lasts, when the framerate is known and sane.
+    pub fn frame_duration(&self) -> Option<Duration> {
+        let fps = self.frame_rate?;
+        // A container that states 0 fps, or something absurd, has said
+        // nothing useful. 1000 fps is well past any real file and keeps the
+        // arithmetic away from zero-length steps.
+        (fps.is_finite() && fps > 0.0 && fps <= 1000.0).then(|| Duration::from_secs_f64(1.0 / fps))
+    }
 }
 
 /// The selected audio track.
@@ -334,6 +356,7 @@ fn describe_mp4(path: &Path, demux: &Mp4Demux<BufReader<File>>) -> SourceDescrip
                 codec: t.codec.into(),
                 width: info.map(|i| i.width).unwrap_or(0),
                 height: info.map(|i| i.height).unwrap_or(0),
+                frame_rate: info.and_then(|i| i.frame_rate),
             }
         });
     let audio = demux
@@ -372,6 +395,7 @@ fn describe_mkv(path: &Path, demux: &MkvDemux<BufReader<File>>) -> SourceDescrip
             codec: (&t.codec).into(),
             width: info.map(|i| i.width).unwrap_or(0),
             height: info.map(|i| i.height).unwrap_or(0),
+            frame_rate: info.and_then(|i| i.frame_rate),
         }
     });
     let audio = demux.audio_track().and_then(|t| {
@@ -795,4 +819,45 @@ impl Engine {
             Err(_) => tracing::warn!("pipeline did not stop within 5s"),
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The 2 s H.264/AAC fixture: 20 frames at 10 fps, keyframe every 5.
+    fn fixture() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/tiny_h264_aac.mkv")
+    }
+
+    #[test]
+    fn the_container_states_a_frame_rate_and_it_reaches_the_transport() {
+        let probed = probe(&fixture()).expect("the fixture probes");
+        let video = probed.description.video.expect("it has video");
+        // 10 fps, so one frame is 100 ms — the step size (#281).
+        assert_eq!(
+            video.frame_duration(),
+            Some(Duration::from_millis(100)),
+            "frame rate {:?} did not survive the probe",
+            video.frame_rate
+        );
+    }
+
+    /// Why there is no end-to-end frame-step test here.
+    ///
+    /// The player links the demuxer to the decoder 24 buffers deep
+    /// (`Engine::build`), and the only fixture in the tree is two seconds —
+    /// twenty frames. The whole file therefore fits in the link buffer, so
+    /// the demuxer reads it to EOS within milliseconds of `start()` and there
+    /// is nothing left to reposition by the time a seek could be issued;
+    /// frames then drain out of the buffers at pace and playback looks
+    /// perfectly normal. `tests/av_sync_tests.rs` hits the same wall and
+    /// works around it by building its own pipeline with 4/8-deep links,
+    /// which is exactly what makes it *not* the player's pipeline.
+    ///
+    /// So the arithmetic is tested here and the seek behaviour it depends on
+    /// — ACCURATE landing on the requested time rather than a keyframe — is
+    /// tested against a real MKV in `av_sync_tests`. Proving the two together
+    /// needs a fixture longer than the link depth.
+    const _: () = ();
 }

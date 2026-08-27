@@ -26,7 +26,7 @@ use iced::widget::{center, container, stack};
 use iced::{Element, Subscription, Task, Theme};
 
 use parallax::clock::ClockTime;
-use parallax::event::SeekEvent;
+use parallax::event::{SeekEvent, SeekFlags};
 use parallax::pipeline::MessageKind;
 use parallax::video::FrameMailbox;
 
@@ -150,6 +150,20 @@ impl Stage {
     fn accepts_probe(&self, seq: u64) -> bool {
         matches!(self, Self::Probing(request) if request.seq == seq)
     }
+}
+
+/// Where a step of `frames` from `from` lands, in nanoseconds.
+///
+/// Clamped at both ends, and the far end matters: a duration of `NONE` means
+/// *unknown* — an MKV with no Segment Duration — not an empty file, so it
+/// must not clamp to zero. That is the same trap `seek_relative` documents.
+fn step_target(from: i64, frame: Duration, frames: i32, duration: ClockTime) -> u64 {
+    let step = frame.as_nanos() as i64 * i64::from(frames);
+    let mut target = from.saturating_add(step).max(0);
+    if let Some(total) = duration.to_option() {
+        target = target.min(total.nanos().saturating_sub(1) as i64);
+    }
+    target as u64
 }
 
 /// How far one scroll gesture moves the volume, in dB.
@@ -397,6 +411,8 @@ enum Message {
     TogglePause,
     /// Seek by a number of seconds, relative to where the transport is headed.
     SeekBy(i64),
+    /// Step by a number of frames, pausing first.
+    StepBy(i32),
     /// Seek to a fraction of the duration — the scrubber.
     SeekTo(f32),
     /// Set the volume in dB — the slider.
@@ -446,6 +462,14 @@ struct SeekState {
     in_flight: Option<(u64, u64)>,
     /// When it went out, for the supersede timeout.
     sent: Option<Instant>,
+    /// Whether the pending seek must land on the frame asked for (#281).
+    ///
+    /// A scrub wants the nearest keyframe — it is faster and nobody can see
+    /// the difference at scrubbing speed. A frame step wants the frame it
+    /// named, which is what `ACCURATE` buys: the segment starts at the
+    /// request while data starts at the keyframe, and the decoder
+    /// decodes-but-drops the gap.
+    accurate: bool,
 }
 
 impl SeekState {
@@ -666,6 +690,10 @@ impl Player {
                 self.activity();
                 self.seek_relative(secs);
                 Task::none()
+            }
+            Message::StepBy(frames) => {
+                self.activity();
+                self.step(frames)
             }
             Message::SeekTo(fraction) => {
                 self.activity();
@@ -1164,6 +1192,68 @@ impl Player {
     fn aim(&mut self, target_ns: u64) {
         self.seek.pending = Some(target_ns);
         self.seek.due = Some(Instant::now() + SEEK_DEBOUNCE);
+        self.seek.accurate = false;
+    }
+
+    /// Step one frame, pausing first (#281).
+    ///
+    /// A flushing `ACCURATE` seek per frame is wasteful — a flush trio, a
+    /// decoder reset and a keyframe re-decode to advance by one frame
+    /// duration — but it is correct, and it is built out of a path that
+    /// already works. The cheaper answer is a real `Event::Step` that a paced
+    /// sink consumes by releasing exactly N frames; that design is written up
+    /// in `plans/30_iced_player.md` and deliberately not built here.
+    ///
+    /// Backward stepping is a backward seek like any other. Decoding
+    /// backwards is what the engine cannot do; seeking backwards it does
+    /// every time an arrow key is pressed.
+    fn step(&mut self, frames: i32) -> Task<Message> {
+        let Some(frame) = self
+            .source()
+            .and_then(|s| s.video.as_ref())
+            .and_then(|v| v.frame_duration())
+        else {
+            // Guessing 30 fps here would step 33 ms and call it a frame. The
+            // container said nothing; say so.
+            self.note(
+                Level::Warning,
+                "this file does not state a frame rate, so it cannot be stepped",
+            );
+            return Task::none();
+        };
+
+        // Stepping is a paused gesture: it is how you look at one frame.
+        let task = if self.paused {
+            Task::none()
+        } else {
+            self.update(Message::TogglePause)
+        };
+
+        let target = step_target(self.step_origin(), frame, frames, self.duration());
+
+        // No debounce: holding `.` should step frame by frame, not coalesce
+        // four presses into one. And ACCURATE, or the seek lands on the
+        // previous keyframe and the picture goes backwards instead of on.
+        self.seek.pending = Some(target);
+        self.seek.due = None;
+        self.seek.accurate = true;
+        self.dispatch_seek();
+        task
+    }
+
+    /// Where a step counts from.
+    ///
+    /// The last aim if there is one, for the same reason `seek_relative`
+    /// walks from it: `position()` does not move until the seek's Segment
+    /// lands, so counting from it would make the second of two quick steps
+    /// undo the first.
+    fn step_origin(&self) -> i64 {
+        self.seek.target().map(|t| t as i64).unwrap_or_else(|| {
+            self.position
+                .to_option()
+                .map(|p| p.nanos() as i64)
+                .unwrap_or(0)
+        })
     }
 
     /// Send the accumulated seek, once the debounce has expired and the last
@@ -1188,7 +1278,25 @@ impl Player {
             return;
         }
 
-        let event = SeekEvent::new_time(ClockTime::from_nanos(target));
+        let mut event = SeekEvent::new_time(ClockTime::from_nanos(target));
+        if self.seek.accurate {
+            // `new_time` is FLUSH | KEY_UNIT, and `with_flags` replaces
+            // rather than ORs — so the whole set has to be restated.
+            //
+            // SNAP_BEFORE matters as much as ACCURATE here, and it is not
+            // obvious: the per-container default snap is *forward* for MKV,
+            // so a step from 600 ms to 700 ms would land on the keyframe at
+            // 1000 ms — a step forward that skips most of a GOP. Snapping
+            // backward puts the decoder at the keyframe before the target and
+            // ACCURATE makes it decode-but-drop the gap, so the frame that
+            // appears is the one that was asked for.
+            event = event.with_flags(
+                SeekFlags::FLUSH
+                    | SeekFlags::KEY_UNIT
+                    | SeekFlags::ACCURATE
+                    | SeekFlags::SNAP_BEFORE,
+            );
+        }
         let seqnum = event.seqnum();
         if engine.handle().dispatch_seek(event) {
             self.seek.in_flight = Some((seqnum, target));
@@ -1198,6 +1306,7 @@ impl Player {
         }
         self.seek.pending = None;
         self.seek.due = None;
+        self.seek.accurate = false;
     }
 
     /// Ask the pipeline to play at `rate` (#280).
@@ -1324,6 +1433,8 @@ fn shortcut(key: &Key) -> Option<Message> {
             "f" => Some(Message::ToggleFullscreen),
             "m" => Some(Message::ToggleMute),
             "i" => Some(Message::ToggleStats),
+            "." => Some(Message::StepBy(1)),
+            "," => Some(Message::StepBy(-1)),
             "d" => Some(Message::DumpGraph),
             "o" => Some(Message::OpenDialog),
             "p" => Some(Message::TogglePlaylist),
@@ -1420,6 +1531,14 @@ mod tests {
         assert!(matches!(
             shortcut(&Key::Character("p".into())),
             Some(Message::TogglePlaylist)
+        ));
+        assert!(matches!(
+            shortcut(&Key::Character(".".into())),
+            Some(Message::StepBy(1))
+        ));
+        assert!(matches!(
+            shortcut(&Key::Character(",".into())),
+            Some(Message::StepBy(-1))
         ));
         assert!(shortcut(&Key::Character("z".into())).is_none());
     }
@@ -1519,6 +1638,67 @@ mod tests {
             index: 0,
             path: PathBuf::from("f.mp4"),
         }
+    }
+
+    /// Stepping refuses rather than guessing (#281).
+    ///
+    /// `Framerate::default()` is 30 fps, so "unknown" and "30" are the same
+    /// value on the buffer path — which is why the step size comes from the
+    /// container header and why `None` has to mean no.
+    #[test]
+    fn a_file_that_states_no_frame_rate_cannot_be_stepped() {
+        let stream = |rate| engine::VideoStream {
+            codec: engine::VideoCodecKind::H264,
+            width: 64,
+            height: 64,
+            frame_rate: rate,
+        };
+        assert_eq!(stream(None).frame_duration(), None);
+        assert_eq!(
+            stream(Some(25.0)).frame_duration(),
+            Some(Duration::from_millis(40))
+        );
+        // A container stating nonsense has said nothing useful.
+        assert_eq!(stream(Some(0.0)).frame_duration(), None);
+        assert_eq!(stream(Some(-24.0)).frame_duration(), None);
+        assert_eq!(stream(Some(f64::NAN)).frame_duration(), None);
+        assert_eq!(stream(Some(f64::INFINITY)).frame_duration(), None);
+        // Past any real file, and the guard that keeps steps off zero.
+        assert_eq!(stream(Some(100_000.0)).frame_duration(), None);
+        assert!(stream(Some(1000.0)).frame_duration().is_some());
+    }
+
+    /// Where a step lands (#281).
+    #[test]
+    fn a_step_moves_by_exactly_one_frame_and_stops_at_the_ends() {
+        let frame = Duration::from_millis(100);
+        let two_seconds = ClockTime::from_nanos(2_000_000_000);
+
+        // Forward and back, one frame at a time.
+        assert_eq!(step_target(500_000_000, frame, 1, two_seconds), 600_000_000);
+        assert_eq!(
+            step_target(500_000_000, frame, -1, two_seconds),
+            400_000_000
+        );
+        assert_eq!(step_target(500_000_000, frame, 4, two_seconds), 900_000_000);
+
+        // The start is a floor, not a wrap.
+        assert_eq!(step_target(50_000_000, frame, -1, two_seconds), 0);
+        assert_eq!(step_target(0, frame, -10, two_seconds), 0);
+
+        // The end is a ceiling, one nanosecond inside the duration.
+        assert_eq!(
+            step_target(1_950_000_000, frame, 1, two_seconds),
+            1_999_999_999
+        );
+
+        // An unknown duration does not clamp to zero — that is the trap a
+        // Segment-Duration-less MKV sets, and it would send every step to
+        // the start of the file.
+        assert_eq!(
+            step_target(1_950_000_000, frame, 1, ClockTime::NONE),
+            2_050_000_000
+        );
     }
 
     /// A wheel notch is an arrow key, and a touchpad flick is not a lurch.

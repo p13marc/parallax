@@ -62,6 +62,23 @@ Every out-of-tree plugin must be rebuilt: the plugin ABI went **12 → 13**.
   `parallax_iced::DEFAULT_MAX_LATENESS` rather than inventing a second pacing
   policy.
 
+- **Frame stepping** (#281). `.` and `,` step one frame forward or back,
+  pausing first. It is a flushing `ACCURATE` seek per frame — wasteful, and
+  correct: `plans/30_iced_player.md` carries the design for the real
+  `Event::Step` that a paced sink would consume without a flush.
+
+  Two details decide whether it works at all. `SeekEvent::new_time` is
+  `FLUSH | KEY_UNIT` and `with_flags` *replaces* rather than ORs, so a step
+  restates the whole set — and it must add **`SNAP_BEFORE`** as well as
+  `ACCURATE`, because MKV's default snap is *forward*: without it a step from
+  600 ms to 700 ms lands on the keyframe at 1000 ms, skipping most of a GOP in
+  the name of advancing one frame. And the step size comes from the container
+  header, carried on the player's `VideoStream`, because nothing on the buffer
+  path has a framerate — the demuxers emit encoded buffers, whose
+  `MediaFormat::Video` has no slot for one, and `Framerate::default()` is
+  30 fps, so a decoded frame cannot be asked either. A file that states no
+  frame rate refuses to step rather than guessing 33 ms and calling it a frame.
+
 - **The gestures a GUI is expected to have** (#274). Wheel to change the
   volume, a pointer that disappears with the chrome (under the same rule, so
   the film is alone on screen when it is playing), `o` for a file dialog

@@ -45,6 +45,7 @@ software without comment when the driver has not got it.
 | `f`, double-click | fullscreen |
 | `Esc` | leave fullscreen, else quit |
 | `o` | open files |
+| `.` `,` | step one frame forward / back (pauses) |
 | `s` | playback speed |
 | `i` | diagnostics |
 | `p` | playlist |

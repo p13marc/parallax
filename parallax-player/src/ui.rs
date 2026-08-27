@@ -119,7 +119,15 @@ fn controls(player: &Player) -> Element<'_, Message> {
             .into(),
     };
 
-    let transport = row![
+    // Frame stepping only when the container said how long a frame is; a
+    // guess would step 33 ms and call it a frame (#281).
+    let steppable = player
+        .source()
+        .and_then(|s| s.video.as_ref())
+        .and_then(|v| v.frame_duration())
+        .is_some();
+
+    let mut transport = row![
         button(text(if player.paused { "Play" } else { "Pause" }).size(13))
             .on_press(Message::TogglePause)
             .padding([4, 10]),
@@ -129,6 +137,20 @@ fn controls(player: &Player) -> Element<'_, Message> {
     ]
     .spacing(10)
     .align_y(Alignment::Center);
+
+    if steppable {
+        transport = transport
+            .push(
+                button(text("◀|").size(12))
+                    .on_press(Message::StepBy(-1))
+                    .padding([4, 6]),
+            )
+            .push(
+                button(text("|▶").size(12))
+                    .on_press(Message::StepBy(1))
+                    .padding([4, 6]),
+            );
+    }
 
     let mut tools = row![].spacing(8).align_y(Alignment::Center);
     if player.has_audio() {
