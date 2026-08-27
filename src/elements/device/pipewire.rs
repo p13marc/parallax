@@ -64,6 +64,20 @@ pub enum PipeWireTarget {
     Window(u32),
 }
 
+impl PipeWireTarget {
+    /// The node this target names, if it names one.
+    ///
+    /// `TARGET_OBJECT` takes a node name or a serial id; the "default"
+    /// variants name nothing and leave the session manager to choose, which
+    /// is what they mean.
+    pub fn node_name(&self) -> Option<&str> {
+        match self {
+            Self::Camera(name) | Self::AudioInput(name) => Some(name.as_str()),
+            Self::DefaultCamera | Self::DefaultMicrophone | Self::Screen | Self::Window(_) => None,
+        }
+    }
+}
+
 /// PipeWire node information.
 #[derive(Debug, Clone)]
 pub struct PipeWireNodeInfo {
@@ -356,11 +370,18 @@ impl PipeWireSrc {
             PipeWireTarget::Screen | PipeWireTarget::Window(_) => ("Video", "Capture"),
         };
 
-        let props = pw::properties::properties! {
+        let mut props = pw::properties::properties! {
             *pw::keys::MEDIA_TYPE => media_type,
             *pw::keys::MEDIA_CATEGORY => media_category,
             *pw::keys::MEDIA_ROLE => "Production",
         };
+        // Same hole as the playback side had (#284): the named device was
+        // carried this far and then dropped, so `PipeWireSrc::audio(Some(..))`
+        // captured from whatever the session manager picked.
+        if let Some(name) = target.node_name() {
+            props.insert(*pw::keys::TARGET_OBJECT, name);
+            tracing::debug!("pipewire capture targeting '{name}'");
+        }
 
         let stream = match pw::stream::StreamRc::new(core, "parallax-capture", props) {
             Ok(s) => s,
@@ -533,7 +554,7 @@ impl PipeWireSink {
 
     /// Main playback thread.
     fn playback_thread(
-        _device: Option<String>,
+        device: Option<String>,
         mut buffer_rx: tokio_mpsc::Receiver<(u64, Vec<u8>)>,
         shutdown_rx: std_mpsc::Receiver<()>,
         generation: Arc<AtomicU64>,
@@ -562,11 +583,21 @@ impl PipeWireSink {
             }
         };
 
-        let props = pw::properties::properties! {
+        let mut props = pw::properties::properties! {
             *pw::keys::MEDIA_TYPE => "Audio",
             *pw::keys::MEDIA_CATEGORY => "Playback",
             *pw::keys::MEDIA_ROLE => "Music",
         };
+        // The device parameter used to be accepted and dropped — named
+        // `_device`, and the stream connected with AUTOCONNECT and no target,
+        // so `PipeWireSink::audio(Some("headphones"))` played out of whatever
+        // the session manager felt like (#284). `TARGET_OBJECT` takes either
+        // a node name or a serial id, which is exactly what
+        // `enumerate_audio_nodes` returns.
+        if let Some(target) = &device {
+            props.insert(*pw::keys::TARGET_OBJECT, target.as_str());
+            tracing::debug!("pipewire playback targeting '{target}'");
+        }
 
         let stream = match pw::stream::StreamRc::new(core, "parallax-playback", props) {
             Ok(s) => s,

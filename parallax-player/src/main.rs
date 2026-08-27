@@ -315,6 +315,10 @@ struct Args {
     #[arg(long)]
     no_sync: bool,
 
+    /// ALSA device to play through; `--audio-device list` prints them.
+    #[arg(long, default_value = "default")]
+    audio_device: String,
+
     /// Play with no window at all, printing the machine-readable summary.
     ///
     /// The pipeline is the same one the window drives, and this process is
@@ -344,6 +348,7 @@ impl Args {
             frame_delay: self.frame_delay,
             channel_capacity: self.channel_capacity.max(1),
             sync: !self.no_sync,
+            audio_device: self.audio_device.clone(),
         }
     }
 }
@@ -358,6 +363,13 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
+
+    if args.audio_device == "list" {
+        for device in parallax::elements::AlsaSink::enumerate_devices()? {
+            println!("{}\t{}", device.name, device.description);
+        }
+        return Ok(());
+    }
 
     if args.headless {
         let code = headless::run(args)?;
@@ -408,6 +420,8 @@ enum Message {
     CycleRepeat,
     /// Show or hide the playlist.
     TogglePlaylist,
+    /// Play through this ALSA device from the next build on.
+    AudioDevice(String),
     /// Play/pause.
     TogglePause,
     /// Seek by a number of seconds, relative to where the transport is headed.
@@ -499,6 +513,14 @@ struct Player {
     show_playlist: bool,
     /// Files opened lately, newest first — the empty screen's only content.
     recent: Vec<PathBuf>,
+    /// Output devices, read once when someone first asks to see them.
+    audio_devices: Vec<parallax::elements::AlsaDeviceInfo>,
+    /// Where to resume after a rebuild that was not a track change.
+    ///
+    /// Changing the output device means building a new pipeline, and a
+    /// pipeline that restarted from the beginning would be a worse answer
+    /// than not offering the choice.
+    resume_at: Option<u64>,
 
     position: ClockTime,
     paused: bool,
@@ -538,6 +560,8 @@ impl Player {
             failures: 0,
             show_playlist: false,
             recent: recent::load(),
+            audio_devices: Vec::new(),
+            resume_at: None,
             position: ClockTime::ZERO,
             paused: false,
             speed: 1.0,
@@ -666,6 +690,17 @@ impl Player {
                 self.show_playlist = !self.show_playlist;
                 Task::none()
             }
+            Message::AudioDevice(device) => {
+                self.activity();
+                if self.options.audio_device == device {
+                    return Task::none();
+                }
+                self.options.audio_device = device;
+                // The graph has no dynamic re-link, and an ALSA sink is
+                // opened once for a fixed device — so this is a rebuild, and
+                // it resumes where it was rather than starting the file over.
+                self.reopen_current()
+            }
             Message::TornDown => self.torn_down(),
             Message::Probed(seq, result) => self.build(seq, result),
             Message::Tick => {
@@ -785,6 +820,13 @@ impl Player {
                 // Ask once, the first time anyone looks. It is a round trip
                 // through the runtime, and a player that never opens the
                 // panel should never pay for it.
+                if self.show_stats && self.audio_devices.is_empty() {
+                    // Enumerating opens no PCM — it walks ALSA's hint list —
+                    // but it is still work nobody who never opens the panel
+                    // should pay for.
+                    self.audio_devices =
+                        parallax::elements::AlsaSink::enumerate_devices().unwrap_or_default();
+                }
                 if self.show_stats && self.diagnostics.graphics.is_none() {
                     return iced::system::information()
                         .map(|info| Message::Graphics(Box::new(info)));
@@ -947,6 +989,9 @@ impl Player {
                 self.stage = Stage::Playing;
                 recent::remember(&request.path);
                 self.recent = recent::load();
+                if let Some(at) = self.resume_at.take() {
+                    self.aim(at);
+                }
                 // The transport's state belongs to the *player*, not to the
                 // pipeline that happens to be running: a rate set before a
                 // track change was still shown afterwards while the new
@@ -960,6 +1005,9 @@ impl Player {
             Err(e) => {
                 self.note(Level::Error, format!("{e:#}"));
                 self.status = "no file open".into();
+                // Whatever it was resuming to belongs to a pipeline that
+                // never started; the next file starts at its own beginning.
+                self.resume_at = None;
                 self.skip_failed(request.index)
             }
         }
@@ -1163,6 +1211,24 @@ impl Player {
             return self.advance();
         }
         Task::none()
+    }
+
+    /// Rebuild the current file, resuming where it was.
+    ///
+    /// The whole graph is fixed at `start()`: no dynamic re-link, and the
+    /// ALSA sink is opened once for one device. Anything that changes how the
+    /// pipeline is *built* therefore goes through here, which is a visible
+    /// hitch and honest about being one.
+    fn reopen_current(&mut self) -> Task<Message> {
+        let Some(index) = self.playlist.current() else {
+            return Task::none();
+        };
+        self.resume_at = self
+            .seek
+            .target()
+            .or_else(|| self.position.to_option().map(|p| p.nanos()))
+            .filter(|at| *at > 0);
+        self.play(index)
     }
 
     /// Stop playing, without opening anything else.

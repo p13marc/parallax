@@ -62,6 +62,19 @@ Every out-of-tree plugin must be rebuilt: the plugin ABI went **12 → 13**.
   `parallax_iced::DEFAULT_MAX_LATENESS` rather than inventing a second pacing
   policy.
 
+- **Audio output device selection** (#284). `--audio-device NAME` picks it,
+  `--audio-device list` prints what ALSA offers, and the diagnostics panel
+  has a picker; choosing one rebuilds the pipeline and resumes where it was,
+  because the graph is fixed at `start()` and an ALSA sink is opened once for
+  one device.
+
+- **`PipeWireSink::audio(Some(name))` reaches the named node** (#284). The
+  device parameter was carried as far as `playback_thread` and then dropped —
+  the parameter was literally named `_device`, and the stream connected with
+  `AUTOCONNECT` and no target, so a named device played out of whatever the
+  session manager chose. It sets `TARGET_OBJECT` now, and so does the capture
+  side, which had the same hole one indirection later.
+
 - **Snapshot the frame on screen** (#283). `c` writes the *decoder's* frame —
   full resolution, source colour, no scaling, letterbox or overlay — through
   the same `VideoConvert` the pipeline uses, so a saved still and the picture
@@ -161,6 +174,23 @@ Every out-of-tree plugin must be rebuilt: the plugin ABI went **12 → 13**.
   dependency, with `cfg(test)` off.
 
 ### Fixed
+
+- **ALSA no longer plays at a rate the hardware is not using** (#284).
+  `AlsaSink::new` asks for a rate with `ValueOr::Nearest`, so a driver that
+  cannot do 44.1 kHz **substitutes** the closest it can and says nothing —
+  while `self.format.sample_rate` kept the *requested* value. Everything
+  derived from it then ran on a fiction: the pinned caps, the declared
+  latency, `frames_to_nanos`, and `AlsaPosition`, which is the master clock
+  the whole pipeline paces against. The result was audio at the wrong pitch
+  and a clock that drifts, with no error anywhere.
+
+  The granted rate, channels, buffer and period are read back after
+  `hw_params` now. A rounded buffer is accepted and the real numbers stored,
+  because that is normal and harmless once the latency follows it; a
+  substituted *rate* is refused with `DeviceError::FormatNotSupported` — which
+  was defined and never constructed in this file — naming both rates and
+  saying to resample upstream. `AlsaSrc` had the same hole and gets the same
+  treatment: its timestamps are derived from that rate too.
 
 - **Playback speed survives a track change** (#276). `reset_transport` cleared
   position, pause and the seek state; `build` re-applied the volume. Nothing

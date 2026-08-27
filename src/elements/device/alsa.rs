@@ -243,7 +243,7 @@ pub struct AlsaSrc {
 
 impl AlsaSrc {
     /// Create a capture source for the given device.
-    pub fn new(device: &str, format: AlsaFormat) -> Result<Self> {
+    pub fn new(device: &str, requested: AlsaFormat) -> Result<Self> {
         let pcm = PCM::new(device, Direction::Capture, false).map_err(|e| {
             if e.errno() == libc::ENOENT {
                 DeviceError::NotFound(device.to_string())
@@ -257,29 +257,34 @@ impl AlsaSrc {
         })?;
 
         // Configure hardware parameters
+        let format;
         {
             let hwp = HwParams::any(&pcm).map_err(|e| DeviceError::Alsa(e.to_string()))?;
 
             hwp.set_access(Access::RWInterleaved)
                 .map_err(|e| DeviceError::Alsa(e.to_string()))?;
 
-            hwp.set_format(format.format.to_alsa())
+            hwp.set_format(requested.format.to_alsa())
                 .map_err(|e| DeviceError::Alsa(e.to_string()))?;
 
-            hwp.set_channels(format.channels)
+            hwp.set_channels(requested.channels)
                 .map_err(|e| DeviceError::Alsa(e.to_string()))?;
 
-            hwp.set_rate(format.sample_rate, ValueOr::Nearest)
+            hwp.set_rate(requested.sample_rate, ValueOr::Nearest)
                 .map_err(|e| DeviceError::Alsa(e.to_string()))?;
 
-            hwp.set_buffer_size(format.buffer_frames as i64)
+            hwp.set_buffer_size(requested.buffer_frames as i64)
                 .map_err(|e| DeviceError::Alsa(e.to_string()))?;
 
-            hwp.set_period_size(format.period_frames as i64, ValueOr::Nearest)
+            hwp.set_period_size(requested.period_frames as i64, ValueOr::Nearest)
                 .map_err(|e| DeviceError::Alsa(e.to_string()))?;
 
             pcm.hw_params(&hwp)
                 .map_err(|e| DeviceError::Alsa(e.to_string()))?;
+
+            // A capture source's rate is just as load-bearing: the timestamps
+            // it stamps are derived from it.
+            format = accept_granted(device, &requested, granted_format(&hwp, &requested))?;
         }
 
         // Start the capture
@@ -537,9 +542,94 @@ impl ClockProvider for AlsaSinkClockProvider {
     }
 }
 
+/// What the device granted, against what was asked for.
+///
+/// ALSA's `set_rate` is called with [`ValueOr::Nearest`], which means the
+/// driver **substitutes** the closest rate it can do rather than refusing —
+/// and says nothing. Everything downstream then runs on a rate the hardware
+/// is not using: the pinned caps, the declared latency, `frames_to_nanos`,
+/// and `AlsaPosition`, which *is* the master clock. A 44.1 kHz stream on a
+/// 48 kHz-only device would play fast and drift, with no error anywhere.
+///
+/// So the granted values are read back and reconciled. Buffer and period
+/// sizes are advisory — a driver rounding them is normal and harmless once
+/// the real numbers are the ones stored — but a rate the caller did not ask
+/// for changes the pitch and the clock, and that is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Granted {
+    /// The device took what was asked for.
+    AsRequested,
+    /// The device rounded the buffering; the granted numbers are the truth.
+    Rounded,
+    /// The device substituted a rate. Playing anyway would be wrong.
+    WrongRate {
+        /// What was asked for, in Hz.
+        wanted: u32,
+        /// What the device would give, in Hz.
+        got: u32,
+    },
+}
+
+/// Compare what a device granted with what was asked for.
+pub(crate) fn reconcile(requested: &AlsaFormat, granted: &AlsaFormat) -> Granted {
+    if requested.sample_rate != granted.sample_rate {
+        return Granted::WrongRate {
+            wanted: requested.sample_rate,
+            got: granted.sample_rate,
+        };
+    }
+    if requested.buffer_frames != granted.buffer_frames
+        || requested.period_frames != granted.period_frames
+    {
+        return Granted::Rounded;
+    }
+    Granted::AsRequested
+}
+
+/// Read back what the driver actually committed to.
+fn granted_format(hwp: &HwParams<'_>, requested: &AlsaFormat) -> AlsaFormat {
+    AlsaFormat {
+        sample_rate: hwp.get_rate().unwrap_or(requested.sample_rate),
+        channels: hwp.get_channels().unwrap_or(requested.channels),
+        format: requested.format,
+        buffer_frames: hwp
+            .get_buffer_size()
+            .map(|frames| frames as u32)
+            .unwrap_or(requested.buffer_frames),
+        period_frames: hwp
+            .get_period_size()
+            .map(|frames| frames as u32)
+            .unwrap_or(requested.period_frames),
+    }
+}
+
+/// Apply the reconciliation, or explain the refusal.
+fn accept_granted(device: &str, requested: &AlsaFormat, granted: AlsaFormat) -> Result<AlsaFormat> {
+    match reconcile(requested, &granted) {
+        Granted::WrongRate { wanted, got } => Err(DeviceError::FormatNotSupported(format!(
+            "{device} cannot play {wanted} Hz — it offers {got} Hz, and \
+             playing {wanted} Hz samples at {got} Hz would change the pitch \
+             and the clock this sink provides. Resample upstream."
+        ))
+        .into()),
+        Granted::Rounded => {
+            tracing::info!(
+                "{device}: buffering rounded to {} frames ({} per period), \
+                 from {}/{} — declared latency follows the device",
+                granted.buffer_frames,
+                granted.period_frames,
+                requested.buffer_frames,
+                requested.period_frames
+            );
+            Ok(granted)
+        }
+        Granted::AsRequested => Ok(granted),
+    }
+}
+
 impl AlsaSink {
     /// Create a playback sink for the given device.
-    pub fn new(device: &str, format: AlsaFormat) -> Result<Self> {
+    pub fn new(device: &str, requested: AlsaFormat) -> Result<Self> {
         let pcm = PCM::new(device, Direction::Playback, false).map_err(|e| {
             if e.errno() == libc::ENOENT {
                 DeviceError::NotFound(device.to_string())
@@ -554,30 +644,34 @@ impl AlsaSink {
 
         // Configure hardware parameters
         let can_pause;
+        let format;
         {
             let hwp = HwParams::any(&pcm).map_err(|e| DeviceError::Alsa(e.to_string()))?;
 
             hwp.set_access(Access::RWInterleaved)
                 .map_err(|e| DeviceError::Alsa(e.to_string()))?;
 
-            hwp.set_format(format.format.to_alsa())
+            hwp.set_format(requested.format.to_alsa())
                 .map_err(|e| DeviceError::Alsa(e.to_string()))?;
 
-            hwp.set_channels(format.channels)
+            hwp.set_channels(requested.channels)
                 .map_err(|e| DeviceError::Alsa(e.to_string()))?;
 
-            hwp.set_rate(format.sample_rate, ValueOr::Nearest)
+            hwp.set_rate(requested.sample_rate, ValueOr::Nearest)
                 .map_err(|e| DeviceError::Alsa(e.to_string()))?;
 
-            hwp.set_buffer_size(format.buffer_frames as i64)
+            hwp.set_buffer_size(requested.buffer_frames as i64)
                 .map_err(|e| DeviceError::Alsa(e.to_string()))?;
 
-            hwp.set_period_size(format.period_frames as i64, ValueOr::Nearest)
+            hwp.set_period_size(requested.period_frames as i64, ValueOr::Nearest)
                 .map_err(|e| DeviceError::Alsa(e.to_string()))?;
 
             pcm.hw_params(&hwp)
                 .map_err(|e| DeviceError::Alsa(e.to_string()))?;
 
+            // What the driver committed to, which is not always what it was
+            // asked for — see `reconcile`.
+            format = accept_granted(device, &requested, granted_format(&hwp, &requested))?;
             can_pause = hwp.can_pause();
         }
 
@@ -1811,5 +1905,79 @@ mod tests {
             ClockTime::from_secs(2),
             "the device drives the clock again"
         );
+    }
+
+    /// A device that substitutes a rate must not be played to (#284).
+    ///
+    /// This is the half of device handling a machine with no sound card can
+    /// still be held to: the reconciliation is a pure function over what was
+    /// asked for and what came back, and it is where the silent failure was.
+    #[test]
+    fn a_substituted_rate_is_refused_and_a_rounded_buffer_is_not() {
+        let asked = AlsaFormat {
+            sample_rate: 44_100,
+            channels: 2,
+            format: AlsaSampleFormat::S16LE,
+            buffer_frames: 4096,
+            period_frames: 1024,
+        };
+
+        assert_eq!(reconcile(&asked, &asked), Granted::AsRequested);
+
+        // The failure that used to be silent: `set_rate(.., Nearest)` gives
+        // 48 kHz for a 44.1 kHz stream and says nothing, and everything
+        // downstream — the caps, the declared latency, and the clock this
+        // sink provides — then runs on a rate the hardware is not using.
+        let substituted = AlsaFormat {
+            sample_rate: 48_000,
+            ..asked
+        };
+        assert_eq!(
+            reconcile(&asked, &substituted),
+            Granted::WrongRate {
+                wanted: 44_100,
+                got: 48_000
+            }
+        );
+
+        // Buffering is advisory: a driver rounding it is normal, and harmless
+        // once the granted numbers are the ones stored.
+        let rounded = AlsaFormat {
+            buffer_frames: 3840,
+            period_frames: 960,
+            ..asked
+        };
+        assert_eq!(reconcile(&asked, &rounded), Granted::Rounded);
+
+        // A rate mismatch outranks a rounded buffer — it is the one that
+        // changes what comes out of the speakers.
+        let both = AlsaFormat {
+            sample_rate: 48_000,
+            buffer_frames: 3840,
+            ..asked
+        };
+        assert!(matches!(
+            reconcile(&asked, &both),
+            Granted::WrongRate { .. }
+        ));
+    }
+
+    /// The refusal says what to do about it, not just that it failed.
+    #[test]
+    fn the_refusal_names_both_rates() {
+        let asked = AlsaFormat {
+            sample_rate: 44_100,
+            ..AlsaFormat::default()
+        };
+        let granted = AlsaFormat {
+            sample_rate: 48_000,
+            ..asked
+        };
+        let err = accept_granted("hw:0,0", &asked, granted).expect_err("it refuses");
+        let text = format!("{err}");
+        assert!(text.contains("44100"), "{text}");
+        assert!(text.contains("48000"), "{text}");
+        assert!(text.contains("hw:0,0"), "{text}");
+        assert!(text.contains("Resample"), "{text}");
     }
 }

@@ -60,6 +60,9 @@ pub struct Options {
     /// Present frames at their due time. Off is the batch-decode floor — the
     /// pipeline runs as fast as it can, which is how #192 was measured.
     pub sync: bool,
+    /// ALSA device to play through. `"default"` is whatever ALSA is
+    /// configured to mean, which is usually dmix or PipeWire's bridge.
+    pub audio_device: String,
 }
 
 impl Default for Options {
@@ -73,6 +76,7 @@ impl Default for Options {
             frame_delay: 0,
             channel_capacity: 4,
             sync: true,
+            audio_device: "default".into(),
         }
     }
 }
@@ -552,10 +556,13 @@ fn audio_branch(opts: &Options, audio: Option<&AudioStream>) -> Option<(AudioDec
         format: alsa_sample_format,
         ..AlsaFormat::default()
     };
-    match AlsaSink::new("default", format) {
+    match AlsaSink::new(&opts.audio_device, format) {
         Ok(sink) => Some((decoder, sink)),
         Err(e) => {
-            tracing::warn!("audio device unavailable ({e}) — video only");
+            tracing::warn!(
+                "audio device '{}' unavailable ({e}) — video only",
+                opts.audio_device
+            );
             None
         }
     }

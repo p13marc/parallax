@@ -74,6 +74,7 @@ therefore the video, at wall rate.
 | `--channel-capacity N` | executor link capacity |
 | `--no-sync` | decode as fast as possible; the batch-decode floor |
 | `--headless` | play with no window at all |
+| `--audio-device NAME` | ALSA device to play through; `list` prints them |
 | `--exit-after N` | quit after N seconds, printing the summary |
 
 ## The machine-readable summary

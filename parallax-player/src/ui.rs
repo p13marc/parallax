@@ -266,6 +266,35 @@ pub fn welcome(player: &Player) -> Element<'_, Message> {
     body.into()
 }
 
+/// The output devices, with the one in use marked.
+///
+/// Choosing one rebuilds the pipeline and resumes where it was: the graph is
+/// fixed at `start()` and an ALSA sink is opened once for one device, so
+/// there is no re-link to do it any other way. A visible hitch, and honest
+/// about being one.
+fn devices(player: &Player) -> Element<'_, Message> {
+    let mut list = column![].spacing(2);
+    for device in &player.audio_devices {
+        let current = player.options.audio_device == device.name;
+        let label = if device.description.is_empty() {
+            device.name.clone()
+        } else {
+            format!("{} — {}", device.name, device.description)
+        };
+        list = list.push(
+            row![
+                text(if current { "•" } else { " " }).size(11),
+                button(text(label).size(11))
+                    .on_press(Message::AudioDevice(device.name.clone()))
+                    .padding([2, 6]),
+            ]
+            .spacing(4)
+            .align_y(Alignment::Center),
+        );
+    }
+    scrollable(list).height(Length::Fixed(90.0)).into()
+}
+
 /// What is queued. Toggled with `p`, or the button.
 ///
 /// Scrollable and capped in height: a playlist is allowed to be long, and the
@@ -425,6 +454,12 @@ fn stats(player: &Player) -> Element<'_, Message> {
             ))
             .size(12),
         );
+    }
+
+    if !player.audio_devices.is_empty() {
+        lines = lines
+            .push(text("audio output").size(12))
+            .push(devices(player));
     }
 
     lines = lines.push(
