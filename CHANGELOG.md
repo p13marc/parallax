@@ -62,6 +62,32 @@ Every out-of-tree plugin must be rebuilt: the plugin ABI went **12 → 13**.
   `parallax_iced::DEFAULT_MAX_LATENESS` rather than inventing a second pacing
   policy.
 
+- **A playlist, and open-next** (#276). Several files on the command line, or
+  dropped on the window, are a queue: it plays through them and stops, or
+  repeats one or all. A file that will not open is marked and skipped rather
+  than stopping the list, and a full lap with nothing playable stops rather
+  than spinning.
+
+  Advancing keys off the bus's `MessageKind::Eos`, which is an *edge* —
+  posted once, after every task finished, and scoped to the engine whose bus
+  carries it. `FrameMailbox::end_reason()` is a level that stays set, and the
+  sink raises it when the EOS *event* arrives, with frames still queued and
+  the audio device buffer still to play; `PipelineHandle::ended()` would
+  outlive the engine it belongs to and fire again on every manual Next, since
+  `stop()` reports `Eos` too.
+
+  The open chain became a state machine because it had a race. `open()` took
+  the engine and spawned a teardown, so a second Next 50 ms later found
+  `engine == None`, took the "nothing to tear down" path, and built a second
+  pipeline — two demuxers, two decoders and two ALSA devices — while the
+  first was still winding down. And a probe answering a superseded request
+  would install itself over a live engine, which leaks it outright:
+  `PipelineHandle` has no `Drop`, so dropping one detaches its tasks. Now an
+  engine exists only in `Stage::Playing`, exactly one teardown is ever in
+  flight (N rapid presses collapse into one teardown and one probe of the
+  last target), and a probe is built only if its seqnum is still the one being
+  waited for.
+
 - **The diagnostics panel says what the pipeline is doing** (#275). Which
   decoder actually won (`--hwdec auto` leaves that open, and the answer used
   to be logged once and forgotten), which adapter and backend Iced is drawing
@@ -84,6 +110,11 @@ Every out-of-tree plugin must be rebuilt: the plugin ABI went **12 → 13**.
   dependency, with `cfg(test)` off.
 
 ### Fixed
+
+- **Playback speed survives a track change** (#276). `reset_transport` cleared
+  position, pause and the seek state; `build` re-applied the volume. Nothing
+  re-applied the rate, so opening a second file left the transport showing
+  `2x` and the label saying "muted" while the new pipeline played at 1x.
 
 - **A packed frame's length is measured by its own packing** (#264).
   The geometry read checked declared dimensions against a hardcoded four bytes

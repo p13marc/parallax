@@ -43,7 +43,11 @@ pub struct Options {
     /// Play the audio track, when there is one.
     pub audio: bool,
     /// Loop inside the demuxer — gapless, and cheaper than a rebuild.
-    pub repeat: bool,
+    ///
+    /// Named for the mechanism rather than the intent, because it is not the
+    /// playlist's repeat: it suppresses end-of-stream entirely, so a player
+    /// built with it never learns that a file finished and never advances.
+    pub gapless_loop: bool,
     /// Finished frames the decoder may run ahead of the screen.
     pub decode_ahead: usize,
     /// dav1d thread count; 0 picks by resolution.
@@ -62,7 +66,7 @@ impl Default for Options {
         Self {
             hwdec: HwDec::Auto,
             audio: true,
-            repeat: false,
+            gapless_loop: false,
             decode_ahead: 4,
             dav1d_threads: 0,
             frame_delay: 0,
@@ -602,7 +606,7 @@ impl Engine {
                 } else {
                     Mp4DemuxSource::video_only(*demux)
                 }
-                .with_loop(opts.repeat);
+                .with_loop(opts.gapless_loop);
                 pipeline.add_demuxer("demux", s)
             }
             ProbedSource::Mkv(demux) => {
@@ -611,7 +615,7 @@ impl Engine {
                 } else {
                     demux.video_only()
                 }
-                .with_loop(opts.repeat);
+                .with_loop(opts.gapless_loop);
                 pipeline.add_demuxer("demux", s)
             }
         };

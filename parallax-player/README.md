@@ -5,7 +5,14 @@ A video player built on the [parallax](../) pipeline engine and
 
 ```bash
 cargo run -p parallax-player --release -- movie.mp4
+cargo run -p parallax-player --release -- one.mp4 two.mkv three.webm
 ```
+
+Several files are a playlist: it plays through them and stops, or repeats one
+or all (`r`). A file that will not open is marked and skipped rather than
+stopping the list. Note that `--repeat` is a *different* thing — it loops
+inside the demuxer, gaplessly and without a rebuild, which means the pipeline
+never reaches end-of-stream and the playlist never advances.
 
 The engine does the hard parts — demux, decode, A/V sync, seeking — and this
 is the front end: a window, a video surface, and the transport.
@@ -37,6 +44,10 @@ software without comment when the driver has not got it.
 | `Esc` | leave fullscreen, else quit |
 | `s` | playback speed |
 | `i` | diagnostics |
+| `p` | playlist |
+| `n` `b` | next / previous file |
+| `r` | repeat off / all / one |
+| `d` | write the running graph as GraphViz |
 | `q` | quit |
 
 Audio is muted at any speed other than 1×: `AlsaSink` plays at the hardware

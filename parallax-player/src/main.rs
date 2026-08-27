@@ -10,6 +10,7 @@
 
 mod engine;
 mod headless;
+mod playlist;
 mod ui;
 
 use std::collections::VecDeque;
@@ -28,6 +29,7 @@ use parallax::pipeline::MessageKind;
 use parallax::video::FrameMailbox;
 
 use engine::{Engine, HwDec, Options, Probed, SourceDescription};
+use playlist::Playlist;
 
 /// Long enough to swallow a held arrow key's repeats, short enough that a
 /// single press still feels immediate.
@@ -90,6 +92,108 @@ fn notice_expired(level: Level, age: Duration) -> bool {
     level != Level::Error && age >= NOTICE_LINGER
 }
 
+/// One request to put a file on screen.
+///
+/// The seqnum is what lets a probe that answers a superseded request be
+/// dropped rather than built: an Iced `Task` cannot be cancelled, so the
+/// answer always arrives and something has to decide it is stale.
+#[derive(Debug, Clone)]
+struct Request {
+    seq: u64,
+    index: usize,
+    path: PathBuf,
+}
+
+/// Where the open chain is.
+///
+/// The invariant the type exists to hold: an `Engine` exists only in
+/// `Playing`, exactly one teardown is in flight in `TearingDown`, and exactly
+/// one probe is outstanding in `Probing`.
+#[derive(Debug, Default)]
+enum Stage {
+    /// Nothing open.
+    #[default]
+    Idle,
+    /// The previous pipeline is winding down; this is what follows it.
+    TearingDown { next: Option<Request> },
+    /// A file is being read for what it contains.
+    Probing(Request),
+    /// An engine is running.
+    Playing,
+}
+
+/// What opening a file does next, given where the chain already is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Open {
+    /// Wind the running pipeline down first.
+    Teardown,
+    /// Nothing is running; read the file.
+    Probe,
+    /// A teardown is already in flight — wait for it, and let it pick this
+    /// up. Spawning a second one is how two pipelines end up alive at once.
+    Wait,
+}
+
+impl Stage {
+    /// What to do about a request arriving here.
+    fn open(&self) -> Open {
+        match self {
+            Self::Playing => Open::Teardown,
+            Self::TearingDown { .. } => Open::Wait,
+            Self::Probing(_) | Self::Idle => Open::Probe,
+        }
+    }
+
+    /// Whether a probe answering `seq` is still the one being waited for.
+    fn accepts_probe(&self, seq: u64) -> bool {
+        matches!(self, Self::Probing(request) if request.seq == seq)
+    }
+}
+
+/// Whether to stop skipping past files that will not open.
+///
+/// A full lap of the list with nothing playable is the end of it; anything
+/// less keeps going, because one bad file in a directory is normal.
+fn give_up(failures: usize, entries: usize) -> bool {
+    entries > 1 && failures >= entries
+}
+
+/// A probe result exactly one reader may take.
+///
+/// An Iced `Message` must be `Clone`, and a probe result is not: it owns an
+/// open demuxer. A cloned message therefore finds the cell empty and does
+/// nothing, which is the right answer — the alternative, `Arc::try_unwrap`,
+/// turns a harmless duplicate into a failed open.
+#[derive(Debug, Clone)]
+struct ProbeCell(Arc<std::sync::Mutex<Option<Result<Probed, String>>>>);
+
+impl ProbeCell {
+    fn new(result: Result<Probed, String>) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(Some(result))))
+    }
+
+    fn take(&self) -> Option<Result<Probed, String>> {
+        self.0.lock().ok()?.take()
+    }
+}
+
+/// Read a file for what it contains, off the interface's thread.
+///
+/// An MP4 index parse on a large file is 100 ms and more.
+fn probe(request: Request) -> Task<Message> {
+    let seq = request.seq;
+    Task::perform(
+        async move {
+            tokio::task::spawn_blocking(move || {
+                engine::probe(&request.path).map_err(|e| format!("{e:#}"))
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("probe panicked: {e}")))
+        },
+        move |result| Message::Probed(seq, ProbeCell::new(result)),
+    )
+}
+
 /// What the pipeline last said about itself, for the diagnostics panel.
 ///
 /// All of it arrives on the bus and all of it used to land in `_ => {}`.
@@ -136,8 +240,8 @@ fn stats_line(position: ClockTime, dropped: u64, stats: &parallax::video::FrameS
     about = "A video player built on parallax and Iced"
 )]
 struct Args {
-    /// MP4/MOV or MKV/WebM file to play.
-    file: Option<PathBuf>,
+    /// MP4/MOV or MKV/WebM files to play, in order.
+    files: Vec<PathBuf>,
 
     /// Play without audio.
     #[arg(long)]
@@ -201,7 +305,7 @@ impl Args {
         Options {
             hwdec: self.hwdec,
             audio: !self.no_audio,
-            repeat: self.repeat,
+            gapless_loop: self.repeat,
             decode_ahead: self.decode_ahead,
             dav1d_threads: self.dav1d_threads,
             frame_delay: self.frame_delay,
@@ -253,12 +357,24 @@ enum Message {
     Tick,
     /// A frame landed on an idle mailbox.
     Frame,
-    /// A file finished probing.
-    Probed(Arc<Result<Probed, String>>),
-    /// The previous engine finished tearing down; build the pending one.
+    /// A file finished probing, answering this request.
+    Probed(u64, ProbeCell),
+    /// The previous engine finished tearing down; start whatever waits.
     TornDown,
-    /// Open a file.
-    Open(PathBuf),
+    /// Add files to the playlist, playing the first if nothing is.
+    Enqueue(Vec<PathBuf>),
+    /// Play the playlist entry at this index.
+    PlayIndex(usize),
+    /// Drop the playlist entry at this index.
+    Remove(usize),
+    /// Play the next file.
+    Next,
+    /// Play the previous file.
+    Previous,
+    /// Step through off / all / one.
+    CycleRepeat,
+    /// Show or hide the playlist.
+    TogglePlaylist,
     /// Play/pause.
     TogglePause,
     /// Seek by a number of seconds, relative to where the transport is headed.
@@ -318,8 +434,16 @@ impl SeekState {
 struct Player {
     options: Options,
     engine: Option<Engine>,
-    /// A file waiting for the previous engine to finish tearing down.
-    pending_open: Option<PathBuf>,
+    /// Where the open chain is. `Engine` exists only in `Stage::Playing`.
+    stage: Stage,
+    /// Monotonic request number, so a stale probe can be recognised.
+    seq: u64,
+    /// What to play, and what to play next.
+    playlist: Playlist,
+    /// Consecutive files that failed to open, reset when one actually plays.
+    failures: usize,
+    /// Whether the playlist panel is on screen.
+    show_playlist: bool,
 
     position: ClockTime,
     paused: bool,
@@ -353,7 +477,11 @@ impl Player {
         let player = Self {
             options: args.options(),
             engine: None,
-            pending_open: None,
+            stage: Stage::Idle,
+            seq: 0,
+            playlist: Playlist::default(),
+            failures: 0,
+            show_playlist: false,
             position: ClockTime::ZERO,
             paused: false,
             speed: 1.0,
@@ -370,9 +498,10 @@ impl Player {
                 .exit_after
                 .map(|s| Instant::now() + Duration::from_secs(s)),
         };
-        let task = match args.file {
-            Some(path) => Task::done(Message::Open(path)),
-            None => Task::none(),
+        let task = if args.files.is_empty() {
+            Task::none()
+        } else {
+            Task::done(Message::Enqueue(args.files))
         };
         (player, task)
     }
@@ -421,16 +550,75 @@ impl Player {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Open(path) => self.open(path),
-            Message::TornDown => self.start_pending(),
-            Message::Probed(result) => self.build(result),
+            Message::Enqueue(paths) => {
+                self.activity();
+                let first = self.playlist.extend(paths);
+                // Adding to an idle player starts it; adding to a playing one
+                // queues, which is what a drop onto a running film should do.
+                match (first, self.playlist.current()) {
+                    (Some(index), None) => self.play(index),
+                    _ => Task::none(),
+                }
+            }
+            Message::PlayIndex(index) => {
+                self.activity();
+                self.failures = 0;
+                self.play(index)
+            }
+            Message::Remove(index) => {
+                self.activity();
+                if self.playlist.remove(index) {
+                    // What was playing is gone; stop rather than jump to
+                    // whatever slid into its index.
+                    self.stop_playback()
+                } else {
+                    Task::none()
+                }
+            }
+            Message::Next => {
+                self.activity();
+                self.failures = 0;
+                match self.playlist.next() {
+                    Some(index) => self.play(index),
+                    None => Task::none(),
+                }
+            }
+            Message::Previous => {
+                self.activity();
+                self.failures = 0;
+                match self.playlist.previous() {
+                    Some(index) => self.play(index),
+                    None => Task::none(),
+                }
+            }
+            Message::CycleRepeat => {
+                self.activity();
+                self.playlist.repeat = self.playlist.repeat.next();
+                if self.options.gapless_loop {
+                    // `--repeat` loops inside the demuxer, which never emits
+                    // end-of-stream — so nothing here will ever be consulted.
+                    // Saying so beats a control that silently does nothing.
+                    self.note(
+                        Level::Warning,
+                        "--repeat loops inside the demuxer, so the playlist never advances",
+                    );
+                }
+                Task::none()
+            }
+            Message::TogglePlaylist => {
+                self.activity();
+                self.show_playlist = !self.show_playlist;
+                Task::none()
+            }
+            Message::TornDown => self.torn_down(),
+            Message::Probed(seq, result) => self.build(seq, result),
             Message::Tick => {
-                self.poll();
+                let task = self.poll();
                 if self.deadline.is_some_and(|at| Instant::now() >= at) {
                     self.report();
                     return iced::exit();
                 }
-                Task::none()
+                task
             }
             // The subscription's only job is to wake an interface that had
             // nothing queued; the widget reads the mailbox itself.
@@ -544,43 +732,80 @@ impl Player {
         }
     }
 
-    /// Tear the current engine down, then build the new one.
+    /// Play the entry at `index`.
     ///
-    /// Two steps rather than one because teardown is bounded-but-slow (it
-    /// waits for the tasks to wind down) and the interface must stay live
-    /// through it. The engine is taken *now*, so `view()` immediately shows
-    /// the placeholder rather than the last frame of the previous file.
-    fn open(&mut self, path: PathBuf) -> Task<Message> {
-        self.status = format!("opening {}…", path.display());
-        self.pending_open = Some(path);
+    /// The whole open/teardown chain runs through here, and the two rules
+    /// that keep it honest are both about what *cannot* happen. An `Engine`
+    /// is never dropped without `teardown()` — `PipelineHandle` has no
+    /// `Drop`, so dropping one detaches the tasks and leaves a live pipeline
+    /// with an open sound device behind. And there is never more than one
+    /// teardown in flight: pressing Next three times during one collapses
+    /// into a single teardown of the running file and a single probe of the
+    /// third target, rather than three overlapping builds.
+    ///
+    /// Teardown is two steps rather than one because it is bounded-but-slow
+    /// (it waits for the tasks to wind down, up to five seconds) and the
+    /// interface must stay live through it. The engine is taken *now*, so
+    /// `view()` shows the placeholder immediately rather than the last frame
+    /// of the previous file.
+    fn play(&mut self, index: usize) -> Task<Message> {
+        let Some(path) = self.playlist.select(index) else {
+            return Task::none();
+        };
+        self.seq += 1;
+        let request = Request {
+            seq: self.seq,
+            index,
+            path,
+        };
+        self.status = format!("opening {}…", request.path.display());
         self.reset_transport();
 
-        match self.engine.take() {
-            Some(engine) => Task::future(async move {
-                engine.teardown().await;
-                Message::TornDown
-            }),
-            None => self.start_pending(),
+        match self.stage.open() {
+            Open::Teardown => {
+                let engine = self
+                    .engine
+                    .take()
+                    .expect("Stage::Playing means there is an engine");
+                self.stage = Stage::TearingDown {
+                    next: Some(request),
+                };
+                Task::future(async move {
+                    engine.teardown().await;
+                    Message::TornDown
+                })
+            }
+            // A teardown is already winding the previous pipeline down.
+            // Replace its target and spawn nothing: exactly one teardown is
+            // in flight, so its `TornDown` is unambiguous when it lands.
+            Open::Wait => {
+                self.stage = Stage::TearingDown {
+                    next: Some(request),
+                };
+                Task::none()
+            }
+            // Nothing is running; the outstanding probe (if any) answers a
+            // seqnum nobody is waiting for now, and is dropped when it lands.
+            Open::Probe => {
+                debug_assert!(self.engine.is_none(), "no engine outside Stage::Playing");
+                self.stage = Stage::Probing(request.clone());
+                probe(request)
+            }
         }
     }
 
-    fn start_pending(&mut self) -> Task<Message> {
-        let Some(path) = self.pending_open.take() else {
+    /// The previous pipeline is gone; start whatever was waiting for it.
+    fn torn_down(&mut self) -> Task<Message> {
+        let Stage::TearingDown { next } = std::mem::replace(&mut self.stage, Stage::Idle) else {
             return Task::none();
         };
-        // Probing is blocking — an MP4 index parse on a large file is 100 ms
-        // and more — so it does not belong on the interface's thread.
-        Task::perform(
-            async move {
-                let result = tokio::task::spawn_blocking(move || {
-                    engine::probe(&path).map_err(|e| format!("{e:#}"))
-                })
-                .await
-                .unwrap_or_else(|e| Err(format!("probe panicked: {e}")));
-                Arc::new(result)
-            },
-            Message::Probed,
-        )
+        match next {
+            Some(request) => {
+                self.stage = Stage::Probing(request.clone());
+                probe(request)
+            }
+            None => Task::none(),
+        }
     }
 
     /// Build and start the pipeline for a probed file.
@@ -589,22 +814,34 @@ impl Player {
     /// Iced's `tokio` feature runs `update` inside `runtime.enter()`, so the
     /// tasks it spawns find a runtime. Doing it here is what keeps `Engine`
     /// and `PipelineHandle` off the `Send` hook.
-    fn build(&mut self, result: Arc<Result<Probed, String>>) -> Task<Message> {
-        // The probe result is behind an `Arc` only because an Iced `Message`
-        // must be `Clone`; there is exactly one of them.
-        let probed = match Arc::try_unwrap(result) {
-            Ok(inner) => inner,
-            Err(_) => {
-                self.note(Level::Error, "probe result was cloned");
-                return Task::none();
-            }
+    fn build(&mut self, seq: u64, result: ProbeCell) -> Task<Message> {
+        // Only the probe the user is actually waiting for gets to build. An
+        // older one answers a request that has already been superseded, and
+        // building it would put the wrong file on screen — or, worse, over a
+        // pipeline that is already running.
+        if !self.stage.accepts_probe(seq) {
+            return Task::none();
+        }
+        let Stage::Probing(request) = &self.stage else {
+            unreachable!("accepts_probe implies Probing")
         };
-        let probed = match probed {
+        let request = request.clone();
+        // A cloned message finds the cell already emptied. Iced clones
+        // messages on some paths, and the alternative — `Arc::try_unwrap`,
+        // which reports a clone as the error "probe result was cloned" —
+        // turns a harmless duplicate into a failed open.
+        let Some(result) = result.take() else {
+            return Task::none();
+        };
+        self.stage = Stage::Idle;
+        debug_assert!(self.engine.is_none(), "building over a live engine");
+
+        let probed = match result {
             Ok(p) => p,
             Err(e) => {
-                self.note(Level::Error, e);
+                self.note(Level::Error, format!("{}: {e}", request.path.display()));
                 self.status = "no file open".into();
-                return Task::none();
+                return self.skip_failed(request.index);
             }
         };
 
@@ -616,13 +853,59 @@ impl Player {
                 }
                 self.apply_volume_to(&engine);
                 self.engine = Some(engine);
+                self.stage = Stage::Playing;
+                // The transport's state belongs to the *player*, not to the
+                // pipeline that happens to be running: a rate set before a
+                // track change was still shown afterwards while the new
+                // pipeline played at 1x, because nothing re-applied it.
+                if self.speed != 1.0 {
+                    let rate = self.speed;
+                    self.set_speed(rate);
+                }
+                Task::none()
             }
             Err(e) => {
                 self.note(Level::Error, format!("{e:#}"));
                 self.status = "no file open".into();
+                self.skip_failed(request.index)
             }
         }
-        Task::none()
+    }
+
+    /// An entry could not be opened: mark it, and move on if there is a list.
+    ///
+    /// "Could not be opened" is deliberately not the same as "did not play".
+    /// The counter that stops the skipping is reset when a file actually
+    /// presents a frame, not when it builds — otherwise a directory of files
+    /// that open and die 200 ms later would be walked forever.
+    fn skip_failed(&mut self, index: usize) -> Task<Message> {
+        self.playlist.mark_failed(index);
+        self.failures += 1;
+        if give_up(self.failures, self.playlist.len()) {
+            self.note(
+                Level::Error,
+                "nothing in the playlist could be played — stopping",
+            );
+            return Task::none();
+        }
+        if self.playlist.len() <= 1 {
+            return Task::none();
+        }
+        match self.playlist.advance() {
+            Some(next) => self.play(next),
+            None => Task::none(),
+        }
+    }
+
+    /// Play whatever comes after the file that just ended.
+    fn advance(&mut self) -> Task<Message> {
+        match self.playlist.advance() {
+            Some(next) => self.play(next),
+            None => {
+                self.status = "end of playlist".into();
+                Task::none()
+            }
+        }
     }
 
     /// One machine-readable line, for `scripts/decode_matrix.py` and #270.
@@ -664,14 +947,23 @@ impl Player {
     }
 
     /// Everything the interface re-reads on a tick.
-    fn poll(&mut self) {
+    ///
+    /// Returns whatever the pipeline's news asks for — today, opening the
+    /// next file when this one ends.
+    fn poll(&mut self) -> Task<Message> {
         self.expire_notices();
 
         let Some(engine) = &mut self.engine else {
-            return;
+            return Task::none();
         };
         self.position = engine.position();
+        // A file that reached the screen is a file that played, whatever
+        // happens to it next: that is what stops the failure-skipping.
+        if engine.mailbox.stats().presented > 0 {
+            self.failures = 0;
+        }
 
+        let mut ended = false;
         let messages = engine.poll_bus();
         for message in &messages {
             match &message.kind {
@@ -719,6 +1011,17 @@ impl Player {
                         engine.source.duration = *duration;
                     }
                 }
+                // The end of the stream, as an *edge*. Deliberately not
+                // `mailbox.end_reason()`, which is a level that stays set —
+                // and which the sink raises when the EOS *event* arrives,
+                // with frames still queued and the whole audio device buffer
+                // still to play. This is posted after every task finished.
+                //
+                // It is also scoped to this engine: the bus dies with it, so
+                // the `Eos` that `stop()` posts while tearing a file down
+                // cannot reach the player and advance the playlist a second
+                // time. A `PipelineHandle::ended()` future would.
+                MessageKind::Eos => ended = true,
                 _ => {}
             }
         }
@@ -730,6 +1033,38 @@ impl Player {
         }
 
         self.dispatch_seek();
+
+        if ended && matches!(self.stage, Stage::Playing) {
+            return self.advance();
+        }
+        Task::none()
+    }
+
+    /// Stop playing, without opening anything else.
+    fn stop_playback(&mut self) -> Task<Message> {
+        self.status = "no file open".into();
+        self.reset_transport();
+        match std::mem::replace(&mut self.stage, Stage::Idle) {
+            Stage::Playing => {
+                let engine = self
+                    .engine
+                    .take()
+                    .expect("Stage::Playing means there is an engine");
+                self.stage = Stage::TearingDown { next: None };
+                Task::future(async move {
+                    engine.teardown().await;
+                    Message::TornDown
+                })
+            }
+            Stage::TearingDown { .. } => {
+                self.stage = Stage::TearingDown { next: None };
+                Task::none()
+            }
+            other => {
+                self.stage = other;
+                Task::none()
+            }
+        }
     }
 
     /// Say something, keeping the last few.
@@ -892,6 +1227,18 @@ impl Player {
         // Only while there is a stream: the recipe is keyed on the mailbox's
         // id, so a rebuild swaps it and frames from the old file cannot reach
         // the new interface.
+        // Files dropped onto the window. Iced emits one event per file, so a
+        // multi-file drop enqueues naturally.
+        //
+        // Wayland does not deliver these at all — `window::Event::FileDropped`
+        // says so in its own documentation, and this player enables both
+        // backends. It works on X11; the file dialog and the playlist are
+        // what actually have to carry opening a file.
+        subs.push(iced::window::events().filter_map(|(_, event)| match event {
+            iced::window::Event::FileDropped(path) => Some(Message::Enqueue(vec![path])),
+            _ => None,
+        }));
+
         if let Some(mailbox) = self.mailbox() {
             subs.push(parallax_iced::frames(mailbox).map(|_| Message::Frame));
         }
@@ -915,6 +1262,10 @@ fn shortcut(key: &Key) -> Option<Message> {
             "m" => Some(Message::ToggleMute),
             "i" => Some(Message::ToggleStats),
             "d" => Some(Message::DumpGraph),
+            "p" => Some(Message::TogglePlaylist),
+            "n" => Some(Message::Next),
+            "b" => Some(Message::Previous),
+            "r" => Some(Message::CycleRepeat),
             "s" => Some(Message::CycleSpeed),
             " " => Some(Message::TogglePause),
             _ => None,
@@ -994,6 +1345,18 @@ mod tests {
             shortcut(&Key::Character("s".into())),
             Some(Message::CycleSpeed)
         ));
+        assert!(matches!(
+            shortcut(&Key::Character("n".into())),
+            Some(Message::Next)
+        ));
+        assert!(matches!(
+            shortcut(&Key::Character("b".into())),
+            Some(Message::Previous)
+        ));
+        assert!(matches!(
+            shortcut(&Key::Character("p".into())),
+            Some(Message::TogglePlaylist)
+        ));
         assert!(shortcut(&Key::Character("z".into())).is_none());
     }
 
@@ -1018,6 +1381,80 @@ mod tests {
         // Half speed is below everything, so it steps up into the sequence.
         assert_eq!(next(0.5), 1.0);
         assert!(SPEEDS.iter().all(|s| *s > 0.0), "no reverse: see SPEEDS");
+    }
+
+    /// The rule that keeps two pipelines from being alive at once (#276).
+    ///
+    /// `PipelineHandle` has no `Drop`: dropping one detaches its tasks and
+    /// leaves a live pipeline behind, sound device and all. So an engine
+    /// exists only in `Stage::Playing`, and every path out of it goes through
+    /// a teardown — of which there is never more than one.
+    #[test]
+    fn pressing_next_during_a_teardown_does_not_start_a_second_one() {
+        assert_eq!(Stage::Playing.open(), Open::Teardown);
+        // The second, third and tenth press all land here: the target is
+        // replaced, nothing is spawned.
+        assert_eq!(Stage::TearingDown { next: None }.open(), Open::Wait);
+        assert_eq!(
+            Stage::TearingDown {
+                next: Some(request(7))
+            }
+            .open(),
+            Open::Wait
+        );
+        // Nothing is running, so there is nothing to wind down first.
+        assert_eq!(Stage::Idle.open(), Open::Probe);
+        assert_eq!(Stage::Probing(request(1)).open(), Open::Probe);
+    }
+
+    /// An Iced task cannot be cancelled, so a superseded probe still answers.
+    #[test]
+    fn only_the_probe_being_waited_for_is_built() {
+        let stage = Stage::Probing(request(4));
+        assert!(stage.accepts_probe(4));
+        assert!(!stage.accepts_probe(3), "an older request was superseded");
+        assert!(!stage.accepts_probe(5), "and there is no newer one yet");
+
+        // Nothing else accepts one at all — building while a pipeline is
+        // running or winding down is the leak this prevents.
+        assert!(!Stage::Playing.accepts_probe(4));
+        assert!(!Stage::Idle.accepts_probe(4));
+        assert!(!Stage::TearingDown { next: None }.accepts_probe(4));
+    }
+
+    /// A cloned message must be harmless, not an error (#276).
+    #[test]
+    fn a_probe_result_can_only_be_taken_once() {
+        let cell = ProbeCell::new(Err("no".into()));
+        let clone = cell.clone();
+        assert!(cell.take().is_some());
+        // The clone finds it emptied and does nothing, which is right: the
+        // request it answers has already been dealt with.
+        assert!(clone.take().is_none());
+        assert!(cell.take().is_none());
+    }
+
+    /// One bad file in a directory is normal; a whole directory of them is
+    /// not a reason to spin forever (#276).
+    #[test]
+    fn skipping_stops_after_a_full_lap_of_failures() {
+        // A single file has nowhere to skip to.
+        assert!(!give_up(1, 1));
+        assert!(!give_up(9, 1));
+        // Part way through a list, keep going.
+        assert!(!give_up(1, 3));
+        assert!(!give_up(2, 3));
+        // A full lap with nothing playable is the end of it.
+        assert!(give_up(3, 3));
+        assert!(give_up(4, 3));
+    }
+
+    fn request(seq: u64) -> Request {
+        Request {
+            seq,
+            index: 0,
+            path: PathBuf::from("f.mp4"),
+        }
     }
 
     /// A warning is passing news; an error is the end of the run (#275).

@@ -5,7 +5,7 @@
 //! player redraws at the frame rate — so a playing-fullscreen tree should be
 //! one `Shader` widget and nothing else.
 
-use iced::widget::{Space, button, column, container, row, slider, text};
+use iced::widget::{Space, button, column, container, row, scrollable, slider, text};
 use iced::{Alignment, Element, Length};
 
 use parallax::clock::ClockTime;
@@ -36,6 +36,9 @@ pub fn overlay(player: &Player) -> Element<'_, Message> {
     }
     if player.show_stats {
         stack = stack.push(stats(player));
+    }
+    if player.show_playlist {
+        stack = stack.push(playlist(player));
     }
 
     // Push the controls to the bottom.
@@ -146,6 +149,11 @@ fn controls(player: &Player) -> Element<'_, Message> {
         .push(Space::new().width(Length::Fill))
         .push(speed(player))
         .push(
+            button(text("Queue").size(12))
+                .on_press(Message::TogglePlaylist)
+                .padding([4, 8]),
+        )
+        .push(
             button(text("Stats").size(12))
                 .on_press(Message::ToggleStats)
                 .padding([4, 8]),
@@ -196,6 +204,63 @@ fn speed(player: &Player) -> Element<'_, Message> {
         );
     }
     row.into()
+}
+
+/// What is queued. Toggled with `p`, or the button.
+///
+/// Scrollable and capped in height: a playlist is allowed to be long, and the
+/// video is what the window is for.
+fn playlist(player: &Player) -> Element<'_, Message> {
+    let mut rows = column![].spacing(2);
+    for (index, entry) in player.playlist.entries().iter().enumerate() {
+        let current = player.playlist.current() == Some(index);
+        let mut label = entry.label();
+        if entry.failed {
+            // Marked rather than removed: a file the user put in the list is
+            // still something they chose, and silently dropping it looks like
+            // the drop never happened.
+            label.push_str("  (could not be opened)");
+        }
+        rows = rows.push(
+            row![
+                text(if current { "▶" } else { " " }).size(12),
+                button(text(label).size(12))
+                    .on_press(Message::PlayIndex(index))
+                    .padding([3, 6])
+                    .width(Length::Fill),
+                button(text("×").size(12))
+                    .on_press(Message::Remove(index))
+                    .padding([3, 6]),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        );
+    }
+
+    let body: Element<'_, Message> = if player.playlist.is_empty() {
+        text("nothing queued — drop files on the window, or pass one on the command line")
+            .size(12)
+            .into()
+    } else {
+        scrollable(rows).height(Length::Fixed(180.0)).into()
+    };
+
+    let controls = row![
+        button(text("Previous (b)").size(11))
+            .on_press(Message::Previous)
+            .padding([3, 8]),
+        button(text("Next (n)").size(11))
+            .on_press(Message::Next)
+            .padding([3, 8]),
+        button(text(player.playlist.repeat.label()).size(11))
+            .on_press(Message::CycleRepeat)
+            .padding([3, 8]),
+    ]
+    .spacing(6);
+
+    panel(column![body, controls].spacing(8))
+        .width(Length::Fill)
+        .into()
 }
 
 /// What the pipeline is actually doing. Toggled with `i`, or the button.

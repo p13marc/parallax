@@ -46,10 +46,17 @@ pub fn run(args: Args) -> Result<i32> {
 }
 
 async fn play(args: Args) -> Result<i32> {
+    // One file: this host has no interface to advance a playlist from, and
+    // an auto-advancing measurement run would report numbers for whichever
+    // file happened to be playing when the deadline hit.
     let path = args
-        .file
-        .clone()
+        .files
+        .first()
+        .cloned()
         .context("--headless needs a file to play")?;
+    if args.files.len() > 1 {
+        tracing::warn!("--headless plays the first file only");
+    }
     let options = args.options();
 
     let probed = tokio::task::spawn_blocking(move || engine::probe(&path))
