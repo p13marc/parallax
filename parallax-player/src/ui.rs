@@ -171,6 +171,11 @@ fn controls(player: &Player) -> Element<'_, Message> {
         .push(Space::new().width(Length::Fill))
         .push(speed(player))
         .push(
+            button(text("Snapshot").size(12))
+                .on_press(Message::Snapshot)
+                .padding([4, 8]),
+        )
+        .push(
             button(text("Queue").size(12))
                 .on_press(Message::TogglePlaylist)
                 .padding([4, 8]),

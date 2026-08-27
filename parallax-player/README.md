@@ -51,6 +51,7 @@ software without comment when the driver has not got it.
 | `p` | playlist |
 | `n` `b` | next / previous file |
 | `r` | repeat off / all / one |
+| `c` | save the frame on screen as a PNG |
 | `d` | write the running graph as GraphViz |
 | `q` | quit |
 

@@ -62,6 +62,26 @@ Every out-of-tree plugin must be rebuilt: the plugin ABI went **12 → 13**.
   `parallax_iced::DEFAULT_MAX_LATENESS` rather than inventing a second pacing
   policy.
 
+- **Snapshot the frame on screen** (#283). `c` writes the *decoder's* frame —
+  full resolution, source colour, no scaling, letterbox or overlay — through
+  the same `VideoConvert` the pipeline uses, so a saved still and the picture
+  it was taken from agree about the matrix and range the stream declared.
+
+  Not the pipeline branch the issue proposes, and `snapshot.rs` says why:
+  a closed `Valve` *drops* rather than queues and has no one-shot mode, so
+  opening and closing it from the interface thread lets an unbounded number
+  of frames through; `FileSink` cannot be re-targeted and appends, so N
+  snapshots would concatenate into one broken PNG; and `Valve::passthrough()`
+  is true, which means the branch adds its whole downstream capacity to the
+  decoder's hold rather than costing nothing while idle. The host already has
+  the frame.
+
+- **`FrameMailbox::last_presented()`** (#283) — the frame the host last took,
+  kept for whoever wants it afterwards. A `PacedFrame` clone moves no pixels,
+  and the slot it holds is one a host displaying a frame retains anyway. It
+  survives a flush on purpose: the frame on screen after a seek is still the
+  frame on screen.
+
 - **Frame stepping** (#281). `.` and `,` step one frame forward or back,
   pausing first. It is a flushing `ACCURATE` seek per frame — wasteful, and
   correct: `plans/30_iced_player.md` carries the design for the real

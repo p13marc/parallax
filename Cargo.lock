@@ -4538,6 +4538,7 @@ dependencies = [
  "parallax-iced",
  "parallax-pipeline",
  "percent-encoding",
+ "png",
  "tokio",
  "tracing",
  "tracing-subscriber",

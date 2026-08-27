@@ -13,6 +13,7 @@ mod engine;
 mod headless;
 mod playlist;
 mod recent;
+mod snapshot;
 mod ui;
 
 use std::collections::VecDeque;
@@ -435,6 +436,10 @@ enum Message {
     ToggleStats,
     /// Write the running graph out as GraphViz.
     DumpGraph,
+    /// Save the frame on screen as a PNG.
+    Snapshot,
+    /// A snapshot finished, for better or worse.
+    Snapshotted(Result<PathBuf, String>),
     /// Dismiss the notice at this index.
     Dismiss(usize),
     /// What Iced's renderer is running on.
@@ -796,6 +801,17 @@ impl Player {
                 self.dump_graph();
                 Task::none()
             }
+            Message::Snapshot => {
+                self.activity();
+                self.snapshot()
+            }
+            Message::Snapshotted(result) => {
+                match result {
+                    Ok(path) => self.note(Level::Info, format!("saved {}", path.display())),
+                    Err(e) => self.note(Level::Warning, e),
+                }
+                Task::none()
+            }
             Message::Dismiss(index) => {
                 self.activity();
                 if index < self.notices.len() {
@@ -994,6 +1010,38 @@ impl Player {
             .unwrap_or_default();
         let dropped = self.engine.as_ref().map(|e| e.dropped()).unwrap_or(0);
         println!("{}", stats_line(self.position, dropped, &stats));
+    }
+
+    /// Save the frame on screen (#283).
+    ///
+    /// The frame comes from the mailbox, not from a branch in the pipeline:
+    /// it is the decoder's own output, so what lands in the file is the
+    /// source frame at full resolution rather than the scaled, letterboxed,
+    /// overlaid window. Converting and compressing it is real work, so it
+    /// goes to a blocking thread — the interface must not stutter for a
+    /// keypress.
+    fn snapshot(&mut self) -> Task<Message> {
+        let Some(engine) = &self.engine else {
+            self.note(Level::Warning, "nothing is playing");
+            return Task::none();
+        };
+        let Some(frame) = engine.mailbox.last_presented() else {
+            self.note(Level::Warning, "no frame has been shown yet");
+            return Task::none();
+        };
+        let source = engine.source.path.clone();
+        let at = self.position.to_option().map(|p| p.nanos()).unwrap_or(0);
+
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    snapshot::write_png(&frame, &source, at).map_err(|e| format!("{e:#}"))
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("the snapshot task panicked: {e}")))
+            },
+            Message::Snapshotted,
+        )
     }
 
     /// Write the running graph out as GraphViz, and say where it went.
@@ -1435,6 +1483,7 @@ fn shortcut(key: &Key) -> Option<Message> {
             "i" => Some(Message::ToggleStats),
             "." => Some(Message::StepBy(1)),
             "," => Some(Message::StepBy(-1)),
+            "c" => Some(Message::Snapshot),
             "d" => Some(Message::DumpGraph),
             "o" => Some(Message::OpenDialog),
             "p" => Some(Message::TogglePlaylist),
