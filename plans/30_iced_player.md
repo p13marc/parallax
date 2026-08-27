@@ -390,8 +390,9 @@ would mean rasterising into video frames for no benefit.
 by muting and saying so on the bus, rather than today's guaranteed desync, since it is
 the clock master. Time-stretch is out of scope; the UI states what it does.
 
-**D4 ([#281](https://git.marcpardo.eu/marcpardo/parallax/issues/281)). Frame stepping (M).** Pause + `ACCURATE` seek to `position + frame_duration` ships
-first; a real `Event::Step` is the follow-up.
+**D4 ([#281](https://git.marcpardo.eu/marcpardo/parallax/issues/281)). Frame stepping (M). DONE (the cheap half).** Pause + `ACCURATE` seek to
+`position ± frame_duration`; the real `Event::Step` design is written up below
+("A real step event") and deliberately not built.
 
 **D5 ([#282](https://git.marcpardo.eu/marcpardo/parallax/issues/282)). Thumbnails and seek preview (L).** A second short-lived pipeline over a second file
 handle (`Mp4Demux` → decoder → `AppSink` → `JpegEncoder`), driven from the GUI, with a
@@ -404,14 +405,8 @@ is mandatory.
 **D7 ([#284](https://git.marcpardo.eu/marcpardo/parallax/issues/284)). Audio output device picker (M).** Wire `AlsaSink::enumerate_devices` to the UI, and
 make `PipeWireSink`'s device parameter actually do something.
 
-**D8 ([#285](https://git.marcpardo.eu/marcpardo/parallax/issues/285)). Deduplicate the two presenters (S, decision).** Once the widget has parity, decide
-how `WgpuBackend`/`dmabuf_import` and `parallax-iced` stop duplicating each other. The
-answer is probably *not* deletion — `parallax-launch` and four examples need an in-crate
-display path, and `display-gpu` is the only in-tree consumer that exercises
-`plane_imports` against a real Vulkan device. After A1 the duplicated surface is already
-down to one `unsafe fn` per wgpu major, which is honest: the hal API genuinely differs
-and any abstraction over it would lie. The interesting option to weigh is re-expressing
-`AutoVideoSink`'s GPU path *on top of* `parallax-iced` once Iced reaches wgpu 30.
+**D8 ([#285](https://git.marcpardo.eu/marcpardo/parallax/issues/285)). Deduplicate the two presenters (S, decision). DECIDED — see "The two
+presenters" below.**
 
 Overlap with `plans/README.md`'s proposed list, to be reconciled rather than duplicated:
 proposed plan **24** (video filters) already names Flip/Rotate and TextOverlay — A4's
@@ -566,7 +561,104 @@ behind.
 
 What it **cannot** show is a cores number. There is no GPU here (`/dev/dri` is
 empty, no `vainfo`), so the renderer is Mesa's software rasteriser and it
-dominates any CPU measurement. `scripts/decode_matrix.py --headless` records
+dominates any CPU measurement. `scripts/decode_matrix.py --weston` records
 frame accounting, arena bytes and position honestly and says so in its own
 help; the 0.54 / 0.24 / 0.12-core ladder from #190 and #62 is still owed by a
 machine with hardware.
+
+## The two presenters (#285, decided)
+
+After this milestone parallax has two wgpu presenters: `WgpuBackend` +
+`dmabuf_import` in the core crate on **wgpu 30**, and `parallax-iced`'s
+pipeline on **Iced's wgpu 27**. The decision is to **keep both**, and this is
+what it rests on rather than taste.
+
+**`display-gpu` is not redundant with the widget, because they do not have the
+same consumers.** `parallax-launch` — the gst-launch equivalent, and a
+headline capability of a crate whose front door is pipeline strings — reaches
+the screen only through `autovideosink`, as do examples 23, 24, 58 and 59. A
+one-liner that ends in a *player crate* is not the same product.
+
+**It is the only place `plane_imports` meets a real Vulkan device.** The
+`parallax::video` maths (#263) is shared by both presenters and pinned by
+golden tests, but golden tests do not catch a wrong DRM format modifier or a
+mis-declared plane offset. `display-gpu` + `dmabuf_import` is the one in-tree
+consumer that hands those numbers to a driver, and CI's `display-check` job is
+what keeps them honest. Deleting it would leave the arithmetic tested and the
+*use* of it untested.
+
+**Deleting it makes playback measurably worse, not just differently
+structured.** `AutoVideoSink`'s caps flip to `[Rgba, Bgra]` + `cpu_only()`
+without the GPU backend (`autovideosink.rs:1020-1026`), so every playback
+graph regains a mandatory full-frame `videoconvert`: at 1080p that is 8.3 MB
+written per frame plus the letterbox blit, against the 3.1 MB upload the GPU
+path collapses it to. Ten tests and a CI job go with it.
+
+**And the duplication is already small and honest.** After A1 the shared
+surface is the plane geometry, the letterbox rect, the colour matrices and the
+WGSL — all in `parallax::video`, all unfeatured, all tested once. What is
+duplicated is roughly *one `unsafe fn` per wgpu major*: the dmabuf import call
+into wgpu-hal. The hal API genuinely differs between majors, and an
+abstraction over it would have to lie about which one it is talking to.
+
+**The option worth revisiting, and its precondition.** Re-expressing
+`AutoVideoSink`'s GPU path *on top of* `parallax-iced` — a minimal Iced
+application with a single video widget — would collapse the duplication
+entirely and hand `autovideosink` window management, HiDPI and input handling
+for free. It also makes the core crate depend on Iced for a gated feature,
+which is a real cost to weigh, not a free win. Its precondition is B3 (#269):
+one wgpu major across the tree. **Checked 2026-08-27: Iced master is
+`0.15.0-dev` and pins `wgpu = "29"`**, so the precondition is still not met,
+and nothing here can make it so. Revisit when a released Iced is on wgpu 30.
+
+The related A2 follow-up — whether `AutoVideoSink` should be rebuilt on top of
+`AppVideoSink` — resolves the same way and for a smaller reason: `AppVideoSink`
+deliberately owns no window, and `AutoVideoSink` is *entirely* about owning
+one. What they share is the pacing decision, and that is already shared:
+`pipeline::schedule` is one function both call.
+
+## A real step event (#281's follow-up, designed not built)
+
+The shipped step is a flushing `ACCURATE` seek per frame. It is correct and it
+is wasteful: a flush trio, a decoder reset and a keyframe re-decode to advance
+by 40 ms. GStreamer's answer is `GstEventStep`, and the shape that fits this
+tree is:
+
+```rust
+Event::Step { format: SegmentFormat, amount: u64, rate: f64, flush: bool }
+```
+
+**It is a third upstream family**, alongside QoS (an advisory) and
+ForceKeyUnit (an imperative the first encoder consumes). A step is an
+imperative the first *paced sink* consumes, and it travels no further —
+exactly `INSTANT_RATE_CHANGE`'s sink-terminated shape (#165), for the same
+reason: nothing upstream should reposition.
+
+**The sink is where it lands, because the sink is what is holding the frames.**
+A paused `AppVideoSink` has up to `capacity` frames queued and a host parked
+on the doorbell. A step of N means: release exactly N, re-park, and post
+`MessageKind::StepDone { amount, eos }`. No flush, no seek, no decoder reset —
+and the decoder keeps running ahead, so a held `.` steps at decode speed
+rather than at flush speed.
+
+**Three things it must get right**, none of which the seek version has to:
+
+1. **The clock does not move while paused**, so a released frame cannot be
+   paced against running time — it is presented on arrival, and the sink's
+   `position()` must advance by the frame it released or the readout lies.
+2. **Running out of queued frames is not EOS.** A step past the end of the
+   queue has to either unblock the producer for one frame (raising the pause
+   gate for a single buffer, which the `watch` cannot express today) or answer
+   `StepDone { eos: false, amount: 0 }` and let the caller retry. The second
+   is honest and simple; the first is what makes holding `.` smooth.
+3. **`rate` is not the playback rate.** GStreamer's step rate scales the
+   *step*, which is how frame-accurate scrubbing at 0.1× works. Ignoring it
+   is fine for v1 but the field should exist, or adding it later is another
+   ABI bump.
+
+**Cost**: a new `Event` variant (no ABI implication — `Event` is not returned
+by value across the plugin boundary, unlike `MediaFormat`), a
+`handle_upstream_event` arm on the paced sinks, a `PipelineHandle::step`, and
+the pause-gate change in (2) if smoothness is wanted. Backward stepping stays
+out: it needs decode-order buffering the engine does not do, and a backward
+*seek* already covers the use case at a hitch's cost.
