@@ -10,7 +10,7 @@ commit messages and the Forgejo releases.
 
 ## [Unreleased]
 
-Every out-of-tree plugin must be rebuilt: the plugin ABI went **12 → 13**.
+Every out-of-tree plugin must be rebuilt: the plugin ABI went **12 → 14**.
 
 ### Added
 
@@ -61,6 +61,41 @@ Every out-of-tree plugin must be rebuilt: the plugin ABI went **12 → 13**.
   agreement is the point, and the reason it calls `take_due` and
   `parallax_iced::DEFAULT_MAX_LATENESS` rather than inventing a second pacing
   policy.
+
+- **Subtitles** (#279). `parallax::subtitle` is a new unfeatured module beside
+  `parallax::video`: a `Cue` (text plus its interval), a `CueTrack` that
+  retains cues until they expire, `srt` for sidecar files and `text` for
+  taking the words out of an ASS event body. `AppSubtitleSink` publishes into
+  a `CueTrack` the way `AppVideoSink` publishes into a `FrameMailbox`, sharing
+  its flush discipline; the player draws them with Iced's own text stack,
+  bottom-centred, mounted only while a cue is on screen.
+
+  **A cue is an interval, and that is why it needed its own store.**
+  `FrameMailbox::take_due` pops and forgets — right for a frame, wrong for a
+  subtitle, which would then show for exactly one repaint. `CueTrack::active`
+  answers "what is on screen now" as many times as it is asked, and
+  `retire()` clears the cue *being displayed* as well as the queue: a seek
+  that left the old subtitle burnt over the new picture is precisely the bug
+  the video path's generations exist to prevent.
+
+  **Matroska never stores SRT as SRT.** A muxer converts it to `S_TEXT/UTF8`
+  with the timing in the container, so a subtitle track inside an MKV needs no
+  parsing at all — the block payload *is* the cue text and `BlockDuration`
+  *is* the out-time. The SRT parser exists for the sidecar `.srt` next to the
+  video, which is where a downloaded subtitle actually lives. ASS is degraded
+  to plain text (eight commas to the event body, then `{...}` overrides
+  stripped and `\N` turned into a line break) and says so; PGS and VobSub are
+  bitmap formats and are refused rather than shown as garbage.
+
+  Subtitles are **off until asked for**: a container's default-subtitle flag
+  is a hint about a language preference the engine does not have.
+
+- **`MediaFormat::Text(TextCodec)`** (#279), with its wire code and its arm in
+  both projections. A cue that crossed a process or machine boundary as
+  anonymous bytes is the drift #219 and #238 exist to prevent. `WIRE_VERSION`
+  is 6 and the **plugin ABI is 14**: caps cross the plugin boundary by value,
+  so a plugin compiled against the old enum could be handed a discriminant it
+  has no arm for — the same reason `MemoryType::External` minted 11.
 
 - **Track enumeration and selection** (#278). `Mp4Track` and `MkvTrack` carry
   a `TrackLabel` — language, name, and the default/forced/enabled flags — so a
@@ -208,6 +243,11 @@ Every out-of-tree plugin must be rebuilt: the plugin ABI went **12 → 13**.
   dependency, with `cfg(test)` off.
 
 ### Fixed
+
+- **A third demuxer pad would have been called "audio"** (#279). Both file
+  demuxers' `pad_name` ended in `_ => "audio"`, so routing anything to
+  `PadId(2)` would have sent it silently down the audio branch. Exhaustive
+  now, in both.
 
 - **MKV could not describe two video tracks** (#278). `nal_config` was a
   single `Option<NalConfig>` where MP4 has a per-track map, so routing a

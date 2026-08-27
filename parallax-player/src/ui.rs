@@ -233,6 +233,47 @@ fn speed(player: &Player) -> Element<'_, Message> {
     row.into()
 }
 
+/// The subtitles on screen (#279).
+///
+/// Bottom-centred over the picture, in the same translucent box the rest of
+/// the chrome uses so it stays legible over a bright frame. Drawn with Iced's
+/// own text stack rather than rasterised into the video: text shaped at the
+/// window's real scale stays crisp at any size, and the engine's job is timed
+/// text, not pixels.
+pub fn subtitles(player: &Player) -> Element<'_, Message> {
+    let mut lines = column![].spacing(4).align_x(Alignment::Center);
+    for cue in &player.cues {
+        lines = lines.push(
+            container(
+                text(cue.text.clone())
+                    .size(player.subtitle_size)
+                    .align_x(Alignment::Center),
+            )
+            .padding([4, 10])
+            .style(|_: &iced::Theme| {
+                container::background(iced::Color::from_rgba(0.0, 0.0, 0.0, 0.6))
+                    .border(iced::border::rounded(4))
+                    .color(iced::Color::WHITE)
+            }),
+        );
+    }
+
+    // Clear of the transport when it is up, near the bottom when it is not —
+    // a cue hidden behind the seek bar is the same as no cue.
+    let bottom = if player.controls_visible() {
+        110.0
+    } else {
+        40.0
+    };
+    container(lines)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(iced::Padding::new(0.0).bottom(bottom))
+        .align_x(Alignment::Center)
+        .align_y(Alignment::End)
+        .into()
+}
+
 /// What an empty window shows.
 ///
 /// Not a slogan: the two things a player with nothing open can offer are a

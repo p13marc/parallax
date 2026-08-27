@@ -33,7 +33,9 @@ pub const WIRE_MAGIC: [u8; 2] = [0x50, 0x58];
 
 /// The internal schema's version.
 ///
-/// 5: `color` (#265) — colorimetry, so the same file stops rendering three
+/// 6: `WireFormat::Text` (#279) — a subtitle cue that crosses a boundary says
+/// so, rather than arriving as anonymous bytes. 5: `color` (#265) —
+/// colorimetry, so the same file stops rendering three
 /// different ways. 4: `rtp`, `planes` and `WireFormat::Rtp` (#219) — the
 /// fields the two wires had already diverged on. 3: `terminal` (#224).
 /// 2: `coded` (#236).
@@ -43,4 +45,4 @@ pub const WIRE_MAGIC: [u8; 2] = [0x50, 0x58];
 /// [`IPC_RING_VERSION`](crate::memory::IPC_RING_VERSION) is *mechanics*: the
 /// ring's layout and handshake. A doc saying "remember to bump both" is a doc
 /// that will be violated.
-pub const WIRE_VERSION: u8 = 5;
+pub const WIRE_VERSION: u8 = 6;

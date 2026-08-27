@@ -902,7 +902,10 @@ fn test_plugin_abi_version() {
     // 10: AsyncElementDyn::retained_buffers (#189)
     // 12: AsyncElementDyn::finish (#221)
     // 13: AsyncElementDyn::set_clock takes Arc<SyncBase> (#265)
-    assert_eq!(PARALLAX_ABI_VERSION, 13);
+    // 14: MediaFormat/FormatCaps grew a Text variant (#279) — caps cross the
+    //     boundary by value, so an old plugin could be handed a discriminant
+    //     it has no arm for
+    assert_eq!(PARALLAX_ABI_VERSION, 14);
 }
 
 /// Test plugin descriptor struct sizes are non-zero.

@@ -31,7 +31,7 @@ use parallax::clock::ClockTime;
 use parallax::format::{
     AudioCodec, AudioFormat, ColorInfo, ColorMatrix, ColorPrimaries, ColorRange, DisplayGeometry,
     Framerate, MediaFormat, PixelFormat, PlaneDesc, PlaneLayout, Rotation, RtpEncoding, RtpFormat,
-    SampleFormat, TransferFunction, VideoCodec, VideoFormat,
+    SampleFormat, TextCodec, TransferFunction, VideoCodec, VideoFormat,
 };
 use parallax::memory::SharedIpcSlotRef;
 use parallax::metadata::{BufferFlags, Metadata, RtpMeta};
@@ -301,6 +301,17 @@ fn every_format() -> Vec<(&'static str, Metadata)> {
     let mut m = base();
     m.format = Some(MediaFormat::Bytes);
     out.push(("bytes", m));
+
+    // Timed text (#279). Every codec, because a cue that crossed a boundary
+    // as anonymous bytes is the drift #219 and #238 exist to prevent.
+    for codec in [TextCodec::Utf8, TextCodec::Ass, TextCodec::WebVtt] {
+        let mut m = base();
+        m.format = Some(MediaFormat::Text(codec));
+        // A cue is an interval: the duration is as load-bearing as the PTS,
+        // and a projection that dropped it would show every subtitle forever.
+        m.duration = ClockTime::from_millis(2_500);
+        out.push(("text", m));
+    }
 
     out
 }

@@ -327,6 +327,14 @@ struct Args {
     #[arg(long)]
     audio_track: Option<u64>,
 
+    /// Subtitle track to show, by container id; none by default.
+    #[arg(long)]
+    subtitle_track: Option<u64>,
+
+    /// A SubRip file to show alongside the video.
+    #[arg(long = "sub", value_name = "FILE.srt")]
+    sidecar: Option<PathBuf>,
+
     /// Play with no window at all, printing the machine-readable summary.
     ///
     /// The pipeline is the same one the window drives, and this process is
@@ -359,6 +367,8 @@ impl Args {
             audio_device: self.audio_device.clone(),
             video_track: self.video_track,
             audio_track: self.audio_track,
+            subtitle_track: self.subtitle_track,
+            sidecar: self.sidecar.clone(),
         }
     }
 }
@@ -464,6 +474,8 @@ enum Message {
     DumpGraph,
     /// Save the frame on screen as a PNG.
     Snapshot,
+    /// Grow or shrink the subtitles.
+    SubtitleSize(f32),
     /// A snapshot finished, for better or worse.
     Snapshotted(Result<PathBuf, String>),
     /// Dismiss the notice at this index.
@@ -525,6 +537,15 @@ struct Player {
     show_playlist: bool,
     /// Files opened lately, newest first — the empty screen's only content.
     recent: Vec<PathBuf>,
+    /// The cues on screen right now, re-read on the tick (#279).
+    ///
+    /// Polled rather than pushed: `VideoView::update` deliberately never
+    /// publishes a message — Iced rebuilds the whole interface when a redraw
+    /// produces one — and a cue boundary is comfortably inside the 50 ms
+    /// tick's tolerance.
+    cues: Vec<parallax::subtitle::Cue>,
+    /// How large to draw them.
+    subtitle_size: f32,
     /// Output devices, read once when someone first asks to see them.
     audio_devices: Vec<parallax::elements::AlsaDeviceInfo>,
     /// Where to resume after a rebuild that was not a track change.
@@ -572,6 +593,8 @@ impl Player {
             failures: 0,
             show_playlist: false,
             recent: recent::load(),
+            cues: Vec::new(),
+            subtitle_size: 22.0,
             audio_devices: Vec::new(),
             resume_at: None,
             position: ClockTime::ZERO,
@@ -709,15 +732,11 @@ impl Player {
                     engine::TrackKind::Audio => &mut self.options.audio_track,
                     // #279 wires the subtitle pad; until then there is
                     // nothing to select one *into*.
-                    engine::TrackKind::Subtitle => {
-                        self.note(Level::Info, "subtitle tracks are not rendered yet");
-                        return Task::none();
-                    }
+                    engine::TrackKind::Subtitle => &mut self.options.subtitle_track,
                 };
-                if *slot == Some(id) {
-                    return Task::none();
-                }
-                *slot = Some(id);
+                // Choosing the track already playing turns it off, which is
+                // how "no subtitles" is reachable without a separate control.
+                *slot = if *slot == Some(id) { None } else { Some(id) };
                 self.reopen_current()
             }
             Message::AudioDevice(device) => {
@@ -871,6 +890,11 @@ impl Player {
             Message::DumpGraph => {
                 self.activity();
                 self.dump_graph();
+                Task::none()
+            }
+            Message::SubtitleSize(delta) => {
+                self.activity();
+                self.subtitle_size = (self.subtitle_size + delta).clamp(12.0, 64.0);
                 Task::none()
             }
             Message::Snapshot => {
@@ -1165,6 +1189,15 @@ impl Player {
         if engine.mailbox.stats().presented > 0 {
             self.failures = 0;
         }
+
+        // The cues on screen, against the same running time the widget paces
+        // to — so a subtitle and the frame it belongs to appear together.
+        let now = engine
+            .mailbox
+            .clock()
+            .map(|clock| clock.now())
+            .unwrap_or(ClockTime::NONE);
+        self.cues = engine.cues.active(now);
 
         let mut ended = false;
         let messages = engine.poll_bus();
@@ -1517,14 +1550,21 @@ impl Player {
                 iced::mouse::Interaction::Hidden
             });
 
-        stack![
+        let mut layers = stack![
             container(video)
                 .width(iced::Fill)
                 .height(iced::Fill)
                 .style(|_| container::background(iced::Color::BLACK)),
-            ui::overlay(self),
-        ]
-        .into()
+        ];
+        // Subtitles sit above the picture and *below* the transport, so a cue
+        // can never occlude the controls (#279). Mounted only when a cue is
+        // actually on screen: `ui.rs`'s rule is that the overlay is unmounted
+        // rather than transparent, because every redraw runs full layout and
+        // text shaping at the frame rate.
+        if !self.cues.is_empty() {
+            layers = layers.push(ui::subtitles(self));
+        }
+        layers.push(ui::overlay(self)).into()
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -1581,6 +1621,8 @@ fn shortcut(key: &Key) -> Option<Message> {
             "," => Some(Message::StepBy(-1)),
             "c" => Some(Message::Snapshot),
             "d" => Some(Message::DumpGraph),
+            "+" | "=" => Some(Message::SubtitleSize(2.0)),
+            "-" => Some(Message::SubtitleSize(-2.0)),
             "o" => Some(Message::OpenDialog),
             "p" => Some(Message::TogglePlaylist),
             "n" => Some(Message::Next),

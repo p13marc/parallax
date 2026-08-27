@@ -433,6 +433,8 @@ pub struct MkvDemux<R: Read + Seek> {
     /// Whether the stream collection has gone out. Once per pipeline: the
     /// track table is fixed at construction, so repeating it says nothing.
     reported: bool,
+    /// Subtitle track to route, if any (#279). Off unless asked for.
+    subtitle_pick: Option<u64>,
     /// Reusable frame to avoid a fresh allocation per block.
     frame: Frame,
     looping: bool,
@@ -582,6 +584,7 @@ impl<R: Read + Seek> MkvDemux<R> {
                 .grow_to_fit(),
             bus: None,
             reported: false,
+            subtitle_pick: None,
             frame: Frame::default(),
             looping: false,
             staged_segment: None,
@@ -729,6 +732,21 @@ impl<R: Read + Seek> MkvDemux<R> {
         self
     }
 
+    /// The text codec a subtitle track's id names, if parallax can draw it.
+    ///
+    /// `S_HDMV/PGS` and `S_VOBSUB` are **bitmap** subtitles — a completely
+    /// different rendering path from timed text — so they are listed and not
+    /// routed rather than routed and shown as garbage.
+    pub fn text_codec(codec_id: &str) -> Option<crate::format::TextCodec> {
+        use crate::format::TextCodec;
+        match codec_id {
+            "S_TEXT/UTF8" => Some(TextCodec::Utf8),
+            "S_TEXT/ASS" | "S_TEXT/SSA" => Some(TextCodec::Ass),
+            "S_TEXT/WEBVTT" => Some(TextCodec::WebVtt),
+            _ => None,
+        }
+    }
+
     /// Route specific tracks instead of the first of each type (#278).
     ///
     /// `None` keeps the default pick, so `with_tracks(None, Some(3))` changes
@@ -741,7 +759,41 @@ impl<R: Read + Seek> MkvDemux<R> {
     /// and an E-AC-3 track need different decoder elements, and the graph is
     /// fixed at `start()`. An application changes tracks by building again —
     /// which is what the player does, resuming where it was.
-    pub fn with_tracks(mut self, video: Option<u64>, audio: Option<u64>) -> Result<Self> {
+    pub fn with_tracks(self, video: Option<u64>, audio: Option<u64>) -> Result<Self> {
+        let subtitle = self.subtitle_pick;
+        self.with_all_tracks(video, audio, subtitle)
+    }
+
+    /// Route a subtitle track as well (#279).
+    ///
+    /// `None` routes none: subtitles are off by default, which is what a
+    /// player does until somebody asks for them. There is no "the
+    /// container's default subtitle" here for the same reason — a file's
+    /// forced-subtitle flag is a hint for a *language preference* the engine
+    /// does not have.
+    pub fn with_subtitle_track(mut self, subtitle: Option<u64>) -> Result<Self> {
+        self.subtitle_pick = subtitle;
+        let (video, audio) = self.current_picks();
+        self.with_all_tracks(video, audio, subtitle)
+    }
+
+    /// The video and audio tracks currently routed.
+    fn current_picks(&self) -> (Option<u64>, Option<u64>) {
+        let at = |pad: u32| {
+            self.routed
+                .iter()
+                .find(|(_, p)| p.0 == pad)
+                .map(|(id, _)| *id)
+        };
+        (at(0), at(1))
+    }
+
+    fn with_all_tracks(
+        mut self,
+        video: Option<u64>,
+        audio: Option<u64>,
+        subtitle: Option<u64>,
+    ) -> Result<Self> {
         let video = match video {
             Some(id) => Some(self.require_track(id, MkvTrackType::Video)?),
             None => self.default_track(MkvTrackType::Video),
@@ -750,6 +802,26 @@ impl<R: Read + Seek> MkvDemux<R> {
             Some(id) => Some(self.require_track(id, MkvTrackType::Audio)?),
             None => self.default_track(MkvTrackType::Audio),
         };
+        let subtitle = match subtitle {
+            Some(id) => {
+                let id = self.require_track(id, MkvTrackType::Subtitle)?;
+                let codec_id = self
+                    .tracks
+                    .iter()
+                    .find(|t| t.id == id)
+                    .map(|t| t.codec_id.clone())
+                    .unwrap_or_default();
+                if Self::text_codec(&codec_id).is_none() {
+                    return Err(Error::Config(format!(
+                        "MKV track {id} is {codec_id}, which is a bitmap subtitle \
+                         format parallax cannot draw"
+                    )));
+                }
+                Some(id)
+            }
+            None => None,
+        };
+        self.subtitle_pick = subtitle;
 
         // Everything `route` accumulated for the previous pick has to go, or
         // the old track's parameter sets and header-stripping prefixes follow
@@ -765,6 +837,9 @@ impl<R: Read + Seek> MkvDemux<R> {
         }
         if let Some(id) = audio {
             self.route(id, crate::element::PadId(1), crate::format::Caps::any())?;
+        }
+        if let Some(id) = subtitle {
+            self.route(id, crate::element::PadId(2), crate::format::Caps::any())?;
         }
         Ok(self)
     }
@@ -1012,6 +1087,11 @@ impl<R: Read + Seek> MkvDemux<R> {
                 }
             } else if let Some(codec) = track_info.codec.audio_codec() {
                 metadata.format = Some(crate::format::MediaFormat::Audio(codec));
+            } else if let Some(codec) = Self::text_codec(&track_info.codec_id) {
+                // A subtitle block is already a cue: Matroska strips the
+                // timing into the block, and this buffer's pts/duration are
+                // that timing (#279).
+                metadata.format = Some(crate::format::MediaFormat::Text(codec));
             }
         }
 
@@ -1360,9 +1440,13 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
     }
 
     fn pad_name(&self, pad: crate::element::PadId) -> String {
+        // Exhaustive on purpose. The catch-all used to be `_ => "audio"`, so
+        // adding a third pad silently collided with the audio one — every
+        // subtitle buffer would have gone down the audio branch (#279).
         match pad.0 {
             0 => "video".into(),
-            _ => "audio".into(),
+            1 => "audio".into(),
+            _ => "subtitle".into(),
         }
     }
 

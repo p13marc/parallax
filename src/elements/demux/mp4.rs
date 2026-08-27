@@ -1598,9 +1598,12 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for Mp4DemuxSource<R> {
     }
 
     fn pad_name(&self, pad: crate::element::PadId) -> String {
+        // Exhaustive on purpose: the catch-all used to be `_ => "audio"`, so
+        // a third pad would silently collide with the audio one (#279).
         match pad.0 {
             0 => "video".into(),
-            _ => "audio".into(),
+            1 => "audio".into(),
+            _ => "subtitle".into(),
         }
     }
 

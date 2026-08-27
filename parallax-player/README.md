@@ -46,6 +46,7 @@ software without comment when the driver has not got it.
 | `Esc` | leave fullscreen, else quit |
 | `o` | open files |
 | `.` `,` | step one frame forward / back (pauses) |
+| `+` `-` | subtitle size |
 | `s` | playback speed |
 | `i` | diagnostics |
 | `p` | playlist |
@@ -77,6 +78,8 @@ therefore the video, at wall rate.
 | `--audio-device NAME` | ALSA device to play through; `list` prints them |
 | `--video-track ID` | video track to play, by container id |
 | `--audio-track ID` | audio track to play, by container id |
+| `--subtitle-track ID` | subtitle track to show; none by default |
+| `--sub FILE.srt` | a SubRip file to show alongside the video |
 | `--exit-after N` | quit after N seconds, printing the summary |
 
 ## The machine-readable summary

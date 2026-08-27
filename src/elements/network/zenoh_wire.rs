@@ -26,7 +26,7 @@
 //! consumer-facing contract owned by its specification. See
 //! `docs/zenoh-wire.md`.
 
-use crate::format::{AudioCodec, MediaFormat, VideoCodec};
+use crate::format::{AudioCodec, MediaFormat, TextCodec, VideoCodec};
 
 pub use crate::wire::{
     CUSTOM_META, WIRE_MAGIC, WIRE_VERSION, WireFormat, WireMetadata, WirePlanes, WireRtp,
@@ -63,6 +63,12 @@ pub fn encoding_for_format(format: Option<&MediaFormat>) -> zenoh::bytes::Encodi
             af.sample_format, af.channels, af.sample_rate
         )),
         Some(MediaFormat::MpegTs) => Encoding::from("video/mp2t"),
+        // A subtitle cue, so a non-parallax subscriber gets a content hint
+        // rather than `zenoh/bytes` (#279 — the same drift #238 closed for
+        // the demuxers' video and audio).
+        Some(MediaFormat::Text(TextCodec::Utf8)) => Encoding::TEXT_PLAIN,
+        Some(MediaFormat::Text(TextCodec::Ass)) => Encoding::from("text/x-ssa"),
+        Some(MediaFormat::Text(TextCodec::WebVtt)) => Encoding::from("text/vtt"),
         Some(MediaFormat::Rtp(_)) | Some(MediaFormat::Bytes) | None => Encoding::ZENOH_BYTES,
     }
 }

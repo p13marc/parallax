@@ -68,6 +68,12 @@ pub struct Options {
     pub video_track: Option<u64>,
     /// Audio track to play, by container id. `None` takes the default.
     pub audio_track: Option<u64>,
+    /// Subtitle track to show, by container id. `None` shows none — off is
+    /// the right default, and the container's "default subtitle" flag is a
+    /// hint about a language preference the player does not have (#279).
+    pub subtitle_track: Option<u64>,
+    /// A `.srt` file to show instead of a container track.
+    pub sidecar: Option<PathBuf>,
 }
 
 impl Default for Options {
@@ -84,6 +90,8 @@ impl Default for Options {
             audio_device: "default".into(),
             video_track: None,
             audio_track: None,
+            subtitle_track: None,
+            sidecar: None,
         }
     }
 }
@@ -682,6 +690,12 @@ pub struct Engine {
     /// What is playing.
     pub source: SourceDescription,
     dropped: Arc<AtomicU64>,
+    /// The subtitle cues on screen, for the host to draw (#279).
+    ///
+    /// Always present, even with no subtitle track: a sidecar `.srt` fills
+    /// the same store, and a host that had to ask whether it exists would
+    /// have two code paths for one job.
+    pub cues: Arc<parallax::subtitle::CueTrack>,
     /// Which decoder actually won — hardware or software, and which one.
     ///
     /// The choice is made once and then consumed by `add_filter`, so it has
@@ -708,6 +722,9 @@ impl Engine {
         let audio = audio_branch(opts, description.audio.as_ref());
 
         let mut pipeline = Pipeline::new();
+        // Set when a container track is routed to the subtitle pad; a sidecar
+        // file fills the same store without one.
+        let mut subtitle_routed = false;
         let dropped = Arc::new(AtomicU64::new(0));
         pipeline
             .tracer_registry()
@@ -735,13 +752,23 @@ impl Engine {
             }
             ProbedSource::Mkv(demux) => {
                 let selected = demux.with_tracks(opts.video_track, opts.audio_track)?;
-                let s = if audio.is_some() {
+                let selected = if audio.is_some() {
                     selected
                 } else {
                     selected.video_only()
-                }
-                .with_loop(opts.gapless_loop);
-                pipeline.add_demuxer("demux", s)
+                };
+                // Subtitles are MKV-only for now: MP4's tx3g is reachable
+                // (`read_sample` is track-type agnostic) but rare outside
+                // Apple exports, and there is no fixture here to prove it
+                // against (#279).
+                let selected = match opts.subtitle_track {
+                    Some(id) => {
+                        subtitle_routed = true;
+                        selected.with_subtitle_track(Some(id))?
+                    }
+                    None => selected,
+                };
+                pipeline.add_demuxer("demux", selected.with_loop(opts.gapless_loop))
             }
         };
 
@@ -801,6 +828,43 @@ impl Engine {
         let mailbox = sink.mailbox();
         let snk = pipeline.add_async_sink("display", sink);
 
+        // Subtitles (#279). The branch exists only when a track was asked
+        // for; the cue store exists either way, because a sidecar `.srt`
+        // fills the same one.
+        let subtitles = parallax::elements::AppSubtitleSink::new();
+        let cues = subtitles.cues();
+        if subtitle_routed {
+            let subs = pipeline.add_async_sink("subtitles", subtitles);
+            // Lossy and shallow: a cue is a short string and there is nothing
+            // to be gained by back-pressuring the demuxer for one, while a
+            // blocked subtitle branch would stall the picture.
+            pipeline.link_pads_full(
+                src,
+                "subtitle",
+                subs,
+                "sink",
+                LinkPolicy::DropNewest,
+                Some(8),
+            )?;
+        }
+        if let Some(path) = &opts.sidecar {
+            match std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("{e}"))
+                .and_then(|text| {
+                    parallax::subtitle::srt::parse(&text).map_err(|e| anyhow::anyhow!("{e}"))
+                }) {
+                Ok(parsed) => {
+                    tracing::info!("{} cues from {}", parsed.len(), path.display());
+                    for cue in parsed {
+                        cues.push(cue);
+                    }
+                }
+                // A missing or malformed sidecar loses the subtitles, not the
+                // film.
+                Err(e) => tracing::warn!("{}: {e}", path.display()),
+            }
+        }
+
         // Deep branch links decouple the two consumers: the demuxer emits in
         // DTS order, so if the video branch back-pressures at its exact rate
         // the audio branch starves, the device underruns, the audio-master
@@ -854,6 +918,7 @@ impl Engine {
             handle,
             bus,
             mailbox,
+            cues,
             volume,
             source,
             dropped,

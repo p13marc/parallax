@@ -43,7 +43,7 @@ through the control socket.
 Every code both encodings write comes from `wire::codes`, whose lock test pins
 each assignment. Reordering `PixelFormat` is therefore not a wire event.
 
-## Chapter P — the parallax plane (contract version 5)
+## Chapter P — the parallax plane (contract version 6)
 
 Each buffer becomes exactly one zenoh sample:
 
@@ -51,7 +51,7 @@ Each buffer becomes exactly one zenoh sample:
 |---|---|
 | payload | the raw buffer bytes, unmodified |
 | encoding | derived from `Metadata.format` (`video/h264`, `image/jpeg`-style MIME hints; `zenoh/bytes` when unknown), overridable via `ZenohSink::with_encoding` |
-| attachment | `[0x50 'P', 0x58 'X', 0x05] ++ rkyv(WireMetadata)` |
+| attachment | `[0x50 'P', 0x58 'X', 0x06] ++ rkyv(WireMetadata)` |
 
 ### Custom metadata
 
@@ -103,7 +103,10 @@ and gates on exact equality, because both ends there are parallax and a
 mismatch is a deployment error rather than a stranger on the network.
 
 v2 added the coded-geometry field; v3 added the terminal marker below; v4
-added `rtp`, `planes` and `WireFormat::Rtp` (#219).
+added `rtp`, `planes` and `WireFormat::Rtp` (#219); v5 added `color` and
+`display` (#265, #266); v6 added `WireFormat::Text` (#279), so a subtitle cue
+crossing a machine boundary says what it is instead of arriving as
+`zenoh/bytes`.
 
 ### Terminal samples (#224)
 
