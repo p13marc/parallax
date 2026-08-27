@@ -104,6 +104,9 @@ pub struct AppVideoSink {
     host_retention: usize,
     /// Running-time window boundary for the next QoS report.
     qos_window_start: Option<u64>,
+    /// Cumulative counter values at the last report, so the window's deltas
+    /// can be derived without resetting what the interface reads.
+    qos_baseline: (u64, u64),
     /// The staged QoS event, taken by the executor.
     qos_pending: Option<crate::event::QosEvent>,
 }
@@ -143,6 +146,7 @@ impl AppVideoSink {
             acceptance: FrameAcceptance::default(),
             host_retention: 1,
             qos_window_start: None,
+            qos_baseline: (0, 0),
             qos_pending: None,
         }
     }
@@ -279,7 +283,10 @@ impl AppVideoSink {
         if now_ns.saturating_sub(start) < QOS_WINDOW_NS {
             return;
         }
-        let (processed, dropped, worst_late_ns) = self.mailbox.take_presentation_counters();
+        let (presented, dropped_late, worst_late_ns) = self.mailbox.presentation_counters();
+        let processed = presented.saturating_sub(self.qos_baseline.0);
+        let dropped = dropped_late.saturating_sub(self.qos_baseline.1);
+        self.qos_baseline = (presented, dropped_late);
         if dropped > 0 {
             self.qos_pending = Some(crate::event::QosEvent {
                 qos_type: crate::event::QosType::Underflow,

@@ -1004,6 +1004,18 @@ impl PipelineHandle {
     /// async-spawned sources (RT-scheduled sources carry no control channel),
     /// or every source task has already finished.
     pub async fn send_event_upstream(&self, event: Event) -> bool {
+        self.dispatch_event_upstream(event)
+    }
+
+    /// [`send_event_upstream`](Self::send_event_upstream), synchronously.
+    ///
+    /// Dispatching an upstream event does not block — every channel it
+    /// touches is unbounded, and what takes time is the flush trio running
+    /// afterwards, elsewhere. The `async` twin exists because callers
+    /// generally are async, not because there is anything to await; a GUI
+    /// event handler, which is neither async nor able to move a
+    /// `PipelineHandle` into a task, needs this one.
+    pub fn dispatch_event_upstream(&self, event: Event) -> bool {
         // Same courtesy to the paced sinks as `seek` (#265): a flushing seek
         // sent through the escape hatch still abandons the position they are
         // pacing, so they still need telling before the flush trio catches
@@ -1057,6 +1069,20 @@ impl PipelineHandle {
     /// Watch the bus for [`MessageKind::SeekDone`](crate::pipeline::bus::MessageKind::SeekDone) to learn when the flush
     /// sequence has run.
     pub async fn seek(&self, seek: SeekEvent) -> bool {
+        self.dispatch_seek(seek)
+    }
+
+    /// [`seek`](Self::seek), synchronously.
+    ///
+    /// A seek is dispatched, not performed: this raises the flush epoch and
+    /// posts the event to the sink inboxes, and everything that takes time —
+    /// the flush trio, the demuxer repositioning, the decoder restarting —
+    /// happens in the element tasks. Watch the bus for `SeekDone`.
+    ///
+    /// The `async` twin is the ergonomic one for async callers. This is the
+    /// one a GUI needs: an Iced `update` is synchronous and cannot move a
+    /// `PipelineHandle` into a `Task`.
+    pub fn dispatch_seek(&self, seek: SeekEvent) -> bool {
         // The gate is unchanged: no source declared seekability → nothing
         // is dispatched at all. EXCEPT instant rate changes (#165): they
         // terminate at the sinks and reposition nothing, so a live,

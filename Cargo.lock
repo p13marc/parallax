@@ -4546,6 +4546,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "parallax-play"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "iced",
+ "parallax-iced",
+ "parallax-pipeline",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "parallax-player"
 version = "0.1.0"
 dependencies = [

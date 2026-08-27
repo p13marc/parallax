@@ -8,7 +8,7 @@ use iced::widget::shader;
 use iced::{Event, Rectangle, mouse, window};
 
 use parallax::clock::ClockTime;
-use parallax::pipeline::StallWatch;
+use parallax::pipeline::{Pace, StallWatch, schedule};
 use parallax::video::{FrameMailbox, PacedFrame};
 
 use crate::render::VideoPrimitive;
@@ -179,15 +179,16 @@ impl<Message> shader::Program<Message> for VideoView {
         }
 
         match self.mailbox.next_due() {
-            // Due at a known time: ask for exactly that instant.
-            Some(target) if target != ClockTime::NONE => {
-                let wait = target.nanos().saturating_sub(clock.now().nanos());
-                Some(shader::Action::request_redraw_at(
-                    *instant + Duration::from_nanos(wait),
-                ))
-            }
-            // Queued with no timing contract — draw it now.
-            Some(_) => Some(shader::Action::request_redraw()),
+            // Ask `schedule` when to come back, not the raw target — it is
+            // the same function `take_due` uses to decide whether a frame is
+            // due, so the two cannot disagree. They did: a target more than
+            // `MAX_WAIT` ahead is due *now* by the PTS-jump escape hatch,
+            // while sleeping until it stalled the picture for as long as the
+            // jump was.
+            Some(target) => match schedule(target, clock.now(), self.max_lateness) {
+                Pace::Wait(delay) => Some(shader::Action::request_redraw_at(*instant + delay)),
+                Pace::Present | Pace::DropLate { .. } => Some(shader::Action::request_redraw()),
+            },
             // Nothing queued. The doorbell subscription is what normally wakes
             // us; this is the fallback so a missed one costs a fifth of a
             // second rather than the picture.

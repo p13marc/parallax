@@ -428,18 +428,17 @@ impl FrameMailbox {
         self.space.notify_waiters();
     }
 
-    /// Take the drop counters the sink turns into a QoS report, resetting them.
-    pub(crate) fn take_presentation_counters(&self) -> (u64, u64, u64) {
+    /// The counters the sink turns into a QoS report.
+    ///
+    /// `presented` and `dropped_late` are cumulative — a diagnostics panel
+    /// reads them and would be baffled by a counter that goes down — so the
+    /// sink keeps its own window baselines. Only the worst-lateness watermark
+    /// is taken, because "worst since the last report" is the only useful
+    /// reading of it.
+    pub(crate) fn presentation_counters(&self) -> (u64, u64, u64) {
         let mut state = self.lock();
-        let out = (
-            state.stats.presented,
-            state.stats.dropped_late,
-            state.stats.worst_late_ns,
-        );
-        state.stats.presented = 0;
-        state.stats.dropped_late = 0;
-        state.stats.worst_late_ns = 0;
-        out
+        let worst = std::mem::take(&mut state.stats.worst_late_ns);
+        (state.stats.presented, state.stats.dropped_late, worst)
     }
 
     pub(crate) fn space(&self) -> &Notify {

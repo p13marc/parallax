@@ -386,7 +386,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v7.0.1
-      - run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev fonts-dejavu-core pkg-config
+      - run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev fonts-dejavu-core libasound2-dev libva-dev libdav1d-dev libopus-dev libvpx-dev libudev-dev g++ libclang-dev pkg-config
       - uses: https://github.com/dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_VERSION }}
@@ -397,9 +397,12 @@ jobs:
           cache-targets: false
       - uses: https://github.com/taiki-e/install-action@nextest
       - run: cargo clippy -p parallax-iced --all-targets -- -D warnings
+      - run: cargo clippy -p parallax-play --all-targets -- -D warnings
       - run: cargo nextest run -p parallax-iced
       - name: exactly one wgpu
-        run: '! cargo tree -p parallax-iced -d 2>/dev/null | grep -q "^wgpu"'
+        run: |
+          ! cargo tree -p parallax-iced -d 2>/dev/null | grep -q "^wgpu"
+          ! cargo tree -p parallax-play -d 2>/dev/null | grep -q "^wgpu"
 
   docs:
     runs-on: ubuntu-24.04
