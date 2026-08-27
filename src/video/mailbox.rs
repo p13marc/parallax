@@ -187,6 +187,13 @@ struct MailboxState {
     stats: FrameStats,
     clock: Option<PresentationClock>,
     end: Option<EndReason>,
+    /// The last frame the host took, kept for whoever wants it afterwards.
+    ///
+    /// A `PacedFrame` clone is two atomic increments and a `Metadata` clone —
+    /// no pixels move — so holding one costs an arena slot and nothing else.
+    /// That slot is already accounted for: a host retains the frame it is
+    /// displaying anyway, which is what `host_retention` declares.
+    last: Option<PacedFrame>,
 }
 
 /// A bounded, drop-oldest handoff of paced frames from a sink to a host.
@@ -314,12 +321,27 @@ impl FrameMailbox {
                 }
             }
         };
-        if taken.is_some() {
+        if let Some(frame) = &taken {
             state.stats.presented += 1;
+            state.last = Some(frame.clone());
         }
         drop(state);
         self.space.notify_one();
         taken
+    }
+
+    /// The last frame the host took, if it has taken one.
+    ///
+    /// This is the decoder's own output — the buffer it wrote, with its
+    /// geometry, plane layout and colour — not whatever the host scaled,
+    /// letterboxed or drew an interface over. That is what makes it the right
+    /// thing to save to a file, and the reason a snapshot needs no second
+    /// branch in the pipeline (#283).
+    ///
+    /// It survives a flush deliberately: the frame on screen after a seek is
+    /// still the frame on screen. What clears it is a new frame.
+    pub fn last_presented(&self) -> Option<PacedFrame> {
+        self.lock().last.clone()
     }
 
     /// Running time the next queued frame is due at.
@@ -571,6 +593,35 @@ mod tests {
             mb.take_due(ClockTime::NONE, Duration::from_millis(40))
                 .is_some()
         );
+    }
+
+    /// The frame a snapshot saves is the one the host last took (#283).
+    #[test]
+    fn the_last_taken_frame_is_kept_for_whoever_wants_it() {
+        let mb = FrameMailbox::new(4);
+        assert!(mb.last_presented().is_none(), "nothing has been shown yet");
+
+        mb.try_push(frame(0, 0)).unwrap();
+        mb.try_push(frame(0, 100)).unwrap();
+        assert!(
+            mb.last_presented().is_none(),
+            "queued is not shown — a snapshot must not save a frame nobody saw"
+        );
+
+        let first = mb
+            .take_due(ClockTime::from_nanos(200), Duration::from_millis(40))
+            .expect("the first is due");
+        assert_eq!(mb.last_presented().map(|f| f.target), Some(first.target));
+
+        let second = mb
+            .take_due(ClockTime::from_nanos(200), Duration::from_millis(40))
+            .expect("the second is due too");
+        assert_eq!(mb.last_presented().map(|f| f.target), Some(second.target));
+
+        // A flush retires what is *queued*; the frame on screen after a seek
+        // is still the frame on screen until a new one replaces it.
+        mb.retire();
+        assert_eq!(mb.last_presented().map(|f| f.target), Some(second.target));
     }
 
     #[test]

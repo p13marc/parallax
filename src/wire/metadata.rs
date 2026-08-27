@@ -162,6 +162,11 @@ mod wire_types {
         },
         /// MPEG-TS packets.
         MpegTs,
+        /// Timed text — one subtitle cue (#279).
+        Text {
+            /// Text codec code.
+            codec: u8,
+        },
         /// Raw bytes.
         Bytes,
     }
@@ -244,6 +249,9 @@ impl WireFormat {
                 }
             }
             MediaFormat::MpegTs => WireFormat::MpegTs,
+            MediaFormat::Text(codec) => WireFormat::Text {
+                codec: codes::text_codec_to_code(*codec),
+            },
             MediaFormat::Bytes => WireFormat::Bytes,
         })
     }
@@ -294,6 +302,7 @@ impl WireFormat {
                 encoding: codes::rtp_encoding_from_code(*encoding, *dynamic_pt)?,
             }),
             WireFormat::MpegTs => MediaFormat::MpegTs,
+            WireFormat::Text { codec } => MediaFormat::Text(codes::text_codec_from_code(*codec)?),
             WireFormat::Bytes => MediaFormat::Bytes,
         })
     }

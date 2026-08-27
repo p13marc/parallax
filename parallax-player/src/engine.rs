@@ -12,6 +12,7 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 
@@ -59,6 +60,20 @@ pub struct Options {
     /// Present frames at their due time. Off is the batch-decode floor — the
     /// pipeline runs as fast as it can, which is how #192 was measured.
     pub sync: bool,
+    /// ALSA device to play through. `"default"` is whatever ALSA is
+    /// configured to mean, which is usually dmix or PipeWire's bridge.
+    pub audio_device: String,
+    /// Video track to play, by container id. `None` takes the container's
+    /// default (#278).
+    pub video_track: Option<u64>,
+    /// Audio track to play, by container id. `None` takes the default.
+    pub audio_track: Option<u64>,
+    /// Subtitle track to show, by container id. `None` shows none — off is
+    /// the right default, and the container's "default subtitle" flag is a
+    /// hint about a language preference the player does not have (#279).
+    pub subtitle_track: Option<u64>,
+    /// A `.srt` file to show instead of a container track.
+    pub sidecar: Option<PathBuf>,
 }
 
 impl Default for Options {
@@ -72,6 +87,11 @@ impl Default for Options {
             frame_delay: 0,
             channel_capacity: 4,
             sync: true,
+            audio_device: "default".into(),
+            video_track: None,
+            audio_track: None,
+            subtitle_track: None,
+            sidecar: None,
         }
     }
 }
@@ -179,6 +199,27 @@ pub struct VideoStream {
     pub width: u32,
     /// Coded height, or 0 when the container did not say.
     pub height: u32,
+    /// Frames per second, when the container said.
+    ///
+    /// `None` is *unknown*, and has to stay distinguishable from a real rate:
+    /// nothing on the buffer path carries a framerate at all — the demuxers
+    /// emit encoded buffers, whose `MediaFormat::Video` has no slot for one,
+    /// and `Framerate::default()` is 30 fps, so a decoded frame cannot be
+    /// asked either. This is read from the container header and is the only
+    /// honest source the player has. Frame stepping refuses rather than
+    /// guessing 30 (#281).
+    pub frame_rate: Option<f64>,
+}
+
+impl VideoStream {
+    /// How long one frame lasts, when the framerate is known and sane.
+    pub fn frame_duration(&self) -> Option<Duration> {
+        let fps = self.frame_rate?;
+        // A container that states 0 fps, or something absurd, has said
+        // nothing useful. 1000 fps is well past any real file and keeps the
+        // arithmetic away from zero-length steps.
+        (fps.is_finite() && fps > 0.0 && fps <= 1000.0).then(|| Duration::from_secs_f64(1.0 / fps))
+    }
 }
 
 /// The selected audio track.
@@ -211,6 +252,32 @@ pub struct SourceDescription {
     pub duration: ClockTime,
     /// Subtitle tracks present but not rendered (#279).
     pub subtitles: usize,
+    /// Every track the container holds, for the picker (#278).
+    pub tracks: Vec<TrackChoice>,
+}
+
+/// One track a picker can offer.
+#[derive(Debug, Clone)]
+pub struct TrackChoice {
+    /// Container track id, which is what selection is by.
+    pub id: u64,
+    /// Video, audio or subtitle.
+    pub kind: TrackKind,
+    /// What to show for it.
+    pub label: String,
+    /// Whether it is the one playing.
+    pub selected: bool,
+}
+
+/// What a track carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackKind {
+    /// Pictures.
+    Video,
+    /// Sound.
+    Audio,
+    /// Timed text.
+    Subtitle,
 }
 
 impl SourceDescription {
@@ -334,6 +401,7 @@ fn describe_mp4(path: &Path, demux: &Mp4Demux<BufReader<File>>) -> SourceDescrip
                 codec: t.codec.into(),
                 width: info.map(|i| i.width).unwrap_or(0),
                 height: info.map(|i| i.height).unwrap_or(0),
+                frame_rate: info.and_then(|i| i.frame_rate),
             }
         });
     let audio = demux
@@ -362,6 +430,36 @@ fn describe_mp4(path: &Path, demux: &Mp4Demux<BufReader<File>>) -> SourceDescrip
             .iter()
             .filter(|t| t.track_type == Mp4TrackType::Subtitle)
             .count(),
+        tracks: demux
+            .tracks()
+            .iter()
+            .filter_map(|track| {
+                let kind = match track.track_type {
+                    Mp4TrackType::Video => TrackKind::Video,
+                    Mp4TrackType::Audio => TrackKind::Audio,
+                    Mp4TrackType::Subtitle => TrackKind::Subtitle,
+                    Mp4TrackType::Unknown => return None,
+                };
+                Some(TrackChoice {
+                    id: track.id as u64,
+                    kind,
+                    label: choice_label(&track.label, &track.codec.to_string()),
+                    selected: match kind {
+                        TrackKind::Video => demux.video_track_id() == Some(track.id),
+                        TrackKind::Audio => demux.audio_track_id() == Some(track.id),
+                        TrackKind::Subtitle => false,
+                    },
+                })
+            })
+            .collect(),
+    }
+}
+
+/// What to show for a track: what the container said, else the codec.
+fn choice_label(label: &parallax::elements::TrackLabel, codec: &str) -> String {
+    match label.describe() {
+        Some(described) => format!("{described} · {codec}"),
+        None => codec.to_string(),
     }
 }
 
@@ -372,6 +470,7 @@ fn describe_mkv(path: &Path, demux: &MkvDemux<BufReader<File>>) -> SourceDescrip
             codec: (&t.codec).into(),
             width: info.map(|i| i.width).unwrap_or(0),
             height: info.map(|i| i.height).unwrap_or(0),
+            frame_rate: info.and_then(|i| i.frame_rate),
         }
     });
     let audio = demux.audio_track().and_then(|t| {
@@ -399,6 +498,28 @@ fn describe_mkv(path: &Path, demux: &MkvDemux<BufReader<File>>) -> SourceDescrip
             .iter()
             .filter(|t| t.track_type == MkvTrackType::Subtitle)
             .count(),
+        tracks: demux
+            .tracks()
+            .iter()
+            .filter_map(|track| {
+                let kind = match track.track_type {
+                    MkvTrackType::Video => TrackKind::Video,
+                    MkvTrackType::Audio => TrackKind::Audio,
+                    MkvTrackType::Subtitle => TrackKind::Subtitle,
+                    MkvTrackType::Unknown => return None,
+                };
+                Some(TrackChoice {
+                    id: track.id,
+                    kind,
+                    label: choice_label(&track.label, &track.codec.to_string()),
+                    selected: match kind {
+                        TrackKind::Video => demux.video_track().map(|t| t.id) == Some(track.id),
+                        TrackKind::Audio => demux.audio_track().map(|t| t.id) == Some(track.id),
+                        TrackKind::Subtitle => false,
+                    },
+                })
+            })
+            .collect(),
     }
 }
 
@@ -528,10 +649,13 @@ fn audio_branch(opts: &Options, audio: Option<&AudioStream>) -> Option<(AudioDec
         format: alsa_sample_format,
         ..AlsaFormat::default()
     };
-    match AlsaSink::new("default", format) {
+    match AlsaSink::new(&opts.audio_device, format) {
         Ok(sink) => Some((decoder, sink)),
         Err(e) => {
-            tracing::warn!("audio device unavailable ({e}) — video only");
+            tracing::warn!(
+                "audio device '{}' unavailable ({e}) — video only",
+                opts.audio_device
+            );
             None
         }
     }
@@ -566,6 +690,12 @@ pub struct Engine {
     /// What is playing.
     pub source: SourceDescription,
     dropped: Arc<AtomicU64>,
+    /// The subtitle cues on screen, for the host to draw (#279).
+    ///
+    /// Always present, even with no subtitle track: a sidecar `.srt` fills
+    /// the same store, and a host that had to ask whether it exists would
+    /// have two code paths for one job.
+    pub cues: Arc<parallax::subtitle::CueTrack>,
     /// Which decoder actually won — hardware or software, and which one.
     ///
     /// The choice is made once and then consumed by `add_filter`, so it has
@@ -592,6 +722,9 @@ impl Engine {
         let audio = audio_branch(opts, description.audio.as_ref());
 
         let mut pipeline = Pipeline::new();
+        // Set when a container track is routed to the subtitle pad; a sidecar
+        // file fills the same store without one.
+        let mut subtitle_routed = false;
         let dropped = Arc::new(AtomicU64::new(0));
         pipeline
             .tracer_registry()
@@ -601,22 +734,41 @@ impl Engine {
         // from existing at all, so nothing warns about an unlinked pad.
         let src = match source {
             ProbedSource::Mp4(demux) => {
+                let selected = Mp4DemuxSource::new(*demux).with_tracks(
+                    opts.video_track.map(|id| id as u32),
+                    opts.audio_track.map(|id| id as u32),
+                )?;
+                // Without an audio branch the audio pad must not exist, or
+                // every audio buffer is dropped into an unlinked pad. Note
+                // `drop_audio()`, not `with_tracks(v, None)`: the latter means
+                // "the container's default audio track", not "no audio".
                 let s = if audio.is_some() {
-                    Mp4DemuxSource::new(*demux)
+                    selected
                 } else {
-                    Mp4DemuxSource::video_only(*demux)
+                    selected.drop_audio()
                 }
                 .with_loop(opts.gapless_loop);
                 pipeline.add_demuxer("demux", s)
             }
             ProbedSource::Mkv(demux) => {
-                let s = if audio.is_some() {
-                    *demux
+                let selected = demux.with_tracks(opts.video_track, opts.audio_track)?;
+                let selected = if audio.is_some() {
+                    selected
                 } else {
-                    demux.video_only()
-                }
-                .with_loop(opts.gapless_loop);
-                pipeline.add_demuxer("demux", s)
+                    selected.video_only()
+                };
+                // Subtitles are MKV-only for now: MP4's tx3g is reachable
+                // (`read_sample` is track-type agnostic) but rare outside
+                // Apple exports, and there is no fixture here to prove it
+                // against (#279).
+                let selected = match opts.subtitle_track {
+                    Some(id) => {
+                        subtitle_routed = true;
+                        selected.with_subtitle_track(Some(id))?
+                    }
+                    None => selected,
+                };
+                pipeline.add_demuxer("demux", selected.with_loop(opts.gapless_loop))
             }
         };
 
@@ -676,6 +828,43 @@ impl Engine {
         let mailbox = sink.mailbox();
         let snk = pipeline.add_async_sink("display", sink);
 
+        // Subtitles (#279). The branch exists only when a track was asked
+        // for; the cue store exists either way, because a sidecar `.srt`
+        // fills the same one.
+        let subtitles = parallax::elements::AppSubtitleSink::new();
+        let cues = subtitles.cues();
+        if subtitle_routed {
+            let subs = pipeline.add_async_sink("subtitles", subtitles);
+            // Lossy and shallow: a cue is a short string and there is nothing
+            // to be gained by back-pressuring the demuxer for one, while a
+            // blocked subtitle branch would stall the picture.
+            pipeline.link_pads_full(
+                src,
+                "subtitle",
+                subs,
+                "sink",
+                LinkPolicy::DropNewest,
+                Some(8),
+            )?;
+        }
+        if let Some(path) = &opts.sidecar {
+            match std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("{e}"))
+                .and_then(|text| {
+                    parallax::subtitle::srt::parse(&text).map_err(|e| anyhow::anyhow!("{e}"))
+                }) {
+                Ok(parsed) => {
+                    tracing::info!("{} cues from {}", parsed.len(), path.display());
+                    for cue in parsed {
+                        cues.push(cue);
+                    }
+                }
+                // A missing or malformed sidecar loses the subtitles, not the
+                // film.
+                Err(e) => tracing::warn!("{}: {e}", path.display()),
+            }
+        }
+
         // Deep branch links decouple the two consumers: the demuxer emits in
         // DTS order, so if the video branch back-pressures at its exact rate
         // the audio branch starves, the device underruns, the audio-master
@@ -729,6 +918,7 @@ impl Engine {
             handle,
             bus,
             mailbox,
+            cues,
             volume,
             source,
             dropped,
@@ -795,4 +985,45 @@ impl Engine {
             Err(_) => tracing::warn!("pipeline did not stop within 5s"),
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The 2 s H.264/AAC fixture: 20 frames at 10 fps, keyframe every 5.
+    fn fixture() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/tiny_h264_aac.mkv")
+    }
+
+    #[test]
+    fn the_container_states_a_frame_rate_and_it_reaches_the_transport() {
+        let probed = probe(&fixture()).expect("the fixture probes");
+        let video = probed.description.video.expect("it has video");
+        // 10 fps, so one frame is 100 ms — the step size (#281).
+        assert_eq!(
+            video.frame_duration(),
+            Some(Duration::from_millis(100)),
+            "frame rate {:?} did not survive the probe",
+            video.frame_rate
+        );
+    }
+
+    /// Why there is no end-to-end frame-step test here.
+    ///
+    /// The player links the demuxer to the decoder 24 buffers deep
+    /// (`Engine::build`), and the only fixture in the tree is two seconds —
+    /// twenty frames. The whole file therefore fits in the link buffer, so
+    /// the demuxer reads it to EOS within milliseconds of `start()` and there
+    /// is nothing left to reposition by the time a seek could be issued;
+    /// frames then drain out of the buffers at pace and playback looks
+    /// perfectly normal. `tests/av_sync_tests.rs` hits the same wall and
+    /// works around it by building its own pipeline with 4/8-deep links,
+    /// which is exactly what makes it *not* the player's pipeline.
+    ///
+    /// So the arithmetic is tested here and the seek behaviour it depends on
+    /// — ACCURATE landing on the requested time rather than a keyframe — is
+    /// tested against a real MKV in `av_sync_tests`. Proving the two together
+    /// needs a fixture longer than the link depth.
+    const _: () = ();
 }

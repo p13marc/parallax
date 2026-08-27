@@ -10,7 +10,7 @@ commit messages and the Forgejo releases.
 
 ## [Unreleased]
 
-Every out-of-tree plugin must be rebuilt: the plugin ABI went **12 → 13**.
+Every out-of-tree plugin must be rebuilt: the plugin ABI went **12 → 14**.
 
 ### Added
 
@@ -61,6 +61,125 @@ Every out-of-tree plugin must be rebuilt: the plugin ABI went **12 → 13**.
   agreement is the point, and the reason it calls `take_due` and
   `parallax_iced::DEFAULT_MAX_LATENESS` rather than inventing a second pacing
   policy.
+
+- **Subtitles** (#279). `parallax::subtitle` is a new unfeatured module beside
+  `parallax::video`: a `Cue` (text plus its interval), a `CueTrack` that
+  retains cues until they expire, `srt` for sidecar files and `text` for
+  taking the words out of an ASS event body. `AppSubtitleSink` publishes into
+  a `CueTrack` the way `AppVideoSink` publishes into a `FrameMailbox`, sharing
+  its flush discipline; the player draws them with Iced's own text stack,
+  bottom-centred, mounted only while a cue is on screen.
+
+  **A cue is an interval, and that is why it needed its own store.**
+  `FrameMailbox::take_due` pops and forgets — right for a frame, wrong for a
+  subtitle, which would then show for exactly one repaint. `CueTrack::active`
+  answers "what is on screen now" as many times as it is asked, and
+  `retire()` clears the cue *being displayed* as well as the queue: a seek
+  that left the old subtitle burnt over the new picture is precisely the bug
+  the video path's generations exist to prevent.
+
+  **Matroska never stores SRT as SRT.** A muxer converts it to `S_TEXT/UTF8`
+  with the timing in the container, so a subtitle track inside an MKV needs no
+  parsing at all — the block payload *is* the cue text and `BlockDuration`
+  *is* the out-time. The SRT parser exists for the sidecar `.srt` next to the
+  video, which is where a downloaded subtitle actually lives. ASS is degraded
+  to plain text (eight commas to the event body, then `{...}` overrides
+  stripped and `\N` turned into a line break) and says so; PGS and VobSub are
+  bitmap formats and are refused rather than shown as garbage.
+
+  Subtitles are **off until asked for**: a container's default-subtitle flag
+  is a hint about a language preference the engine does not have.
+
+- **`MediaFormat::Text(TextCodec)`** (#279), with its wire code and its arm in
+  both projections. A cue that crossed a process or machine boundary as
+  anonymous bytes is the drift #219 and #238 exist to prevent. `WIRE_VERSION`
+  is 6 and the **plugin ABI is 14**: caps cross the plugin boundary by value,
+  so a plugin compiled against the old enum could be handed a discriminant it
+  has no arm for — the same reason `MemoryType::External` minted 11.
+
+- **Track enumeration and selection** (#278). `Mp4Track` and `MkvTrack` carry
+  a `TrackLabel` — language, name, and the default/forced/enabled flags — so a
+  picker has something to label a row with. MKV had all of it available and
+  unread; MP4 needed three sources (`mdhd`'s packed language code, `hdlr`'s
+  name where several muxers write a title, and `tkhd`'s enabled bit), and its
+  missing pieces are an honest `None` rather than something invented: there is
+  no forced flag in MP4 at all, and `elng` is not modelled by the crate.
+
+  `MkvDemux::with_tracks` and `Mp4DemuxSource::with_tracks` select by
+  container id, falling back to the container's own default flag and then to
+  the first playable track. A track id that does not exist, or names a track
+  of the wrong type, is an **error** — a picker offered it, so a silent
+  fall-back would hide a real bug. `MkvDemux::route` is public with them.
+
+  Selection is construction-time by design, and the player switches tracks by
+  rebuilding and resuming where it was: an AAC track and an E-AC-3 track need
+  different decoder elements, so a switch is a different graph rather than a
+  re-pointed pad. `--video-track` / `--audio-track` and a picker in the
+  diagnostics panel.
+
+- **`MessageKind::StreamCollection` and `MessageKind::Tag` have producers**
+  (#278). Both, plus `StreamInfo`, `BusHandle::post_tags` and all of
+  `pipeline::tags`, shipped as types with no caller anywhere in the tree. The
+  file demuxers now post one collection and one tag list on their first
+  `produce` — a track list with each stream's language, flags and whether it
+  is the one playing, and the container format, duration and selected codecs.
+  `Demuxer` gained a defaulted `set_bus` to reach the bus at all; the executor
+  already called `set_bus` on every element, and the adapter simply had
+  nowhere to forward it to. No ABI change.
+
+- **`TagValue::Bool`** and the `track-default` / `track-forced` /
+  `track-selected` tag keys (#278). `StreamInfo` has no field for which stream
+  is playing, and a collection that cannot say that is half an answer.
+
+- **Audio output device selection** (#284). `--audio-device NAME` picks it,
+  `--audio-device list` prints what ALSA offers, and the diagnostics panel
+  has a picker; choosing one rebuilds the pipeline and resumes where it was,
+  because the graph is fixed at `start()` and an ALSA sink is opened once for
+  one device.
+
+- **`PipeWireSink::audio(Some(name))` reaches the named node** (#284). The
+  device parameter was carried as far as `playback_thread` and then dropped —
+  the parameter was literally named `_device`, and the stream connected with
+  `AUTOCONNECT` and no target, so a named device played out of whatever the
+  session manager chose. It sets `TARGET_OBJECT` now, and so does the capture
+  side, which had the same hole one indirection later.
+
+- **Snapshot the frame on screen** (#283). `c` writes the *decoder's* frame —
+  full resolution, source colour, no scaling, letterbox or overlay — through
+  the same `VideoConvert` the pipeline uses, so a saved still and the picture
+  it was taken from agree about the matrix and range the stream declared.
+
+  Not the pipeline branch the issue proposes, and `snapshot.rs` says why:
+  a closed `Valve` *drops* rather than queues and has no one-shot mode, so
+  opening and closing it from the interface thread lets an unbounded number
+  of frames through; `FileSink` cannot be re-targeted and appends, so N
+  snapshots would concatenate into one broken PNG; and `Valve::passthrough()`
+  is true, which means the branch adds its whole downstream capacity to the
+  decoder's hold rather than costing nothing while idle. The host already has
+  the frame.
+
+- **`FrameMailbox::last_presented()`** (#283) — the frame the host last took,
+  kept for whoever wants it afterwards. A `PacedFrame` clone moves no pixels,
+  and the slot it holds is one a host displaying a frame retains anyway. It
+  survives a flush on purpose: the frame on screen after a seek is still the
+  frame on screen.
+
+- **Frame stepping** (#281). `.` and `,` step one frame forward or back,
+  pausing first. It is a flushing `ACCURATE` seek per frame — wasteful, and
+  correct: `plans/30_iced_player.md` carries the design for the real
+  `Event::Step` that a paced sink would consume without a flush.
+
+  Two details decide whether it works at all. `SeekEvent::new_time` is
+  `FLUSH | KEY_UNIT` and `with_flags` *replaces* rather than ORs, so a step
+  restates the whole set — and it must add **`SNAP_BEFORE`** as well as
+  `ACCURATE`, because MKV's default snap is *forward*: without it a step from
+  600 ms to 700 ms lands on the keyframe at 1000 ms, skipping most of a GOP in
+  the name of advancing one frame. And the step size comes from the container
+  header, carried on the player's `VideoStream`, because nothing on the buffer
+  path has a framerate — the demuxers emit encoded buffers, whose
+  `MediaFormat::Video` has no slot for one, and `Framerate::default()` is
+  30 fps, so a decoded frame cannot be asked either. A file that states no
+  frame rate refuses to step rather than guessing 33 ms and calling it a frame.
 
 - **The gestures a GUI is expected to have** (#274). Wheel to change the
   volume, a pointer that disappears with the chrome (under the same rule, so
@@ -124,6 +243,34 @@ Every out-of-tree plugin must be rebuilt: the plugin ABI went **12 → 13**.
   dependency, with `cfg(test)` off.
 
 ### Fixed
+
+- **A third demuxer pad would have been called "audio"** (#279). Both file
+  demuxers' `pad_name` ended in `_ => "audio"`, so routing anything to
+  `PadId(2)` would have sent it silently down the audio branch. Exhaustive
+  now, in both.
+
+- **MKV could not describe two video tracks** (#278). `nal_config` was a
+  single `Option<NalConfig>` where MP4 has a per-track map, so routing a
+  second video track overwrote the first one's parameter sets outright. It
+  never bit because nothing could select a track; `with_tracks` would have
+  made it reachable. Fixed with it rather than left as a landmine.
+
+- **ALSA no longer plays at a rate the hardware is not using** (#284).
+  `AlsaSink::new` asks for a rate with `ValueOr::Nearest`, so a driver that
+  cannot do 44.1 kHz **substitutes** the closest it can and says nothing —
+  while `self.format.sample_rate` kept the *requested* value. Everything
+  derived from it then ran on a fiction: the pinned caps, the declared
+  latency, `frames_to_nanos`, and `AlsaPosition`, which is the master clock
+  the whole pipeline paces against. The result was audio at the wrong pitch
+  and a clock that drifts, with no error anywhere.
+
+  The granted rate, channels, buffer and period are read back after
+  `hw_params` now. A rounded buffer is accepted and the real numbers stored,
+  because that is normal and harmless once the latency follows it; a
+  substituted *rate* is refused with `DeviceError::FormatNotSupported` — which
+  was defined and never constructed in this file — naming both rates and
+  saying to resample upstream. `AlsaSrc` had the same hole and gets the same
+  treatment: its timestamps are derived from that rate too.
 
 - **Playback speed survives a track change** (#276). `reset_transport` cleared
   position, pause and the seek state; `build` re-applied the volume. Nothing

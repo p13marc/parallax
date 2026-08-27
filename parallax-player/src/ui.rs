@@ -119,7 +119,15 @@ fn controls(player: &Player) -> Element<'_, Message> {
             .into(),
     };
 
-    let transport = row![
+    // Frame stepping only when the container said how long a frame is; a
+    // guess would step 33 ms and call it a frame (#281).
+    let steppable = player
+        .source()
+        .and_then(|s| s.video.as_ref())
+        .and_then(|v| v.frame_duration())
+        .is_some();
+
+    let mut transport = row![
         button(text(if player.paused { "Play" } else { "Pause" }).size(13))
             .on_press(Message::TogglePause)
             .padding([4, 10]),
@@ -129,6 +137,20 @@ fn controls(player: &Player) -> Element<'_, Message> {
     ]
     .spacing(10)
     .align_y(Alignment::Center);
+
+    if steppable {
+        transport = transport
+            .push(
+                button(text("◀|").size(12))
+                    .on_press(Message::StepBy(-1))
+                    .padding([4, 6]),
+            )
+            .push(
+                button(text("|▶").size(12))
+                    .on_press(Message::StepBy(1))
+                    .padding([4, 6]),
+            );
+    }
 
     let mut tools = row![].spacing(8).align_y(Alignment::Center);
     if player.has_audio() {
@@ -148,6 +170,11 @@ fn controls(player: &Player) -> Element<'_, Message> {
     tools = tools
         .push(Space::new().width(Length::Fill))
         .push(speed(player))
+        .push(
+            button(text("Snapshot").size(12))
+                .on_press(Message::Snapshot)
+                .padding([4, 8]),
+        )
         .push(
             button(text("Queue").size(12))
                 .on_press(Message::TogglePlaylist)
@@ -206,6 +233,47 @@ fn speed(player: &Player) -> Element<'_, Message> {
     row.into()
 }
 
+/// The subtitles on screen (#279).
+///
+/// Bottom-centred over the picture, in the same translucent box the rest of
+/// the chrome uses so it stays legible over a bright frame. Drawn with Iced's
+/// own text stack rather than rasterised into the video: text shaped at the
+/// window's real scale stays crisp at any size, and the engine's job is timed
+/// text, not pixels.
+pub fn subtitles(player: &Player) -> Element<'_, Message> {
+    let mut lines = column![].spacing(4).align_x(Alignment::Center);
+    for cue in &player.cues {
+        lines = lines.push(
+            container(
+                text(cue.text.clone())
+                    .size(player.subtitle_size)
+                    .align_x(Alignment::Center),
+            )
+            .padding([4, 10])
+            .style(|_: &iced::Theme| {
+                container::background(iced::Color::from_rgba(0.0, 0.0, 0.0, 0.6))
+                    .border(iced::border::rounded(4))
+                    .color(iced::Color::WHITE)
+            }),
+        );
+    }
+
+    // Clear of the transport when it is up, near the bottom when it is not —
+    // a cue hidden behind the seek bar is the same as no cue.
+    let bottom = if player.controls_visible() {
+        110.0
+    } else {
+        40.0
+    };
+    container(lines)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(iced::Padding::new(0.0).bottom(bottom))
+        .align_x(Alignment::Center)
+        .align_y(Alignment::End)
+        .into()
+}
+
 /// What an empty window shows.
 ///
 /// Not a slogan: the two things a player with nothing open can offer are a
@@ -237,6 +305,65 @@ pub fn welcome(player: &Player) -> Element<'_, Message> {
     }
 
     body.into()
+}
+
+/// What the container holds, with the playing tracks marked (#278).
+///
+/// Choosing one rebuilds the pipeline and resumes where it was — an AAC track
+/// and an E-AC-3 track need different decoder elements, so a switch is a
+/// different graph, not a re-pointed pad.
+fn tracks(source: &crate::engine::SourceDescription) -> Element<'_, Message> {
+    use crate::engine::TrackKind;
+
+    let mut list = column![].spacing(2);
+    for track in &source.tracks {
+        let kind = match track.kind {
+            TrackKind::Video => "video",
+            TrackKind::Audio => "audio",
+            TrackKind::Subtitle => "subs",
+        };
+        list = list.push(
+            row![
+                text(if track.selected { "•" } else { " " }).size(11),
+                text(kind).size(11),
+                button(text(track.label.clone()).size(11))
+                    .on_press(Message::SelectTrack(track.kind, track.id))
+                    .padding([2, 6]),
+            ]
+            .spacing(4)
+            .align_y(Alignment::Center),
+        );
+    }
+    scrollable(list).height(Length::Fixed(90.0)).into()
+}
+
+/// The output devices, with the one in use marked.
+///
+/// Choosing one rebuilds the pipeline and resumes where it was: the graph is
+/// fixed at `start()` and an ALSA sink is opened once for one device, so
+/// there is no re-link to do it any other way. A visible hitch, and honest
+/// about being one.
+fn devices(player: &Player) -> Element<'_, Message> {
+    let mut list = column![].spacing(2);
+    for device in &player.audio_devices {
+        let current = player.options.audio_device == device.name;
+        let label = if device.description.is_empty() {
+            device.name.clone()
+        } else {
+            format!("{} — {}", device.name, device.description)
+        };
+        list = list.push(
+            row![
+                text(if current { "•" } else { " " }).size(11),
+                button(text(label).size(11))
+                    .on_press(Message::AudioDevice(device.name.clone()))
+                    .padding([2, 6]),
+            ]
+            .spacing(4)
+            .align_y(Alignment::Center),
+        );
+    }
+    scrollable(list).height(Length::Fixed(90.0)).into()
 }
 
 /// What is queued. Toggled with `p`, or the button.
@@ -398,6 +525,18 @@ fn stats(player: &Player) -> Element<'_, Message> {
             ))
             .size(12),
         );
+    }
+
+    if let Some(source) = player.source()
+        && !source.tracks.is_empty()
+    {
+        lines = lines.push(text("tracks").size(12)).push(tracks(source));
+    }
+
+    if !player.audio_devices.is_empty() {
+        lines = lines
+            .push(text("audio output").size(12))
+            .push(devices(player));
     }
 
     lines = lines.push(

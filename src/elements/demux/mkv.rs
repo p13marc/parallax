@@ -358,6 +358,8 @@ pub struct MkvTrack {
     pub video_info: Option<MkvVideoInfo>,
     /// Audio parameters (audio tracks only).
     pub audio_info: Option<MkvAudioInfo>,
+    /// Language, name and flags — what a picker labels a row with (#278).
+    pub label: super::TrackLabel,
 }
 
 /// VP9 uncompressed-header keyframe probe (profiles 0–3).
@@ -411,14 +413,28 @@ pub struct MkvDemux<R: Read + Seek> {
     outputs: Vec<(crate::element::PadId, crate::format::Caps)>,
     /// `(track_number, pad)` for each routed track.
     routed: Vec<(u64, crate::element::PadId)>,
-    /// avcC config of the routed H.264 video track, if any.
-    nal_config: Option<NalConfig>,
+    /// avcC/hvcC config per routed track.
+    ///
+    /// A map, not a single `Option`, because routing a second video track
+    /// used to clobber the first one's parameter sets outright — the
+    /// asymmetry with MP4's `nal_configs` was a latent bug waiting for the
+    /// first caller that selected a track (#278).
+    nal_configs: Vec<(u64, NalConfig)>,
     /// Bytes to prepend per frame for tracks using header-stripping
     /// compression, keyed like `routed`.
     stripped_prefix: Vec<(u64, Vec<u8>)>,
     /// Per-track default frame duration in ns (Matroska DefaultDuration).
     default_duration_ns: Vec<(u64, u64)>,
     output: OutputArena,
+    /// Where to report what this file holds (#278). `None` outside a running
+    /// pipeline — `tracks()` is the answer for a caller that has not started
+    /// one yet, and is how the player builds its picker before `start`.
+    bus: Option<crate::pipeline::bus::BusHandle>,
+    /// Whether the stream collection has gone out. Once per pipeline: the
+    /// track table is fixed at construction, so repeating it says nothing.
+    reported: bool,
+    /// Subtitle track to route, if any (#279). Off unless asked for.
+    subtitle_pick: Option<u64>,
     /// Reusable frame to avoid a fresh allocation per block.
     frame: Frame,
     looping: bool,
@@ -537,6 +553,18 @@ impl<R: Read + Seek> MkvDemux<R> {
                 codec_id,
                 video_info,
                 audio_info,
+                label: super::TrackLabel {
+                    // BCP-47 overrides the ISO-639-2 field when present —
+                    // that is the spec's own rule, not a preference.
+                    language: entry
+                        .language_bcp47()
+                        .or_else(|| entry.language())
+                        .map(str::to_string),
+                    name: entry.name().map(str::to_string),
+                    default: entry.flag_default(),
+                    forced: entry.flag_forced(),
+                    enabled: entry.flag_enabled(),
+                },
             });
         }
 
@@ -548,12 +576,15 @@ impl<R: Read + Seek> MkvDemux<R> {
             timestamp_scale,
             outputs: Vec::new(),
             routed: Vec::new(),
-            nal_config: None,
+            nal_configs: Vec::new(),
             stripped_prefix: Vec::new(),
             default_duration_ns: Vec::new(),
             output: OutputArena::new(defaults::MP4_DEMUX_SLOT_COUNT)
                 .with_min_slot_size(defaults::DEMUX_MIN_SLOT_SIZE)
                 .grow_to_fit(),
+            bus: None,
+            reported: false,
+            subtitle_pick: None,
             frame: Frame::default(),
             looping: false,
             staged_segment: None,
@@ -589,7 +620,13 @@ impl<R: Read + Seek> MkvDemux<R> {
 
     /// Route track `id` to `pad`, lifting codec config and validating
     /// content encodings.
-    fn route(
+    ///
+    /// Public since #278: a caller that has read `tracks()` and wants a
+    /// different one needs a way to say so. Prefer
+    /// [`with_tracks`](Self::with_tracks), which clears the previous pick's
+    /// state first — routing over a live pad leaves the old track's
+    /// parameter sets behind.
+    pub fn route(
         &mut self,
         id: u64,
         pad: crate::element::PadId,
@@ -640,7 +677,11 @@ impl<R: Read + Seek> MkvDemux<R> {
         };
         if let Some((name, parse)) = record {
             match entry.codec_private() {
-                Some(private) => self.nal_config = Some(parse(private)?),
+                Some(private) => {
+                    let config = parse(private)?;
+                    self.nal_configs.retain(|(track, _)| *track != id);
+                    self.nal_configs.push((id, config));
+                }
                 None => tracing::warn!(
                     "{} MKV track {id} has no {name} CodecPrivate; frames pass \
                      through length-prefixed and will not decode",
@@ -689,6 +730,191 @@ impl<R: Read + Seek> MkvDemux<R> {
         self.routed.retain(|(_, pad)| pad.0 == 0);
         self.outputs.retain(|(pad, _)| pad.0 == 0);
         self
+    }
+
+    /// The text codec a subtitle track's id names, if parallax can draw it.
+    ///
+    /// `S_HDMV/PGS` and `S_VOBSUB` are **bitmap** subtitles — a completely
+    /// different rendering path from timed text — so they are listed and not
+    /// routed rather than routed and shown as garbage.
+    pub fn text_codec(codec_id: &str) -> Option<crate::format::TextCodec> {
+        use crate::format::TextCodec;
+        match codec_id {
+            "S_TEXT/UTF8" => Some(TextCodec::Utf8),
+            "S_TEXT/ASS" | "S_TEXT/SSA" => Some(TextCodec::Ass),
+            "S_TEXT/WEBVTT" => Some(TextCodec::WebVtt),
+            _ => None,
+        }
+    }
+
+    /// Route specific tracks instead of the first of each type (#278).
+    ///
+    /// `None` keeps the default pick, so `with_tracks(None, Some(3))` changes
+    /// only the audio. An id that is not in the file is an error rather than
+    /// a silent fall-back: a picker offered it, so something is wrong
+    /// upstream if it does not exist.
+    ///
+    /// This is a **construction-time** choice, and deliberately so. Switching
+    /// a track mid-stream is not a matter of re-pointing a pad: an AAC track
+    /// and an E-AC-3 track need different decoder elements, and the graph is
+    /// fixed at `start()`. An application changes tracks by building again —
+    /// which is what the player does, resuming where it was.
+    pub fn with_tracks(self, video: Option<u64>, audio: Option<u64>) -> Result<Self> {
+        let subtitle = self.subtitle_pick;
+        self.with_all_tracks(video, audio, subtitle)
+    }
+
+    /// Route a subtitle track as well (#279).
+    ///
+    /// `None` routes none: subtitles are off by default, which is what a
+    /// player does until somebody asks for them. There is no "the
+    /// container's default subtitle" here for the same reason — a file's
+    /// forced-subtitle flag is a hint for a *language preference* the engine
+    /// does not have.
+    pub fn with_subtitle_track(mut self, subtitle: Option<u64>) -> Result<Self> {
+        self.subtitle_pick = subtitle;
+        let (video, audio) = self.current_picks();
+        self.with_all_tracks(video, audio, subtitle)
+    }
+
+    /// The video and audio tracks currently routed.
+    fn current_picks(&self) -> (Option<u64>, Option<u64>) {
+        let at = |pad: u32| {
+            self.routed
+                .iter()
+                .find(|(_, p)| p.0 == pad)
+                .map(|(id, _)| *id)
+        };
+        (at(0), at(1))
+    }
+
+    fn with_all_tracks(
+        mut self,
+        video: Option<u64>,
+        audio: Option<u64>,
+        subtitle: Option<u64>,
+    ) -> Result<Self> {
+        let video = match video {
+            Some(id) => Some(self.require_track(id, MkvTrackType::Video)?),
+            None => self.default_track(MkvTrackType::Video),
+        };
+        let audio = match audio {
+            Some(id) => Some(self.require_track(id, MkvTrackType::Audio)?),
+            None => self.default_track(MkvTrackType::Audio),
+        };
+        let subtitle = match subtitle {
+            Some(id) => {
+                let id = self.require_track(id, MkvTrackType::Subtitle)?;
+                let codec_id = self
+                    .tracks
+                    .iter()
+                    .find(|t| t.id == id)
+                    .map(|t| t.codec_id.clone())
+                    .unwrap_or_default();
+                if Self::text_codec(&codec_id).is_none() {
+                    return Err(Error::Config(format!(
+                        "MKV track {id} is {codec_id}, which is a bitmap subtitle \
+                         format parallax cannot draw"
+                    )));
+                }
+                Some(id)
+            }
+            None => None,
+        };
+        self.subtitle_pick = subtitle;
+
+        // Everything `route` accumulated for the previous pick has to go, or
+        // the old track's parameter sets and header-stripping prefixes follow
+        // the new one around.
+        self.routed.clear();
+        self.outputs.clear();
+        self.nal_configs.clear();
+        self.stripped_prefix.clear();
+        self.default_duration_ns.clear();
+
+        if let Some(id) = video {
+            self.route(id, crate::element::PadId(0), crate::format::Caps::any())?;
+        }
+        if let Some(id) = audio {
+            self.route(id, crate::element::PadId(1), crate::format::Caps::any())?;
+        }
+        if let Some(id) = subtitle {
+            self.route(id, crate::element::PadId(2), crate::format::Caps::any())?;
+        }
+        Ok(self)
+    }
+
+    /// Check that `id` names a track of `kind`, and return it.
+    fn require_track(&self, id: u64, kind: MkvTrackType) -> Result<u64> {
+        match self.tracks.iter().find(|t| t.id == id) {
+            Some(track) if track.track_type == kind => Ok(id),
+            Some(track) => Err(Error::Config(format!(
+                "MKV track {id} is {:?}, not {kind:?}",
+                track.track_type
+            ))),
+            None => Err(Error::Config(format!("MKV has no track {id}"))),
+        }
+    }
+
+    /// The track this demuxer picks for `kind` when nobody says otherwise.
+    ///
+    /// The container's own default flag first — that is what it is for — then
+    /// the first playable track, which is what this always did.
+    fn default_track(&self, kind: MkvTrackType) -> Option<u64> {
+        let playable = |t: &&MkvTrack| {
+            t.track_type == kind
+                && t.label.enabled
+                && match kind {
+                    MkvTrackType::Video => t.codec.is_video(),
+                    MkvTrackType::Audio => t.codec.is_audio(),
+                    _ => true,
+                }
+        };
+        self.tracks
+            .iter()
+            .find(|t| playable(t) && t.label.default)
+            .or_else(|| self.tracks.iter().find(playable))
+            .map(|t| t.id)
+    }
+
+    /// Tell the bus what this file holds, once (#278).
+    ///
+    /// From `produce` rather than from `set_bus`, because the executor calls
+    /// `set_bus` before the pipeline is running and a message posted then has
+    /// nobody listening yet — the application takes the bus off the handle
+    /// `start()` returns.
+    fn report_streams(&mut self) {
+        if self.reported {
+            return;
+        }
+        self.reported = true;
+        let Some(bus) = self.bus.clone() else {
+            return;
+        };
+        let reports = self
+            .tracks
+            .iter()
+            .map(|track| super::StreamReport {
+                id: format!("mkv:{}", track.id),
+                kind: match track.track_type {
+                    MkvTrackType::Video => crate::element::muxer::StreamType::Video,
+                    MkvTrackType::Audio => crate::element::muxer::StreamType::Audio,
+                    MkvTrackType::Subtitle => crate::element::muxer::StreamType::Subtitle,
+                    MkvTrackType::Unknown => crate::element::muxer::StreamType::Data,
+                },
+                label: track.label.clone(),
+                caps: track.codec_id.clone(),
+                selected: self.routed.iter().any(|(id, _)| *id == track.id),
+            })
+            .collect();
+        super::post_streams(
+            &bus,
+            "matroska",
+            self.duration_ns()
+                .map(crate::clock::ClockTime::from_nanos)
+                .unwrap_or(crate::clock::ClockTime::NONE),
+            reports,
+        );
     }
 
     /// All tracks in the file, including unrouted subtitle/extra tracks.
@@ -742,14 +968,19 @@ impl<R: Read + Seek> MkvDemux<R> {
             .map(|(_, p)| p.as_slice())
             .unwrap_or(&[]);
 
-        let is_length_prefixed_video = self.nal_config.is_some()
+        let nal_config = self
+            .nal_configs
+            .iter()
+            .find(|(id, _)| *id == track)
+            .map(|(_, cfg)| cfg);
+        let is_length_prefixed_video = nal_config.is_some()
             && self
                 .routed
-                .first()
-                .is_some_and(|(id, pad)| *id == track && pad.0 == 0);
+                .iter()
+                .any(|(id, pad)| *id == track && pad.0 == 0);
 
         let handle = if is_length_prefixed_video && prefix.is_empty() {
-            let cfg = self.nal_config.as_ref().expect("checked above");
+            let cfg = nal_config.expect("checked above");
             let params_len: usize = if is_keyframe {
                 cfg.params.iter().map(|n| 4 + n.len()).sum()
             } else {
@@ -777,7 +1008,7 @@ impl<R: Read + Seek> MkvDemux<R> {
             let mut joined = Vec::with_capacity(prefix.len() + data.len());
             joined.extend_from_slice(prefix);
             joined.extend_from_slice(data);
-            let cfg = self.nal_config.as_ref().expect("checked above");
+            let cfg = nal_config.expect("checked above");
             let params_len: usize = if is_keyframe {
                 cfg.params.iter().map(|n| 4 + n.len()).sum()
             } else {
@@ -856,6 +1087,11 @@ impl<R: Read + Seek> MkvDemux<R> {
                 }
             } else if let Some(codec) = track_info.codec.audio_codec() {
                 metadata.format = Some(crate::format::MediaFormat::Audio(codec));
+            } else if let Some(codec) = Self::text_codec(&track_info.codec_id) {
+                // A subtitle block is already a cue: Matroska strips the
+                // timing into the block, and this buffer's pts/duration are
+                // that timing (#279).
+                metadata.format = Some(crate::format::MediaFormat::Text(codec));
             }
         }
 
@@ -874,9 +1110,9 @@ impl<R: Read + Seek> MkvDemux<R> {
             MkvCodec::H264 | MkvCodec::H265 => {
                 // Length-prefixed at this point; walk NALs by prefix.
                 let len_size = self
-                    .nal_config
-                    .as_ref()
-                    .map(|c| c.length_size as usize)
+                    .nal_configs
+                    .first()
+                    .map(|(_, c)| c.length_size as usize)
                     .unwrap_or(4);
                 let is_irap = |first: u8, second: u8| match codec {
                     // H.264: nal_unit_type 5 is an IDR slice.
@@ -1028,6 +1264,10 @@ impl<R: Read + Seek> MkvDemux<R> {
 }
 
 impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
+    fn set_bus(&mut self, bus: crate::pipeline::bus::BusHandle) {
+        self.bus = Some(bus);
+    }
+
     fn take_downstream_event(&mut self) -> Option<crate::event::Event> {
         self.staged_segment.take().map(crate::event::Event::Segment)
     }
@@ -1040,6 +1280,8 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
 
     fn produce(&mut self) -> Result<crate::element::DemuxerProduce> {
         use crate::element::{DemuxerProduce, RoutedOutput};
+
+        self.report_streams();
 
         // A frame parked by arena exhaustion goes out before anything new is
         // read — the executor treats PoolExhausted as flow control and calls
@@ -1198,9 +1440,13 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for MkvDemux<R> {
     }
 
     fn pad_name(&self, pad: crate::element::PadId) -> String {
+        // Exhaustive on purpose. The catch-all used to be `_ => "audio"`, so
+        // adding a third pad silently collided with the audio one — every
+        // subtitle buffer would have gone down the audio branch (#279).
         match pad.0 {
             0 => "video".into(),
-            _ => "audio".into(),
+            1 => "audio".into(),
+            _ => "subtitle".into(),
         }
     }
 

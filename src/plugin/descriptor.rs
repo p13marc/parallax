@@ -17,6 +17,10 @@ use std::ffi::{CStr, c_char, c_int, c_void};
 /// bump is not a compatibility inconvenience — it is undefined behaviour.
 ///
 /// History:
+/// - **14**: `MediaFormat` and `FormatCaps` grew a `Text` variant (#279).
+///   Caps cross the boundary by value, so a plugin compiled against the old
+///   enum could be handed a discriminant it has no arm for — the same reason
+///   `MemoryType::External` minted 11.
 /// - **13**: `AsyncElementDyn::set_clock` takes an `Arc<SyncBase>` instead of
 ///   a by-value `ClockTime` base (#265) — the slot's signature changed, and
 ///   with it what running time *means*: the origin is now shared and
@@ -51,7 +55,7 @@ use std::ffi::{CStr, c_char, c_int, c_void};
 /// - **3**: `AsyncElementDyn::process_demux` (demuxer routing).
 /// - **2**: `AsyncElementDyn::set_output_budget` (executor-sized output arenas).
 /// - **1**: initial hand-rolled `#[repr(C)]` descriptor ABI.
-pub const PARALLAX_ABI_VERSION: u32 = 13;
+pub const PARALLAX_ABI_VERSION: u32 = 14;
 
 /// Function pointer type for creating element instances.
 ///
@@ -424,8 +428,9 @@ mod tests {
     fn test_abi_version() {
         // Pinned so a vtable change to AsyncElementDyn has to be a decision.
         // 2: set_output_budget. 10: retained_buffers (#189). 12: finish
-        // (#221). 13: set_clock takes a shared SyncBase (#265).
-        assert_eq!(PARALLAX_ABI_VERSION, 13);
+        // (#221). 13: set_clock takes a shared SyncBase (#265). 14: a Text
+        // arm on MediaFormat/FormatCaps (#279).
+        assert_eq!(PARALLAX_ABI_VERSION, 14);
     }
 
     #[test]

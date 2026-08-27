@@ -13,6 +13,7 @@ mod engine;
 mod headless;
 mod playlist;
 mod recent;
+mod snapshot;
 mod ui;
 
 use std::collections::VecDeque;
@@ -26,7 +27,7 @@ use iced::widget::{center, container, stack};
 use iced::{Element, Subscription, Task, Theme};
 
 use parallax::clock::ClockTime;
-use parallax::event::SeekEvent;
+use parallax::event::{SeekEvent, SeekFlags};
 use parallax::pipeline::MessageKind;
 use parallax::video::FrameMailbox;
 
@@ -150,6 +151,20 @@ impl Stage {
     fn accepts_probe(&self, seq: u64) -> bool {
         matches!(self, Self::Probing(request) if request.seq == seq)
     }
+}
+
+/// Where a step of `frames` from `from` lands, in nanoseconds.
+///
+/// Clamped at both ends, and the far end matters: a duration of `NONE` means
+/// *unknown* — an MKV with no Segment Duration — not an empty file, so it
+/// must not clamp to zero. That is the same trap `seek_relative` documents.
+fn step_target(from: i64, frame: Duration, frames: i32, duration: ClockTime) -> u64 {
+    let step = frame.as_nanos() as i64 * i64::from(frames);
+    let mut target = from.saturating_add(step).max(0);
+    if let Some(total) = duration.to_option() {
+        target = target.min(total.nanos().saturating_sub(1) as i64);
+    }
+    target as u64
 }
 
 /// How far one scroll gesture moves the volume, in dB.
@@ -300,6 +315,26 @@ struct Args {
     #[arg(long)]
     no_sync: bool,
 
+    /// ALSA device to play through; `--audio-device list` prints them.
+    #[arg(long, default_value = "default")]
+    audio_device: String,
+
+    /// Video track to play, by container id; the default is the container's.
+    #[arg(long)]
+    video_track: Option<u64>,
+
+    /// Audio track to play, by container id.
+    #[arg(long)]
+    audio_track: Option<u64>,
+
+    /// Subtitle track to show, by container id; none by default.
+    #[arg(long)]
+    subtitle_track: Option<u64>,
+
+    /// A SubRip file to show alongside the video.
+    #[arg(long = "sub", value_name = "FILE.srt")]
+    sidecar: Option<PathBuf>,
+
     /// Play with no window at all, printing the machine-readable summary.
     ///
     /// The pipeline is the same one the window drives, and this process is
@@ -329,6 +364,11 @@ impl Args {
             frame_delay: self.frame_delay,
             channel_capacity: self.channel_capacity.max(1),
             sync: !self.no_sync,
+            audio_device: self.audio_device.clone(),
+            video_track: self.video_track,
+            audio_track: self.audio_track,
+            subtitle_track: self.subtitle_track,
+            sidecar: self.sidecar.clone(),
         }
     }
 }
@@ -343,6 +383,13 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
+
+    if args.audio_device == "list" {
+        for device in parallax::elements::AlsaSink::enumerate_devices()? {
+            println!("{}\t{}", device.name, device.description);
+        }
+        return Ok(());
+    }
 
     if args.headless {
         let code = headless::run(args)?;
@@ -393,10 +440,16 @@ enum Message {
     CycleRepeat,
     /// Show or hide the playlist.
     TogglePlaylist,
+    /// Play through this ALSA device from the next build on.
+    AudioDevice(String),
+    /// Play this track of the current file instead.
+    SelectTrack(engine::TrackKind, u64),
     /// Play/pause.
     TogglePause,
     /// Seek by a number of seconds, relative to where the transport is headed.
     SeekBy(i64),
+    /// Step by a number of frames, pausing first.
+    StepBy(i32),
     /// Seek to a fraction of the duration — the scrubber.
     SeekTo(f32),
     /// Set the volume in dB — the slider.
@@ -419,6 +472,12 @@ enum Message {
     ToggleStats,
     /// Write the running graph out as GraphViz.
     DumpGraph,
+    /// Save the frame on screen as a PNG.
+    Snapshot,
+    /// Grow or shrink the subtitles.
+    SubtitleSize(f32),
+    /// A snapshot finished, for better or worse.
+    Snapshotted(Result<PathBuf, String>),
     /// Dismiss the notice at this index.
     Dismiss(usize),
     /// What Iced's renderer is running on.
@@ -446,6 +505,14 @@ struct SeekState {
     in_flight: Option<(u64, u64)>,
     /// When it went out, for the supersede timeout.
     sent: Option<Instant>,
+    /// Whether the pending seek must land on the frame asked for (#281).
+    ///
+    /// A scrub wants the nearest keyframe — it is faster and nobody can see
+    /// the difference at scrubbing speed. A frame step wants the frame it
+    /// named, which is what `ACCURATE` buys: the segment starts at the
+    /// request while data starts at the keyframe, and the decoder
+    /// decodes-but-drops the gap.
+    accurate: bool,
 }
 
 impl SeekState {
@@ -470,6 +537,23 @@ struct Player {
     show_playlist: bool,
     /// Files opened lately, newest first — the empty screen's only content.
     recent: Vec<PathBuf>,
+    /// The cues on screen right now, re-read on the tick (#279).
+    ///
+    /// Polled rather than pushed: `VideoView::update` deliberately never
+    /// publishes a message — Iced rebuilds the whole interface when a redraw
+    /// produces one — and a cue boundary is comfortably inside the 50 ms
+    /// tick's tolerance.
+    cues: Vec<parallax::subtitle::Cue>,
+    /// How large to draw them.
+    subtitle_size: f32,
+    /// Output devices, read once when someone first asks to see them.
+    audio_devices: Vec<parallax::elements::AlsaDeviceInfo>,
+    /// Where to resume after a rebuild that was not a track change.
+    ///
+    /// Changing the output device means building a new pipeline, and a
+    /// pipeline that restarted from the beginning would be a worse answer
+    /// than not offering the choice.
+    resume_at: Option<u64>,
 
     position: ClockTime,
     paused: bool,
@@ -509,6 +593,10 @@ impl Player {
             failures: 0,
             show_playlist: false,
             recent: recent::load(),
+            cues: Vec::new(),
+            subtitle_size: 22.0,
+            audio_devices: Vec::new(),
+            resume_at: None,
             position: ClockTime::ZERO,
             paused: false,
             speed: 1.0,
@@ -637,6 +725,31 @@ impl Player {
                 self.show_playlist = !self.show_playlist;
                 Task::none()
             }
+            Message::SelectTrack(kind, id) => {
+                self.activity();
+                let slot = match kind {
+                    engine::TrackKind::Video => &mut self.options.video_track,
+                    engine::TrackKind::Audio => &mut self.options.audio_track,
+                    // #279 wires the subtitle pad; until then there is
+                    // nothing to select one *into*.
+                    engine::TrackKind::Subtitle => &mut self.options.subtitle_track,
+                };
+                // Choosing the track already playing turns it off, which is
+                // how "no subtitles" is reachable without a separate control.
+                *slot = if *slot == Some(id) { None } else { Some(id) };
+                self.reopen_current()
+            }
+            Message::AudioDevice(device) => {
+                self.activity();
+                if self.options.audio_device == device {
+                    return Task::none();
+                }
+                self.options.audio_device = device;
+                // The graph has no dynamic re-link, and an ALSA sink is
+                // opened once for a fixed device — so this is a rebuild, and
+                // it resumes where it was rather than starting the file over.
+                self.reopen_current()
+            }
             Message::TornDown => self.torn_down(),
             Message::Probed(seq, result) => self.build(seq, result),
             Message::Tick => {
@@ -666,6 +779,10 @@ impl Player {
                 self.activity();
                 self.seek_relative(secs);
                 Task::none()
+            }
+            Message::StepBy(frames) => {
+                self.activity();
+                self.step(frames)
             }
             Message::SeekTo(fraction) => {
                 self.activity();
@@ -752,6 +869,13 @@ impl Player {
                 // Ask once, the first time anyone looks. It is a round trip
                 // through the runtime, and a player that never opens the
                 // panel should never pay for it.
+                if self.show_stats && self.audio_devices.is_empty() {
+                    // Enumerating opens no PCM — it walks ALSA's hint list —
+                    // but it is still work nobody who never opens the panel
+                    // should pay for.
+                    self.audio_devices =
+                        parallax::elements::AlsaSink::enumerate_devices().unwrap_or_default();
+                }
                 if self.show_stats && self.diagnostics.graphics.is_none() {
                     return iced::system::information()
                         .map(|info| Message::Graphics(Box::new(info)));
@@ -766,6 +890,22 @@ impl Player {
             Message::DumpGraph => {
                 self.activity();
                 self.dump_graph();
+                Task::none()
+            }
+            Message::SubtitleSize(delta) => {
+                self.activity();
+                self.subtitle_size = (self.subtitle_size + delta).clamp(12.0, 64.0);
+                Task::none()
+            }
+            Message::Snapshot => {
+                self.activity();
+                self.snapshot()
+            }
+            Message::Snapshotted(result) => {
+                match result {
+                    Ok(path) => self.note(Level::Info, format!("saved {}", path.display())),
+                    Err(e) => self.note(Level::Warning, e),
+                }
                 Task::none()
             }
             Message::Dismiss(index) => {
@@ -903,6 +1043,9 @@ impl Player {
                 self.stage = Stage::Playing;
                 recent::remember(&request.path);
                 self.recent = recent::load();
+                if let Some(at) = self.resume_at.take() {
+                    self.aim(at);
+                }
                 // The transport's state belongs to the *player*, not to the
                 // pipeline that happens to be running: a rate set before a
                 // track change was still shown afterwards while the new
@@ -916,6 +1059,9 @@ impl Player {
             Err(e) => {
                 self.note(Level::Error, format!("{e:#}"));
                 self.status = "no file open".into();
+                // Whatever it was resuming to belongs to a pipeline that
+                // never started; the next file starts at its own beginning.
+                self.resume_at = None;
                 self.skip_failed(request.index)
             }
         }
@@ -968,6 +1114,38 @@ impl Player {
         println!("{}", stats_line(self.position, dropped, &stats));
     }
 
+    /// Save the frame on screen (#283).
+    ///
+    /// The frame comes from the mailbox, not from a branch in the pipeline:
+    /// it is the decoder's own output, so what lands in the file is the
+    /// source frame at full resolution rather than the scaled, letterboxed,
+    /// overlaid window. Converting and compressing it is real work, so it
+    /// goes to a blocking thread — the interface must not stutter for a
+    /// keypress.
+    fn snapshot(&mut self) -> Task<Message> {
+        let Some(engine) = &self.engine else {
+            self.note(Level::Warning, "nothing is playing");
+            return Task::none();
+        };
+        let Some(frame) = engine.mailbox.last_presented() else {
+            self.note(Level::Warning, "no frame has been shown yet");
+            return Task::none();
+        };
+        let source = engine.source.path.clone();
+        let at = self.position.to_option().map(|p| p.nanos()).unwrap_or(0);
+
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    snapshot::write_png(&frame, &source, at).map_err(|e| format!("{e:#}"))
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("the snapshot task panicked: {e}")))
+            },
+            Message::Snapshotted,
+        )
+    }
+
     /// Write the running graph out as GraphViz, and say where it went.
     ///
     /// `PARALLAX_DOT_DIR` is the engine's own convention for state-transition
@@ -1011,6 +1189,15 @@ impl Player {
         if engine.mailbox.stats().presented > 0 {
             self.failures = 0;
         }
+
+        // The cues on screen, against the same running time the widget paces
+        // to — so a subtitle and the frame it belongs to appear together.
+        let now = engine
+            .mailbox
+            .clock()
+            .map(|clock| clock.now())
+            .unwrap_or(ClockTime::NONE);
+        self.cues = engine.cues.active(now);
 
         let mut ended = false;
         let messages = engine.poll_bus();
@@ -1089,6 +1276,24 @@ impl Player {
         Task::none()
     }
 
+    /// Rebuild the current file, resuming where it was.
+    ///
+    /// The whole graph is fixed at `start()`: no dynamic re-link, and the
+    /// ALSA sink is opened once for one device. Anything that changes how the
+    /// pipeline is *built* therefore goes through here, which is a visible
+    /// hitch and honest about being one.
+    fn reopen_current(&mut self) -> Task<Message> {
+        let Some(index) = self.playlist.current() else {
+            return Task::none();
+        };
+        self.resume_at = self
+            .seek
+            .target()
+            .or_else(|| self.position.to_option().map(|p| p.nanos()))
+            .filter(|at| *at > 0);
+        self.play(index)
+    }
+
     /// Stop playing, without opening anything else.
     fn stop_playback(&mut self) -> Task<Message> {
         self.status = "no file open".into();
@@ -1164,6 +1369,68 @@ impl Player {
     fn aim(&mut self, target_ns: u64) {
         self.seek.pending = Some(target_ns);
         self.seek.due = Some(Instant::now() + SEEK_DEBOUNCE);
+        self.seek.accurate = false;
+    }
+
+    /// Step one frame, pausing first (#281).
+    ///
+    /// A flushing `ACCURATE` seek per frame is wasteful — a flush trio, a
+    /// decoder reset and a keyframe re-decode to advance by one frame
+    /// duration — but it is correct, and it is built out of a path that
+    /// already works. The cheaper answer is a real `Event::Step` that a paced
+    /// sink consumes by releasing exactly N frames; that design is written up
+    /// in `plans/30_iced_player.md` and deliberately not built here.
+    ///
+    /// Backward stepping is a backward seek like any other. Decoding
+    /// backwards is what the engine cannot do; seeking backwards it does
+    /// every time an arrow key is pressed.
+    fn step(&mut self, frames: i32) -> Task<Message> {
+        let Some(frame) = self
+            .source()
+            .and_then(|s| s.video.as_ref())
+            .and_then(|v| v.frame_duration())
+        else {
+            // Guessing 30 fps here would step 33 ms and call it a frame. The
+            // container said nothing; say so.
+            self.note(
+                Level::Warning,
+                "this file does not state a frame rate, so it cannot be stepped",
+            );
+            return Task::none();
+        };
+
+        // Stepping is a paused gesture: it is how you look at one frame.
+        let task = if self.paused {
+            Task::none()
+        } else {
+            self.update(Message::TogglePause)
+        };
+
+        let target = step_target(self.step_origin(), frame, frames, self.duration());
+
+        // No debounce: holding `.` should step frame by frame, not coalesce
+        // four presses into one. And ACCURATE, or the seek lands on the
+        // previous keyframe and the picture goes backwards instead of on.
+        self.seek.pending = Some(target);
+        self.seek.due = None;
+        self.seek.accurate = true;
+        self.dispatch_seek();
+        task
+    }
+
+    /// Where a step counts from.
+    ///
+    /// The last aim if there is one, for the same reason `seek_relative`
+    /// walks from it: `position()` does not move until the seek's Segment
+    /// lands, so counting from it would make the second of two quick steps
+    /// undo the first.
+    fn step_origin(&self) -> i64 {
+        self.seek.target().map(|t| t as i64).unwrap_or_else(|| {
+            self.position
+                .to_option()
+                .map(|p| p.nanos() as i64)
+                .unwrap_or(0)
+        })
     }
 
     /// Send the accumulated seek, once the debounce has expired and the last
@@ -1188,7 +1455,25 @@ impl Player {
             return;
         }
 
-        let event = SeekEvent::new_time(ClockTime::from_nanos(target));
+        let mut event = SeekEvent::new_time(ClockTime::from_nanos(target));
+        if self.seek.accurate {
+            // `new_time` is FLUSH | KEY_UNIT, and `with_flags` replaces
+            // rather than ORs — so the whole set has to be restated.
+            //
+            // SNAP_BEFORE matters as much as ACCURATE here, and it is not
+            // obvious: the per-container default snap is *forward* for MKV,
+            // so a step from 600 ms to 700 ms would land on the keyframe at
+            // 1000 ms — a step forward that skips most of a GOP. Snapping
+            // backward puts the decoder at the keyframe before the target and
+            // ACCURATE makes it decode-but-drop the gap, so the frame that
+            // appears is the one that was asked for.
+            event = event.with_flags(
+                SeekFlags::FLUSH
+                    | SeekFlags::KEY_UNIT
+                    | SeekFlags::ACCURATE
+                    | SeekFlags::SNAP_BEFORE,
+            );
+        }
         let seqnum = event.seqnum();
         if engine.handle().dispatch_seek(event) {
             self.seek.in_flight = Some((seqnum, target));
@@ -1198,6 +1483,7 @@ impl Player {
         }
         self.seek.pending = None;
         self.seek.due = None;
+        self.seek.accurate = false;
     }
 
     /// Ask the pipeline to play at `rate` (#280).
@@ -1264,14 +1550,21 @@ impl Player {
                 iced::mouse::Interaction::Hidden
             });
 
-        stack![
+        let mut layers = stack![
             container(video)
                 .width(iced::Fill)
                 .height(iced::Fill)
                 .style(|_| container::background(iced::Color::BLACK)),
-            ui::overlay(self),
-        ]
-        .into()
+        ];
+        // Subtitles sit above the picture and *below* the transport, so a cue
+        // can never occlude the controls (#279). Mounted only when a cue is
+        // actually on screen: `ui.rs`'s rule is that the overlay is unmounted
+        // rather than transparent, because every redraw runs full layout and
+        // text shaping at the frame rate.
+        if !self.cues.is_empty() {
+            layers = layers.push(ui::subtitles(self));
+        }
+        layers.push(ui::overlay(self)).into()
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -1324,7 +1617,12 @@ fn shortcut(key: &Key) -> Option<Message> {
             "f" => Some(Message::ToggleFullscreen),
             "m" => Some(Message::ToggleMute),
             "i" => Some(Message::ToggleStats),
+            "." => Some(Message::StepBy(1)),
+            "," => Some(Message::StepBy(-1)),
+            "c" => Some(Message::Snapshot),
             "d" => Some(Message::DumpGraph),
+            "+" | "=" => Some(Message::SubtitleSize(2.0)),
+            "-" => Some(Message::SubtitleSize(-2.0)),
             "o" => Some(Message::OpenDialog),
             "p" => Some(Message::TogglePlaylist),
             "n" => Some(Message::Next),
@@ -1420,6 +1718,14 @@ mod tests {
         assert!(matches!(
             shortcut(&Key::Character("p".into())),
             Some(Message::TogglePlaylist)
+        ));
+        assert!(matches!(
+            shortcut(&Key::Character(".".into())),
+            Some(Message::StepBy(1))
+        ));
+        assert!(matches!(
+            shortcut(&Key::Character(",".into())),
+            Some(Message::StepBy(-1))
         ));
         assert!(shortcut(&Key::Character("z".into())).is_none());
     }
@@ -1519,6 +1825,67 @@ mod tests {
             index: 0,
             path: PathBuf::from("f.mp4"),
         }
+    }
+
+    /// Stepping refuses rather than guessing (#281).
+    ///
+    /// `Framerate::default()` is 30 fps, so "unknown" and "30" are the same
+    /// value on the buffer path — which is why the step size comes from the
+    /// container header and why `None` has to mean no.
+    #[test]
+    fn a_file_that_states_no_frame_rate_cannot_be_stepped() {
+        let stream = |rate| engine::VideoStream {
+            codec: engine::VideoCodecKind::H264,
+            width: 64,
+            height: 64,
+            frame_rate: rate,
+        };
+        assert_eq!(stream(None).frame_duration(), None);
+        assert_eq!(
+            stream(Some(25.0)).frame_duration(),
+            Some(Duration::from_millis(40))
+        );
+        // A container stating nonsense has said nothing useful.
+        assert_eq!(stream(Some(0.0)).frame_duration(), None);
+        assert_eq!(stream(Some(-24.0)).frame_duration(), None);
+        assert_eq!(stream(Some(f64::NAN)).frame_duration(), None);
+        assert_eq!(stream(Some(f64::INFINITY)).frame_duration(), None);
+        // Past any real file, and the guard that keeps steps off zero.
+        assert_eq!(stream(Some(100_000.0)).frame_duration(), None);
+        assert!(stream(Some(1000.0)).frame_duration().is_some());
+    }
+
+    /// Where a step lands (#281).
+    #[test]
+    fn a_step_moves_by_exactly_one_frame_and_stops_at_the_ends() {
+        let frame = Duration::from_millis(100);
+        let two_seconds = ClockTime::from_nanos(2_000_000_000);
+
+        // Forward and back, one frame at a time.
+        assert_eq!(step_target(500_000_000, frame, 1, two_seconds), 600_000_000);
+        assert_eq!(
+            step_target(500_000_000, frame, -1, two_seconds),
+            400_000_000
+        );
+        assert_eq!(step_target(500_000_000, frame, 4, two_seconds), 900_000_000);
+
+        // The start is a floor, not a wrap.
+        assert_eq!(step_target(50_000_000, frame, -1, two_seconds), 0);
+        assert_eq!(step_target(0, frame, -10, two_seconds), 0);
+
+        // The end is a ceiling, one nanosecond inside the duration.
+        assert_eq!(
+            step_target(1_950_000_000, frame, 1, two_seconds),
+            1_999_999_999
+        );
+
+        // An unknown duration does not clamp to zero — that is the trap a
+        // Segment-Duration-less MKV sets, and it would send every step to
+        // the start of the file.
+        assert_eq!(
+            step_target(1_950_000_000, frame, 1, ClockTime::NONE),
+            2_050_000_000
+        );
     }
 
     /// A wheel notch is an arrow key, and a touchpad flick is not a lurch.

@@ -45,11 +45,14 @@ software without comment when the driver has not got it.
 | `f`, double-click | fullscreen |
 | `Esc` | leave fullscreen, else quit |
 | `o` | open files |
+| `.` `,` | step one frame forward / back (pauses) |
+| `+` `-` | subtitle size |
 | `s` | playback speed |
 | `i` | diagnostics |
 | `p` | playlist |
 | `n` `b` | next / previous file |
 | `r` | repeat off / all / one |
+| `c` | save the frame on screen as a PNG |
 | `d` | write the running graph as GraphViz |
 | `q` | quit |
 
@@ -72,6 +75,11 @@ therefore the video, at wall rate.
 | `--channel-capacity N` | executor link capacity |
 | `--no-sync` | decode as fast as possible; the batch-decode floor |
 | `--headless` | play with no window at all |
+| `--audio-device NAME` | ALSA device to play through; `list` prints them |
+| `--video-track ID` | video track to play, by container id |
+| `--audio-track ID` | audio track to play, by container id |
+| `--subtitle-track ID` | subtitle track to show; none by default |
+| `--sub FILE.srt` | a SubRip file to show alongside the video |
 | `--exit-after N` | quit after N seconds, printing the summary |
 
 ## The machine-readable summary

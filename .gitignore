@@ -16,3 +16,6 @@ log.txt
 *~
 .idea/
 .vscode/
+
+# Local Claude Code settings (permissions), per-checkout
+.claude/settings.local.json

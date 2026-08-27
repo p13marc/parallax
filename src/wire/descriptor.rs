@@ -265,6 +265,10 @@ impl IpcDescriptor {
                 d.fmt_d = dynamic as u32;
             }
             Some(MediaFormat::MpegTs) => d.fmt_tag = codes::FMT_MPEG_TS,
+            Some(MediaFormat::Text(c)) => {
+                d.fmt_tag = codes::FMT_TEXT;
+                d.fmt_a = codes::text_codec_to_code(*c) as u32;
+            }
             Some(MediaFormat::Bytes) => d.fmt_tag = codes::FMT_BYTES,
         }
         d
@@ -376,6 +380,10 @@ impl IpcDescriptor {
                     .ok_or_else(|| bad_wire(format!("RtpEncoding {}", self.fmt_c)))?,
             })),
             codes::FMT_MPEG_TS => Some(MediaFormat::MpegTs),
+            codes::FMT_TEXT => Some(MediaFormat::Text(
+                codes::text_codec_from_code(self.fmt_a as u8)
+                    .ok_or_else(|| bad_wire(format!("TextCodec {}", self.fmt_a)))?,
+            )),
             codes::FMT_BYTES => Some(MediaFormat::Bytes),
             other => return Err(bad_wire(format!("format tag {other}"))),
         };

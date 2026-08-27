@@ -276,8 +276,38 @@ pub enum MediaFormat {
     Rtp(RtpFormat),
     /// MPEG-TS packet.
     MpegTs,
+    /// Timed text — a subtitle cue and its interval (#279).
+    Text(TextCodec),
     /// Raw bytes (no format constraints).
     Bytes,
+}
+
+/// How a timed-text buffer is encoded (#279).
+///
+/// The payload is always the *cue*, never the file: a container strips the
+/// timing (which becomes the buffer's PTS and duration) and, for ASS, the
+/// `Dialogue:` prefix as well.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TextCodec {
+    /// Plain UTF-8, one cue per buffer. Matroska's `S_TEXT/UTF8`, and what a
+    /// parsed SRT file becomes — Matroska never stores SRT *as* SRT.
+    Utf8,
+    /// An ASS/SSA event body: everything after `Dialogue:` and its two
+    /// timestamps, i.e.
+    /// `ReadOrder,Layer,Style,Name,MarginL,MarginR,MarginV,Effect,Text`.
+    Ass,
+    /// A WebVTT cue payload.
+    WebVtt,
+}
+
+impl std::fmt::Display for TextCodec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Utf8 => write!(f, "text/utf8"),
+            Self::Ass => write!(f, "text/ass"),
+            Self::WebVtt => write!(f, "text/vtt"),
+        }
+    }
 }
 
 impl MediaFormat {
@@ -295,6 +325,7 @@ impl MediaFormat {
             (Self::Audio(a), Self::Audio(b)) => a == b,
             (Self::Rtp(a), Self::Rtp(b)) => a.payload_type == b.payload_type,
             (Self::MpegTs, Self::MpegTs) => true,
+            (Self::Text(a), Self::Text(b)) => a == b,
             _ => false,
         }
     }
@@ -313,6 +344,8 @@ impl MediaFormat {
             Self::Rtp(_) => None,
             // MPEG-TS packets are 188 bytes, but typically batched
             Self::MpegTs => Some(188 * 7), // Common batch size
+            // A cue is as long as its text
+            Self::Text(_) => None,
             // Raw bytes have no size constraint
             Self::Bytes => None,
         }
@@ -1880,6 +1913,8 @@ pub enum FormatCaps {
     Rtp(RtpFormat),
     /// MPEG-TS.
     MpegTs,
+    /// Timed text (#279).
+    Text(TextCodec),
     /// Raw bytes.
     Bytes,
     /// Any format.
@@ -1916,6 +1951,7 @@ impl FormatCaps {
             Self::Audio(codec) => Some(MediaFormat::Audio(*codec)),
             Self::Rtp(rtp) => Some(MediaFormat::Rtp(*rtp)),
             Self::MpegTs => Some(MediaFormat::MpegTs),
+            Self::Text(codec) => Some(MediaFormat::Text(*codec)),
             Self::Bytes => Some(MediaFormat::Bytes),
             Self::Any => None,
         }
@@ -1933,6 +1969,7 @@ impl FormatCaps {
             Self::Audio(codec) => MediaFormat::Audio(*codec),
             Self::Rtp(rtp) => MediaFormat::Rtp(*rtp),
             Self::MpegTs => MediaFormat::MpegTs,
+            Self::Text(codec) => MediaFormat::Text(*codec),
             Self::Bytes => MediaFormat::Bytes,
             Self::Any => MediaFormat::Bytes,
         }
@@ -1958,6 +1995,7 @@ impl From<MediaFormat> for FormatCaps {
             MediaFormat::Audio(c) => Self::Audio(c),
             MediaFormat::Rtp(r) => Self::Rtp(r),
             MediaFormat::MpegTs => Self::MpegTs,
+            MediaFormat::Text(c) => Self::Text(c),
             MediaFormat::Bytes => Self::Bytes,
         }
     }

@@ -183,8 +183,8 @@ pub use transform::{
 
 // App integration
 pub use app::{
-    AppSink, AppSinkHandle, AppSinkStats, AppSrc, AppSrcHandle, AppSrcStats, AppVideoSink,
-    EndReason, Pulled,
+    AppSink, AppSinkHandle, AppSinkStats, AppSrc, AppSrcHandle, AppSrcStats, AppSubtitleSink,
+    AppVideoSink, EndReason, Pulled,
 };
 
 #[cfg(feature = "display")]
@@ -202,7 +202,7 @@ pub use timing::{
 };
 
 // Demux
-pub use demux::{StreamIdDemux, StreamIdDemuxStats, StreamOutput};
+pub use demux::{StreamIdDemux, StreamIdDemuxStats, StreamOutput, TrackLabel};
 
 #[cfg(feature = "mpeg-ts")]
 pub use demux::{

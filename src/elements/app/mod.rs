@@ -7,6 +7,7 @@
 
 mod appsink;
 mod appsrc;
+mod appsubtitlesink;
 mod appvideosink;
 
 #[cfg(feature = "display")]
@@ -19,6 +20,7 @@ mod present;
 pub use crate::pipeline::EndReason;
 pub use appsink::{AppSink, AppSinkHandle, AppSinkStats, Pulled};
 pub use appsrc::{AppSrc, AppSrcHandle, AppSrcStats};
+pub use appsubtitlesink::AppSubtitleSink;
 pub use appvideosink::AppVideoSink;
 
 #[cfg(feature = "display")]

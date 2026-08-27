@@ -337,6 +337,12 @@ pub enum FormatType {
     Rtp,
     /// MPEG-TS.
     MpegTs,
+    /// Timed text (#279).
+    ///
+    /// One arm for every text codec: there is no converter between them, and
+    /// there should not be — an ASS event carries styling a plain-text cue
+    /// cannot hold, so "converting" it would silently discard it.
+    Text,
     /// Raw bytes.
     Bytes,
     /// Any format.
@@ -352,6 +358,7 @@ impl From<&FormatCaps> for FormatType {
             FormatCaps::Audio(_) => Self::AudioEncoded,
             FormatCaps::Rtp(_) => Self::Rtp,
             FormatCaps::MpegTs => Self::MpegTs,
+            FormatCaps::Text(_) => Self::Text,
             FormatCaps::Bytes => Self::Bytes,
             FormatCaps::Any => Self::Any,
         }
@@ -367,6 +374,7 @@ impl From<&MediaFormat> for FormatType {
             MediaFormat::Audio(_) => Self::AudioEncoded,
             MediaFormat::Rtp(_) => Self::Rtp,
             MediaFormat::MpegTs => Self::MpegTs,
+            MediaFormat::Text(_) => Self::Text,
             MediaFormat::Bytes => Self::Bytes,
         }
     }

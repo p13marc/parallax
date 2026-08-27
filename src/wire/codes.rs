@@ -26,7 +26,7 @@
 
 use crate::format::{
     AudioCodec, ColorMatrix, ColorPrimaries, ColorRange, PixelFormat, Rotation, RtpEncoding,
-    SampleFormat, TransferFunction, VideoCodec,
+    SampleFormat, TextCodec, TransferFunction, VideoCodec,
 };
 
 // ---------------------------------------------------------------------------
@@ -49,6 +49,8 @@ pub const FMT_RTP: u8 = 5;
 pub const FMT_MPEG_TS: u8 = 6;
 /// [`MediaFormat::Bytes`](crate::format::MediaFormat::Bytes).
 pub const FMT_BYTES: u8 = 7;
+/// [`MediaFormat::Text`](crate::format::MediaFormat::Text) (#279).
+pub const FMT_TEXT: u8 = 8;
 
 // ---------------------------------------------------------------------------
 // Video codecs
@@ -316,6 +318,29 @@ pub fn rotation_from_code(code: u8) -> Option<Rotation> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Text codecs (#279)
+// ---------------------------------------------------------------------------
+
+/// Stable wire code for a [`TextCodec`].
+pub fn text_codec_to_code(codec: TextCodec) -> u8 {
+    match codec {
+        TextCodec::Utf8 => 0,
+        TextCodec::Ass => 1,
+        TextCodec::WebVtt => 2,
+    }
+}
+
+/// [`TextCodec`] for a stable wire code.
+pub fn text_codec_from_code(code: u8) -> Option<TextCodec> {
+    Some(match code {
+        0 => TextCodec::Utf8,
+        1 => TextCodec::Ass,
+        2 => TextCodec::WebVtt,
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,6 +358,7 @@ mod tests {
         use PixelFormat as P;
         use RtpEncoding as R;
         use SampleFormat as S;
+        use TextCodec as TX;
         use TransferFunction as TF;
         use VideoCodec as V;
 
@@ -346,6 +372,11 @@ mod tests {
         ] {
             assert_eq!(video_codec_to_code(codec), code, "{codec:?}");
             assert_eq!(video_codec_from_code(code), Some(codec));
+        }
+
+        for (codec, code) in [(TX::Utf8, 0), (TX::Ass, 1), (TX::WebVtt, 2)] {
+            assert_eq!(text_codec_to_code(codec), code, "{codec:?}");
+            assert_eq!(text_codec_from_code(code), Some(codec));
         }
 
         for (codec, code) in [
@@ -412,9 +443,10 @@ mod tests {
                 FMT_AUDIO,
                 FMT_RTP,
                 FMT_MPEG_TS,
-                FMT_BYTES
+                FMT_BYTES,
+                FMT_TEXT
             ],
-            [0, 1, 2, 3, 4, 5, 6, 7]
+            [0, 1, 2, 3, 4, 5, 6, 7, 8]
         );
 
         // Colour codes are the H.273 numbers themselves (#265), so these

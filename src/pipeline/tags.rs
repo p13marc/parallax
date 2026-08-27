@@ -64,6 +64,18 @@ pub mod tag_keys {
     pub const ENCODER: &str = "encoder";
     /// Language code (ISO 639).
     pub const LANGUAGE_CODE: &str = "language-code";
+
+    /// Whether a track is the container's default for its type (#278).
+    pub const TRACK_DEFAULT: &str = "track-default";
+
+    /// Whether a track is forced — shown regardless of preference (#278).
+    pub const TRACK_FORCED: &str = "track-forced";
+
+    /// Whether this is the track the pipeline actually selected (#278).
+    ///
+    /// `StreamInfo` has no field for it, and a stream collection that cannot
+    /// say which stream is playing is only half the answer.
+    pub const TRACK_SELECTED: &str = "track-selected";
 }
 
 // ============================================================================
@@ -85,11 +97,18 @@ pub enum TagValue {
     ClockTime(ClockTime),
     /// Multiple string values (multiple artists, genres).
     StringList(Vec<String>),
+    /// A flag (a track's default/forced bits).
+    ///
+    /// Added with the first producer of tags in the tree (#278). A `Uint`
+    /// carrying 0 or 1 would have worked and would have read as a number
+    /// wherever it was displayed.
+    Bool(bool),
 }
 
 impl fmt::Display for TagValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            TagValue::Bool(b) => write!(f, "{b}"),
             TagValue::String(s) => write!(f, "{s}"),
             TagValue::Uint(n) => write!(f, "{n}"),
             TagValue::Float(v) => write!(f, "{v:.2}"),
@@ -169,7 +188,15 @@ impl TagList {
         }
     }
 
-    /// Get an unsigned integer tag value.
+    /// Get a boolean tag value.
+    pub fn get_bool(&self, key: &str) -> Option<bool> {
+        match self.tags.get(key) {
+            Some(TagValue::Bool(b)) => Some(*b),
+            _ => None,
+        }
+    }
+
+    /// Get a tag as an unsigned integer.
     pub fn get_uint(&self, key: &str) -> Option<u64> {
         match self.tags.get(key) {
             Some(TagValue::Uint(n)) => Some(*n),

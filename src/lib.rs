@@ -68,6 +68,7 @@ pub mod negotiation;
 pub mod observability;
 pub mod pipeline;
 pub mod plugin;
+pub mod subtitle;
 pub mod temporal;
 pub mod typed;
 pub mod video;

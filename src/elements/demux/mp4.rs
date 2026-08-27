@@ -149,6 +149,41 @@ impl From<MediaType> for Mp4Codec {
 // Track Information
 // ============================================================================
 
+/// What the container says about a track, beyond its codec (#278).
+///
+/// MP4 spreads this across three boxes and mp4-rs exposes one of them
+/// directly: `mdhd`'s packed 5-bit-per-letter language code comes through
+/// `track.language()`, while `hdlr`'s name — where several muxers write a
+/// track title — and `tkhd`'s enabled flag are reachable only because
+/// `mp4::Mp4Track::trak` is a public field. There is no forced flag in MP4 at
+/// all, and `elng` (the BCP-47 extended language tag) is not modelled by the
+/// crate; both are an honest `None`/`false` rather than something invented.
+fn track_label(track: &mp4::Mp4Track) -> super::TrackLabel {
+    const TKHD_TRACK_ENABLED: u32 = 0x0000_0001;
+    let hdlr = &track.trak.mdia.hdlr;
+    // Muxers write "VideoHandler"/"SoundHandler"/"Core Media Video" here as a
+    // matter of course; that is the tool talking about itself, not a title
+    // anybody wants in a menu.
+    let name = Some(hdlr.name.trim())
+        .filter(|name| {
+            !name.is_empty()
+                && !name.ends_with("Handler")
+                && !name.eq_ignore_ascii_case("core media video")
+                && !name.eq_ignore_ascii_case("core media audio")
+        })
+        .map(str::to_string);
+
+    super::TrackLabel {
+        language: Some(track.language().to_string()),
+        name,
+        // MP4 has no per-track default flag; `alternate_group` says which
+        // tracks are alternatives to each other, not which one to pick.
+        default: false,
+        forced: false,
+        enabled: track.trak.tkhd.flags & TKHD_TRACK_ENABLED != 0,
+    }
+}
+
 /// Information about a track in the MP4 file.
 #[derive(Debug, Clone)]
 pub struct Mp4Track {
@@ -168,6 +203,8 @@ pub struct Mp4Track {
     pub video_info: Option<Mp4VideoInfo>,
     /// Audio-specific information (if applicable).
     pub audio_info: Option<Mp4AudioInfo>,
+    /// Language, name and flags — what a picker labels a row with (#278).
+    pub label: super::TrackLabel,
 }
 
 /// Track type classification.
@@ -686,6 +723,7 @@ impl<R: Read + Seek> Mp4Demux<R> {
                 sample_count: track.sample_count(),
                 video_info,
                 audio_info,
+                label: track_label(track),
             });
 
             sample_indices.insert(track.track_id(), 1); // Samples are 1-indexed
@@ -1220,6 +1258,10 @@ pub struct Mp4DemuxSource<R: Read + Seek + Send> {
     outputs: Vec<(crate::element::PadId, crate::format::Caps)>,
     /// `(track_id, pad)` for each routed track.
     tracks: Vec<(u32, crate::element::PadId)>,
+    /// Where to report what this file holds (#278).
+    bus: Option<crate::pipeline::bus::BusHandle>,
+    /// Whether the stream collection has gone out.
+    reported: bool,
     /// Read-ahead of one sample per track, for DTS-ordered interleaving.
     pending: Vec<Option<Mp4Sample>>,
     primed: bool,
@@ -1272,6 +1314,8 @@ impl<R: Read + Seek + Send> Mp4DemuxSource<R> {
             demux,
             outputs,
             tracks,
+            bus: None,
+            reported: false,
             pending,
             primed: false,
             looping: false,
@@ -1289,11 +1333,105 @@ impl<R: Read + Seek + Send> Mp4DemuxSource<R> {
     /// running without an audio branch, this beats leaving the pad unlinked
     /// (which drops each audio sample with a rate-limited warning).
     pub fn video_only(demux: Mp4Demux<R>) -> Self {
-        let mut this = Self::new(demux);
-        this.tracks.retain(|(_, pad)| pad.0 == 0);
-        this.outputs.retain(|(pad, _)| pad.0 == 0);
-        this.pending.truncate(this.tracks.len());
-        this
+        Self::new(demux).drop_audio()
+    }
+
+    /// Drop the audio pad, keeping whatever video track is selected.
+    ///
+    /// Distinct from `with_tracks(video, None)`, which means "take the
+    /// container's default audio track" — the difference between *no* audio
+    /// and *the usual* audio, and getting it wrong leaves an unlinked pad
+    /// dropping every audio buffer it is handed.
+    pub fn drop_audio(mut self) -> Self {
+        self.tracks.retain(|(_, pad)| pad.0 == 0);
+        self.outputs.retain(|(pad, _)| pad.0 == 0);
+        self.pending.truncate(self.tracks.len());
+        self
+    }
+
+    /// Route specific tracks instead of the first of each type (#278).
+    ///
+    /// `None` keeps the default pick. An id that is not in the file, or names
+    /// a track of the wrong type, is an error rather than a silent fall-back.
+    ///
+    /// Construction-time by design: switching a track mid-stream would mean a
+    /// different decoder element, and the graph is fixed at `start()`.
+    pub fn with_tracks(mut self, video: Option<u32>, audio: Option<u32>) -> Result<Self> {
+        use crate::element::PadId;
+        use crate::format::Caps;
+
+        let video = match video {
+            Some(id) => Some(self.require_track(id, Mp4TrackType::Video)?),
+            None => self.demux.video_track_id(),
+        };
+        let audio = match audio {
+            Some(id) => Some(self.require_track(id, Mp4TrackType::Audio)?),
+            None => self.demux.audio_track_id(),
+        };
+
+        self.outputs.clear();
+        self.tracks.clear();
+        if let Some(id) = video {
+            self.outputs.push((PadId(0), Caps::any()));
+            self.tracks.push((id, PadId(0)));
+        }
+        if let Some(id) = audio {
+            self.outputs.push((PadId(1), Caps::any()));
+            self.tracks.push((id, PadId(1)));
+        }
+        self.pending = (0..self.tracks.len()).map(|_| None).collect();
+        self.primed = false;
+        Ok(self)
+    }
+
+    /// Check that `id` names a track of `kind`, and return it.
+    fn require_track(&self, id: u32, kind: Mp4TrackType) -> Result<u32> {
+        match self.demux.track(id) {
+            Some(track) if track.track_type == kind => Ok(id),
+            Some(track) => Err(Error::Config(format!(
+                "MP4 track {id} is {:?}, not {kind:?}",
+                track.track_type
+            ))),
+            None => Err(Error::Config(format!("MP4 has no track {id}"))),
+        }
+    }
+
+    /// Tell the bus what this file holds, once (#278).
+    ///
+    /// From `produce` rather than from `set_bus`: the executor hands the bus
+    /// over before the pipeline is running, and a message posted then has
+    /// nobody listening — the application takes the bus off `start()`.
+    fn report_streams(&mut self) {
+        if self.reported {
+            return;
+        }
+        self.reported = true;
+        let Some(bus) = self.bus.clone() else {
+            return;
+        };
+        let reports = self
+            .demux
+            .tracks()
+            .iter()
+            .map(|track| super::StreamReport {
+                id: format!("mp4:{}", track.id),
+                kind: match track.track_type {
+                    Mp4TrackType::Video => crate::element::muxer::StreamType::Video,
+                    Mp4TrackType::Audio => crate::element::muxer::StreamType::Audio,
+                    Mp4TrackType::Subtitle => crate::element::muxer::StreamType::Subtitle,
+                    Mp4TrackType::Unknown => crate::element::muxer::StreamType::Data,
+                },
+                label: track.label.clone(),
+                caps: track.codec.to_string(),
+                selected: self.tracks.iter().any(|(id, _)| *id == track.id),
+            })
+            .collect();
+        super::post_streams(
+            &bus,
+            "mp4",
+            crate::clock::ClockTime::from_nanos(self.demux.duration_ns()),
+            reports,
+        );
     }
 
     /// Loop playback: at end of stream, seek back to the start and keep
@@ -1369,6 +1507,10 @@ impl<R: Read + Seek + Send> Mp4DemuxSource<R> {
 }
 
 impl<R: Read + Seek + Send> crate::element::Demuxer for Mp4DemuxSource<R> {
+    fn set_bus(&mut self, bus: crate::pipeline::bus::BusHandle) {
+        self.bus = Some(bus);
+    }
+
     fn take_downstream_event(&mut self) -> Option<crate::event::Event> {
         self.staged_segment.take().map(crate::event::Event::Segment)
     }
@@ -1381,6 +1523,8 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for Mp4DemuxSource<R> {
 
     fn produce(&mut self) -> Result<crate::element::DemuxerProduce> {
         use crate::element::{DemuxerProduce, RoutedOutput};
+
+        self.report_streams();
 
         if self.trick_rate < 0.0 {
             return self.produce_reverse();
@@ -1454,9 +1598,12 @@ impl<R: Read + Seek + Send> crate::element::Demuxer for Mp4DemuxSource<R> {
     }
 
     fn pad_name(&self, pad: crate::element::PadId) -> String {
+        // Exhaustive on purpose: the catch-all used to be `_ => "audio"`, so
+        // a third pad would silently collide with the audio one (#279).
         match pad.0 {
             0 => "video".into(),
-            _ => "audio".into(),
+            1 => "audio".into(),
+            _ => "subtitle".into(),
         }
     }
 
