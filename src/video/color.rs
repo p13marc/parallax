@@ -1,17 +1,21 @@
-//! YUV→RGB conversion constants shared by the render backends (#190).
+//! YUV→RGB conversion constants shared by every presentation backend (#190).
 //!
-//! One module owns the numbers: the WGSL shader in `present.wgsl` mirrors
-//! these constants (a comment there points back here), and the golden tests
-//! below pin them, so shader drift is reviewable as a diff against this
-//! file. Limited (studio) range only — that is what every decoder in the
-//! tree emits.
+//! One module owns the numbers: the WGSL in [`PRESENT_WGSL`](super::PRESENT_WGSL)
+//! mirrors these constants (a comment there points back here), and the golden
+//! tests below pin them, so shader drift is reviewable as a diff against this
+//! file. Limited (studio) range only — that is what every decoder in the tree
+//! emits.
+//!
+//! The shader expresses the same algebra normalised to 0..1 (`- 16.0/255.0`
+//! then `* 255/219`) where this module works in 0..255. That difference is
+//! deliberate, not drift.
 
 /// Which YUV→RGB matrix a stream wants.
 ///
 /// Chosen by the height heuristic in [`matrix_for_height`] until
 /// colorimetry rides in metadata: SD content predates BT.709.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ColorMatrix {
+pub enum ColorMatrix {
     /// ITU-R BT.601 (SD).
     Bt601,
     /// ITU-R BT.709 (HD).
@@ -19,8 +23,7 @@ pub(crate) enum ColorMatrix {
 }
 
 /// The height heuristic: ≥720 lines is HD and HD means BT.709.
-#[cfg_attr(not(any(test, feature = "display-gpu")), allow(dead_code))]
-pub(crate) fn matrix_for_height(height: u32) -> ColorMatrix {
+pub fn matrix_for_height(height: u32) -> ColorMatrix {
     if height >= 720 {
         ColorMatrix::Bt709
     } else {
@@ -36,28 +39,23 @@ pub(crate) fn matrix_for_height(height: u32) -> ColorMatrix {
 /// g = y − cb_g·cb − cr_g·cr
 /// b = y + cb_b·cb
 /// ```
-// The reference items below are exercised by the golden tests and mirrored
-// by present.wgsl — they have no runtime caller by design.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const fn coefficients(matrix: ColorMatrix) -> [f32; 4] {
+pub const fn coefficients(matrix: ColorMatrix) -> [f32; 4] {
     match matrix {
         ColorMatrix::Bt601 => [1.402, 0.344136, 0.714136, 1.772],
         ColorMatrix::Bt709 => [1.5748, 0.187324, 0.468124, 1.8556],
     }
 }
 
-/// Limited-range expansion factors: Y spans 16..=235, chroma 16..=240.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const Y_SCALE: f32 = 255.0 / 219.0;
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const C_SCALE: f32 = 255.0 / 224.0;
+/// Limited-range luma expansion factor: Y spans 16..=235.
+pub const Y_SCALE: f32 = 255.0 / 219.0;
+/// Limited-range chroma expansion factor: Cb/Cr span 16..=240.
+pub const C_SCALE: f32 = 255.0 / 224.0;
 
 /// Reference conversion of one limited-range Y'CbCr sample to 8-bit RGB.
 ///
 /// This scalar path is the truth the shader constants are pinned to; it is
 /// not a hot path anywhere.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn yuv_to_rgb(y: u8, cb: u8, cr: u8, matrix: ColorMatrix) -> [u8; 3] {
+pub fn yuv_to_rgb(y: u8, cb: u8, cr: u8, matrix: ColorMatrix) -> [u8; 3] {
     let [cr_r, cb_g, cr_g, cb_b] = coefficients(matrix);
     let y = (y as f32 - 16.0) * Y_SCALE;
     let cb = (cb as f32 - 128.0) * C_SCALE;

@@ -7,9 +7,10 @@
 //! (8.3 MB read + 8.3 MB written) — collapses into one ~3.1 MB texture
 //! upload the driver performs.
 
-use super::{DisplayFrame, RenderBackend, color, letterbox_rect};
+use super::{DisplayFrame, RenderBackend, letterbox_rect};
 use crate::error::{Error, Result};
 use crate::format::PixelFormat;
+use crate::video::layout::{TexelFormat, plane_uploads};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use winit::window::Window;
@@ -255,7 +256,7 @@ impl WgpuBackend {
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("autovideosink-present"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("present.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(crate::video::PRESENT_WGSL.into()),
         });
 
         let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -353,19 +354,7 @@ impl WgpuBackend {
 
     /// The shader mode for a frame's format and height.
     fn shader_mode(format: PixelFormat, height: u32) -> Result<u32> {
-        let matrix = color::matrix_for_height(height);
-        Ok(match (format, matrix) {
-            (PixelFormat::I420, color::ColorMatrix::Bt709) => 0,
-            (PixelFormat::I420, color::ColorMatrix::Bt601) => 1,
-            (PixelFormat::Nv12, color::ColorMatrix::Bt709) => 2,
-            (PixelFormat::Nv12, color::ColorMatrix::Bt601) => 3,
-            (PixelFormat::Rgba | PixelFormat::Bgra, _) => 4,
-            (other, _) => {
-                return Err(Error::Element(format!(
-                    "autovideosink/wgpu: unsupported display format {other:?}"
-                )));
-            }
-        })
+        crate::video::shader_mode_for(format, height)
     }
 
     /// Import this frame's dma-buf as textures, or reuse an earlier import
@@ -407,7 +396,7 @@ impl WgpuBackend {
             return Ok(true);
         }
 
-        let planes = match super::dmabuf_import::plane_imports(
+        let planes = match crate::video::layout::plane_imports(
             frame.format,
             frame.width,
             frame.height,
@@ -561,38 +550,26 @@ impl WgpuBackend {
             })
         };
 
-        let matrix = color::matrix_for_height(h);
-        let (y, u, v, mode) = match frame.format {
+        // Formats and mode come from `crate::video`, so this backend and a
+        // host renderer on another wgpu major cannot drift apart.
+        let mode = Self::shader_mode(frame.format, h)?;
+        let planes = crate::video::layout::plane_formats(frame.format)?;
+        // The shader always binds three textures; unused ones are 1x1 padding.
+        let dummy = || make("dummy", 1, 1, wgpu::TextureFormat::R8Unorm);
+        let (y, u, v) = match frame.format {
             PixelFormat::I420 => (
-                make("y", w, h, wgpu::TextureFormat::R8Unorm),
-                make("u", cw, ch, wgpu::TextureFormat::R8Unorm),
-                make("v", cw, ch, wgpu::TextureFormat::R8Unorm),
-                match matrix {
-                    color::ColorMatrix::Bt709 => 0,
-                    color::ColorMatrix::Bt601 => 1,
-                },
+                make("y", w, h, texel(planes[0])),
+                make("u", cw, ch, texel(planes[1])),
+                make("v", cw, ch, texel(planes[2])),
             ),
             PixelFormat::Nv12 => (
-                make("y", w, h, wgpu::TextureFormat::R8Unorm),
-                make("uv", cw, ch, wgpu::TextureFormat::Rg8Unorm),
-                make("dummy-v", 1, 1, wgpu::TextureFormat::R8Unorm),
-                match matrix {
-                    color::ColorMatrix::Bt709 => 2,
-                    color::ColorMatrix::Bt601 => 3,
-                },
+                make("y", w, h, texel(planes[0])),
+                make("uv", cw, ch, texel(planes[1])),
+                dummy(),
             ),
-            PixelFormat::Rgba => (
-                make("rgb", w, h, wgpu::TextureFormat::Rgba8Unorm),
-                make("dummy-u", 1, 1, wgpu::TextureFormat::R8Unorm),
-                make("dummy-v", 1, 1, wgpu::TextureFormat::R8Unorm),
-                4,
-            ),
-            PixelFormat::Bgra => (
-                make("rgb", w, h, wgpu::TextureFormat::Bgra8Unorm),
-                make("dummy-u", 1, 1, wgpu::TextureFormat::R8Unorm),
-                make("dummy-v", 1, 1, wgpu::TextureFormat::R8Unorm),
-                4,
-            ),
+            PixelFormat::Rgba | PixelFormat::Bgra => {
+                (make("rgb", w, h, texel(planes[0])), dummy(), dummy())
+            }
             other => {
                 return Err(Error::Element(format!(
                     "autovideosink/wgpu: unsupported display format {other:?}"
@@ -692,93 +669,18 @@ impl WgpuBackend {
     }
 }
 
-/// One plane's slice geometry for `write_texture` — pure math, testable
-/// without a GPU.
-#[derive(Debug, PartialEq, Eq)]
-struct PlaneUpload {
-    /// Byte offset of the plane's first row in the frame data.
-    offset: usize,
-    /// Real row stride (becomes `bytes_per_row`).
-    bytes_per_row: usize,
-    /// Rows to copy.
-    rows: usize,
-    /// Used bytes in each row (the final row needs only this much data).
-    row_bytes: usize,
-    /// Texture extent width in texels (row_bytes / bytes-per-texel).
-    width_texels: u32,
-}
-
-impl PlaneUpload {
-    /// End of the byte range `write_texture` reads: full strides for all
-    /// rows but the last, which needs only its used bytes.
-    fn end(&self) -> usize {
-        self.offset + self.bytes_per_row * (self.rows - 1) + self.row_bytes
+/// This backend's half of the [`TexelFormat`] contract.
+///
+/// `crate::video` names plane formats without a graphics dependency so the
+/// arithmetic can be shared; each renderer maps those four arms to its own
+/// enum. This is ours.
+pub(crate) fn texel(format: TexelFormat) -> wgpu::TextureFormat {
+    match format {
+        TexelFormat::R8 => wgpu::TextureFormat::R8Unorm,
+        TexelFormat::Rg8 => wgpu::TextureFormat::Rg8Unorm,
+        TexelFormat::Rgba8 => wgpu::TextureFormat::Rgba8Unorm,
+        TexelFormat::Bgra8 => wgpu::TextureFormat::Bgra8Unorm,
     }
-}
-
-/// Resolve a display frame's planes against its (possibly strided) layout
-/// into `write_texture` geometry, validating the data length. Plane order
-/// matches the texture binding order: Y/U/V for I420, Y/UV for NV12, one
-/// RGBA plane for RGB.
-fn plane_uploads(
-    format: PixelFormat,
-    width: u32,
-    height: u32,
-    layout: Option<&crate::format::PlaneLayout>,
-    data_len: usize,
-) -> Result<Vec<PlaneUpload>> {
-    // Bytes per texel per plane index, mirroring ensure_textures' formats.
-    let texel_bytes: &[usize] = match format {
-        PixelFormat::I420 => &[1, 1, 1],
-        PixelFormat::Nv12 => &[1, 2],
-        PixelFormat::Rgba | PixelFormat::Bgra => &[4],
-        other => {
-            return Err(Error::Element(format!(
-                "autovideosink/wgpu: unsupported display format {other:?}"
-            )));
-        }
-    };
-
-    let packed;
-    let layout = match layout {
-        Some(l) => l,
-        None => {
-            packed = crate::format::PlaneLayout::packed(format, width, height);
-            &packed
-        }
-    };
-
-    let mut uploads = Vec::with_capacity(texel_bytes.len());
-    for (plane, &texel) in layout.resolved(format, width, height).zip(texel_bytes) {
-        if plane.stride < plane.row_bytes || plane.rows == 0 {
-            return Err(Error::Element(format!(
-                "autovideosink/wgpu: invalid plane layout (stride {} < row {})",
-                plane.stride, plane.row_bytes
-            )));
-        }
-        let upload = PlaneUpload {
-            offset: plane.offset,
-            bytes_per_row: plane.stride,
-            rows: plane.rows,
-            row_bytes: plane.row_bytes,
-            width_texels: (plane.row_bytes / texel) as u32,
-        };
-        if upload.end() > data_len {
-            return Err(Error::Element(format!(
-                "autovideosink/wgpu: {format:?} frame is {data_len} bytes, plane needs {}",
-                upload.end()
-            )));
-        }
-        uploads.push(upload);
-    }
-    if uploads.len() != texel_bytes.len() {
-        return Err(Error::Element(format!(
-            "autovideosink/wgpu: {format:?} frame declares {} planes, expected {}",
-            uploads.len(),
-            texel_bytes.len()
-        )));
-    }
-    Ok(uploads)
 }
 
 fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
@@ -919,97 +821,5 @@ impl RenderBackend for WgpuBackend {
 
     fn name(&self) -> &'static str {
         "wgpu"
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::format::{PlaneDesc, PlaneLayout};
-
-    #[test]
-    fn packed_i420_uploads_match_the_split_at_math() {
-        // 64x48 packed I420: exactly the geometry the old split_at code
-        // produced.
-        let ups = plane_uploads(PixelFormat::I420, 64, 48, None, 64 * 48 * 3 / 2).unwrap();
-        assert_eq!(ups.len(), 3);
-        assert_eq!(
-            (
-                ups[0].offset,
-                ups[0].bytes_per_row,
-                ups[0].rows,
-                ups[0].width_texels
-            ),
-            (0, 64, 48, 64)
-        );
-        assert_eq!(
-            (
-                ups[1].offset,
-                ups[1].bytes_per_row,
-                ups[1].rows,
-                ups[1].width_texels
-            ),
-            (64 * 48, 32, 24, 32)
-        );
-        assert_eq!(ups[2].offset, 64 * 48 + 32 * 24);
-    }
-
-    #[test]
-    fn strided_i420_uses_real_strides_and_offsets() {
-        // dav1d-shaped layout: Y stride 128, chroma stride 64, planes
-        // spaced with allocator padding.
-        let layout = PlaneLayout::from_planes(&[
-            PlaneDesc {
-                offset: 0,
-                stride: 128,
-            },
-            PlaneDesc {
-                offset: 128 * 64,
-                stride: 64,
-            },
-            PlaneDesc {
-                offset: 128 * 64 + 64 * 32,
-                stride: 64,
-            },
-        ]);
-        let data_len = 128 * 64 + 2 * (64 * 32);
-        let ups = plane_uploads(PixelFormat::I420, 64, 48, Some(&layout), data_len).unwrap();
-        assert_eq!(ups[0].bytes_per_row, 128, "real stride, not width");
-        assert_eq!(ups[0].width_texels, 64, "extent from real plane width");
-        assert_eq!(ups[0].rows, 48);
-        assert_eq!(ups[1].offset, 128 * 64);
-        assert_eq!(ups[1].bytes_per_row, 64);
-        assert_eq!(ups[1].width_texels, 32);
-        // Last row needs only row_bytes, not a full stride.
-        assert_eq!(ups[0].end(), 128 * 47 + 64);
-    }
-
-    #[test]
-    fn nv12_interleaved_chroma_is_two_byte_texels() {
-        let ups = plane_uploads(PixelFormat::Nv12, 64, 48, None, 64 * 48 * 3 / 2).unwrap();
-        assert_eq!(ups.len(), 2);
-        assert_eq!(ups[1].bytes_per_row, 64, "cw * 2 bytes");
-        assert_eq!(ups[1].width_texels, 32, "Rg8 texels");
-        assert_eq!(ups[1].rows, 24);
-    }
-
-    #[test]
-    fn short_buffers_and_bad_strides_are_rejected() {
-        assert!(plane_uploads(PixelFormat::I420, 64, 48, None, 100).is_err());
-        let bad = PlaneLayout::from_planes(&[
-            PlaneDesc {
-                offset: 0,
-                stride: 8,
-            }, // < row_bytes 64
-            PlaneDesc {
-                offset: 512,
-                stride: 32,
-            },
-            PlaneDesc {
-                offset: 1024,
-                stride: 32,
-            },
-        ]);
-        assert!(plane_uploads(PixelFormat::I420, 64, 48, Some(&bad), 1 << 20).is_err());
     }
 }

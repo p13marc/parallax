@@ -1,11 +1,11 @@
-// AutoVideoSink presentation shader (#190).
+// Parallax video presentation shader (#190).
 //
 // One pipeline for every input layout; `params.mode` selects:
 //   0 = I420 · BT.709     1 = I420 · BT.601
 //   2 = NV12 · BT.709     3 = NV12 · BT.601
 //   4 = RGB passthrough (tex_y holds the RGBA/BGRA texture)
 //
-// The YUV matrix constants MIRROR src/elements/app/present/color.rs —
+// The YUV matrix constants MIRROR src/video/color.rs —
 // change both together; the golden tests there are the truth.
 
 struct Params {
@@ -58,7 +58,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
     cbcr = (cbcr - 128.0 / 255.0) * (255.0 / 224.0);
 
-    // [cr_r, cb_g, cr_g, cb_b] — see color.rs::coefficients.
+    // [cr_r, cb_g, cr_g, cb_b] — see video::color::coefficients.
     var c: vec4<f32>;
     if params.mode == 0u || params.mode == 2u {
         c = vec4<f32>(1.5748, 0.187324, 0.468124, 1.8556); // BT.709

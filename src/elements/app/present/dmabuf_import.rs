@@ -39,7 +39,7 @@
 //! only, and they address disjoint byte ranges.
 
 use crate::error::{Error, Result};
-use crate::format::{PixelFormat, PlaneLayout};
+use crate::video::layout::PlaneImport;
 
 /// Whether this adapter can import dma-bufs at all.
 ///
@@ -70,80 +70,6 @@ fn hal_uses(usage: wgpu::TextureUsages) -> wgpu::wgt::TextureUses {
         uses |= wgpu::wgt::TextureUses::COPY_SRC;
     }
     uses
-}
-
-/// One plane's worth of import geometry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PlaneImport {
-    /// Texture format the shader expects for this plane.
-    pub format: wgpu::TextureFormat,
-    /// Size in *texels*, which for `Rg8Unorm` chroma is half the byte width.
-    pub width: u32,
-    pub height: u32,
-    /// Byte offset of the plane within the dma-buf.
-    pub offset: u64,
-    /// Byte pitch of one row.
-    pub stride: u64,
-}
-
-/// Resolve a frame's plane layout into per-plane import geometry.
-///
-/// Pure arithmetic, so it is unit-tested without a GPU — which matters,
-/// because a mistake here does not fail loudly. It produces a picture that
-/// is sheared, shifted or checkerboarded, and only a comparison catches it.
-///
-/// `base_offset` is the buffer's own offset into its allocation: a `slice`d
-/// dma-buf buffer is legal and its offset is not part of the `PlaneLayout`.
-pub(crate) fn plane_imports(
-    format: PixelFormat,
-    width: u32,
-    height: u32,
-    layout: &PlaneLayout,
-    base_offset: usize,
-) -> Result<Vec<PlaneImport>> {
-    let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
-    // (texture format, texels wide, rows) per plane, in shader binding order.
-    let planes: &[(wgpu::TextureFormat, u32, u32)] = match format {
-        PixelFormat::I420 => &[
-            (wgpu::TextureFormat::R8Unorm, width, height),
-            (wgpu::TextureFormat::R8Unorm, cw, ch),
-            (wgpu::TextureFormat::R8Unorm, cw, ch),
-        ],
-        // NV12's chroma is two bytes per texel, so `cw` texels is `cw * 2`
-        // bytes — the pitch is in bytes either way.
-        PixelFormat::Nv12 => &[
-            (wgpu::TextureFormat::R8Unorm, width, height),
-            (wgpu::TextureFormat::Rg8Unorm, cw, ch),
-        ],
-        PixelFormat::Rgba => &[(wgpu::TextureFormat::Rgba8Unorm, width, height)],
-        PixelFormat::Bgra => &[(wgpu::TextureFormat::Bgra8Unorm, width, height)],
-        other => {
-            return Err(Error::Element(format!(
-                "autovideosink/wgpu: cannot import {other:?} frames"
-            )));
-        }
-    };
-
-    let declared = layout.planes();
-    if declared.len() < planes.len() {
-        return Err(Error::Element(format!(
-            "autovideosink/wgpu: {format:?} needs {} planes, the frame declares {}",
-            planes.len(),
-            declared.len()
-        )));
-    }
-
-    Ok(planes
-        .iter()
-        .zip(declared)
-        .map(|(&(format, width, height), desc)| PlaneImport {
-            format,
-            width,
-            height,
-            offset: (base_offset + desc.offset) as u64,
-            stride: desc.stride as u64,
-        })
-        .collect())
 }
 
 /// Import one plane as a texture aliasing the dma-buf.
@@ -182,7 +108,7 @@ pub(crate) unsafe fn import_plane(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: plane.format,
+        format: super::wgpu_backend::texel(plane.format),
         usage: hal_uses(usage),
         memory_flags: wgpu::hal::MemoryFlags::empty(),
         view_formats: vec![],
@@ -210,7 +136,7 @@ pub(crate) unsafe fn import_plane(
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: plane.format,
+                format: super::wgpu_backend::texel(plane.format),
                 usage,
                 view_formats: &[],
             },
@@ -222,81 +148,6 @@ pub(crate) unsafe fn import_plane(
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::format::PlaneDesc;
-
-    fn layout(planes: &[(usize, usize)]) -> PlaneLayout {
-        PlaneLayout::from_planes(
-            &planes
-                .iter()
-                .map(|&(offset, stride)| PlaneDesc { offset, stride })
-                .collect::<Vec<_>>(),
-        )
-    }
-
-    /// NV12's chroma plane is half the texels wide but the same bytes wide,
-    /// which is exactly the confusion that produces a half-width picture.
-    #[test]
-    fn nv12_chroma_is_half_the_texels_at_the_full_pitch() {
-        let l = layout(&[(0, 1920), (1920 * 1088, 1920)]);
-        let p = plane_imports(PixelFormat::Nv12, 1920, 1080, &l, 0).unwrap();
-
-        assert_eq!(p.len(), 2, "NV12 is two planes, not three");
-        assert_eq!(p[0].format, wgpu::TextureFormat::R8Unorm);
-        assert_eq!((p[0].width, p[0].height), (1920, 1080));
-        assert_eq!((p[0].offset, p[0].stride), (0, 1920));
-
-        assert_eq!(p[1].format, wgpu::TextureFormat::Rg8Unorm);
-        assert_eq!((p[1].width, p[1].height), (960, 540), "texels, not bytes");
-        assert_eq!(p[1].stride, 1920, "bytes per row is unchanged");
-        assert_eq!(p[1].offset, 1920 * 1088);
-    }
-
-    /// Odd dimensions round chroma up: a 1x1 chroma plane still exists for a
-    /// 1x1 frame, and dropping it would index past the end of the layout.
-    #[test]
-    fn odd_dimensions_round_the_chroma_plane_up() {
-        let l = layout(&[(0, 128), (128 * 32, 128), (128 * 48, 128)]);
-        let p = plane_imports(PixelFormat::I420, 17, 9, &l, 0).unwrap();
-        assert_eq!((p[1].width, p[1].height), (9, 5));
-        assert_eq!((p[2].width, p[2].height), (9, 5));
-    }
-
-    /// A sliced buffer's own offset has to reach the import, or every plane
-    /// is read from the wrong place.
-    #[test]
-    fn the_buffers_base_offset_is_added_to_every_plane() {
-        let l = layout(&[(0, 64), (64 * 32, 64)]);
-        let p = plane_imports(PixelFormat::Nv12, 64, 64, &l, 4096).unwrap();
-        assert_eq!(p[0].offset, 4096);
-        assert_eq!(p[1].offset, 4096 + 64 * 32);
-    }
-
-    #[test]
-    fn a_frame_with_too_few_planes_is_refused() {
-        let l = layout(&[(0, 64)]);
-        assert!(plane_imports(PixelFormat::I420, 64, 64, &l, 0).is_err());
-    }
-
-    #[test]
-    fn packed_formats_import_as_one_plane() {
-        let l = layout(&[(0, 256)]);
-        let p = plane_imports(PixelFormat::Bgra, 64, 64, &l, 0).unwrap();
-        assert_eq!(p.len(), 1);
-        assert_eq!(p[0].format, wgpu::TextureFormat::Bgra8Unorm);
-    }
-}
-
-/// The import proved against a real producer, on real hardware.
-///
-/// Separate from the arithmetic tests above because this one needs a Vulkan
-/// adapter with the external-memory extensions *and* `/dev/udmabuf`, and
-/// green-skips without either. The producer is the VA-API frame allocator,
-/// which is the one in the tree that owns real dma-bufs — and whose frames
-/// are **Y-tiled**, which is the case worth proving: a modifier the importer
-/// gets wrong yields a coherent but scrambled picture, never an error.
 #[cfg(all(test, feature = "vaapi"))]
 mod hardware_tests {
     use super::*;
