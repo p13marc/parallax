@@ -72,8 +72,20 @@ impl FrameView {
                     )));
                 }
             },
+            // Packed formats: trust declared dimensions when the payload is
+            // big enough to hold them. The length is checked against the
+            // format's own packing rather than a hardcoded four bytes per
+            // pixel — `AutoVideoSink` could assume that because its caps
+            // admit nothing else, but this read is shared now, and a 24-bit
+            // frame silently failing the check falls through to the guess and
+            // reports a plausible wrong size.
             _ => match meta.video_dims() {
-                Some((w, h)) if w > 0 && h > 0 && (w as usize * h as usize * 4) == data_len => {
+                Some((w, h))
+                    if w > 0
+                        && h > 0
+                        && data_len
+                            >= PlaneLayout::packed(format, w, h).required_len(format, w, h) =>
+                {
                     (w, h)
                 }
                 _ => detect_dimensions(data_len),
@@ -209,10 +221,24 @@ mod tests {
         m.set_video_dims(100, 50, PixelFormat::Rgba);
         let view = FrameView::from_metadata(&m, 100 * 50 * 4).unwrap();
         assert_eq!((view.width, view.height), (100, 50));
-        // A length that disagrees falls back to the guess, which is how a
-        // padded or mis-declared buffer used to keep working.
+        // A payload too short for the declared size falls back to the guess,
+        // which is how a mis-declared buffer used to keep working.
         let view = FrameView::from_metadata(&m, 640 * 480 * 4).unwrap();
-        assert_eq!((view.width, view.height), (640, 480));
+        assert_eq!((view.width, view.height), (100, 50), "still fits");
+        let view = FrameView::from_metadata(&m, 8).unwrap();
+        assert_ne!((view.width, view.height), (100, 50), "too short to be that");
+    }
+
+    #[test]
+    fn a_packed_format_is_measured_by_its_own_packing() {
+        // Rgb24 is three bytes per pixel. Checking against a hardcoded four
+        // would fail here and report a plausible wrong size from the guess —
+        // 320x240 came out as 278x207 before this was fixed.
+        let mut m = Metadata::default();
+        m.set_video_dims(320, 240, PixelFormat::Rgb24);
+        let view = FrameView::from_metadata(&m, 320 * 240 * 3).unwrap();
+        assert_eq!((view.width, view.height), (320, 240));
+        assert_eq!(view.format, PixelFormat::Rgb24);
     }
 
     #[test]

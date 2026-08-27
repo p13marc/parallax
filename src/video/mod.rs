@@ -34,9 +34,13 @@ pub mod fit;
 pub mod layout;
 
 mod frame;
+mod mailbox;
 
 pub use frame::{FrameView, VideoFrame};
 pub use layout::TexelFormat;
+pub use mailbox::{
+    DEFAULT_QUEUE_DEPTH, FrameAcceptance, FrameMailbox, FrameStats, PacedFrame, PresentationClock,
+};
 
 use crate::error::{Error, Result};
 use crate::format::PixelFormat;

@@ -1,5 +1,11 @@
 [workspace]
-members = [".", "parallax-macros", "parallax-player", "examples/example-plugin"]
+members = [
+    ".",
+    "parallax-macros",
+    "parallax-player",
+    "parallax-iced",
+    "examples/example-plugin",
+]
 # The default build set stays exactly what a bare `cargo <cmd>` built before
 # the player existed: the root package alone. Anything wider changes what CI
 # compiles — adding the player would unify its features (h264/display/...)
@@ -468,6 +474,9 @@ name = "56_typefind"
 
 [[example]]
 name = "60_ipc"
+
+[[example]]
+name = "64_appvideosink"
 
 [[example]]
 name = "62_zenoh"

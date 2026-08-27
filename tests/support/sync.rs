@@ -136,7 +136,7 @@ impl Log {
 /// A handle onto a sink's log, cloned before `start()` moves the element.
 pub type LogHandle = Arc<Mutex<Log>>;
 
-fn record(log: &LogHandle, f: impl FnOnce(&mut Log)) {
+pub fn record(log: &LogHandle, f: impl FnOnce(&mut Log)) {
     f(&mut log.lock().unwrap_or_else(|e| e.into_inner()))
 }
 

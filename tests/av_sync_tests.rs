@@ -31,13 +31,16 @@ mod sync;
 use parallax::buffer::{Buffer, MemoryHandle};
 use parallax::clock::ClockTime;
 use parallax::element::{Demuxer, DemuxerProduce, PadId, RoutedOutput};
+use parallax::elements::AppVideoSink;
 use parallax::error::Result;
 use parallax::event::{Event, EventResult, SeekType};
 use parallax::memory::SharedArena;
 use parallax::metadata::Metadata;
 use parallax::pipeline::{Executor, ExecutorConfig, LinkPolicy, Pipeline};
+use parallax::video::FrameMailbox;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use sync::{ClockAudioSink, LogHandle, PacedVideoSink, Presented, SlowRestart};
+use sync::{ClockAudioSink, LogHandle, PacedVideoSink, Presented, SlowRestart, record};
 
 /// 10 fps video, so a frame every 100 ms.
 const FRAME_NS: u64 = 100_000_000;
@@ -216,6 +219,68 @@ fn build(source: AvSource) -> (Pipeline, LogHandle, LogHandle) {
         .link_pads_full(src, "audio", asink, "sink", LinkPolicy::Block, Some(96))
         .unwrap();
     (pipeline, audio_log, video_log)
+}
+
+/// The same graph, but ending in the GUI-facing sink instead of the paced
+/// stand-in.
+///
+/// `AppVideoSink` does not decide when a frame is shown — that is the host's
+/// job, which is the whole point of it — so the drain task below *is* the
+/// host, doing what a redraw loop does. It logs into the same `Presented`
+/// records the stand-in produces, so both are measured with one yardstick.
+fn build_with_app_sink(
+    source: AvSource,
+    shed_after: Duration,
+) -> (Pipeline, LogHandle, Arc<FrameMailbox>) {
+    let mut pipeline = Pipeline::new();
+    let src = pipeline.add_demuxer("demux", source);
+
+    let audio = ClockAudioSink::new(SAMPLE_RATE, 2, 2);
+    let audio_log = audio.log();
+    let video = AppVideoSink::new()
+        .with_sync(true)
+        .with_shed_after(shed_after);
+    let mailbox = video.mailbox();
+
+    let decode = pipeline.add_async_transform("decode", SlowRestart::new(VIDEO_RESTART));
+    let vsink = pipeline.add_async_sink("display", video);
+    let asink = pipeline.add_async_sink("speaker", audio);
+    pipeline
+        .link_pads_full(src, "video", decode, "sink", LinkPolicy::Block, Some(24))
+        .unwrap();
+    pipeline.link(decode, vsink).unwrap();
+    pipeline
+        .link_pads_full(src, "audio", asink, "sink", LinkPolicy::Block, Some(96))
+        .unwrap();
+    (pipeline, audio_log, mailbox)
+}
+
+/// A host's redraw loop, at roughly 200 Hz.
+fn spawn_host(mailbox: Arc<FrameMailbox>) -> (LogHandle, tokio::task::JoinHandle<()>) {
+    let log: LogHandle = Arc::new(Mutex::new(sync::Log::default()));
+    let into = LogHandle::clone(&log);
+    let task = tokio::spawn(async move {
+        loop {
+            if let Some(clock) = mailbox.clock() {
+                let now = clock.now();
+                while let Some(paced) = mailbox.take_due(now, Duration::from_millis(40)) {
+                    let at = clock.clock_time();
+                    record(&into, |l| {
+                        l.presented.push(Presented {
+                            pts: paced.frame.data.metadata().pts,
+                            running_time: paced.target,
+                            at,
+                        });
+                    });
+                }
+            }
+            if mailbox.end_reason().is_some() && !mailbox.has_frame() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+    (log, task)
 }
 
 fn snapshot(log: &LogHandle) -> sync::Log {
@@ -675,4 +740,80 @@ async fn a_looping_real_pipeline_survives_repeated_seeks() {
         video.stalled,
     );
     assert!(stopped.is_ok(), "teardown wedged");
+}
+
+/// The GUI-facing sink keeps A/V together, which is the whole reason it can
+/// replace the one that owns a window.
+///
+/// `AppVideoSink` hands frames to a host rather than presenting them itself,
+/// so the anchor handshake, the segment mapping and the flush generations all
+/// have to work across that boundary. This runs the identical graph the paced
+/// stand-in runs and holds it to the identical bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_app_sink_settles_on_the_audio_origin_too() {
+    let (mut pipeline, audio_log, mailbox) =
+        build_with_app_sink(AvSource::new(10), Duration::from_millis(500));
+    let (video_log, host) = spawn_host(Arc::clone(&mailbox));
+
+    let executor = Executor::with_config(ExecutorConfig::default());
+    let handle = executor.start(&mut pipeline).unwrap();
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let audio = snapshot(&audio_log);
+    let video = snapshot(&video_log);
+    handle.stop();
+    let _ = handle.wait().await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), host).await;
+
+    assert!(!audio.presented.is_empty(), "audio played");
+    assert!(!video.presented.is_empty(), "video presented");
+
+    let drift = settled_drift_ms(&audio, &video, ClockTime::ZERO);
+    assert!(
+        drift.abs() < TOLERANCE_MS,
+        "video settled {drift:.1} ms off the audio origin"
+    );
+
+    // And the host is told the run ended, rather than being left waiting on
+    // a doorbell nobody is going to ring.
+    assert!(
+        mailbox.end_reason().is_some(),
+        "the host learns the outcome"
+    );
+}
+
+/// A host that stops drawing must not stop the pipeline.
+///
+/// An occluded or minimised window stops receiving redraws. If the sink
+/// blocked on mailbox space it would fill the video link, back the demuxer
+/// up, starve the audio branch and freeze the master clock — a hidden window
+/// would become a stopped pipeline. It sheds instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_that_stops_drawing_does_not_stall_the_audio_branch() {
+    // A short shed deadline so the test does not spend its life waiting on
+    // one: the behaviour under test is *that* it sheds, not how long it waits.
+    let (mut pipeline, audio_log, mailbox) =
+        build_with_app_sink(AvSource::new(20), Duration::from_millis(60));
+    // No host at all: nothing ever drains the mailbox.
+    let executor = Executor::with_config(ExecutorConfig::default());
+    let handle = executor.start(&mut pipeline).unwrap();
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let audio = snapshot(&audio_log);
+    let stats = mailbox.stats();
+    handle.stop();
+    let _ = handle.wait().await;
+
+    assert!(
+        audio.presented.len() > 5,
+        "audio kept playing with nobody drawing: {} buffers",
+        audio.presented.len()
+    );
+    assert!(
+        stats.dropped_full > 0,
+        "the video branch shed rather than blocking"
+    );
+    assert!(
+        stats.queued <= mailbox.capacity(),
+        "the ring stayed bounded at {} frames",
+        stats.queued
+    );
 }
