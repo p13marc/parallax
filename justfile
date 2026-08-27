@@ -98,11 +98,12 @@ check-display:
 # for. Duplicates would compile and quietly double the build.
 check-iced:
     cargo clippy -p parallax-iced --all-targets -- -D warnings
-    cargo clippy -p parallax-play --all-targets -- -D warnings
+    cargo clippy -p parallax-player --all-targets -- -D warnings
     cargo nextest run -p parallax-iced
-    cargo nextest run -p parallax-play
+    cargo nextest run -p parallax-player
     ! cargo tree -p parallax-iced -d 2>/dev/null | grep -q '^wgpu'
-    ! cargo tree -p parallax-play -d 2>/dev/null | grep -q '^wgpu'
+    ! cargo tree -p parallax-player -d 2>/dev/null | grep -q '^wgpu'
+    ! cargo tree -p parallax-player -d 2>/dev/null | grep -q '^ashpd'
 
 # Run the player against a fixture with no display attached, and check it
 # actually played. weston's headless backend plus Mesa's software Vulkan is
@@ -115,12 +116,26 @@ play-headless FILE="tests/fixtures/tiny_h264_aac.mkv" SECS="5":
     #!/usr/bin/env bash
     set -euo pipefail
     export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-    cargo build -p parallax-play
+    cargo build -p parallax-player
     weston --backend=headless --width=1280 --height=720 --socket=wayland-check &
     weston_pid=$!
     trap 'kill $weston_pid 2>/dev/null || true' EXIT
     sleep 3
-    WAYLAND_DISPLAY=wayland-check ./target/debug/parallax-play --exit-after={{SECS}} {{FILE}} \
+    WAYLAND_DISPLAY=wayland-check ./target/debug/parallax-player --exit-after={{SECS}} {{FILE}} \
+        | tee /dev/stderr | grep -qE 'presented=[1-9]' \
+        || { echo 'no frames were presented'; exit 1; }
+
+# The same player with no window at all (#277). It drains the frame mailbox
+# itself, at the same due times and with the same lateness budget the widget
+# uses, so the two report the same frame counts for the same file — which is
+# the assertion that keeps the null host honest.
+#
+# Unlike `play-headless` it needs no compositor, no GPU and no sound card, so
+# CI runs it. It exercises none of `parallax-iced`; that is what the weston
+# recipe above is for.
+play-smoke FILE="tests/fixtures/tiny_h264_aac.mkv" SECS="5":
+    cargo build -p parallax-player
+    ./target/debug/parallax-player --headless --exit-after={{SECS}} {{FILE}} \
         | tee /dev/stderr | grep -qE 'presented=[1-9]' \
         || { echo 'no frames were presented'; exit 1; }
 
@@ -133,9 +148,11 @@ check-vulkan:
     cargo nextest run --features image-jpeg,vulkan-video
     cargo check --all-targets --features image-jpeg,vulkan-video
 
-# Colorspace SIMD combo (the `yuv` crate) — what parallax-player actually
-# builds with. The scalar arms are the default-feature fallback, so both
-# families need running: a stride or format change touches two twins.
+# Colorspace SIMD combo (the `yuv` crate): the second implementation of every
+# conversion arm. The scalar arms are the default-feature fallback — what a
+# bare `cargo build` ships — so both families need running: a stride, format
+# or colorimetry change touches two twins, and #265 is what happens when only
+# one of them is checked.
 check-simd:
     cargo nextest run --features simd-colorspace
     cargo clippy --all-targets --features simd-colorspace -- -D warnings

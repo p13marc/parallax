@@ -16,7 +16,11 @@ use crate::render::VideoPrimitive;
 /// Default lateness past which a frame is not worth showing.
 ///
 /// One frame at 25 fps, the same budget `AutoVideoSink` uses.
-const DEFAULT_MAX_LATENESS: Duration = Duration::from_millis(40);
+///
+/// Public because a host that draws no window still has to pace, and two
+/// hosts pacing to different budgets would report different frame counts for
+/// the same file — which is exactly what the headless run is asked to prove.
+pub const DEFAULT_MAX_LATENESS: Duration = Duration::from_millis(40);
 
 /// Longest gap between redraws while a stream is live but nothing is queued.
 ///

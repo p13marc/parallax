@@ -11,7 +11,7 @@ B4 ([#270](https://git.marcpardo.eu/marcpardo/parallax/issues/270)),
 B5 ([#271](https://git.marcpardo.eu/marcpardo/parallax/issues/271)),
 C1 ([#272](https://git.marcpardo.eu/marcpardo/parallax/issues/272)) and
 C2 ([#273](https://git.marcpardo.eu/marcpardo/parallax/issues/273)) are done:
-`parallax-play` opens a file, plays it in sync, seeks, and gets its controls
+`parallax-player` opens a file, plays it in sync, seeks, and gets its controls
 out of the way. What the build taught that this plan did not know is in
 § "What building it changed" at the end.
 
@@ -349,10 +349,18 @@ toasts, and a `to_dot()` dump.
 
 **C5 ([#276](https://git.marcpardo.eu/marcpardo/parallax/issues/276)). Playlist and open-next (M).** Depends on C1 ([#272](https://git.marcpardo.eu/marcpardo/parallax/issues/272)).
 
-**C6 ([#277](https://git.marcpardo.eu/marcpardo/parallax/issues/277)). Retire the crossterm player (S).** Delete the terminal path, but keep a
-`--headless` mode preserving `--exit-after` and the machine-readable
-`stats: position_ns=… dropped=…` line, because `scripts/decode_matrix.py` parses it and
-B4 depends on it.
+**C6 ([#277](https://git.marcpardo.eu/marcpardo/parallax/issues/277)). Retire the crossterm player (S). DONE.** The old crate is deleted and the
+Iced one took its name, its binary path and its measurement flags
+(`--no-sync`, `--channel-capacity`, `--frame-delay`, `--loop` as an alias), so
+`scripts/decode_matrix.py` is unchanged. `--headless` is now real rather than
+promised: the process becomes the host and drains the mailbox at the widget's
+own due times, needing no compositor, GPU or sound card — which is how CI runs
+the player end to end. Two things had to be re-homed: the 14-feature union the
+old Cargo.toml was CI's only build of (now a `feature-union` job against the
+root crate, which additionally compiles `dmabuf_import.rs`'s `hardware_tests`
+for the first time), and the name `--headless`, which
+`scripts/decode_matrix.py` used for the *opposite* meaning and which is
+`--weston` there now.
 
 ### Phase D — engine gaps the player exposes
 
@@ -416,8 +424,11 @@ path exists at any layer), MP3/FLAC streaming decoders.
 
 ## Breaking changes
 
-- `parallax-player` is rewritten; its CLI keeps `--headless`, `--exit-after` and the
-  `stats:` line, and little else.
+- `parallax-player` is rewritten; its CLI keeps `--exit-after`, the `stats:`
+  line, and the measurement flags (`--no-sync`, `--channel-capacity`,
+  `--frame-delay`, `--dav1d-threads`, `--decode-ahead`, `--hwdec`,
+  `--no-audio`, `--loop` as an alias for `--repeat`). `--no-gpu` is gone with
+  the `display-gpu` path it selected, and `--headless` is new.
 - `parallax::video` moves code out of `elements::app::present`; `present` is re-pointed
   at it. No public API is lost — `present` was `pub(crate)` — but every promoted item
   needs a doc comment, since `#![warn(missing_docs)]` is on.

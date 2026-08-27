@@ -48,6 +48,13 @@ pub struct Options {
     pub decode_ahead: usize,
     /// dav1d thread count; 0 picks by resolution.
     pub dav1d_threads: u32,
+    /// dav1d frame-delay bound; 0 leaves the decoder's own choice.
+    pub frame_delay: u32,
+    /// Executor link capacity for edges that do not set their own.
+    pub channel_capacity: usize,
+    /// Present frames at their due time. Off is the batch-decode floor — the
+    /// pipeline runs as fast as it can, which is how #192 was measured.
+    pub sync: bool,
 }
 
 impl Default for Options {
@@ -58,6 +65,9 @@ impl Default for Options {
             repeat: false,
             decode_ahead: 4,
             dav1d_threads: 0,
+            frame_delay: 0,
+            channel_capacity: 4,
+            sync: true,
         }
     }
 }
@@ -619,7 +629,11 @@ impl Engine {
                     0 if height > 0 && height <= 1440 => 2,
                     explicit_or_auto => explicit_or_auto,
                 };
-                pipeline.add_filter("decode", Dav1dDecoder::new()?.with_threads(threads)?)
+                let mut dav1d = Dav1dDecoder::new()?.with_threads(threads)?;
+                if opts.frame_delay > 0 {
+                    dav1d = dav1d.with_max_frame_delay(opts.frame_delay)?;
+                }
+                pipeline.add_filter("decode", dav1d)
             }
             // `probe` rejects these, so reaching here is a bug rather than a
             // user error.
@@ -627,7 +641,7 @@ impl Engine {
         };
 
         let sink = AppVideoSink::new()
-            .with_sync(true)
+            .with_sync(opts.sync)
             .with_host_retention(parallax_iced::HOST_RETENTION);
         let mailbox = sink.mailbox();
         let snk = pipeline.add_async_sink("display", sink);
@@ -665,7 +679,9 @@ impl Engine {
             pipeline.link(avolume, aout)?;
         }
 
-        let executor = Executor::with_config(ExecutorConfig::default().with_channel_capacity(4));
+        let executor = Executor::with_config(
+            ExecutorConfig::default().with_channel_capacity(opts.channel_capacity),
+        );
         let mut handle = executor.start(&mut pipeline)?;
         let bus = handle.take_bus();
 

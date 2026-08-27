@@ -151,8 +151,10 @@ pub(crate) unsafe fn import_plane(
 #[cfg(all(test, feature = "vaapi"))]
 mod hardware_tests {
     use super::*;
+    use crate::format::{PixelFormat, PlaneDesc, PlaneLayout};
     use crate::gpu::vaapi::VaFrame;
     use crate::memory::I915_FORMAT_MOD_Y_TILED;
+    use crate::video::layout::plane_imports;
 
     const TILE_W: usize = 128;
     const TILE_H: usize = 32;
@@ -282,11 +284,11 @@ mod hardware_tests {
         }
 
         let layout = PlaneLayout::from_planes(&[
-            crate::format::PlaneDesc {
+            PlaneDesc {
                 offset: luma_off,
                 stride: pitch,
             },
-            crate::format::PlaneDesc {
+            PlaneDesc {
                 offset: chroma_off,
                 stride: frame.pitches()[1],
             },

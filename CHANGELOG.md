@@ -46,11 +46,30 @@ Every out-of-tree plugin must be rebuilt: the plugin ABI went **12 → 13**.
   now call these rather than leaving callers to rely on the fact.
 
 - **Two new workspace crates**, both `publish = false`: `parallax-iced` (a
-  `shader` widget that draws a `FrameMailbox`, on Iced's wgpu) and
-  `parallax-play` (a player built on it). The old `parallax-player` is
-  untouched and still builds; #277 retires it. `just check-iced` and
-  `just play-headless` are their gates — the latter runs the real player under
-  weston's headless backend and asserts frames were presented.
+  `shader` widget that draws a `FrameMailbox`, on Iced's wgpu) and the
+  rewritten `parallax-player` built on it. The crossterm/winit demo that held
+  that name is gone (#277) — the new one took the name and the binary path, so
+  `scripts/decode_matrix.py` and every `cargo run -p parallax-player` are
+  unchanged. `just check-iced`, `just play-headless` (the real widget under
+  weston) and `just play-smoke` (`--headless`, no compositor) are its gates.
+
+- **`parallax-player --headless`** (#277) plays with no window at all: this
+  process becomes the host and drains the frame mailbox at the same due times,
+  with the same lateness budget, that the widget uses. It needs no compositor,
+  no GPU and no sound card, so CI runs the player end to end for the first
+  time. It reports the same frame counts the windowed run does — that
+  agreement is the point, and the reason it calls `take_due` and
+  `parallax_iced::DEFAULT_MAX_LATENESS` rather than inventing a second pacing
+  policy.
+
+- **A `feature-union` CI job** (#277). The retired player's Cargo.toml was the
+  only build of `mp4-demux,mkv-demux,vpx,av1-decode,opus,h264,display,
+  display-gpu,simd-colorspace,audio-aac,audio-vorbis,eac3,alsa,vaapi` in one
+  dependency graph. Every feature in it is built by some other job; the
+  *union* was not. Against the root crate with `--all-targets` it also
+  compiles `present/dmabuf_import.rs`'s `hardware_tests` for the first time,
+  which the old job could never reach — it built the root crate as a
+  dependency, with `cfg(test)` off.
 
 ### Fixed
 
