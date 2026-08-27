@@ -12,6 +12,54 @@ commit messages and the Forgejo releases.
 
 Every out-of-tree plugin must be rebuilt: the plugin ABI went **12 → 13**.
 
+### Added
+
+- **`parallax::video` — presentation maths without a graphics dependency**
+  (#263). Plane strides, the letterbox rect, the YUV matrices, the WGSL and
+  the `(format, matrix) → shader mode` table now live in a public, unfeatured
+  module, over a graphics-free `TexelFormat` instead of `wgpu::TextureFormat`.
+  That is what lets parallax's own `display-gpu` backend and a GUI host on a
+  *different wgpu major* share the arithmetic and the golden tests that pin it.
+  `FrameView::from_metadata` is the one read of a buffer's format, geometry and
+  strides — `AutoVideoSink` uses it, so a host presenter cannot disagree with
+  the sink about what a buffer is. Thirteen of the twenty-two tests here
+  previously ran only under `--features display`; they run in the default
+  `cargo test` job now. No golden value changed.
+
+- **`AppVideoSink` — a paced sink that hands frames to a GUI** (#264).
+  `AutoVideoSink` builds the process's one winit event loop, so an application
+  that owns that loop itself cannot use it. This one keeps everything needing a
+  `ConsumeContext` — the anchor handshake, segment mapping, flush generations,
+  out-of-segment clipping, QoS — and publishes each frame into a `FrameMailbox`
+  stamped with the running time it is due at; the host decides when to show it,
+  because only the host knows when the next vertical blank is. Unfeatured: no
+  winit, no wgpu. Back-pressure is the wait for mailbox space, which is what
+  makes the pipeline run at playback speed — **bounded**, because an occluded
+  window stops redrawing and blocking there would starve the audio branch and
+  freeze the master clock. See `examples/64_appvideosink.rs`.
+
+- **`PipelineHandle::dispatch_seek` / `dispatch_event_upstream`** (#272), the
+  synchronous twins of `seek` / `send_event_upstream`. Dispatching an upstream
+  event never blocked — every channel it touches is unbounded, and what takes
+  time is the flush trio running elsewhere — but a GUI event handler is neither
+  async nor able to move a `PipelineHandle` into a task, so the async versions
+  now call these rather than leaving callers to rely on the fact.
+
+- **Two new workspace crates**, both `publish = false`: `parallax-iced` (a
+  `shader` widget that draws a `FrameMailbox`, on Iced's wgpu) and
+  `parallax-play` (a player built on it). The old `parallax-player` is
+  untouched and still builds; #277 retires it. `just check-iced` and
+  `just play-headless` are their gates — the latter runs the real player under
+  weston's headless backend and asserts frames were presented.
+
+### Fixed
+
+- **A packed frame's length is measured by its own packing** (#264).
+  The geometry read checked declared dimensions against a hardcoded four bytes
+  per pixel. `AutoVideoSink` could assume that because its caps admit nothing
+  else, but shared it made a 320×240 `Rgb24` frame fail the check, fall through
+  to the size guess, and report 278×207.
+
 ### Breaking
 
 - **A/V synchronization has one origin instead of two guesses** (#265).

@@ -1,6 +1,19 @@
 # A real video player: Parallax on Iced
 
-Status: **proposed**. Written 2026-08-27.
+Status: **spine done**, on `feat/iced-player`. Written 2026-08-27, revised the
+same day after building it.
+
+A1 ([#263](https://git.marcpardo.eu/marcpardo/parallax/issues/263)),
+A2 ([#264](https://git.marcpardo.eu/marcpardo/parallax/issues/264)),
+B1 ([#267](https://git.marcpardo.eu/marcpardo/parallax/issues/267)),
+B2 ([#268](https://git.marcpardo.eu/marcpardo/parallax/issues/268)),
+B4 ([#270](https://git.marcpardo.eu/marcpardo/parallax/issues/270)),
+B5 ([#271](https://git.marcpardo.eu/marcpardo/parallax/issues/271)),
+C1 ([#272](https://git.marcpardo.eu/marcpardo/parallax/issues/272)) and
+C2 ([#273](https://git.marcpardo.eu/marcpardo/parallax/issues/273)) are done:
+`parallax-play` opens a file, plays it in sync, seeks, and gets its controls
+out of the way. What the build taught that this plan did not know is in
+§ "What building it changed" at the end.
 
 Tracked by [#286](https://git.marcpardo.eu/marcpardo/parallax/issues/286) (**epic**),
 milestone *A real video player: Parallax on Iced* —
@@ -455,3 +468,58 @@ path exists at any layer), MP3/FLAC streaming decoders.
 | Cadence never gets built and 23.976/25 content judders more than `AutoVideoSink` did | `take_due` alone is no worse; the vsync-locked selector is additive. Ship a present-policy flag so a regression is measurable and revertible. |
 | A3/A4 touch the wire format and caps — a wide blast radius | Extend `tests/wire_projection.rs` round-trip cases *before* adding the fields. |
 | Scope: 23 issues is a large milestone | A+B+C are the spine; Phase D items are individually droppable. |
+
+
+## What building it changed
+
+Written after the fact, because a plan that only records what it predicted is
+not much use to the next person.
+
+**The clock reaches an element only through its consume context.** `set_clock`
+is on the adapter, not on `AsyncSink`, so `FrameMailbox::clock()` cannot exist
+until the first buffer arrives. Every host has to handle `None` by drawing on
+arrival. That is an API consequence, not a detail, and it was invisible from
+outside the trait.
+
+**The wake-up policy has to *be* the take policy.** The widget first computed
+its next redraw from the raw frame target and let `take_due` decide separately
+whether a frame was due. Those disagree exactly where `MAX_WAIT`'s PTS-jump
+escape hatch fires: a target more than a second ahead is due *now*, while
+sleeping until it stalls the picture for as long as the jump was. The widget
+calls `pipeline::schedule` for both now.
+
+**Counters a UI reads must be monotonic.** The sink originally reset
+`presented`/`dropped_late` when it rolled a QoS window, so a diagnostics panel
+watched its own numbers go down and a measurement run reported nonsense. The
+mailbox keeps cumulative counters; the sink keeps its own window baselines.
+
+**A packed frame is not four bytes per pixel.** The geometry read inherited
+that assumption from `AutoVideoSink`, whose caps admit nothing else. Shared, it
+turned a 320×240 `Rgb24` frame into 278×207 — no error, just a wrong picture.
+
+**Seeking from a GUI needed a synchronous dispatch.** `PipelineHandle::seek` is
+`async` and never awaits; an Iced `update` is synchronous and cannot move the
+handle into a task. Rather than rely on that, `dispatch_seek` says it.
+
+**And a harness trap worth more than the code that found it.** weston stops
+repainting when it goes idle, and a Wayland client that never receives a frame
+callback never draws. That is indistinguishable from a stalled pipeline, and it
+cost an hour of hunting a bug that was not there. `just play-headless` and the
+matrix runner both start a fresh compositor for exactly this reason.
+
+### What the dev box could and could not prove
+
+`just play-headless` runs the real player with no display attached: 20 frames
+presented from the 2 s H.264/AAC fixture with nothing dropped, and 83 across
+four laps under `--repeat`, running time tracking the frame targets to within
+100 ms. The offscreen render tests in `parallax-iced` check the pixels
+themselves — limited-range black and white on the rails, mid-grey linearised by
+exactly what `video::color` says, letterbox bars painted rather than left
+behind.
+
+What it **cannot** show is a cores number. There is no GPU here (`/dev/dri` is
+empty, no `vainfo`), so the renderer is Mesa's software rasteriser and it
+dominates any CPU measurement. `scripts/decode_matrix.py --headless` records
+frame accounting, arena bytes and position honestly and says so in its own
+help; the 0.54 / 0.24 / 0.12-core ladder from #190 and #62 is still owed by a
+machine with hardware.
