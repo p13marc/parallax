@@ -62,6 +62,18 @@ Every out-of-tree plugin must be rebuilt: the plugin ABI went **12 → 13**.
   `parallax_iced::DEFAULT_MAX_LATENESS` rather than inventing a second pacing
   policy.
 
+- **The diagnostics panel says what the pipeline is doing** (#275). Which
+  decoder actually won (`--hwdec auto` leaves that open, and the answer used
+  to be logged once and forgotten), which adapter and backend Iced is drawing
+  on, the elected clock, buffering and download progress, the newest QoS
+  advisory, worst observed lateness, and a `d` key that writes the running
+  graph out as GraphViz. Bus warnings and errors are **toasts** now rather
+  than one sticky banner: a warning fades after eight seconds, an error waits
+  to be dismissed, because a message that vanishes before it is read is the
+  same as no message. `MessageKind::DurationChanged` finally reaches the seek
+  bar — a file whose length only becomes known after the probe used to keep
+  the "live / unknown length" label for the whole run.
+
 - **A `feature-union` CI job** (#277). The retired player's Cargo.toml was the
   only build of `mp4-demux,mkv-demux,vpx,av1-decode,opus,h264,display,
   display-gpu,simd-colorspace,audio-aac,audio-vorbis,eac3,alsa,vaapi` in one

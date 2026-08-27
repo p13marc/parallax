@@ -12,6 +12,7 @@ mod engine;
 mod headless;
 mod ui;
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -51,6 +52,62 @@ const CONTROLS_LINGER: Duration = Duration::from_secs(3);
 /// No reverse: an `INSTANT_RATE_CHANGE` cannot flip the sign — that needs a
 /// real seek, and no demuxer in the tree plays backwards.
 const SPEEDS: [f64; 5] = [1.0, 1.25, 1.5, 2.0, 0.5];
+
+/// How long a passing notice stays on screen.
+///
+/// Long enough to read a sentence, short enough that a stream posting one a
+/// second does not bury the picture.
+const NOTICE_LINGER: Duration = Duration::from_secs(8);
+
+/// How many notices are kept at once. The oldest goes first.
+const NOTICE_LIMIT: usize = 4;
+
+/// How bad the news is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Level {
+    /// Something happened worth saying once.
+    Info,
+    /// Something is wrong but playback continues.
+    Warning,
+    /// The run is over.
+    Error,
+}
+
+/// One thing the pipeline said, with the time it said it.
+#[derive(Debug, Clone)]
+pub struct Notice {
+    text: String,
+    level: Level,
+    at: Instant,
+}
+
+/// Whether a notice has been on screen long enough.
+///
+/// Errors never expire: the run is over, and a message that vanishes before
+/// it is read is the same as no message. Everything else is passing news, and
+/// the picture is what the user came for.
+fn notice_expired(level: Level, age: Duration) -> bool {
+    level != Level::Error && age >= NOTICE_LINGER
+}
+
+/// What the pipeline last said about itself, for the diagnostics panel.
+///
+/// All of it arrives on the bus and all of it used to land in `_ => {}`.
+#[derive(Debug, Default)]
+struct Diagnostics {
+    /// Network buffering, 0-100.
+    buffering: Option<u32>,
+    /// Downloaded bytes and the total, when a download-mode queue says.
+    downloaded: Option<(u64, Option<u64>)>,
+    /// The last QoS advisory: required-vs-achieved rate, and worst lateness.
+    qos: Option<(f64, i64)>,
+    /// The clock the pipeline elected.
+    clock: Option<String>,
+    /// Iced's adapter and backend — the only honest answer to "which GPU is
+    /// drawing", since `wgpu::Device` cannot name its own adapter and the
+    /// custom-primitive path is handed nothing else.
+    graphics: Option<(String, String)>,
+}
 
 /// The one machine-readable summary line, printed by both hosts.
 ///
@@ -220,6 +277,12 @@ enum Message {
     ToggleFullscreen,
     /// Show or hide the diagnostics panel.
     ToggleStats,
+    /// Write the running graph out as GraphViz.
+    DumpGraph,
+    /// Dismiss the notice at this index.
+    Dismiss(usize),
+    /// What Iced's renderer is running on.
+    Graphics(Box<iced::system::Information>),
     /// Step through the playback speeds.
     CycleSpeed,
     /// Set the playback speed directly.
@@ -276,7 +339,10 @@ struct Player {
     /// When the user last did anything, for the auto-hiding controls.
     last_activity: Instant,
     status: String,
-    error: Option<String>,
+    /// What the pipeline has said lately, newest last.
+    notices: VecDeque<Notice>,
+    /// What it has said about itself.
+    diagnostics: Diagnostics,
 
     /// When to quit, for `--exit-after`.
     deadline: Option<Instant>,
@@ -298,7 +364,8 @@ impl Player {
             show_stats: false,
             last_activity: Instant::now(),
             status: "no file open".into(),
-            error: None,
+            notices: VecDeque::new(),
+            diagnostics: Diagnostics::default(),
             deadline: args
                 .exit_after
                 .map(|s| Instant::now() + Duration::from_secs(s)),
@@ -447,6 +514,30 @@ impl Player {
             Message::ToggleStats => {
                 self.activity();
                 self.show_stats = !self.show_stats;
+                // Ask once, the first time anyone looks. It is a round trip
+                // through the runtime, and a player that never opens the
+                // panel should never pay for it.
+                if self.show_stats && self.diagnostics.graphics.is_none() {
+                    return iced::system::information()
+                        .map(|info| Message::Graphics(Box::new(info)));
+                }
+                Task::none()
+            }
+            Message::Graphics(info) => {
+                self.diagnostics.graphics =
+                    Some((info.graphics_adapter.clone(), info.graphics_backend.clone()));
+                Task::none()
+            }
+            Message::DumpGraph => {
+                self.activity();
+                self.dump_graph();
+                Task::none()
+            }
+            Message::Dismiss(index) => {
+                self.activity();
+                if index < self.notices.len() {
+                    self.notices.remove(index);
+                }
                 Task::none()
             }
             Message::Quit => iced::exit(),
@@ -460,7 +551,6 @@ impl Player {
     /// through it. The engine is taken *now*, so `view()` immediately shows
     /// the placeholder rather than the last frame of the previous file.
     fn open(&mut self, path: PathBuf) -> Task<Message> {
-        self.error = None;
         self.status = format!("opening {}…", path.display());
         self.pending_open = Some(path);
         self.reset_transport();
@@ -505,14 +595,14 @@ impl Player {
         let probed = match Arc::try_unwrap(result) {
             Ok(inner) => inner,
             Err(_) => {
-                self.error = Some("probe result was cloned".into());
+                self.note(Level::Error, "probe result was cloned");
                 return Task::none();
             }
         };
         let probed = match probed {
             Ok(p) => p,
             Err(e) => {
-                self.error = Some(e);
+                self.note(Level::Error, e);
                 self.status = "no file open".into();
                 return Task::none();
             }
@@ -528,7 +618,7 @@ impl Player {
                 self.engine = Some(engine);
             }
             Err(e) => {
-                self.error = Some(format!("{e:#}"));
+                self.note(Level::Error, format!("{e:#}"));
                 self.status = "no file open".into();
             }
         }
@@ -546,6 +636,27 @@ impl Player {
         println!("{}", stats_line(self.position, dropped, &stats));
     }
 
+    /// Write the running graph out as GraphViz, and say where it went.
+    ///
+    /// `PARALLAX_DOT_DIR` is the engine's own convention for state-transition
+    /// dumps, so a dump asked for by hand lands in the same place.
+    fn dump_graph(&mut self) {
+        let Some(engine) = &self.engine else {
+            self.note(Level::Warning, "nothing is playing");
+            return;
+        };
+        let dir = std::env::var("PARALLAX_DOT_DIR").unwrap_or_else(|_| ".".into());
+        let path = std::path::Path::new(&dir).join(format!("parallax-{}.dot", std::process::id()));
+        let (level, text) = match std::fs::write(&path, engine.dot()) {
+            Ok(()) => (Level::Info, format!("wrote {}", path.display())),
+            Err(e) => (
+                Level::Warning,
+                format!("could not write {}: {e}", path.display()),
+            ),
+        };
+        self.note(level, text);
+    }
+
     fn reset_transport(&mut self) {
         self.position = ClockTime::ZERO;
         self.paused = false;
@@ -554,12 +665,15 @@ impl Player {
 
     /// Everything the interface re-reads on a tick.
     fn poll(&mut self) {
+        self.expire_notices();
+
         let Some(engine) = &mut self.engine else {
             return;
         };
         self.position = engine.position();
 
-        for message in engine.poll_bus() {
+        let messages = engine.poll_bus();
+        for message in &messages {
             match &message.kind {
                 MessageKind::SeekDone { seqnum, .. } => {
                     if self.seek.in_flight.map(|(s, _)| s) == Some(*seqnum) {
@@ -567,17 +681,80 @@ impl Player {
                         self.seek.sent = None;
                     }
                 }
-                MessageKind::Error { error, .. } => self.error = Some(error.clone()),
-                MessageKind::Warning { warning, .. } => tracing::warn!("{warning}"),
+                MessageKind::Error { error, .. } => {
+                    self.note(Level::Error, format!("{}: {error}", message.source));
+                }
+                MessageKind::Warning { warning, .. } => {
+                    tracing::warn!("{warning}");
+                    self.note(Level::Warning, format!("{}: {warning}", message.source));
+                }
+                MessageKind::Info { info } => self.note(Level::Info, info.clone()),
+                MessageKind::Buffering { percent, .. } => {
+                    self.diagnostics.buffering = Some(*percent);
+                }
+                MessageKind::DownloadProgress { ranges, total, .. } => {
+                    let have = ranges.iter().map(|(from, to)| to - from).sum();
+                    self.diagnostics.downloaded = Some((have, *total));
+                }
+                MessageKind::Qos {
+                    proportion,
+                    jitter_ns,
+                    ..
+                } => {
+                    // A rate advisory, not an event: the newest one is the
+                    // only one worth showing.
+                    self.diagnostics.qos = Some((*proportion, *jitter_ns));
+                }
+                MessageKind::NewClock { clock_name } => {
+                    self.diagnostics.clock = Some(clock_name.clone());
+                }
+                MessageKind::ClockLost => self.diagnostics.clock = None,
+                MessageKind::DurationChanged {
+                    duration: Some(duration),
+                } => {
+                    // A duration the container did not know at probe time.
+                    // Without this the seek bar stays a "live / unknown
+                    // length" label for a file that has since said.
+                    if let Some(engine) = &mut self.engine {
+                        engine.source.duration = *duration;
+                    }
+                }
                 _ => {}
             }
         }
 
-        if let Some(reason) = engine.mailbox.end_reason() {
+        if let Some(engine) = &self.engine
+            && let Some(reason) = engine.mailbox.end_reason()
+        {
             self.status = format!("{} · {reason:?}", engine.source.summary());
         }
 
         self.dispatch_seek();
+    }
+
+    /// Say something, keeping the last few.
+    fn note(&mut self, level: Level, text: impl Into<String>) {
+        let text = text.into();
+        let at = Instant::now();
+        // A stream that repeats itself should not fill the screen with the
+        // same sentence.
+        if self.notices.back().is_some_and(|last| last.text == text) {
+            if let Some(last) = self.notices.back_mut() {
+                last.at = at;
+            }
+            return;
+        }
+        self.notices.push_back(Notice { text, level, at });
+        while self.notices.len() > NOTICE_LIMIT {
+            self.notices.pop_front();
+        }
+    }
+
+    fn expire_notices(&mut self) {
+        let now = Instant::now();
+        self.notices.retain(|notice| {
+            !notice_expired(notice.level, now.saturating_duration_since(notice.at))
+        });
     }
 
     fn seek_relative(&mut self, secs: i64) {
@@ -633,7 +810,7 @@ impl Player {
             self.seek.in_flight = Some((seqnum, target));
             self.seek.sent = Some(now);
         } else {
-            self.error = Some("this source cannot seek".into());
+            self.note(Level::Warning, "this source cannot seek");
         }
         self.seek.pending = None;
         self.seek.due = None;
@@ -659,7 +836,7 @@ impl Player {
             self.speed = rate;
         } else {
             // A sign flip, or nothing playing yet. Reverse needs a real seek.
-            self.error = Some(format!("cannot play at {rate}x"));
+            self.note(Level::Warning, format!("cannot play at {rate}x"));
         }
     }
 
@@ -737,6 +914,7 @@ fn shortcut(key: &Key) -> Option<Message> {
             "f" => Some(Message::ToggleFullscreen),
             "m" => Some(Message::ToggleMute),
             "i" => Some(Message::ToggleStats),
+            "d" => Some(Message::DumpGraph),
             "s" => Some(Message::CycleSpeed),
             " " => Some(Message::TogglePause),
             _ => None,
@@ -840,6 +1018,23 @@ mod tests {
         // Half speed is below everything, so it steps up into the sequence.
         assert_eq!(next(0.5), 1.0);
         assert!(SPEEDS.iter().all(|s| *s > 0.0), "no reverse: see SPEEDS");
+    }
+
+    /// A warning is passing news; an error is the end of the run (#275).
+    #[test]
+    fn an_error_waits_to_be_read_and_a_warning_does_not() {
+        // Fresh: everything stays.
+        assert!(!notice_expired(Level::Info, Duration::ZERO));
+        assert!(!notice_expired(Level::Warning, Duration::from_secs(1)));
+        assert!(!notice_expired(Level::Error, Duration::ZERO));
+
+        // Past the linger, only the passing kinds go.
+        assert!(notice_expired(Level::Info, NOTICE_LINGER));
+        assert!(notice_expired(Level::Warning, NOTICE_LINGER * 2));
+        assert!(
+            !notice_expired(Level::Error, NOTICE_LINGER * 1000),
+            "an error that vanished before it was read is the same as no error"
+        );
     }
 
     /// The `stats:` line is a contract with `scripts/decode_matrix.py`, so it

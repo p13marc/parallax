@@ -35,6 +35,12 @@ iced = { version = "0.14", default-features = false, features = [
     "advanced",
     "x11",
     "wayland",
+    # `sysinfo` is what `iced::system::information()` needs. It is the only
+    # way to name the adapter that is actually drawing: `wgpu::Device` has no
+    # `adapter_info()` and the custom-primitive path is handed nothing else,
+    # so a diagnostics panel would otherwise have to probe a *second* adapter
+    # and hope it matched.
+    "sysinfo",
 ] }
 clap = { version = "4", features = ["derive"] }
 # `signal` is declared rather than inherited: the root crate enables it and
