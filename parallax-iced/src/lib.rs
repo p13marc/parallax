@@ -45,7 +45,7 @@ mod view;
 
 pub use render::{VideoPipeline, VideoPrimitive};
 pub use subscription::{FrameSignal, frames};
-pub use view::{State, VideoView};
+pub use view::{DEFAULT_MAX_LATENESS, State, VideoView};
 
 /// Frames this renderer holds beyond the mailbox, for
 /// [`AppVideoSink::with_host_retention`](parallax::elements::AppVideoSink::with_host_retention).

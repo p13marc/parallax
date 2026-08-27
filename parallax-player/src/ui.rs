@@ -5,12 +5,12 @@
 //! player redraws at the frame rate — so a playing-fullscreen tree should be
 //! one `Shader` widget and nothing else.
 
-use iced::widget::{Space, button, column, container, row, slider, text};
+use iced::widget::{Space, button, column, container, row, scrollable, slider, text};
 use iced::{Alignment, Element, Length};
 
 use parallax::clock::ClockTime;
 
-use crate::{Message, Player};
+use crate::{Level, Message, Notice, Player};
 
 /// `mm:ss`, or `--:--` when the container never said how long the file is.
 ///
@@ -31,11 +31,14 @@ pub fn timecode(t: ClockTime) -> String {
 pub fn overlay(player: &Player) -> Element<'_, Message> {
     let mut stack = column![].spacing(8);
 
-    if let Some(error) = &player.error {
-        stack = stack.push(banner(error));
+    for (index, notice) in player.notices.iter().enumerate() {
+        stack = stack.push(toast(index, notice));
     }
     if player.show_stats {
         stack = stack.push(stats(player));
+    }
+    if player.show_playlist {
+        stack = stack.push(playlist(player));
     }
 
     // Push the controls to the bottom.
@@ -52,12 +55,32 @@ pub fn overlay(player: &Player) -> Element<'_, Message> {
         .into()
 }
 
-fn banner(message: &str) -> Element<'_, Message> {
-    container(text(message.to_string()).size(14))
+/// One thing the pipeline said, with a way to make it go away.
+///
+/// A warning fades on its own; an error waits to be dismissed, because the
+/// run is over and a message nobody read is the same as no message.
+fn toast(index: usize, notice: &Notice) -> Element<'_, Message> {
+    let level = notice.level;
+    let body = row![
+        text(notice.text.clone()).size(14).width(Length::Fill),
+        button(text("×").size(14))
+            .on_press(Message::Dismiss(index))
+            .padding([0, 6]),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+
+    container(body)
         .padding(10)
         .width(Length::Fill)
-        .style(|theme: &iced::Theme| {
-            container::background(theme.palette().danger).color(iced::Color::WHITE)
+        .style(move |theme: &iced::Theme| {
+            let palette = theme.palette();
+            let background = match level {
+                Level::Error => palette.danger,
+                Level::Warning => palette.warning,
+                Level::Info => palette.primary,
+            };
+            container::background(background).color(iced::Color::WHITE)
         })
         .into()
 }
@@ -126,6 +149,11 @@ fn controls(player: &Player) -> Element<'_, Message> {
         .push(Space::new().width(Length::Fill))
         .push(speed(player))
         .push(
+            button(text("Queue").size(12))
+                .on_press(Message::TogglePlaylist)
+                .padding([4, 8]),
+        )
+        .push(
             button(text("Stats").size(12))
                 .on_press(Message::ToggleStats)
                 .padding([4, 8]),
@@ -178,7 +206,102 @@ fn speed(player: &Player) -> Element<'_, Message> {
     row.into()
 }
 
+/// What an empty window shows.
+///
+/// Not a slogan: the two things a player with nothing open can offer are a
+/// way in and the files it opened last time.
+pub fn welcome(player: &Player) -> Element<'_, Message> {
+    let mut body = column![
+        text("parallax").size(28),
+        button(text("Open… (o)").size(14))
+            .on_press(Message::OpenDialog)
+            .padding([6, 14]),
+    ]
+    .spacing(14)
+    .align_x(Alignment::Center);
+
+    if !player.recent.is_empty() {
+        let mut list = column![text("recently played").size(12)].spacing(4);
+        for path in &player.recent {
+            let label = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            list = list.push(
+                button(text(label).size(13))
+                    .on_press(Message::Enqueue(vec![path.clone()]))
+                    .padding([3, 8]),
+            );
+        }
+        body = body.push(list.align_x(Alignment::Center));
+    }
+
+    body.into()
+}
+
+/// What is queued. Toggled with `p`, or the button.
+///
+/// Scrollable and capped in height: a playlist is allowed to be long, and the
+/// video is what the window is for.
+fn playlist(player: &Player) -> Element<'_, Message> {
+    let mut rows = column![].spacing(2);
+    for (index, entry) in player.playlist.entries().iter().enumerate() {
+        let current = player.playlist.current() == Some(index);
+        let mut label = entry.label();
+        if entry.failed {
+            // Marked rather than removed: a file the user put in the list is
+            // still something they chose, and silently dropping it looks like
+            // the drop never happened.
+            label.push_str("  (could not be opened)");
+        }
+        rows = rows.push(
+            row![
+                text(if current { "▶" } else { " " }).size(12),
+                button(text(label).size(12))
+                    .on_press(Message::PlayIndex(index))
+                    .padding([3, 6])
+                    .width(Length::Fill),
+                button(text("×").size(12))
+                    .on_press(Message::Remove(index))
+                    .padding([3, 6]),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        );
+    }
+
+    let body: Element<'_, Message> = if player.playlist.is_empty() {
+        text("nothing queued — drop files on the window, or pass one on the command line")
+            .size(12)
+            .into()
+    } else {
+        scrollable(rows).height(Length::Fixed(180.0)).into()
+    };
+
+    let controls = row![
+        button(text("Previous (b)").size(11))
+            .on_press(Message::Previous)
+            .padding([3, 8]),
+        button(text("Next (n)").size(11))
+            .on_press(Message::Next)
+            .padding([3, 8]),
+        button(text(player.playlist.repeat.label()).size(11))
+            .on_press(Message::CycleRepeat)
+            .padding([3, 8]),
+    ]
+    .spacing(6);
+
+    panel(column![body, controls].spacing(8))
+        .width(Length::Fill)
+        .into()
+}
+
 /// What the pipeline is actually doing. Toggled with `i`, or the button.
+///
+/// Everything here is read from something that already existed — the mailbox
+/// counters, the bus, the pipeline handle — and most of it used to be thrown
+/// away in a `_ => {}` arm. It is unmounted when hidden, like the rest of the
+/// overlay, so a playing-fullscreen tree stays one `Shader` widget.
 fn stats(player: &Player) -> Element<'_, Message> {
     let mut lines = column![text(player.status.clone()).size(13)].spacing(2);
 
@@ -226,7 +349,62 @@ fn stats(player: &Player) -> Element<'_, Message> {
         if let Some(latency) = engine.handle().latency() {
             lines = lines.push(text(format!("declared latency: {:?}", latency.max)).size(12));
         }
+        if frames.worst_late_ns > 0 {
+            lines = lines.push(
+                text(format!(
+                    "worst lateness: {:.1} ms",
+                    frames.worst_late_ns as f64 / 1e6
+                ))
+                .size(12),
+            );
+        }
+        // Which decoder actually won, which is the question `--hwdec auto`
+        // leaves open.
+        lines = lines.push(text(format!("decode: {}", engine.decoder)).size(12));
     }
+
+    let diagnostics = &player.diagnostics;
+    // Presentation is stated rather than queried: `wgpu::Device` cannot name
+    // its own adapter, and the custom-primitive path is handed nothing else,
+    // so Iced's own answer is the only honest one — and the upload-vs-import
+    // half is a fact about this build, not about the machine (#269).
+    let path = match &diagnostics.graphics {
+        Some((adapter, backend)) => format!("present: upload · {backend} · {adapter}"),
+        None => "present: upload".into(),
+    };
+    lines = lines.push(text(path).size(12));
+
+    if let Some(clock) = &diagnostics.clock {
+        lines = lines.push(text(format!("clock: {clock}")).size(12));
+    }
+    if let Some(percent) = diagnostics.buffering {
+        lines = lines.push(text(format!("buffering: {percent}%")).size(12));
+    }
+    if let Some((have, total)) = diagnostics.downloaded {
+        let total = match total {
+            Some(total) => format!(" of {:.1} MB", total as f64 / 1e6),
+            None => String::new(),
+        };
+        lines =
+            lines.push(text(format!("downloaded: {:.1} MB{total}", have as f64 / 1e6)).size(12));
+    }
+    if let Some((proportion, jitter_ns)) = diagnostics.qos {
+        // 1.0 is keeping up; 2.0 means only half the frames were presentable
+        // in time. Saying so beats printing a bare number.
+        lines = lines.push(
+            text(format!(
+                "qos: {proportion:.2}× required ({:.1} ms late)",
+                jitter_ns as f64 / 1e6
+            ))
+            .size(12),
+        );
+    }
+
+    lines = lines.push(
+        button(text("Write graph (d)").size(11))
+            .on_press(Message::DumpGraph)
+            .padding([3, 8]),
+    );
 
     panel(lines).into()
 }

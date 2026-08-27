@@ -11,7 +11,7 @@ B4 ([#270](https://git.marcpardo.eu/marcpardo/parallax/issues/270)),
 B5 ([#271](https://git.marcpardo.eu/marcpardo/parallax/issues/271)),
 C1 ([#272](https://git.marcpardo.eu/marcpardo/parallax/issues/272)) and
 C2 ([#273](https://git.marcpardo.eu/marcpardo/parallax/issues/273)) are done:
-`parallax-play` opens a file, plays it in sync, seeks, and gets its controls
+`parallax-player` opens a file, plays it in sync, seeks, and gets its controls
 out of the way. What the build taught that this plan did not know is in
 § "What building it changed" at the end.
 
@@ -338,21 +338,42 @@ flight, correlate by `SeekDone` seqnum, supersede after 1 s — because `positio
 not move until the seek's `Segment` lands. Keep the chrome cheap and *unmounted* when
 hidden, so a playing-fullscreen tree is one `Shader` widget.
 
-**C3 ([#274](https://git.marcpardo.eu/marcpardo/parallax/issues/274)). Input and window UX (M).** The existing key map, plus mouse: click to pause,
-double-click fullscreen, wheel volume, cursor auto-hide in fullscreen, drag-and-drop to
-open, recent files.
+**C3 ([#274](https://git.marcpardo.eu/marcpardo/parallax/issues/274)). Input and window UX (M). DONE.** All of it, plus `Esc` that leaves
+fullscreen rather than toggling into it. Two notes for the next person: the
+pointer hides under the *same* rule as the chrome (`MouseArea::interaction` only
+overrides an interaction the content reported as `None`, which `shader` does), and
+drag-and-drop is the garnish rather than the mechanism — Iced's `FileDropped` says
+"Wayland: Not implemented" in its own docs. The dialog is `ashpd`'s portal, because
+parallax already depends on ashpd for screencast and `rfd` would bring a second major
+of it; `just check-iced` asserts exactly one, the way it does for wgpu.
 
-**C4 ([#275](https://git.marcpardo.eu/marcpardo/parallax/issues/275)). Diagnostics (M).** Which decoder is live (software vs VA-API), which presentation
-path, dropped frames via the existing `DropTracer` plus `FrameStats`, declared latency,
-buffering (`MessageKind::Buffering`/`DownloadProgress`), bus warnings and errors as
-toasts, and a `to_dot()` dump.
+**C4 ([#275](https://git.marcpardo.eu/marcpardo/parallax/issues/275)). Diagnostics (M). DONE.** Three of these were facts the player already had
+and threw away — the decoder choice was logged and forgotten, `to_dot()` was called on a
+local that went out of scope, and `DurationChanged` never reached the seek bar. Which
+adapter is drawing has exactly one honest source: `wgpu::Device` has no `adapter_info()`
+in wgpu 27 and the custom-primitive path is handed nothing else, so
+`iced::system::information()` it is.
 
-**C5 ([#276](https://git.marcpardo.eu/marcpardo/parallax/issues/276)). Playlist and open-next (M).** Depends on C1 ([#272](https://git.marcpardo.eu/marcpardo/parallax/issues/272)).
+**C5 ([#276](https://git.marcpardo.eu/marcpardo/parallax/issues/276)). Playlist and open-next (M). DONE.** Advance on the bus's `MessageKind::Eos`,
+which is the only end-of-stream signal that is an edge, arrives after every task
+finished, and dies with the engine it belongs to — `mailbox.end_reason()` is a level
+raised while frames are still queued, and `PipelineHandle::ended()` outlives its engine
+while `stop()` reports `Eos`, so both would advance twice on a manual Next. The open
+chain became a state machine because it had a real race: `open()` took the engine before
+spawning the teardown, so a second press built a second pipeline over the first.
 
-**C6 ([#277](https://git.marcpardo.eu/marcpardo/parallax/issues/277)). Retire the crossterm player (S).** Delete the terminal path, but keep a
-`--headless` mode preserving `--exit-after` and the machine-readable
-`stats: position_ns=… dropped=…` line, because `scripts/decode_matrix.py` parses it and
-B4 depends on it.
+**C6 ([#277](https://git.marcpardo.eu/marcpardo/parallax/issues/277)). Retire the crossterm player (S). DONE.** The old crate is deleted and the
+Iced one took its name, its binary path and its measurement flags
+(`--no-sync`, `--channel-capacity`, `--frame-delay`, `--loop` as an alias), so
+`scripts/decode_matrix.py` is unchanged. `--headless` is now real rather than
+promised: the process becomes the host and drains the mailbox at the widget's
+own due times, needing no compositor, GPU or sound card — which is how CI runs
+the player end to end. Two things had to be re-homed: the 14-feature union the
+old Cargo.toml was CI's only build of (now a `feature-union` job against the
+root crate, which additionally compiles `dmabuf_import.rs`'s `hardware_tests`
+for the first time), and the name `--headless`, which
+`scripts/decode_matrix.py` used for the *opposite* meaning and which is
+`--weston` there now.
 
 ### Phase D — engine gaps the player exposes
 
@@ -416,8 +437,11 @@ path exists at any layer), MP3/FLAC streaming decoders.
 
 ## Breaking changes
 
-- `parallax-player` is rewritten; its CLI keeps `--headless`, `--exit-after` and the
-  `stats:` line, and little else.
+- `parallax-player` is rewritten; its CLI keeps `--exit-after`, the `stats:`
+  line, and the measurement flags (`--no-sync`, `--channel-capacity`,
+  `--frame-delay`, `--dav1d-threads`, `--decode-ahead`, `--hwdec`,
+  `--no-audio`, `--loop` as an alias for `--repeat`). `--no-gpu` is gone with
+  the `display-gpu` path it selected, and `--headless` is new.
 - `parallax::video` moves code out of `elements::app::present`; `present` is re-pointed
   at it. No public API is lost — `present` was `pub(crate)` — but every promoted item
   needs a doc comment, since `#![warn(missing_docs)]` is on.
@@ -506,6 +530,29 @@ repainting when it goes idle, and a Wayland client that never receives a frame
 callback never draws. That is indistinguishable from a stalled pipeline, and it
 cost an hour of hunting a bug that was not there. `just play-headless` and the
 matrix runner both start a fresh compositor for exactly this reason.
+
+**What the second run changed.** Three things worth carrying forward.
+
+*An `Engine` dropped instead of torn down is a leaked pipeline.* `PipelineHandle`
+has no `Drop`, so dropping one detaches its tasks — decoder threads, arena, an open
+sound device — and nothing ever ends them. The convention that held it together
+("`self.engine` is only assigned when it is `None`") survived exactly until a
+playlist, and the fix was to make the invariant a type rather than a habit.
+
+*The three end-of-stream signals mean three different things.*
+`FrameMailbox::end_reason()` is raised when the EOS *event* reaches the sink, with
+frames still queued and the audio device buffer still to play, and stays raised.
+`PipelineHandle::ended()` outlives the engine and reports `Eos` for a `stop()`. Only
+the bus's `MessageKind::Eos` is an edge, posted after every task finished, on a bus
+that dies with its engine. A player that picks the wrong one advances a playlist
+twice on every manual Next, or truncates the tail of every file.
+
+*A CI job that builds a crate as a dependency compiles none of its tests.*
+`cargo clippy -p parallax-player` was the tree's only build of the display-gpu ×
+vaapi × simd union — and because the root crate was a dependency there, `cfg(test)`
+was off, so `dmabuf_import.rs`'s `hardware_tests` had never been compiled at all. It
+did not compile. `--all-targets` on the root crate is the version of that job that
+means something.
 
 ### What the dev box could and could not prove
 

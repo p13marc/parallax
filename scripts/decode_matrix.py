@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Decode-performance matrix runner for the parallax players (#192, #270).
+"""Decode-performance matrix runner for parallax-player (#192, #270).
 
 Runs the player once per (config × repeat) in interleaved order — the
 A/B/A protocol from the #189/#190 rounds, which cancels thermal drift —
@@ -18,11 +18,11 @@ Config syntax: "name:[ENV=VALUE ...] [extra player flags]". The player must supp
 --exit-after and print the final "stats: position_ns=… dropped=…" line.
 Stdlib only; Linux only (reads /proc).
 
-For `parallax-play` (the Iced player) pass --headless: it needs a compositor,
-and weston's headless backend plus Mesa's software renderer is enough. It also
-reports frame accounting the old player has no notion of — presented, and drops
-split into late / stale-after-seek / host-too-slow — which is the part of this
-that means anything without a GPU. See the caveat under --headless.
+The player draws in a window, so on a machine with no display pass --weston:
+weston's headless backend plus Mesa's software renderer is enough to drive the
+real widget. The player's own `--headless` flag is a *different* thing — it
+draws nothing at all, which makes it a fine smoke test and a poor measurement,
+so this runner does not use it. See the caveat under --weston.
 """
 
 import argparse
@@ -171,9 +171,9 @@ def run_once(player, file, extra_flags, duration, warmup, quiet, env_overrides=N
     arena = memfd_bytes(pid)
 
     stdout, _ = proc.communicate(timeout=duration + 30)
-    # The two players print different amounts. `position_ns` and `dropped`
-    # come first and adjacent in both; everything after is the Iced player's
-    # frame accounting, absent from the old one.
+    # `position_ns` and `dropped` come first and adjacent; everything after is
+    # frame accounting. The defaults below survive a player that prints less —
+    # a -1 column means "not reported", not "zero".
     stats = {"position_ns": 0, "dropped": -1}
     m = re.search(r"stats: position_ns=(\d+) dropped=(\d+)", stdout or "")
     if m:
@@ -228,14 +228,14 @@ def main():
     ap.add_argument("--out", default=None, help="prefix for .csv/.md result files")
     ap.add_argument("--loud", action="store_true", help="pass player stderr through")
     ap.add_argument(
-        "--headless",
+        "--weston",
         action="store_true",
         help=(
-            "run under a fresh weston headless compositor (needed by "
-            "parallax-play). NOTE: with no GPU the renderer is software, so "
-            "the *cores* columns measure rasterisation rather than the "
-            "pipeline. Frame accounting, arena bytes and position stay "
-            "meaningful; a cores comparison needs real hardware."
+            "run under a fresh weston headless compositor, for a machine with "
+            "no display. NOTE: with no GPU the renderer is software, so the "
+            "*cores* columns measure rasterisation rather than the pipeline. "
+            "Frame accounting, arena bytes and position stay meaningful; a "
+            "cores comparison needs real hardware."
         ),
     )
     args = ap.parse_args()
@@ -257,7 +257,7 @@ def main():
                 flags.append(token)
         configs.append((name.strip(), flags, env))
 
-    compositor = Compositor() if args.headless else None
+    compositor = Compositor() if args.weston else None
     if compositor:
         print(
             f"weston headless on {compositor.socket} — software rendering, so "

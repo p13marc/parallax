@@ -1,1169 +1,1643 @@
-//! parallax-player — video player demo built on the parallax pipeline engine.
+//! A video player built on parallax and Iced.
 //!
-//! M0 (#79): video-only playback at the stream's own speed, built entirely
-//! on in-pipeline elements — `Mp4DemuxSource` (#76) routes the video track
-//! straight into the decoder, and `AutoVideoSink(sync)` paces presentation
-//! against the pipeline clock (#66). No app-side feeder thread.
+//! The engine does the hard parts — demux, decode, A/V sync, seeking — and
+//! this is the front end: a window, a video surface, and the transport.
+//!
+//! ```text
+//! demux ─┬─ video ─▶ decode ─▶ AppVideoSink ⇄ mailbox ⇄ VideoView (this)
+//!        └─ audio ─▶ decode ─▶ downmix ─▶ gain ─▶ AlsaSink (the clock)
+//! ```
 
-use anyhow::{Context, bail};
-use clap::Parser;
-use parallax::clock::ClockTime;
-use parallax::converters::PixelFormat;
-use parallax::elements::Eac3Decoder;
-use parallax::elements::codec::AudioDecoderElement;
-use parallax::elements::demux::{
-    MkvCodec, MkvDemux, MkvTrackType, Mp4Codec, Mp4Demux, Mp4DemuxSource, Mp4TrackType,
-};
-use parallax::elements::device::{AlsaFormat, AlsaSampleFormat, AlsaSink};
-use parallax::elements::transform::{AudioDownmix, VideoConvertElement};
-use parallax::elements::{
-    AacDecoder, AutoVideoSink, Dav1dDecoder, Gain, H264Decoder, OpusDecoder, VideoKey,
-    VideoWindowEvent, VorbisDecoder, VpxDecoder,
-};
-use parallax::pipeline::typefind::{MediaType, TypeFindRegistry};
-use parallax::pipeline::{EndReason, Executor, ExecutorConfig, LinkPolicy, Pipeline};
-use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+mod dialog;
+mod engine;
+mod headless;
+mod playlist;
+mod recent;
+mod ui;
+
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
-/// A video player built on the parallax pipeline engine.
-#[derive(Parser, Debug)]
-#[command(version, about)]
+use clap::Parser;
+use iced::keyboard::{self, Key, key::Named};
+use iced::widget::{center, container, stack};
+use iced::{Element, Subscription, Task, Theme};
+
+use parallax::clock::ClockTime;
+use parallax::event::SeekEvent;
+use parallax::pipeline::MessageKind;
+use parallax::video::FrameMailbox;
+
+use engine::{Engine, HwDec, Options, Probed, SourceDescription};
+use playlist::Playlist;
+
+/// Long enough to swallow a held arrow key's repeats, short enough that a
+/// single press still feels immediate.
+const SEEK_DEBOUNCE: Duration = Duration::from_millis(120);
+
+/// How long a newer target waits for the outstanding seek's `SeekDone` before
+/// going out anyway.
+///
+/// `SeekDone` normally lands within a frame, so this only fires when one is
+/// lost or a demuxer is genuinely stuck — and then a superseding seek is the
+/// right answer, not an unresponsive transport.
+const SEEK_SUPERSEDE: Duration = Duration::from_secs(1);
+
+/// How often the interface re-reads position, drops and the bus.
+const TICK: Duration = Duration::from_millis(50);
+
+/// How long the controls stay up after the last thing the user did.
+const CONTROLS_LINGER: Duration = Duration::from_secs(3);
+
+/// The speeds `s` cycles through, and the buttons the transport offers.
+///
+/// No reverse: an `INSTANT_RATE_CHANGE` cannot flip the sign — that needs a
+/// real seek, and no demuxer in the tree plays backwards.
+const SPEEDS: [f64; 5] = [1.0, 1.25, 1.5, 2.0, 0.5];
+
+/// How long a passing notice stays on screen.
+///
+/// Long enough to read a sentence, short enough that a stream posting one a
+/// second does not bury the picture.
+const NOTICE_LINGER: Duration = Duration::from_secs(8);
+
+/// How many notices are kept at once. The oldest goes first.
+const NOTICE_LIMIT: usize = 4;
+
+/// How bad the news is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Level {
+    /// Something happened worth saying once.
+    Info,
+    /// Something is wrong but playback continues.
+    Warning,
+    /// The run is over.
+    Error,
+}
+
+/// One thing the pipeline said, with the time it said it.
+#[derive(Debug, Clone)]
+pub struct Notice {
+    text: String,
+    level: Level,
+    at: Instant,
+}
+
+/// Whether a notice has been on screen long enough.
+///
+/// Errors never expire: the run is over, and a message that vanishes before
+/// it is read is the same as no message. Everything else is passing news, and
+/// the picture is what the user came for.
+fn notice_expired(level: Level, age: Duration) -> bool {
+    level != Level::Error && age >= NOTICE_LINGER
+}
+
+/// One request to put a file on screen.
+///
+/// The seqnum is what lets a probe that answers a superseded request be
+/// dropped rather than built: an Iced `Task` cannot be cancelled, so the
+/// answer always arrives and something has to decide it is stale.
+#[derive(Debug, Clone)]
+struct Request {
+    seq: u64,
+    index: usize,
+    path: PathBuf,
+}
+
+/// Where the open chain is.
+///
+/// The invariant the type exists to hold: an `Engine` exists only in
+/// `Playing`, exactly one teardown is in flight in `TearingDown`, and exactly
+/// one probe is outstanding in `Probing`.
+#[derive(Debug, Default)]
+enum Stage {
+    /// Nothing open.
+    #[default]
+    Idle,
+    /// The previous pipeline is winding down; this is what follows it.
+    TearingDown { next: Option<Request> },
+    /// A file is being read for what it contains.
+    Probing(Request),
+    /// An engine is running.
+    Playing,
+}
+
+/// What opening a file does next, given where the chain already is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Open {
+    /// Wind the running pipeline down first.
+    Teardown,
+    /// Nothing is running; read the file.
+    Probe,
+    /// A teardown is already in flight — wait for it, and let it pick this
+    /// up. Spawning a second one is how two pipelines end up alive at once.
+    Wait,
+}
+
+impl Stage {
+    /// What to do about a request arriving here.
+    fn open(&self) -> Open {
+        match self {
+            Self::Playing => Open::Teardown,
+            Self::TearingDown { .. } => Open::Wait,
+            Self::Probing(_) | Self::Idle => Open::Probe,
+        }
+    }
+
+    /// Whether a probe answering `seq` is still the one being waited for.
+    fn accepts_probe(&self, seq: u64) -> bool {
+        matches!(self, Self::Probing(request) if request.seq == seq)
+    }
+}
+
+/// How far one scroll gesture moves the volume, in dB.
+///
+/// A notch of a wheel is one step of the arrow keys, so the two agree. A
+/// touchpad reports pixels instead, and its own idea of how many make a
+/// notch, so those are scaled and clamped: an inertial flick should not swing
+/// the volume through its whole range.
+fn volume_step(delta: iced::mouse::ScrollDelta) -> f32 {
+    const PIXELS_PER_NOTCH: f32 = 50.0;
+    const STEP_DB: f32 = 2.0;
+    let notches = match delta {
+        iced::mouse::ScrollDelta::Lines { y, .. } => y,
+        iced::mouse::ScrollDelta::Pixels { y, .. } => y / PIXELS_PER_NOTCH,
+    };
+    (notches * STEP_DB).clamp(-STEP_DB * 3.0, STEP_DB * 3.0)
+}
+
+/// Whether to stop skipping past files that will not open.
+///
+/// A full lap of the list with nothing playable is the end of it; anything
+/// less keeps going, because one bad file in a directory is normal.
+fn give_up(failures: usize, entries: usize) -> bool {
+    entries > 1 && failures >= entries
+}
+
+/// A probe result exactly one reader may take.
+///
+/// An Iced `Message` must be `Clone`, and a probe result is not: it owns an
+/// open demuxer. A cloned message therefore finds the cell empty and does
+/// nothing, which is the right answer — the alternative, `Arc::try_unwrap`,
+/// turns a harmless duplicate into a failed open.
+#[derive(Debug, Clone)]
+struct ProbeCell(Arc<std::sync::Mutex<Option<Result<Probed, String>>>>);
+
+impl ProbeCell {
+    fn new(result: Result<Probed, String>) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(Some(result))))
+    }
+
+    fn take(&self) -> Option<Result<Probed, String>> {
+        self.0.lock().ok()?.take()
+    }
+}
+
+/// Read a file for what it contains, off the interface's thread.
+///
+/// An MP4 index parse on a large file is 100 ms and more.
+fn probe(request: Request) -> Task<Message> {
+    let seq = request.seq;
+    Task::perform(
+        async move {
+            tokio::task::spawn_blocking(move || {
+                engine::probe(&request.path).map_err(|e| format!("{e:#}"))
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("probe panicked: {e}")))
+        },
+        move |result| Message::Probed(seq, ProbeCell::new(result)),
+    )
+}
+
+/// What the pipeline last said about itself, for the diagnostics panel.
+///
+/// All of it arrives on the bus and all of it used to land in `_ => {}`.
+#[derive(Debug, Default)]
+struct Diagnostics {
+    /// Network buffering, 0-100.
+    buffering: Option<u32>,
+    /// Downloaded bytes and the total, when a download-mode queue says.
+    downloaded: Option<(u64, Option<u64>)>,
+    /// The last QoS advisory: required-vs-achieved rate, and worst lateness.
+    qos: Option<(f64, i64)>,
+    /// The clock the pipeline elected.
+    clock: Option<String>,
+    /// Iced's adapter and backend — the only honest answer to "which GPU is
+    /// drawing", since `wgpu::Device` cannot name its own adapter and the
+    /// custom-primitive path is handed nothing else.
+    graphics: Option<(String, String)>,
+}
+
+/// The one machine-readable summary line, printed by both hosts.
+///
+/// `position_ns` and `dropped` stay adjacent and in that order:
+/// `scripts/decode_matrix.py` parses exactly that pair, and #270 extends the
+/// same script rather than replacing it. One function rather than two format
+/// strings, because a windowed run and a headless one that disagreed about
+/// the shape of this line would make the matrix silently unreadable.
+fn stats_line(position: ClockTime, dropped: u64, stats: &parallax::video::FrameStats) -> String {
+    format!(
+        "stats: position_ns={} dropped={} presented={} queued={} late={} full={} stale={} clipped={}",
+        position.to_option().map(|p| p.nanos()).unwrap_or(0),
+        dropped,
+        stats.presented,
+        stats.queued,
+        stats.dropped_late,
+        stats.dropped_full,
+        stats.dropped_stale,
+        stats.clipped,
+    )
+}
+
+#[derive(Parser, Debug, Clone)]
+#[command(
+    name = "parallax-player",
+    about = "A video player built on parallax and Iced"
+)]
 struct Args {
-    /// The media file to play (MP4/MOV or MKV/WebM with H.264 video).
-    file: PathBuf,
+    /// MP4/MOV or MKV/WebM files to play, in order.
+    files: Vec<PathBuf>,
 
-    /// Disable the audio branch.
+    /// Play without audio.
     #[arg(long)]
     no_audio: bool,
 
-    /// Disable GPU presentation: keep the CPU convert + softbuffer blit
-    /// path even when a usable adapter exists.
-    #[arg(long)]
-    no_gpu: bool,
+    /// Loop the file, gaplessly, inside the demuxer.
+    ///
+    /// `--loop` is kept as an alias: it is what the crossterm player called
+    /// this, and scripts outlive rewrites.
+    #[arg(long = "repeat", alias = "loop")]
+    repeat: bool,
 
-    /// Loop playback when the stream ends.
-    #[arg(long = "loop")]
-    loop_playback: bool,
+    /// Whether to try the GPU video engine.
+    #[arg(long, value_enum, default_value_t = HwDec::Auto)]
+    hwdec: HwDec,
 
-    /// dav1d frame-delay bound (AV1 only): 0 = library auto. Small values
-    /// bound the picture pool (~3.5 MB each) but measurably raise decode
-    /// CPU — constrained frame-threading keeps the worker pool busier for
-    /// the same work — so the default stays auto.
-    #[arg(long, default_value_t = 0)]
-    frame_delay: u32,
-
-    /// Depth of the unlabelled tail links (decode→convert→display, audio
-    /// tail). Deeper = more read-ahead and pinned arena slots.
-    #[arg(long, default_value_t = 4)]
-    channel_capacity: usize,
-
-    /// dav1d worker threads (AV1 only). 0 = pick from the stream: 2 up to
-    /// 1440p (measured #192: at paced 1080p60, 2 threads ≈ 0.45 cores vs
-    /// ≈ 2.3 with the full pool for identical output, and 2 threads still
-    /// batch-decode 1080p60 at 3.7× realtime), dav1d auto above.
-    #[arg(long, default_value_t = 0)]
-    dav1d_threads: u32,
-
-    /// Depth of the decode→display link: how many finished frames the
-    /// decoder may run ahead of the paced sink. Deeper lets the decoder
-    /// work in bursts with a full frame pipeline instead of one frame per
-    /// display interval (#192); each extra slot pins ~3.1 MB of arena at
-    /// 1080p (accounted, not leaked — the decoder arena is budget-sized).
+    /// Finished frames the decoder may run ahead of the screen.
     #[arg(long, default_value_t = 4)]
     decode_ahead: usize,
 
-    /// Present frames as fast as they decode instead of pacing to PTS —
-    /// the batch-decode-floor configuration for perf measurement.
+    /// dav1d worker threads; 0 picks by resolution.
+    #[arg(long, default_value_t = 0)]
+    dav1d_threads: u32,
+
+    /// dav1d frame-delay bound; 0 leaves the decoder's own choice.
+    #[arg(long, default_value_t = 0)]
+    frame_delay: u32,
+
+    /// Executor link capacity for edges that do not set their own.
+    #[arg(long, default_value_t = 4)]
+    channel_capacity: usize,
+
+    /// Decode as fast as possible instead of presenting at the due time.
+    ///
+    /// The batch-decode floor: it measures what the decode path costs with
+    /// pacing out of the way, which is how #192 was measured. Playback is
+    /// meaningless in this mode.
     #[arg(long)]
     no_sync: bool,
 
-    /// Use hardware video decode when the driver offers it (#193).
+    /// Play with no window at all, printing the machine-readable summary.
     ///
-    /// `auto` tries the GPU's video engine and falls back to software with a
-    /// warning naming the reason; `off` never tries. Deliberately separate
-    /// from `--no-gpu`, which is about *presentation* — a machine can have
-    /// one without the other.
-    #[arg(long, default_value = "auto")]
-    hwdec: HwDec,
+    /// The pipeline is the same one the window drives, and this process is
+    /// the host: it drains the frame mailbox at each frame's due time exactly
+    /// as the widget does. What it cannot exercise is the shader and the
+    /// swapchain — `just play-headless` runs the real widget under weston for
+    /// that.
+    #[arg(long)]
+    headless: bool,
 
-    /// Stop playback cleanly after this many seconds (0 = play to the
-    /// end). For scripted measurement runs.
-    #[arg(long, default_value_t = 0)]
-    exit_after: u64,
+    /// Quit after this many seconds, printing a machine-readable summary.
+    ///
+    /// The window still opens and the pipeline still runs — this only bounds
+    /// the run, so a headless box can prove playback works and measure it.
+    #[arg(long)]
+    exit_after: Option<u64>,
 }
 
-/// Why one playback pass ended.
-enum Outcome {
-    /// Stream ran out (loopable).
-    Eos,
-    /// The user quit (window closed or Ctrl-C) or playback failed.
-    Stop,
+impl Args {
+    fn options(&self) -> Options {
+        Options {
+            hwdec: self.hwdec,
+            audio: !self.no_audio,
+            gapless_loop: self.repeat,
+            decode_ahead: self.decode_ahead,
+            dav1d_threads: self.dav1d_threads,
+            frame_delay: self.frame_delay,
+            channel_capacity: self.channel_capacity.max(1),
+            sync: !self.no_sync,
+        }
+    }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // Logs go to stderr so that stdout carries the `stats:` line and nothing
+    // else: `scripts/decode_matrix.py` parses that stream, and
+    // `tracing_subscriber::fmt()` writes to stdout by default.
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
     let args = Args::parse();
 
-    // Looping happens inside the source (Mp4DemuxSource::with_loop): winit
-    // allows one event loop per process ever, so the pipeline cannot be
-    // rebuilt to reopen the window.
-    let _ = play(&args).await?;
+    if args.headless {
+        let code = headless::run(args)?;
+        if code != 0 {
+            std::process::exit(code);
+        }
+        return Ok(());
+    }
+
+    // `view` goes through a closure: as a bare method reference its elided
+    // lifetime does not satisfy Iced's higher-ranked `ViewFn` bound.
+    iced::application(
+        move || Player::boot(args.clone()),
+        Player::update,
+        Player::view,
+    )
+    .subscription(Player::subscription)
+    .title(Player::title)
+    // The argument type is annotated because Iced's `ThemeFn` is
+    // higher-ranked over the state's lifetime and cannot infer it from `_`.
+    .theme(|_: &Player| Theme::Dark)
+    .window_size((1280.0, 720.0))
+    .run()?;
     Ok(())
 }
 
-/// The hardware decoder for `codec`, if this machine offers one.
-///
-/// Every failure is a reason to use software, not a reason to stop: no DRM
-/// node, no driver, or — commonly — a driver built without the codec the
-/// backend needs to initialise. The reason is logged so a machine that
-/// *should* have hardware decode says why it does not.
-fn hw_decoder(
-    mode: HwDec,
-    codec: parallax::gpu::Codec,
-    label: &str,
-) -> Option<parallax::elements::VaapiDecoder> {
-    if mode == HwDec::Off {
-        return None;
-    }
-    match parallax::elements::VaapiDecoder::open(codec) {
-        Ok(dec) => {
-            tracing::info!("{label}: decoding on the GPU video engine");
-            Some(dec)
-        }
-        Err(e) => {
-            tracing::warn!("{label}: software decode ({e})");
-            None
-        }
-    }
-}
-
-/// Whether to attempt hardware decode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-enum HwDec {
-    /// Try hardware, fall back to software.
-    Auto,
-    /// Software only.
-    Off,
-}
-
-/// Video codec of the selected track, container-agnostic.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum VideoCodecKind {
-    H264,
-    H265,
-    Vp8,
-    Vp9,
-    Av1,
-    Other(String),
-}
-
-impl std::fmt::Display for VideoCodecKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            VideoCodecKind::H264 => write!(f, "H.264"),
-            VideoCodecKind::H265 => write!(f, "H.265"),
-            VideoCodecKind::Vp8 => write!(f, "VP8"),
-            VideoCodecKind::Vp9 => write!(f, "VP9"),
-            VideoCodecKind::Av1 => write!(f, "AV1"),
-            VideoCodecKind::Other(s) => write!(f, "{s}"),
-        }
-    }
-}
-
-/// Audio codec of the selected track, container-agnostic.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum AudioCodecKind {
-    Aac,
-    Opus,
-    Vorbis,
-    Eac3,
-    Other(String),
-}
-
-impl std::fmt::Display for AudioCodecKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            AudioCodecKind::Aac => write!(f, "AAC"),
-            AudioCodecKind::Opus => write!(f, "Opus"),
-            AudioCodecKind::Vorbis => write!(f, "Vorbis"),
-            AudioCodecKind::Eac3 => write!(f, "E-AC-3"),
-            AudioCodecKind::Other(s) => write!(f, "{s}"),
-        }
-    }
-}
-
-impl From<Mp4Codec> for VideoCodecKind {
-    fn from(c: Mp4Codec) -> Self {
-        match c {
-            Mp4Codec::H264 => VideoCodecKind::H264,
-            Mp4Codec::H265 => VideoCodecKind::H265,
-            Mp4Codec::Vp9 => VideoCodecKind::Vp9,
-            Mp4Codec::Av1 => VideoCodecKind::Av1,
-            other => VideoCodecKind::Other(other.to_string()),
-        }
-    }
-}
-
-impl From<&MkvCodec> for VideoCodecKind {
-    fn from(c: &MkvCodec) -> Self {
-        match c {
-            MkvCodec::H264 => VideoCodecKind::H264,
-            MkvCodec::H265 => VideoCodecKind::H265,
-            MkvCodec::Vp8 => VideoCodecKind::Vp8,
-            MkvCodec::Vp9 => VideoCodecKind::Vp9,
-            MkvCodec::Av1 => VideoCodecKind::Av1,
-            other => VideoCodecKind::Other(other.to_string()),
-        }
-    }
-}
-
-impl From<&MkvCodec> for AudioCodecKind {
-    fn from(c: &MkvCodec) -> Self {
-        match c {
-            MkvCodec::Aac => AudioCodecKind::Aac,
-            MkvCodec::Opus => AudioCodecKind::Opus,
-            MkvCodec::Vorbis => AudioCodecKind::Vorbis,
-            MkvCodec::Eac3 => AudioCodecKind::Eac3,
-            other => AudioCodecKind::Other(other.to_string()),
-        }
-    }
-}
-
-/// The selected video track, container-agnostic.
-struct VideoStream {
-    codec: VideoCodecKind,
-    width: u32,
-    height: u32,
-}
-
-/// The selected audio track, container-agnostic.
-///
-/// `extradata` is the codec's out-of-band configuration: the
-/// AudioSpecificConfig for AAC (esds-synthesized for MP4, raw CodecPrivate
-/// for MKV) — later codecs put their own headers here.
-struct AudioStream {
-    codec: AudioCodecKind,
-    sample_rate: u32,
-    channels: u32,
-    extradata: Option<Vec<u8>>,
-}
-
-/// Container-agnostic description of what the file holds.
-struct StreamSummary {
-    video: Option<VideoStream>,
-    audio: Option<AudioStream>,
-}
-
-/// The opened demuxer, by container.
-// Both boxed: each demuxer carries its own index and parser state — around a
-// kilobyte — so bare variants would make every `ProbedSource` the size of the
-// larger one, for a value that exists once per run.
-enum ProbedSource {
-    Mp4(Box<Mp4Demux<BufReader<File>>>),
-    Mkv(Box<MkvDemux<BufReader<File>>>),
-}
-
-/// Everything `play` needs from the container probe.
-struct Probed {
-    source: ProbedSource,
-    summary: StreamSummary,
-}
-
-/// Probe an opened MP4: print the track table and summarize the selection.
-fn probe_mp4(args: &Args, demux: &Mp4Demux<BufReader<File>>) -> StreamSummary {
-    println!(
-        "{} — {:.1}s, {} track(s)",
-        args.file.display(),
-        demux.duration_ns() as f64 / 1e9,
-        demux.tracks().len()
-    );
-    for track in demux.tracks() {
-        match track.track_type {
-            Mp4TrackType::Video => {
-                let info = track.video_info.as_ref();
-                println!(
-                    "  #{} video: {} {}x{} @ {:.2} fps, {} samples",
-                    track.id,
-                    track.codec,
-                    info.map(|i| i.width).unwrap_or(0),
-                    info.map(|i| i.height).unwrap_or(0),
-                    info.and_then(|i| i.frame_rate).unwrap_or(0.0),
-                    track.sample_count,
-                );
-            }
-            Mp4TrackType::Audio => {
-                let info = track.audio_info.as_ref();
-                println!(
-                    "  #{} audio: {} {} Hz, {} ch, {} samples",
-                    track.id,
-                    track.codec,
-                    info.map(|i| i.sample_rate).unwrap_or(0),
-                    info.map(|i| i.channels).unwrap_or(0),
-                    track.sample_count,
-                );
-            }
-            other => println!("  #{} {:?}: {}", track.id, other, track.codec),
-        }
-    }
-
-    let video = demux
-        .video_track_id()
-        .and_then(|id| demux.track(id))
-        .map(|t| {
-            let info = t.video_info.as_ref();
-            VideoStream {
-                codec: t.codec.into(),
-                width: info.map(|i| i.width).unwrap_or(0),
-                height: info.map(|i| i.height).unwrap_or(0),
-            }
-        });
-    let audio = demux
-        .audio_track_id()
-        .and_then(|id| demux.track(id))
-        .and_then(|t| {
-            let info = t.audio_info.as_ref()?;
-            Some(AudioStream {
-                codec: match t.codec {
-                    Mp4Codec::Aac => AudioCodecKind::Aac,
-                    Mp4Codec::Opus => AudioCodecKind::Opus,
-                    other => AudioCodecKind::Other(other.to_string()),
-                },
-                sample_rate: info.sample_rate,
-                channels: info.channels as u32,
-                extradata: info.audio_specific_config.clone(),
-            })
-        });
-    StreamSummary { video, audio }
-}
-
-/// Probe an opened MKV/WebM: print the track table and summarize.
-fn probe_mkv(args: &Args, demux: &MkvDemux<BufReader<File>>) -> StreamSummary {
-    let duration_ns = demux.duration_ns().unwrap_or(0);
-    println!(
-        "{} — {:.1}s, {} track(s)",
-        args.file.display(),
-        duration_ns as f64 / 1e9,
-        demux.tracks().len()
-    );
-    let mut subtitles = 0usize;
-    for track in demux.tracks() {
-        match track.track_type {
-            MkvTrackType::Video => {
-                let info = track.video_info.as_ref();
-                println!(
-                    "  #{} video: {} {}x{} @ {:.2} fps",
-                    track.id,
-                    track.codec,
-                    info.map(|i| i.width).unwrap_or(0),
-                    info.map(|i| i.height).unwrap_or(0),
-                    info.and_then(|i| i.frame_rate).unwrap_or(0.0),
-                );
-            }
-            MkvTrackType::Audio => {
-                let info = track.audio_info.as_ref();
-                println!(
-                    "  #{} audio: {} {} Hz, {} ch",
-                    track.id,
-                    track.codec,
-                    info.map(|i| i.sample_rate).unwrap_or(0),
-                    info.map(|i| i.channels).unwrap_or(0),
-                );
-            }
-            MkvTrackType::Subtitle => subtitles += 1,
-            other => println!("  #{} {:?}: {}", track.id, other, track.codec),
-        }
-    }
-    if subtitles > 0 {
-        println!("  ({subtitles} subtitle track(s) — not rendered)");
-    }
-
-    let video = demux.video_track().map(|t| {
-        let info = t.video_info.as_ref();
-        VideoStream {
-            codec: (&t.codec).into(),
-            width: info.map(|i| i.width).unwrap_or(0),
-            height: info.map(|i| i.height).unwrap_or(0),
-        }
-    });
-    let audio = demux.audio_track().and_then(|t| {
-        let info = t.audio_info.as_ref()?;
-        Some(AudioStream {
-            codec: (&t.codec).into(),
-            sample_rate: info.sample_rate,
-            channels: info.channels as u32,
-            extradata: info.codec_private.clone(),
-        })
-    });
-    StreamSummary { video, audio }
-}
-
-/// Open the file and describe it; error out early on things we cannot play.
-fn open_and_probe(args: &Args) -> anyhow::Result<Probed> {
-    let mut file =
-        File::open(&args.file).with_context(|| format!("cannot open {}", args.file.display()))?;
-    let size = file.metadata()?.len();
-
-    // Name what the file actually is before the demuxer's parse error can:
-    // "AVI detected" beats "not a readable MP4".
-    let mut head = [0u8; 8192];
-    let n = file.read(&mut head)?;
-    let media_type = match TypeFindRegistry::with_builtins().detect(&head[..n]) {
-        Some(found) => found.media_type,
-        None => bail!(
-            "{}: not a media file this player recognizes",
-            args.file.display()
-        ),
-    };
-    file.seek(SeekFrom::Start(0))?;
-
-    let (source, summary) = match media_type {
-        MediaType::Mp4 => {
-            let demux = Mp4Demux::new(BufReader::with_capacity(1 << 20, file), size)
-                .with_context(|| format!("{} is not a readable MP4", args.file.display()))?;
-            let summary = probe_mp4(args, &demux);
-            (ProbedSource::Mp4(Box::new(demux)), summary)
-        }
-        MediaType::Matroska | MediaType::WebM => {
-            // 1 MiB: the matroska parser issues many small reads through a
-            // mutex'd SharedReader, inline on a tokio worker.
-            let demux =
-                MkvDemux::new(BufReader::with_capacity(1 << 20, file)).with_context(|| {
-                    format!("{} is not a readable Matroska/WebM", args.file.display())
-                })?;
-            let summary = probe_mkv(args, &demux);
-            (ProbedSource::Mkv(Box::new(demux)), summary)
-        }
-        other => bail!(
-            "{}: {other:?} detected — only MP4 and MKV/WebM are supported for now",
-            args.file.display()
-        ),
-    };
-
-    let Some(video) = &summary.video else {
-        bail!("no video track — nothing to play");
-    };
-    if let VideoCodecKind::Other(codec) = &video.codec {
-        bail!("video track is {codec} — no decoder for it yet");
-    }
-
-    Ok(Probed { source, summary })
-}
-
-/// The player's control commands, from window keys or the terminal.
-enum Command {
-    PauseToggle,
+#[derive(Debug, Clone)]
+enum Message {
+    /// The periodic re-read of position, drops and the bus.
+    Tick,
+    /// A frame landed on an idle mailbox.
+    Frame,
+    /// A file finished probing, answering this request.
+    Probed(u64, ProbeCell),
+    /// The previous engine finished tearing down; start whatever waits.
+    TornDown,
+    /// Add files to the playlist, playing the first if nothing is.
+    Enqueue(Vec<PathBuf>),
+    /// Play the playlist entry at this index.
+    PlayIndex(usize),
+    /// Drop the playlist entry at this index.
+    Remove(usize),
+    /// Play the next file.
+    Next,
+    /// Play the previous file.
+    Previous,
+    /// Step through off / all / one.
+    CycleRepeat,
+    /// Show or hide the playlist.
+    TogglePlaylist,
+    /// Play/pause.
+    TogglePause,
+    /// Seek by a number of seconds, relative to where the transport is headed.
     SeekBy(i64),
-    /// Volume step in dB (±2 per keypress, clamped in the handler).
+    /// Seek to a fraction of the duration — the scrubber.
+    SeekTo(f32),
+    /// Set the volume in dB — the slider.
+    VolumeTo(f32),
+    /// The pointer moved or a key was pressed: keep the controls up.
+    Activity,
+    /// Step the volume in dB.
     VolumeBy(f32),
-    MuteToggle,
-    Fullscreen,
+    /// Mute/unmute.
+    ToggleMute,
+    /// Enter or leave fullscreen.
+    ToggleFullscreen,
+    /// Leave fullscreen, or quit.
+    Escape,
+    /// Ask the desktop for files to play.
+    OpenDialog,
+    /// The desktop could not be asked, and why.
+    DialogFailed(String),
+    /// Show or hide the diagnostics panel.
+    ToggleStats,
+    /// Write the running graph out as GraphViz.
+    DumpGraph,
+    /// Dismiss the notice at this index.
+    Dismiss(usize),
+    /// What Iced's renderer is running on.
+    Graphics(Box<iced::system::Information>),
+    /// Step through the playback speeds.
+    CycleSpeed,
+    /// Set the playback speed directly.
+    SpeedTo(f64),
+    /// Quit.
     Quit,
 }
 
-fn command_for_key(key: &VideoKey) -> Option<Command> {
+/// Where a seek is, between the keypress and the `SeekDone`.
+#[derive(Debug, Default)]
+struct SeekState {
+    /// Where the transport is headed, accumulated across presses.
+    ///
+    /// Not read back from `position()`: until the seek's `Segment` lands that
+    /// still reports the *old* position, so a second press would walk from
+    /// there and undo the first.
+    pending: Option<u64>,
+    /// When the debounce expires.
+    due: Option<Instant>,
+    /// The seek that has been dispatched: `(seqnum, target)`.
+    in_flight: Option<(u64, u64)>,
+    /// When it went out, for the supersede timeout.
+    sent: Option<Instant>,
+}
+
+impl SeekState {
+    /// Where the transport is headed, if anywhere.
+    fn target(&self) -> Option<u64> {
+        self.pending.or(self.in_flight.map(|(_, t)| t))
+    }
+}
+
+struct Player {
+    options: Options,
+    engine: Option<Engine>,
+    /// Where the open chain is. `Engine` exists only in `Stage::Playing`.
+    stage: Stage,
+    /// Monotonic request number, so a stale probe can be recognised.
+    seq: u64,
+    /// What to play, and what to play next.
+    playlist: Playlist,
+    /// Consecutive files that failed to open, reset when one actually plays.
+    failures: usize,
+    /// Whether the playlist panel is on screen.
+    show_playlist: bool,
+    /// Files opened lately, newest first — the empty screen's only content.
+    recent: Vec<PathBuf>,
+
+    position: ClockTime,
+    paused: bool,
+    /// Playback speed (#280). Audio is muted away from 1x — see
+    /// [`Player::set_speed`].
+    speed: f64,
+    seek: SeekState,
+
+    /// Volume lives here rather than in the `Gain` handle: the handle knows a
+    /// linear factor, the interface thinks in dB, and a mute has to remember
+    /// the level it will restore.
+    volume_db: f32,
+    muted: bool,
+
+    fullscreen: bool,
+    show_stats: bool,
+    /// When the user last did anything, for the auto-hiding controls.
+    last_activity: Instant,
+    status: String,
+    /// What the pipeline has said lately, newest last.
+    notices: VecDeque<Notice>,
+    /// What it has said about itself.
+    diagnostics: Diagnostics,
+
+    /// When to quit, for `--exit-after`.
+    deadline: Option<Instant>,
+}
+
+impl Player {
+    fn boot(args: Args) -> (Self, Task<Message>) {
+        let player = Self {
+            options: args.options(),
+            engine: None,
+            stage: Stage::Idle,
+            seq: 0,
+            playlist: Playlist::default(),
+            failures: 0,
+            show_playlist: false,
+            recent: recent::load(),
+            position: ClockTime::ZERO,
+            paused: false,
+            speed: 1.0,
+            seek: SeekState::default(),
+            volume_db: 0.0,
+            muted: false,
+            fullscreen: false,
+            show_stats: false,
+            last_activity: Instant::now(),
+            status: "no file open".into(),
+            notices: VecDeque::new(),
+            diagnostics: Diagnostics::default(),
+            deadline: args
+                .exit_after
+                .map(|s| Instant::now() + Duration::from_secs(s)),
+        };
+        let task = if args.files.is_empty() {
+            Task::none()
+        } else {
+            Task::done(Message::Enqueue(args.files))
+        };
+        (player, task)
+    }
+
+    fn title(&self) -> String {
+        match &self.engine {
+            Some(engine) => format!("{} — parallax", engine.source.summary()),
+            None => "parallax".into(),
+        }
+    }
+
+    /// The running pipeline, for the diagnostics panel.
+    fn engine(&self) -> Option<&Engine> {
+        self.engine.as_ref()
+    }
+
+    fn has_audio(&self) -> bool {
+        self.engine.as_ref().is_some_and(|e| e.has_audio())
+    }
+
+    /// Keep the controls up for a while longer.
+    fn activity(&mut self) {
+        self.last_activity = Instant::now();
+    }
+
+    /// Whether the transport is on screen.
+    fn controls_visible(&self) -> bool {
+        controls_visible(
+            self.engine.is_some(),
+            self.paused,
+            self.last_activity.elapsed(),
+        )
+    }
+
+    fn source(&self) -> Option<&SourceDescription> {
+        self.engine.as_ref().map(|e| &e.source)
+    }
+
+    fn duration(&self) -> ClockTime {
+        self.source().map(|s| s.duration).unwrap_or(ClockTime::NONE)
+    }
+
+    fn mailbox(&self) -> Option<Arc<FrameMailbox>> {
+        self.engine.as_ref().map(|e| Arc::clone(&e.mailbox))
+    }
+
+    fn update(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::Enqueue(paths) => {
+                self.activity();
+                let first = self.playlist.extend(paths);
+                // Adding to an idle player starts it; adding to a playing one
+                // queues, which is what a drop onto a running film should do.
+                match (first, self.playlist.current()) {
+                    (Some(index), None) => self.play(index),
+                    _ => Task::none(),
+                }
+            }
+            Message::PlayIndex(index) => {
+                self.activity();
+                self.failures = 0;
+                self.play(index)
+            }
+            Message::Remove(index) => {
+                self.activity();
+                if self.playlist.remove(index) {
+                    // What was playing is gone; stop rather than jump to
+                    // whatever slid into its index.
+                    self.stop_playback()
+                } else {
+                    Task::none()
+                }
+            }
+            Message::Next => {
+                self.activity();
+                self.failures = 0;
+                match self.playlist.next() {
+                    Some(index) => self.play(index),
+                    None => Task::none(),
+                }
+            }
+            Message::Previous => {
+                self.activity();
+                self.failures = 0;
+                match self.playlist.previous() {
+                    Some(index) => self.play(index),
+                    None => Task::none(),
+                }
+            }
+            Message::CycleRepeat => {
+                self.activity();
+                self.playlist.repeat = self.playlist.repeat.next();
+                if self.options.gapless_loop {
+                    // `--repeat` loops inside the demuxer, which never emits
+                    // end-of-stream — so nothing here will ever be consulted.
+                    // Saying so beats a control that silently does nothing.
+                    self.note(
+                        Level::Warning,
+                        "--repeat loops inside the demuxer, so the playlist never advances",
+                    );
+                }
+                Task::none()
+            }
+            Message::TogglePlaylist => {
+                self.activity();
+                self.show_playlist = !self.show_playlist;
+                Task::none()
+            }
+            Message::TornDown => self.torn_down(),
+            Message::Probed(seq, result) => self.build(seq, result),
+            Message::Tick => {
+                let task = self.poll();
+                if self.deadline.is_some_and(|at| Instant::now() >= at) {
+                    self.report();
+                    return iced::exit();
+                }
+                task
+            }
+            // The subscription's only job is to wake an interface that had
+            // nothing queued; the widget reads the mailbox itself.
+            Message::Frame => Task::none(),
+            Message::TogglePause => {
+                self.activity();
+                if let Some(engine) = &self.engine {
+                    if self.paused {
+                        engine.handle().resume();
+                    } else {
+                        engine.handle().pause();
+                    }
+                    self.paused = !self.paused;
+                }
+                Task::none()
+            }
+            Message::SeekBy(secs) => {
+                self.activity();
+                self.seek_relative(secs);
+                Task::none()
+            }
+            Message::SeekTo(fraction) => {
+                self.activity();
+                if let Some(total) = self.duration().to_option() {
+                    let target = (fraction.clamp(0.0, 1.0) as f64 * total.nanos() as f64) as u64;
+                    self.aim(target);
+                }
+                Task::none()
+            }
+            Message::VolumeTo(db) => {
+                self.activity();
+                self.volume_db = db.clamp(-40.0, 6.0);
+                self.muted = false;
+                self.apply_volume();
+                Task::none()
+            }
+            Message::Activity => {
+                self.activity();
+                Task::none()
+            }
+            Message::VolumeBy(delta) => {
+                self.activity();
+                self.volume_db = (self.volume_db + delta).clamp(-40.0, 6.0);
+                // Reaching for the volume always unmutes: the user wants to
+                // hear it.
+                self.muted = false;
+                self.apply_volume();
+                Task::none()
+            }
+            Message::ToggleMute => {
+                self.activity();
+                self.muted = !self.muted;
+                self.apply_volume();
+                Task::none()
+            }
+            Message::ToggleFullscreen => {
+                self.activity();
+                self.fullscreen = !self.fullscreen;
+                let mode = if self.fullscreen {
+                    iced::window::Mode::Fullscreen
+                } else {
+                    iced::window::Mode::Windowed
+                };
+                iced::window::latest().and_then(move |id| iced::window::set_mode(id, mode))
+            }
+            Message::CycleSpeed => {
+                self.activity();
+                let next = SPEEDS
+                    .iter()
+                    .copied()
+                    .find(|s| *s > self.speed + 1e-6)
+                    .unwrap_or(SPEEDS[0]);
+                self.set_speed(next);
+                Task::none()
+            }
+            Message::SpeedTo(rate) => {
+                self.activity();
+                self.set_speed(rate);
+                Task::none()
+            }
+            Message::OpenDialog => {
+                self.activity();
+                Task::perform(dialog::open_files(), |result| match result {
+                    Ok(paths) => Message::Enqueue(paths),
+                    // The portal is missing or the user cancelled; either way
+                    // there is nothing to open and something to say.
+                    Err(reason) => Message::DialogFailed(reason),
+                })
+            }
+            Message::DialogFailed(reason) => {
+                self.note(Level::Warning, reason);
+                Task::none()
+            }
+            Message::Escape => {
+                self.activity();
+                if self.fullscreen {
+                    return self.update(Message::ToggleFullscreen);
+                }
+                iced::exit()
+            }
+            Message::ToggleStats => {
+                self.activity();
+                self.show_stats = !self.show_stats;
+                // Ask once, the first time anyone looks. It is a round trip
+                // through the runtime, and a player that never opens the
+                // panel should never pay for it.
+                if self.show_stats && self.diagnostics.graphics.is_none() {
+                    return iced::system::information()
+                        .map(|info| Message::Graphics(Box::new(info)));
+                }
+                Task::none()
+            }
+            Message::Graphics(info) => {
+                self.diagnostics.graphics =
+                    Some((info.graphics_adapter.clone(), info.graphics_backend.clone()));
+                Task::none()
+            }
+            Message::DumpGraph => {
+                self.activity();
+                self.dump_graph();
+                Task::none()
+            }
+            Message::Dismiss(index) => {
+                self.activity();
+                if index < self.notices.len() {
+                    self.notices.remove(index);
+                }
+                Task::none()
+            }
+            Message::Quit => iced::exit(),
+        }
+    }
+
+    /// Play the entry at `index`.
+    ///
+    /// The whole open/teardown chain runs through here, and the two rules
+    /// that keep it honest are both about what *cannot* happen. An `Engine`
+    /// is never dropped without `teardown()` — `PipelineHandle` has no
+    /// `Drop`, so dropping one detaches the tasks and leaves a live pipeline
+    /// with an open sound device behind. And there is never more than one
+    /// teardown in flight: pressing Next three times during one collapses
+    /// into a single teardown of the running file and a single probe of the
+    /// third target, rather than three overlapping builds.
+    ///
+    /// Teardown is two steps rather than one because it is bounded-but-slow
+    /// (it waits for the tasks to wind down, up to five seconds) and the
+    /// interface must stay live through it. The engine is taken *now*, so
+    /// `view()` shows the placeholder immediately rather than the last frame
+    /// of the previous file.
+    fn play(&mut self, index: usize) -> Task<Message> {
+        let Some(path) = self.playlist.select(index) else {
+            return Task::none();
+        };
+        self.seq += 1;
+        let request = Request {
+            seq: self.seq,
+            index,
+            path,
+        };
+        self.status = format!("opening {}…", request.path.display());
+        self.reset_transport();
+
+        match self.stage.open() {
+            Open::Teardown => {
+                let engine = self
+                    .engine
+                    .take()
+                    .expect("Stage::Playing means there is an engine");
+                self.stage = Stage::TearingDown {
+                    next: Some(request),
+                };
+                Task::future(async move {
+                    engine.teardown().await;
+                    Message::TornDown
+                })
+            }
+            // A teardown is already winding the previous pipeline down.
+            // Replace its target and spawn nothing: exactly one teardown is
+            // in flight, so its `TornDown` is unambiguous when it lands.
+            Open::Wait => {
+                self.stage = Stage::TearingDown {
+                    next: Some(request),
+                };
+                Task::none()
+            }
+            // Nothing is running; the outstanding probe (if any) answers a
+            // seqnum nobody is waiting for now, and is dropped when it lands.
+            Open::Probe => {
+                debug_assert!(self.engine.is_none(), "no engine outside Stage::Playing");
+                self.stage = Stage::Probing(request.clone());
+                probe(request)
+            }
+        }
+    }
+
+    /// The previous pipeline is gone; start whatever was waiting for it.
+    fn torn_down(&mut self) -> Task<Message> {
+        let Stage::TearingDown { next } = std::mem::replace(&mut self.stage, Stage::Idle) else {
+            return Task::none();
+        };
+        match next {
+            Some(request) => {
+                self.stage = Stage::Probing(request.clone());
+                probe(request)
+            }
+            None => Task::none(),
+        }
+    }
+
+    /// Build and start the pipeline for a probed file.
+    ///
+    /// Synchronously, in `update`: `Executor::start` is sync and fast, and
+    /// Iced's `tokio` feature runs `update` inside `runtime.enter()`, so the
+    /// tasks it spawns find a runtime. Doing it here is what keeps `Engine`
+    /// and `PipelineHandle` off the `Send` hook.
+    fn build(&mut self, seq: u64, result: ProbeCell) -> Task<Message> {
+        // Only the probe the user is actually waiting for gets to build. An
+        // older one answers a request that has already been superseded, and
+        // building it would put the wrong file on screen — or, worse, over a
+        // pipeline that is already running.
+        if !self.stage.accepts_probe(seq) {
+            return Task::none();
+        }
+        let Stage::Probing(request) = &self.stage else {
+            unreachable!("accepts_probe implies Probing")
+        };
+        let request = request.clone();
+        // A cloned message finds the cell already emptied. Iced clones
+        // messages on some paths, and the alternative — `Arc::try_unwrap`,
+        // which reports a clone as the error "probe result was cloned" —
+        // turns a harmless duplicate into a failed open.
+        let Some(result) = result.take() else {
+            return Task::none();
+        };
+        self.stage = Stage::Idle;
+        debug_assert!(self.engine.is_none(), "building over a live engine");
+
+        let probed = match result {
+            Ok(p) => p,
+            Err(e) => {
+                self.note(Level::Error, format!("{}: {e}", request.path.display()));
+                self.status = "no file open".into();
+                return self.skip_failed(request.index);
+            }
+        };
+
+        match Engine::build(probed, &self.options) {
+            Ok(engine) => {
+                self.status = engine.source.summary();
+                if !engine.has_audio() {
+                    self.status.push_str(" · video only");
+                }
+                self.apply_volume_to(&engine);
+                self.engine = Some(engine);
+                self.stage = Stage::Playing;
+                recent::remember(&request.path);
+                self.recent = recent::load();
+                // The transport's state belongs to the *player*, not to the
+                // pipeline that happens to be running: a rate set before a
+                // track change was still shown afterwards while the new
+                // pipeline played at 1x, because nothing re-applied it.
+                if self.speed != 1.0 {
+                    let rate = self.speed;
+                    self.set_speed(rate);
+                }
+                Task::none()
+            }
+            Err(e) => {
+                self.note(Level::Error, format!("{e:#}"));
+                self.status = "no file open".into();
+                self.skip_failed(request.index)
+            }
+        }
+    }
+
+    /// An entry could not be opened: mark it, and move on if there is a list.
+    ///
+    /// "Could not be opened" is deliberately not the same as "did not play".
+    /// The counter that stops the skipping is reset when a file actually
+    /// presents a frame, not when it builds — otherwise a directory of files
+    /// that open and die 200 ms later would be walked forever.
+    fn skip_failed(&mut self, index: usize) -> Task<Message> {
+        self.playlist.mark_failed(index);
+        self.failures += 1;
+        if give_up(self.failures, self.playlist.len()) {
+            self.note(
+                Level::Error,
+                "nothing in the playlist could be played — stopping",
+            );
+            return Task::none();
+        }
+        if self.playlist.len() <= 1 {
+            return Task::none();
+        }
+        match self.playlist.advance() {
+            Some(next) => self.play(next),
+            None => Task::none(),
+        }
+    }
+
+    /// Play whatever comes after the file that just ended.
+    fn advance(&mut self) -> Task<Message> {
+        match self.playlist.advance() {
+            Some(next) => self.play(next),
+            None => {
+                self.status = "end of playlist".into();
+                Task::none()
+            }
+        }
+    }
+
+    /// One machine-readable line, for `scripts/decode_matrix.py` and #270.
+    fn report(&self) {
+        let stats = self
+            .engine
+            .as_ref()
+            .map(|e| e.mailbox.stats())
+            .unwrap_or_default();
+        let dropped = self.engine.as_ref().map(|e| e.dropped()).unwrap_or(0);
+        println!("{}", stats_line(self.position, dropped, &stats));
+    }
+
+    /// Write the running graph out as GraphViz, and say where it went.
+    ///
+    /// `PARALLAX_DOT_DIR` is the engine's own convention for state-transition
+    /// dumps, so a dump asked for by hand lands in the same place.
+    fn dump_graph(&mut self) {
+        let Some(engine) = &self.engine else {
+            self.note(Level::Warning, "nothing is playing");
+            return;
+        };
+        let dir = std::env::var("PARALLAX_DOT_DIR").unwrap_or_else(|_| ".".into());
+        let path = std::path::Path::new(&dir).join(format!("parallax-{}.dot", std::process::id()));
+        let (level, text) = match std::fs::write(&path, engine.dot()) {
+            Ok(()) => (Level::Info, format!("wrote {}", path.display())),
+            Err(e) => (
+                Level::Warning,
+                format!("could not write {}: {e}", path.display()),
+            ),
+        };
+        self.note(level, text);
+    }
+
+    fn reset_transport(&mut self) {
+        self.position = ClockTime::ZERO;
+        self.paused = false;
+        self.seek = SeekState::default();
+    }
+
+    /// Everything the interface re-reads on a tick.
+    ///
+    /// Returns whatever the pipeline's news asks for — today, opening the
+    /// next file when this one ends.
+    fn poll(&mut self) -> Task<Message> {
+        self.expire_notices();
+
+        let Some(engine) = &mut self.engine else {
+            return Task::none();
+        };
+        self.position = engine.position();
+        // A file that reached the screen is a file that played, whatever
+        // happens to it next: that is what stops the failure-skipping.
+        if engine.mailbox.stats().presented > 0 {
+            self.failures = 0;
+        }
+
+        let mut ended = false;
+        let messages = engine.poll_bus();
+        for message in &messages {
+            match &message.kind {
+                MessageKind::SeekDone { seqnum, .. } => {
+                    if self.seek.in_flight.map(|(s, _)| s) == Some(*seqnum) {
+                        self.seek.in_flight = None;
+                        self.seek.sent = None;
+                    }
+                }
+                MessageKind::Error { error, .. } => {
+                    self.note(Level::Error, format!("{}: {error}", message.source));
+                }
+                MessageKind::Warning { warning, .. } => {
+                    tracing::warn!("{warning}");
+                    self.note(Level::Warning, format!("{}: {warning}", message.source));
+                }
+                MessageKind::Info { info } => self.note(Level::Info, info.clone()),
+                MessageKind::Buffering { percent, .. } => {
+                    self.diagnostics.buffering = Some(*percent);
+                }
+                MessageKind::DownloadProgress { ranges, total, .. } => {
+                    let have = ranges.iter().map(|(from, to)| to - from).sum();
+                    self.diagnostics.downloaded = Some((have, *total));
+                }
+                MessageKind::Qos {
+                    proportion,
+                    jitter_ns,
+                    ..
+                } => {
+                    // A rate advisory, not an event: the newest one is the
+                    // only one worth showing.
+                    self.diagnostics.qos = Some((*proportion, *jitter_ns));
+                }
+                MessageKind::NewClock { clock_name } => {
+                    self.diagnostics.clock = Some(clock_name.clone());
+                }
+                MessageKind::ClockLost => self.diagnostics.clock = None,
+                MessageKind::DurationChanged {
+                    duration: Some(duration),
+                } => {
+                    // A duration the container did not know at probe time.
+                    // Without this the seek bar stays a "live / unknown
+                    // length" label for a file that has since said.
+                    if let Some(engine) = &mut self.engine {
+                        engine.source.duration = *duration;
+                    }
+                }
+                // The end of the stream, as an *edge*. Deliberately not
+                // `mailbox.end_reason()`, which is a level that stays set —
+                // and which the sink raises when the EOS *event* arrives,
+                // with frames still queued and the whole audio device buffer
+                // still to play. This is posted after every task finished.
+                //
+                // It is also scoped to this engine: the bus dies with it, so
+                // the `Eos` that `stop()` posts while tearing a file down
+                // cannot reach the player and advance the playlist a second
+                // time. A `PipelineHandle::ended()` future would.
+                MessageKind::Eos => ended = true,
+                _ => {}
+            }
+        }
+
+        if let Some(engine) = &self.engine
+            && let Some(reason) = engine.mailbox.end_reason()
+        {
+            self.status = format!("{} · {reason:?}", engine.source.summary());
+        }
+
+        self.dispatch_seek();
+
+        if ended && matches!(self.stage, Stage::Playing) {
+            return self.advance();
+        }
+        Task::none()
+    }
+
+    /// Stop playing, without opening anything else.
+    fn stop_playback(&mut self) -> Task<Message> {
+        self.status = "no file open".into();
+        self.reset_transport();
+        match std::mem::replace(&mut self.stage, Stage::Idle) {
+            Stage::Playing => {
+                let engine = self
+                    .engine
+                    .take()
+                    .expect("Stage::Playing means there is an engine");
+                self.stage = Stage::TearingDown { next: None };
+                Task::future(async move {
+                    engine.teardown().await;
+                    Message::TornDown
+                })
+            }
+            Stage::TearingDown { .. } => {
+                self.stage = Stage::TearingDown { next: None };
+                Task::none()
+            }
+            other => {
+                self.stage = other;
+                Task::none()
+            }
+        }
+    }
+
+    /// Say something, keeping the last few.
+    fn note(&mut self, level: Level, text: impl Into<String>) {
+        let text = text.into();
+        let at = Instant::now();
+        // A stream that repeats itself should not fill the screen with the
+        // same sentence.
+        if self.notices.back().is_some_and(|last| last.text == text) {
+            if let Some(last) = self.notices.back_mut() {
+                last.at = at;
+            }
+            return;
+        }
+        self.notices.push_back(Notice { text, level, at });
+        while self.notices.len() > NOTICE_LIMIT {
+            self.notices.pop_front();
+        }
+    }
+
+    fn expire_notices(&mut self) {
+        let now = Instant::now();
+        self.notices.retain(|notice| {
+            !notice_expired(notice.level, now.saturating_duration_since(notice.at))
+        });
+    }
+
+    fn seek_relative(&mut self, secs: i64) {
+        // From where the last press aimed, not from `position()`: until the
+        // seek's Segment lands that still reports the old position, so a
+        // second press would walk from there and undo the first.
+        let from = self.seek.target().map(|t| t as i64).unwrap_or_else(|| {
+            self.position
+                .to_option()
+                .map(|p| p.nanos() as i64)
+                .unwrap_or(0)
+        });
+        let mut target = (from + secs * 1_000_000_000).max(0);
+        // A duration of NONE means *unknown* (MKV with no Segment Duration),
+        // not an empty file — clamping against zero sends every seek to the
+        // start.
+        if let Some(total) = self.duration().to_option() {
+            target = target.min(total.nanos().saturating_sub(1) as i64);
+        }
+        self.aim(target as u64);
+    }
+
+    fn aim(&mut self, target_ns: u64) {
+        self.seek.pending = Some(target_ns);
+        self.seek.due = Some(Instant::now() + SEEK_DEBOUNCE);
+    }
+
+    /// Send the accumulated seek, once the debounce has expired and the last
+    /// one is out of the way.
+    fn dispatch_seek(&mut self) {
+        let Some(engine) = &self.engine else {
+            return;
+        };
+        let now = Instant::now();
+        if self.seek.due.is_some_and(|due| now < due) {
+            return;
+        }
+        let Some(target) = self.seek.pending else {
+            return;
+        };
+        // At most one in flight — but do not wait forever for a `SeekDone`
+        // that may have been lost. Dispatching twice is harmless: the engine
+        // takes the newest.
+        if self.seek.in_flight.is_some()
+            && self.seek.sent.is_some_and(|at| now - at < SEEK_SUPERSEDE)
+        {
+            return;
+        }
+
+        let event = SeekEvent::new_time(ClockTime::from_nanos(target));
+        let seqnum = event.seqnum();
+        if engine.handle().dispatch_seek(event) {
+            self.seek.in_flight = Some((seqnum, target));
+            self.seek.sent = Some(now);
+        } else {
+            self.note(Level::Warning, "this source cannot seek");
+        }
+        self.seek.pending = None;
+        self.seek.due = None;
+    }
+
+    /// Ask the pipeline to play at `rate` (#280).
+    ///
+    /// An `INSTANT_RATE_CHANGE` seek: no flush, no repositioning, and it
+    /// terminates at the sinks — so it works on a live pipeline that cannot
+    /// seek at all. Audio goes silent above or below 1x, because `AlsaSink`
+    /// plays at the hardware rate and there is no pitch-preserving
+    /// time-stretch in the tree; it keeps writing silence at the running-time
+    /// rate so the clock — which that sink provides — stays true and video
+    /// stays locked to it.
+    fn set_speed(&mut self, rate: f64) {
+        let Some(engine) = &self.engine else {
+            return;
+        };
+        if engine
+            .handle()
+            .dispatch_seek(SeekEvent::new_instant_rate(rate))
+        {
+            self.speed = rate;
+        } else {
+            // A sign flip, or nothing playing yet. Reverse needs a real seek.
+            self.note(Level::Warning, format!("cannot play at {rate}x"));
+        }
+    }
+
+    fn apply_volume(&self) {
+        if let Some(engine) = &self.engine {
+            self.apply_volume_to(engine);
+        }
+    }
+
+    fn apply_volume_to(&self, engine: &Engine) {
+        let factor = if self.muted {
+            0.0
+        } else {
+            10f32.powf(self.volume_db / 20.0)
+        };
+        engine.set_volume(factor);
+    }
+
+    fn view(&self) -> Element<'_, Message> {
+        let video: Element<'_, Message> = match self.mailbox() {
+            Some(mailbox) => iced::widget::shader(parallax_iced::VideoView::new(mailbox))
+                .width(iced::Fill)
+                .height(iced::Fill)
+                .into(),
+            None => center(ui::welcome(self)).into(),
+        };
+
+        let video = iced::widget::mouse_area(video)
+            .on_move(|_| Message::Activity)
+            .on_press(Message::TogglePause)
+            .on_double_click(Message::ToggleFullscreen)
+            .on_scroll(|delta| Message::VolumeBy(volume_step(delta)))
+            // The pointer goes away with the chrome, under the same rule:
+            // both are things that are not the film. `MouseArea` only
+            // overrides an interaction the content reported as `None`, which
+            // is what `shader` reports, so the video surface is the only
+            // place this applies — a button still shows a pointer.
+            .interaction(if self.controls_visible() {
+                iced::mouse::Interaction::None
+            } else {
+                iced::mouse::Interaction::Hidden
+            });
+
+        stack![
+            container(video)
+                .width(iced::Fill)
+                .height(iced::Fill)
+                .style(|_| container::background(iced::Color::BLACK)),
+            ui::overlay(self),
+        ]
+        .into()
+    }
+
+    fn subscription(&self) -> Subscription<Message> {
+        let mut subs = vec![
+            iced::time::every(TICK).map(|_| Message::Tick),
+            keyboard::listen()
+                .with(())
+                .filter_map(|(_, event)| match event {
+                    keyboard::Event::KeyPressed { key, .. } => shortcut(&key),
+                    _ => None,
+                }),
+        ];
+        // Only while there is a stream: the recipe is keyed on the mailbox's
+        // id, so a rebuild swaps it and frames from the old file cannot reach
+        // the new interface.
+        // Files dropped onto the window. Iced emits one event per file, so a
+        // multi-file drop enqueues naturally.
+        //
+        // Wayland does not deliver these at all — `window::Event::FileDropped`
+        // says so in its own documentation, and this player enables both
+        // backends. It works on X11; the file dialog and the playlist are
+        // what actually have to carry opening a file.
+        subs.push(iced::window::events().filter_map(|(_, event)| match event {
+            iced::window::Event::FileDropped(path) => Some(Message::Enqueue(vec![path])),
+            _ => None,
+        }));
+
+        if let Some(mailbox) = self.mailbox() {
+            subs.push(parallax_iced::frames(mailbox).map(|_| Message::Frame));
+        }
+        Subscription::batch(subs)
+    }
+}
+
+/// The key map. Deliberately the one the old player had, plus the diagnostics
+/// panel — muscle memory is a feature.
+fn shortcut(key: &Key) -> Option<Message> {
     match key {
-        VideoKey::Space => Some(Command::PauseToggle),
-        VideoKey::ArrowLeft => Some(Command::SeekBy(-10)),
-        VideoKey::ArrowRight => Some(Command::SeekBy(10)),
-        VideoKey::ArrowUp => Some(Command::VolumeBy(2.0)),
-        VideoKey::ArrowDown => Some(Command::VolumeBy(-2.0)),
-        VideoKey::Escape => Some(Command::Quit),
-        VideoKey::Enter => Some(Command::Fullscreen),
-        VideoKey::Character(c) => match c.as_str() {
-            "q" => Some(Command::Quit),
-            "f" => Some(Command::Fullscreen),
-            "m" => Some(Command::MuteToggle),
-            " " => Some(Command::PauseToggle),
+        Key::Named(Named::Space) => Some(Message::TogglePause),
+        Key::Named(Named::ArrowLeft) => Some(Message::SeekBy(-10)),
+        Key::Named(Named::ArrowRight) => Some(Message::SeekBy(10)),
+        Key::Named(Named::ArrowUp) => Some(Message::VolumeBy(2.0)),
+        Key::Named(Named::ArrowDown) => Some(Message::VolumeBy(-2.0)),
+        // Escape *leaves* fullscreen rather than toggling into it, which is
+        // what every other application does with it; `f` is the toggle. What
+        // it does from a window is decided in `update`, where the state is.
+        Key::Named(Named::Escape) => Some(Message::Escape),
+        Key::Character(c) => match c.as_str() {
+            "q" => Some(Message::Quit),
+            "f" => Some(Message::ToggleFullscreen),
+            "m" => Some(Message::ToggleMute),
+            "i" => Some(Message::ToggleStats),
+            "d" => Some(Message::DumpGraph),
+            "o" => Some(Message::OpenDialog),
+            "p" => Some(Message::TogglePlaylist),
+            "n" => Some(Message::Next),
+            "b" => Some(Message::Previous),
+            "r" => Some(Message::CycleRepeat),
+            "s" => Some(Message::CycleSpeed),
+            " " => Some(Message::TogglePause),
             _ => None,
         },
         _ => None,
     }
 }
 
-/// Raw-mode terminal keys, mapped onto the same commands as the window's.
+/// Whether the transport should be on screen.
 ///
-/// Raw mode swallows the terminal's own Ctrl-C handling, so it is mapped to
-/// Quit here explicitly. Only armed when stdin is a terminal.
-fn command_for_terminal() -> Option<Command> {
-    use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, poll, read};
-    while poll(std::time::Duration::ZERO).unwrap_or(false) {
-        if let Ok(Event::Key(key)) = read() {
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-                return Some(Command::Quit);
-            }
-            return match key.code {
-                KeyCode::Char(' ') => Some(Command::PauseToggle),
-                KeyCode::Left => Some(Command::SeekBy(-10)),
-                KeyCode::Right => Some(Command::SeekBy(10)),
-                KeyCode::Up => Some(Command::VolumeBy(2.0)),
-                KeyCode::Down => Some(Command::VolumeBy(-2.0)),
-                KeyCode::Char('m') => Some(Command::MuteToggle),
-                // No Esc here, deliberately: with `poll(ZERO)` crossterm can
-                // catch the lone ESC byte of a not-yet-complete arrow
-                // sequence and report Esc — quitting on an arrow key. `q`
-                // and Ctrl-C quit the terminal path; the window path keeps
-                // Escape (winit delivers whole key events, no CSI ambiguity).
-                KeyCode::Char('q') => Some(Command::Quit),
-                KeyCode::Char('f') => Some(Command::Fullscreen),
-                _ => None,
-            };
-        }
-    }
-    None
+/// Always, unless something is actually playing: there is nothing to get out
+/// of the way of otherwise, and a paused player is a player someone is about
+/// to touch.
+fn controls_visible(playing: bool, paused: bool, idle: Duration) -> bool {
+    !playing || paused || idle < CONTROLS_LINGER
 }
 
-/// Counts dropped buffers across the whole pipeline, for the status line.
-struct DropCounter(Arc<AtomicU64>);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl parallax::pipeline::tracer::Tracer for DropCounter {
-    // Drops only (#189): without this, registering the tracer puts a mutex +
-    // clock read on every buffer at every hop for two hooks it ignores.
-    fn interests(&self) -> parallax::pipeline::tracer::TracerInterests {
-        parallax::pipeline::tracer::TracerInterests::DROP
+    #[test]
+    fn the_controls_only_get_out_of_the_way_of_playback() {
+        let long = CONTROLS_LINGER + Duration::from_secs(1);
+        assert!(
+            controls_visible(false, false, long),
+            "nothing playing: nothing to hide for"
+        );
+        assert!(
+            controls_visible(true, true, long),
+            "paused: someone is about to touch it"
+        );
+        assert!(controls_visible(true, false, Duration::ZERO), "just used");
+        assert!(
+            !controls_visible(true, false, long),
+            "playing and idle: get out of the way"
+        );
     }
 
-    fn on_drop(&self, _element_name: &str, _ts: std::time::Instant) {
-        self.0.fetch_add(1, Ordering::Relaxed);
+    #[test]
+    fn an_unknown_duration_reads_as_unknown_not_as_zero() {
+        // The distinction matters beyond cosmetics: clamping a seek against a
+        // zero duration sends every one of them to the start.
+        assert_eq!(ui::timecode(ClockTime::NONE), "--:--");
+        assert_eq!(ui::timecode(ClockTime::ZERO), "00:00");
+        assert_eq!(ui::timecode(ClockTime::from_millis(125_500)), "02:05");
     }
 
-    fn name(&self) -> &str {
-        "player-drops"
-    }
-}
-
-/// `mm:ss` for the status line.
-fn mmss(ns: u64) -> String {
-    let secs = ns / 1_000_000_000;
-    format!("{:02}:{:02}", secs / 60, secs % 60)
-}
-
-/// Keep raw mode strictly scoped to the playback loop, whatever exit path.
-struct RawMode(bool);
-
-impl RawMode {
-    fn enable() -> Self {
-        use crossterm::tty::IsTty;
-        let armed = std::io::stdin().is_tty() && crossterm::terminal::enable_raw_mode().is_ok();
-        RawMode(armed)
-    }
-}
-
-impl Drop for RawMode {
-    fn drop(&mut self) {
-        if self.0 {
-            let _ = crossterm::terminal::disable_raw_mode();
-        }
-    }
-}
-
-/// The audio decoder chosen for the stream — variants per codec, so each
-/// concrete `AudioDecoderElement<D>` can be added to the pipeline.
-enum AudioDec {
-    Aac(AudioDecoderElement<AacDecoder>),
-    Opus(AudioDecoderElement<OpusDecoder>),
-    Vorbis(AudioDecoderElement<VorbisDecoder>),
-    Eac3(AudioDecoderElement<Eac3Decoder>),
-}
-
-/// Build the audio branch's fallible pieces, explaining a fallback to
-/// video-only instead of failing playback.
-///
-/// The decoder's output format decides the ALSA configuration: AAC emits
-/// interleaved f32, Opus interleaved s16 — hand ALSA exactly that so no
-/// conversion sits in between. The sink also provides the pipeline clock
-/// (priority 150), so once this branch exists the video paces off the
-/// audio hardware.
-fn audio_branch(args: &Args, audio: Option<&AudioStream>) -> Option<(AudioDec, AlsaSink)> {
-    if args.no_audio {
-        return None;
-    }
-    let Some(stream) = audio else {
-        println!("no audio track — video only");
-        return None;
-    };
-
-    let (decoder, alsa_sample_format) = match &stream.codec {
-        AudioCodecKind::Aac => {
-            let Some(asc) = &stream.extradata else {
-                println!("AAC track has no usable decoder config — video only");
-                return None;
-            };
-            match AacDecoder::from_asc(asc) {
-                Ok(d) => (
-                    AudioDec::Aac(AudioDecoderElement::new(d)),
-                    AlsaSampleFormat::F32LE,
-                ),
-                Err(e) => {
-                    println!("audio decoder unavailable ({e}) — video only");
-                    return None;
-                }
-            }
-        }
-        AudioCodecKind::Opus => {
-            // Opus always decodes at 48 kHz; the track's declared rate is
-            // the original input rate, not the decode rate.
-            match OpusDecoder::new(48_000, stream.channels) {
-                Ok(d) => (
-                    AudioDec::Opus(AudioDecoderElement::new(d)),
-                    AlsaSampleFormat::S16LE,
-                ),
-                Err(e) => {
-                    println!("audio decoder unavailable ({e}) — video only");
-                    return None;
-                }
-            }
-        }
-        AudioCodecKind::Vorbis => {
-            let Some(private) = &stream.extradata else {
-                println!("Vorbis track has no CodecPrivate headers — video only");
-                return None;
-            };
-            match VorbisDecoder::from_codec_private(private) {
-                Ok(d) => (
-                    AudioDec::Vorbis(AudioDecoderElement::new(d)),
-                    AlsaSampleFormat::F32LE,
-                ),
-                Err(e) => {
-                    println!("audio decoder unavailable ({e}) — video only");
-                    return None;
-                }
-            }
-        }
-        AudioCodecKind::Eac3 => {
-            // The decoder folds 5.1 programs down to stereo internally
-            // (spec LoRo matrix), so ALSA always gets 2 channels here.
-            match Eac3Decoder::stereo(stream.sample_rate) {
-                Ok(d) => (
-                    AudioDec::Eac3(AudioDecoderElement::new(d)),
-                    AlsaSampleFormat::S16LE,
-                ),
-                Err(e) => {
-                    println!("audio decoder unavailable ({e}) — video only");
-                    return None;
-                }
-            }
-        }
-        other => {
-            println!("audio track is {other} — decode not wired up yet, video only");
-            return None;
-        }
-    };
-
-    let (sample_rate, channels) = match decoder {
-        AudioDec::Aac(_) | AudioDec::Vorbis(_) => (stream.sample_rate, stream.channels),
-        AudioDec::Opus(_) => (48_000, stream.channels),
-        // Stereo fold-down happens inside the decoder.
-        AudioDec::Eac3(_) => (stream.sample_rate, 2),
-    };
-    // The AudioDownmix behind the decoder folds anything above stereo, so
-    // ALSA never opens with more than 2 channels.
-    let channels = channels.min(2);
-    let format = AlsaFormat {
-        sample_rate,
-        channels,
-        format: alsa_sample_format,
-        ..AlsaFormat::default()
-    };
-    match AlsaSink::new("default", format) {
-        Ok(sink) => Some((decoder, sink)),
-        Err(e) => {
-            println!("audio device unavailable ({e}) — video only");
-            None
-        }
-    }
-}
-
-/// One playback pass: build the pipeline, run it to EOS / close / Ctrl-C.
-async fn play(args: &Args) -> anyhow::Result<Outcome> {
-    let Probed { source, summary } = open_and_probe(args)?;
-    let (width, height) = summary
-        .video
-        .as_ref()
-        .map(|v| (v.width, v.height))
-        .filter(|(w, h)| *w > 0 && *h > 0)
-        .unwrap_or((0, 0));
-    let audio = audio_branch(args, summary.audio.as_ref());
-
-    // GPU presentation (#190): with a usable adapter the sink takes the
-    // decoder's I420 directly — colorspace conversion and scaling run in a
-    // fragment shader, and the whole convert stage (CPU + its BGRA arena)
-    // disappears from the pipeline.
-    let use_gpu = !args.no_gpu && parallax::elements::gpu_present_available();
-
-    // CPU fallback path: BGRA, not RGBA — same SIMD conversion cost, but
-    // BGRA bytes read as little-endian u32 are already softbuffer's
-    // presentation layout, so AutoVideoSink's blit is a copy instead of a
-    // per-pixel channel shuffle (the shuffle measured ~37% of the player's
-    // total CPU).
-    let convert = (!use_gpu).then(|| {
-        let mut convert = VideoConvertElement::new()
-            .with_input_format(PixelFormat::I420)
-            .with_output_format(PixelFormat::Bgra);
-        if width > 0 {
-            convert = convert.with_size(width, height);
-        }
-        convert
-    });
-
-    let title = args
-        .file
-        .file_name()
-        .map(|n| format!("{} — parallax", n.to_string_lossy()))
-        .unwrap_or_else(|| "parallax".into());
-    // `sync` is what makes this a *player*: frames present at their PTS on
-    // the pipeline clock instead of as fast as the decoder can go.
-    let mut sink = AutoVideoSink::new()
-        .with_title(title)
-        .with_sync(!args.no_sync)
-        .with_gpu(use_gpu);
-    let window = sink.handle();
-
-    let mut pipeline = Pipeline::new();
-    let dropped = Arc::new(AtomicU64::new(0));
-    pipeline
-        .tracer_registry()
-        .add(Box::new(DropCounter(dropped.clone())));
-    // Without an audio branch the video-only source keeps the audio pad from
-    // existing at all (no unlinked-pad drop warnings).
-    let src = match source {
-        ProbedSource::Mp4(demux) => {
-            let s = if audio.is_some() {
-                Mp4DemuxSource::new(*demux)
-            } else {
-                Mp4DemuxSource::video_only(*demux)
-            }
-            .with_loop(args.loop_playback);
-            pipeline.add_demuxer("demux", s)
-        }
-        ProbedSource::Mkv(demux) => {
-            let s = if audio.is_some() {
-                *demux
-            } else {
-                demux.video_only()
-            }
-            .with_loop(args.loop_playback);
-            pipeline.add_demuxer("demux", s)
-        }
-    };
-    // The video decoder follows the probed codec. Geometry travels in-band
-    // either way, so the convert → display tail is codec-agnostic — but note
-    // the *format* is not uniform: software decoders emit I420 and the VA-API
-    // one emits NV12. Both the converter and the GPU sink take either.
-    let video_codec = summary
-        .video
-        .as_ref()
-        .map(|v| v.codec.clone())
-        .expect("probe guarantees a video track");
-    let dec = match video_codec {
-        VideoCodecKind::H264 => match hw_decoder(args.hwdec, parallax::gpu::Codec::H264, "H.264") {
-            Some(hw) => pipeline.add_filter("decode", hw),
-            None => pipeline.add_filter("decode", H264Decoder::new()?),
-        },
-        // HEVC has neither a software decoder in this tree nor, for now, a
-        // hardware one: `cros-codecs`' `h265` feature does not compile against
-        // its published release (#200), so it is not built. The container side
-        // still reads the track, which is why this is a clean message rather
-        // than a demux failure.
-        VideoCodecKind::H265 => bail!(
-            "H.265 is not supported: parallax has no software HEVC decoder, and \
-             hardware HEVC is disabled pending an upstream cros-codecs fix (#200)"
-        ),
-        VideoCodecKind::Vp8 => match hw_decoder(args.hwdec, parallax::gpu::Codec::Vp8, "VP8") {
-            Some(hw) => pipeline.add_filter("decode", hw),
-            None => pipeline.add_filter("decode", VpxDecoder::vp8()?),
-        },
-        VideoCodecKind::Vp9 => match hw_decoder(args.hwdec, parallax::gpu::Codec::Vp9, "VP9") {
-            Some(hw) => pipeline.add_filter("decode", hw),
-            None => pipeline.add_filter("decode", VpxDecoder::vp9()?),
-        },
-        VideoCodecKind::Av1 => {
-            // Thread-count default is the #192 lever: at paced rates dav1d
-            // worker CPU scales with pool size (idle-worker task-queue
-            // churn), so size the pool to the stream instead of the
-            // machine. 2 threads hold 1080p60 with 3.7× batch headroom at
-            // ~1/5 the decode CPU of the full pool; above 1440p the full
-            // pool is needed for throughput.
-            let threads = match args.dav1d_threads {
-                0 if height > 0 && height <= 1440 => 2,
-                explicit_or_auto => explicit_or_auto,
-            };
-            pipeline.add_filter(
-                "decode",
-                Dav1dDecoder::new()?
-                    .with_threads(threads)?
-                    .with_max_frame_delay(args.frame_delay)?,
-            )
-        }
-        VideoCodecKind::Other(codec) => bail!("video track is {codec} — no decoder for it yet"),
-    };
-    let snk = pipeline.add_async_sink("display", sink);
-    // Deep branch links decouple the two consumers: the demuxer emits in DTS
-    // order, so if the video branch backpressures at its exact rate the audio
-    // branch starves, the device underruns, the audio-master clock freezes,
-    // and the paced video sink waits on that frozen clock — a crawl. The
-    // demuxer's output arena is sized from these capacities (#84/#91), so
-    // depth here is accounted memory, not a leak.
-    pipeline.link_pads_full(src, "video", dec, "sink", LinkPolicy::Block, Some(24))?;
-    // The decode→display depth is the decode-ahead window (#192): the
-    // decoder task blocks in send_output once it is this many finished
-    // frames ahead of the paced sink. Applied to every hop of the video
-    // tail so the GPU and CPU paths stay comparable.
-    let ahead = Some(args.decode_ahead.max(1));
-    match convert {
-        // CPU path: decoder → I420→BGRA convert → softbuffer blit.
-        Some(convert) => {
-            let cvt = pipeline.add_filter("convert", convert);
-            pipeline.link_pads_full(dec, "src", cvt, "sink", LinkPolicy::Block, ahead)?;
-            pipeline.link_pads_full(cvt, "src", snk, "sink", LinkPolicy::Block, ahead)?;
-        }
-        // GPU path (#190): the sink takes I420 straight from the decoder.
-        None => {
-            pipeline.link_pads_full(dec, "src", snk, "sink", LinkPolicy::Block, ahead)?;
-        }
+    #[test]
+    fn a_seek_target_leads_the_position_it_has_not_reached_yet() {
+        let mut seek = SeekState::default();
+        assert_eq!(seek.target(), None);
+        seek.in_flight = Some((7, 5_000_000_000));
+        assert_eq!(seek.target(), Some(5_000_000_000));
+        // A newer press supersedes the one in flight, so the bar leads to the
+        // newest target rather than snapping back to the old one.
+        seek.pending = Some(9_000_000_000);
+        assert_eq!(seek.target(), Some(9_000_000_000));
     }
 
-    // Volume handle, taken before start(); None on a video-only run.
-    let mut volume: Option<parallax::elements::GainControl> = None;
-    if let Some((audio_decoder, alsa_sink)) = audio {
-        let adec = match audio_decoder {
-            AudioDec::Aac(d) => pipeline.add_transform("audiodec", d),
-            AudioDec::Opus(d) => pipeline.add_transform("audiodec", d),
-            AudioDec::Vorbis(d) => pipeline.add_transform("audiodec", d),
-            AudioDec::Eac3(d) => pipeline.add_transform("audiodec", d),
+    #[test]
+    fn the_key_map_is_the_one_people_already_know() {
+        use iced::keyboard::key::Named;
+        assert!(matches!(
+            shortcut(&Key::Named(Named::Space)),
+            Some(Message::TogglePause)
+        ));
+        assert!(matches!(
+            shortcut(&Key::Named(Named::ArrowLeft)),
+            Some(Message::SeekBy(-10))
+        ));
+        assert!(matches!(
+            shortcut(&Key::Character("q".into())),
+            Some(Message::Quit)
+        ));
+        assert!(matches!(
+            shortcut(&Key::Character("s".into())),
+            Some(Message::CycleSpeed)
+        ));
+        assert!(matches!(
+            shortcut(&Key::Character("n".into())),
+            Some(Message::Next)
+        ));
+        assert!(matches!(
+            shortcut(&Key::Character("b".into())),
+            Some(Message::Previous)
+        ));
+        assert!(matches!(
+            shortcut(&Key::Character("p".into())),
+            Some(Message::TogglePlaylist)
+        ));
+        assert!(shortcut(&Key::Character("z".into())).is_none());
+    }
+
+    /// `s` walks the speeds and wraps, so one key reaches every rate (#280).
+    #[test]
+    fn the_speed_key_cycles_through_every_rate_and_wraps() {
+        // The table is deliberately not sorted: 1x first, because that is
+        // where a player starts and where a user most wants to get back to.
+        // The cycle follows the table's own order.
+        let next = |from: f64| {
+            SPEEDS
+                .iter()
+                .copied()
+                .find(|s| *s > from + 1e-6)
+                .unwrap_or(SPEEDS[0])
         };
-        // Fold any multichannel PCM to stereo; mono/stereo pass through
-        // untouched, so this is free for the common case and keeps a
-        // future multichannel decoder from mis-sizing the sink.
-        let adownmix = pipeline.add_filter("adownmix", AudioDownmix::new());
-        // Software volume — format-aware (reads each buffer's AudioRaw
-        // metadata), so it sits safely on the S16 and F32 branches alike.
-        // The control handle must be taken BEFORE start moves the element.
-        let gain = Gain::new(1.0).with_name("volume");
-        volume = Some(gain.control());
-        let avolume = pipeline.add_filter("volume", gain);
-        let aout = pipeline.add_async_sink("speaker", alsa_sink);
-        // ~2 s of audio read-ahead at ~20 ms per packet.
-        pipeline.link_pads_full(src, "audio", adec, "sink", LinkPolicy::Block, Some(96))?;
-        pipeline.link(adec, adownmix)?;
-        pipeline.link(adownmix, avolume)?;
-        pipeline.link(avolume, aout)?;
+        assert_eq!(next(1.0), 1.25);
+        assert_eq!(next(1.25), 1.5);
+        assert_eq!(next(1.5), 2.0);
+        // Past the fastest it wraps to the front rather than sticking.
+        assert_eq!(next(2.0), 1.0);
+        // Half speed is below everything, so it steps up into the sequence.
+        assert_eq!(next(0.5), 1.0);
+        assert!(SPEEDS.iter().all(|s| *s > 0.0), "no reverse: see SPEEDS");
     }
 
-    // Default-capacity (16) tail links ahead of a paced sink only add
-    // latency and pin arena slots — 4 is a 66 ms cushion at 60 fps (#189).
-    // The explicit pad links (video 24 / audio 96) keep their depths.
-    let executor = Executor::with_config(
-        ExecutorConfig::default().with_channel_capacity(args.channel_capacity),
-    );
-    let mut handle = executor
-        .start(&mut pipeline)
-        .context("failed to start the pipeline")?;
-    let mut bus = handle.take_bus();
-    let mut ended = handle.ended();
-
-    // Scripted measurement runs end cleanly (sources stop, sinks drain,
-    // final stats print) instead of being killed mid-frame.
-    if args.exit_after > 0 {
-        let stopper = handle.stopper();
-        let secs = args.exit_after;
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
-            stopper.stop();
-        });
+    /// The rule that keeps two pipelines from being alive at once (#276).
+    ///
+    /// `PipelineHandle` has no `Drop`: dropping one detaches its tasks and
+    /// leaves a live pipeline behind, sound device and all. So an engine
+    /// exists only in `Stage::Playing`, and every path out of it goes through
+    /// a teardown — of which there is never more than one.
+    #[test]
+    fn pressing_next_during_a_teardown_does_not_start_a_second_one() {
+        assert_eq!(Stage::Playing.open(), Open::Teardown);
+        // The second, third and tenth press all land here: the target is
+        // replaced, nothing is spawned.
+        assert_eq!(Stage::TearingDown { next: None }.open(), Open::Wait);
+        assert_eq!(
+            Stage::TearingDown {
+                next: Some(request(7))
+            }
+            .open(),
+            Open::Wait
+        );
+        // Nothing is running, so there is nothing to wind down first.
+        assert_eq!(Stage::Idle.open(), Open::Probe);
+        assert_eq!(Stage::Probing(request(1)).open(), Open::Probe);
     }
 
-    // Duration comes from the framework now — the demuxer reported it at
-    // start and the handle serves it (#162). NONE means unknown (streamed
-    // WebM without a Segment Duration): keep 0 so the seek clamp below
-    // stays open-ended.
-    let duration_ns = handle
-        .duration()
-        .to_option()
-        .map(|d| d.nanos())
-        .unwrap_or(0);
+    /// An Iced task cannot be cancelled, so a superseded probe still answers.
+    #[test]
+    fn only_the_probe_being_waited_for_is_built() {
+        let stage = Stage::Probing(request(4));
+        assert!(stage.accepts_probe(4));
+        assert!(!stage.accepts_probe(3), "an older request was superseded");
+        assert!(!stage.accepts_probe(5), "and there is no newer one yet");
 
-    println!("controls: Space pause · ←/→ seek 10s · ↑/↓ volume · m mute · f fullscreen · q quit");
-    let raw_mode = RawMode::enable();
-    let mut status_tick = tokio::time::interval(std::time::Duration::from_millis(250));
+        // Nothing else accepts one at all — building while a pipeline is
+        // running or winding down is the leak this prevents.
+        assert!(!Stage::Playing.accepts_probe(4));
+        assert!(!Stage::Idle.accepts_probe(4));
+        assert!(!Stage::TearingDown { next: None }.accepts_probe(4));
+    }
 
-    // Volume state lives player-side: the Gain handle only knows a linear
-    // factor, while the UI thinks in dB steps and a mute that remembers the
-    // level it will restore.
-    let mut vol_db: f32 = 0.0;
-    let mut muted = false;
+    /// A cloned message must be harmless, not an error (#276).
+    #[test]
+    fn a_probe_result_can_only_be_taken_once() {
+        let cell = ProbeCell::new(Err("no".into()));
+        let clone = cell.clone();
+        assert!(cell.take().is_some());
+        // The clone finds it emptied and does nothing, which is right: the
+        // request it answers has already been dealt with.
+        assert!(clone.take().is_none());
+        assert!(cell.take().is_none());
+    }
 
-    // Seek state, player-side. Arrow presses used to be applied straight to
-    // `handle.position()`, which still reports the *old* position until the
-    // seek's Segment lands — so holding the key walked a target that kept
-    // being recomputed from where playback had not moved from yet, and each
-    // press fired a fresh flush through the graph. Now the presses accumulate
-    // into a local target, one seek is in flight at a time, and its
-    // completion is recognised by seqnum on the bus.
-    let mut pending_target: Option<u64> = None;
-    let mut seek_due: Option<std::time::Instant> = None;
-    let mut in_flight: Option<(u64, u64)> = None; // (seqnum, target ns)
-    let mut seek_sent: Option<std::time::Instant> = None;
-    // The most recent bus message, shown for one status tick and then let
-    // go. Draining moved to the 20 ms tick (the seek's completion arrives on
-    // the bus), so unlike the old per-tick local this has to be cleared
-    // explicitly or a transient warning would stick for the rest of the run.
-    let mut notes = String::new();
-    // Long enough to swallow a held arrow key's repeats, short enough that a
-    // single press still feels immediate.
-    const SEEK_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(120);
-    // How long a newer target waits for the outstanding seek's `SeekDone`
-    // before going out anyway. `SeekDone` normally lands within a frame, so
-    // this only fires when one is lost or a demuxer is genuinely stuck — and
-    // then a superseding seek is the right answer, not an unresponsive
-    // transport. Dispatching twice is harmless: the engine takes the newest.
-    const SEEK_SUPERSEDE: std::time::Duration = std::time::Duration::from_secs(1);
+    /// One bad file in a directory is normal; a whole directory of them is
+    /// not a reason to spin forever (#276).
+    #[test]
+    fn skipping_stops_after_a_full_lap_of_failures() {
+        // A single file has nowhere to skip to.
+        assert!(!give_up(1, 1));
+        assert!(!give_up(9, 1));
+        // Part way through a list, keep going.
+        assert!(!give_up(1, 3));
+        assert!(!give_up(2, 3));
+        // A full lap with nothing playable is the end of it.
+        assert!(give_up(3, 3));
+        assert!(give_up(4, 3));
+    }
 
-    // The window opens lazily on the first displayed frame, so is_open()
-    // starts out false — only treat false as "closed" after it was seen open.
-    let mut window_seen = false;
-    let outcome = loop {
-        tokio::select! {
-            reason = &mut ended => {
-                break match reason {
-                    // A window close now ends the run as a clean Eos
-                    // (Error::Shutdown, #191) — no string matching.
-                    EndReason::Eos => Outcome::Eos,
-                    EndReason::Aborted => Outcome::Stop,
-                    EndReason::Error(e) => bail!("playback failed: {e}"),
-                };
-            }
-            _ = tokio::signal::ctrl_c() => {
-                println!("\ninterrupted");
-                handle.stop();
-                break Outcome::Stop;
-            }
-            _ = status_tick.tick() => {
-                // One line, redrawn in place ~4x/s: position / duration,
-                // pause marker, drop count, and any bus warnings/errors.
-                let position = handle.position().to_option().map(|p| p.nanos()).unwrap_or(0);
-                let state = if handle.is_paused() { " ⏸" } else { "" };
-                let drops = dropped.load(Ordering::Relaxed);
-                let drops = if drops > 0 {
-                    format!(" · {drops} dropped")
-                } else {
-                    String::new()
-                };
-                // Where the transport is *heading*, so a held arrow key shows
-                // its accumulated target immediately instead of a position
-                // that will not move until the seek lands.
-                let seeking = pending_target
-                    .or(in_flight.map(|(_, t)| t))
-                    .map(|t| format!(" → {}", mmss(t)))
-                    .unwrap_or_default();
-                let vol = if volume.is_none() {
-                    String::new()
-                } else if muted {
-                    " · muted".to_string()
-                } else if vol_db != 0.0 {
-                    format!(" · vol {vol_db:+.0} dB")
-                } else {
-                    String::new()
-                };
-                print!(
-                    "\r\x1b[K{} / {}{seeking}{state}{vol}{drops}{notes}",
-                    mmss(position),
-                    mmss(duration_ns)
-                );
-                let _ = std::io::stdout().flush();
-                notes.clear();
-            }
-            _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
-                let mut commands = Vec::new();
-                let mut quit = false;
-                while let Some(event) = window.try_event() {
-                    match event {
-                        VideoWindowEvent::KeyPressed(key) => {
-                            if let Some(cmd) = command_for_key(&key) {
-                                commands.push(cmd);
-                            }
-                        }
-                        // The deterministic close signal (#191) — don't
-                        // wait for the sink to notice on its next frame.
-                        VideoWindowEvent::CloseRequested => commands.push(Command::Quit),
-                        _ => {}
-                    }
-                }
-                if let Some(cmd) = command_for_terminal() {
-                    commands.push(cmd);
-                }
-                for cmd in commands {
-                    match cmd {
-                        Command::PauseToggle => {
-                            if handle.is_paused() {
-                                handle.resume();
-                            } else {
-                                handle.pause();
-                            }
-                        }
-                        Command::SeekBy(secs) => {
-                            // From where the last press aimed, not from
-                            // `position()`: until the seek's Segment lands
-                            // that still reports the old position, so a
-                            // second press would walk from there and undo
-                            // the first.
-                            let from = pending_target
-                                .or(in_flight.map(|(_, t)| t))
-                                .map(|t| t as i64)
-                                .unwrap_or_else(|| {
-                                    handle.position().to_option()
-                                        .map(|p| p.nanos() as i64)
-                                        .unwrap_or(0)
-                                });
-                            // duration 0 means *unknown* (MKV/WebM with no
-                            // Segment Duration), not an empty file — clamping
-                            // against it sent every seek to t=0. Leave the
-                            // upper end open and let the demuxer land it.
-                            let mut target = (from + secs * 1_000_000_000).max(0);
-                            if duration_ns > 0 {
-                                target = target.min(duration_ns.saturating_sub(1) as i64);
-                            }
-                            pending_target = Some(target as u64);
-                            seek_due = Some(std::time::Instant::now() + SEEK_DEBOUNCE);
-                        }
-                        Command::VolumeBy(delta) => {
-                            if let Some(volume) = &volume {
-                                vol_db = (vol_db + delta).clamp(-40.0, 6.0);
-                                // Changing the volume always unmutes — the
-                                // user reaching for ↑ wants to hear it.
-                                muted = false;
-                                volume.set_db(vol_db);
-                            }
-                        }
-                        Command::MuteToggle => {
-                            if let Some(volume) = &volume {
-                                muted = !muted;
-                                if muted {
-                                    volume.set_factor(0.0);
-                                } else {
-                                    volume.set_db(vol_db);
-                                }
-                            }
-                        }
-                        Command::Fullscreen => window.set_fullscreen(!window.is_fullscreen()),
-                        Command::Quit => {
-                            // Break as well as stop (#191): waiting for the
-                            // pipeline to end used to be the only exit, and
-                            // when it didn't end, no quit path worked.
-                            handle.stop();
-                            quit = true;
-                        }
-                    }
-                }
-
-                // Bus draining moved here from the 250 ms status tick: the
-                // seek's completion arrives on it, and waiting a quarter of a
-                // second to notice would make every seek feel like one.
-                if let Some(bus) = bus.as_mut() {
-                    use parallax::pipeline::bus::MessageKind;
-                    while let Some(msg) = bus.poll() {
-                        match msg.kind {
-                            MessageKind::Error { error, .. } => {
-                                notes = format!(" · ERROR: {error}");
-                            }
-                            MessageKind::Warning { warning, .. } => {
-                                notes = format!(" · warning: {warning}");
-                            }
-                            MessageKind::Buffering { percent, .. } => {
-                                notes = format!(" · buffering {percent}%");
-                            }
-                            // Correlated by seqnum, which is the point of
-                            // having one: a stale completion from a
-                            // superseded seek is ignored rather than
-                            // clearing the seek that superseded it.
-                            MessageKind::SeekDone { seqnum, .. }
-                                if in_flight.is_some_and(|(s, _)| s == seqnum) =>
-                            {
-                                in_flight = None;
-                                seek_sent = None;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-
-                // Fire the coalesced seek once the presses have settled, and
-                // only ever one at a time — overlapping flushes through the
-                // graph buy nothing and cost a decoder restart each.
-                let outstanding = seek_sent.is_some_and(|t| t.elapsed() > SEEK_SUPERSEDE);
-                if let Some(target) = pending_target
-                    && seek_due.is_some_and(|due| std::time::Instant::now() >= due)
-                    && (in_flight.is_none() || outstanding)
-                {
-                    let event = parallax::event::SeekEvent::new_time(
-                        ClockTime::from_nanos(target),
-                    );
-                    let seqnum = event.seqnum();
-                    if handle.seek(event).await {
-                        in_flight = Some((seqnum, target));
-                        seek_sent = Some(std::time::Instant::now());
-                    } else {
-                        // Nothing declared itself seekable; say so once
-                        // rather than looking like a dead keypress.
-                        notes = " · not seekable".to_string();
-                    }
-                    pending_target = None;
-                    seek_due = None;
-                }
-
-                if window.is_open() {
-                    window_seen = true;
-                } else if window_seen {
-                    handle.stop();
-                    quit = true;
-                }
-                if quit {
-                    break Outcome::Stop;
-                }
-            }
-        }
-    };
-
-    drop(raw_mode);
-    println!();
-    // Bounded teardown (#191). The cooperative stop above normally drains
-    // within a moment; if anything wedges, a second Ctrl-C hard-exits (130,
-    // like parallax-launch) and a timeout aborts — this select is also what
-    // keeps SIGINT *listened to* here: `tokio::signal::ctrl_c` installed a
-    // process-global handler on first poll, so an unlistened SIGINT during a
-    // bare `wait().await` would be captured and discarded.
-    // Machine-readable run summary (scripts/decode_matrix.py parses it),
-    // captured before `wait()` consumes the handle.
-    let final_position_ns = handle
-        .position()
-        .to_option()
-        .map(|p| p.nanos())
-        .unwrap_or(0);
-    let ended = handle.ended();
-    tokio::select! {
-        _ = ended => { let _ = handle.wait().await; }
-        _ = tokio::signal::ctrl_c() => {
-            eprintln!("interrupted during teardown — aborting");
-            handle.abort();
-            std::process::exit(130);
-        }
-        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
-            eprintln!("teardown timed out — aborting pipeline");
-            handle.abort();
+    fn request(seq: u64) -> Request {
+        Request {
+            seq,
+            index: 0,
+            path: PathBuf::from("f.mp4"),
         }
     }
-    println!(
-        "stats: position_ns={final_position_ns} dropped={}",
-        dropped.load(Ordering::Relaxed)
-    );
-    Ok(outcome)
+
+    /// A wheel notch is an arrow key, and a touchpad flick is not a lurch.
+    #[test]
+    fn the_wheel_moves_the_volume_the_way_the_arrow_keys_do() {
+        use iced::mouse::ScrollDelta;
+        assert_eq!(volume_step(ScrollDelta::Lines { x: 0.0, y: 1.0 }), 2.0);
+        assert_eq!(volume_step(ScrollDelta::Lines { x: 0.0, y: -1.0 }), -2.0);
+        // Horizontal scrolling is not a volume gesture.
+        assert_eq!(volume_step(ScrollDelta::Lines { x: 5.0, y: 0.0 }), 0.0);
+        // Pixels: 50 to a notch.
+        assert_eq!(volume_step(ScrollDelta::Pixels { x: 0.0, y: 50.0 }), 2.0);
+        assert_eq!(volume_step(ScrollDelta::Pixels { x: 0.0, y: 25.0 }), 1.0);
+        // An inertial flick is clamped rather than swinging the whole range.
+        assert_eq!(volume_step(ScrollDelta::Pixels { x: 0.0, y: 5000.0 }), 6.0);
+        assert_eq!(volume_step(ScrollDelta::Lines { x: 0.0, y: -40.0 }), -6.0);
+    }
+
+    /// Escape leaves fullscreen; it does not enter it (#274).
+    #[test]
+    fn escape_is_a_way_out_not_a_toggle() {
+        assert!(matches!(
+            shortcut(&Key::Named(Named::Escape)),
+            Some(Message::Escape)
+        ));
+        // `f` remains the toggle, in both directions.
+        assert!(matches!(
+            shortcut(&Key::Character("f".into())),
+            Some(Message::ToggleFullscreen)
+        ));
+        assert!(matches!(
+            shortcut(&Key::Character("o".into())),
+            Some(Message::OpenDialog)
+        ));
+    }
+
+    /// A warning is passing news; an error is the end of the run (#275).
+    #[test]
+    fn an_error_waits_to_be_read_and_a_warning_does_not() {
+        // Fresh: everything stays.
+        assert!(!notice_expired(Level::Info, Duration::ZERO));
+        assert!(!notice_expired(Level::Warning, Duration::from_secs(1)));
+        assert!(!notice_expired(Level::Error, Duration::ZERO));
+
+        // Past the linger, only the passing kinds go.
+        assert!(notice_expired(Level::Info, NOTICE_LINGER));
+        assert!(notice_expired(Level::Warning, NOTICE_LINGER * 2));
+        assert!(
+            !notice_expired(Level::Error, NOTICE_LINGER * 1000),
+            "an error that vanished before it was read is the same as no error"
+        );
+    }
+
+    /// The `stats:` line is a contract with `scripts/decode_matrix.py`, so it
+    /// is pinned here rather than only described in a comment above the
+    /// format string.
+    #[test]
+    fn the_summary_line_is_the_shape_the_matrix_runner_parses() {
+        let stats = parallax::video::FrameStats {
+            queued: 2,
+            presented: 20,
+            dropped_late: 3,
+            dropped_full: 4,
+            dropped_stale: 5,
+            clipped: 6,
+            worst_late_ns: 7,
+        };
+        let line = stats_line(ClockTime::from_nanos(1_900_000_000), 1, &stats);
+        assert_eq!(
+            line,
+            "stats: position_ns=1900000000 dropped=1 presented=20 queued=2 \
+             late=3 full=4 stale=5 clipped=6"
+                .replace("             ", "")
+        );
+        // The pair the runner's regex requires, adjacent and in this order.
+        assert!(line.contains("stats: position_ns=1900000000 dropped=1"));
+        // An unknown position reads as zero, not as a panic or a sentinel.
+        assert!(
+            stats_line(ClockTime::NONE, 0, &Default::default())
+                .starts_with("stats: position_ns=0 dropped=0")
+        );
+    }
+
+    /// The measurement flags the crossterm player had (#277). They vanished
+    /// once already, silently, which is why they are asserted rather than
+    /// trusted.
+    #[test]
+    fn the_measurement_flags_survive_the_rewrite() {
+        use clap::CommandFactory;
+        Args::command().debug_assert();
+
+        let args = Args::try_parse_from([
+            "parallax-player",
+            "--no-sync",
+            "--channel-capacity=16",
+            "--frame-delay=2",
+            "--headless",
+            "movie.mp4",
+        ])
+        .expect("the measurement flags parse");
+        let options = args.options();
+        assert!(!options.sync, "--no-sync turns pacing off");
+        assert_eq!(options.channel_capacity, 16);
+        assert_eq!(options.frame_delay, 2);
+        assert!(args.headless);
+
+        // A capacity of zero would be a link that can hold nothing; the
+        // executor wants at least one slot.
+        let zero = Args::try_parse_from(["parallax-player", "--channel-capacity=0", "f.mp4"])
+            .unwrap()
+            .options();
+        assert_eq!(zero.channel_capacity, 1);
+
+        // `--loop` is what the old player called `--repeat`, and scripts
+        // outlive rewrites.
+        assert!(
+            Args::try_parse_from(["parallax-player", "--loop", "movie.mp4"])
+                .expect("--loop still parses")
+                .repeat
+        );
+    }
 }

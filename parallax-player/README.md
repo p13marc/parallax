@@ -1,64 +1,97 @@
 # parallax-player
 
-A video player demo built on the [parallax](..) pipeline engine. Lives in the
-workspace as a demo app (`publish = false`); it may graduate to a standalone
-project later.
+A video player built on the [parallax](../) pipeline engine and
+[Iced](https://iced.rs) 0.14.
 
 ```bash
-cargo run -p parallax-player -- movie.mp4
+cargo run -p parallax-player --release -- movie.mp4
+cargo run -p parallax-player --release -- one.mp4 two.mkv three.webm
 ```
 
-## Scope
+Several files are a playlist: it plays through them and stops, or repeats one
+or all (`r`). A file that will not open is marked and skipped rather than
+stopping the list. Files can also be added with `o` — the XDG portal's dialog,
+so it works from a sandbox — or by dropping them on the window, which Iced
+does not implement on Wayland. Note that `--repeat` is a *different* thing — it loops
+inside the demuxer, gaplessly and without a rebuild, which means the pipeline
+never reaches end-of-stream and the playlist never advances.
 
-MP4/MOV and MKV/WebM files; video H.264, VP8, VP9 or AV1; audio AAC-LC,
-Opus, Vorbis or E-AC-3 (5.1 folded to stereo); subtitle tracks are listed but not rendered.
-The pipeline is built programmatically on the in-pipeline demuxers, with
-the decoder chosen from the probed codec:
+The engine does the hard parts — demux, decode, A/V sync, seeking — and this
+is the front end: a window, a video surface, and the transport.
 
 ```text
-Mp4DemuxSource │        H264Decoder │
-MkvDemux       ├ video ─▶ VpxDecoder ├─▶ VideoConvert ─▶ AutoVideoSink(sync)
-               │       Dav1dDecoder │
-               └ audio ─▶ AacDecoder | OpusDecoder | VorbisDecoder ─▶ AlsaSink
+demux ─┬─ video ─▶ decode ─▶ AppVideoSink ⇄ mailbox ⇄ VideoView (parallax-iced)
+       └─ audio ─▶ decode ─▶ downmix ─▶ gain ─▶ AlsaSink (provides the clock)
 ```
 
-## Roadmap
+`AppVideoSink` keeps everything that needs a pipeline context — the anchor
+handshake, segment mapping, flush generations, out-of-segment clipping, QoS —
+and hands each frame to the host stamped with the running time it is due at.
+The host decides when to show it, because only the host knows when the next
+vertical blank is.
 
-Phase 1 (`player-app` label, all done): #77 scaffold, #79 video-only M0,
-#80 audio branch + ALSA clock, #81 pause/seek, #82 status line, #83
-friendly errors and probing.
+MP4/MOV and MKV/WebM, with H.264, VP8, VP9 and AV1 video and AAC, Opus, Vorbis
+and E-AC-3 audio. VA-API is tried first for H.264/VP8/VP9 and falls back to
+software without comment when the driver has not got it.
 
-Phase 2 — format expansion (`video-player` label):
+## Keys
 
-| Issue | What | Status |
-|---|---|---|
-| #121/#122 | Matroska/WebM container support | done |
-| #123/#124 | VP8/VP9 decode (libvpx) + codec dispatch | done |
-| #125 | AV1/Opus in MP4 | done |
-| #126 | Vorbis audio | done |
-| #127 | E-AC-3 audio (in-decoder stereo fold-down) | done |
-| #128 | Generic 5.1/7.1 downmix element | done |
+| | |
+|---|---|
+| `Space`, click | play / pause |
+| `←` `→` | seek 10 s |
+| `↑` `↓`, wheel | volume |
+| `m` | mute |
+| `f`, double-click | fullscreen |
+| `Esc` | leave fullscreen, else quit |
+| `o` | open files |
+| `s` | playback speed |
+| `i` | diagnostics |
+| `p` | playlist |
+| `n` `b` | next / previous file |
+| `r` | repeat off / all / one |
+| `d` | write the running graph as GraphViz |
+| `q` | quit |
 
-The core engine work the player rides on (in-pipeline MP4 demuxing with
-per-pad routing, runtime pause/seek/position, the streaming AAC decoder,
-PTS-paced presentation, the ALSA hardware clock) is already merged — see
-issues #64–#76 for the history.
-
-## A/V sync
-
-The ALSA sink provides the pipeline clock (priority 150, counting frames the
-card has actually played) and is the **sync master**: on the first in-segment
-sample after every flush it publishes the pipeline's running-time origin, and
-the video sink presents against that rather than against its own arrival. That
-is what makes a seek land both branches on the same instant instead of on
-whatever skew the two happened to restart with — see the engine's
-`docs/pipeline.md` § A/V synchronization.
-
-Arrow-key seeks coalesce: presses accumulate into one target, settle for
-120 ms, and go out as a single seek whose completion is matched back by
-seqnum. The status line shows the target while the seek is outstanding.
+Audio is muted at any speed other than 1×: `AlsaSink` plays at the hardware
+rate and there is no pitch-preserving time-stretch in this tree, so the
+alternative is chipmunks. The picture stays locked either way — the sink
+writes `frames / |rate|` frames of silence, which keeps its clock, and
+therefore the video, at wall rate.
 
 ## Flags
 
-- `--no-audio` — video only, even if the file has audio
-- `--loop` — restart playback at EOS
+| | |
+|---|---|
+| `--no-audio` | video only |
+| `--repeat` (`--loop`) | loop gaplessly inside the demuxer |
+| `--hwdec auto\|off` | whether to try the GPU video engine |
+| `--decode-ahead N` | finished frames the decoder may run ahead |
+| `--dav1d-threads N` | 0 picks by resolution |
+| `--frame-delay N` | dav1d frame-delay bound; 0 leaves its own choice |
+| `--channel-capacity N` | executor link capacity |
+| `--no-sync` | decode as fast as possible; the batch-decode floor |
+| `--headless` | play with no window at all |
+| `--exit-after N` | quit after N seconds, printing the summary |
+
+## The machine-readable summary
+
+`--exit-after` (in either mode) prints exactly one line to stdout:
+
+```text
+stats: position_ns=1900000000 dropped=0 presented=20 queued=0 late=0 full=0 stale=0 clipped=0
+```
+
+`position_ns` and `dropped` stay adjacent and in that order:
+`scripts/decode_matrix.py` parses that pair. Everything after is frame
+accounting — `late` is past the lateness budget, `stale` is superseded by a
+seek, `full` is this host failing to drain fast enough, `clipped` is
+out-of-segment pre-roll after an accurate seek. Logs go to stderr, so stdout
+carries the line and nothing else.
+
+`--headless` runs the same pipeline with this process as the host: it drains
+the frame mailbox at the same due times, with the same lateness budget, that
+the widget uses. It needs no compositor, no GPU and no sound card, which is
+why CI runs it — but it exercises none of the shader, the upload or the
+swapchain. `just play-headless` runs the real widget under weston for that,
+and `just play-smoke` runs this.

@@ -306,8 +306,9 @@ jobs:
       - run: cargo clippy --all-targets --features vaapi,mkv-demux,mp4-demux,vpx,h264 -- -D warnings
 
   # The SIMD colorspace arms (the `yuv` crate) are a second implementation of
-  # every conversion, selected by a feature no other job enables — and the one
-  # parallax-player builds with. Untested, they rot silently (#196).
+  # every conversion, selected by a feature no other job enables. The scalar
+  # arms are what a bare `cargo build` ships, so both families need running:
+  # untested, they rot silently (#196) — or diverge (#265).
   simd-check:
     runs-on: ubuntu-24.04
     steps:
@@ -354,18 +355,16 @@ jobs:
       - run: cargo nextest run --features "$MEDIA_FEATURES,vpx,av1-decode,av1-encode,opus,h264"
       - run: cargo clippy --all-targets --features "$MEDIA_FEATURES,vpx,av1-decode,av1-encode,opus,h264" -- -D warnings
 
-  # The three workspace members nothing builds. `default-members = ["."]` keeps
-  # a bare `cargo build` narrow on purpose (see Cargo.toml), and no job passes
-  # `-p` or `--workspace` — so the player, the proc-macro crate and the example
-  # plugin were never compiled by CI at all (#255). Checking them explicitly
-  # closes that without widening the default set.
+  # The workspace members nothing builds. `default-members = ["."]` keeps a
+  # bare `cargo build` narrow on purpose (see Cargo.toml), and no job passes
+  # `-p` or `--workspace` — so the proc-macro crate and the example plugin
+  # were never compiled by CI at all (#255). Checking them explicitly closes
+  # that without widening the default set. The player has its own job below.
   workspace-members:
     runs-on: ubuntu-24.04
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v7.0.1
-      # `parallax-player` pulls a lot in: vpx, av1-decode, opus, h264, alsa and
-      # vaapi all want a system library, and its Cargo.toml is the list.
-      - run: sudo apt-get update && sudo apt-get install -y libudev-dev g++ libclang-dev libdav1d-dev libopus-dev libvpx-dev libasound2-dev libva-dev pkg-config
+      - run: sudo apt-get update && sudo apt-get install -y libudev-dev g++ libclang-dev pkg-config
       - uses: https://github.com/dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_VERSION }}
@@ -376,7 +375,31 @@ jobs:
           cache-targets: false
       - run: cargo clippy -p parallax-pipeline-macros --all-targets -- -D warnings
       - run: cargo clippy -p example-plugin --all-targets -- -D warnings
-      - run: cargo clippy -p parallax-player --all-targets -- -D warnings
+
+  # The feature union the crossterm player used to carry (#277). Every feature
+  # here is built by some other job — display-check, vaapi-check, simd-check —
+  # but only in its own dependency graph, and `cargo clippy -p parallax-player`
+  # was the one build that put them together. It also built the root crate as
+  # a *dependency*, so `cfg(test)` was off for it: `#[cfg(all(test, feature =
+  # "vaapi"))] mod hardware_tests` in `present/dmabuf_import.rs` was compiled
+  # by nothing at all. `--all-targets` on the root crate compiles it.
+  #
+  # Do not fold this into display-check: what is being checked is the *union*,
+  # and a job that builds half of it proves nothing about the other half.
+  feature-union:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@v7.0.1
+      - run: sudo apt-get update && sudo apt-get install -y libudev-dev g++ libclang-dev libdav1d-dev libopus-dev libvpx-dev libasound2-dev libva-dev pkg-config
+      - uses: https://github.com/dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: clippy
+      - uses: https://github.com/Swatinem/rust-cache@v2.9.2
+        with:
+          key: feature-union
+          cache-targets: false
+      - run: cargo clippy --all-targets --features mp4-demux,mkv-demux,vpx,av1-decode,opus,h264,display,display-gpu,simd-colorspace,audio-aac,audio-vorbis,eac3,alsa,vaapi -- -D warnings
 
   # The Iced integration crate (#267). Separate from `workspace-members`
   # because it needs the windowing/font system libraries and nothing else in
@@ -397,13 +420,23 @@ jobs:
           cache-targets: false
       - uses: https://github.com/taiki-e/install-action@nextest
       - run: cargo clippy -p parallax-iced --all-targets -- -D warnings
-      - run: cargo clippy -p parallax-play --all-targets -- -D warnings
+      - run: cargo clippy -p parallax-player --all-targets -- -D warnings
       - run: cargo nextest run -p parallax-iced
-      - run: cargo nextest run -p parallax-play
-      - name: exactly one wgpu
+      - run: cargo nextest run -p parallax-player
+      - name: exactly one wgpu, and one ashpd
         run: |
           ! cargo tree -p parallax-iced -d 2>/dev/null | grep -q "^wgpu"
-          ! cargo tree -p parallax-play -d 2>/dev/null | grep -q "^wgpu"
+          ! cargo tree -p parallax-player -d 2>/dev/null | grep -q "^wgpu"
+          ! cargo tree -p parallax-player -d 2>/dev/null | grep -q "^ashpd"
+      # The player, end to end, with no compositor and no sound card (#277).
+      # `--headless` makes this process the host: it drains the frame mailbox
+      # at the same due times the widget does, so "frames were presented" is
+      # a real claim about demux, decode, sync and pacing.
+      - name: the player plays
+        run: |
+          cargo build -p parallax-player
+          ./target/debug/parallax-player --headless --exit-after=5 tests/fixtures/tiny_h264_aac.mkv \
+            | tee /dev/stderr | grep -qE 'presented=[1-9]'
 
   docs:
     runs-on: ubuntu-24.04

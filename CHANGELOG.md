@@ -46,13 +46,89 @@ Every out-of-tree plugin must be rebuilt: the plugin ABI went **12 → 13**.
   now call these rather than leaving callers to rely on the fact.
 
 - **Two new workspace crates**, both `publish = false`: `parallax-iced` (a
-  `shader` widget that draws a `FrameMailbox`, on Iced's wgpu) and
-  `parallax-play` (a player built on it). The old `parallax-player` is
-  untouched and still builds; #277 retires it. `just check-iced` and
-  `just play-headless` are their gates — the latter runs the real player under
-  weston's headless backend and asserts frames were presented.
+  `shader` widget that draws a `FrameMailbox`, on Iced's wgpu) and the
+  rewritten `parallax-player` built on it. The crossterm/winit demo that held
+  that name is gone (#277) — the new one took the name and the binary path, so
+  `scripts/decode_matrix.py` and every `cargo run -p parallax-player` are
+  unchanged. `just check-iced`, `just play-headless` (the real widget under
+  weston) and `just play-smoke` (`--headless`, no compositor) are its gates.
+
+- **`parallax-player --headless`** (#277) plays with no window at all: this
+  process becomes the host and drains the frame mailbox at the same due times,
+  with the same lateness budget, that the widget uses. It needs no compositor,
+  no GPU and no sound card, so CI runs the player end to end for the first
+  time. It reports the same frame counts the windowed run does — that
+  agreement is the point, and the reason it calls `take_due` and
+  `parallax_iced::DEFAULT_MAX_LATENESS` rather than inventing a second pacing
+  policy.
+
+- **The gestures a GUI is expected to have** (#274). Wheel to change the
+  volume, a pointer that disappears with the chrome (under the same rule, so
+  the film is alone on screen when it is playing), `o` for a file dialog
+  through the XDG portal, files dropped on the window, and a list of what was
+  played lately on the empty screen. `Esc` leaves fullscreen rather than
+  entering it; `f` is still the toggle.
+
+  The dialog is `ashpd`, not `rfd`: parallax already depends on ashpd 0.13 for
+  the screencast portal, and `rfd` would pull a second major of it into the
+  same binary — `just check-iced` now refuses that the way it refuses two
+  wgpus. Drag-and-drop is deliberately the garnish rather than the mechanism:
+  Iced's `window::Event::FileDropped` says "**Wayland:** Not implemented" in
+  its own documentation, and this player enables both backends.
+
+- **A playlist, and open-next** (#276). Several files on the command line, or
+  dropped on the window, are a queue: it plays through them and stops, or
+  repeats one or all. A file that will not open is marked and skipped rather
+  than stopping the list, and a full lap with nothing playable stops rather
+  than spinning.
+
+  Advancing keys off the bus's `MessageKind::Eos`, which is an *edge* —
+  posted once, after every task finished, and scoped to the engine whose bus
+  carries it. `FrameMailbox::end_reason()` is a level that stays set, and the
+  sink raises it when the EOS *event* arrives, with frames still queued and
+  the audio device buffer still to play; `PipelineHandle::ended()` would
+  outlive the engine it belongs to and fire again on every manual Next, since
+  `stop()` reports `Eos` too.
+
+  The open chain became a state machine because it had a race. `open()` took
+  the engine and spawned a teardown, so a second Next 50 ms later found
+  `engine == None`, took the "nothing to tear down" path, and built a second
+  pipeline — two demuxers, two decoders and two ALSA devices — while the
+  first was still winding down. And a probe answering a superseded request
+  would install itself over a live engine, which leaks it outright:
+  `PipelineHandle` has no `Drop`, so dropping one detaches its tasks. Now an
+  engine exists only in `Stage::Playing`, exactly one teardown is ever in
+  flight (N rapid presses collapse into one teardown and one probe of the
+  last target), and a probe is built only if its seqnum is still the one being
+  waited for.
+
+- **The diagnostics panel says what the pipeline is doing** (#275). Which
+  decoder actually won (`--hwdec auto` leaves that open, and the answer used
+  to be logged once and forgotten), which adapter and backend Iced is drawing
+  on, the elected clock, buffering and download progress, the newest QoS
+  advisory, worst observed lateness, and a `d` key that writes the running
+  graph out as GraphViz. Bus warnings and errors are **toasts** now rather
+  than one sticky banner: a warning fades after eight seconds, an error waits
+  to be dismissed, because a message that vanishes before it is read is the
+  same as no message. `MessageKind::DurationChanged` finally reaches the seek
+  bar — a file whose length only becomes known after the probe used to keep
+  the "live / unknown length" label for the whole run.
+
+- **A `feature-union` CI job** (#277). The retired player's Cargo.toml was the
+  only build of `mp4-demux,mkv-demux,vpx,av1-decode,opus,h264,display,
+  display-gpu,simd-colorspace,audio-aac,audio-vorbis,eac3,alsa,vaapi` in one
+  dependency graph. Every feature in it is built by some other job; the
+  *union* was not. Against the root crate with `--all-targets` it also
+  compiles `present/dmabuf_import.rs`'s `hardware_tests` for the first time,
+  which the old job could never reach — it built the root crate as a
+  dependency, with `cfg(test)` off.
 
 ### Fixed
+
+- **Playback speed survives a track change** (#276). `reset_transport` cleared
+  position, pause and the seek state; `build` re-applied the volume. Nothing
+  re-applied the rate, so opening a second file left the transport showing
+  `2x` and the label saying "muted" while the new pipeline played at 1x.
 
 - **A packed frame's length is measured by its own packing** (#264).
   The geometry read checked declared dimensions against a hardcoded four bytes

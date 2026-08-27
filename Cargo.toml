@@ -2,9 +2,8 @@
 members = [
     ".",
     "parallax-macros",
-    "parallax-player",
     "parallax-iced",
-    "parallax-play",
+    "parallax-player",
     "examples/example-plugin",
 ]
 # The default build set stays exactly what a bare `cargo <cmd>` built before
@@ -13,6 +12,12 @@ members = [
 # into every workspace-wide invocation, and even adding example-plugin
 # surfaces clippy findings CI never gated on. Build the others explicitly:
 # `cargo run -p parallax-player -- file.mp4`, `cargo clippy -p example-plugin`.
+#
+# There is a sharper hazard than lint drift now: `parallax-iced` and the
+# player compile against *Iced's* wgpu, and `display-gpu` against a different
+# major. A workspace-wide feature union would unify both into one build and
+# quietly link two wgpu majors — which is why `just check-iced` and CI assert
+# `cargo tree -d` finds exactly one.
 default-members = ["."]
 
 [package]

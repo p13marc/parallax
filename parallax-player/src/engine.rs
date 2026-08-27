@@ -43,11 +43,22 @@ pub struct Options {
     /// Play the audio track, when there is one.
     pub audio: bool,
     /// Loop inside the demuxer — gapless, and cheaper than a rebuild.
-    pub repeat: bool,
+    ///
+    /// Named for the mechanism rather than the intent, because it is not the
+    /// playlist's repeat: it suppresses end-of-stream entirely, so a player
+    /// built with it never learns that a file finished and never advances.
+    pub gapless_loop: bool,
     /// Finished frames the decoder may run ahead of the screen.
     pub decode_ahead: usize,
     /// dav1d thread count; 0 picks by resolution.
     pub dav1d_threads: u32,
+    /// dav1d frame-delay bound; 0 leaves the decoder's own choice.
+    pub frame_delay: u32,
+    /// Executor link capacity for edges that do not set their own.
+    pub channel_capacity: usize,
+    /// Present frames at their due time. Off is the batch-decode floor — the
+    /// pipeline runs as fast as it can, which is how #192 was measured.
+    pub sync: bool,
 }
 
 impl Default for Options {
@@ -55,9 +66,12 @@ impl Default for Options {
         Self {
             hwdec: HwDec::Auto,
             audio: true,
-            repeat: false,
+            gapless_loop: false,
             decode_ahead: 4,
             dav1d_threads: 0,
+            frame_delay: 0,
+            channel_capacity: 4,
+            sync: true,
         }
     }
 }
@@ -406,17 +420,23 @@ fn hw_decoder(
     mode: HwDec,
     codec: parallax::gpu::Codec,
     label: &str,
+    chosen: &mut String,
 ) -> Option<parallax::elements::VaapiDecoder> {
     if mode == HwDec::Off {
+        *chosen = format!("{label} · software (--hwdec off)");
         return None;
     }
     match parallax::elements::VaapiDecoder::open(codec) {
         Ok(dec) => {
             tracing::info!("{label}: decoding on the GPU video engine");
+            *chosen = format!("{label} · VA-API");
             Some(dec)
         }
         Err(e) => {
             tracing::warn!("{label}: software decode ({e})");
+            // The reason travels with the answer: "software" on a machine
+            // with a GPU is a question, and this is the answer to it.
+            *chosen = format!("{label} · software ({e})");
             None
         }
     }
@@ -546,6 +566,15 @@ pub struct Engine {
     /// What is playing.
     pub source: SourceDescription,
     dropped: Arc<AtomicU64>,
+    /// Which decoder actually won — hardware or software, and which one.
+    ///
+    /// The choice is made once and then consumed by `add_filter`, so it has
+    /// to be recorded on the way past. It used to be logged and forgotten,
+    /// which meant the only way to find out whether VA-API was live was to
+    /// read the logs at startup.
+    pub decoder: String,
+    /// The graph as GraphViz, captured before `start` moved the elements.
+    dot: String,
 }
 
 impl Engine {
@@ -577,7 +606,7 @@ impl Engine {
                 } else {
                     Mp4DemuxSource::video_only(*demux)
                 }
-                .with_loop(opts.repeat);
+                .with_loop(opts.gapless_loop);
                 pipeline.add_demuxer("demux", s)
             }
             ProbedSource::Mkv(demux) => {
@@ -586,7 +615,7 @@ impl Engine {
                 } else {
                     demux.video_only()
                 }
-                .with_loop(opts.repeat);
+                .with_loop(opts.gapless_loop);
                 pipeline.add_demuxer("demux", s)
             }
         };
@@ -596,21 +625,31 @@ impl Engine {
             .as_ref()
             .expect("probe guarantees a video track");
         let height = video.height;
+        let mut decoder = String::new();
         let dec = match &video.codec {
             VideoCodecKind::H264 => {
-                match hw_decoder(opts.hwdec, parallax::gpu::Codec::H264, "H.264") {
+                match hw_decoder(
+                    opts.hwdec,
+                    parallax::gpu::Codec::H264,
+                    "H.264",
+                    &mut decoder,
+                ) {
                     Some(hw) => pipeline.add_filter("decode", hw),
                     None => pipeline.add_filter("decode", H264Decoder::new()?),
                 }
             }
-            VideoCodecKind::Vp8 => match hw_decoder(opts.hwdec, parallax::gpu::Codec::Vp8, "VP8") {
-                Some(hw) => pipeline.add_filter("decode", hw),
-                None => pipeline.add_filter("decode", VpxDecoder::vp8()?),
-            },
-            VideoCodecKind::Vp9 => match hw_decoder(opts.hwdec, parallax::gpu::Codec::Vp9, "VP9") {
-                Some(hw) => pipeline.add_filter("decode", hw),
-                None => pipeline.add_filter("decode", VpxDecoder::vp9()?),
-            },
+            VideoCodecKind::Vp8 => {
+                match hw_decoder(opts.hwdec, parallax::gpu::Codec::Vp8, "VP8", &mut decoder) {
+                    Some(hw) => pipeline.add_filter("decode", hw),
+                    None => pipeline.add_filter("decode", VpxDecoder::vp8()?),
+                }
+            }
+            VideoCodecKind::Vp9 => {
+                match hw_decoder(opts.hwdec, parallax::gpu::Codec::Vp9, "VP9", &mut decoder) {
+                    Some(hw) => pipeline.add_filter("decode", hw),
+                    None => pipeline.add_filter("decode", VpxDecoder::vp9()?),
+                }
+            }
             VideoCodecKind::Av1 => {
                 // At paced rates dav1d worker CPU scales with pool size
                 // (idle-worker task-queue churn), so size the pool to the
@@ -619,7 +658,12 @@ impl Engine {
                     0 if height > 0 && height <= 1440 => 2,
                     explicit_or_auto => explicit_or_auto,
                 };
-                pipeline.add_filter("decode", Dav1dDecoder::new()?.with_threads(threads)?)
+                let mut dav1d = Dav1dDecoder::new()?.with_threads(threads)?;
+                if opts.frame_delay > 0 {
+                    dav1d = dav1d.with_max_frame_delay(opts.frame_delay)?;
+                }
+                decoder = format!("AV1 · dav1d, {threads} threads");
+                pipeline.add_filter("decode", dav1d)
             }
             // `probe` rejects these, so reaching here is a bug rather than a
             // user error.
@@ -627,7 +671,7 @@ impl Engine {
         };
 
         let sink = AppVideoSink::new()
-            .with_sync(true)
+            .with_sync(opts.sync)
             .with_host_retention(parallax_iced::HOST_RETENTION);
         let mailbox = sink.mailbox();
         let snk = pipeline.add_async_sink("display", sink);
@@ -665,7 +709,13 @@ impl Engine {
             pipeline.link(avolume, aout)?;
         }
 
-        let executor = Executor::with_config(ExecutorConfig::default().with_channel_capacity(4));
+        // Before `start`: it moves the elements into their tasks, and the
+        // pipeline is a local that goes out of scope here.
+        let dot = pipeline.to_dot();
+
+        let executor = Executor::with_config(
+            ExecutorConfig::default().with_channel_capacity(opts.channel_capacity),
+        );
         let mut handle = executor.start(&mut pipeline)?;
         let bus = handle.take_bus();
 
@@ -682,6 +732,8 @@ impl Engine {
             volume,
             source,
             dropped,
+            decoder,
+            dot,
         })
     }
 
@@ -711,6 +763,11 @@ impl Engine {
         if let Some(volume) = &self.volume {
             volume.set_factor(factor);
         }
+    }
+
+    /// The running graph as GraphViz, for `to_dot` dumps.
+    pub fn dot(&self) -> &str {
+        &self.dot
     }
 
     /// Whether this run has audio at all.

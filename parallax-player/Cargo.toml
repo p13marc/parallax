@@ -4,10 +4,17 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
 publish = false
-description = "Video player demo built on the parallax pipeline engine"
+description = "A video player built on parallax and Iced"
 license = "MIT OR Apache-2.0"
 
+[[bin]]
+name = "parallax-player"
+path = "src/main.rs"
+
 [dependencies]
+# Deliberately *not* `display` or `display-gpu`: those pull winit and a
+# different wgpu major, and an Iced application owns the event loop itself.
+# `parallax-iced` brings the only wgpu in this tree, Iced's.
 parallax = { package = "parallax-pipeline", path = "..", features = [
     "mp4-demux",
     "mkv-demux",
@@ -15,18 +22,42 @@ parallax = { package = "parallax-pipeline", path = "..", features = [
     "av1-decode",
     "opus",
     "h264",
-    "display",
-    "display-gpu",
-    "simd-colorspace",
     "audio-aac",
     "audio-vorbis",
     "eac3",
     "alsa",
     "vaapi",
 ] }
+parallax-iced = { path = "../parallax-iced" }
+iced = { version = "0.14", default-features = false, features = [
+    "wgpu",
+    "tokio",
+    "advanced",
+    "x11",
+    "wayland",
+    # `sysinfo` is what `iced::system::information()` needs. It is the only
+    # way to name the adapter that is actually drawing: `wgpu::Device` has no
+    # `adapter_info()` and the custom-primitive path is handed nothing else,
+    # so a diagnostics panel would otherwise have to probe a *second* adapter
+    # and hope it matched.
+    "sysinfo",
+] }
+# The file dialog, through the XDG portal. Not `rfd`: parallax already
+# depends on ashpd 0.13 for the screencast portal, and rfd would pull a second
+# major of it into the same binary — which `just check-iced` now refuses.
+ashpd = { version = "0.13", default-features = false, features = [
+    "tokio",
+    "file_chooser",
+] }
+# The portal answers in URIs, and a path with a space in it comes back
+# percent-encoded.
+percent-encoding = "2"
 clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+# `signal` is declared rather than inherited: the root crate enables it and
+# cargo unifies tokio's features across the graph, so `--headless`'s Ctrl-C
+# handler would compile here by accident and break the day the root stops
+# needing it.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-anyhow = "1"
-crossterm = "0.29"
