@@ -124,6 +124,7 @@ fn controls(player: &Player) -> Element<'_, Message> {
     }
     tools = tools
         .push(Space::new().width(Length::Fill))
+        .push(speed(player))
         .push(
             button(text("Stats").size(12))
                 .on_press(Message::ToggleStats)
@@ -145,6 +146,36 @@ fn controls(player: &Player) -> Element<'_, Message> {
     panel(column![transport, tools].spacing(8))
         .width(Length::Fill)
         .into()
+}
+
+/// The playback speed (#280), as one button per rate.
+///
+/// The current one is labelled with a dot rather than styled: a `Button`
+/// style closure allocates per redraw, and this widget is rebuilt at the
+/// frame rate.
+///
+/// Audio is muted away from 1x — `AlsaSink` plays at the hardware rate and
+/// this tree has no pitch-preserving time-stretch — so the label says so
+/// rather than leaving the user to wonder whether the sound broke.
+fn speed(player: &Player) -> Element<'_, Message> {
+    let mut row = row![].spacing(4).align_y(Alignment::Center);
+    if player.speed != 1.0 && player.has_audio() {
+        row = row.push(text("muted").size(11));
+    }
+    for rate in crate::SPEEDS {
+        let current = (player.speed - rate).abs() < 1e-6;
+        let label = if current {
+            format!("• {rate}x")
+        } else {
+            format!("{rate}x")
+        };
+        row = row.push(
+            button(text(label).size(12))
+                .on_press(Message::SpeedTo(rate))
+                .padding([4, 6]),
+        );
+    }
+    row.into()
 }
 
 /// What the pipeline is actually doing. Toggled with `i`, or the button.

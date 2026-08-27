@@ -449,6 +449,26 @@ pub fn clip_to_segment(
     (skip, keep)
 }
 
+/// How many frames of *running time* a buffer of `frames` occupies at `rate`.
+///
+/// A segment maps media time to running time by dividing by `|rate|`
+/// ([`SegmentEvent::to_running_time`](crate::event::SegmentEvent::to_running_time)),
+/// so a buffer holding N frames of media occupies `N / |rate|` of running
+/// time. An audio sink whose clock is its own write cursor must advance that
+/// cursor by this many frames, not by N, or the clock falls a factor of
+/// `rate` behind where every paced branch needs it (#280).
+///
+/// A rate of zero or a non-finite one is treated as 1: the caller has already
+/// declined such a seek, and inventing an infinity here would be worse than
+/// playing on.
+pub fn frames_at_rate(frames: usize, rate: f64) -> usize {
+    let rate = rate.abs();
+    if !rate.is_finite() || rate == 0.0 || rate == 1.0 {
+        return frames;
+    }
+    (frames as f64 / rate).round() as usize
+}
+
 /// How long `frames` last at `sample_rate`, in nanoseconds.
 pub fn frames_to_nanos(frames: u64, sample_rate: u32) -> u64 {
     frames
@@ -1181,5 +1201,47 @@ mod stall_tests {
             !watch.stalled(ClockTime::from_millis(510), false),
             "the count restarted at the move"
         );
+    }
+}
+
+#[cfg(test)]
+mod rate_tests {
+    use super::{frames_at_rate, frames_to_nanos};
+
+    /// The arithmetic behind #280, on its own: a sink that plays at the
+    /// hardware rate keeps the *clock* honest by writing this many frames.
+    ///
+    /// Tested here rather than against `AlsaSink` because that sink needs a
+    /// sound card, and this is the part that has to be right — assert the
+    /// clock arithmetic, not the audio.
+    #[test]
+    fn a_buffer_occupies_its_media_length_divided_by_the_rate() {
+        const RATE: u32 = 48_000;
+
+        // 1024 frames at 48 kHz is 21.33 ms of media. At 2x it occupies half
+        // that of running time; at 0.5x, twice.
+        assert_eq!(frames_at_rate(1024, 1.0), 1024);
+        assert_eq!(frames_at_rate(1024, 2.0), 512);
+        assert_eq!(frames_at_rate(1024, 0.5), 2048);
+        // Direction does not change how much time passes.
+        assert_eq!(frames_at_rate(1024, -2.0), 512);
+
+        // Which is the point: one second of media at 2x must advance the
+        // clock by half a second, so a video branch mapping the same second
+        // into half a second of running time stays locked to it.
+        let media = frames_to_nanos(RATE as u64, RATE);
+        let running = frames_to_nanos(frames_at_rate(RATE as usize, 2.0) as u64, RATE);
+        assert_eq!(media, 1_000_000_000);
+        assert_eq!(running, 500_000_000);
+
+        // A rate this sink should never see leaves the buffer alone rather
+        // than dividing by nothing.
+        assert_eq!(frames_at_rate(1024, 0.0), 1024);
+        assert_eq!(frames_at_rate(1024, f64::NAN), 1024);
+        assert_eq!(frames_at_rate(1024, f64::INFINITY), 1024);
+
+        // Fast enough that a buffer rounds away entirely: the caller writes
+        // nothing and leaves the cursor where it was.
+        assert_eq!(frames_at_rate(1, 4.0), 0);
     }
 }

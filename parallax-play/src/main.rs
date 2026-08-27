@@ -45,6 +45,12 @@ const TICK: Duration = Duration::from_millis(50);
 /// How long the controls stay up after the last thing the user did.
 const CONTROLS_LINGER: Duration = Duration::from_secs(3);
 
+/// The speeds `s` cycles through, and the buttons the transport offers.
+///
+/// No reverse: an `INSTANT_RATE_CHANGE` cannot flip the sign — that needs a
+/// real seek, and no demuxer in the tree plays backwards.
+const SPEEDS: [f64; 5] = [1.0, 1.25, 1.5, 2.0, 0.5];
+
 #[derive(Parser, Debug, Clone)]
 #[command(name = "parallax-play", about = "A video player built on parallax")]
 struct Args {
@@ -143,6 +149,10 @@ enum Message {
     ToggleFullscreen,
     /// Show or hide the diagnostics panel.
     ToggleStats,
+    /// Step through the playback speeds.
+    CycleSpeed,
+    /// Set the playback speed directly.
+    SpeedTo(f64),
     /// Quit.
     Quit,
 }
@@ -179,6 +189,9 @@ struct Player {
 
     position: ClockTime,
     paused: bool,
+    /// Playback speed (#280). Audio is muted away from 1x — see
+    /// [`Player::set_speed`].
+    speed: f64,
     seek: SeekState,
 
     /// Volume lives here rather than in the `Gain` handle: the handle knows a
@@ -206,6 +219,7 @@ impl Player {
             pending_open: None,
             position: ClockTime::ZERO,
             paused: false,
+            speed: 1.0,
             seek: SeekState::default(),
             volume_db: 0.0,
             muted: false,
@@ -343,6 +357,21 @@ impl Player {
                     iced::window::Mode::Windowed
                 };
                 iced::window::latest().and_then(move |id| iced::window::set_mode(id, mode))
+            }
+            Message::CycleSpeed => {
+                self.activity();
+                let next = SPEEDS
+                    .iter()
+                    .copied()
+                    .find(|s| *s > self.speed + 1e-6)
+                    .unwrap_or(SPEEDS[0]);
+                self.set_speed(next);
+                Task::none()
+            }
+            Message::SpeedTo(rate) => {
+                self.activity();
+                self.set_speed(rate);
+                Task::none()
             }
             Message::ToggleStats => {
                 self.activity();
@@ -552,6 +581,30 @@ impl Player {
         self.seek.due = None;
     }
 
+    /// Ask the pipeline to play at `rate` (#280).
+    ///
+    /// An `INSTANT_RATE_CHANGE` seek: no flush, no repositioning, and it
+    /// terminates at the sinks — so it works on a live pipeline that cannot
+    /// seek at all. Audio goes silent above or below 1x, because `AlsaSink`
+    /// plays at the hardware rate and there is no pitch-preserving
+    /// time-stretch in the tree; it keeps writing silence at the running-time
+    /// rate so the clock — which that sink provides — stays true and video
+    /// stays locked to it.
+    fn set_speed(&mut self, rate: f64) {
+        let Some(engine) = &self.engine else {
+            return;
+        };
+        if engine
+            .handle()
+            .dispatch_seek(SeekEvent::new_instant_rate(rate))
+        {
+            self.speed = rate;
+        } else {
+            // A sign flip, or nothing playing yet. Reverse needs a real seek.
+            self.error = Some(format!("cannot play at {rate}x"));
+        }
+    }
+
     fn apply_volume(&self) {
         if let Some(engine) = &self.engine {
             self.apply_volume_to(engine);
@@ -626,6 +679,7 @@ fn shortcut(key: &Key) -> Option<Message> {
             "f" => Some(Message::ToggleFullscreen),
             "m" => Some(Message::ToggleMute),
             "i" => Some(Message::ToggleStats),
+            "s" => Some(Message::CycleSpeed),
             " " => Some(Message::TogglePause),
             _ => None,
         },
@@ -700,6 +754,33 @@ mod tests {
             shortcut(&Key::Character("q".into())),
             Some(Message::Quit)
         ));
+        assert!(matches!(
+            shortcut(&Key::Character("s".into())),
+            Some(Message::CycleSpeed)
+        ));
         assert!(shortcut(&Key::Character("z".into())).is_none());
+    }
+
+    /// `s` walks the speeds and wraps, so one key reaches every rate (#280).
+    #[test]
+    fn the_speed_key_cycles_through_every_rate_and_wraps() {
+        // The table is deliberately not sorted: 1x first, because that is
+        // where a player starts and where a user most wants to get back to.
+        // The cycle follows the table's own order.
+        let next = |from: f64| {
+            SPEEDS
+                .iter()
+                .copied()
+                .find(|s| *s > from + 1e-6)
+                .unwrap_or(SPEEDS[0])
+        };
+        assert_eq!(next(1.0), 1.25);
+        assert_eq!(next(1.25), 1.5);
+        assert_eq!(next(1.5), 2.0);
+        // Past the fastest it wraps to the front rather than sticking.
+        assert_eq!(next(2.0), 1.0);
+        // Half speed is below everything, so it steps up into the sequence.
+        assert_eq!(next(0.5), 1.0);
+        assert!(SPEEDS.iter().all(|s| *s > 0.0), "no reverse: see SPEEDS");
     }
 }
