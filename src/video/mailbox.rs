@@ -466,16 +466,6 @@ impl FrameMailbox {
         self.lock().stats.clipped += 1;
     }
 
-    /// Record a frame the producer discarded rather than queueing.
-    ///
-    /// The counterpart to the eviction count in
-    /// [`push_evicting`](Self::push_evicting): a frame that could not be shown
-    /// in place of what is already queued is dropped where it stands, and that
-    /// is the same loss to the same cause.
-    pub(crate) fn count_dropped_full(&self) {
-        self.lock().stats.dropped_full += 1;
-    }
-
     pub(crate) fn count_stale(&self) {
         self.lock().stats.dropped_stale += 1;
     }

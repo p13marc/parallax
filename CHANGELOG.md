@@ -298,19 +298,27 @@ Every out-of-tree plugin must be rebuilt: the plugin ABI went **12 → 14**.
   wherever it lands. `StallWatch` could not break it either; it wants a
   bit-identical clock reading and a creeping clock never gives one.
 
-  So the sink now leaves the loop rather than choosing a slower place in it.
-  Past the deadline it stops back-pressuring: where a sync master exists its
-  device paces the graph through its own branch, so video is shed at source
-  rate and audio plays through untouched; where nothing else paces anything,
-  the sink paces itself against the clock, which cannot collapse because a
-  clock no device provides runs at wall rate. The latch clears when the host
-  takes a frame again. Two rules keep it honest — a host that has taken nothing
-  because nothing is *due* is not a stalled host, and a frame that cannot be
-  shown never displaces one that can. Without the first the two states
-  alternate and the picture arrives in bursts; without the second the ring
-  walks past the clock and the shed becomes the deadlock it exists to prevent.
+  So past the deadline the sink stops waiting on the host and paces itself: it
+  holds each frame until its presentation time, then sheds it. The pipeline
+  runs at exactly playback speed with nobody watching, and the picture is the
+  only thing that pays. Pacing does not starve the graph even though waiting
+  for the *host* did — the sink consumes one frame per frame interval, so it
+  unblocks the demuxer at exactly the rate the other branches drain at. What
+  put it inside the bad loop was consuming slower than frames come due, which
+  is what a wall-clock deadline does and a due-time wait cannot.
 
-  `with_shed_after` therefore means "how long before concluding the host has
+  Shedding at source rate instead — letting the audio device do the pacing —
+  was tried and is worse: with no back-pressure the demuxer runs ahead by the
+  *other* branch's link depth (2.05 s of audio against 1.24 s of video), so
+  frames reach the mailbox two seconds early, `schedule`'s `MAX_WAIT` hatch
+  presents them on arrival, and the picture runs two seconds ahead of the
+  sound. The regression test measures exactly that, which is how it was caught.
+
+  A host that has taken nothing because nothing is *due* is a correctly paced
+  host, not a stopped one; without that distinction the two states alternate
+  and the picture arrives in bursts a second apart.
+
+    `with_shed_after` therefore means "how long before concluding the host has
   stopped", paid once per stall rather than per frame, and `with_stall_limit`
   joins it for the master-less case.
 

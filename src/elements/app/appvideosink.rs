@@ -49,52 +49,41 @@
 //! branch's feed rate, which sets playback, which drives the master clock,
 //! which — through [`schedule`](crate::pipeline::schedule) — decides when this
 //! sink consumes again. That loop is self-consistent at *any* rate. Shedding
-//! one frame per deadline just chooses a slow one and stays there; the
-//! pipeline settles at a fraction of playback speed and never climbs out,
+//! one frame per wall-clock deadline just chooses a slow one and stays there;
+//! the pipeline settles at a fraction of playback speed and never climbs out,
 //! because nothing in the loop is pulling it back up.
 //!
-//! So once the host has missed a deadline this sink leaves the loop instead of
-//! slowing it down. The mode it switches to depends on what else paces the
-//! graph ([`shed_mode`]):
+//! So once the host has missed a deadline this sink stops waiting on it and
+//! paces itself instead: it holds each frame until its presentation time and
+//! then sheds it. The pipeline runs at exactly playback speed with nobody
+//! watching, and the picture is the only thing that pays.
 //!
-//! - **a sync master exists** — an audio device, whose own branch is real 1x
-//!   back-pressure this sink is not part of. Shed at source rate, no waiting:
-//!   video degrades, audio plays through, the clock keeps running.
-//! - **no master** — this sink is the only pacing the graph has, so it paces
-//!   itself against the clock and sheds what it cannot hand over. The
-//!   circularity cannot arise here: with no device-provided clock the pipeline
-//!   clock runs at wall rate and nothing in the graph can starve it.
+//! **Pacing here does not starve the graph, and the difference is worth being
+//! precise about**, because the obvious reading says it must. The sink
+//! consumes one frame per frame interval, so it unblocks the demuxer at
+//! exactly the rate the other branches are being drained at; the video link
+//! stays full, the demuxer blocks on *that* pad, and audio is fed at 1x. What
+//! puts the sink inside the bad loop is consuming *slower* than the frames
+//! come due — which is what a wall-clock deadline does and what a due-time
+//! wait cannot. A clock that stops for reasons no pause explains is the one
+//! case left, and `StallWatch` sheds through it.
 //!
-//! The latch clears the moment the host takes a frame again.
+//! The tempting alternative — shed at source rate and let some other branch's
+//! device do the pacing — is worse, and measurably so. With no back-pressure
+//! at all the demuxer runs as far ahead as the *other* branch's link allows;
+//! in `parallax-player` that is 2.05 s of audio against 1.24 s of video, so
+//! frames reach the mailbox 2 s early, `schedule`'s
+//! [`MAX_WAIT`](crate::pipeline::MAX_WAIT) hatch presents them on arrival, and
+//! the picture runs two seconds ahead of the sound. That is
+//! `a_host_that_comes_back_gets_a_picture_in_sync` measuring 2050 ms.
 //!
-//! Two things had to be got right around it, and both were found by watching
-//! it fail rather than by reasoning about it:
-//!
-//! - **Not every wait is a stall.** A host that has taken nothing because
-//!   nothing is *due* is a correctly paced host, and latching at it is how the
-//!   two states start alternating: shed, lead builds, host cannot present,
-//!   latch, shed again — the picture then arrives in bursts a second apart
-//!   forever. Only an untaken frame that is genuinely due counts, unless the
-//!   clock itself has stopped (see `host_is_merely_waiting`).
-//! - **A frame that cannot be shown must not displace one that can.** Without
-//!   back-pressure the demuxer runs as far ahead as the other branch's link
-//!   allows, so frames arrive dated that far in the future. Evicting the
-//!   oldest for one of those walks the whole ring past the clock, and a host
-//!   calling `take_due` then finds nothing due however long it waits — so it
-//!   never frees a slot, so the latch never clears. The shed becomes the
-//!   deadlock it exists to prevent. Frames that cannot go up are dropped where
-//!   they stand instead, which leaves a ring that goes stale — and a stale
-//!   ring is one a returning host empties in a single call.
+//! The latch clears the moment the host takes a frame again. One rule around
+//! it earns its place: a host that has taken nothing because nothing is *due*
+//! is a correctly paced host, not a stopped one, and latching at it would
+//! throw the picture away for doing its job (see `host_is_merely_waiting`).
 //!
 //! A *paused* pipeline is excluded throughout: the clock is supposed to stop
 //! there, and the executor gates this task anyway.
-//!
-//! One transient survives by design. While shedding, this sink imposes no
-//! back-pressure, so the lead above is real; when the host comes back it waits
-//! out whatever is left of it before the first frame is due, and the link
-//! re-fills and absorbs it. Bounded by the difference between the two
-//! branches' depths — the reason `parallax-player` buffers more seconds of
-//! video than of audio — and discharged within a second or two.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -140,33 +129,26 @@ enum ShedMode {
     /// Wait for the host to take one, bounded by `shed_after`. The normal
     /// path: that wait is what makes the pipeline run at playback speed.
     WaitForHost,
-    /// Hold the frame until it is due, then shed it. For a graph where this
-    /// sink is the only thing pacing anything.
+    /// Hold the frame until it is *due*, then shed it. What a stopped host
+    /// gets: the pipeline keeps running at exactly playback speed and the
+    /// picture is what pays.
     PaceOurselves,
-    /// Shed immediately. Something else paces the graph.
-    ShedNow,
 }
 
-/// Which of the three behaviours applies to this frame.
+/// Which of the two behaviours applies to this frame.
 ///
 /// Pure, so the decision is testable without a pipeline, a clock or a host —
 /// the same reason [`StallWatch`](crate::pipeline::StallWatch) and
 /// [`AnchorGate`](crate::pipeline::AnchorGate) are.
-fn shed_mode(stalled: bool, has_master: bool, target: ClockTime) -> ShedMode {
-    if !stalled {
-        return ShedMode::WaitForHost;
-    }
-    match (has_master, target == ClockTime::NONE) {
-        // A master's device paces the graph through its own branch. Shedding
-        // here cannot run anything away, and waiting here is what starves it.
-        (true, _) => ShedMode::ShedNow,
-        // Unpaced, and nobody else pacing either: the bounded wait is the only
-        // brake in the graph, so it stays. Deliberately unchanged — an
-        // unsynced sink with a stopped host is not the failure this latch is
-        // for, and shedding freely would race the source to EOS.
-        (false, true) => ShedMode::WaitForHost,
-        // This sink is the graph's only pacing, so it has to do it itself.
-        (false, false) => ShedMode::PaceOurselves,
+fn shed_mode(stalled: bool, target: ClockTime) -> ShedMode {
+    // With nothing to pace against — `sync` off, or no clock yet — the bounded
+    // wait is the only brake in the graph, so it stays. Deliberately
+    // unchanged: an unsynced sink has no timing contract to keep, and shedding
+    // freely would let a hidden window run the source to EOS.
+    if !stalled || target == ClockTime::NONE {
+        ShedMode::WaitForHost
+    } else {
+        ShedMode::PaceOurselves
     }
 }
 
@@ -368,18 +350,13 @@ impl AppVideoSink {
     /// Put the frame in the mailbox, by whichever of the three routes applies.
     async fn enqueue(&mut self, frame: PacedFrame) {
         let clock = self.mailbox.clock();
+        // No clock yet means no timeline: the first buffer has not been
+        // through `consume` anywhere, so there is nothing to pace against.
         let mode = match &clock {
-            Some(clock) => shed_mode(self.host_stalled, clock.sync().has_master(), frame.target),
-            // No clock yet — the first buffer has not been through `consume`
-            // on some other branch, so no roles are elected and there is
-            // nothing to pace against.
+            Some(_) => shed_mode(self.host_stalled, frame.target),
             None => ShedMode::WaitForHost,
         };
         match mode {
-            ShedMode::ShedNow => {
-                let clock = clock.expect("ShedNow implies a master, and so a clock");
-                self.shed(frame, &clock);
-            }
             ShedMode::PaceOurselves => {
                 let clock = clock.expect("PaceOurselves is only reachable with a clock");
                 self.pace_then_shed(frame, &clock).await;
@@ -484,41 +461,18 @@ impl AppVideoSink {
         )
     }
 
-    /// Hand the frame over without waiting, shedding what will not fit.
-    fn shed(&mut self, frame: PacedFrame, clock: &PresentationClock) {
-        let returned = match self.mailbox.try_push(frame) {
-            Ok(()) => return self.host_is_back(),
-            Err(returned) => returned,
-        };
-        // Displace the oldest only if this frame could go up in its place.
-        //
-        // Not back-pressuring means the demuxer runs as far ahead as the
-        // *other* branch's link lets it, so frames arrive dated that far in
-        // the future — and evicting a showable frame for one of those marches
-        // the whole ring ahead of the clock. A host calling `take_due` then
-        // finds nothing due however long it waits, so it never frees a slot,
-        // so the latch never clears: the shed becomes the deadlock it exists
-        // to prevent. Keeping the soonest frames instead leaves a ring that
-        // goes stale, which is a ring the host can drain in one call.
-        if matches!(
-            schedule(returned.target, clock.now(), self.max_lateness),
-            Pace::Wait(_)
-        ) {
-            self.mailbox.count_dropped_full();
-        } else {
-            // `push_evicting` can displace a `must_present` frame — the first
-            // of a post-seek generation — but it carries the promise forward
-            // onto whatever replaces it, so the guarantee survives.
-            self.mailbox.push_evicting(returned);
-        }
-    }
-
     /// Hold the frame until it is due, then shed it.
     ///
-    /// The graph has no master, so this sink is the only thing keeping it at
-    /// playback speed; with the host gone, pacing has to happen here or the
-    /// source runs to EOS behind a hidden window. Shaped like
+    /// With the host gone this sink is the only thing keeping the graph at
+    /// playback speed, so pacing has to happen here. Shaped like
     /// `AutoVideoSink`'s pacing loop, and for the same reasons.
+    ///
+    /// Waiting here does not starve the rest of the graph, which is the part
+    /// that is easy to get wrong: the sink consumes one frame per frame
+    /// interval, so it unblocks the demuxer at exactly the rate the other
+    /// branches are being drained at. What it must never do is consume
+    /// *slower* than that — which is precisely what a wait bounded by a
+    /// wall-clock deadline, rather than by the frame's own due time, does.
     async fn pace_then_shed(&mut self, mut frame: PacedFrame, clock: &PresentationClock) {
         let entered_at = clock.flush_epoch();
         let mut stall = crate::pipeline::StallWatch::new(self.stall_limit);
@@ -839,59 +793,32 @@ mod tests {
         assert_eq!(declared.max, ClockTime::from_millis(160));
     }
 
-    /// The policy in one place: what a stalled host costs depends on what
-    /// else is pacing the graph.
+    /// The policy in one place.
     mod shedding {
         use super::*;
 
         #[test]
         fn a_draining_host_is_never_shed_against() {
-            for has_master in [true, false] {
-                for target in [ClockTime::NONE, ClockTime::from_millis(40)] {
-                    assert_eq!(shed_mode(false, has_master, target), ShedMode::WaitForHost);
-                }
+            for target in [ClockTime::NONE, ClockTime::from_millis(40)] {
+                assert_eq!(shed_mode(false, target), ShedMode::WaitForHost);
             }
         }
 
-        /// A device clock means a device paces the graph, so waiting here only
-        /// starves the branch that drives it.
+        /// A stopped host costs the picture, not the pipeline: the sink paces
+        /// itself so the graph keeps running at exactly playback speed.
         #[test]
-        fn a_master_device_makes_shedding_free() {
+        fn a_stopped_host_makes_this_sink_the_pacing() {
             assert_eq!(
-                shed_mode(true, true, ClockTime::from_millis(40)),
-                ShedMode::ShedNow
-            );
-        }
-
-        /// And it outranks pacing being off. `--no-sync` with an audio device
-        /// is a supported configuration, and it starves exactly like the
-        /// synced one: the master is still what makes shedding safe.
-        #[test]
-        fn a_master_device_outranks_having_no_timeline() {
-            assert_eq!(
-                shed_mode(true, true, ClockTime::NONE),
-                ShedMode::ShedNow,
-                "an unsynced sink with a sound card must still stop back-pressuring"
-            );
-        }
-
-        #[test]
-        fn with_no_master_this_sink_is_the_pacing() {
-            assert_eq!(
-                shed_mode(true, false, ClockTime::from_millis(40)),
+                shed_mode(true, ClockTime::from_millis(40)),
                 ShedMode::PaceOurselves
             );
         }
 
-        /// Nothing to pace against and nothing else pacing: the bounded wait
-        /// is the only brake the graph has, so it stays. Shedding freely here
-        /// would run the source off to EOS behind a hidden window.
+        /// With no timeline there is nothing to pace against, so the bounded
+        /// wait stays — it is the only brake an unsynced graph has.
         #[test]
-        fn with_neither_a_master_nor_a_timeline_the_wait_stays() {
-            assert_eq!(
-                shed_mode(true, false, ClockTime::NONE),
-                ShedMode::WaitForHost
-            );
+        fn with_no_timeline_the_bounded_wait_stays() {
+            assert_eq!(shed_mode(true, ClockTime::NONE), ShedMode::WaitForHost);
         }
     }
 

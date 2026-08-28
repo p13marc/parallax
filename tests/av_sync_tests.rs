@@ -59,6 +59,16 @@ const AUDIO_BYTES: usize = 480 * 2 * 2;
 /// hundreds of milliseconds the arrival anchor used to produce.
 const TOLERANCE_MS: f64 = 25.0;
 
+/// Audio buffers a branch holds, in the ratio `parallax-player` really runs.
+///
+/// The player links 96 AAC packets, and an AAC-LC packet is 1024 samples —
+/// 21.3 ms at 48 kHz, so **2.05 s** of audio against the video branch's
+/// 24 + 4 + 3 frames, which is 1.24 s at 25 fps. Audio buffers roughly twice
+/// what video does, and that asymmetry is not incidental: it decides how far
+/// ahead an un-back-pressured demuxer can run, which is the whole subject of
+/// the occlusion tests. At 10 ms per buffer here, 205 is the same 2.05 s.
+const AUDIO_DEPTH: usize = 205;
+
 const VIDEO_PAD: PadId = PadId(0);
 const AUDIO_PAD: PadId = PadId(1);
 
@@ -245,6 +255,7 @@ fn build(source: AvSource) -> (Pipeline, LogHandle, LogHandle) {
 fn build_with_app_sink(
     source: AvSource,
     shed_after: Option<Duration>,
+    audio_depth: usize,
 ) -> (Pipeline, LogHandle, Arc<FrameMailbox>) {
     let mut pipeline = Pipeline::new();
     let src = pipeline.add_demuxer("demux", source);
@@ -271,7 +282,14 @@ fn build_with_app_sink(
         .link_pads_full(decode, "src", vsink, "sink", LinkPolicy::Block, Some(4))
         .unwrap();
     pipeline
-        .link_pads_full(src, "audio", asink, "sink", LinkPolicy::Block, Some(96))
+        .link_pads_full(
+            src,
+            "audio",
+            asink,
+            "sink",
+            LinkPolicy::Block,
+            Some(audio_depth),
+        )
         .unwrap();
     (pipeline, audio_log, mailbox)
 }
@@ -826,7 +844,8 @@ async fn a_looping_real_pipeline_survives_repeated_seeks() {
 /// stand-in runs and holds it to the identical bound.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_app_sink_settles_on_the_audio_origin_too() {
-    let (mut pipeline, audio_log, mailbox) = build_with_app_sink(AvSource::new(10), None);
+    let (mut pipeline, audio_log, mailbox) =
+        build_with_app_sink(AvSource::new(10), None, AUDIO_DEPTH);
     let (video_log, host) = spawn_host(Arc::clone(&mailbox));
 
     let executor = Executor::with_config(ExecutorConfig::default());
@@ -875,8 +894,11 @@ async fn a_host_that_stops_drawing_does_not_slow_the_pipeline_down() {
     // 25 fps, so the video branch's 24 + 4 + 3 frames are ~1.2 s of stream and
     // the audio link's 96 buffers are ~1 s — both spent well inside the settle
     // window below.
-    let (mut pipeline, audio_log, mailbox) =
-        build_with_app_sink(AvSource::new(400).with_frame_ns(40_000_000), None);
+    let (mut pipeline, audio_log, mailbox) = build_with_app_sink(
+        AvSource::new(400).with_frame_ns(40_000_000),
+        None,
+        AUDIO_DEPTH,
+    );
     // No host at all: nothing ever drains the mailbox.
     let executor = Executor::with_config(ExecutorConfig::default());
     let handle = executor.start(&mut pipeline).unwrap();
@@ -921,8 +943,28 @@ async fn a_host_that_stops_drawing_does_not_slow_the_pipeline_down() {
 /// out. Recovering has to be automatic and quick.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_host_that_comes_back_gets_a_picture_in_sync() {
-    let (mut pipeline, audio_log, mailbox) =
-        build_with_app_sink(AvSource::new(400).with_frame_ns(40_000_000), None);
+    host_returns_in_sync(40_000_000).await;
+}
+
+/// The same, at 50 fps.
+///
+/// The frame rate decides how many *seconds* the video branch's 24 + 4 + 3
+/// frames hold — 1.24 s at 25 fps, 0.62 s at 50 — while the audio branch holds
+/// 2.05 s either way. The shallower the video side, the further a demuxer that
+/// nothing is back-pressuring can run ahead of the playhead, and the further
+/// ahead of the audio the picture ends up. This is the worst ratio the player
+/// meets in practice, so it is the one worth pinning.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_that_comes_back_is_in_sync_at_high_frame_rates() {
+    host_returns_in_sync(20_000_000).await;
+}
+
+async fn host_returns_in_sync(frame_ns: u64) {
+    let (mut pipeline, audio_log, mailbox) = build_with_app_sink(
+        AvSource::new(800).with_frame_ns(frame_ns),
+        None,
+        AUDIO_DEPTH,
+    );
     // Draw briefly, go dark for longer than the branch depths can absorb, come
     // back. 2.5 s of dark against ~1.2 s of video and ~1 s of audio buffering.
     let (video_log, host) = spawn_host_with_gap(

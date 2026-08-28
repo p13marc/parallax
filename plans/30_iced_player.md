@@ -544,15 +544,27 @@ Three things this taught that the plan had no way to know:
   demuxer routing → audio feed → playback → master clock → (`schedule`) → sink
   consumption — so the loop is self-consistent at any rate and simply stays where
   it lands. `StallWatch` cannot break it either: it wants a bit-identical clock
-  reading, and a creeping clock never gives one. The sink has to *leave* the loop,
-  and the discriminator that says whether it safely can is
-  `SyncHandle::has_master()` — a device sink's own branch is back-pressure this
-  one is not part of.
-- *"The host has not taken a frame" is not the same as "the host has stopped."*
-  Coming back from a stall the queue is dated ahead of the clock, so the host
-  genuinely cannot present for a moment; treating that as a stall re-latches the
-  shed and the two states alternate forever, delivering the picture in bursts a
-  second apart. Only an untaken frame that is *due* counts.
+  reading, and a creeping clock never gives one. What takes the sink out of the
+  loop is pacing against the frame's own due time rather than a wall-clock
+  deadline: it then consumes one frame per frame interval, which unblocks the
+  demuxer at exactly the rate the other branches drain at. Consuming *slower*
+  than frames come due is the thing that starves them, and only a wall-clock
+  bound does that.
+- *Removing back-pressure entirely is not the safe direction, it is a different
+  bug.* The first fix let a device-clocked graph shed at source rate on the
+  theory that the audio branch was doing the pacing. It is, but with nothing
+  holding the video pad the demuxer runs ahead by the *audio* link's depth —
+  2.05 s of AAC against 1.24 s of video — so frames reach the mailbox two
+  seconds early, `schedule`'s `MAX_WAIT` hatch presents them on arrival, and the
+  picture runs two seconds ahead of the sound. The rig missed it because its
+  branch depths were the inverse of the player's; matching the player's ratio
+  reproduced it exactly, at 2050 ms.
+
+A fourth, smaller: *"the host has not taken a frame" is not the same as "the
+host has stopped."* Coming back from a stall the queue is briefly dated ahead of
+the clock, so the host genuinely cannot present; treating that as a stall
+re-latches the shed and the two states alternate, delivering the picture in
+bursts a second apart.
 
 **The clock reaches an element only through its consume context.** `set_clock`
 is on the adapter, not on `AsyncSink`, so `FrameMailbox::clock()` cannot exist
