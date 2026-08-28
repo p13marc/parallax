@@ -10,7 +10,112 @@ commit messages and the Forgejo releases.
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-08-28
+
+Sixty-one commits since 0.8.0, and the release the engine grew an
+*application*. `parallax-player` and `parallax-iced` are new workspace crates
+(both `publish = false`): a real player — playlist, seek previews, frame
+stepping, subtitles, track and audio-device selection, a diagnostics panel —
+built on the public API, plus the reusable Iced widget layer under it.
+
+That application is what earned this release its `Fixed` section. Nothing
+exercises a pipeline like a human scrubbing, pausing and backgrounding it, and
+almost every fix below was found that way: A/V synchronization anchored on two
+independent guesses, a flushing seek that could deadlock a paced pipeline, a
+sink that reported what it *offered* as what it *sent*, and a hidden window
+that dragged the whole pipeline — audio included — into a self-sustaining
+low-rate equilibrium it never left.
+
 Every out-of-tree plugin must be rebuilt: the plugin ABI went **12 → 14**.
+
+### Breaking
+
+- **A zenoh publish error drops the sample instead of ending the run** (#258).
+  A failed `put` returned `Err` from `ZenohSink::consume`, which the sink task
+  turned into `EndReason::Error` — so one transport fault ended a 24/7
+  publisher, and `publish_errors` was structurally bounded by one, which is why
+  #246 gave it no rate. It now counts the failure, warns on a 1st/10th/100th
+  ladder with a matching bus `Warning`, and carries on, for the same reason the
+  executor sheds a `PoolExhausted`: a dropped frame beats a dead live pipeline,
+  and on `@media` the frame was best-effort and droppable by contract anyway.
+  `ZenohSink::with_fatal_publish_errors(true)` (`fatal-publish-errors=true`
+  from a pipeline string) restores the old behaviour, which is what batch work
+  wants. Failing to *declare* the publisher stays fatal either way — that is a
+  configuration fault, not a hiccup. `publish_errors` is a real unbounded
+  counter now, with `publish_errors_per_second()` beside it.
+
+- **`ZenohSinkHandle::samples_sent`/`bytes_sent` are `samples_offered`/
+  `bytes_offered`** (#289), with deprecated shims. The old names promised
+  delivery the sink cannot observe: under `CongestionControl::Drop` — which the
+  `@media` profile pins, correctly — zenoh discards a sample inside its
+  transport when the queue is full and `put()` still returns `Ok`. Measured on
+  a shaped veth lab at 1.69 Mbps offered, a receiver got 44 of 255 sequences
+  over a 300 kbit link and 14 of 193 over a 100 kbit one, while every
+  sender-side counter read zero. There is no fix inside the sink — zenoh counts
+  transport drops only under its `stats` feature and only per *link*, never per
+  publisher, and `Block` would trade the loss for a stall behind the slowest
+  viewer — so delivery is a receiver-side measurement, and
+  `ZenohSrcHandle::last_frame_age()` is the second axis it needed.
+  `lost_wire()` says how much went missing; age says *why*, because the two
+  modes differ by orders of magnitude: congestion backs samples up behind a
+  full queue (medians of 3.5 s and 9.1 s in the same lab) while genuine
+  in-flight loss discards frames without delaying the survivors (0.77 ms while
+  losing 20 %). Only as good as the clock sync between the two machines, and
+  said so.
+
+- **A/V synchronization has one origin instead of two guesses** (#265).
+  Running time used to be `clock.now() - base_time`, where `base_time` was a
+  `ClockTime` snapshotted at `Executor::start` and copied into every element.
+  A flushing seek restarts every segment at running time zero while an
+  audio-provided master clock keeps counting monotonically upward, so after a
+  seek the two quantities no longer named the same instant — and each sink
+  papered over that on its own. `AutoVideoSink` pinned its first post-seek
+  frame's mapped time to whatever running time it happened to *arrive* at;
+  `AlsaSink` was entirely PTS-blind, with no `Event::Segment` arm at all, and
+  simply wrote whatever bytes it was handed. The post-seek A/V offset was
+  therefore the arrival skew between the two branches — a rebuilt openh264 and
+  a keyframe decode on one side against a freshly emptied device accepting a
+  buffer instantly on the other — and it stayed until the next seek re-rolled
+  it. Measured on the test rig: −130 ms at start-up, −330 ms after one seek,
+  430 ms worst across four.
+
+  `base_time` is now a shared, re-anchorable `SyncBase`, reachable through
+  `ProduceContext`/`ConsumeContext`. On the first in-segment buffer of each
+  flush generation exactly one designated **sync master** — the sink whose
+  element provided the selected clock — publishes
+  `base = clock_when_that_sample_is_heard − segment.to_running_time(pts)`;
+  every other sink reads it. A pipeline with no clock provider has no master
+  and the first sink to see data anchors it, which is what the old private
+  anchor did, only shared. A master that never arrives is waited out, so a
+  stalled audio branch cannot freeze the picture. `AutoVideoSink` presents at
+  `running_time >= segment.to_running_time(pts)` and nothing else.
+
+  API breaks: `set_clock` (on `AsyncElementDyn`, the author traits and both
+  contexts) takes a `SyncHandle` instead of a `ClockTime`; `base_time()` keeps
+  its name but reads the live shared cell; `FlushStopEvent` grew the seek
+  epoch that names the generation; `Demuxer` grew `take_downstream_event`.
+- **`Mp4SeekPoint.time_ns` is a composition time**, not a decode time (#265).
+  The seek tables are `stts`/`stss`, which are decode time, while `read_sample`
+  stamps `pts` from composition time — so the landing that becomes the
+  synthesized segment's `start`, the `SeekDone` position and the target every
+  non-reference track is re-sought to was on the wrong clock. On any B-frame
+  stream that put audio ahead of video by the reorder delay, 40–125 ms.
+- **`MkvDemux` reports a forward seek's landing** instead of `None`, and uses
+  it as the skip floor for every track (#265). Cues are video keyframes, so
+  the landing is knowable up front; it used to start audio at the requested
+  time and video at the next keyframe, up to a whole GOP apart.
+- **Audio sinks drop out-of-segment audio.** `AlsaSink` and `PipeWireSink`
+  clip head and tail sample-accurately; they previously played every byte they
+  were handed. A container seeks its non-reference tracks at-or-before the
+  reference keyframe on purpose, so the first post-seek audio buffer routinely
+  straddles `segment.start`.
+- **`with_loop` is no longer a silent rewind.** Both source-style demuxers
+  stage a `Segment` at the lap boundary, so running time stays monotonic
+  across it. Absolute pacing requires it: without the segment, lap two reads
+  as uniformly late and the picture freezes for good.
+- `AudioDecoder` gained a defaulted `reset()`. Out-of-tree decoders keep
+  compiling, but any with inter-packet state should override it — it is what a
+  flushing seek now calls.
 
 ### Added
 
@@ -390,97 +495,6 @@ Every out-of-tree plugin must be rebuilt: the plugin ABI went **12 → 14**.
   per pixel. `AutoVideoSink` could assume that because its caps admit nothing
   else, but shared it made a 320×240 `Rgb24` frame fail the check, fall through
   to the size guess, and report 278×207.
-
-### Breaking
-
-- **A zenoh publish error drops the sample instead of ending the run** (#258).
-  A failed `put` returned `Err` from `ZenohSink::consume`, which the sink task
-  turned into `EndReason::Error` — so one transport fault ended a 24/7
-  publisher, and `publish_errors` was structurally bounded by one, which is why
-  #246 gave it no rate. It now counts the failure, warns on a 1st/10th/100th
-  ladder with a matching bus `Warning`, and carries on, for the same reason the
-  executor sheds a `PoolExhausted`: a dropped frame beats a dead live pipeline,
-  and on `@media` the frame was best-effort and droppable by contract anyway.
-  `ZenohSink::with_fatal_publish_errors(true)` (`fatal-publish-errors=true`
-  from a pipeline string) restores the old behaviour, which is what batch work
-  wants. Failing to *declare* the publisher stays fatal either way — that is a
-  configuration fault, not a hiccup. `publish_errors` is a real unbounded
-  counter now, with `publish_errors_per_second()` beside it.
-
-- **`ZenohSinkHandle::samples_sent`/`bytes_sent` are `samples_offered`/
-  `bytes_offered`** (#289), with deprecated shims. The old names promised
-  delivery the sink cannot observe: under `CongestionControl::Drop` — which the
-  `@media` profile pins, correctly — zenoh discards a sample inside its
-  transport when the queue is full and `put()` still returns `Ok`. Measured on
-  a shaped veth lab at 1.69 Mbps offered, a receiver got 44 of 255 sequences
-  over a 300 kbit link and 14 of 193 over a 100 kbit one, while every
-  sender-side counter read zero. There is no fix inside the sink — zenoh counts
-  transport drops only under its `stats` feature and only per *link*, never per
-  publisher, and `Block` would trade the loss for a stall behind the slowest
-  viewer — so delivery is a receiver-side measurement, and
-  `ZenohSrcHandle::last_frame_age()` is the second axis it needed.
-  `lost_wire()` says how much went missing; age says *why*, because the two
-  modes differ by orders of magnitude: congestion backs samples up behind a
-  full queue (medians of 3.5 s and 9.1 s in the same lab) while genuine
-  in-flight loss discards frames without delaying the survivors (0.77 ms while
-  losing 20 %). Only as good as the clock sync between the two machines, and
-  said so.
-
-- **A/V synchronization has one origin instead of two guesses** (#265).
-  Running time used to be `clock.now() - base_time`, where `base_time` was a
-  `ClockTime` snapshotted at `Executor::start` and copied into every element.
-  A flushing seek restarts every segment at running time zero while an
-  audio-provided master clock keeps counting monotonically upward, so after a
-  seek the two quantities no longer named the same instant — and each sink
-  papered over that on its own. `AutoVideoSink` pinned its first post-seek
-  frame's mapped time to whatever running time it happened to *arrive* at;
-  `AlsaSink` was entirely PTS-blind, with no `Event::Segment` arm at all, and
-  simply wrote whatever bytes it was handed. The post-seek A/V offset was
-  therefore the arrival skew between the two branches — a rebuilt openh264 and
-  a keyframe decode on one side against a freshly emptied device accepting a
-  buffer instantly on the other — and it stayed until the next seek re-rolled
-  it. Measured on the test rig: −130 ms at start-up, −330 ms after one seek,
-  430 ms worst across four.
-
-  `base_time` is now a shared, re-anchorable `SyncBase`, reachable through
-  `ProduceContext`/`ConsumeContext`. On the first in-segment buffer of each
-  flush generation exactly one designated **sync master** — the sink whose
-  element provided the selected clock — publishes
-  `base = clock_when_that_sample_is_heard − segment.to_running_time(pts)`;
-  every other sink reads it. A pipeline with no clock provider has no master
-  and the first sink to see data anchors it, which is what the old private
-  anchor did, only shared. A master that never arrives is waited out, so a
-  stalled audio branch cannot freeze the picture. `AutoVideoSink` presents at
-  `running_time >= segment.to_running_time(pts)` and nothing else.
-
-  API breaks: `set_clock` (on `AsyncElementDyn`, the author traits and both
-  contexts) takes a `SyncHandle` instead of a `ClockTime`; `base_time()` keeps
-  its name but reads the live shared cell; `FlushStopEvent` grew the seek
-  epoch that names the generation; `Demuxer` grew `take_downstream_event`.
-- **`Mp4SeekPoint.time_ns` is a composition time**, not a decode time (#265).
-  The seek tables are `stts`/`stss`, which are decode time, while `read_sample`
-  stamps `pts` from composition time — so the landing that becomes the
-  synthesized segment's `start`, the `SeekDone` position and the target every
-  non-reference track is re-sought to was on the wrong clock. On any B-frame
-  stream that put audio ahead of video by the reorder delay, 40–125 ms.
-- **`MkvDemux` reports a forward seek's landing** instead of `None`, and uses
-  it as the skip floor for every track (#265). Cues are video keyframes, so
-  the landing is knowable up front; it used to start audio at the requested
-  time and video at the next keyframe, up to a whole GOP apart.
-- **Audio sinks drop out-of-segment audio.** `AlsaSink` and `PipeWireSink`
-  clip head and tail sample-accurately; they previously played every byte they
-  were handed. A container seeks its non-reference tracks at-or-before the
-  reference keyframe on purpose, so the first post-seek audio buffer routinely
-  straddles `segment.start`.
-- **`with_loop` is no longer a silent rewind.** Both source-style demuxers
-  stage a `Segment` at the lap boundary, so running time stays monotonic
-  across it. Absolute pacing requires it: without the segment, lap two reads
-  as uniformly late and the picture freezes for good.
-- `AudioDecoder` gained a defaulted `reset()`. Out-of-tree decoders keep
-  compiling, but any with inter-packet state should override it — it is what a
-  flushing seek now calls.
-
-### Fixed
 
 - `AudioDecoderElement` had no `handle_downstream_event` at all, so a seek
   never reset the wrapped decoder, its running `current_pts` carried the
