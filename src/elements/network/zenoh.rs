@@ -120,7 +120,7 @@ impl From<ZenohReliability> for zenoh::qos::Reliability {
 /// | | `Parallax` | `Media` |
 /// |---|---|---|
 /// | attachment | rkyv [`WireMetadata`] | CBOR [`FrameMeta`](crate::wire::FrameMeta) |
-/// | QoS default | Block / Data | best-effort · drop · interactive-high · express |
+/// | QoS default | Block / Data | best-effort · drop · interactive-high |
 /// | sequence | forwarded from the buffer | owned by the publisher |
 /// | wildcards | legal | refused |
 /// | keyframe flag | `SYNC_POINT` passthrough | derived from the bytes |
@@ -350,7 +350,11 @@ pub enum PublisherLoss {
 }
 
 /// Counters behind [`ZenohSrcHandle`], shared with the subscriber callback.
-#[derive(Debug, Default)]
+///
+/// Hand-written `Default` rather than derived: `last_frame_age_us` starts at
+/// `NO_FRAME_AGE`, and a derived zero would report every source as perfectly
+/// fresh before it had received anything.
+#[derive(Debug)]
 struct ZenohSrcCounters {
     bytes_received: RateMeter,
     samples_received: RateMeter,
@@ -377,6 +381,32 @@ struct ZenohSrcCounters {
     publisher_losses: AtomicU64,
     /// `Media` only: receive-timeout expiries, which produce no buffer.
     heartbeats: AtomicU64,
+    /// Microseconds between the last sample's HLC stamp and its arrival here,
+    /// or `NO_FRAME_AGE` when the sample carried no timestamp. See
+    /// [`ZenohSrcHandle::last_frame_age`].
+    last_frame_age_us: AtomicU64,
+}
+
+/// `last_frame_age_us` when nothing has been measured yet, or the publisher
+/// stamps nothing. A real age is never this large.
+const NO_FRAME_AGE: u64 = u64::MAX;
+
+impl Default for ZenohSrcCounters {
+    fn default() -> Self {
+        Self {
+            last_frame_age_us: AtomicU64::new(NO_FRAME_AGE),
+            bytes_received: RateMeter::default(),
+            samples_received: RateMeter::default(),
+            dropped_queue: AtomicU64::default(),
+            dropped_no_slot: AtomicU64::default(),
+            lost_wire: AtomicU64::default(),
+            dropped_pre_keyframe: AtomicU64::default(),
+            end_requested: AtomicBool::default(),
+            end_signal: tokio::sync::Notify::default(),
+            publisher_losses: AtomicU64::default(),
+            heartbeats: AtomicU64::default(),
+        }
+    }
 }
 
 /// Read-only runtime view of a [`ZenohSrc`] (#225).
@@ -444,6 +474,39 @@ impl ZenohSrcHandle {
         self.counters.publisher_losses.load(Ordering::Relaxed)
     }
 
+    /// How stale the last sample was when it arrived, or `None` if it carried
+    /// no timestamp (#289).
+    ///
+    /// # Why a receiver needs this next to [`lost_wire`](Self::lost_wire)
+    ///
+    /// Loss alone does not say *why* frames are missing, and no sender-side
+    /// counter can tell you — see
+    /// [`ZenohSinkHandle::samples_offered`](crate::control::ZenohSinkHandle::samples_offered).
+    /// Age discriminates the two modes cleanly, because they differ by orders
+    /// of magnitude: a link too narrow for the stream backs samples up behind
+    /// a full transport queue, so what arrives is *old* (medians of 3.5 s and
+    /// 9.1 s measured on a shaped link), while genuine in-flight packet loss
+    /// discards frames without delaying the survivors (0.77 ms while losing
+    /// 20 %). High loss plus high age is congestion — lower the bitrate. High
+    /// loss plus low age is a lossy path — that is a network problem.
+    ///
+    /// # The one caveat, and it is a real one
+    ///
+    /// The stamp is the **publisher's** HLC reading, so across machines this
+    /// is only as good as the clock sync between them: an unsynchronised pair
+    /// makes the number meaningless, and a publisher whose clock runs ahead
+    /// reads as `None` rather than as zero. Same-host and NTP-disciplined
+    /// deployments are where it can be trusted.
+    ///
+    /// Every session parallax opens enables zenoh session timestamping (#245),
+    /// so a parallax publisher always stamps. A foreign one need not.
+    pub fn last_frame_age(&self) -> Option<std::time::Duration> {
+        match self.counters.last_frame_age_us.load(Ordering::Relaxed) {
+            NO_FRAME_AGE => None,
+            us => Some(std::time::Duration::from_micros(us)),
+        }
+    }
+
     /// End this source's stream now (#224).
     ///
     /// The lever parallax exposes so an application can apply a policy
@@ -464,6 +527,21 @@ impl ZenohSrcHandle {
 
 /// `1, 10, 100, …` — the rate-limit ladder for drop warnings, matching the
 /// executor's shed reporting. A per-sample warning would bury everything else.
+/// How long ago the publisher stamped this sample, by the wall clocks at both
+/// ends (#289).
+///
+/// `None` when the sample carries no timestamp, or when its stamp is in the
+/// future — which is what an unsynchronised pair of clocks looks like, and is
+/// better reported as "unknown" than as a saturated zero.
+fn sample_age(sample: &zenoh::sample::Sample) -> Option<std::time::Duration> {
+    sample
+        .timestamp()?
+        .get_time()
+        .to_system_time()
+        .elapsed()
+        .ok()
+}
+
 fn is_power_of_ten(mut n: u64) -> bool {
     if n == 0 {
         return false;
@@ -815,6 +893,10 @@ impl ZenohSrc {
             .bytes_received
             .add_at(sample.payload().len() as u64, now);
         self.counters.samples_received.add_at(1, now);
+        self.counters.last_frame_age_us.store(
+            sample_age(&sample).map_or(NO_FRAME_AGE, |age| age.as_micros() as u64),
+            Ordering::Relaxed,
+        );
 
         if self.profile == WireProfile::Media {
             return self.media_sample_to_buffer(sample);
@@ -1255,10 +1337,16 @@ pub enum ZenohDemandEvent {
 /// listener's callback.
 #[derive(Debug, Default)]
 struct ZenohSinkCounters {
-    bytes_sent: RateMeter,
-    samples_sent: RateMeter,
+    /// *Offered*, not delivered — see [`ZenohSinkHandle::samples_offered`].
+    bytes_offered: RateMeter,
+    samples_offered: RateMeter,
     keyframes_sent: AtomicU64,
-    publish_errors: AtomicU64,
+    /// A `RateMeter` since #258 made publish errors non-fatal: until then the
+    /// count was structurally bounded by one, so a rate meant nothing.
+    publish_errors: RateMeter,
+    /// Failures since the last success, for the warn ladder. Not exported: a
+    /// burst that recovered is not a figure anyone reads.
+    consecutive_publish_errors: AtomicU64,
     /// Whether anyone is currently subscribed.
     has_viewers: AtomicBool,
     rising_edges: AtomicU64,
@@ -1363,20 +1451,76 @@ impl ZenohSinkHandle {
         self.counters.keyframe_requests.load(Ordering::Relaxed)
     }
 
+    /// Samples handed to zenoh — **offered, not delivered** (#289).
+    ///
+    /// # No sender-side counter can see a transport drop
+    ///
+    /// Under [`ZenohCongestionControl::Drop`] — which the `@media` profile
+    /// pins, and which is the right choice for live video — `put()` returns
+    /// `Ok` whether or not the sample reaches the wire. Zenoh discards it
+    /// internally when its queue is full, and there is no API to read that
+    /// back: zenoh counts transport drops only under its own `stats` cargo
+    /// feature, and only per **link**, never per publisher, so one session
+    /// with many publishers cannot attribute a link-level number to a sink.
+    /// [`Block`](ZenohCongestionControl::Block) would convert the loss into
+    /// back-pressure and make it visible, but that stalls the pipeline behind
+    /// the slowest viewer, which is the opposite trade for live video.
+    ///
+    /// So on a congested link this and *delivered* diverge silently and
+    /// enormously. Measured on a shaped veth lab at 1.69 Mbps offered: a
+    /// receiver saw 44 of 255 sequences over a 300 kbit link and 14 of 193
+    /// over a 100 kbit one, while every sender-side counter — this one,
+    /// [`bytes_offered`](Self::bytes_offered),
+    /// [`publish_errors`](Self::publish_errors) — read what it always reads.
+    ///
+    /// # What does work
+    ///
+    /// The **receiver**, on two axes at once:
+    /// [`ZenohSrcHandle::lost_wire`] counts gaps in `FrameMeta.sequence`, and
+    /// [`ZenohSrcHandle::last_frame_age`] says how stale the samples that did
+    /// arrive were. The pair distinguishes the two failure modes, which loss
+    /// alone cannot: in the same lab, congestion showed median frame ages of
+    /// 3.5 s and 9.1 s, while genuine in-flight loss on a lossy link showed
+    /// 0.77 ms while losing 20 % of frames. Three orders of magnitude apart,
+    /// with sender counters at zero in every case.
+    pub fn samples_offered(&self) -> u64 {
+        self.counters.samples_offered.total()
+    }
+
+    /// Payload bytes handed to zenoh — offered, not delivered. See
+    /// [`samples_offered`](Self::samples_offered).
+    pub fn bytes_offered(&self) -> u64 {
+        self.counters.bytes_offered.total()
+    }
+
     /// Samples published.
+    #[deprecated(
+        since = "0.8.0",
+        note = "renamed to `samples_offered` (#289): \
+        under `CongestionControl::Drop` this counts what was handed to zenoh, \
+        not what reached the wire"
+    )]
     pub fn samples_sent(&self) -> u64 {
-        self.counters.samples_sent.total()
+        self.samples_offered()
     }
 
     /// Payload bytes published.
+    #[deprecated(
+        since = "0.8.0",
+        note = "renamed to `bytes_offered` (#289): \
+        under `CongestionControl::Drop` this counts what was handed to zenoh, \
+        not what reached the wire"
+    )]
     pub fn bytes_sent(&self) -> u64 {
-        self.counters.bytes_sent.total()
+        self.bytes_offered()
     }
 
-    /// Samples published per second, smoothed over
+    /// Samples offered per second, smoothed over
     /// [`RATE_WINDOW`](crate::control::RATE_WINDOW).
+    ///
+    /// Keeps its name: a rate makes no delivery claim that the total does not.
     pub fn samples_per_second(&self) -> f64 {
-        self.counters.samples_sent.per_second()
+        self.counters.samples_offered.per_second()
     }
 
     /// Published bitrate in bits per second, smoothed over
@@ -1387,7 +1531,7 @@ impl ZenohSinkHandle {
     /// sees. It is the figure comparable to an encoder's
     /// [`bits_per_second`](crate::control::EncoderStatsHandle::bits_per_second).
     pub fn bits_per_second(&self) -> f64 {
-        self.counters.bytes_sent.per_second() * 8.0
+        self.counters.bytes_offered.per_second() * 8.0
     }
 
     /// Samples published carrying a decoder entry point.
@@ -1397,16 +1541,31 @@ impl ZenohSinkHandle {
         self.counters.keyframes_sent.load(Ordering::Relaxed)
     }
 
-    /// Publishes that failed.
+    /// Publishes that failed, and were dropped.
     ///
-    /// **Not a congestion signal, and bounded by one.** Under
-    /// [`ZenohCongestionControl::Drop`] — which the `@media` profile pins — a
-    /// congested link drops the sample and returns success, and zenoh offers no
-    /// way to read that back. So this counts session and transport faults only.
-    /// A failed publish is also fatal to the sink task, so the count cannot
-    /// exceed one before the run ends; there is deliberately no rate.
+    /// **Not a congestion signal.** Under [`ZenohCongestionControl::Drop`] —
+    /// which the `@media` profile pins — a congested link discards the sample
+    /// inside zenoh's transport and returns *success*, and zenoh offers no way
+    /// to read that back. So this counts session and transport faults only,
+    /// never the far more common loss. See
+    /// [`samples_offered`](Self::samples_offered) for what can and cannot be
+    /// observed from this end.
+    ///
+    /// It is a real, unbounded count since #258: a failed publish drops the
+    /// sample rather than ending the run, unless the sink was built with
+    /// [`with_fatal_publish_errors`](ZenohSink::with_fatal_publish_errors).
     pub fn publish_errors(&self) -> u64 {
-        self.counters.publish_errors.load(Ordering::Relaxed)
+        self.counters.publish_errors.total()
+    }
+
+    /// Failed publishes per second, smoothed over
+    /// [`RATE_WINDOW`](crate::control::RATE_WINDOW).
+    ///
+    /// A rate is the useful shape here: a session that is broken fails on
+    /// every buffer, so the count climbs with the framerate and only the rate
+    /// distinguishes "one hiccup" from "the link is gone".
+    pub fn publish_errors_per_second(&self) -> f64 {
+        self.counters.publish_errors.per_second()
     }
 }
 
@@ -1440,6 +1599,9 @@ pub struct ZenohSink {
     congestion_control: ZenohCongestionControl,
     priority: ZenohPriority,
     express: bool,
+    /// #258: whether a failed `put` ends the run. Off — a live publisher
+    /// outlives a transport hiccup.
+    fatal_publish_errors: bool,
     #[cfg(feature = "zenoh-unstable")]
     reliability: Option<ZenohReliability>,
     encoding: Option<zenoh::bytes::Encoding>,
@@ -1506,6 +1668,7 @@ impl ZenohSink {
             congestion_control: ZenohCongestionControl::Block,
             priority: ZenohPriority::Data,
             express: false,
+            fatal_publish_errors: false,
             #[cfg(feature = "zenoh-unstable")]
             reliability: None,
             encoding: None,
@@ -1535,9 +1698,28 @@ impl ZenohSink {
     /// Publish on the `@media` plane.
     ///
     /// Applies the plane's `frame` QoS profile — best-effort, drop,
-    /// interactive-high, express — because a stale frame is worthless and the
-    /// encoder must never block. A plain declared publisher, never an
+    /// interactive-high — because a stale frame is worthless and the encoder
+    /// must never block. A plain declared publisher, never an
     /// AdvancedPublisher: recovering a superseded frame is anti-useful.
+    ///
+    /// # Express is deliberately off (#262)
+    ///
+    /// It was on until zenkey RFC v1.26 M1 removed it from this profile, and
+    /// the reasoning above never implied it: *a stale frame is worthless* is
+    /// [`Drop`](ZenohCongestionControl::Drop) plus
+    /// [`InteractiveHigh`](ZenohPriority::InteractiveHigh), and *the encoder
+    /// must never block* is best-effort plus drop. Express is a third,
+    /// independent axis — **do not wait to batch** — and batching engages only
+    /// under back-pressure, so express is a no-op on an unsaturated link and
+    /// spends per-message framing at exactly the moment a `drop` profile
+    /// should be shedding instead. The `alert` profile keeps it, because
+    /// rare-and-must-arrive is the case it is for.
+    ///
+    /// [`with_express(true)`](Self::with_express) still turns it back on: the
+    /// three QoS axes are a deployment's to tune, unlike
+    /// [`without_metadata`](Self::without_metadata) and
+    /// [`with_forward_custom_keys`](Self::with_forward_custom_keys), which
+    /// change the wire contract and are refused on this plane.
     ///
     /// The key must be a concrete tier key. Wildcards are refused rather than
     /// warned about: publishing under one is a lie about identity, and
@@ -1565,7 +1747,11 @@ impl ZenohSink {
         // The plane's `frame` QoS profile.
         sink.congestion_control = ZenohCongestionControl::Drop;
         sink.priority = ZenohPriority::InteractiveHigh;
-        sink.express = true;
+        // Off, and stated rather than left to the struct default: the three
+        // lines above pin the other axes, so a silent absence here would read
+        // as an oversight and invite someone to "fix" it. See the doc above
+        // for why express is not part of this profile (#262).
+        sink.express = false;
         #[cfg(feature = "zenoh-unstable")]
         {
             sink.reliability = Some(ZenohReliability::BestEffort);
@@ -1587,6 +1773,25 @@ impl ZenohSink {
     /// Which wire contract this sink speaks.
     pub fn profile(&self) -> WireProfile {
         self.profile
+    }
+
+    /// The congestion control this sink will declare its publisher with.
+    pub fn congestion_control(&self) -> ZenohCongestionControl {
+        self.congestion_control
+    }
+
+    /// The priority this sink will declare its publisher with.
+    pub fn priority(&self) -> ZenohPriority {
+        self.priority
+    }
+
+    /// Whether this sink will declare its publisher as express.
+    ///
+    /// Readable because the QoS axes are precisely what a conformance check
+    /// wants to compare against the profile it expects (#262) — without a
+    /// getter the only way to observe them is a packet capture.
+    pub fn express(&self) -> bool {
+        self.express
     }
 
     /// Ask upstream for a decoder entry point (#213, #234).
@@ -1637,6 +1842,29 @@ impl ZenohSink {
     /// links where batching wins.
     pub fn with_express(mut self, express: bool) -> Self {
         self.express = express;
+        self
+    }
+
+    /// End the run when a publish fails, instead of dropping and counting it
+    /// (#258).
+    ///
+    /// Off by default. A live publisher — a camera republishing to `@media`,
+    /// a 24/7 sensor — should outlive a transport fault the same way the
+    /// executor sheds a `PoolExhausted` rather than tearing the graph down: a
+    /// dropped frame beats a dead pipeline, and the frame was best-effort and
+    /// droppable by contract anyway. Every failure is counted
+    /// ([`publish_errors`](ZenohSinkHandle::publish_errors)) and warned about
+    /// on a 1st/10th/100th ladder, so it is never silent.
+    ///
+    /// Turn it on for batch work, where a publish that did not happen means
+    /// the output is incomplete and finishing quietly is worse than failing.
+    ///
+    /// This covers **per-sample** failures only. Failing to *declare* the
+    /// publisher — an invalid key expression, a session that will not open —
+    /// stays fatal either way: that is a configuration fault, not a hiccup,
+    /// and retrying it per buffer would spin.
+    pub fn with_fatal_publish_errors(mut self, fatal: bool) -> Self {
+        self.fatal_publish_errors = fatal;
         self
     }
 
@@ -1698,21 +1926,35 @@ impl ZenohSink {
         &self.key_expr
     }
 
+    /// Payload bytes handed to zenoh — offered, not delivered (#289). See
+    /// [`ZenohSinkHandle::samples_offered`] for why the distinction matters.
+    pub fn bytes_offered(&self) -> u64 {
+        self.counters.bytes_offered.total()
+    }
+
+    /// Samples handed to zenoh — offered, not delivered (#289). See
+    /// [`ZenohSinkHandle::samples_offered`].
+    pub fn samples_offered(&self) -> u64 {
+        self.counters.samples_offered.total()
+    }
+
     /// Get the number of bytes sent.
+    #[deprecated(since = "0.8.0", note = "renamed to `bytes_offered` (#289)")]
     pub fn bytes_sent(&self) -> u64 {
-        self.counters.bytes_sent.total()
+        self.bytes_offered()
     }
 
     /// Get the number of samples sent.
+    #[deprecated(since = "0.8.0", note = "renamed to `samples_offered` (#289)")]
     pub fn samples_sent(&self) -> u64 {
-        self.counters.samples_sent.total()
+        self.samples_offered()
     }
 
     /// Get statistics.
     pub fn stats(&self) -> ZenohStats {
         ZenohStats {
-            bytes_transferred: self.bytes_sent(),
-            samples: self.samples_sent(),
+            bytes_transferred: self.bytes_offered(),
+            samples: self.samples_offered(),
         }
     }
 
@@ -1884,10 +2126,47 @@ impl ZenohSink {
             .put(Vec::new())
             .attachment(attachment)
             .await
-            .map_err(|e| {
-                self.counters.publish_errors.fetch_add(1, Ordering::Relaxed);
-                Error::Element(format!("Zenoh terminal put error: {e}"))
-            })
+            .map_err(|e| Error::Element(format!("Zenoh terminal put error: {e}")))
+    }
+
+    /// Count a failed publish, warn on the ladder, and decide whether it ends
+    /// the run (#258).
+    ///
+    /// `Ok(())` — drop the sample and carry on — unless
+    /// [`with_fatal_publish_errors`](Self::with_fatal_publish_errors) is set.
+    /// The warn and the bus message are rate-limited to the 1st, 10th, 100th
+    /// consecutive failure: a broken session fails on *every* buffer, so a
+    /// message each would bury everything else in the log.
+    fn record_publish_error(&self, ctx: &ConsumeContext<'_>, error: zenoh::Error) -> Result<()> {
+        let now = std::time::Instant::now();
+        self.counters.publish_errors.add_at(1, now);
+        let total = self.counters.publish_errors.total();
+        let consecutive = self
+            .counters
+            .consecutive_publish_errors
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+
+        if self.fatal_publish_errors {
+            return Err(Error::Element(format!("Zenoh put error: {error}")));
+        }
+
+        if is_power_of_ten(consecutive) {
+            tracing::warn!(
+                "{}: publish failed, dropping the sample ({consecutive} in a row, {total} \
+                 total): {error}",
+                self.name
+            );
+            ctx.post_message(crate::pipeline::bus::MessageKind::Warning {
+                warning: format!(
+                    "{}: dropping samples, publish failed ({consecutive} in a row, {total} \
+                     total)",
+                    self.name
+                ),
+                debug: Some(error.to_string()),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -1957,13 +2236,15 @@ impl AsyncSink for ZenohSink {
         };
 
         if let Err(e) = put.await {
-            self.counters.publish_errors.fetch_add(1, Ordering::Relaxed);
-            return Err(Error::Element(format!("Zenoh put error: {e}")));
+            return self.record_publish_error(ctx, e);
         }
+        self.counters
+            .consecutive_publish_errors
+            .store(0, Ordering::Relaxed);
 
         let now = std::time::Instant::now();
-        self.counters.bytes_sent.add_at(len as u64, now);
-        self.counters.samples_sent.add_at(1, now);
+        self.counters.bytes_offered.add_at(len as u64, now);
+        self.counters.samples_offered.add_at(1, now);
         if keyframe {
             self.counters.keyframes_sent.fetch_add(1, Ordering::Relaxed);
         }

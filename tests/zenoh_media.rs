@@ -23,7 +23,7 @@ use std::time::Duration;
 use parallax::buffer::{Buffer, MemoryHandle};
 use parallax::codec::annexb::{self, NalCodec};
 use parallax::element::{AsyncSink, AsyncSource, ConsumeContext, ProduceContext, ProduceResult};
-use parallax::elements::{ZenohSink, ZenohSrc};
+use parallax::elements::{ZenohCongestionControl, ZenohPriority, ZenohSink, ZenohSrc};
 use parallax::format::VideoCodec;
 use parallax::memory::SharedArena;
 use parallax::metadata::{BufferFlags, Metadata};
@@ -490,6 +490,28 @@ async fn media_refuses_the_parallax_plane_s_options() {
     );
 }
 
+/// #262: the `frame` QoS profile is best-effort, drop, interactive-high — and
+/// **not** express, which zenkey RFC v1.26 M1 removed from it. A consumer
+/// validating against that convention compares exactly these axes, so they are
+/// pinned here rather than left to a packet capture.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_media_profile_sets_the_frame_qos_axes() {
+    let (pub_session, _sub) = session_pair().await;
+    let key = unique_key("video/h264/high");
+
+    let sink = ZenohSink::media_with_session(pub_session.clone(), &key)
+        .await
+        .expect("media sink");
+
+    assert_eq!(sink.congestion_control(), ZenohCongestionControl::Drop);
+    assert_eq!(sink.priority(), ZenohPriority::InteractiveHigh);
+    assert!(!sink.express(), "RFC v1.26 M1 removed express from `frame`");
+
+    // Still a deployment's to tune, unlike the two wire-contract options the
+    // test above proves are refused.
+    assert!(sink.with_express(true).express());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_foreign_publisher_does_not_break_the_subscriber() {
     // Something publishing plain bytes on a media key: not conformant, but a
@@ -611,11 +633,70 @@ async fn the_handle_counts_what_was_published() {
         .await
         .expect("publish");
 
-    assert_eq!(stats.samples_sent(), 1);
-    assert!(stats.bytes_sent() > 0);
+    assert_eq!(stats.samples_offered(), 1);
+    assert!(stats.bytes_offered() > 0);
     // Meaningful since #246: the error path increments this now. It used to
     // have no writer at all, so the assertion passed vacuously.
     assert_eq!(stats.publish_errors(), 0);
+}
+
+/// #258: a transport fault drops the sample and counts it. A camera
+/// republishing to `@media` must outlive one, the same way the executor sheds
+/// a `PoolExhausted` rather than tearing the graph down.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_publish_drops_the_sample_and_keeps_going() {
+    let (pub_session, _sub) = session_pair().await;
+    let key = unique_key("video/h264/high");
+
+    let mut sink = ZenohSink::media_with_session(pub_session.clone(), &key)
+        .await
+        .expect("media sink");
+    let stats = sink.control();
+    sink.ensure_publisher().await.expect("publisher");
+
+    // Closing the session under the publisher is the cheapest real transport
+    // fault: the key expression stays valid, so this exercises the `put` arm
+    // and not the declaration one, which is still fatal on purpose.
+    pub_session.close().await.expect("close");
+
+    let mut meta = Metadata::new();
+    meta.flags |= BufferFlags::SYNC_POINT;
+    for _ in 0..3 {
+        sink.consume(&ConsumeContext::new(&buffer(&keyframe_au(), meta.clone())))
+            .await
+            .expect("a publish failure must not end the run");
+    }
+
+    assert_eq!(stats.publish_errors(), 3, "every failure is counted");
+    assert!(
+        stats.publish_errors_per_second() > 0.0,
+        "the counter has a meaningful rate now that it is unbounded"
+    );
+    assert_eq!(stats.samples_offered(), 0, "nothing was handed to the wire");
+}
+
+/// The opt-in that batch work wants: a publish that did not happen means the
+/// output is incomplete, and finishing quietly is worse than failing.
+#[tokio::test(flavor = "multi_thread")]
+async fn with_fatal_publish_errors_a_failed_publish_still_ends_the_run() {
+    let (pub_session, _sub) = session_pair().await;
+    let key = unique_key("video/h264/high");
+
+    let mut sink = ZenohSink::media_with_session(pub_session.clone(), &key)
+        .await
+        .expect("media sink")
+        .with_fatal_publish_errors(true);
+    sink.ensure_publisher().await.expect("publisher");
+    pub_session.close().await.expect("close");
+
+    let mut meta = Metadata::new();
+    meta.flags |= BufferFlags::SYNC_POINT;
+    assert!(
+        sink.consume(&ConsumeContext::new(&buffer(&keyframe_au(), meta)))
+            .await
+            .is_err(),
+        "the opt-in must still fail the sink task"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -685,6 +766,48 @@ async fn the_three_drop_counters_mean_different_things() {
     assert_eq!(stats.dropped_no_slot(), 0, "slots were available");
     assert_eq!(stats.samples_received(), 2);
     assert!(stats.bytes_received() > 0);
+}
+
+/// #289: the receiver can read how stale a sample was, which is the axis that
+/// separates congestion from in-flight loss — and which no sender-side counter
+/// can see at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_receiver_reads_how_stale_the_last_sample_was() {
+    let (pub_session, sub_session) = session_pair().await;
+    let key = unique_key("video/h264/high");
+
+    let mut src = ZenohSrc::media_with_session(sub_session.clone(), &key)
+        .await
+        .expect("media source");
+    let stats = src.control();
+    assert_eq!(
+        stats.last_frame_age(),
+        None,
+        "nothing measured is not the same as fresh"
+    );
+
+    let mut sink = ZenohSink::media_with_session(pub_session.clone(), &key)
+        .await
+        .expect("media sink");
+    settle(&pub_session, &sub_session).await;
+
+    let mut meta = Metadata::new();
+    meta.flags |= BufferFlags::SYNC_POINT;
+    sink.consume(&ConsumeContext::new(&buffer(&keyframe_au(), meta)))
+        .await
+        .expect("publish");
+    let _ = next_buffer(&mut src).await;
+
+    // Both ends share this machine's clock, so the age is a real elapsed time
+    // over a unix socket. Bounded generously: the assertion worth making is
+    // that it is a plausible transit, not a fixed number.
+    let age = stats
+        .last_frame_age()
+        .expect("a parallax publisher always stamps (#245)");
+    assert!(
+        age < Duration::from_secs(5),
+        "a sample that just crossed a unix socket cannot be {age:?} old"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1157,7 +1280,7 @@ async fn the_handle_counts_keyframes_separately_from_samples() {
         .await
         .expect("publish delta");
 
-    assert_eq!(stats.samples_sent(), 2);
+    assert_eq!(stats.samples_offered(), 2);
     assert_eq!(
         stats.keyframes_sent(),
         1,
@@ -1205,7 +1328,7 @@ async fn the_send_rate_rises_with_published_samples_and_decays_when_publishing_s
         "a stalled publisher must read as stalled: {publishing:.1} -> {stopped:.3} /s"
     );
     assert_eq!(
-        stats.samples_sent(),
+        stats.samples_offered(),
         30,
         "the counter does not decay — that is the point of keeping both"
     );

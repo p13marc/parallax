@@ -64,13 +64,20 @@ The `@media` profile fixes the plane's `frame` profile, and
 | Reliability | best-effort | A retransmitted frame arrives after the frame that replaced it. |
 | Congestion control | **drop** | The encoder must never block on the network. |
 | Priority | interactive-high | Ahead of telemetry, behind control. |
-| Express | on | No batching delay for a frame that is already whole. |
+| Express | **off** | Batching engages only under back-pressure, so express buys nothing on an unsaturated link and costs per-message framing on a saturated one. |
 | Publisher | plain declared | Never an `AdvancedPublisher` — recovering a superseded frame is anti-useful. |
 
-Turn **express off** on a constrained link: batching costs a few milliseconds
-and buys back header overhead, which matters more than latency when the link is
-the bottleneck. That is the one knob in this table worth changing per
-deployment.
+Express was on until zenkey RFC v1.26 M1 removed it from this profile (#262),
+and the removal is right: batching costs a few milliseconds and buys back
+header overhead, which matters more than latency when the link is the
+bottleneck — and a link that is *not* the bottleneck never batches in the first
+place, so express changes nothing there. The axis M1 draws is
+rare-and-must-arrive versus continuous-and-sheddable: `frame` is the second and
+loses express, `alert` is the first and keeps it.
+
+`ZenohSink::with_express(true)` still turns it back on — the three QoS axes are
+a deployment's to tune, and they are applied after the profile, from the
+pipeline-string API too (`zenohsink profile=media express=true`).
 
 On the **parallax plane** the defaults are the opposite — `Block` and `Data` —
 because that plane is used for links where losing a buffer is a bug, and where

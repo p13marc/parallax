@@ -85,9 +85,9 @@ Feature-gated:
 |---|---|---|
 | `rtspsrc` | `rtsp` | `location` (req), `transport` = tcp\|udp, `timeout-ms`, `video-only`, `audio-only`, `skip-until-keyframe`, `reconnect` (bool, **default true**), `reconnect-max-retries`, `reconnect-initial-backoff-ms`, `reconnect-max-backoff-ms` |
 | `zenohsrc` | `zenoh` | `key` (req), `profile` = parallax\|media, `resync-on-discont`, `timeout-ms` (heartbeat, keeps the stream open), `stream-timeout-ms` (ends it), `on-publisher-loss` = wait\|eos |
-| `zenohsink` | `zenoh` | `key` (req), `profile` = parallax\|media, `congestion` = block\|drop, `priority`, `express` |
+| `zenohsink` | `zenoh` | `key` (req), `profile` = parallax\|media, `congestion` = block\|drop, `priority`, `express`, `fatal-publish-errors` |
 
-`profile=media` selects the `@media` plane: the codec comes from the key expression (so caps are known before the first sample), the attachment is a CBOR `FrameMeta`, the QoS profile is fixed, and wildcards are refused. Both zenoh elements share one process-wide session, opened on first use and configurable with `PARALLAX_ZENOH_CONFIG`. Every session parallax opens enables zenoh **session timestamping** (#245) — the `@media` plane's `FrameMeta` carries no wallclock, so the HLC stamp on the sample is a consumer's only clock for frame age. An operator's config file wins, and gets one warning if it turns timestamping off.
+`profile=media` selects the `@media` plane: the codec comes from the key expression (so caps are known before the first sample), the attachment is a CBOR `FrameMeta`, the QoS profile is set (best-effort, drop, interactive-high — **not** express since #262, though `express=true` still overrides it), and wildcards are refused. Both zenoh elements share one process-wide session, opened on first use and configurable with `PARALLAX_ZENOH_CONFIG`. Every session parallax opens enables zenoh **session timestamping** (#245) — the `@media` plane's `FrameMeta` carries no wallclock, so the HLC stamp on the sample is a consumer's only clock for frame age. An operator's config file wins, and gets one warning if it turns timestamping off.
 
 Not registered (use the programmatic API): mux/demux elements (the linear grammar cannot name pads), closure-taking transforms, `AppSrc`/`AppSink`, v4l2-m2m and Vulkan hardware codecs.
 
@@ -433,8 +433,8 @@ Every controllable element implements `Controllable`, so the accessor is always 
 | `ValveControl` | `Valve::control()` | `open()` / `close()` |
 | `GainControl` | `Gain::control()` | `set_factor(f)` / `set_db(db)`, `factor()` / `db()` |
 | `FlowStateHandle` | `Pipeline::monitor_link` | backpressure signalling to live sources |
-| `ZenohSinkHandle` | `ZenohSink::control()` `[zenoh]` | *read-only* except `request_keyframe()`: `has_viewers`, rise/fall edge counters, `samples_sent`/`bytes_sent` + their rates, `keyframes_sent`, `publish_errors` |
-| `ZenohSrcHandle` | `ZenohSrc::control()` `[zenoh]` | *read-only*: `samples_received`/`bytes_received` + their rates, three distinct drop counters, `lost_wire`, `publisher_losses`; plus `end_stream()` |
+| `ZenohSinkHandle` | `ZenohSink::control()` `[zenoh]` | *read-only* except `request_keyframe()`: `has_viewers`, rise/fall edge counters, `samples_offered`/`bytes_offered` + their rates, `keyframes_sent`, `publish_errors` + its rate |
+| `ZenohSrcHandle` | `ZenohSrc::control()` `[zenoh]` | *read-only*: `samples_received`/`bytes_received` + their rates, three distinct drop counters, `lost_wire`, `last_frame_age`, `publisher_losses`; plus `end_stream()` |
 | `Queue2RangesHandle` | `Queue2::control()` (download mode) | *read-only*: downloaded byte ranges, total, write position |
 | `AppSinkHandle` / `AppSrcHandle` | `AppSink::handle()` / `AppSrc::handle()` | async-first `pull_buffer`/`push_buffer` (+`_timeout`; `*_blocking` twins for plain threads), `try_pull_buffer`/`try_push_buffer`, `stats()` |
 | `FrameMailbox` | `AppVideoSink::mailbox()` | `clock()` → `PresentationClock` (`None` until the first buffer — an element only sees the clock through its consume context), `take_due(now, max_lateness)`, `next_due()`, `stats()` → `FrameStats` (presented/late/stale/full/clipped), `end_reason()`, `doorbell()`, `id()` (process-unique, so a rebuilt pipeline cannot be mistaken for the old one) |
@@ -481,13 +481,14 @@ last value; counters do not decay, which is why you want both.
 | `EncoderStatsHandle` | `bytes_encoded()` | `bits_per_second()` — the same units as `EncoderControl::set_bitrate`, so the two are directly comparable |
 | `EncoderStatsHandle` | `frames_dropped_by_rc()` | `rc_drops_per_second()` |
 | `EncoderStatsHandle` | `last_encode_ns()` — one sample | `encode_latency()` → `EncodeLatency` — a **distribution**, not a rate: p50/p95/p99 + min/max, all-time, each quantised **up** to its bucket (≤19% high, never low) |
-| `ZenohSinkHandle` | `samples_sent()` | `samples_per_second()` |
-| `ZenohSinkHandle` | `bytes_sent()` | `bits_per_second()` — payload only, excluding zenoh framing and the CBOR attachment |
+| `ZenohSinkHandle` | `samples_offered()` | `samples_per_second()` — **offered, not delivered** (#289): under `CongestionControl::Drop` zenoh discards a sample internally and `put()` still returns success, so on a congested link this and *delivered* diverge silently. No sender-side counter can see the difference; the receiver's `lost_wire()` and `last_frame_age()` can |
+| `ZenohSinkHandle` | `bytes_offered()` | `bits_per_second()` — payload only, excluding zenoh framing and the CBOR attachment; offered, not delivered |
 | `ZenohSinkHandle` | `keyframes_sent()` | *none* — one per GOP is not a figure anyone reads per second |
-| `ZenohSinkHandle` | `publish_errors()` | *none* — a failed publish is fatal to the sink task, so the count cannot exceed one. It is also **not** a congestion signal: under `CongestionControl::Drop`, which the `@media` profile pins, a congested link drops the sample and returns success |
+| `ZenohSinkHandle` | `publish_errors()` | `publish_errors_per_second()` — real and unbounded since #258, where a failed publish began dropping the sample rather than ending the run (`with_fatal_publish_errors(true)` restores that). Still **not** a congestion signal: under `CongestionControl::Drop`, which the `@media` profile pins, a congested link drops the sample and returns success |
 | `ZenohSinkHandle` | `keyframe_requests()`, `rising_edges()`, `falling_edges()` | *none* |
 | `ZenohSrcHandle` | `samples_received()` | `samples_per_second()` |
 | `ZenohSrcHandle` | `bytes_received()` | `bits_per_second()` — payload only, so it is comparable across the wire to the publisher's own figure; the gap between them is loss |
+| `ZenohSrcHandle` | `last_frame_age()` | *is* the smoothing-free reading: how stale the last sample was on arrival. Paired with `lost_wire()` it separates congestion (high loss, seconds of age) from in-flight packet loss (high loss, sub-millisecond age) — the distinction the sender cannot make. Only as good as the clock sync between the two machines |
 | `ZenohSrcHandle` | `dropped_queue()`, `dropped_no_slot()`, `lost_wire()`, `dropped_pre_keyframe()`, `publisher_losses()`, `heartbeats()` | *none* — these mean deliberately different things and point at different machines (too slow / arena undersized / never arrived); a smoothed version of any of them says less, not more |
 
 A distribution rather than `last_encode_ns` alone because a single last value
