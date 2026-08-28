@@ -298,24 +298,42 @@ impl FrameMailbox {
     /// Discards stale generations and frames later than `max_lateness`,
     /// counting both. Returns `None` when the next frame is not due yet — ask
     /// [`next_due`](Self::next_due) when to come back.
+    ///
+    /// **Every path that frees a slot rings the space doorbell**, not just the
+    /// one that hands a frame back. A host that has fallen behind drains the
+    /// ring entirely by dropping frames as late and returns `None` from here —
+    /// and the producer is parked on that doorbell with a `shed_after`
+    /// deadline behind it. Waking it only when a frame came out cost the video
+    /// branch a full deadline per frame in exactly the case where it was
+    /// already behind, which is self-reinforcing.
     pub fn take_due(&self, now: ClockTime, max_lateness: Duration) -> Option<PacedFrame> {
         let generation = self.generation();
         let mut state = self.lock();
+        // Whether a slot came free, by any route.
+        let mut freed = false;
         let taken = loop {
-            let front = state.queue.front()?;
+            let Some(front) = state.queue.front() else {
+                break None;
+            };
             if front.generation < generation {
                 let _ = state.queue.pop_front();
+                freed = true;
                 state.stats.dropped_stale += 1;
                 continue;
             }
             if front.must_present {
+                freed = true;
                 break state.queue.pop_front();
             }
             match schedule(front.target, now, max_lateness) {
-                Pace::Present => break state.queue.pop_front(),
-                Pace::Wait(_) => return None,
+                Pace::Present => {
+                    freed = true;
+                    break state.queue.pop_front();
+                }
+                Pace::Wait(_) => break None,
                 Pace::DropLate { late_ns } => {
                     let _ = state.queue.pop_front();
+                    freed = true;
                     state.stats.dropped_late += 1;
                     state.stats.worst_late_ns = state.stats.worst_late_ns.max(late_ns);
                 }
@@ -326,7 +344,9 @@ impl FrameMailbox {
             state.last = Some(frame.clone());
         }
         drop(state);
-        self.space.notify_one();
+        if freed {
+            self.space.notify_one();
+        }
         taken
     }
 
@@ -392,10 +412,21 @@ impl FrameMailbox {
     }
 
     /// Enqueue, evicting the oldest frame to make room.
-    pub(crate) fn push_evicting(&self, frame: PacedFrame) {
+    pub(crate) fn push_evicting(&self, mut frame: PacedFrame) {
         let mut state = self.lock();
         while state.queue.len() >= self.capacity {
-            let _ = state.queue.pop_front();
+            if let Some(evicted) = state.queue.pop_front()
+                && evicted.must_present
+                && evicted.generation == frame.generation
+            {
+                // "The first frame of a generation goes up however late" is a
+                // promise about the *generation*, not about that particular
+                // frame: after a seek the user is waiting for a picture from
+                // the new position, and any frame of it will do. Carry the
+                // flag forward, or a host that stopped drawing across a seek
+                // has the guarantee quietly evicted out from under it.
+                frame.must_present = true;
+            }
             state.stats.dropped_full += 1;
         }
         let was_empty = state.queue.is_empty();
@@ -433,6 +464,16 @@ impl FrameMailbox {
 
     pub(crate) fn count_clipped(&self) {
         self.lock().stats.clipped += 1;
+    }
+
+    /// Record a frame the producer discarded rather than queueing.
+    ///
+    /// The counterpart to the eviction count in
+    /// [`push_evicting`](Self::push_evicting): a frame that could not be shown
+    /// in place of what is already queued is dropped where it stands, and that
+    /// is the same loss to the same cause.
+    pub(crate) fn count_dropped_full(&self) {
+        self.lock().stats.dropped_full += 1;
     }
 
     pub(crate) fn count_stale(&self) {
@@ -566,6 +607,47 @@ mod tests {
         assert_eq!(mb.next_due(), Some(ms(40)));
     }
 
+    /// Eviction must not quietly cancel the post-seek guarantee.
+    ///
+    /// "The first frame of a generation goes up however late" is a promise
+    /// about the generation, so the flag rides forward onto whatever replaces
+    /// the frame that carried it — but only within the same generation, since
+    /// a new one brings its own opener.
+    #[test]
+    fn the_promise_to_show_a_new_generation_survives_eviction() {
+        let mb = FrameMailbox::new(1);
+        let mut opener = frame(0, 4);
+        opener.must_present = true;
+        mb.try_push(opener).unwrap();
+
+        mb.push_evicting(frame(40, 4));
+        assert_eq!(mb.stats().dropped_full, 1);
+        // Hopelessly late, and still shown: it inherited the promise.
+        let got = mb
+            .take_due(ms(10_000), Duration::from_millis(40))
+            .expect("the replacement carries the opener's promise");
+        assert_eq!(got.target, ms(40));
+        assert_eq!(mb.stats().dropped_late, 0);
+    }
+
+    #[test]
+    fn a_promise_does_not_cross_into_a_later_generation() {
+        let mb = FrameMailbox::new(1);
+        let mut opener = frame(0, 4);
+        opener.must_present = true;
+        mb.try_push(opener).unwrap();
+
+        // A frame of the *next* generation brings its own opener; inheriting
+        // this one would show a frame the seek did not ask for.
+        mb.push_evicting(frame(40, 5));
+        mb.open(5);
+        assert!(
+            mb.take_due(ms(10_000), Duration::from_millis(40)).is_none(),
+            "a later generation's frame is paced on its own terms"
+        );
+        assert_eq!(mb.stats().dropped_late, 1);
+    }
+
     #[test]
     fn retiring_a_generation_discards_what_belonged_to_the_old_position() {
         let mb = FrameMailbox::new(4);
@@ -622,6 +704,81 @@ mod tests {
         // is still the frame on screen until a new one replaces it.
         mb.retire();
         assert_eq!(mb.last_presented().map(|f| f.target), Some(second.target));
+    }
+
+    /// The producer parks on the space doorbell with a shed deadline behind
+    /// it. A host that has fallen behind empties the ring by dropping every
+    /// frame as late and returns `None` — freeing the whole queue. Waking it
+    /// only when a frame came out left the producer asleep for the full
+    /// deadline in exactly the case where it was already behind, which is
+    /// self-reinforcing.
+    #[tokio::test]
+    async fn dropping_every_frame_as_late_still_wakes_the_producer() {
+        let mb = Arc::new(FrameMailbox::new(3));
+        for t in [0, 40, 80] {
+            mb.try_push(frame(t, 0)).unwrap();
+        }
+
+        let waiter = Arc::clone(&mb);
+        let parked = tokio::spawn(async move { waiter.space().notified().await });
+        // Let it register before anything is taken.
+        tokio::task::yield_now().await;
+
+        // Ten seconds in with a 40 ms budget: every queued frame is past
+        // saving, so nothing is handed back.
+        assert!(mb.take_due(ms(10_000), Duration::from_millis(40)).is_none());
+        assert_eq!(mb.stats().queued, 0, "the ring really did empty");
+        assert_eq!(mb.stats().dropped_late, 3);
+
+        tokio::time::timeout(Duration::from_secs(1), parked)
+            .await
+            .expect("the producer was left asleep on a ring it could have filled")
+            .expect("the waiting task panicked");
+    }
+
+    /// Same contract on the stale path: a retired generation's frames are
+    /// popped and `None` is returned, and that is still a slot coming free.
+    #[tokio::test]
+    async fn discarding_a_stale_generation_wakes_the_producer() {
+        let mb = Arc::new(FrameMailbox::new(3));
+        mb.try_push(frame(0, 0)).unwrap();
+        mb.try_push(frame(40, 0)).unwrap();
+        mb.open(9);
+
+        let waiter = Arc::clone(&mb);
+        let parked = tokio::spawn(async move { waiter.space().notified().await });
+        tokio::task::yield_now().await;
+
+        assert!(mb.take_due(ms(0), Duration::from_millis(40)).is_none());
+        assert_eq!(mb.stats().dropped_stale, 2);
+
+        tokio::time::timeout(Duration::from_secs(1), parked)
+            .await
+            .expect("a stale discard frees a slot like any other")
+            .expect("the waiting task panicked");
+    }
+
+    /// The mirror image: nothing came free, so nobody is woken. A permit left
+    /// behind here would make the producer's next wait return instantly on a
+    /// mailbox that is still full.
+    #[tokio::test]
+    async fn a_frame_that_is_merely_not_due_yet_wakes_nobody() {
+        let mb = Arc::new(FrameMailbox::new(1));
+        mb.try_push(frame(1_000, 0)).unwrap();
+
+        let waiter = Arc::clone(&mb);
+        let parked = tokio::spawn(async move { waiter.space().notified().await });
+        tokio::task::yield_now().await;
+
+        assert!(mb.take_due(ms(0), Duration::from_millis(40)).is_none());
+        assert_eq!(mb.stats().queued, 1);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), parked)
+                .await
+                .is_err(),
+            "no slot came free, so there was nothing to announce"
+        );
     }
 
     #[test]

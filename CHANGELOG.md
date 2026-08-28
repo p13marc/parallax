@@ -275,6 +275,59 @@ Every out-of-tree plugin must be rebuilt: the plugin ABI went **12 → 14**.
 
 ### Fixed
 
+- **Backgrounding `parallax-player` no longer drags the whole pipeline down
+  with it** (#293). Putting the window behind another made playback crawl —
+  audio breaking up along with the picture — and it stayed that way until a
+  seek. Measured in the new regression test, the pipeline ran at **0.08x** real
+  time and never climbed back.
+
+  An occluded surface stops getting frame callbacks, so nothing drains the
+  `FrameMailbox`; that part is the compositor's business and iced 0.14 exposes
+  no occlusion event to react to. What was ours is what `AppVideoSink` did
+  about it. `enqueue` recomputed its `shed_after` deadline **per frame**, so a
+  host that had stopped did not make the sink shed at source rate — it made the
+  video branch consume at two frames a second. The video link filled, the
+  demuxer blocked on the video pad, the audio branch starved behind it, the
+  device underran and the master clock crept.
+
+  Bounding the wait was never going to be enough, which is why the original
+  bound did not help: every rate in a paced graph is defined by every other one
+  — sink consumption sets demuxer routing, which sets the audio feed, which
+  sets playback, which drives the master clock, which through `schedule` sets
+  sink consumption — so the loop is self-consistent at *any* rate and stays
+  wherever it lands. `StallWatch` could not break it either; it wants a
+  bit-identical clock reading and a creeping clock never gives one.
+
+  So the sink now leaves the loop rather than choosing a slower place in it.
+  Past the deadline it stops back-pressuring: where a sync master exists its
+  device paces the graph through its own branch, so video is shed at source
+  rate and audio plays through untouched; where nothing else paces anything,
+  the sink paces itself against the clock, which cannot collapse because a
+  clock no device provides runs at wall rate. The latch clears when the host
+  takes a frame again. Two rules keep it honest — a host that has taken nothing
+  because nothing is *due* is not a stalled host, and a frame that cannot be
+  shown never displaces one that can. Without the first the two states
+  alternate and the picture arrives in bursts; without the second the ring
+  walks past the clock and the shed becomes the deadlock it exists to prevent.
+
+  `with_shed_after` therefore means "how long before concluding the host has
+  stopped", paid once per stall rather than per frame, and `with_stall_limit`
+  joins it for the master-less case.
+
+- **`FrameMailbox::take_due` wakes the producer whenever it frees a slot**
+  (#293), not only when it hands a frame back. Both early returns skipped the
+  `space` notify, and both are reachable after the loop has already popped
+  frames on the stale and drop-late branches — so a host that had fallen behind
+  emptied the ring by dropping every frame as late, freed the whole queue and
+  told the producer nothing. It then slept out its full shed deadline in
+  exactly the case where it was already behind, which is self-reinforcing.
+  Independent of the occlusion bug and reachable with the window in front.
+
+  `push_evicting` also carries a displaced frame's `must_present` forward onto
+  its replacement in the same generation: "the first frame of a generation goes
+  up however late" is a promise about the generation, and shedding at source
+  rate made evicting the frame that carried it routine.
+
 - **`ZenohSink` no longer turns on `express` for the `@media` frame profile**
   (#262). Both halves of the reasoning it was added under are true and neither
   of them is express: "a stale frame is worthless" is `Drop` plus
