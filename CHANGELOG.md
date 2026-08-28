@@ -14,6 +14,37 @@ Every out-of-tree plugin must be rebuilt: the plugin ABI went **12 → 14**.
 
 ### Added
 
+- **Seek previews in `parallax-player`** (#282). Hovering the scrubber shows
+  the frame at that instant, decoded by a second demuxer and decoder over a
+  second file handle. The issue proposed a short-lived second *pipeline* per
+  hover; it is right that nothing here decoded a frame at an arbitrary time and
+  wrong that a pipeline was needed. Every video decoder implements `Element`
+  directly (#160), so `Mp4Demux::read_sample` → `decoder.process` → `flush` is
+  the whole thumbnailer — no `Executor`, no `AppSink`, no seek event, no flush
+  epoch — which is already how `tests/mp4_av1_tests.rs` and
+  `benches/media_path.rs` drive a decoder. The `JpegEncoder` went too: the
+  consumer is an Iced `image::Handle`, which wants pixels.
+
+  The demuxer and decoder stay **open** between requests, because an MP4 index
+  parse is 100 ms and rebuilding one per hover tick would be the entire latency
+  budget. One decode runs at a time with a single pending slot behind it, so a
+  fast drag decodes where the cursor started and where it stopped and nothing
+  in between — an Iced `Task` cannot be cancelled, so "cancel on hover-move" is
+  really "let the answer arrive and decide it is stale", the same generation
+  counter the probe path uses.
+
+  Two limits are surfaced rather than hidden, both in the diagnostics panel: a
+  **cue-less Matroska** (which still *seeks* — it degrades to a linear scan
+  from the start, so a scrubber must decline rather than appear to hang;
+  `MkvDemux::has_cues` is new for this) and a file with no declared duration.
+  HEVC never gets that far, since `engine::probe` refuses to open it at all.
+
+  The trap worth naming: a decoder driven off a pipeline never receives
+  `set_output_budget`, so `OutputBudget::resolve` falls back to the static
+  floor and a preview would map `VIDEO_DECODER_SLOT_COUNT` megabyte-plus slots
+  — hundreds of megabytes. `OutputBudget::new(1, 2)` is what stands between the
+  two.
+
 - **`parallax::video` — presentation maths without a graphics dependency**
   (#263). Plane strides, the letterbox rect, the YUV matrices, the WGSL and
   the `(format, matrix) → shader mode` table now live in a public, unfeatured

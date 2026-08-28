@@ -14,6 +14,7 @@ mod headless;
 mod playlist;
 mod recent;
 mod snapshot;
+mod thumbnail;
 mod ui;
 
 use std::collections::VecDeque;
@@ -482,6 +483,16 @@ enum Message {
     Dismiss(usize),
     /// What Iced's renderer is running on.
     Graphics(Box<iced::system::Information>),
+    /// The cursor moved over the seek bar, `x` pixels along it (#282).
+    ScrubHover(f32),
+    /// The cursor left the seek bar.
+    ScrubLeave,
+    /// The seek bar reported its own size, which is the only way an x offset
+    /// becomes a fraction of the file.
+    ScrubberSized(iced::Size),
+    /// A preview finished decoding: generation, instant, and whether the
+    /// thumbnailer was already open when it started.
+    Previewed(u64, u64, bool, Result<thumbnail::Thumb, String>),
     /// Step through the playback speeds.
     CycleSpeed,
     /// Set the playback speed directly.
@@ -578,6 +589,10 @@ struct Player {
     /// What it has said about itself.
     diagnostics: Diagnostics,
 
+    /// Seek-bar previews: the second decoder, its cache, and what is on
+    /// screen (#282).
+    previews: thumbnail::Previews,
+
     /// When to quit, for `--exit-after`.
     deadline: Option<Instant>,
 }
@@ -609,6 +624,7 @@ impl Player {
             status: "no file open".into(),
             notices: VecDeque::new(),
             diagnostics: Diagnostics::default(),
+            previews: thumbnail::Previews::default(),
             deadline: args
                 .exit_after
                 .map(|s| Instant::now() + Duration::from_secs(s)),
@@ -657,6 +673,35 @@ impl Player {
 
     fn duration(&self) -> ClockTime {
         self.source().map(|s| s.duration).unwrap_or(ClockTime::NONE)
+    }
+
+    /// The open file's length in nanoseconds, or zero when it never said.
+    fn duration_ns(&self) -> u64 {
+        self.duration().to_option().map(|d| d.nanos()).unwrap_or(0)
+    }
+
+    /// Decode one seek-bar preview, off the interface's thread (#282).
+    ///
+    /// The first call for a file also opens the second demuxer and decoder,
+    /// which is why this is on `spawn_blocking` and not merely "fast enough":
+    /// an MP4 index parse is 100 ms and more.
+    fn preview(&mut self, request: thumbnail::Request) -> Task<Message> {
+        let thumbnail::Request::Decode { at_ns, generation } = request else {
+            return Task::none();
+        };
+        let Some(path) = self.previews.path().map(PathBuf::from) else {
+            return Task::none();
+        };
+        let slot = self.previews.decoder_slot();
+
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || thumbnail::decode(&slot, &path, at_ns))
+                    .await
+                    .unwrap_or_else(|e| (true, Err(format!("the preview task panicked: {e}"))))
+            },
+            move |(opened, result)| Message::Previewed(generation, at_ns, opened, result),
+        )
     }
 
     fn mailbox(&self) -> Option<Arc<FrameMailbox>> {
@@ -897,6 +942,30 @@ impl Player {
                 self.subtitle_size = (self.subtitle_size + delta).clamp(12.0, 64.0);
                 Task::none()
             }
+            Message::ScrubHover(x) => {
+                // Counts as activity: the controls auto-hide on a timer, and a
+                // bar that vanished from under the cursor the user is aiming
+                // with would take the preview with it. A still cursor produces
+                // no events, so this cannot hold them open by itself.
+                self.activity();
+                let request = self.previews.hover(x, self.duration_ns());
+                self.preview(request)
+            }
+            Message::ScrubLeave => {
+                self.previews.leave();
+                Task::none()
+            }
+            Message::ScrubberSized(size) => {
+                self.previews.set_bar_width(size.width);
+                Task::none()
+            }
+            Message::Previewed(generation, at_ns, opened, result) => {
+                if let Err(why) = &result {
+                    tracing::debug!("preview at {at_ns} ns failed: {why}");
+                }
+                let next = self.previews.finished(generation, at_ns, result, opened);
+                self.preview(next)
+            }
             Message::Snapshot => {
                 self.activity();
                 self.snapshot()
@@ -1041,6 +1110,10 @@ impl Player {
                 self.apply_volume_to(&engine);
                 self.engine = Some(engine);
                 self.stage = Stage::Playing;
+                // Previews are for *this* file now. Nothing is opened here —
+                // the second demuxer costs another index parse, and a file
+                // nobody scrubs should not pay it (#282).
+                self.previews.open(request.path.clone());
                 recent::remember(&request.path);
                 self.recent = recent::load();
                 if let Some(at) = self.resume_at.take() {
@@ -1171,6 +1244,10 @@ impl Player {
         self.position = ClockTime::ZERO;
         self.paused = false;
         self.seek = SeekState::default();
+        // Dropping the thumbnailer here is what "closing the player leaves no
+        // orphaned decoder" means (#282): it owns a `File`, a demuxer index
+        // and a decoder with its arena, none of which the next file wants.
+        self.previews.close();
     }
 
     /// Everything the interface re-reads on a tick.
