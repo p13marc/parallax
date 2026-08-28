@@ -244,6 +244,22 @@ Every out-of-tree plugin must be rebuilt: the plugin ABI went **12 → 14**.
 
 ### Fixed
 
+- **`ZenohSink` no longer turns on `express` for the `@media` frame profile**
+  (#262). Both halves of the reasoning it was added under are true and neither
+  of them is express: "a stale frame is worthless" is `Drop` plus
+  `InteractiveHigh`, "the encoder must never block" is best-effort plus drop,
+  and the profile already set all four. Express is a third, independent axis —
+  *do not wait to batch* — and batching engages only under back-pressure, so it
+  is a no-op on an unsaturated link and spends per-message framing at exactly
+  the moment a `drop` profile should be shedding. zenkey RFC v1.26 M1 removes
+  it from `frame` for that reason, keeping it on `alert`, and it was enough to
+  stop a downstream consumer adopting the sink at all: it validates its
+  `@media` plane against the convention, and `zenctl doctor` compares exactly
+  these four axes. `with_express(true)` still overrides it, from the
+  pipeline-string API too. `ZenohSink` gained `express()`,
+  `congestion_control()` and `priority()`, because the profile was previously
+  unobservable outside a packet capture.
+
 - **A third demuxer pad would have been called "audio"** (#279). Both file
   demuxers' `pad_name` ended in `_ => "audio"`, so routing anything to
   `PadId(2)` would have sent it silently down the audio branch. Exhaustive
@@ -284,6 +300,39 @@ Every out-of-tree plugin must be rebuilt: the plugin ABI went **12 → 14**.
   to the size guess, and report 278×207.
 
 ### Breaking
+
+- **A zenoh publish error drops the sample instead of ending the run** (#258).
+  A failed `put` returned `Err` from `ZenohSink::consume`, which the sink task
+  turned into `EndReason::Error` — so one transport fault ended a 24/7
+  publisher, and `publish_errors` was structurally bounded by one, which is why
+  #246 gave it no rate. It now counts the failure, warns on a 1st/10th/100th
+  ladder with a matching bus `Warning`, and carries on, for the same reason the
+  executor sheds a `PoolExhausted`: a dropped frame beats a dead live pipeline,
+  and on `@media` the frame was best-effort and droppable by contract anyway.
+  `ZenohSink::with_fatal_publish_errors(true)` (`fatal-publish-errors=true`
+  from a pipeline string) restores the old behaviour, which is what batch work
+  wants. Failing to *declare* the publisher stays fatal either way — that is a
+  configuration fault, not a hiccup. `publish_errors` is a real unbounded
+  counter now, with `publish_errors_per_second()` beside it.
+
+- **`ZenohSinkHandle::samples_sent`/`bytes_sent` are `samples_offered`/
+  `bytes_offered`** (#289), with deprecated shims. The old names promised
+  delivery the sink cannot observe: under `CongestionControl::Drop` — which the
+  `@media` profile pins, correctly — zenoh discards a sample inside its
+  transport when the queue is full and `put()` still returns `Ok`. Measured on
+  a shaped veth lab at 1.69 Mbps offered, a receiver got 44 of 255 sequences
+  over a 300 kbit link and 14 of 193 over a 100 kbit one, while every
+  sender-side counter read zero. There is no fix inside the sink — zenoh counts
+  transport drops only under its `stats` feature and only per *link*, never per
+  publisher, and `Block` would trade the loss for a stall behind the slowest
+  viewer — so delivery is a receiver-side measurement, and
+  `ZenohSrcHandle::last_frame_age()` is the second axis it needed.
+  `lost_wire()` says how much went missing; age says *why*, because the two
+  modes differ by orders of magnitude: congestion backs samples up behind a
+  full queue (medians of 3.5 s and 9.1 s in the same lab) while genuine
+  in-flight loss discards frames without delaying the survivors (0.77 ms while
+  losing 20 %). Only as good as the clock sync between the two machines, and
+  said so.
 
 - **A/V synchronization has one origin instead of two guesses** (#265).
   Running time used to be `clock.now() - base_time`, where `base_time` was a

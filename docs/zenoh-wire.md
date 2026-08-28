@@ -92,6 +92,40 @@ type-erased part of the in-memory metadata map cannot cross the wire.
 - With wildcard subscriptions, the concrete key expression a sample arrived on
   is stored under `"zenoh/key_expr"`.
 
+### What the sender can and cannot see (#289)
+
+`ZenohSinkHandle::samples_offered()` is named for what it counts. Under
+`CongestionControl::Drop` — which the `@media` profile pins, and which is right
+for live video — `put()` returns `Ok` whether or not the sample reaches the
+wire; zenoh discards it inside the transport when its queue is full. Measured
+on a shaped link at 1.69 Mbps offered, a receiver got 44 of 255 sequences over
+300 kbit and 14 of 193 over 100 kbit, with every sender-side counter reading
+zero throughout.
+
+There is no fix inside the sink, and that is worth stating rather than
+papering over:
+
+- zenoh counts transport drops only under its own `stats` cargo feature, and
+  only per **link** — never per publisher. One session with many publishers
+  cannot attribute a link-level number to a sink.
+- `CongestionControl::Block` converts the loss into back-pressure and makes it
+  visible, but that stalls the pipeline behind the slowest viewer, which is the
+  opposite trade for live video and must never be "fixed" on `@media`.
+
+So delivery is a **receiver-side** measurement, on two axes:
+`ZenohSrcHandle::lost_wire()` counts gaps in the publisher-owned sequence, and
+`ZenohSrcHandle::last_frame_age()` says how stale what did arrive was. Loss
+alone cannot say which fault it is looking at; the pair can, because the two
+modes differ by orders of magnitude. Congestion backs samples up behind a full
+transport queue — median frame ages of 3.5 s and 9.1 s in the same lab — while
+genuine in-flight packet loss discards frames without delaying the survivors
+(0.77 ms while losing 20 %). High loss with high age means lower the bitrate;
+high loss with low age is a network problem.
+
+Age is the publisher's HLC reading, so across machines it is only as good as
+the clock sync between them. Session timestamping is on for every session
+parallax opens (#245), so a parallax publisher always stamps.
+
 ### Versioning
 
 `WireMetadata` is decoupled from the in-memory `Metadata` type on purpose:

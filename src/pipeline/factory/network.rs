@@ -271,12 +271,17 @@ async fn create_zenohsrc(props: Props) -> Result<Box<DynAsyncElement<'static>>> 
 }
 
 /// `zenohsink key=<key-expr> [profile=media] [congestion=block|drop]
-///           [priority=<name>] [express=<bool>]`
+///           [priority=<name>] [express=<bool>]
+///           [fatal-publish-errors=<bool>]`
 ///
 /// `profile=media` publishes on the `@media` plane, which sets the QoS
 /// profile (best-effort, drop, interactive-high — **not** express, #262) —
 /// the individual knobs are for the parallax plane, though they are applied
 /// after the profile, so `profile=media express=true` does turn it back on.
+///
+/// `fatal-publish-errors=true` restores the pre-#258 behaviour, where a failed
+/// publish ends the run instead of being dropped and counted — what batch work
+/// wants, and what a live publisher does not.
 #[cfg(feature = "zenoh")]
 async fn create_zenohsink(props: Props) -> Result<Box<DynAsyncElement<'static>>> {
     use crate::elements::network::shared_session;
@@ -323,6 +328,9 @@ async fn create_zenohsink(props: Props) -> Result<Box<DynAsyncElement<'static>>>
     }
     if let Some(express) = props.get_bool("express")? {
         sink = sink.with_express(express);
+    }
+    if let Some(fatal) = props.get_bool("fatal-publish-errors")? {
+        sink = sink.with_fatal_publish_errors(fatal);
     }
     Ok(DynAsyncElement::new_box(AsyncSinkAdapter::new(sink)))
 }
