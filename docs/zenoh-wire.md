@@ -10,7 +10,7 @@ why.
 | Payload | raw buffer bytes | one whole access unit |
 | Encoding | derived from `Metadata.format` | same, and **authoritative** |
 | Attachment | `[b'P', b'X', ver] ++ rkyv(WireMetadata)` | CBOR `FrameMeta` |
-| QoS default | Block · Data | best-effort · drop · interactive-high · express |
+| QoS default | Block · Data | best-effort · drop · interactive-high |
 | Sequence | the buffer's | **the publisher's** |
 | Keyframe flag | `SYNC_POINT` passthrough | **derived from the bytes** |
 | Wildcards | allowed | refused at construction |
@@ -151,9 +151,14 @@ What parallax guarantees on it:
 - **CBOR `FrameMeta` on the attachment** (`src/wire/frame_meta.rs`): keyframe,
   pts/dts/duration, sequence, width, height. Absent timing fields are
   *omitted from the map*, not null — that is wire shape, pinned by a test.
-- **The `frame` QoS profile**: best-effort, drop, interactive-high, express. A
-  plain declared publisher, never an `AdvancedPublisher` — recovering a
-  superseded frame is anti-useful.
+- **The `frame` QoS profile**: best-effort, drop, interactive-high. A plain
+  declared publisher, never an `AdvancedPublisher` — recovering a superseded
+  frame is anti-useful. **Not express** (#262): zenkey RFC v1.26 M1 removed it
+  from this profile, and rightly — batching engages only under back-pressure,
+  so express is a no-op on an unsaturated link and spends per-message framing
+  at exactly the moment a `drop` profile should be shedding. The axis M1 draws
+  is rare-and-must-arrive versus continuous-and-sheddable; `frame` is the
+  second, `alert` the first. `ZenohSink::with_express(true)` still overrides it.
 - **Session timestamping is on** (#245). `FrameMeta` carries no wallclock on
   purpose, so the zenoh HLC stamp on the sample is the only clock a consumer has
   for frame age or end-to-end latency. zenoh's own default is

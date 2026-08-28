@@ -273,9 +273,10 @@ async fn create_zenohsrc(props: Props) -> Result<Box<DynAsyncElement<'static>>> 
 /// `zenohsink key=<key-expr> [profile=media] [congestion=block|drop]
 ///           [priority=<name>] [express=<bool>]`
 ///
-/// `profile=media` publishes on the `@media` plane, which fixes the QoS
-/// profile (best-effort, drop, interactive-high, express) — the individual
-/// knobs are for the parallax plane.
+/// `profile=media` publishes on the `@media` plane, which sets the QoS
+/// profile (best-effort, drop, interactive-high — **not** express, #262) —
+/// the individual knobs are for the parallax plane, though they are applied
+/// after the profile, so `profile=media express=true` does turn it back on.
 #[cfg(feature = "zenoh")]
 async fn create_zenohsink(props: Props) -> Result<Box<DynAsyncElement<'static>>> {
     use crate::elements::network::shared_session;

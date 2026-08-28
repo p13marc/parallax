@@ -120,7 +120,7 @@ impl From<ZenohReliability> for zenoh::qos::Reliability {
 /// | | `Parallax` | `Media` |
 /// |---|---|---|
 /// | attachment | rkyv [`WireMetadata`] | CBOR [`FrameMeta`](crate::wire::FrameMeta) |
-/// | QoS default | Block / Data | best-effort · drop · interactive-high · express |
+/// | QoS default | Block / Data | best-effort · drop · interactive-high |
 /// | sequence | forwarded from the buffer | owned by the publisher |
 /// | wildcards | legal | refused |
 /// | keyframe flag | `SYNC_POINT` passthrough | derived from the bytes |
@@ -1535,9 +1535,28 @@ impl ZenohSink {
     /// Publish on the `@media` plane.
     ///
     /// Applies the plane's `frame` QoS profile — best-effort, drop,
-    /// interactive-high, express — because a stale frame is worthless and the
-    /// encoder must never block. A plain declared publisher, never an
+    /// interactive-high — because a stale frame is worthless and the encoder
+    /// must never block. A plain declared publisher, never an
     /// AdvancedPublisher: recovering a superseded frame is anti-useful.
+    ///
+    /// # Express is deliberately off (#262)
+    ///
+    /// It was on until zenkey RFC v1.26 M1 removed it from this profile, and
+    /// the reasoning above never implied it: *a stale frame is worthless* is
+    /// [`Drop`](ZenohCongestionControl::Drop) plus
+    /// [`InteractiveHigh`](ZenohPriority::InteractiveHigh), and *the encoder
+    /// must never block* is best-effort plus drop. Express is a third,
+    /// independent axis — **do not wait to batch** — and batching engages only
+    /// under back-pressure, so express is a no-op on an unsaturated link and
+    /// spends per-message framing at exactly the moment a `drop` profile
+    /// should be shedding instead. The `alert` profile keeps it, because
+    /// rare-and-must-arrive is the case it is for.
+    ///
+    /// [`with_express(true)`](Self::with_express) still turns it back on: the
+    /// three QoS axes are a deployment's to tune, unlike
+    /// [`without_metadata`](Self::without_metadata) and
+    /// [`with_forward_custom_keys`](Self::with_forward_custom_keys), which
+    /// change the wire contract and are refused on this plane.
     ///
     /// The key must be a concrete tier key. Wildcards are refused rather than
     /// warned about: publishing under one is a lie about identity, and
@@ -1565,7 +1584,11 @@ impl ZenohSink {
         // The plane's `frame` QoS profile.
         sink.congestion_control = ZenohCongestionControl::Drop;
         sink.priority = ZenohPriority::InteractiveHigh;
-        sink.express = true;
+        // Off, and stated rather than left to the struct default: the three
+        // lines above pin the other axes, so a silent absence here would read
+        // as an oversight and invite someone to "fix" it. See the doc above
+        // for why express is not part of this profile (#262).
+        sink.express = false;
         #[cfg(feature = "zenoh-unstable")]
         {
             sink.reliability = Some(ZenohReliability::BestEffort);
@@ -1587,6 +1610,25 @@ impl ZenohSink {
     /// Which wire contract this sink speaks.
     pub fn profile(&self) -> WireProfile {
         self.profile
+    }
+
+    /// The congestion control this sink will declare its publisher with.
+    pub fn congestion_control(&self) -> ZenohCongestionControl {
+        self.congestion_control
+    }
+
+    /// The priority this sink will declare its publisher with.
+    pub fn priority(&self) -> ZenohPriority {
+        self.priority
+    }
+
+    /// Whether this sink will declare its publisher as express.
+    ///
+    /// Readable because the QoS axes are precisely what a conformance check
+    /// wants to compare against the profile it expects (#262) — without a
+    /// getter the only way to observe them is a packet capture.
+    pub fn express(&self) -> bool {
+        self.express
     }
 
     /// Ask upstream for a decoder entry point (#213, #234).

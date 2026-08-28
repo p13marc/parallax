@@ -23,7 +23,7 @@ use std::time::Duration;
 use parallax::buffer::{Buffer, MemoryHandle};
 use parallax::codec::annexb::{self, NalCodec};
 use parallax::element::{AsyncSink, AsyncSource, ConsumeContext, ProduceContext, ProduceResult};
-use parallax::elements::{ZenohSink, ZenohSrc};
+use parallax::elements::{ZenohCongestionControl, ZenohPriority, ZenohSink, ZenohSrc};
 use parallax::format::VideoCodec;
 use parallax::memory::SharedArena;
 use parallax::metadata::{BufferFlags, Metadata};
@@ -488,6 +488,28 @@ async fn media_refuses_the_parallax_plane_s_options() {
         sink.with_forward_custom_keys(&["stanag/klv"]).is_err(),
         "@media carries pixels and nothing else"
     );
+}
+
+/// #262: the `frame` QoS profile is best-effort, drop, interactive-high — and
+/// **not** express, which zenkey RFC v1.26 M1 removed from it. A consumer
+/// validating against that convention compares exactly these axes, so they are
+/// pinned here rather than left to a packet capture.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_media_profile_sets_the_frame_qos_axes() {
+    let (pub_session, _sub) = session_pair().await;
+    let key = unique_key("video/h264/high");
+
+    let sink = ZenohSink::media_with_session(pub_session.clone(), &key)
+        .await
+        .expect("media sink");
+
+    assert_eq!(sink.congestion_control(), ZenohCongestionControl::Drop);
+    assert_eq!(sink.priority(), ZenohPriority::InteractiveHigh);
+    assert!(!sink.express(), "RFC v1.26 M1 removed express from `frame`");
+
+    // Still a deployment's to tune, unlike the two wire-contract options the
+    // test above proves are refused.
+    assert!(sink.with_express(true).express());
 }
 
 #[tokio::test(flavor = "multi_thread")]
