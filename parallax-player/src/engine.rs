@@ -305,10 +305,15 @@ impl SourceDescription {
 /// The opened demuxer, by container.
 // Both boxed: each carries its own index and parser state, so bare variants
 // would make every `Probed` the size of the larger one.
-enum ProbedSource {
-    Mp4(Box<Mp4Demux<BufReader<File>>>),
-    Mkv(Box<MkvDemux<BufReader<File>>>),
+pub(crate) enum ProbedSource {
+    Mp4(Box<ThumbMp4>),
+    Mkv(Box<ThumbMkv>),
 }
+
+/// The MP4 demuxer shape `probe` builds, named so another module can hold one.
+pub(crate) type ThumbMp4 = Mp4Demux<BufReader<File>>;
+/// The Matroska demuxer shape `probe` builds.
+pub(crate) type ThumbMkv = MkvDemux<BufReader<File>>;
 
 /// An opened, described file, ready to be built into a pipeline.
 ///
@@ -320,11 +325,67 @@ pub struct Probed {
     pub description: SourceDescription,
 }
 
+impl Probed {
+    /// Split into the open demuxer and what the probe found.
+    ///
+    /// The thumbnailer (#282) probes a second time for a second, independent
+    /// file handle, and then wants the demuxer rather than a whole pipeline.
+    pub(crate) fn into_parts(self) -> (ProbedSource, SourceDescription) {
+        (self.source, self.description)
+    }
+}
+
 impl std::fmt::Debug for Probed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Probed")
             .field("description", &self.description)
             .finish()
+    }
+}
+
+/// A software decoder for `codec`, off any pipeline (#282).
+///
+/// The thumbnailer's decoder. Software only and deliberately: probing VA-API
+/// per preview is the wrong trade, and `hw_decoder`'s fallback logging would
+/// fire a second time for a decision the playback path has already made.
+///
+/// `Element` is what a video decoder implements directly (#160), so the box is
+/// enough — but it is enough only *off* a pipeline, where the caller drives
+/// `process`/`flush`/`set_output_budget` by hand. `Pipeline::add_filter` takes
+/// `impl Element`, and boxing behind a forwarding newtype to satisfy it would
+/// silently drop every defaulted method the newtype forgot —
+/// `handle_downstream_event` among them, which is how a decoder learns about
+/// a flush. So `build` keeps its own construction; only the dav1d arm, which
+/// is the one with real configuration, is shared.
+pub(crate) fn software_decoder(
+    codec: &VideoCodecKind,
+    height: u32,
+) -> anyhow::Result<Box<dyn parallax::element::Element + Send>> {
+    Ok(match codec {
+        VideoCodecKind::H264 => Box::new(H264Decoder::new()?),
+        VideoCodecKind::Vp8 => Box::new(VpxDecoder::vp8()?),
+        VideoCodecKind::Vp9 => Box::new(VpxDecoder::vp9()?),
+        // One frame at a time, so the lookahead that pays off at paced rates
+        // is pure latency here.
+        VideoCodecKind::Av1 => Box::new(
+            Dav1dDecoder::new()?
+                .with_threads(dav1d_threads(height, 0))?
+                .with_max_frame_delay(1)?,
+        ),
+        VideoCodecKind::H265 => bail!("H.265 has no software decoder in this tree (#200)"),
+        VideoCodecKind::Other(name) => bail!("no decoder for {name}"),
+    })
+}
+
+/// How many dav1d workers a stream of this height wants.
+///
+/// At paced rates dav1d worker CPU scales with pool size (idle-worker
+/// task-queue churn), so the pool is sized to the stream rather than to the
+/// machine (#192). `requested = 0` means "decide from the height".
+fn dav1d_threads(height: u32, requested: u32) -> u32 {
+    match requested {
+        0 if height > 0 && height <= 1440 => 2,
+        explicit_or_auto => explicit_or_auto,
     }
 }
 
@@ -803,13 +864,7 @@ impl Engine {
                 }
             }
             VideoCodecKind::Av1 => {
-                // At paced rates dav1d worker CPU scales with pool size
-                // (idle-worker task-queue churn), so size the pool to the
-                // stream rather than the machine (#192).
-                let threads = match opts.dav1d_threads {
-                    0 if height > 0 && height <= 1440 => 2,
-                    explicit_or_auto => explicit_or_auto,
-                };
+                let threads = dav1d_threads(height, opts.dav1d_threads);
                 let mut dav1d = Dav1dDecoder::new()?.with_threads(threads)?;
                 if opts.frame_delay > 0 {
                     dav1d = dav1d.with_max_frame_delay(opts.frame_delay)?;

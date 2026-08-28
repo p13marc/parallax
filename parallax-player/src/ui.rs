@@ -5,12 +5,14 @@
 //! player redraws at the frame rate — so a playing-fullscreen tree should be
 //! one `Shader` widget and nothing else.
 
-use iced::widget::{Space, button, column, container, row, scrollable, slider, text};
+use iced::widget::{
+    Space, button, column, container, image, mouse_area, row, scrollable, sensor, slider, text,
+};
 use iced::{Alignment, Element, Length};
 
 use parallax::clock::ClockTime;
 
-use crate::{Level, Message, Notice, Player};
+use crate::{Level, Message, Notice, Player, thumbnail};
 
 /// `mm:ss`, or `--:--` when the container never said how long the file is.
 ///
@@ -92,6 +94,41 @@ fn panel<'a>(content: impl Into<Element<'a, Message>>) -> container::Container<'
     })
 }
 
+/// The preview floating over the point on the bar it was decoded for (#282).
+///
+/// Positioned with two proportional spacers rather than absolute coordinates:
+/// the picture's centre lands on the cursor in the middle of the bar and slides
+/// to flush-left and flush-right at the ends, which is what every player does
+/// and what keeps it on screen without any clamping arithmetic.
+fn preview_lane<'a>(fraction: f32, preview: &thumbnail::Preview) -> Element<'a, Message> {
+    /// Enough resolution that the picture tracks the cursor smoothly; the
+    /// exact number does not matter, only that the two shares add to it.
+    const PORTIONS: u16 = 1000;
+    let left = (fraction * f32::from(PORTIONS))
+        .round()
+        .clamp(0.0, f32::from(PORTIONS)) as u16;
+
+    let picture = column![
+        image(preview.handle.clone())
+            .width(Length::Fixed(preview.width))
+            .height(Length::Fixed(preview.height)),
+        text(timecode(ClockTime::from_nanos(preview.pts_ns))).size(11),
+    ]
+    .align_x(Alignment::Center)
+    .spacing(2);
+
+    row![
+        Space::new().width(Length::FillPortion(left.max(1))),
+        container(picture).padding(3).style(|_: &iced::Theme| {
+            container::background(iced::Color::from_rgba(0.0, 0.0, 0.0, 0.85))
+                .border(iced::border::rounded(4))
+        }),
+        Space::new().width(Length::FillPortion((PORTIONS - left).max(1))),
+    ]
+    .padding([0, 0])
+    .into()
+}
+
 /// The transport: position, a seek bar, volume, and the two toggles.
 fn controls(player: &Player) -> Element<'_, Message> {
     let position = player.position.to_option().map(|p| p.nanos()).unwrap_or(0);
@@ -106,10 +143,35 @@ fn controls(player: &Player) -> Element<'_, Message> {
     let scrubber: Element<'_, Message> = match duration.to_option() {
         Some(total) if total.nanos() > 0 => {
             let fraction = (shown as f64 / total.nanos() as f64).clamp(0.0, 1.0) as f32;
-            slider(0.0..=1.0f32, fraction, Message::SeekTo)
+            let bar = slider(0.0..=1.0f32, fraction, Message::SeekTo)
                 .step(0.0005f32)
-                .width(Length::Fill)
-                .into()
+                .width(Length::Fill);
+
+            // The bar is `Length::Fill` and `MouseArea::on_move` reports a
+            // widget-local point with no size, so an x offset cannot become a
+            // fraction of the file without measuring the widget (#282). The
+            // `Sensor` is that measurement, and it costs nothing while the
+            // width is not changing.
+            let sensed = sensor(
+                mouse_area(bar)
+                    .on_move(|p| Message::ScrubHover(p.x))
+                    .on_exit(Message::ScrubLeave),
+            )
+            .on_show(Message::ScrubberSized)
+            .on_resize(Message::ScrubberSized)
+            .on_hide(Message::ScrubLeave);
+
+            // The preview lane sits in the scrubber's own cell, not in the
+            // overlay above it: positioning is a fraction of *the bar*, and
+            // the transport's buttons and timecodes sit to either side of it.
+            // It is mounted only while the cursor is over the bar, so the
+            // layout shifts once on entry and once on exit rather than under
+            // a moving cursor.
+            let mut cell = column![].width(Length::Fill);
+            if let Some((fraction, preview)) = player.previews.showing(total.nanos()) {
+                cell = cell.push(preview_lane(fraction, preview));
+            }
+            cell.push(sensed).into()
         }
         // No duration means the container never said — a live stream, or an
         // MKV without one. There is nothing to scrub against, so say so
@@ -444,6 +506,13 @@ fn stats(player: &Player) -> Element<'_, Message> {
             ))
             .size(12),
         );
+    }
+
+    // Why the seek bar has no previews (#282). A limit worth surfacing rather
+    // than hiding: "no cue table" is a fact about the file, and a user seeing
+    // nothing above the bar has no other way to learn it.
+    if let Some(why) = player.previews.refusal() {
+        lines = lines.push(text(format!("no seek previews — {why}")).size(12));
     }
 
     if let Some(engine) = player.engine() {

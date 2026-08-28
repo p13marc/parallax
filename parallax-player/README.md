@@ -34,6 +34,22 @@ MP4/MOV and MKV/WebM, with H.264, VP8, VP9 and AV1 video and AAC, Opus, Vorbis
 and E-AC-3 audio. VA-API is tried first for H.264/VP8/VP9 and falls back to
 software without comment when the driver has not got it.
 
+## Seek previews
+
+Hovering the seek bar shows the frame at that instant. It comes from a
+**second** demuxer and decoder over a second file handle, driven directly
+rather than through a pipeline — `thumbnail.rs` explains why that is smaller
+rather than larger — opened on the first hover and kept until the file closes.
+
+One decode runs at a time and at most one waits behind it, so a fast drag
+decodes where the cursor started and where it stopped, and nothing in between.
+Sixty previews are cached.
+
+Two kinds of file get a bar with nothing above it, which the diagnostics panel
+(`i`) names: **Matroska with no cue table**, where every seek is a linear scan
+from the start, and anything with **no declared duration**. HEVC never gets
+this far — the player will not open it at all.
+
 ## Keys
 
 | | |

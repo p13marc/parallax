@@ -123,7 +123,7 @@ player trips over them.
 | **`StreamCollection` / tags never posted** | The bus variants and `TagList` exist; nothing produces them. A media-info panel has no source. | `pipeline/bus.rs:114-117, 445-455, 699` |
 | **Subtitles: nothing** | Recognised as a track *type* and then dropped; no SRT/ASS/WebVTT/CEA-608 parser; no overlay element anywhere in `src/`. | `mkv.rs:973-975`, `mp4_extra.rs:5` |
 | **No frame stepping** | No `Step` event; `SeekFlags` bits 6-8 are reserved for a trickmode family that does not exist. | `event/mod.rs:60-135, 774-812` |
-| **No out-of-band frame decode** | No thumbnailer; seek preview needs a whole second pipeline. | — |
+| ~~**No out-of-band frame decode**~~ | Closed by #282: `thumbnail.rs` drives a second demuxer straight into a decoder, no pipeline involved. | `parallax-player/src/thumbnail.rs` |
 | **HEVC not built** | `cros-codecs`' `h265` does not compile against its release; `vaapih265dec` is permanently unavailable. Files open, then fail. | `Cargo.toml:175-186`, `factory/mod.rs:79-85` (#200, #202) |
 | **MP3/FLAC unusable** | `SymphoniaDecoder` re-probes a whole container per call — not a pipeline element. MKV identifies MP3 tracks it cannot decode. | `codec/audio.rs:110-118` |
 | **Network playback is TS-only** | `Mp4Demux`/`MkvDemux` need an owning `Read + Seek`; no HTTP adapter exists. No HLS or DASH *source*. | `mp4.rs:535`, `mkv.rs:281` |
@@ -403,9 +403,22 @@ the clock master. Time-stretch is out of scope; the UI states what it does.
 `position ± frame_duration`; the real `Event::Step` design is written up below
 ("A real step event") and deliberately not built.
 
-**D5 ([#282](https://git.marcpardo.eu/marcpardo/parallax/issues/282)). Thumbnails and seek preview (L).** A second short-lived pipeline over a second file
-handle (`Mp4Demux` → decoder → `AppSink` → `JpegEncoder`), driven from the GUI, with a
-cache. Impossible for cue-less MKV and for HEVC; say so in the UI.
+**D5 ([#282](https://git.marcpardo.eu/marcpardo/parallax/issues/282)). Thumbnails and seek preview (L). DONE — and no pipeline was
+needed.** The design called for a second short-lived pipeline per hover
+(`Mp4Demux` → decoder → `AppSink` → `JpegEncoder`). Half of its premise is right — nothing
+here decodes a frame at T — and half is wrong: every video decoder implements `Element`
+directly (#160), so `Mp4Demux::read_sample` → `decoder.process` → `flush` is a complete
+thumbnailer with no `Executor`, no `AppSink`, no seek event and no flush epoch, which is
+already how `tests/mp4_av1_tests.rs` and `benches/media_path.rs` work. `JpegEncoder` went
+too: the consumer is an Iced `image::Handle`, which wants pixels.
+
+Two things the design did not mention. The demuxer and decoder are kept **open** between
+requests rather than rebuilt per hover — an MP4 index parse is the whole latency budget —
+and a decoder driven off a pipeline gets the static arena floor, so
+`set_output_budget(OutputBudget::new(1, 2))` is what stands between a preview and 256 MB
+of memfd. And the refusal list is different from the one predicted: HEVC never reaches the
+transport (`engine::probe` bails), while a **cue-less MKV still seeks** — it degrades to a
+linear scan from the start, so it must be declined rather than allowed to appear slow.
 
 **D6 ([#283](https://git.marcpardo.eu/marcpardo/parallax/issues/283)). Snapshot (S). DONE — off the mailbox, not through the graph.** The proposed
 branch has three problems the design did not mention: a closed `Valve` *drops* rather

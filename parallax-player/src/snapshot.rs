@@ -22,7 +22,7 @@ use anyhow::{Context, Result, bail};
 
 use parallax::converters::{PixelFormat as ConvertFormat, VideoConvert};
 use parallax::format::{PixelFormat, PlaneLayout};
-use parallax::video::PacedFrame;
+use parallax::video::{PacedFrame, VideoFrame};
 
 /// Write `frame` to a PNG beside `source`, and return where it went.
 ///
@@ -36,7 +36,7 @@ pub fn write_png(frame: &PacedFrame, source: &Path, at: u64) -> Result<PathBuf> 
     }
 
     let path = destination(source, at);
-    let rgb = to_rgb24(frame, width, height)?;
+    let rgb = to_rgb24(&frame.frame, width, height)?;
 
     let file =
         std::fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
@@ -56,30 +56,78 @@ pub fn write_png(frame: &PacedFrame, source: &Path, at: u64) -> Result<PathBuf> 
 /// The converter is the one the pipeline uses, so a snapshot and the picture
 /// it was taken from agree about colour — including the matrix and range the
 /// stream declared (#265). A frame that is already `Rgb24` skips it.
-fn to_rgb24(frame: &PacedFrame, width: u32, height: u32) -> Result<Vec<u8>> {
-    let view = frame.frame.view();
-    let bytes = frame.frame.data.as_bytes();
+pub(crate) fn to_rgb24(frame: &VideoFrame, width: u32, height: u32) -> Result<Vec<u8>> {
+    let view = frame.view();
+    rgb24_from(
+        frame.data.as_bytes(),
+        view.format,
+        view.layout,
+        view.color,
+        width,
+        height,
+    )
+}
 
-    if view.format == PixelFormat::Rgb24 && view.layout.is_none() {
+/// Packed 8-bit RGB from raw pixels of a known shape.
+///
+/// Split out of [`to_rgb24`] so the thumbnailer can convert bytes it has
+/// already scaled, which are no longer inside a `Buffer` (#282). The colour
+/// handling is the part worth sharing: the converter is the one the pipeline
+/// uses, told what the stream declared, so every picture this player produces
+/// agrees about matrix and range (#265).
+pub(crate) fn rgb24_from(
+    bytes: &[u8],
+    format: PixelFormat,
+    layout: Option<PlaneLayout>,
+    color: Option<parallax::format::ColorInfo>,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>> {
+    convert_to(
+        ConvertFormat::Rgb24,
+        bytes,
+        format,
+        layout,
+        color,
+        width,
+        height,
+    )
+}
+
+/// Raw pixels of a known shape, converted to a packed RGB-family format.
+///
+/// The output format is a parameter because a PNG wants three bytes per pixel
+/// and Iced's `image::Handle::from_rgba` wants four (#282). Everything else is
+/// shared, and the part worth sharing is the colour handling: the converter is
+/// the one the pipeline uses, told what the stream declared, so every picture
+/// this player produces agrees about matrix and range (#265).
+pub(crate) fn convert_to(
+    target: ConvertFormat,
+    bytes: &[u8],
+    format: PixelFormat,
+    layout: Option<PlaneLayout>,
+    color: Option<parallax::format::ColorInfo>,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>> {
+    let target_as_caps = PixelFormat::from(target);
+    if format == target_as_caps && layout.is_none() {
         return Ok(bytes.to_vec());
     }
 
-    let input: ConvertFormat = view
-        .format
+    let input: ConvertFormat = format
         .try_into()
-        .map_err(|_| anyhow::anyhow!("cannot convert {:?} to RGB", view.format))?;
-    let mut converter = VideoConvert::new(input, ConvertFormat::Rgb24, width, height)
-        .context("building the converter")?;
-    if let Some(color) = view.color {
+        .map_err(|_| anyhow::anyhow!("cannot convert {format:?} to {target:?}"))?;
+    let mut converter =
+        VideoConvert::new(input, target, width, height).context("building the converter")?;
+    if let Some(color) = color {
         converter = converter.with_color_info(color);
     }
 
     // The converter addresses planes by whole rows, so a packed frame has to
     // say so explicitly rather than leaving the layout `None`.
-    let layout = view
-        .layout
-        .unwrap_or_else(|| PlaneLayout::packed(view.format, width, height));
-    let mut out = vec![0u8; width as usize * height as usize * 3];
+    let layout = layout.unwrap_or_else(|| PlaneLayout::packed(format, width, height));
+    let mut out = vec![0u8; target.buffer_size(width, height)];
     converter
         .convert(bytes, layout, &mut out)
         .context("converting the frame")?;

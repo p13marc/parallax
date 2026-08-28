@@ -41,6 +41,11 @@ iced = { version = "0.14", default-features = false, features = [
     # so a diagnostics panel would otherwise have to probe a *second* adapter
     # and hope it matched.
     "sysinfo",
+    # Seek-bar previews (#282) draw through `image::Handle::from_rgba`.
+    # `image-without-codecs`, not `image`: the thumbnailer decodes with
+    # parallax and hands over raw RGBA, so the `image` crate's own format
+    # readers would be dead weight in the binary.
+    "image-without-codecs",
 ] }
 # The file dialog, through the XDG portal. Not `rfd`: parallax already
 # depends on ashpd 0.13 for the screencast portal, and rfd would pull a second
@@ -55,6 +60,10 @@ percent-encoding = "2"
 # PNG encoding for snapshots (#283). The core crate's `PngEncoder` is a
 # pipeline *element* and a snapshot is not a pipeline — see `snapshot.rs`.
 png = "0.18"
+# Seek-bar previews (#282). Already in the lock as a transitive dependency of
+# `cryoglyph`, iced's text renderer, so this compiles nothing new and cannot
+# duplicate a major.
+lru = "0.16"
 clap = { version = "4", features = ["derive"] }
 # `signal` is declared rather than inherited: the root crate enables it and
 # cargo unifies tokio's features across the graph, so `--headless`'s Ctrl-C

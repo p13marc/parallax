@@ -922,6 +922,23 @@ impl<R: Read + Seek> MkvDemux<R> {
         &self.tracks
     }
 
+    /// Whether this file carries a cue table.
+    ///
+    /// Cue-less Matroska is still *seekable* — the fallback rewinds and scans
+    /// forward from the start — but every seek costs a linear read, and a
+    /// backward index does not exist at all, which is why reverse playback
+    /// refuses on such files. A caller that seeks at interaction rates (a
+    /// scrubber's preview) should ask this and decline rather than appear to
+    /// hang.
+    pub fn has_cues(&self) -> bool {
+        !self.cues.is_empty()
+    }
+
+    /// How many cue points the file declares. Zero means no cue table.
+    pub fn cue_count(&self) -> usize {
+        self.cues.len()
+    }
+
     /// The first video track, if any.
     pub fn video_track(&self) -> Option<&MkvTrack> {
         self.tracks
