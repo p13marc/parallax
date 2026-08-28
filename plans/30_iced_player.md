@@ -499,7 +499,9 @@ path exists at any layer), MP3/FLAC streaming decoders.
   `Cargo.toml` by `tests/readme_features.rs`.
 - Manual: play an MP4 and an MKV; seek forward and backward through a keyframe-sparse
   region; pause and resume; change volume; go fullscreen; minimise for a minute with
-  audio playing and confirm audio never underruns while `dropped_full` climbs; open a
+  audio playing and confirm audio never underruns while `dropped_full` climbs, then
+  un-minimise and confirm the picture resyncs within about two seconds; repeat at
+  50 fps or better, which is where the branch depths leave the least slack; open a
   second file without restarting; close the window.
 
 ## Risks
@@ -521,6 +523,48 @@ path exists at any layer), MP3/FLAC streaming decoders.
 
 Written after the fact, because a plan that only records what it predicted is
 not much use to the next person.
+
+**A bounded wait is still a block, if the bound restarts.** The risk table below
+predicted this failure and named the right mitigation — "drop-oldest ring plus
+`StallWatch`; `consume` never blocks indefinitely on mailbox space" — and the
+implementation satisfied every word of it while reproducing the failure exactly
+(#293). `AppVideoSink::enqueue` recomputed its `shed_after` deadline per frame, so
+a host that had stopped did not make it shed at source rate; it made the video
+branch consume at 1/`shed_after` — two frames a second. That filled the video
+link, backed the demuxer up, starved the audio branch and left the master clock
+creeping. Backgrounding the window ran the whole pipeline at **0.08x**, and it
+stayed there.
+
+Three things this taught that the plan had no way to know:
+
+- *The ring being drop-oldest is not enough if the path to the ring is not.* The
+  policy has to be stated about `consume`, not about the queue.
+- *You cannot fix a circular equilibrium by choosing a better rate inside it.*
+  Every rate in a paced graph is defined by every other one — sink consumption →
+  demuxer routing → audio feed → playback → master clock → (`schedule`) → sink
+  consumption — so the loop is self-consistent at any rate and simply stays where
+  it lands. `StallWatch` cannot break it either: it wants a bit-identical clock
+  reading, and a creeping clock never gives one. What takes the sink out of the
+  loop is pacing against the frame's own due time rather than a wall-clock
+  deadline: it then consumes one frame per frame interval, which unblocks the
+  demuxer at exactly the rate the other branches drain at. Consuming *slower*
+  than frames come due is the thing that starves them, and only a wall-clock
+  bound does that.
+- *Removing back-pressure entirely is not the safe direction, it is a different
+  bug.* The first fix let a device-clocked graph shed at source rate on the
+  theory that the audio branch was doing the pacing. It is, but with nothing
+  holding the video pad the demuxer runs ahead by the *audio* link's depth —
+  2.05 s of AAC against 1.24 s of video — so frames reach the mailbox two
+  seconds early, `schedule`'s `MAX_WAIT` hatch presents them on arrival, and the
+  picture runs two seconds ahead of the sound. The rig missed it because its
+  branch depths were the inverse of the player's; matching the player's ratio
+  reproduced it exactly, at 2050 ms.
+
+A fourth, smaller: *"the host has not taken a frame" is not the same as "the
+host has stopped."* Coming back from a stall the queue is briefly dated ahead of
+the clock, so the host genuinely cannot present; treating that as a stall
+re-latches the shed and the two states alternate, delivering the picture in
+bursts a second apart.
 
 **The clock reaches an element only through its consume context.** `set_clock`
 is on the adapter, not on `AsyncSink`, so `FrameMailbox::clock()` cannot exist

@@ -59,6 +59,16 @@ const AUDIO_BYTES: usize = 480 * 2 * 2;
 /// hundreds of milliseconds the arrival anchor used to produce.
 const TOLERANCE_MS: f64 = 25.0;
 
+/// Audio buffers a branch holds, in the ratio `parallax-player` really runs.
+///
+/// The player links 96 AAC packets, and an AAC-LC packet is 1024 samples —
+/// 21.3 ms at 48 kHz, so **2.05 s** of audio against the video branch's
+/// 24 + 4 + 3 frames, which is 1.24 s at 25 fps. Audio buffers roughly twice
+/// what video does, and that asymmetry is not incidental: it decides how far
+/// ahead an un-back-pressured demuxer can run, which is the whole subject of
+/// the occlusion tests. At 10 ms per buffer here, 205 is the same 2.05 s.
+const AUDIO_DEPTH: usize = 205;
+
 const VIDEO_PAD: PadId = PadId(0);
 const AUDIO_PAD: PadId = PadId(1);
 
@@ -76,6 +86,10 @@ struct AvSource {
     frames: u64,
     /// Rewind to zero at the end instead of reporting EOS.
     looping: bool,
+    /// Nanoseconds per video frame. The frame rate decides how many seconds
+    /// of stream the branch depths hold, which is the whole subject of the
+    /// occlusion tests.
+    frame_ns: u64,
     staged: Option<parallax::event::SegmentEvent>,
     outputs: Vec<(PadId, parallax::format::Caps)>,
 }
@@ -88,6 +102,7 @@ impl AvSource {
             audio: 0,
             frames,
             looping: false,
+            frame_ns: FRAME_NS,
             staged: None,
             outputs: vec![
                 (VIDEO_PAD, parallax::format::Caps::any()),
@@ -98,6 +113,12 @@ impl AvSource {
 
     fn looping(mut self) -> Self {
         self.looping = true;
+        self
+    }
+
+    /// Run at a different frame rate than the default 10 fps.
+    fn with_frame_ns(mut self, frame_ns: u64) -> Self {
+        self.frame_ns = frame_ns;
         self
     }
 
@@ -129,7 +150,7 @@ impl Demuxer for AvSource {
         }
         // Interleave in timestamp order, audio slightly ahead like a real
         // container's read-ahead.
-        let video_at = self.video * FRAME_NS;
+        let video_at = self.video * self.frame_ns;
         let audio_at = self.audio * AUDIO_NS;
         let (pad, len, pts) = if audio_at <= video_at {
             self.audio += 1;
@@ -174,16 +195,16 @@ impl Demuxer for AvSource {
         }
         let target = seek.start.position.max(0) as u64;
         // Video snaps back to its GOP's keyframe...
-        let frame = target / FRAME_NS;
+        let frame = target / self.frame_ns;
         let keyframe = frame - (frame % GOP_FRAMES);
         self.video = keyframe;
         // ...and audio lands at or before it, which is what leaves the first
         // post-seek audio buffer straddling the segment start.
-        self.audio = (keyframe * FRAME_NS) / AUDIO_NS;
+        self.audio = (keyframe * self.frame_ns) / AUDIO_NS;
         if self.audio > 0 {
             self.audio -= 1;
         }
-        EventResult::handled_at((keyframe * FRAME_NS) as i64)
+        EventResult::handled_at((keyframe * self.frame_ns) as i64)
     }
 }
 
@@ -228,18 +249,23 @@ fn build(source: AvSource) -> (Pipeline, LogHandle, LogHandle) {
 /// job, which is the whole point of it — so the drain task below *is* the
 /// host, doing what a redraw loop does. It logs into the same `Presented`
 /// records the stand-in produces, so both are measured with one yardstick.
+/// `shed_after: None` means the production default, which is what the
+/// occlusion tests must run at — a shorter deadline than the frame interval
+/// hides the very behaviour they are about.
 fn build_with_app_sink(
     source: AvSource,
-    shed_after: Duration,
+    shed_after: Option<Duration>,
+    audio_depth: usize,
 ) -> (Pipeline, LogHandle, Arc<FrameMailbox>) {
     let mut pipeline = Pipeline::new();
     let src = pipeline.add_demuxer("demux", source);
 
     let audio = ClockAudioSink::new(SAMPLE_RATE, 2, 2);
     let audio_log = audio.log();
-    let video = AppVideoSink::new()
-        .with_sync(true)
-        .with_shed_after(shed_after);
+    let mut video = AppVideoSink::new().with_sync(true);
+    if let Some(shed_after) = shed_after {
+        video = video.with_shed_after(shed_after);
+    }
     let mailbox = video.mailbox();
 
     let decode = pipeline.add_async_transform("decode", SlowRestart::new(VIDEO_RESTART));
@@ -248,9 +274,22 @@ fn build_with_app_sink(
     pipeline
         .link_pads_full(src, "video", decode, "sink", LinkPolicy::Block, Some(24))
         .unwrap();
-    pipeline.link(decode, vsink).unwrap();
+    // The player's decode-ahead window, spelled out rather than inherited from
+    // `ExecutorConfig::channel_capacity` (16): how many seconds of stream the
+    // video branch holds is exactly what decides whether a starving audio
+    // branch shows up inside a test's measuring window.
     pipeline
-        .link_pads_full(src, "audio", asink, "sink", LinkPolicy::Block, Some(96))
+        .link_pads_full(decode, "src", vsink, "sink", LinkPolicy::Block, Some(4))
+        .unwrap();
+    pipeline
+        .link_pads_full(
+            src,
+            "audio",
+            asink,
+            "sink",
+            LinkPolicy::Block,
+            Some(audio_depth),
+        )
         .unwrap();
     (pipeline, audio_log, mailbox)
 }
@@ -281,6 +320,60 @@ fn spawn_host(mailbox: Arc<FrameMailbox>) -> (LogHandle, tokio::task::JoinHandle
         }
     });
     (log, task)
+}
+
+/// The same redraw loop, with a window in which the host draws nothing at all.
+///
+/// This is what an occluded or minimised window looks like from the pipeline's
+/// side: not a slow host, a stopped one. It neither takes frames nor reads the
+/// clock while it is dark, exactly as a widget whose event loop is parked
+/// inside its compositor's present call does not.
+fn spawn_host_with_gap(
+    mailbox: Arc<FrameMailbox>,
+    draw_for: Duration,
+    dark_for: Duration,
+) -> (LogHandle, tokio::task::JoinHandle<()>) {
+    let log: LogHandle = Arc::new(Mutex::new(sync::Log::default()));
+    let into = LogHandle::clone(&log);
+    let task = tokio::spawn(async move {
+        let dark_from = std::time::Instant::now() + draw_for;
+        let dark_until = dark_from + dark_for;
+        loop {
+            let now = std::time::Instant::now();
+            if !(dark_from..dark_until).contains(&now)
+                && let Some(clock) = mailbox.clock()
+            {
+                let running = clock.now();
+                while let Some(paced) = mailbox.take_due(running, Duration::from_millis(40)) {
+                    let at = clock.clock_time();
+                    record(&into, |l| {
+                        l.presented.push(Presented {
+                            pts: paced.frame.data.metadata().pts,
+                            running_time: paced.target,
+                            at,
+                        });
+                    });
+                }
+            }
+            if mailbox.end_reason().is_some() && !mailbox.has_frame() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+    (log, task)
+}
+
+/// How much stream time a log covers, in nanoseconds.
+///
+/// `ClockAudioSink` sleeps for every buffer it plays, so measuring its running
+/// time against wall time is measuring whether the pipeline is keeping up.
+fn advanced_ns(from: &sync::Log, to: &sync::Log) -> u64 {
+    let start = from.presented.last().expect("something played first");
+    let end = to.presented.last().expect("something played after");
+    end.running_time
+        .nanos()
+        .saturating_sub(start.running_time.nanos())
 }
 
 fn snapshot(log: &LogHandle) -> sync::Log {
@@ -752,7 +845,7 @@ async fn a_looping_real_pipeline_survives_repeated_seeks() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_app_sink_settles_on_the_audio_origin_too() {
     let (mut pipeline, audio_log, mailbox) =
-        build_with_app_sink(AvSource::new(10), Duration::from_millis(500));
+        build_with_app_sink(AvSource::new(10), None, AUDIO_DEPTH);
     let (video_log, host) = spawn_host(Arc::clone(&mailbox));
 
     let executor = Executor::with_config(ExecutorConfig::default());
@@ -781,39 +874,152 @@ async fn the_app_sink_settles_on_the_audio_origin_too() {
     );
 }
 
-/// A host that stops drawing must not stop the pipeline.
+/// A host that stops drawing must not *slow the pipeline down*.
 ///
-/// An occluded or minimised window stops receiving redraws. If the sink
-/// blocked on mailbox space it would fill the video link, back the demuxer
-/// up, starve the audio branch and freeze the master clock — a hidden window
-/// would become a stopped pipeline. It sheds instead.
+/// Not merely "must not stop it", which is what the first version of this
+/// test asserted — a count of audio buffers over 1.2 s, with the shed deadline
+/// overridden to 60 ms so that shedding roughly kept pace with a 10 fps source.
+/// A pipeline crawling at two frames a second passes that. It is the shape a
+/// real one takes when the window goes behind another: `enqueue` restarted its
+/// deadline for every frame, so the video branch consumed at 1/`shed_after`,
+/// filled its links, backed the demuxer up, starved the audio branch and left
+/// the master clock creeping. Every rate in that loop is defined by every other
+/// one, so it settles wherever it lands and stays.
+///
+/// What an occluded window must cost is the picture and nothing else. So the
+/// assertion is a *rate*, at the production deadline, measured over a window
+/// that only opens once the branch depths have been used up.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_host_that_stops_drawing_does_not_stall_the_audio_branch() {
-    // A short shed deadline so the test does not spend its life waiting on
-    // one: the behaviour under test is *that* it sheds, not how long it waits.
-    let (mut pipeline, audio_log, mailbox) =
-        build_with_app_sink(AvSource::new(20), Duration::from_millis(60));
+async fn a_host_that_stops_drawing_does_not_slow_the_pipeline_down() {
+    // 25 fps, so the video branch's 24 + 4 + 3 frames are ~1.2 s of stream and
+    // the audio link's 96 buffers are ~1 s — both spent well inside the settle
+    // window below.
+    let (mut pipeline, audio_log, mailbox) = build_with_app_sink(
+        AvSource::new(400).with_frame_ns(40_000_000),
+        None,
+        AUDIO_DEPTH,
+    );
     // No host at all: nothing ever drains the mailbox.
     let executor = Executor::with_config(ExecutorConfig::default());
     let handle = executor.start(&mut pipeline).unwrap();
-    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    tokio::time::sleep(Duration::from_millis(2_000)).await;
+    let mark = snapshot(&audio_log);
+    let marked_at = std::time::Instant::now();
+    let before = mailbox.stats().dropped_full;
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
     let audio = snapshot(&audio_log);
+    let elapsed = marked_at.elapsed();
     let stats = mailbox.stats();
     handle.stop();
     let _ = handle.wait().await;
 
+    let rate = advanced_ns(&mark, &audio) as f64 / elapsed.as_nanos() as f64;
     assert!(
-        audio.presented.len() > 5,
-        "audio kept playing with nobody drawing: {} buffers",
-        audio.presented.len()
+        rate > 0.6,
+        "audio ran at {rate:.2}x real time with nobody drawing — \
+         the video branch was still back-pressuring the demuxer"
     );
+
+    // And the video branch shed at the *source's* rate, not the shed timer's:
+    // ~25 a second over the measured window, against 2 a second before.
+    let shed = stats.dropped_full - before;
     assert!(
-        stats.dropped_full > 0,
-        "the video branch shed rather than blocking"
+        shed > 20,
+        "the video branch shed only {shed} frames in {elapsed:?} — it was still waiting"
     );
     assert!(
         stats.queued <= mailbox.capacity(),
         "the ring stayed bounded at {} frames",
         stats.queued
+    );
+}
+
+/// And a host that comes back gets a picture again, in sync.
+///
+/// The other half of the same failure: the pipeline that crawled while the
+/// window was hidden used to stay crawling once it came back, because the
+/// equilibrium it had settled into was self-consistent and nothing pulled it
+/// out. Recovering has to be automatic and quick.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_that_comes_back_gets_a_picture_in_sync() {
+    host_returns_in_sync(40_000_000).await;
+}
+
+/// The same, at 50 fps.
+///
+/// The frame rate decides how many *seconds* the video branch's 24 + 4 + 3
+/// frames hold — 1.24 s at 25 fps, 0.62 s at 50 — while the audio branch holds
+/// 2.05 s either way. The shallower the video side, the further a demuxer that
+/// nothing is back-pressuring can run ahead of the playhead, and the further
+/// ahead of the audio the picture ends up. This is the worst ratio the player
+/// meets in practice, so it is the one worth pinning.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_that_comes_back_is_in_sync_at_high_frame_rates() {
+    host_returns_in_sync(20_000_000).await;
+}
+
+async fn host_returns_in_sync(frame_ns: u64) {
+    let (mut pipeline, audio_log, mailbox) = build_with_app_sink(
+        AvSource::new(800).with_frame_ns(frame_ns),
+        None,
+        AUDIO_DEPTH,
+    );
+    // Draw briefly, go dark for longer than the branch depths can absorb, come
+    // back. 2.5 s of dark against ~1.2 s of video and ~1 s of audio buffering.
+    let (video_log, host) = spawn_host_with_gap(
+        Arc::clone(&mailbox),
+        Duration::from_millis(700),
+        Duration::from_millis(2_500),
+    );
+
+    let executor = Executor::with_config(ExecutorConfig::default());
+    let handle = executor.start(&mut pipeline).unwrap();
+
+    // Through the dark window, sampling the audio at its edges.
+    tokio::time::sleep(Duration::from_millis(1_400)).await;
+    let dark_mark = snapshot(&audio_log);
+    let dark_at = std::time::Instant::now();
+    tokio::time::sleep(Duration::from_millis(1_700)).await;
+    let dark_end = snapshot(&audio_log);
+    let dark_elapsed = dark_at.elapsed();
+
+    // Back on screen. Give the branch time to re-fill and settle before
+    // judging the drift: the first frames after the host returns discharge
+    // whatever lead the un-back-pressured demuxer built up.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let resumed = snapshot(&video_log);
+    let resumed_at = match resumed.presented.last() {
+        Some(last) => last.at,
+        // The state this whole change exists to make impossible: the host is
+        // drawing again and the pipeline is still wedged where the stall left
+        // it, with nothing ever becoming due.
+        None => panic!("no frame was ever presented — the picture never came back"),
+    };
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+
+    let audio = snapshot(&audio_log);
+    let video = snapshot(&video_log);
+    handle.stop();
+    let _ = handle.wait().await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), host).await;
+
+    let dark_rate = advanced_ns(&dark_mark, &dark_end) as f64 / dark_elapsed.as_nanos() as f64;
+    assert!(
+        dark_rate > 0.6,
+        "audio ran at {dark_rate:.2}x real time while the host was dark"
+    );
+
+    let after_resume = video.after(resumed_at).len();
+    assert!(
+        after_resume > 15,
+        "only {after_resume} frames were presented in the 1.2 s after the picture \
+         came back — the pipeline was still crawling"
+    );
+
+    let drift = settled_drift_ms(&audio, &video, resumed_at);
+    assert!(
+        drift.abs() < TOLERANCE_MS,
+        "video settled {drift:.1} ms off the audio origin after the host returned"
     );
 }

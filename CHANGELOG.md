@@ -275,6 +275,67 @@ Every out-of-tree plugin must be rebuilt: the plugin ABI went **12 → 14**.
 
 ### Fixed
 
+- **Backgrounding `parallax-player` no longer drags the whole pipeline down
+  with it** (#293). Putting the window behind another made playback crawl —
+  audio breaking up along with the picture — and it stayed that way until a
+  seek. Measured in the new regression test, the pipeline ran at **0.08x** real
+  time and never climbed back.
+
+  An occluded surface stops getting frame callbacks, so nothing drains the
+  `FrameMailbox`; that part is the compositor's business and iced 0.14 exposes
+  no occlusion event to react to. What was ours is what `AppVideoSink` did
+  about it. `enqueue` recomputed its `shed_after` deadline **per frame**, so a
+  host that had stopped did not make the sink shed at source rate — it made the
+  video branch consume at two frames a second. The video link filled, the
+  demuxer blocked on the video pad, the audio branch starved behind it, the
+  device underran and the master clock crept.
+
+  Bounding the wait was never going to be enough, which is why the original
+  bound did not help: every rate in a paced graph is defined by every other one
+  — sink consumption sets demuxer routing, which sets the audio feed, which
+  sets playback, which drives the master clock, which through `schedule` sets
+  sink consumption — so the loop is self-consistent at *any* rate and stays
+  wherever it lands. `StallWatch` could not break it either; it wants a
+  bit-identical clock reading and a creeping clock never gives one.
+
+  So past the deadline the sink stops waiting on the host and paces itself: it
+  holds each frame until its presentation time, then sheds it. The pipeline
+  runs at exactly playback speed with nobody watching, and the picture is the
+  only thing that pays. Pacing does not starve the graph even though waiting
+  for the *host* did — the sink consumes one frame per frame interval, so it
+  unblocks the demuxer at exactly the rate the other branches drain at. What
+  put it inside the bad loop was consuming slower than frames come due, which
+  is what a wall-clock deadline does and a due-time wait cannot.
+
+  Shedding at source rate instead — letting the audio device do the pacing —
+  was tried and is worse: with no back-pressure the demuxer runs ahead by the
+  *other* branch's link depth (2.05 s of audio against 1.24 s of video), so
+  frames reach the mailbox two seconds early, `schedule`'s `MAX_WAIT` hatch
+  presents them on arrival, and the picture runs two seconds ahead of the
+  sound. The regression test measures exactly that, which is how it was caught.
+
+  A host that has taken nothing because nothing is *due* is a correctly paced
+  host, not a stopped one; without that distinction the two states alternate
+  and the picture arrives in bursts a second apart.
+
+    `with_shed_after` therefore means "how long before concluding the host has
+  stopped", paid once per stall rather than per frame, and `with_stall_limit`
+  joins it for the master-less case.
+
+- **`FrameMailbox::take_due` wakes the producer whenever it frees a slot**
+  (#293), not only when it hands a frame back. Both early returns skipped the
+  `space` notify, and both are reachable after the loop has already popped
+  frames on the stale and drop-late branches — so a host that had fallen behind
+  emptied the ring by dropping every frame as late, freed the whole queue and
+  told the producer nothing. It then slept out its full shed deadline in
+  exactly the case where it was already behind, which is self-reinforcing.
+  Independent of the occlusion bug and reachable with the window in front.
+
+  `push_evicting` also carries a displaced frame's `must_present` forward onto
+  its replacement in the same generation: "the first frame of a generation goes
+  up however late" is a promise about the generation, and shedding at source
+  rate made evicting the frame that carried it routine.
+
 - **`ZenohSink` no longer turns on `express` for the `@media` frame profile**
   (#262). Both halves of the reasoning it was added under are true and neither
   of them is express: "a stale frame is worthless" is `Drop` plus
