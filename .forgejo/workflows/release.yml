@@ -84,12 +84,21 @@ jobs:
           git add -A
           git -c user.name=ci -c user.email=ci@marcpardo.eu commit -q -m "flatpak export ${RELEASE_TAG}"
           git push --force "http://forgejo:${{ secrets.GITHUB_TOKEN }}@10.10.0.30:3000/${GITHUB_REPOSITORY}.git" HEAD:flatpak-export
-      - uses: https://data.forgejo.org/actions/forgejo-release@v2
-        with:
-          direction: upload
-          url: http://10.10.0.30:3000
-          repo: ${{ github.repository }}
-          tag: ${{ env.RELEASE_TAG }}
-          sha: ${{ env.RELEASE_SHA }}
-          release-dir: dist/release
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Attach bundle to the release
+        # forgejo-release@v2 tries to create the release and 409s when it
+        # already exists (the release job created it) -> attach via the API.
+        # Delete-then-upload keeps dispatch re-runs idempotent. Never
+        # override:true (it recreates the release and wipes every asset).
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          api="http://10.10.0.30:3000/api/v1/repos/${GITHUB_REPOSITORY}"
+          rid=$(curl -sf -H "Authorization: token $TOKEN" "$api/releases/tags/${RELEASE_TAG}" | jq -r .id)
+          for f in "$GITHUB_WORKSPACE"/dist/release/*; do
+            name=$(basename "$f")
+            for aid in $(curl -sf -H "Authorization: token $TOKEN" "$api/releases/$rid/assets" | jq -r --arg n "$name" '.[] | select(.name==$n) | .id'); do
+              curl -sf -X DELETE -H "Authorization: token $TOKEN" "$api/releases/$rid/assets/$aid" >/dev/null
+            done
+            curl -sf -X POST -H "Authorization: token $TOKEN" -F "attachment=@$f" "$api/releases/$rid/assets?name=$name" >/dev/null
+            echo "attached $name"
+          done
