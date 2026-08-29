@@ -1,0 +1,57 @@
+# cargo-deny configuration (fleet standard, myserver#33: cargo-deny is the
+# single supply-chain lint). See https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+# All transitive — unactionable here. Re-check on dep bumps (2026-08-29).
+ignore = [
+    "RUSTSEC-2023-0071", # rsa: Marvin timing sidechannel — no fixed release exists
+    "RUSTSEC-2023-0089", # atomic-polyfill unmaintained (via heapless)
+    "RUSTSEC-2024-0370", # proc-macro-error unmaintained
+    "RUSTSEC-2024-0436", # paste unmaintained
+    "RUSTSEC-2025-0134", # rustls-pemfile unmaintained
+    "RUSTSEC-2025-0141", # bincode 1.x unmaintained
+    "RUSTSEC-2026-0041", # lz4_flex decompress leak — zenoh pins 0.10, fix is in a later minor
+    "RUSTSEC-2026-0150", # audiopus_sys unmaintained (opus FFI; no maintained replacement)
+    "RUSTSEC-2026-0192", # ttf-parser unmaintained (via iced's font stack)
+    "RUSTSEC-2026-0194", # quick-xml 0.39 quadratic attr check — transitive pin, build-time XML only
+    "RUSTSEC-2026-0195", # quick-xml 0.39 NsReader allocation — same pin as above
+]
+
+[licenses]
+version = 2
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+    "0BSD",
+    "BSL-1.0",
+    # Community Data License Agreement – Permissive 2.0. Used by
+    # `webpki-roots` (the Mozilla CA bundle) in zenoh's TLS stack.
+    "CDLA-Permissive-2.0",
+    # Codec crates carry compound expressions: `(MIT OR Apache-2.0) AND NCSA`
+    # and `(MIT OR Apache-2.0) AND IJG` (jpeg). Both permissive, OSI-listed.
+    "NCSA",
+    "IJG",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

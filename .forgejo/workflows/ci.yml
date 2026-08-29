@@ -5,6 +5,8 @@ on:
     paths-ignore: ['**.md', 'docs/**', 'LICENSE*']
   pull_request:
     paths-ignore: ['**.md', 'docs/**', 'LICENSE*']
+  # manual re-run path (flaky job, runner was offline, cache experiments)
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -20,7 +22,13 @@ env:
   # Not `@stable`: that is a moving target, and when it moved to 1.98 on
   # 2026-08-18 it turned seven jobs red on new clippy lints with no code
   # change. Bumping Rust is now a pull request that runs the whole matrix.
-  RUST_VERSION: "1.98.0"
+  #
+  # 1.97, not 1.98: the fleet builds with one rustc (myserver#33, fleet
+  # standard) so sccache hits are shared cluster-wide. The 1.98 pin was the
+  # hotfix for the @stable drift above; the fleet-wide bump to 1.98+ happens
+  # everywhere together per the toolchain-bump checklist in
+  # myserver docs/services/ci-templates/README.md.
+  RUST_VERSION: "1.97"
   # `zenoh-unstable` is in here rather than appended per-job because the
   # matching-listener demand signal (#234) lives behind it: with it only on the
   # clippy and doc jobs, a test covering that code compiled and never ran.
@@ -452,3 +460,16 @@ jobs:
         with:
           cache-targets: false
       - run: cargo doc --no-deps --features "$SENSOR_FEATURES,image-codecs"
+
+  deny:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@v7.0.1
+      - uses: https://github.com/dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      # the docker cargo-deny action cannot see deny.toml -> install directly
+      - uses: https://github.com/taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - run: cargo deny check

@@ -1,0 +1,15 @@
+name: Publish crates
+on:
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@v7.0.1
+      - run: sudo apt-get update && sudo apt-get install -y libudev-dev g++ libclang-dev
+      - uses: https://github.com/dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97"
+      - run: cargo test --locked
+      - run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }}

@@ -84,7 +84,7 @@ ureq = { version = "3", optional = true }
 tungstenite = { version = "0.30", optional = true }
 
 # Zenoh pub/sub (optional)
-zenoh = { version = "1.9", optional = true }
+zenoh = { version = "1.10", optional = true }
 
 # CBOR, for the `@media` plane's FrameMeta attachment (#232). A real CBOR
 # reader rather than a hand-rolled one because the decode side must accept
