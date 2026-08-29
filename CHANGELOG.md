@@ -10,6 +10,21 @@ commit messages and the Forgejo releases.
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-08-29
+
+The fleet-uniformity release (myserver#33). No engine features — this is
+the release that packages and re-plumbs:
+
+- **`parallax-player` ships as a flatpak**: `com.github.p13marc.ParallaxPlayer`
+  on flatpak.marcpardo.eu, built by CI on the freedesktop 25.08 runtime
+  (software rendering in CI; the GPU lane stays on the workstation).
+- **Toolchain rejoins the fleet at 1.97** (the 1.98.0 pin was the hotfix for
+  the `@stable` drift of 2026-08-18; bumps are now fleet-wide by checklist).
+- **zenoh 1.9 → 1.10** (no code changes).
+- CI: `workflow_dispatch` re-runs with a tag input on the release workflow
+  (API-driven create+attach, idempotent), cargo-deny supply-chain lane,
+  `publish-crates.yml` dispatch lane.
+
 ## [0.9.0] — 2026-08-28
 
 Sixty-one commits since 0.8.0, and the release the engine grew an
