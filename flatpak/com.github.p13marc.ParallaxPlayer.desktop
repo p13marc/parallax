@@ -1,0 +1,14 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Parallax Player
+GenericName=Video Player
+Comment=Video player built on the Parallax pipeline engine and Iced
+Keywords=video;player;media;playback;parallax;mp4;mkv;webm;
+Icon=com.github.p13marc.ParallaxPlayer
+Exec=parallax-player %f
+Terminal=false
+Categories=AudioVideo;Video;Player;
+MimeType=video/mp4;video/x-matroska;video/webm;
+StartupNotify=true
+StartupWMClass=parallax-player

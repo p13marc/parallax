@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="128" height="128" viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#33d17a"/>
+      <stop offset="1" stop-color="#26a269"/>
+    </linearGradient>
+    <linearGradient id="screen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#241f31"/>
+      <stop offset="1" stop-color="#3d3846"/>
+    </linearGradient>
+  </defs>
+  <!-- rounded app tile -->
+  <rect x="8" y="8" width="112" height="112" rx="22" fill="url(#bg)"/>
+  <!-- parallax layers: three offset planes behind the screen -->
+  <rect x="30" y="26" width="76" height="52" rx="8" fill="#1a7048" opacity="0.55"/>
+  <rect x="26" y="30" width="76" height="52" rx="8" fill="#145c3a" opacity="0.75"/>
+  <!-- the screen -->
+  <rect x="22" y="34" width="76" height="52" rx="8" fill="url(#screen)"/>
+  <!-- play triangle -->
+  <path d="M 50 46 L 78 60 L 50 74 Z" fill="#f6f5f4"/>
+  <!-- seek bar -->
+  <rect x="26" y="96" width="76" height="6" rx="3" fill="#145c3a"/>
+  <rect x="26" y="96" width="44" height="6" rx="3" fill="#f6f5f4"/>
+  <circle cx="70" cy="99" r="6" fill="#f6f5f4"/>
+</svg>

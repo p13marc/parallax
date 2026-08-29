@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<component type="desktop-application">
+  <id>com.github.p13marc.ParallaxPlayer</id>
+  <name>Parallax Player</name>
+  <summary>Video player built on the Parallax pipeline engine</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+  <developer id="com.github.p13marc">
+    <name>Marc Pardo</name>
+  </developer>
+  <description>
+    <p>
+      Parallax Player is a desktop video player built on Parallax, a
+      Rust-native streaming pipeline engine, with an Iced user interface.
+      Decoding runs through Parallax pipelines; presentation goes through
+      Iced's wgpu renderer, with software rendering as the fallback where no
+      GPU is available.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>MP4/MOV and Matroska/WebM playback</li>
+      <li>H.264, VP8/VP9 and AV1 video decoding</li>
+      <li>AAC, Vorbis, Opus and AC-3/E-AC-3 audio</li>
+      <li>VA-API hardware decode where available, software decode otherwise</li>
+      <li>Seek-bar thumbnails, playlists, and frame-accurate snapshots</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">com.github.p13marc.ParallaxPlayer.desktop</launchable>
+  <url type="homepage">https://github.com/p13marc/parallax</url>
+  <url type="bugtracker">https://github.com/p13marc/parallax/issues</url>
+  <url type="vcs-browser">https://github.com/p13marc/parallax</url>
+  <content_rating type="oars-1.1" />
+  <branding>
+    <color type="primary" scheme_preference="light">#26a269</color>
+    <color type="primary" scheme_preference="dark">#1a7048</color>
+  </branding>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </supports>
+  <requires>
+    <display_length compare="ge">768</display_length>
+  </requires>
+  <categories>
+    <category>AudioVideo</category>
+    <category>Video</category>
+  </categories>
+  <keywords>
+    <keyword>video</keyword>
+    <keyword>player</keyword>
+    <keyword>media</keyword>
+    <keyword>pipeline</keyword>
+    <keyword>parallax</keyword>
+    <keyword>iced</keyword>
+  </keywords>
+  <releases>
+    <release version="0.9.0" date="2026-08-28">
+      <description>
+        <p>First flatpak packaging of the player.</p>
+      </description>
+    </release>
+  </releases>
+</component>
