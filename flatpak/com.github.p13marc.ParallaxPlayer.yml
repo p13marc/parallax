@@ -4,6 +4,8 @@ runtime-version: "25.08"
 sdk: org.freedesktop.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
+  # bindgen (libva FFI) needs libclang; the base Sdk ships NO clang at all
+  - org.freedesktop.Sdk.Extension.llvm20
 command: parallax-player
 
 # CI builds and tests this flatpak with SOFTWARE RENDERING ONLY -- the runner
@@ -30,9 +32,10 @@ finish-args:
   - --filesystem=home
 
 build-options:
-  append-path: /usr/lib/sdk/rust-stable/bin
+  append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm20/bin
   env:
     CARGO_HOME: /run/build/parallax-player/cargo
+    LIBCLANG_PATH: /usr/lib/sdk/llvm20/lib
     RUST_BACKTRACE: "1"
     # Cap build parallelism INSIDE the sandbox: flatpak-builder does not
     # inherit the workflow env, and this is the heaviest crate graph in the
@@ -50,7 +53,8 @@ modules:
       # The workspace's default-members is the root crate alone -- the player
       # must be named explicitly. Its codec feature set (vpx, dav1d, opus,
       # alsa, libva/vaapi) links system libs that all ship in the 25.08
-      # Platform, with headers and the libclang that bindgen needs in the Sdk.
+      # Platform; headers come from the Sdk and libclang (bindgen) from the
+      # llvm20 extension via LIBCLANG_PATH -- the base Sdk has no clang.
       - cargo fetch --manifest-path Cargo.toml
       - cargo build --release -p parallax-player
       - install -Dm755 target/release/parallax-player ${FLATPAK_DEST}/bin/parallax-player

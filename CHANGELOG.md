@@ -10,6 +10,14 @@ commit messages and the Forgejo releases.
 
 ## [Unreleased]
 
+## [0.10.1] — 2026-08-30
+
+- Flatpak: the 0.10.0 flatpak job died in bindgen — the base freedesktop
+  Sdk ships no clang at all. The manifest now pulls the `llvm20` Sdk
+  extension and sets `LIBCLANG_PATH`; verified with a full local
+  flatpak-builder run on the 25.08 runtime (app builds, binary runs).
+  No engine changes.
+
 ## [0.10.0] — 2026-08-29
 
 The fleet-uniformity release (myserver#33). No engine features — this is
