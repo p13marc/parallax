@@ -15,8 +15,8 @@
 //! let mut encoder = KlvEncoder::new();
 //!
 //! // Add platform location
-//! encoder.add_tag(KlvTag::SensorLatitude, 37.2350_f64.to_be_bytes().to_vec());
-//! encoder.add_tag(KlvTag::SensorLongitude, (-115.8111_f64).to_be_bytes().to_vec());
+//! encoder.add_sensor_latitude(37.2350);
+//! encoder.add_sensor_longitude(-115.8111);
 //!
 //! // Get encoded KLV packet (with MISB ST 0601 ULS)
 //! let klv_data = encoder.encode_with_uls(Uls::MisbSt0601);
@@ -489,9 +489,6 @@ impl KlvEncoder {
         // Encode local set
         let local_set = self.encode_local_set();
 
-        // Calculate checksum over local set
-        let checksum = calculate_checksum(&local_set);
-
         // Total value length = local set + checksum tag (1) + checksum length (1) + checksum (2)
         let total_length = local_set.len() + 1 + 1 + 2;
 
@@ -504,6 +501,8 @@ impl KlvEncoder {
         // Checksum (tag 1, length 2, value 2 bytes)
         packet.push(u8::from(KlvTag::Checksum));
         packet.push(2); // Length
+        // ST 0601 checksum covers everything from the UL key through this length byte
+        let checksum = misb::klv::checksum(&packet);
         packet.extend(checksum.to_be_bytes());
 
         packet
@@ -574,32 +573,18 @@ fn encode_heading(degrees: f64) -> u16 {
     scaled.round() as u16
 }
 
-/// Encode pitch (-90 to +90 degrees) as 2-byte IMAPB.
+/// Encode pitch (-20 to +20 degrees, ST 0601 tag 6) as int16.
 fn encode_pitch(degrees: f64) -> i16 {
-    let clamped = degrees.clamp(-90.0, 90.0);
-    let scaled = (clamped / 90.0) * (i16::MAX as f64);
+    let clamped = degrees.clamp(-20.0, 20.0);
+    let scaled = (clamped / 20.0) * (i16::MAX as f64);
     scaled.round() as i16
 }
 
-/// Encode roll (-90 to +90 degrees) as 2-byte IMAPB.
+/// Encode roll (-50 to +50 degrees, ST 0601 tag 7) as int16.
 fn encode_roll(degrees: f64) -> i16 {
-    let clamped = degrees.clamp(-90.0, 90.0);
-    let scaled = (clamped / 90.0) * (i16::MAX as f64);
+    let clamped = degrees.clamp(-50.0, 50.0);
+    let scaled = (clamped / 50.0) * (i16::MAX as f64);
     scaled.round() as i16
-}
-
-// ============================================================================
-// Checksum Calculation
-// ============================================================================
-
-/// Calculate MISB checksum (running 16-bit sum).
-fn calculate_checksum(data: &[u8]) -> u16 {
-    let mut sum: u16 = 0;
-    for (i, &byte) in data.iter().enumerate() {
-        // Checksum includes position-weighted bytes
-        sum = sum.wrapping_add((byte as u16) << (8 * ((i + 1) % 2)));
-    }
-    sum
 }
 
 // ============================================================================
@@ -854,10 +839,19 @@ mod tests {
     }
 
     #[test]
-    fn test_checksum_calculation() {
-        let data = vec![0x01, 0x02, 0x03, 0x04];
-        let checksum = calculate_checksum(&data);
-        assert_ne!(checksum, 0);
+    fn test_st0601_packet_decodes_with_valid_checksum() {
+        let mut encoder = KlvEncoder::new();
+        encoder
+            .add_timestamp(1_234_567_890_000_000)
+            .add_platform_pitch(10.0)
+            .add_platform_roll(-30.0);
+
+        let packet = encoder.encode_st0601();
+        // Packet::parse rejects a packet whose checksum does not verify.
+        let (decoded, used) = misb::st0601::Packet::parse(&packet).unwrap();
+        assert_eq!(used, packet.len());
+        assert!((decoded.platform_pitch().unwrap() - 10.0).abs() < 0.01);
+        assert!((decoded.platform_roll().unwrap() + 30.0).abs() < 0.01);
     }
 
     #[test]
@@ -916,10 +910,10 @@ mod tests {
         let zero_pitch = encode_pitch(0.0);
         assert_eq!(zero_pitch, 0);
 
-        let max_pitch = encode_pitch(90.0);
+        let max_pitch = encode_pitch(20.0);
         assert_eq!(max_pitch, i16::MAX);
 
-        let min_pitch = encode_pitch(-90.0);
+        let min_pitch = encode_pitch(-20.0);
         // Allow for rounding
         assert!(min_pitch < 0);
     }

@@ -3606,6 +3606,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "misb"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11212607254d323818fff9905f8ff8762134e3eb5306e703204a026177cae4f4"
+
+[[package]]
 name = "moxcms"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4519,6 +4525,7 @@ dependencies = [
  "libloading 0.9.0",
  "matroska-demuxer",
  "metrics",
+ "misb",
  "mp4",
  "mpeg2ts-reader",
  "openh264",
