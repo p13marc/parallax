@@ -49,6 +49,9 @@ daggy = { version = "0.9", features = ["stable_dag"] }
 # Parsing
 winnow = "1"
 
+# MISB ST 0601 KLV checksum
+misb = { version = "0.2.0", default-features = false }
+
 # Serialization (zero-copy)
 rkyv = { version = "0.8", features = ["bytecheck"] }
 serde = { version = "1", features = ["derive"] }
