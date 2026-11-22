@@ -419,7 +419,10 @@ impl AsyncSource for AlsaSrc {
         if !fds.is_empty() {
             // Use AsyncFd to wait
             let fd = fds[0].fd;
-            if let Ok(async_fd) = AsyncFd::new(fd) {
+            // SAFETY: the fd is one of `self.pcm`'s poll descriptors, and the
+            // PCM is borrowed for this whole call — it stays open, on the
+            // same descriptor, past the end of this registration.
+            if let Ok(async_fd) = unsafe { AsyncFd::register(fd) } {
                 let _ = async_fd.readable().await;
             }
         }
@@ -474,6 +477,17 @@ impl AsyncSource for AlsaSrc {
 
 /// ALSA audio playback sink.
 pub struct AlsaSink {
+    /// The PCM's poll fd, registered with the tokio reactor once and kept —
+    /// a fresh `AsyncFd` per buffer cost an allocation plus two epoll_ctl
+    /// syscalls per audio buffer (#142). Lazily built on first consume so
+    /// construction stays runtime-independent.
+    ///
+    /// Declared BEFORE `pcm`: fields drop in declaration order, and the
+    /// registration has to leave the reactor while the descriptor it names
+    /// is still the PCM's. Below it, `snd_pcm_close` ran first and the
+    /// `AsyncFd` then deregistered a number the kernel could already have
+    /// reissued.
+    poll_fd: Option<AsyncFd<std::os::fd::RawFd>>,
     /// PCM device.
     pcm: PCM,
     /// Audio format.
@@ -490,11 +504,6 @@ pub struct AlsaSink {
     dev_paused: bool,
     /// Device playback position, shared with the clock.
     position: Arc<AlsaPosition>,
-    /// The PCM's poll fd, registered with the tokio reactor once and kept —
-    /// a fresh `AsyncFd` per buffer cost an allocation plus two epoll_ctl
-    /// syscalls per audio buffer (#142). Lazily built on first consume so
-    /// construction stays runtime-independent.
-    poll_fd: Option<AsyncFd<std::os::fd::RawFd>>,
     /// The Time segment currently playing (#265). This sink used to be
     /// entirely PTS-blind — `consume` read `ctx.input()` and nothing else —
     /// so out-of-segment audio was played in full and no mapping from stream
@@ -1303,7 +1312,10 @@ impl AsyncSink for AlsaSink {
             && let Ok(fds) = self.poll_descriptors()
             && let Some(first) = fds.first()
         {
-            self.poll_fd = AsyncFd::new(first.fd).ok();
+            // SAFETY: the fd is `self.pcm`'s own poll descriptor. The PCM is
+            // never replaced, and `poll_fd` is declared ahead of it, so the
+            // registration is gone before the device closes.
+            self.poll_fd = unsafe { AsyncFd::register(first.fd) }.ok();
         }
 
         // Keep the device's write cursor on the stream's timeline (#265).

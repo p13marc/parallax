@@ -62,7 +62,16 @@ enum WriteMode {
     /// Not yet probed against the reactor.
     Unprobed,
     /// Readiness-driven: await `writable()` before each write attempt.
-    Poll(AsyncFd<RawFd>),
+    ///
+    /// The registration owns a **duplicate** of the sink's fd, not the fd
+    /// itself. tokio's contract for `AsyncFd` is that the descriptor stays
+    /// open, and stays the same one, until the `AsyncFd` is dropped — and the
+    /// sink cannot promise that for a number it merely borrowed
+    /// (`FdSink::new`), nor for an owned one that its own field order would
+    /// close first. A duplicate names the same open file description, so
+    /// readiness and writes are the original's, and it lives exactly as long
+    /// as the registration does.
+    Poll(AsyncFd<OwnedFd>),
     /// Not pollable (regular file): write directly.
     Direct,
 }
@@ -220,10 +229,21 @@ impl AsyncSink for FdSink {
         // Probe on first use, not at construction: `AsyncFd` needs a reactor,
         // and elements are built before the pipeline starts.
         if matches!(self.mode, WriteMode::Unprobed) {
-            self.mode = match AsyncFd::with_interest(self.fd.as_raw_fd(), Interest::WRITABLE) {
-                Ok(afd) => WriteMode::Poll(afd),
-                // epoll refuses regular files — their writes cannot pend
-                // indefinitely anyway, only as long as a page-cache flush.
+            self.mode = match self.fd.as_fd().try_clone_to_owned() {
+                // SAFETY: the `AsyncFd` owns `dup` — an open descriptor that
+                // nothing else can close or replace, for as long as the
+                // registration exists. See `WriteMode::Poll`.
+                Ok(dup) => {
+                    match unsafe { AsyncFd::register_with_interest(dup, Interest::WRITABLE) } {
+                        Ok(afd) => WriteMode::Poll(afd),
+                        // epoll refuses regular files — their writes cannot pend
+                        // indefinitely anyway, only as long as a page-cache
+                        // flush. (The duplicate comes back inside the error and
+                        // closes here.)
+                        Err(_) => WriteMode::Direct,
+                    }
+                }
+                // No descriptor to spare: write without waiting for one.
                 Err(_) => WriteMode::Direct,
             };
         }
@@ -238,8 +258,8 @@ impl AsyncSink for FdSink {
                     .await
                     .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
                 match guard.try_io(|inner| {
-                    let fd = unsafe { BorrowedFd::borrow_raw(*inner.get_ref()) };
-                    rustix::io::write(fd, &data[written..]).map_err(std::io::Error::from)
+                    rustix::io::write(inner.get_ref(), &data[written..])
+                        .map_err(std::io::Error::from)
                 }) {
                     Ok(Ok(n)) => written += n,
                     Ok(Err(e)) => return Err(Error::Io(e)),

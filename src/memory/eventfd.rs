@@ -147,8 +147,14 @@ impl EventFd {
         let async_fd = match self.async_fd.get() {
             Some(afd) => afd,
             None => {
-                let afd = AsyncFd::with_interest(self.as_raw_fd(), Interest::READABLE)
-                    .map_err(Error::Io)?;
+                // SAFETY: the fd is `self.fd`, an `OwnedFd` this struct holds
+                // for its whole life and never replaces, and `async_fd` is
+                // declared before it — so the registration is dropped, and
+                // deregistered, while the fd is still open.
+                let afd = unsafe {
+                    AsyncFd::register_with_interest(self.as_raw_fd(), Interest::READABLE)
+                }
+                .map_err(|e| Error::Io(e.into()))?;
                 // Single-consumer in practice; on a theoretical race the
                 // winner's registration is kept and ours drops (deregisters).
                 self.async_fd.get_or_init(|| afd)

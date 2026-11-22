@@ -40,7 +40,6 @@ use ashpd::desktop::screencast::{
     StartCastOptions,
 };
 use ashpd::desktop::{CreateSessionOptions, PersistMode};
-use ashpd::enumflags2::BitFlags;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded};
 use pipewire as pw;
 use pw::spa;
@@ -72,12 +71,12 @@ pub enum CaptureSourceType {
 }
 
 impl CaptureSourceType {
-    /// Convert to BitFlags for the portal API.
-    fn to_source_type(self) -> BitFlags<SourceType> {
+    /// Convert to the portal API's flag set.
+    fn to_source_type(self) -> SourceType {
         match self {
-            CaptureSourceType::Monitor => SourceType::Monitor.into(),
-            CaptureSourceType::Window => SourceType::Window.into(),
-            CaptureSourceType::Any => SourceType::Monitor | SourceType::Window,
+            CaptureSourceType::Monitor => SourceType::MONITOR,
+            CaptureSourceType::Window => SourceType::WINDOW,
+            CaptureSourceType::Any => SourceType::MONITOR | SourceType::WINDOW,
         }
     }
 }
@@ -330,9 +329,9 @@ impl ScreenCaptureSrc {
 
         // Configure the cursor mode
         let cursor_mode = if self.config.show_cursor {
-            CursorMode::Embedded
+            CursorMode::EMBEDDED
         } else {
-            CursorMode::Hidden
+            CursorMode::HIDDEN
         };
 
         // Determine persist mode and restore token
@@ -1041,16 +1040,16 @@ mod tests {
     #[test]
     fn test_source_type_conversion() {
         let monitor_flags = CaptureSourceType::Monitor.to_source_type();
-        assert!(monitor_flags.contains(SourceType::Monitor));
-        assert!(!monitor_flags.contains(SourceType::Window));
+        assert!(monitor_flags.contains(SourceType::MONITOR));
+        assert!(!monitor_flags.contains(SourceType::WINDOW));
 
         let window_flags = CaptureSourceType::Window.to_source_type();
-        assert!(window_flags.contains(SourceType::Window));
-        assert!(!window_flags.contains(SourceType::Monitor));
+        assert!(window_flags.contains(SourceType::WINDOW));
+        assert!(!window_flags.contains(SourceType::MONITOR));
 
         let any_flags = CaptureSourceType::Any.to_source_type();
-        assert!(any_flags.contains(SourceType::Monitor));
-        assert!(any_flags.contains(SourceType::Window));
+        assert!(any_flags.contains(SourceType::MONITOR));
+        assert!(any_flags.contains(SourceType::WINDOW));
     }
 
     #[test]

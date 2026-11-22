@@ -48,9 +48,9 @@ iced = { version = "0.14", default-features = false, features = [
     "image-without-codecs",
 ] }
 # The file dialog, through the XDG portal. Not `rfd`: parallax already
-# depends on ashpd 0.13 for the screencast portal, and rfd would pull a second
+# depends on ashpd for the screencast portal, and rfd would pull a second
 # major of it into the same binary — which `just check-iced` now refuses.
-ashpd = { version = "0.13", default-features = false, features = [
+ashpd = { version = "0.14", default-features = false, features = [
     "tokio",
     "file_chooser",
 ] }

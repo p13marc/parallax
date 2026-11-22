@@ -6,19 +6,26 @@ all-features = true
 
 [advisories]
 version = 2
-# All transitive — unactionable here. Re-check on dep bumps (2026-08-29).
+# All transitive — unactionable here. Re-check on dep bumps (2026-11-22: the
+# `cargo update` that cleared the url/quinn-proto/rustls/webpki advisories
+# also retired five entries no crate in the graph matches any more, and met
+# three new "unmaintained" notices with no release to move to. The zbus 5
+# family's three were actionable — ashpd 0.14 is on zbus 6 — and are gone).
 ignore = [
     "RUSTSEC-2023-0071", # rsa: Marvin timing sidechannel — no fixed release exists
-    "RUSTSEC-2023-0089", # atomic-polyfill unmaintained (via heapless)
-    "RUSTSEC-2024-0370", # proc-macro-error unmaintained
     "RUSTSEC-2024-0436", # paste unmaintained
+    "RUSTSEC-2024-0449", # unsafe-libyaml unmaintained (serde_yaml, via zenoh-config)
     "RUSTSEC-2025-0134", # rustls-pemfile unmaintained
-    "RUSTSEC-2025-0141", # bincode 1.x unmaintained
     "RUSTSEC-2026-0041", # lz4_flex decompress leak — zenoh pins 0.10, fix is in a later minor
-    "RUSTSEC-2026-0150", # audiopus_sys unmaintained (opus FFI; no maintained replacement)
+    # audiopus_sys unmaintained (opus 0.3's FFI). opus 0.4 replaces it with
+    # opusic-sys, which does not link the system libopus: it compiles a
+    # vendored copy with cmake. That changes what the `opus` feature needs to
+    # build and where the codec's security fixes come from, so it is a
+    # decision, not a bump — held at 0.3 until it is made.
+    "RUSTSEC-2026-0150",
     "RUSTSEC-2026-0192", # ttf-parser unmaintained (via iced's font stack)
-    "RUSTSEC-2026-0194", # quick-xml 0.39 quadratic attr check — transitive pin, build-time XML only
-    "RUSTSEC-2026-0195", # quick-xml 0.39 NsReader allocation — same pin as above
+    "RUSTSEC-2026-0441", # pin-utils archived (nix 0.26, via webrtc-util)
+    "RUSTSEC-2026-0542", # humantime unmaintained (uhlc, via zenoh)
 ]
 
 [licenses]

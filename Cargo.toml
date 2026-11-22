@@ -40,7 +40,7 @@ name = "parallax"
 
 [dependencies]
 # Async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "net", "fs", "io-util", "macros", "sync", "time", "signal"] }
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "net", "fs", "io-util", "macros", "sync", "time", "signal"] }
 
 
 # Graph structure (enforces DAG)
@@ -195,7 +195,7 @@ opus = { version = "0.3", optional = true }
 
 # AC-3 / E-AC-3 audio decoder (pure Rust; young crate — pin exact).
 # oxideav-core supplies the Packet/Decoder types its API speaks.
-oxideav-ac3 = { version = "=0.0.10", optional = true }
+oxideav-ac3 = { version = "=0.0.11", optional = true }
 oxideav-core = { version = "0.1", optional = true }
 
 # AAC audio encoder (bindings to FDK-AAC - note license restrictions)
@@ -225,13 +225,13 @@ udev = { version = "0.9", features = ["send"], optional = true }
 alsa = { version = "0.12", optional = true }
 
 # XDG Portal (for screen capture permissions on Wayland)
-ashpd = { version = "0.13", optional = true, default-features = false, features = ["tokio", "screencast"] }
+ashpd = { version = "0.14", optional = true, default-features = false, features = ["tokio", "screencast"] }
 
 # Regex (for RegexFilter)
 regex = "1"
 
 # XML generation (for DASH MPD)
-quick-xml = "0.41"
+quick-xml = "0.42"
 
 # Object-safe async traits
 dynosaur = "0.3"

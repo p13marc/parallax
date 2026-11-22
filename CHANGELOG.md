@@ -10,6 +10,25 @@ commit messages and the Forgejo releases.
 
 ## [Unreleased]
 
+- **Dependencies refreshed, and two registrations no longer outlive their
+  fd.** `cargo update` across the tree, plus `ashpd` 0.13 → 0.14,
+  `quick-xml` 0.41 → 0.42 and `oxideav-ac3` 0.0.11. It clears what
+  `cargo deny` had started failing on — `url`'s `Url::origin()` stack
+  overflow, the quinn-proto and rustls batches under zenoh, and the zbus 5
+  family ashpd 0.13 held in place. Two bumps are deliberately not taken:
+  `lru` 0.18 would sit beside the 0.16 iced's text renderer pins, and
+  `opus` 0.4 swaps the system libopus for a vendored copy built with cmake.
+  tokio deprecated `AsyncFd::new`/`with_interest` as unsound and made the
+  replacement `unsafe`, with a contract: the fd stays open, and the same fd,
+  until the `AsyncFd` is dropped. Writing that contract down at the four
+  call sites found two that did not keep it. `AlsaSink` declared its PCM
+  above the cached poll registration, and fields drop in declaration order
+  — so it closed the device first and then deregistered a number the kernel
+  was already free to reissue; the fields are reordered. `FdSink` had the
+  same shape and, for a borrowed fd, no way to promise anything at all; its
+  registration now owns a duplicate of the descriptor. The minimum tokio is
+  **1.53.3**, the first release with `AsyncFd::register`.
+
 ## [0.10.1] — 2026-08-30
 
 - Flatpak: the 0.10.0 flatpak job died in bindgen — the base freedesktop
