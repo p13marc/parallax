@@ -413,16 +413,20 @@ fn stts_time_of(entries: impl IntoIterator<Item = (u32, u32)>, sample: u32) -> O
 /// track with no `ctts` box — no reordering, so composition time *is* decode
 /// time.
 ///
-/// This exists because the seek tables and the emitted timestamps used to
-/// disagree about which clock they were on (#265). `stts_locate` and
-/// `stts_time_of` walk `stts` only, which is **decode** time, while
-/// `read_sample` stamps `pts` from `sample.start_time`, which is
-/// **composition** time. So `Mp4SeekPoint.time_ns` — which becomes the
-/// synthesized segment's `start`, the `SeekDone` position, and the target
-/// every non-reference track is re-sought to — was a DTS being compared
-/// against CTS everywhere downstream. On any stream with B-frames that put
-/// audio ahead of video by the reorder delay, and left the first video frame
-/// above the segment start where nothing would clip it.
+/// This exists because the seek tables and the emitted timestamps are on
+/// different clocks (#265). `stts_locate` and `stts_time_of` walk `stts`
+/// only, which is **decode** time, while `read_sample` stamps
+/// **composition** time (see `sample_times_ns`). So `Mp4SeekPoint.time_ns`
+/// — which becomes the synthesized segment's `start`, the `SeekDone`
+/// position, and the target every non-reference track is re-sought to —
+/// has to add the ctts offset, or it is a DTS being compared against CTS
+/// everywhere downstream. On any stream with B-frames that puts audio ahead
+/// of video by the reorder delay, and leaves the first video frame above the
+/// segment start where nothing would clip it.
+///
+/// Before #304, `read_sample` stamped the decode time as the PTS, so adding
+/// this offset was what made a seek's landing disagree with the sample it
+/// landed on.
 fn ctts_offset_of(entries: impl IntoIterator<Item = (u32, i32)>, sample: u32) -> i64 {
     let mut index: u64 = 1;
     for (count, offset) in entries {
@@ -433,6 +437,134 @@ fn ctts_offset_of(entries: impl IntoIterator<Item = (u32, i32)>, sample: u32) ->
         index += count;
     }
     0
+}
+
+/// A sample's `(pts, dts)` in nanoseconds, or `None` for a zero timescale.
+///
+/// `mp4::Mp4Sample::start_time` is the sample's **decode** time — the crate
+/// sums `stts` deltas for it — and `rendering_offset` is its `ctts` entry, so
+/// composition time is their sum. `shift` is the track's edit-list shift
+/// (`edit_shift_ticks`), taken off both so that the first frame shown is
+/// presented at zero. `read_sample` computes them once, for both the
+/// buffer's `Metadata` and the `Mp4Sample` it returns, so they cannot
+/// disagree.
+///
+/// It used to be read the other way round (#304): `start_time` as the PTS and
+/// `start_time - rendering_offset` as the DTS. A B-frame stream then reached
+/// the decoder with monotonic decode times in decode order, a reordering
+/// decoder (VA-API) carried them into display order, and every frame that
+/// came out behind its predecessor was dropped as late — about half of them.
+/// `Mp4Mux::write_sample` has always written the crate's meaning, so the two
+/// ends of a round trip disagreed.
+///
+/// A time that comes out negative clamps to zero: the DTS of the first
+/// frames of any reordered stream with an edit list, or the PTS of samples
+/// an edit cuts off, which this demuxer does not discard.
+///
+/// So the first frames of an x264 file share a DTS of zero, and that is the
+/// honest limit of an unsigned clock rather than an oversight: their decode
+/// times really are before the presentation origin, which is what "the first
+/// frame is shown at zero and something had to be decoded before it" means.
+/// The two ways out both give up something worth more. Leaving the DTS
+/// unshifted puts it *after* the PTS on every B frame, which is not a decode
+/// time at all. Shifting both by less, so the DTS stays positive, hands the
+/// reorder delay back to the PTS — the A/V offset the edit list is there to
+/// remove. What the clamp keeps is what a consumer can actually lean on: the
+/// DTS never runs backwards and never passes the PTS
+/// (`under_an_edit_shift_the_dts_neither_runs_backwards_nor_passes_the_pts`).
+/// A muxer that needs it *strictly* increasing has to offset the whole
+/// timeline, as every muxer facing a negative DTS does.
+fn sample_times_ns(
+    start_time: u64,
+    rendering_offset: i32,
+    shift: i64,
+    timescale: u32,
+) -> Option<(u64, u64)> {
+    if timescale == 0 {
+        return None;
+    }
+    let to_ns = |ticks: i128| (ticks.max(0) as u128 * 1_000_000_000 / timescale as u128) as u64;
+    let dts = start_time as i128 - shift as i128;
+    Some((to_ns(dts + rendering_offset as i128), to_ns(dts)))
+}
+
+/// How far a track's composition timeline sits ahead of its presentation
+/// timeline, in track ticks: presentation = composition − shift.
+///
+/// From the edit list (`edts/elst`), as `(segment_duration, media_time)`
+/// pairs. A reordering encoder writes one: ffmpeg's x264 output sets the
+/// first edit's `media_time` to the first frame's ctts offset, so that the
+/// first frame shown is presented at zero. Ignoring it puts a correctly
+/// composed B-frame stream (#304) one to three frames behind its audio.
+/// Leading empty edits (`media_time` of -1) delay the presentation by their
+/// duration, which is in the **movie** timescale.
+///
+/// Only the first media edit is honoured: a multi-segment edit list (cuts,
+/// repeats) needs a timeline, not a shift.
+fn edit_shift_ticks(
+    entries: impl IntoIterator<Item = (u64, i64)>,
+    track_timescale: u32,
+    movie_timescale: u32,
+) -> i64 {
+    // Leading empty edits, in the movie timescale.
+    let mut empty: u64 = 0;
+    for (segment_duration, media_time) in entries {
+        if media_time < 0 {
+            empty = empty.saturating_add(segment_duration);
+            continue;
+        }
+        let delay = (empty as u128 * track_timescale as u128)
+            .checked_div(movie_timescale as u128)
+            .unwrap_or(0) as i64;
+        return media_time.saturating_sub(delay);
+    }
+    0
+}
+
+/// An `elst` entry's `media_time`, with an empty edit's -1 restored: mp4 0.14
+/// reads both box versions as unsigned and widens them to `u64`.
+fn elst_media_time(version: u8, raw: u64) -> i64 {
+    if version == 1 {
+        raw as i64
+    } else {
+        raw as u32 as i32 as i64
+    }
+}
+
+/// A track's edit list as `(segment_duration, media_time)` pairs.
+fn elst_entries(track: &mp4::Mp4Track) -> Vec<(u64, i64)> {
+    let Some(elst) = track.trak.edts.as_ref().and_then(|e| e.elst.as_ref()) else {
+        return Vec::new();
+    };
+    let version = elst.version;
+    elst.entries
+        .iter()
+        .map(|e| (e.segment_duration, elst_media_time(version, e.media_time)))
+        .collect()
+}
+
+/// A seek target, moved from the clock the pipeline speaks onto the one
+/// `stts` is written in.
+///
+/// `read_sample` stamps presentation time: decode + ctts − shift
+/// (`sample_times_ns`). The time-to-sample table knows decode time only, so a
+/// target has to be taken back through the same arithmetic before
+/// `stts_locate` can be asked about it — or the lookup answers a different
+/// question from the one the landing is then reported on. `sync_ctts` is the
+/// composition offset of the track's sync samples, which are the only samples
+/// a seek lands on; the caller reads it off the first one.
+///
+/// For ffmpeg's x264 output the two terms cancel (the edit's media time *is*
+/// the keyframes' ctts offset), which is why looking the target up as a
+/// decode time appeared to work. They do not cancel on a track with no ctts
+/// and an edit list — audio behind a leading empty edit was looked up that
+/// edit's whole duration late, and audio is re-sought to the video's landing
+/// on every seek, so it opened that far from the picture — nor on a B-frame
+/// track with no edit list, where a target between a keyframe's decode time
+/// and its presentation time landed on that keyframe and `SeekSnap::Before`
+/// came back *after* the target.
+fn seek_target_on_decode_clock(target_ticks: u64, shift: i64, sync_ctts: i64) -> u64 {
+    (target_ticks as i128 + shift as i128 - sync_ctts as i128).max(0) as u64
 }
 
 /// Snap a 1-based sample index back to the nearest sync sample at or before
@@ -550,6 +682,8 @@ pub struct Mp4Demux<R: Read + Seek> {
     /// H.264 decoder configuration per track, lifted from the avcC box.
     /// Tracks in the map get their samples converted to Annex-B.
     nal_configs: std::collections::HashMap<u32, crate::codec::annexb::NalConfig>,
+    /// Edit-list shift per track, in track ticks (`edit_shift_ticks`).
+    edit_shifts: std::collections::HashMap<u32, i64>,
     /// Per-instance output arena for demuxed samples.
     ///
     /// This used to be a process-wide `static`, so two demuxers in one process
@@ -586,6 +720,8 @@ impl<R: Read + Seek> Mp4Demux<R> {
         let mut tracks = Vec::new();
         let mut sample_indices = std::collections::HashMap::new();
         let mut nal_configs = std::collections::HashMap::new();
+        let mut edit_shifts = std::collections::HashMap::new();
+        let movie_timescale = mp4_reader.timescale();
 
         for track in mp4_reader.tracks().values() {
             let track_type = track
@@ -727,6 +863,10 @@ impl<R: Read + Seek> Mp4Demux<R> {
             });
 
             sample_indices.insert(track.track_id(), 1); // Samples are 1-indexed
+
+            let edits = elst_entries(track);
+            let shift = edit_shift_ticks(edits, track.timescale(), movie_timescale);
+            edit_shifts.insert(track.track_id(), shift);
         }
 
         Ok(Self {
@@ -735,6 +875,7 @@ impl<R: Read + Seek> Mp4Demux<R> {
             stats: Mp4DemuxStats::default(),
             sample_indices,
             nal_configs,
+            edit_shifts,
             output: OutputArena::new(defaults::MP4_DEMUX_SLOT_COUNT)
                 .with_min_slot_size(defaults::DEMUX_MIN_SLOT_SIZE)
                 .grow_to_fit(),
@@ -863,8 +1004,9 @@ impl<R: Read + Seek> Mp4Demux<R> {
 
     /// Seek one track to a target time, landing on a decodable sample.
     ///
-    /// Resolves `target_ns` to a sample via the time-to-sample table (stts),
-    /// then snaps to a sync sample via the sync-sample table (stss) in the
+    /// Resolves `target_ns` to a sample via the time-to-sample table (stts)
+    /// — after moving it onto that table's clock, which is decode time
+    /// (`seek_target_on_decode_clock`) — then snaps to a sync sample via the sync-sample table (stss) in the
     /// direction `snap` chose — when a track has no stss box every sample is
     /// a sync sample, which is the normal case for audio, and the snap is a
     /// no-op. `SeekSnap::Before` lands at or before the target (a target
@@ -916,11 +1058,24 @@ impl<R: Read + Seek> Mp4Demux<R> {
                 .map(|e| (e.sample_count, e.sample_delta))
         };
 
+        let ctts = || {
+            stbl.ctts
+                .iter()
+                .flat_map(|c| c.entries.iter().map(|e| (e.sample_count, e.sample_offset)))
+        };
+        let sync_entries = stbl.stss.as_ref().map(|s| s.entries.as_slice());
+        let shift = self.edit_shifts.get(&track_id).copied().unwrap_or(0);
+
+        // `stts` is decode time and the target is presentation time: convert
+        // before looking it up. See `seek_target_on_decode_clock`.
+        let first_sync = sync_entries.and_then(|s| s.first().copied()).unwrap_or(1);
+        let target_ticks =
+            seek_target_on_decode_clock(target_ticks, shift, ctts_offset_of(ctts(), first_sync));
+
         let (sample, _) = stts_locate(stts(), target_ticks).ok_or_else(|| {
             Error::Config(format!("Track {} has no samples to seek in", track_id))
         })?;
 
-        let sync_entries = stbl.stss.as_ref().map(|s| s.entries.as_slice());
         let (landing, is_sync) = match snap {
             SeekSnap::Before => snap_to_sync(sync_entries, sample),
             SeekSnap::After => snap_to_sync_after(sync_entries, sample),
@@ -947,17 +1102,14 @@ impl<R: Read + Seek> Mp4Demux<R> {
         };
 
         // The snap changed the index, so recompute its start time — in
-        // *composition* time, because that is the clock `read_sample` stamps
-        // its buffers on and therefore the only one the rest of the pipeline
-        // ever sees. See `ctts_offset_of`.
+        // *presentation* time (composition time less the edit-list shift),
+        // because that is the clock `read_sample` stamps its buffers on and
+        // therefore the only one the rest of the pipeline ever sees. See
+        // `ctts_offset_of` and `sample_times_ns`.
         let landing_dts = stts_time_of(stts(), landing).unwrap_or(0) as i64;
-        let ctts = || {
-            stbl.ctts
-                .iter()
-                .flat_map(|c| c.entries.iter().map(|e| (e.sample_count, e.sample_offset)))
-        };
         let landing_ticks = landing_dts
             .saturating_add(ctts_offset_of(ctts(), landing))
+            .saturating_sub(shift)
             .max(0) as u64;
         let time_ns = (landing_ticks as u128 * 1_000_000_000 / timescale as u128) as u64;
 
@@ -1096,26 +1248,14 @@ impl<R: Read + Seek> Mp4Demux<R> {
             }
             MemoryHandle::with_len(slot, total)
         };
-        let buffer = self.finish_buffer(handle, track_id, &sample, timescale);
+        // Presentation time for the PTS, decode time for the DTS (#304) —
+        // once, for both the buffer's metadata and the returned sample.
+        let shift = self.edit_shifts.get(&track_id).copied().unwrap_or(0);
+        let times = sample_times_ns(sample.start_time, sample.rendering_offset, shift, timescale);
+        let buffer = self.finish_buffer(handle, track_id, &sample, times, timescale);
+        let (pts_ns, dts_ns) = times.unwrap_or((0, 0));
 
-        // Calculate timestamps in nanoseconds
         let timescale = timescale as u128;
-        let pts_ns = (sample.start_time as u128 * 1_000_000_000)
-            .checked_div(timescale)
-            .unwrap_or(0) as u64;
-
-        // For DTS, use rendering_offset if available
-        let dts_ns = if sample.rendering_offset != 0 && timescale > 0 {
-            let dts = sample.start_time as i64 - sample.rendering_offset as i64;
-            if dts >= 0 {
-                (dts as u128 * 1_000_000_000 / timescale) as u64
-            } else {
-                0
-            }
-        } else {
-            pts_ns
-        };
-
         let duration_ns = (sample.duration as u128 * 1_000_000_000)
             .checked_div(timescale)
             .unwrap_or(0) as u64;
@@ -1149,11 +1289,14 @@ impl<R: Read + Seek> Mp4Demux<R> {
     }
 
     /// Wrap an already-written arena handle with the sample's metadata.
+    ///
+    /// `times` is the sample's `(pts, dts)` from `sample_times_ns`.
     fn finish_buffer(
         &mut self,
         handle: MemoryHandle,
         track_id: u32,
         sample: &mp4::Mp4Sample,
+        times: Option<(u64, u64)>,
         timescale: u32,
     ) -> Buffer {
         let timescale = timescale as u128;
@@ -1161,14 +1304,9 @@ impl<R: Read + Seek> Mp4Demux<R> {
         let mut metadata = Metadata::new();
         metadata.stream_id = track_id;
 
-        if let Some(pts) = (sample.start_time as u128 * 1_000_000_000).checked_div(timescale) {
-            metadata.pts = ClockTime::from_nanos(pts as u64);
-
-            let dts = sample.start_time as i64 - sample.rendering_offset as i64;
-            if dts >= 0 {
-                metadata.dts =
-                    ClockTime::from_nanos((dts as u128 * 1_000_000_000 / timescale) as u64);
-            }
+        if let Some((pts, dts)) = times {
+            metadata.pts = ClockTime::from_nanos(pts);
+            metadata.dts = ClockTime::from_nanos(dts);
 
             metadata.duration =
                 ClockTime::from_nanos((sample.duration as u128 * 1_000_000_000 / timescale) as u64);
@@ -1915,6 +2053,143 @@ mod tests {
     fn a_negative_ctts_offset_is_honoured() {
         // Version-1 ctts allows negative offsets (composition before decode).
         assert_eq!(ctts_offset_of([(4u32, -150i32)], 2), -150);
+    }
+
+    /// #304: `start_time` is decode time; composition is decode + ctts.
+    #[test]
+    fn a_sample_is_presented_at_decode_time_plus_its_ctts_offset() {
+        // 90 kHz, 24 fps (3750 ticks a frame): a P frame decoded at 1 s and
+        // shown three frames later, as in a B-frame pyramid.
+        assert_eq!(
+            sample_times_ns(90_000, 11_250, 0, 90_000),
+            Some((1_125_000_000, 1_000_000_000))
+        );
+    }
+
+    #[test]
+    fn a_sample_without_ctts_has_equal_pts_and_dts() {
+        assert_eq!(
+            sample_times_ns(45_000, 0, 0, 90_000),
+            Some((500_000_000, 500_000_000))
+        );
+    }
+
+    #[test]
+    fn a_negative_composition_time_clamps_to_zero() {
+        // Version-1 ctts on the first frame, with no edit list to shift it.
+        assert_eq!(sample_times_ns(0, -3_750, 0, 90_000), Some((0, 0)));
+        assert_eq!(
+            sample_times_ns(3_750, -3_750, 0, 90_000),
+            Some((0, 41_666_666))
+        );
+    }
+
+    /// The edit list is what puts an x264 file's first frame at zero: ffmpeg
+    /// writes the first frame's ctts offset as the first edit's media time.
+    #[test]
+    fn the_edit_shift_brings_the_first_frame_to_zero() {
+        // 15360 Hz, 30 fps (512 ticks a frame), two frames of reorder delay.
+        assert_eq!(sample_times_ns(0, 1024, 1024, 15_360), Some((0, 0)));
+        // The next frame decoded is a P frame shown third: composition 2560,
+        // presented at 1536 (100 ms). Its decode time clamps to zero.
+        assert_eq!(
+            sample_times_ns(512, 2048, 1024, 15_360),
+            Some((100_000_000, 0))
+        );
+    }
+
+    /// What the clamp leaves a consumer to rely on. An x264-style stream:
+    /// 512 ticks a frame, decoded I P B B P B B, two frames of reorder delay,
+    /// and the edit list taking those two frames back off.
+    #[test]
+    fn under_an_edit_shift_the_dts_neither_runs_backwards_nor_passes_the_pts() {
+        const FRAME: i64 = 512;
+        const DELAY: i64 = 2;
+        // Where each frame is shown, in the order it is decoded.
+        let shown = [0i64, 3, 1, 2, 6, 4, 5];
+        let mut last_dts = 0;
+        for (decoded, shown) in shown.into_iter().enumerate() {
+            let decoded = decoded as i64;
+            let ctts = (shown - decoded + DELAY) * FRAME;
+            let (pts, dts) =
+                sample_times_ns((decoded * FRAME) as u64, ctts as i32, DELAY * FRAME, 15_360)
+                    .unwrap();
+            assert_eq!(pts, shown as u64 * 100_000_000 / 3, "frame {decoded}");
+            assert!(dts <= pts, "frame {decoded}: DTS {dts} is past PTS {pts}");
+            assert!(dts >= last_dts, "frame {decoded}: DTS ran backwards");
+            last_dts = dts;
+        }
+        // The frames decoded at or before the origin are the ones that tie at
+        // zero; the first one decoded after it is the first to move.
+        assert_eq!(
+            sample_times_ns(1024, 512, 1024, 15_360),
+            Some((33_333_333, 0))
+        );
+        assert!(sample_times_ns(1536, 512, 1024, 15_360).unwrap().1 > 0);
+    }
+
+    /// The x264 case: the edit's media time is the keyframes' ctts offset,
+    /// so a keyframe is presented at its decode time and the target is
+    /// already on the decode clock.
+    #[test]
+    fn a_seek_target_is_unchanged_when_the_edit_cancels_the_reorder_delay() {
+        assert_eq!(seek_target_on_decode_clock(15_360, 1024, 1024), 15_360);
+        assert_eq!(seek_target_on_decode_clock(15_360, 0, 0), 15_360);
+    }
+
+    /// Audio delayed 100 ms by a leading empty edit (shift −4800 at 48 kHz):
+    /// the sample heard at 1 s is the one decoded at 900 ms.
+    #[test]
+    fn a_seek_target_behind_an_empty_edit_is_looked_up_that_much_earlier() {
+        assert_eq!(seek_target_on_decode_clock(48_000, -4_800, 0), 43_200);
+        // Inside the silence the edit inserts, the first sample is the answer.
+        assert_eq!(seek_target_on_decode_clock(2_400, -4_800, 0), 0);
+        // Opus pre-skip is the other direction: 312 samples are never heard.
+        assert_eq!(seek_target_on_decode_clock(48_000, 312, 0), 48_312);
+    }
+
+    /// B frames and no edit list: a keyframe is shown one reorder delay after
+    /// it is decoded, so the target comes back by that delay.
+    #[test]
+    fn a_seek_target_on_a_reordered_track_comes_back_by_the_keyframe_offset() {
+        assert_eq!(seek_target_on_decode_clock(90_000, 0, 3_750), 86_250);
+        assert_eq!(seek_target_on_decode_clock(1_000, 0, 3_750), 0);
+    }
+
+    #[test]
+    fn a_zero_timescale_has_no_times() {
+        assert_eq!(sample_times_ns(1_000, 0, 0, 0), None);
+    }
+
+    #[test]
+    fn a_media_edit_is_the_shift() {
+        assert_eq!(edit_shift_ticks([(165_267, 512)], 15_360, 1_000), 512);
+        assert_eq!(edit_shift_ticks([], 15_360, 1_000), 0, "no edit list");
+    }
+
+    #[test]
+    fn a_leading_empty_edit_delays_the_presentation() {
+        // 100 ms of nothing (movie timescale 1000), then the media from its
+        // start: the track's samples are presented 100 ms late.
+        assert_eq!(
+            edit_shift_ticks([(100, -1), (145_074, 0)], 48_000, 1_000),
+            -4_800
+        );
+    }
+
+    #[test]
+    fn only_empty_edits_mean_no_shift() {
+        assert_eq!(edit_shift_ticks([(100, -1)], 48_000, 1_000), 0);
+        // A zero movie timescale cannot convert the delay; it is dropped.
+        assert_eq!(edit_shift_ticks([(100, -1), (0, 312)], 48_000, 0), 312);
+    }
+
+    #[test]
+    fn an_empty_edit_reads_as_minus_one_in_both_box_versions() {
+        assert_eq!(elst_media_time(0, u32::MAX as u64), -1);
+        assert_eq!(elst_media_time(1, u64::MAX), -1);
+        assert_eq!(elst_media_time(0, 512), 512);
+        assert_eq!(elst_media_time(1, 512), 512);
     }
 
     #[test]

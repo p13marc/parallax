@@ -859,4 +859,116 @@ mod mp4_roundtrip_tests {
         assert!(video.is_keyframe);
         assert_eq!(video.pts_ns, point.time_ns);
     }
+
+    /// #304: B-frame GOPs in decode order — I P B B P B B, 100 ms a frame,
+    /// each shown one frame after it is decoded — twice, so the second I
+    /// frame is a seek target. Returns the MP4 and every sample's
+    /// `(pts_ms, dts_ms)`, in the order they were written.
+    fn b_frame_fixture() -> (Vec<u8>, Vec<(u64, u64)>) {
+        let mut mux = Mp4Mux::new(Cursor::new(Vec::new()), Mp4MuxConfig::default())
+            .expect("Should create muxer");
+
+        let sps = vec![0x67, 0x42, 0x00, 0x1f];
+        let pps = vec![0x68, 0xce, 0x3c, 0x80];
+        let video_track = mux
+            .add_video_track(Mp4VideoTrackConfig::h264(320, 240, &sps, &pps))
+            .expect("Should add video track");
+
+        // Where each sample of a GOP is shown, in the order it is decoded.
+        const GOP: [u64; 7] = [0, 3, 1, 2, 6, 4, 5];
+        let keyframe = vec![0x00, 0x00, 0x00, 0x02, 0x65, 0xAA];
+        let delta = vec![0x00, 0x00, 0x00, 0x02, 0x41, 0x9A];
+        let mut written = Vec::new();
+        for gop in 0..2u64 {
+            for (i, shown) in GOP.iter().enumerate() {
+                let dts = (gop * 7 + i as u64) * 100;
+                // One frame of reorder delay keeps every PTS at or above its DTS.
+                let pts = (gop * 7 + shown) * 100 + 100;
+                let is_key = i == 0;
+                let data = if is_key { &keyframe } else { &delta };
+                mux.write_sample(video_track, data, pts, dts, 100, is_key)
+                    .unwrap();
+                written.push((pts, dts));
+            }
+        }
+
+        let mp4_data = mux.finish().expect("Should finalize").into_inner();
+        (mp4_data, written)
+    }
+
+    /// #304: `start_time` is decode time, so a demuxer that stamped it as the
+    /// PTS handed a decoder monotonic times in decode order — and a
+    /// reordering decoder dropped half the frames as late.
+    #[test]
+    fn b_frames_come_back_on_their_composition_times() {
+        let (mp4_data, written) = b_frame_fixture();
+        let mut demux = Mp4Demux::new(Cursor::new(mp4_data.clone()), mp4_data.len() as u64)
+            .expect("Should create demuxer");
+        let video_id = demux.video_track_id().unwrap();
+
+        for (pts_ms, dts_ms) in written {
+            let sample = demux.read_sample(video_id).unwrap().unwrap();
+            assert_eq!(
+                sample.pts_ns,
+                pts_ms * 1_000_000,
+                "PTS of the sample decoded at {dts_ms} ms"
+            );
+            assert_eq!(sample.dts_ns, dts_ms * 1_000_000);
+            // The buffer carries the same pair: it is what a decoder sees.
+            let meta = sample.buffer.metadata();
+            assert_eq!(meta.pts.nanos(), sample.pts_ns);
+            assert_eq!(meta.dts.nanos(), sample.dts_ns);
+        }
+        assert!(demux.read_sample(video_id).unwrap().is_none());
+    }
+
+    /// A seek reports its landing on the clock `read_sample` stamps. Before
+    /// #304 the two differed by the landing sample's ctts offset.
+    #[test]
+    fn a_seek_lands_on_the_pts_of_the_sample_it_returns() {
+        let (mp4_data, _) = b_frame_fixture();
+        let mut demux = Mp4Demux::new(Cursor::new(mp4_data.clone()), mp4_data.len() as u64)
+            .expect("Should create demuxer");
+        let video_id = demux.video_track_id().unwrap();
+
+        // The second GOP's I frame is decoded at 700 ms and shown at 800 ms.
+        let point = demux
+            .seek_to_time(video_id, 1_000_000_000, SeekSnap::Before)
+            .unwrap();
+        assert!(point.is_sync);
+        assert_eq!(point.time_ns, 800_000_000);
+
+        let sample = demux.read_sample(video_id).unwrap().unwrap();
+        assert!(sample.is_keyframe);
+        assert_eq!(sample.pts_ns, point.time_ns);
+    }
+
+    /// The target is presentation time and `stts` is decode time. The second
+    /// I frame is decoded at 700 ms and shown at 800 ms, so a target between
+    /// the two found it in `stts` and landed on it: `SeekSnap::Before`
+    /// answering 50 ms *after* what it was asked for.
+    #[test]
+    fn a_seek_resolves_its_target_on_the_clock_it_reports_on() {
+        let (mp4_data, _) = b_frame_fixture();
+        let mut demux = Mp4Demux::new(Cursor::new(mp4_data.clone()), mp4_data.len() as u64)
+            .expect("Should create demuxer");
+        let video_id = demux.video_track_id().unwrap();
+        let mut land = |ms: u64, snap| {
+            let point = demux.seek_to_time(video_id, ms * 1_000_000, snap).unwrap();
+            assert!(point.is_sync);
+            point.time_ns / 1_000_000
+        };
+
+        // Not yet shown at 750 ms, so the keyframe before it is the answer —
+        // the first I frame, shown at 100 ms.
+        assert_eq!(land(750, SeekSnap::Before), 100);
+        assert_eq!(land(750, SeekSnap::After), 800);
+        // On its presentation time exactly, both directions agree.
+        assert_eq!(land(800, SeekSnap::Before), 800);
+        assert_eq!(land(800, SeekSnap::After), 800);
+        // Nearest measures on the same clock: 500 ms is 400 from the first
+        // keyframe and 300 from the second.
+        assert_eq!(land(500, SeekSnap::Nearest), 800);
+        assert_eq!(land(400, SeekSnap::Nearest), 100);
+    }
 }

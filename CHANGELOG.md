@@ -10,6 +10,19 @@ commit messages and the Forgejo releases.
 
 ## [Unreleased]
 
+- **MP4: B-frame streams are stamped on composition time** (#304).
+  `Mp4Demux` read `mp4::Mp4Sample::start_time`, which is the crate's
+  *decode* time, as the PTS, and derived the DTS by subtracting the `ctts`
+  offset. A reordering decoder (VA-API H.264) then emitted frames out of
+  timestamp order, and the player dropped up to half of them as late; the
+  software path hid it. The PTS is now `start_time + ctts` and the DTS
+  `start_time`, both less the edit list's shift, so that an x264 file's
+  first frame is shown at zero instead of one to three frames behind its
+  audio. A seek's reported landing equals the PTS of the sample it lands
+  on, and its target is taken onto `stts`'s decode clock before the lookup:
+  audio behind a leading empty edit was sought that edit's duration late,
+  and on a B-frame track `SeekSnap::Before` could land after its target.
+
 - **Dependencies refreshed, and two registrations no longer outlive their
   fd.** `cargo update` across the tree, plus `ashpd` 0.13 → 0.14,
   `quick-xml` 0.41 → 0.42 and `oxideav-ac3` 0.0.11. It clears what
