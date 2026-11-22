@@ -44,6 +44,7 @@ use crate::event::SeekSnap;
 use crate::memory::{OutputArena, OutputBudget, defaults};
 use crate::metadata::{BufferFlags, Metadata};
 
+use super::mp4_extra::{PatchedReader, config_first_patches};
 use mp4::{MediaType, Mp4Reader, TrackType};
 use std::io::{Read, Seek};
 
@@ -674,7 +675,9 @@ pub struct Mp4DemuxStats {
 /// }
 /// ```
 pub struct Mp4Demux<R: Read + Seek> {
-    reader: Mp4Reader<R>,
+    /// The crate's reader, over the file with each first sample entry's
+    /// configuration box moved to the front (#305, `config_first_patches`).
+    reader: Mp4Reader<PatchedReader<R>>,
     tracks: Vec<Mp4Track>,
     stats: Mp4DemuxStats,
     /// Current sample index per track (track_id -> next sample index).
@@ -713,6 +716,14 @@ impl<R: Read + Seek> Mp4Demux<R> {
         // the affected tracks Unknown, as before.
         let mut reader = reader;
         let stsd_extras = super::mp4_extra::scan(&mut reader).unwrap_or_default();
+
+        // mp4-rs takes a sample entry's first child for its configuration
+        // and rejects the whole file when it is not (#305). Show it the
+        // entries with that box first; tolerant like the scan above, so an
+        // unwalkable file reaches the crate exactly as before.
+        let patches = config_first_patches(&mut reader).unwrap_or_default();
+        let reader = PatchedReader::new(reader, patches)
+            .map_err(|e| Error::Config(format!("Failed to read MP4 header: {}", e)))?;
 
         let mp4_reader = Mp4Reader::read_header(reader, size)
             .map_err(|e| Error::Config(format!("Failed to read MP4 header: {}", e)))?;

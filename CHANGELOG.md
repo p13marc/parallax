@@ -10,6 +10,13 @@ commit messages and the Forgejo releases.
 
 ## [Unreleased]
 
+- **MP4: files whose sample entry has its configuration box second now
+  open** (#305). mp4 0.14 takes the first child of `avc1`, `hev1`, `vp09`
+  and `mp4a` for its `avcC`/`hvcC`/`vpcC`/`esds`, and rejected the whole
+  file ("avcc not found") when a muxer had written `pasp` first. `Mp4Demux`
+  now shows the crate those entries with the configuration box moved to
+  the front, a same-length reordering that moves no other byte of the file.
+
 - **MP4: B-frame streams are stamped on composition time** (#304).
   `Mp4Demux` read `mp4::Mp4Sample::start_time`, which is the crate's
   *decode* time, as the PTS, and derived the DTS by subtracting the `ctts`

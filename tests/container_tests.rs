@@ -971,4 +971,72 @@ mod mp4_roundtrip_tests {
         assert_eq!(land(500, SeekSnap::Nearest), 800);
         assert_eq!(land(400, SeekSnap::Nearest), 100);
     }
+
+    /// #305: a muxed file rewritten so that its `avc1` entry has a `pasp`
+    /// child before its `avcC`, as some muxers write it. Every box on the
+    /// path grows by 16 bytes; `Mp4Mux` writes `moov` after `mdat`, so no
+    /// chunk offset moves.
+    fn with_pasp_before_avcc(mp4: &[u8]) -> Vec<u8> {
+        // 4:3 pixels, so the box is told apart from the square default.
+        const PASP: [u8; 16] = [0, 0, 0, 16, b'p', b'a', b's', b'p', 0, 0, 0, 4, 0, 0, 0, 3];
+        let size_at = |pos: usize| {
+            let size = u32::from_be_bytes(mp4[pos..pos + 4].try_into().unwrap()) as usize;
+            assert!(size >= 8, "the fixture only has plain 32-bit box sizes");
+            size
+        };
+        let find = |from: usize, to: usize, name: &[u8; 4]| {
+            let mut pos = from;
+            while &mp4[pos + 4..pos + 8] != name {
+                pos += size_at(pos);
+                assert!(pos + 8 <= to, "no {} box", String::from_utf8_lossy(name));
+            }
+            pos
+        };
+
+        let moov = find(0, mp4.len(), b"moov");
+        assert!(moov > find(0, mp4.len(), b"mdat"), "moov must follow mdat");
+        let mut path = vec![moov];
+        for name in [b"trak", b"mdia", b"minf", b"stbl", b"stsd"] {
+            let parent = *path.last().unwrap();
+            path.push(find(parent + 8, parent + size_at(parent), name));
+        }
+        // The first sample entry: past stsd's fullbox header and entry count.
+        let avc1 = path.last().unwrap() + 16;
+        assert_eq!(&mp4[avc1 + 4..avc1 + 8], b"avc1");
+        path.push(avc1);
+        let children = avc1 + 8 + 78;
+        assert_eq!(&mp4[children + 4..children + 8], b"avcC");
+
+        let mut out = mp4[..children].to_vec();
+        out.extend_from_slice(&PASP);
+        out.extend_from_slice(&mp4[children..]);
+        for pos in path {
+            let grown = (size_at(pos) + PASP.len()) as u32;
+            out[pos..pos + 4].copy_from_slice(&grown.to_be_bytes());
+        }
+        out
+    }
+
+    /// Before #305 this was `Failed to read MP4 header: avcc not found`:
+    /// mp4 0.14 takes the first child of `avc1` for its `avcC`.
+    #[test]
+    fn an_avc1_entry_with_pasp_before_avcc_opens() {
+        let mp4_data = with_pasp_before_avcc(&seekable_av_fixture());
+        let mut demux = Mp4Demux::new(Cursor::new(mp4_data.clone()), mp4_data.len() as u64)
+            .expect("an avc1 entry may put pasp before avcC");
+        let video_id = demux.video_track_id().unwrap();
+
+        let track = demux.tracks().iter().find(|t| t.id == video_id).unwrap();
+        assert_eq!(track.codec, Mp4Codec::H264);
+        // The pasp still counts: it is read from the file as written.
+        let video = track.video_info.as_ref().unwrap();
+        assert_eq!(video.display.unwrap().par, (4, 3));
+
+        // The parameter sets came out of the avcC that was not first.
+        let sample = demux.read_sample(video_id).unwrap().unwrap();
+        let nal_types: Vec<u8> = parallax::codec::annexb::nal_units(sample.buffer.as_bytes())
+            .map(|n| n.nal_type())
+            .collect();
+        assert_eq!(nal_types, vec![7, 8, 5]);
+    }
 }

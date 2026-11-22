@@ -238,6 +238,184 @@ pub(crate) fn scan<R: Read + Seek>(r: &mut R) -> Result<Vec<(u32, StsdExtra)>> {
     Ok(out)
 }
 
+/// A `trak`'s first sample entry, as `(fourcc, payload_start, end)`.
+///
+/// trak → mdia → minf → stbl → stsd, then past the stsd fullbox header and
+/// its entry count. The first entry is the only one mp4-rs reads.
+fn first_sample_entry<R: Read + Seek>(
+    r: &mut R,
+    trak_start: u64,
+    trak_end: u64,
+) -> Result<Option<([u8; 4], u64, u64)>> {
+    let mut cur = (trak_start, trak_end);
+    for name in [b"mdia", b"minf", b"stbl", b"stsd"] {
+        match find_child(r, name, cur.0, cur.1)? {
+            Some(next) => cur = next,
+            None => return Ok(None),
+        }
+    }
+    let (stsd, stsd_end) = cur;
+    read_box_header(r, stsd + 8, stsd_end)
+}
+
+/// The configuration box mp4-rs needs as the **first** child of each sample
+/// entry it parses, and the size of the entry's fixed fields before its
+/// children (#305).
+///
+/// `Avc1Box`, `Hev1Box`, `Vp09Box` and `Mp4aBox` each read exactly one child
+/// after their fixed fields and take it for the configuration. `avc1` and
+/// `hev1` then error ("avcc not found"), `vp09` parses whatever came first as
+/// a `vpcC`, and `mp4a` drops its `esds` without a word. ISO/IEC 14496-12
+/// does not fix the order of a sample entry's children, and some muxers put
+/// `pasp` or `colr` first — so a whole file failed `Mp4Reader::read_header`
+/// over the position of one box.
+const CONFIG_FIRST: [(&[u8; 4], &[u8; 4], u64); 4] = [
+    (b"avc1", b"avcC", 6 + 2 + 70),
+    (b"hev1", b"hvcC", 6 + 2 + 70),
+    (b"vp09", b"vpcC", 6 + 2 + 70),
+    (b"mp4a", b"esds", 6 + 2 + 20),
+];
+
+/// Same-length patches that move each track's configuration box to the
+/// front of its first sample entry (`CONFIG_FIRST`), as `(offset, bytes)`
+/// for a [`PatchedReader`]. Rewinds the reader to 0.
+///
+/// Reordering a box's children leaves its size alone, so nothing else in the
+/// file moves: not the sizes up the tree, not the chunk offsets into `mdat`.
+///
+/// Tolerant **per track**: a `trak` this walk cannot read contributes no
+/// patch and costs the others nothing. The caller already treats a failed
+/// scan as "no patches", so letting one truncated audio `trak` fail the
+/// whole scan would take the video track's patch down with it and bring
+/// back the very error the patch exists to remove — over a track the crate
+/// itself might have read without complaint.
+pub(crate) fn config_first_patches<R: Read + Seek>(r: &mut R) -> Result<Vec<(u64, Vec<u8>)>> {
+    let file_end = r.seek(SeekFrom::End(0)).map_err(io_err)?;
+    let mut patches = Vec::new();
+
+    if let Some((moov_start, moov_end)) = find_child(r, b"moov", 0, file_end)? {
+        let mut pos = moov_start;
+        // A box header that does not parse ends the walk — there is no
+        // finding the next `trak` past it — but keeps what came before.
+        while let Ok(Some((fourcc, payload, box_end))) = read_box_header(r, pos, moov_end) {
+            if &fourcc == b"trak"
+                && let Ok(Some(patch)) = config_first_patch(r, payload, box_end)
+            {
+                patches.push(patch);
+            }
+            pos = box_end;
+        }
+    }
+
+    r.seek(SeekFrom::Start(0)).map_err(io_err)?;
+    Ok(patches)
+}
+
+/// The patch for one `trak`, if its first sample entry needs one.
+///
+/// Conservative: the entry is touched only when its children parse as boxes
+/// that run to its end (bar fewer than eight bytes of padding, which stay
+/// where they are) and the configuration box is among them but not first.
+/// Anything this walk cannot read the way the crate would is left exactly as
+/// it is, so the worst case is the old failure.
+fn config_first_patch<R: Read + Seek>(
+    r: &mut R,
+    trak_start: u64,
+    trak_end: u64,
+) -> Result<Option<(u64, Vec<u8>)>> {
+    let Some((fourcc, payload, entry_end)) = first_sample_entry(r, trak_start, trak_end)? else {
+        return Ok(None);
+    };
+    let Some(&(_, config, fixed)) = CONFIG_FIRST.iter().find(|(entry, ..)| **entry == fourcc)
+    else {
+        return Ok(None);
+    };
+    // An `mp4a` has 20 bytes of fixed fields only in version 0. QuickTime's
+    // versions 1 and 2 add more, which the crate does not read either.
+    if &fourcc == b"mp4a" && read_bytes(r, payload + 8, 2)? != [0u8; 2] {
+        return Ok(None);
+    }
+
+    let children = payload + fixed;
+    let mut boxes = Vec::new();
+    let mut pos = children;
+    loop {
+        match read_box_header(r, pos, entry_end) {
+            Ok(Some((name, _, end))) => {
+                boxes.push((name, pos, end));
+                pos = end;
+            }
+            Ok(None) => break,
+            Err(_) => return Ok(None),
+        }
+    }
+    let Some(first) = boxes.iter().position(|(name, ..)| name == config) else {
+        return Ok(None);
+    };
+    if first == 0 {
+        return Ok(None);
+    }
+
+    let original = read_bytes(r, children, (pos - children) as usize)?;
+    let slice = |&(_, start, end): &([u8; 4], u64, u64)| {
+        &original[(start - children) as usize..(end - children) as usize]
+    };
+    let mut reordered = slice(&boxes[first]).to_vec();
+    for (i, child) in boxes.iter().enumerate() {
+        if i != first {
+            reordered.extend_from_slice(slice(child));
+        }
+    }
+    Ok(Some((children, reordered)))
+}
+
+/// `inner`, read with some byte ranges replaced (#305).
+///
+/// Every patch is a same-length replacement (see [`config_first_patches`]),
+/// so offsets and lengths are those of the file underneath. The crate reads
+/// a patched range differently and every other byte as it is.
+#[derive(Debug)]
+pub(crate) struct PatchedReader<R> {
+    inner: R,
+    pos: u64,
+    patches: Vec<(u64, Vec<u8>)>,
+}
+
+impl<R: Seek> PatchedReader<R> {
+    pub(crate) fn new(mut inner: R, patches: Vec<(u64, Vec<u8>)>) -> std::io::Result<Self> {
+        let pos = inner.stream_position()?;
+        Ok(Self {
+            inner,
+            pos,
+            patches,
+        })
+    }
+}
+
+impl<R: Read> Read for PatchedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        let (start, end) = (self.pos, self.pos + n as u64);
+        for (at, bytes) in &self.patches {
+            let from = start.max(*at);
+            let to = end.min(at + bytes.len() as u64);
+            if from < to {
+                buf[(from - start) as usize..(to - start) as usize]
+                    .copy_from_slice(&bytes[(from - at) as usize..(to - at) as usize]);
+            }
+        }
+        self.pos = end;
+        Ok(n)
+    }
+}
+
+impl<R: Seek> Seek for PatchedReader<R> {
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        self.pos = self.inner.seek(to)?;
+        Ok(self.pos)
+    }
+}
+
 fn scan_trak<R: Read + Seek>(
     r: &mut R,
     trak_start: u64,
@@ -262,19 +440,7 @@ fn scan_trak<R: Read + Seek>(
         .as_deref()
         .and_then(rotation_from_matrix);
 
-    // trak → mdia → minf → stbl → stsd.
-    let mut cur = (trak_start, trak_end);
-    for name in [b"mdia", b"minf", b"stbl", b"stsd"] {
-        match find_child(r, name, cur.0, cur.1)? {
-            Some(next) => cur = next,
-            None => return Ok(None),
-        }
-    }
-    let (stsd, stsd_end) = cur;
-
-    // stsd is a fullbox with an entry count; take the first sample entry.
-    let first_entry = stsd + 8;
-    let Some((fourcc, entry_payload, entry_end)) = read_box_header(r, first_entry, stsd_end)?
+    let Some((fourcc, entry_payload, entry_end)) = first_sample_entry(r, trak_start, trak_end)?
     else {
         return Ok(None);
     };
@@ -421,10 +587,13 @@ mod tests {
     fn visual_file_with_matrix(fourcc: &[u8; 4], children: &[u8], matrix: &[u8]) -> Vec<u8> {
         let mut entry_payload = vec![0u8; 6 + 2 + 70];
         entry_payload.extend_from_slice(children);
-        let entry = boxed(fourcc, &entry_payload);
+        file_with_entry(&boxed(fourcc, &entry_payload), matrix)
+    }
 
+    /// A one-track file whose `stsd` holds this one sample entry.
+    fn file_with_entry(entry: &[u8], matrix: &[u8]) -> Vec<u8> {
         let mut stsd_payload = vec![0, 0, 0, 0, 0, 0, 0, 1];
-        stsd_payload.extend_from_slice(&entry);
+        stsd_payload.extend_from_slice(entry);
         let stsd = boxed(b"stsd", &stsd_payload);
         let mdia = boxed(b"mdia", &boxed(b"minf", &boxed(b"stbl", &stsd)));
 
@@ -581,5 +750,141 @@ mod tests {
         let mut file = boxed(b"ftyp", b"isom");
         file.extend_from_slice(&boxed(b"mdat", &[0u8; 16]));
         assert!(scan(&mut Cursor::new(file)).unwrap().is_empty());
+    }
+
+    /// Where the box with this fourcc starts: four bytes before the name.
+    fn box_at(file: &[u8], fourcc: &[u8; 4]) -> u64 {
+        (file.windows(4).position(|w| w == fourcc).unwrap() - 4) as u64
+    }
+
+    fn pasp_1_1() -> Vec<u8> {
+        boxed(b"pasp", &[0, 0, 0, 1, 0, 0, 0, 1])
+    }
+
+    fn avcc() -> Vec<u8> {
+        boxed(b"avcC", &[1, 0x64, 0, 0x1f, 0xff, 0xe0, 0])
+    }
+
+    fn patches_of(file: &[u8]) -> Vec<(u64, Vec<u8>)> {
+        config_first_patches(&mut Cursor::new(file)).unwrap()
+    }
+
+    /// #305: the `avc1` children the failing files carry, in their order.
+    #[test]
+    fn a_config_box_behind_pasp_is_moved_to_the_front() {
+        let btrt = boxed(b"btrt", &[0u8; 12]);
+        let children = [pasp_1_1(), avcc(), btrt.clone()].concat();
+        let file = visual_file(b"avc1", &children);
+
+        let patches = patches_of(&file);
+        assert_eq!(patches.len(), 1);
+        let (at, bytes) = &patches[0];
+        assert_eq!(*at, box_at(&file, b"pasp"), "from the first child on");
+        assert_eq!(bytes, &[avcc(), pasp_1_1(), btrt].concat());
+    }
+
+    #[test]
+    fn an_entry_already_in_order_is_left_alone() {
+        let file = visual_file(b"avc1", &[avcc(), pasp_1_1()].concat());
+        assert!(patches_of(&file).is_empty());
+        // No configuration box at all: nothing to move.
+        assert!(patches_of(&visual_file(b"avc1", &pasp_1_1())).is_empty());
+    }
+
+    #[test]
+    fn an_entry_whose_children_do_not_parse_is_left_alone() {
+        // An avcC that claims more bytes than the entry holds.
+        let mut liar = avcc();
+        liar[..4].copy_from_slice(&500u32.to_be_bytes());
+        let file = visual_file(b"avc1", &[pasp_1_1(), liar].concat());
+        assert!(patches_of(&file).is_empty());
+    }
+
+    /// One track's damage is that track's problem. A `trak` whose `mdia`
+    /// holds a box claiming more bytes than its enclosure makes the walk
+    /// error — and that error used to fail the scan for every track, so the
+    /// caller's `unwrap_or_default` threw away the `avc1` patch with it.
+    #[test]
+    fn a_trak_that_cannot_be_walked_does_not_cost_the_others_their_patch() {
+        let good = visual_file(b"avc1", &[pasp_1_1(), avcc()].concat());
+        let moov = box_at(&good, b"moov") as usize;
+        let good_trak = &good[moov + 8..];
+
+        let mut liar = boxed(b"minf", &[]);
+        liar[..4].copy_from_slice(&256u32.to_be_bytes());
+        let bad_trak = boxed(b"trak", &boxed(b"mdia", &liar));
+
+        // The unreadable track first, so the walk has to go on past it; then
+        // last, so a later failure cannot take back an earlier patch.
+        for traks in [
+            [bad_trak.as_slice(), good_trak].concat(),
+            [good_trak, bad_trak.as_slice()].concat(),
+        ] {
+            let mut file = boxed(b"ftyp", b"isom");
+            file.extend_from_slice(&boxed(b"moov", &traks));
+
+            let patches = patches_of(&file);
+            assert_eq!(patches.len(), 1);
+            assert_eq!(patches[0].0, box_at(&file, b"pasp"));
+            assert_eq!(patches[0].1, [avcc(), pasp_1_1()].concat());
+        }
+    }
+
+    #[test]
+    fn only_the_entries_the_crate_parses_are_touched() {
+        // `av01` is read by this module's own scan, which finds `av1C`
+        // wherever it is.
+        let colr = boxed(b"colr", &nclx(1, 1, 1, false));
+        let file = visual_file(b"av01", &[colr, boxed(b"av1C", &[0x81, 0, 0, 0])].concat());
+        assert!(patches_of(&file).is_empty());
+    }
+
+    /// An `mp4a` entry of this QuickTime sound version with these children.
+    fn mp4a_entry(version: u16, children: &[u8]) -> Vec<u8> {
+        let mut payload = vec![0u8; 6 + 2];
+        payload.extend_from_slice(&version.to_be_bytes());
+        payload.extend_from_slice(&[0u8; 18]);
+        payload.extend_from_slice(children);
+        boxed(b"mp4a", &payload)
+    }
+
+    #[test]
+    fn an_mp4a_esds_is_moved_only_in_the_version_0_layout() {
+        let children = [boxed(b"btrt", &[0u8; 12]), boxed(b"esds", &[0u8; 8])].concat();
+        let v0 = file_with_entry(&mp4a_entry(0, &children), &identity_matrix());
+        assert_eq!(patches_of(&v0).len(), 1);
+        // Version 1 has 16 more bytes of fixed fields: read at the version-0
+        // offset, its children would be boxes that are not there.
+        let v1 = file_with_entry(&mp4a_entry(1, &children), &identity_matrix());
+        assert!(patches_of(&v1).is_empty());
+    }
+
+    #[test]
+    fn a_patched_reader_overlays_its_ranges_and_nothing_else() {
+        let data: Vec<u8> = (0..32).collect();
+        let patches = vec![(10, vec![0xAA; 4])];
+        let mut r = PatchedReader::new(Cursor::new(data.clone()), patches).unwrap();
+
+        let mut whole = Vec::new();
+        r.read_to_end(&mut whole).unwrap();
+        let mut want = data;
+        want[10..14].fill(0xAA);
+        assert_eq!(whole, want);
+
+        // A read that starts inside the patch, after a seek.
+        r.seek(SeekFrom::Start(12)).unwrap();
+        let mut four = [0u8; 4];
+        r.read_exact(&mut four).unwrap();
+        assert_eq!(four, [0xAA, 0xAA, 14, 15]);
+
+        // One byte at a time, across both edges of the patch.
+        r.seek(SeekFrom::Start(8)).unwrap();
+        let mut bytes = Vec::new();
+        for _ in 0..8 {
+            let mut b = [0u8; 1];
+            r.read_exact(&mut b).unwrap();
+            bytes.push(b[0]);
+        }
+        assert_eq!(bytes, [8, 9, 0xAA, 0xAA, 0xAA, 0xAA, 14, 15]);
     }
 }
