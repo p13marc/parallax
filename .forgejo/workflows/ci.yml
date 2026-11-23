@@ -76,7 +76,7 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
           components: clippy
-      - uses: https://github.com/Swatinem/rust-cache@v2.9.2
+      - uses: https://github.com/Swatinem/rust-cache@v2.9.3
         with:
           cache-targets: false
       - run: cargo clippy --all-targets -- -D warnings
@@ -91,10 +91,10 @@ jobs:
       - uses: https://github.com/dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_VERSION }}
-      - uses: https://github.com/Swatinem/rust-cache@v2.9.2
+      - uses: https://github.com/Swatinem/rust-cache@v2.9.3
         with:
           cache-targets: false
-      - uses: https://github.com/taiki-e/install-action@v2.87.7
+      - uses: https://github.com/taiki-e/install-action@v2.90.8
         with:
           tool: cargo-nextest
       - run: cargo nextest run
@@ -130,7 +130,7 @@ jobs:
       - uses: https://github.com/dtolnay/rust-toolchain@master
         with:
           toolchain: "1.97"
-      - uses: https://github.com/Swatinem/rust-cache@v2.9.2
+      - uses: https://github.com/Swatinem/rust-cache@v2.9.3
         with:
           key: msrv
           cache-targets: false
@@ -152,11 +152,11 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
           components: clippy
-      - uses: https://github.com/Swatinem/rust-cache@v2.9.2
+      - uses: https://github.com/Swatinem/rust-cache@v2.9.3
         with:
           key: libcamera
           cache-targets: false
-      - uses: https://github.com/taiki-e/install-action@v2.87.7
+      - uses: https://github.com/taiki-e/install-action@v2.90.8
         with:
           tool: cargo-nextest
       - run: cargo clippy --all-targets --features libcamera -- -D warnings
@@ -178,11 +178,11 @@ jobs:
       - uses: https://github.com/dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_VERSION }}
-      - uses: https://github.com/Swatinem/rust-cache@v2.9.2
+      - uses: https://github.com/Swatinem/rust-cache@v2.9.3
         with:
           key: vulkan
           cache-targets: false
-      - uses: https://github.com/taiki-e/install-action@v2.87.7
+      - uses: https://github.com/taiki-e/install-action@v2.90.8
         with:
           tool: cargo-nextest
       # Most of what `vulkan-video` gates is CPU-only and testable without a
@@ -205,7 +205,7 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
           components: clippy
-      - uses: https://github.com/Swatinem/rust-cache@v2.9.2
+      - uses: https://github.com/Swatinem/rust-cache@v2.9.3
         with:
           key: display
           cache-targets: false
@@ -214,7 +214,7 @@ jobs:
       # only to run. And the combined build is not a superset in practice — a
       # module that loses its cfg gate compiles here and breaks the
       # `display`-alone build below, which has happened.
-      - uses: https://github.com/taiki-e/install-action@v2.87.7
+      - uses: https://github.com/taiki-e/install-action@v2.90.8
         with:
           tool: cargo-nextest
       # The tests run headless — the display elements' unit tests are pure
@@ -244,11 +244,11 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
           components: clippy
-      - uses: https://github.com/Swatinem/rust-cache@v2.9.2
+      - uses: https://github.com/Swatinem/rust-cache@v2.9.3
         with:
           key: feature-gates
           cache-targets: false
-      - uses: https://github.com/taiki-e/install-action@v2.87.7
+      - uses: https://github.com/taiki-e/install-action@v2.90.8
         with:
           tool: cargo-nextest
       # `eac3,audio-flac,audio-mp3,cli,macros` are pure Rust and were compiled
@@ -283,11 +283,11 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
           components: clippy
-      - uses: https://github.com/Swatinem/rust-cache@v2.9.2
+      - uses: https://github.com/Swatinem/rust-cache@v2.9.3
         with:
           key: zenoh-degraded
           cache-targets: false
-      - uses: https://github.com/taiki-e/install-action@v2.87.7
+      - uses: https://github.com/taiki-e/install-action@v2.90.8
         with:
           tool: cargo-nextest
       - run: cargo nextest run --features zenoh
@@ -304,11 +304,11 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
           components: clippy
-      - uses: https://github.com/Swatinem/rust-cache@v2.9.2
+      - uses: https://github.com/Swatinem/rust-cache@v2.9.3
         with:
           key: vaapi
           cache-targets: false
-      - uses: https://github.com/taiki-e/install-action@v2.87.7
+      - uses: https://github.com/taiki-e/install-action@v2.90.8
         with:
           tool: cargo-nextest
       - run: cargo nextest run --features vaapi,mkv-demux,mp4-demux,vpx,h264
@@ -327,11 +327,11 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
           components: clippy
-      - uses: https://github.com/Swatinem/rust-cache@v2.9.2
+      - uses: https://github.com/Swatinem/rust-cache@v2.9.3
         with:
           key: simd
           cache-targets: false
-      - uses: https://github.com/taiki-e/install-action@v2.87.7
+      - uses: https://github.com/taiki-e/install-action@v2.90.8
         with:
           tool: cargo-nextest
       - run: cargo nextest run --features simd-colorspace
@@ -354,11 +354,11 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
           components: clippy
-      - uses: https://github.com/Swatinem/rust-cache@v2.9.2
+      - uses: https://github.com/Swatinem/rust-cache@v2.9.3
         with:
           key: codec-libs
           cache-targets: false
-      - uses: https://github.com/taiki-e/install-action@v2.87.7
+      - uses: https://github.com/taiki-e/install-action@v2.90.8
         with:
           tool: cargo-nextest
       - run: cargo nextest run --features "$MEDIA_FEATURES,vpx,av1-decode,av1-encode,opus,h264"
@@ -378,7 +378,7 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
           components: clippy
-      - uses: https://github.com/Swatinem/rust-cache@v2.9.2
+      - uses: https://github.com/Swatinem/rust-cache@v2.9.3
         with:
           key: workspace-members
           cache-targets: false
@@ -404,7 +404,7 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
           components: clippy
-      - uses: https://github.com/Swatinem/rust-cache@v2.9.2
+      - uses: https://github.com/Swatinem/rust-cache@v2.9.3
         with:
           key: feature-union
           cache-targets: false
@@ -423,7 +423,7 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
           components: clippy
-      - uses: https://github.com/Swatinem/rust-cache@v2.9.2
+      - uses: https://github.com/Swatinem/rust-cache@v2.9.3
         with:
           key: iced
           cache-targets: false
@@ -457,7 +457,7 @@ jobs:
       - uses: https://github.com/dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_VERSION }}
-      - uses: https://github.com/Swatinem/rust-cache@v2.9.2
+      - uses: https://github.com/Swatinem/rust-cache@v2.9.3
         with:
           cache-targets: false
       - run: cargo doc --no-deps --features "$SENSOR_FEATURES,image-codecs"
@@ -470,7 +470,7 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       # the docker cargo-deny action cannot see deny.toml -> install directly
-      - uses: https://github.com/taiki-e/install-action@v2.87.7
+      - uses: https://github.com/taiki-e/install-action@v2.90.8
         with:
           tool: cargo-deny
       - run: cargo deny check

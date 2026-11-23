@@ -124,7 +124,7 @@ pollster = { version = "1", optional = true }
 ash = { version = "0.38", optional = true }
 
 # H.264 bitstream parsing (optional)
-h264-reader = { version = "0.8", optional = true }
+h264-reader = { version = "0.9", optional = true }
 
 # VA-API hardware decode (optional).
 #
@@ -164,7 +164,7 @@ cros-codecs = { package = "cros-codecs-extended", version = "=0.0.5-extended.2",
 # rav1e: use default-features=false to skip asm (slower), or install nasm for optimized builds
 rav1e = { version = "0.8", optional = true, default-features = false, features = ["threading"] }
 # dav1d requires system library (libdav1d-devel on Fedora, libdav1d-dev on Debian)
-dav1d = { version = "0.11", optional = true }
+dav1d = { version = "0.12", optional = true }
 
 # H.264 codec (OpenH264 - ships with source, compiles automatically)
 openh264 = { version = "0.9", optional = true }
@@ -191,11 +191,11 @@ matroska-demuxer = { version = "0.8", optional = true }
 env-libvpx-sys = { version = "5", optional = true, features = ["generate"] }
 
 # Opus audio codec (bindings to libopus)
-opus = { version = "0.3", optional = true }
+opus = { version = "0.4", optional = true }
 
 # AC-3 / E-AC-3 audio decoder (pure Rust; young crate — pin exact).
 # oxideav-core supplies the Packet/Decoder types its API speaks.
-oxideav-ac3 = { version = "=0.0.11", optional = true }
+oxideav-ac3 = { version = "=0.0.12", optional = true }
 oxideav-core = { version = "0.1", optional = true }
 
 # AAC audio encoder (bindings to FDK-AAC - note license restrictions)
@@ -209,7 +209,7 @@ pipewire = { version = "0.10", optional = true, features = ["v0_3_44"] }
 
 # libcamera (modern camera API; needs system libcamera >= 0.4 with dev headers,
 # the crate picks matching pregenerated bindings via pkg-config at build time)
-libcamera = { version = "0.7", optional = true }
+libcamera = { version = "0.8", optional = true }
 
 # V4L2 (fallback video capture)
 v4l = { version = "0.14", optional = true }

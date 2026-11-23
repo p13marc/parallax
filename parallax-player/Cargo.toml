@@ -63,7 +63,7 @@ png = "0.18"
 # Seek-bar previews (#282). Already in the lock as a transitive dependency of
 # `cryoglyph`, iced's text renderer, so this compiles nothing new and cannot
 # duplicate a major.
-lru = "0.16"
+lru = "0.19"
 clap = { version = "4", features = ["derive"] }
 # `signal` is declared rather than inherited: the root crate enables it and
 # cargo unifies tokio's features across the graph, so `--headless`'s Ctrl-C
